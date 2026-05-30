@@ -33,7 +33,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use astra_core::SkillSearchSettings;
 use serde_json::Value;
 
 use crate::server::header_utils::CONNECTION_HEADER_TOKENS_KEY;
@@ -180,7 +179,6 @@ pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 const LARGE_SKILL_CATALOG_WARNING_THRESHOLD: usize = 50;
 static LARGE_SKILL_CATALOG_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
-static IGNORED_SKILL_SEARCH_SETTINGS_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 pub const DEFAULT_AUTO_ROUTE_MIN_SCORE: usize = 20;
 pub const DEFAULT_AUTO_ROUTE_MIN_MARGIN: usize = 8;
 
@@ -530,29 +528,13 @@ pub fn warn_if_full_skill_catalog_surface_is_large(skill_count: usize) {
     }
 }
 
-fn warn_if_selector_removed_surface_has_risks(skill_count: usize, cfg: &SkillSearchSettings) {
-    warn_if_full_skill_catalog_surface_is_large(skill_count);
-    if cfg != &SkillSearchSettings::default() {
-        IGNORED_SKILL_SEARCH_SETTINGS_WARNING_EMITTED.get_or_init(|| {
-            tracing::warn!(
-                dynamic_surface = cfg.dynamic_surface,
-                min_catalog_size = cfg.min_catalog_size,
-                surface_cap = cfg.surface_cap,
-                "SkillSearchSettings are ignored because skill selector surfacing was removed"
-            );
-        });
-    }
-}
-
 /// Selector removed: always returns the full catalog.
 pub fn select_skills_for_turn(
     all_skills: &[SkillToolInfo],
     _user_message: &str,
     _quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     _pinned_skills: Option<&HashSet<String>>,
-    cfg: &SkillSearchSettings,
 ) -> Vec<SkillToolInfo> {
-    warn_if_selector_removed_surface_has_risks(all_skills.len(), cfg);
     all_skills.to_vec()
 }
 
@@ -601,9 +583,7 @@ pub fn visible_skills_for_host_turn(
     _pinned: &HashSet<String>,
     _discovered: &HashSet<String>,
     invoked: &HashMap<String, InvokedSkill>,
-    cfg: &SkillSearchSettings,
 ) -> Vec<SkillToolInfo> {
-    warn_if_selector_removed_surface_has_risks(full.len(), cfg);
     filter_already_invoked_skills(full.to_vec(), invoked)
 }
 
@@ -2764,7 +2744,6 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &invoked,
-            &SkillSearchSettings::default(),
         );
 
         assert!(
@@ -2797,18 +2776,11 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let cfg = SkillSearchSettings {
-            dynamic_surface: true,
-            min_catalog_size: 1,
-            surface_cap: 1,
-        };
-
         let selected = select_skills_for_turn(
             &skills,
             "only beta seems relevant",
             None,
             Some(&HashSet::from(["beta".to_string()])),
-            &cfg,
         );
 
         assert_eq!(
@@ -2862,7 +2834,6 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &invoked,
-            &SkillSearchSettings::default(),
         );
 
         assert!(visible.is_empty(), "all invoked skills should stay hidden");

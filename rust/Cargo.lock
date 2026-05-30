@@ -260,6 +260,7 @@ dependencies = [
  "sqlx",
  "temp-env",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
 ]
 
@@ -470,7 +471,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
- "toml 1.1.2+spec-1.1.0",
  "tower 0.5.3",
  "tower-http",
  "tracing",

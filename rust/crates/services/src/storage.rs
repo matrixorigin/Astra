@@ -1,6 +1,8 @@
 use crate::auth::DatabaseUserRecord;
 use crate::auth::session::SessionRecord;
-use astra_core::{ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error};
+use astra_core::{
+    DedicatedPool, ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error,
+};
 use axum::{Json, http::StatusCode};
 use fs2::FileExt;
 use sqlx::{Executor, MySql, Pool, QueryBuilder, Row, query};
@@ -259,13 +261,16 @@ async fn ensure_matrixone_database_exists(
         })?;
     let mut admin_settings = settings.clone();
     admin_settings.database = bootstrap_catalog.to_string();
-    let admin_pool = connect_matrixone(&admin_settings).await?;
+    let admin_pool = DedicatedPool::new(
+        connect_matrixone(&admin_settings).await?,
+        admin_settings.db_pool_max_connections as u64,
+    );
     let ddl = format!(
         "CREATE DATABASE IF NOT EXISTS {}",
         crate::snapshot_sql::quote_mysql_identifier(&settings.database)
     );
-    query(&ddl).execute(&admin_pool).await?;
-    admin_pool.close().await;
+    query(&ddl).execute(&*admin_pool).await?;
+    // DedicatedPool::drop releases the global connection quota.
     Ok(())
 }
 

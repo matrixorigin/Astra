@@ -6605,6 +6605,7 @@ mod tests {
                 remaining_turns: 0,
                 error_detail: Some("Round budget hard-limit reached".to_string()),
                 stall_signal: None,
+                resume_restricted_tools: vec![],
             },
         );
 
@@ -7242,6 +7243,7 @@ mod tests {
                 remaining_turns: 0,
                 error_detail: Some("Round budget hard-limit reached".to_string()),
                 stall_signal: None,
+                resume_restricted_tools: vec![],
             },
         ));
 

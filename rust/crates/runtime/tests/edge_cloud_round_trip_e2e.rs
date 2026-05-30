@@ -211,6 +211,11 @@ fn build_app_with_capture(capture: Capture) -> Router {
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         },
         enc,
     )

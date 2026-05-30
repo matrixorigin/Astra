@@ -481,7 +481,7 @@ impl IngestionShutdownHandle {
 }
 
 impl EventIngestionWorker {
-    /// Spawn the ingestion pipeline. Returns (sender, shutdown_handle, stats_handle, join_handle).
+    /// Spawn the ingestion pipeline.
     pub fn spawn(
         pool: sqlx::Pool<sqlx::MySql>,
         config: IngestionConfig,

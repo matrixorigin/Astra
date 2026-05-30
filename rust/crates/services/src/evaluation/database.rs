@@ -2179,6 +2179,11 @@ mod tests {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         };
         let svc = DatabaseEvaluationService::new(settings);
         assert!(svc.pool.is_none());
@@ -2194,6 +2199,11 @@ mod tests {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:8080", Some("".to_string()));
@@ -2210,6 +2220,11 @@ mod tests {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:8080", Some("secret123".to_string()));
@@ -2224,6 +2239,11 @@ mod tests {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:8080", None);
@@ -2240,6 +2260,11 @@ mod tests {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         };
         let svc = DatabaseEvaluationService::new(settings);
         let result = svc.memoria_get("/v1/health/storage", "user1").await;
@@ -2256,6 +2281,11 @@ mod tests {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_secs: 5,
+            db_pool_idle_timeout_secs: 60,
+            db_pool_max_lifetime_secs: 300,
         };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:9999", None);

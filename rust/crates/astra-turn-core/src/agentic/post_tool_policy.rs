@@ -150,6 +150,9 @@ pub fn apply_agentic_post_tool_policy(
 
         append_openai_user_content_messages(messages, &verdict.injections);
 
+        // Inject TurnGuard avoid_tools into same-turn restricted_tools
+        // so the model cannot re-use flagged tools within the current turn
+        // (cross-turn restriction is handled separately via resume_restricted_tools).
         for tool in &verdict.avoid_tools {
             if !crate::guardrails::turn_guard::is_read_only_never_restrict(tool) {
                 restricted_tools.insert(tool.clone());

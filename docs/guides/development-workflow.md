@@ -21,51 +21,51 @@ make dev-stop
 
 ### Quick Start Commands
 
-| Command | Description | Time |
-|---------|-------------|------|
-| `make dev-start` | Start deps + API (source mode) | ~5s |
-| `make dev-start-docker` | Start deps + API (Docker mode) | ~10s |
-| `make dev-stop` | Stop all services | ~2s |
-| `make dev-status` | Show all service status | instant |
-| `make dev-init` | Initialize environment | ~10s |
+| Command                 | Description                    | Time    |
+| ----------------------- | ------------------------------ | ------- |
+| `make dev-start`        | Start deps + API (source mode) | ~5s     |
+| `make dev-start-docker` | Start deps + API (Docker mode) | ~10s    |
+| `make dev-stop`         | Stop all services              | ~2s     |
+| `make dev-status`       | Show all service status        | instant |
+| `make dev-init`         | Initialize environment         | ~10s    |
 
 ### Dependency Services (MatrixOne + Redis)
 
-| Command | Description |
-|---------|-------------|
-| `make dev-deps-up` | Start dependencies |
-| `make dev-deps-down` | Stop dependencies |
-| `make dev-deps-clean` | Delete all data (⚠️ destructive) |
-| `make dev-deps-status` | Show dependency status |
-| `make dev-deps-logs` | Tail all dependency logs |
-| `make dev-deps-wait` | Wait for dependencies (max 20s) |
-| `make dev-db-connect` | Connect to MatrixOne CLI |
+| Command                | Description                      |
+| ---------------------- | -------------------------------- |
+| `make dev-deps-up`     | Start dependencies               |
+| `make dev-deps-down`   | Stop dependencies                |
+| `make dev-deps-clean`  | Delete all data (⚠️ destructive) |
+| `make dev-deps-status` | Show dependency status           |
+| `make dev-deps-logs`   | Tail all dependency logs         |
+| `make dev-deps-wait`   | Wait for dependencies (max 20s)  |
+| `make dev-db-connect`  | Connect to MatrixOne CLI         |
 
 ### API Server (Source Code Mode)
 
-| Command | Description |
-|---------|-------------|
-| `make dev-api-start` | Start API server |
-| `make dev-api-stop` | Stop API server |
-| `make dev-api-restart` | Restart API server |
-| `make dev-api-logs` | Tail API server logs |
-| `make dev-api-status` | Show API server status + health |
+| Command                | Description                     |
+| ---------------------- | ------------------------------- |
+| `make dev-api-start`   | Start API server                |
+| `make dev-api-stop`    | Stop API server                 |
+| `make dev-api-restart` | Restart API server              |
+| `make dev-api-logs`    | Tail API server logs            |
+| `make dev-api-status`  | Show API server status + health |
 
 ### API Server (Docker Mode)
 
-| Command | Description |
-|---------|-------------|
-| `make dev-api-docker-build` | Build API server image |
-| `make dev-api-docker-up` | Start API container |
-| `make dev-api-docker-down` | Stop API container |
-| `make dev-api-docker-logs` | Tail container logs |
-| `make dev-api-docker-scale REPLICAS=N` | Scale to N replicas |
+| Command                                | Description            |
+| -------------------------------------- | ---------------------- |
+| `make dev-api-docker-build`            | Build API server image |
+| `make dev-api-docker-up`               | Start API container    |
+| `make dev-api-docker-down`             | Stop API container     |
+| `make dev-api-docker-logs`             | Tail container logs    |
+| `make dev-api-docker-scale REPLICAS=N` | Scale to N replicas    |
 
 ### Testing
 
-| Command | Description |
-|---------|-------------|
-| `make test` | Run all Rust workspace tests |
+| Command              | Description                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `make test`          | Run all Rust workspace tests                                                                                             |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
 
 ## Typical Workflows
@@ -129,6 +129,7 @@ make dev-start
 ## Environment Variables
 
 The `dev-init` command automatically:
+
 - Generates `ASTRA_TOKEN_ENCRYPTION_KEY` if missing
 - Generates `ASTRA_JWT_SECRET` if missing
 - Generates `ASTRA_BRIDGE_SECRET` if missing or still using the template placeholder
@@ -159,12 +160,17 @@ make dev-api-logs
 ```
 
 Common issues:
+
 - Port 8000 already in use: `lsof -i :8000` and kill the process
 - Dependencies not ready: Wait and retry
+- **Missing JWT secret / bridge secret**: If you see `MissingRequiredKey` for `JWT_SECRET` or `BRIDGE_SECRET`:
+  - Run `make dev-init` (auto-generates secrets in `.env`)
+  - Or set `ASTRA_ALLOW_INSECURE_DEFAULTS=1` for quick dev (NOT for production)
 
 ### Tests failing
 
 Ensure dependencies are running:
+
 ```bash
 make dev-deps-status
 make dev-deps-wait

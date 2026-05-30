@@ -1508,6 +1508,7 @@ async fn plan_executor_task(
                     cli_context: Some(&ctx.cli_context),
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
+                    resume_restricted_tools: &[],
                     session_lessons: &[],
                     latest_skill_diagnosis: None,
                     latest_turn_quality_feedback: None,

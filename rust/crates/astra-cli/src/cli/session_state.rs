@@ -284,6 +284,9 @@ pub(crate) struct SessionState {
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
+    /// Tool names blocked on the next resumed/continued turn so the model
+    /// cannot immediately repeat the exploratory path that just tripped a guard.
+    pub resume_restricted_tools: Vec<String>,
 
     /// Turns where history compaction occurred (for drift detection).
     pub drift_compressed_turns: Vec<u32>,
@@ -535,6 +538,7 @@ impl Default for SessionState {
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
+            resume_restricted_tools: Vec::new(),
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
@@ -611,6 +615,8 @@ impl SessionState {
         self.task_manager.rebind("");
         self.session_id = None;
         self.plan_mode_sync_error = None;
+        self.resume_guidance = None;
+        self.resume_restricted_tools.clear();
     }
 
     /// Unregister and drop the root mailbox so a subsequent turn can

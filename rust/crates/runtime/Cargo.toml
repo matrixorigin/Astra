@@ -79,9 +79,8 @@ uuid.workspace = true
 thiserror.workspace = true
 astra-harness = { workspace = true, optional = true }
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
-dashmap = "6.1.0"
-toml = { version = "1.1.2", features = ["preserve_order"] }
-fs2 = "0.4"
+	dashmap = "6.1.0"
+	fs2 = "0.4"
 
 [dev-dependencies]
 astra-core = { workspace = true, features = ["dev-defaults"] }

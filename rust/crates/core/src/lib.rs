@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use axum::{
     Json,
@@ -7,6 +10,67 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
+
+/// Global cap on the sum of `max_connections` across all pools.
+/// Prevents unbounded pool creation from exhausting database connections.
+/// Override with `ASTRA_DB_GLOBAL_MAX_CONNECTIONS` env var.
+const DEFAULT_GLOBAL_MAX_CONNECTIONS: u64 = 200;
+
+/// Running counter of allocated connections across all pools.
+/// Checked against `DEFAULT_GLOBAL_MAX_CONNECTIONS` before creating new pools.
+///
+/// **Multi-instance limitation**: this counter is process-local (`AtomicU64`).
+/// When running multiple Astra instances against the same MatrixOne cluster on
+/// a single host (e.g., dev + staging side-by-side), each process maintains its
+/// own quota view. Set `ASTRA_DB_GLOBAL_MAX_CONNECTIONS` conservatively —
+/// dividing by the expected instance count — to avoid exceeding the database
+/// server's `max_connections`.
+static GLOBAL_CONNECTION_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the effective global connection cap, reading
+/// `ASTRA_DB_GLOBAL_MAX_CONNECTIONS` once if set.
+fn global_connection_cap() -> u64 {
+    use std::sync::LazyLock;
+    static CAP: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("ASTRA_DB_GLOBAL_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_GLOBAL_MAX_CONNECTIONS)
+    });
+    *CAP
+}
+
+/// Atomically try to reserve `max` connections from the global counter.
+/// Returns `Ok(())` if the reservation fits within the cap, or
+/// `Err` with a message if it would exceed.
+fn try_allocate_global_connections(max: u64) -> Result<(), String> {
+    let cap = global_connection_cap();
+    loop {
+        let current = GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire);
+        if current + max > cap {
+            return Err(format!(
+                "Would exceed global connection cap: {current} + {max} > {cap}"
+            ));
+        }
+        if GLOBAL_CONNECTION_ALLOCATED
+            .compare_exchange(current, current + max, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // CAS failed — another thread updated the counter; retry.
+        std::hint::spin_loop();
+    }
+}
+
+/// Release `max` connections back to the global counter.
+///
+/// Callers that obtain a pool via [`connect_matrixone`] and later call
+/// `.close()` on it should invoke this immediately after closing so the
+/// quota is recycled.
+pub fn release_global_connections(max: u64) {
+    GLOBAL_CONNECTION_ALLOCATED.fetch_sub(max, Ordering::AcqRel);
+}
 
 pub mod composite_snapshot;
 pub mod confidence;
@@ -178,17 +242,113 @@ impl std::error::Error for InvalidTransition {}
 
 /// Create an explicit one-shot connection pool.
 ///
-/// This is for call sites that intentionally want a dedicated short-lived pool.
-/// Long-lived runtime wiring should inject [`SharedPool`] instead of reconnecting
-/// implicitly inside service methods.
+/// **Prefer [`DedicatedPool`] or [`SharedPool`] instead.**  This function
+/// allocates from the global connection quota but the caller is responsible
+/// for calling [`release_global_connections`] after closing the pool —
+/// forgetting to do so permanently leaks quota.  `DedicatedPool` automates
+/// release on drop, and `SharedPool` manages the lifecycle completely.
+///
+/// This is for call sites that intentionally want a dedicated pool.
+/// Long-lived runtime wiring should inject [`SharedPool`] instead of
+/// reconnecting implicitly inside service methods.
+///
+/// The returned pool counts against the global connection cap guarded by
+/// [`try_allocate_global_connections`].  Callers that **close** the pool
+/// must release the quota via [`release_global_connections`].
 pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySql>, sqlx::Error> {
-    MySqlPoolOptions::new()
-        .max_connections(1)
+    let max = settings.db_pool_max_connections as u64;
+
+    try_allocate_global_connections(max).map_err(|msg| sqlx::Error::Configuration(msg.into()))?;
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(settings.db_pool_max_connections)
+        .min_connections(settings.db_pool_min_connections)
         .test_before_acquire(true)
-        .acquire_timeout(std::time::Duration::from_secs(2))
-        .idle_timeout(std::time::Duration::from_secs(60))
+        .acquire_timeout(std::time::Duration::from_secs(
+            settings.db_pool_acquire_timeout_secs,
+        ))
+        .idle_timeout(std::time::Duration::from_secs(
+            settings.db_pool_idle_timeout_secs,
+        ))
+        .max_lifetime(std::time::Duration::from_secs(
+            settings.db_pool_max_lifetime_secs,
+        ))
         .connect(&settings.database_url_with_password())
-        .await
+        .await;
+
+    match pool {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            release_global_connections(max);
+            Err(e)
+        }
+    }
+}
+
+/// A short-lived pool that releases its global connection quota on drop.
+///
+/// Prefer this over calling [`connect_matrixone`] directly when the pool
+/// has a bounded lifetime.  The wrapper calls [`release_global_connections`]
+/// in its [`Drop`] impl so the quota is automatically recycled.
+///
+/// Call [`DedicatedPool::close`] explicitly before drop to close
+/// connections promptly.  `Drop` is a safety net that releases the
+/// quota counter but cannot `.await` [`Pool::close`][sqlx::Pool::close].
+/// For long-lived pools prefer [`SharedPool`].
+pub struct DedicatedPool {
+    pub(crate) pool: Pool<MySql>,
+    pub(crate) max_connections: u64,
+    /// Prevents double-release of global connection quota across
+    /// `close()` + `Drop` paths.
+    quota_released: Arc<AtomicBool>,
+}
+
+impl DedicatedPool {
+    /// Build a `DedicatedPool` from an already-allocated pool.
+    ///
+    /// The caller must have already reserved `max_connections` via
+    /// [`try_allocate_global_connections`] (which [`connect_matrixone`]
+    /// does internally).
+    pub fn new(pool: Pool<MySql>, max_connections: u64) -> Self {
+        Self {
+            pool,
+            max_connections,
+            quota_released: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Close the pool and release the global connection quota.
+    ///
+    /// Prefer calling this explicitly before drop to ensure connections
+    /// are released back to the database promptly.  `Drop` is a safety
+    /// net that only releases the quota counter; it cannot `.await`
+    /// [`Pool::close`].
+    pub async fn close(self) {
+        self.pool.close().await;
+        self.release_quota();
+    }
+
+    /// Release the global connection quota exactly once.
+    fn release_quota(&self) {
+        if !self.quota_released.swap(true, Ordering::AcqRel) {
+            release_global_connections(self.max_connections);
+        }
+    }
+
+    // Access the underlying pool via Deref — DedicatedPool derefs to Pool<MySql>.
+}
+
+impl std::ops::Deref for DedicatedPool {
+    type Target = Pool<MySql>;
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+impl Drop for DedicatedPool {
+    fn drop(&mut self) {
+        self.release_quota();
+    }
 }
 
 /// Shared connection pool that can be cloned cheaply across services.
@@ -196,22 +356,47 @@ pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySq
 pub struct SharedPool {
     pool: Arc<Pool<MySql>>,
     settings: MatrixOneSettings,
+    /// Tracks whether the global connection quota for this pool has been
+    /// released, preventing double-release in `close()` + `Drop`.
+    quota_released: Arc<AtomicBool>,
 }
 
 impl SharedPool {
     pub async fn new(settings: &MatrixOneSettings) -> Result<Self, sqlx::Error> {
-        let pool = MySqlPoolOptions::new()
-            .max_connections(10)
-            .min_connections(1)
+        let max = settings.db_pool_max_connections as u64;
+
+        // Atomically reserve global connection quota.
+        try_allocate_global_connections(max)
+            .map_err(|msg| sqlx::Error::Configuration(msg.into()))?;
+
+        // Build the pool. On failure, release the reserved quota.
+        let pool = match MySqlPoolOptions::new()
+            .max_connections(settings.db_pool_max_connections)
+            .min_connections(settings.db_pool_min_connections)
             .test_before_acquire(true)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .idle_timeout(std::time::Duration::from_secs(60))
-            .max_lifetime(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(
+                settings.db_pool_acquire_timeout_secs,
+            ))
+            .idle_timeout(std::time::Duration::from_secs(
+                settings.db_pool_idle_timeout_secs,
+            ))
+            .max_lifetime(std::time::Duration::from_secs(
+                settings.db_pool_max_lifetime_secs,
+            ))
             .connect(&settings.database_url_with_password())
-            .await?;
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                release_global_connections(max);
+                return Err(e);
+            }
+        };
+
         Ok(Self {
             pool: Arc::new(pool),
             settings: settings.clone(),
+            quota_released: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -225,13 +410,25 @@ impl SharedPool {
 
     pub async fn close(&self) {
         self.pool.close().await;
+        self.release_quota();
     }
 }
 
-/// Standard JSON error envelope for HTTP APIs.
-///
-/// `detail` is the human-readable message. `error_code` and `request_id` are optional
-/// in the wire format so older clients keep working; the server middleware fills
+impl Drop for SharedPool {
+    fn drop(&mut self) {
+        self.release_quota();
+    }
+}
+
+impl SharedPool {
+    /// Release the global connection quota once.
+    fn release_quota(&self) {
+        if !self.quota_released.swap(true, Ordering::AcqRel) {
+            release_global_connections(self.settings.db_pool_max_connections as u64);
+        }
+    }
+}
+
 /// `request_id` when missing on 4xx/5xx JSON responses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorResponse {

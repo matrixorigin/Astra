@@ -251,6 +251,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         // A short first prompt like "继续" is valid new-session input and must
         // not silently attach to the last crashed/interrupted session.
         state.pending_recovery = None;
+        state.resume_restricted_tools.clear();
     }
 
     state.perm_manager.trust_explicit_user_paths(&line);
@@ -1241,6 +1242,7 @@ async fn run_chat_turn(
             cli_context: Some(&state.cli_context),
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
+            resume_restricted_tools: &state.resume_restricted_tools,
             session_lessons: &state.session_lessons,
             latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
@@ -2444,6 +2446,11 @@ fn apply_turn_success_sync(
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
     state.recent_tools = result.tools_used.clone();
+    state.resume_restricted_tools = result
+        .interruption
+        .as_ref()
+        .map(astra_turn_core::interruption::resume_restricted_tools_from_interruption_json)
+        .unwrap_or_default();
 
     // Persist tool health for cross-session error budgets
     if !result.tool_health_export.is_empty() {

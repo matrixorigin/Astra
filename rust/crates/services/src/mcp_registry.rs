@@ -786,6 +786,11 @@ mod tests {
                 user: "root".to_string(),
                 password: "test".to_string(),
                 database: "astra_test".to_string(),
+                db_pool_max_connections: 1,
+                db_pool_min_connections: 1,
+                db_pool_acquire_timeout_secs: 5,
+                db_pool_idle_timeout_secs: 60,
+                db_pool_max_lifetime_secs: 300,
             },
             encryptor(),
         );

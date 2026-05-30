@@ -1057,6 +1057,7 @@ mod tests {
                 remaining_turns: 0,
                 error_detail: None,
                 stall_signal: None,
+                resume_restricted_tools: vec![],
             },
         ));
 
@@ -1089,6 +1090,7 @@ mod tests {
                 remaining_turns: 0,
                 error_detail: Some("forced for test".to_string()),
                 stall_signal: None,
+                resume_restricted_tools: vec![],
             },
         ));
 
@@ -1241,6 +1243,7 @@ mod tests {
                     "The circuit breaker stopped the turn after the model ignored the finalization correction. Resume by synthesizing verified evidence before calling more tools.".to_string(),
                 ),
                 stall_signal: Some("single_tool_streak=9".to_string()),
+                resume_restricted_tools: vec![],
             },
         ));
 
@@ -1276,6 +1279,7 @@ mod tests {
                     "The circuit breaker stopped the turn after the model ignored the finalization correction.".to_string(),
                 ),
                 stall_signal: Some("single_tool_streak=9".to_string()),
+                resume_restricted_tools: vec![],
             },
         ));
         state.hooks.task_board_snapshot =

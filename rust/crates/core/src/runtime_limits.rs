@@ -2,7 +2,7 @@
 //!
 //! Infrastructure-level guards that prevent runaway resource consumption.
 //! These are NOT policy knobs — policy (stall detection, round budgets) is
-//! handled by `LoopCircuitBreaker` in `astra-turn-core` and `RuntimeConfig`.
+//! handled by `LoopCircuitBreaker` in `astra-turn-core` and `ServerRuntimeConfig`.
 //!
 //! All values have sensible defaults and can be overridden via environment
 //! variables, allowing production tuning without recompilation.
@@ -16,8 +16,18 @@
 //! ASTRA_MAX_TOOL_RETRIES=2        # transient-error retries per tool
 //! ASTRA_RETRY_BASE_MS=500         # base backoff for retries (doubles each)
 //! ASTRA_MAX_RETRIEVED=6           # memory/knowledge docs per turn
-//! ASTRA_MAX_TURN_INPUT_TOKENS=200000 # max LLM input tokens per turn (0=unlimited)
+//! ASTRA_MAX_TURN_INPUT_TOKENS=200000 # max LLM input tokens per turn (0 = use model ceiling only)
 //! ```
+
+pub(crate) const DEFAULT_MAX_TURNS: usize = 150;
+pub(crate) const DEFAULT_PLAN_SUBTASK_MAX_TURNS: usize = 0;
+pub(crate) const DEFAULT_TURN_TIMEOUT_S: u64 = 300;
+pub(crate) const DEFAULT_GLOBAL_OUTPUT_LIMIT: usize = 200_000;
+pub(crate) const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 80_000;
+pub(crate) const DEFAULT_MAX_TOOL_RETRIES: usize = 2;
+pub(crate) const DEFAULT_RETRY_BASE_MS: u64 = 500;
+pub(crate) const DEFAULT_MAX_RETRIEVED: usize = 6;
+pub(crate) const DEFAULT_MAX_TURN_INPUT_TOKENS: u64 = 200_000;
 
 use std::sync::OnceLock;
 
@@ -53,22 +63,22 @@ pub struct RuntimeLimits {
     pub max_retrieved: usize,
     /// Maximum LLM input tokens per turn before the loop forces a wrap-up.
     /// Prevents runaway context growth that triggers endpoint TPM errors.
-    /// 0 = unlimited (legacy default).
+    /// Default: 200_000.
     pub max_turn_input_tokens: u64,
 }
 
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_turns: 150,
-            plan_subtask_max_turns: 0,
-            turn_timeout_s: 300.0,
-            global_output_limit: 200_000,
-            tool_output_limit: 80_000,
-            max_tool_retries: 2,
-            retry_base_ms: 500,
-            max_retrieved: 6,
-            max_turn_input_tokens: 200_000,
+            max_turns: DEFAULT_MAX_TURNS,
+            plan_subtask_max_turns: DEFAULT_PLAN_SUBTASK_MAX_TURNS,
+            turn_timeout_s: DEFAULT_TURN_TIMEOUT_S as f64,
+            global_output_limit: DEFAULT_GLOBAL_OUTPUT_LIMIT,
+            tool_output_limit: DEFAULT_TOOL_OUTPUT_LIMIT,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            max_retrieved: DEFAULT_MAX_RETRIEVED,
+            max_turn_input_tokens: DEFAULT_MAX_TURN_INPUT_TOKENS,
         }
     }
 }
@@ -76,22 +86,28 @@ impl Default for RuntimeLimits {
 impl RuntimeLimits {
     /// Load limits from environment variables, falling back to defaults.
     pub fn from_env() -> Self {
-        let d = Self::default();
+        Self::from_config_with_env(&crate::config::ServerRuntimeConfig::default())
+    }
+
+    /// Load limits from a TOML [`ServerRuntimeConfig`] base, then let environment
+    /// variables override individual fields. This allows `config.toml` to
+    /// set site-specific values while still permitting ad-hoc env tuning.
+    pub fn from_config_with_env(cfg: &crate::config::ServerRuntimeConfig) -> Self {
         Self {
-            max_turns: env_parse("ASTRA_MAX_TURNS", d.max_turns),
+            max_turns: env_parse("ASTRA_MAX_TURNS", cfg.max_turns()),
             plan_subtask_max_turns: env_parse(
                 "ASTRA_PLAN_SUBTASK_MAX_TURNS",
-                d.plan_subtask_max_turns,
+                cfg.plan_subtask_max_turns(),
             ),
-            turn_timeout_s: env_parse("ASTRA_TURN_TIMEOUT_S", d.turn_timeout_s),
-            global_output_limit: env_parse("ASTRA_GLOBAL_OUTPUT_LIMIT", d.global_output_limit),
-            tool_output_limit: env_parse("ASTRA_TOOL_OUTPUT_LIMIT", d.tool_output_limit),
-            max_tool_retries: env_parse("ASTRA_MAX_TOOL_RETRIES", d.max_tool_retries),
-            retry_base_ms: env_parse("ASTRA_RETRY_BASE_MS", d.retry_base_ms),
-            max_retrieved: env_parse("ASTRA_MAX_RETRIEVED", d.max_retrieved),
+            turn_timeout_s: env_parse("ASTRA_TURN_TIMEOUT_S", cfg.turn_timeout_s() as f64),
+            global_output_limit: env_parse("ASTRA_GLOBAL_OUTPUT_LIMIT", cfg.global_output_limit()),
+            tool_output_limit: env_parse("ASTRA_TOOL_OUTPUT_LIMIT", cfg.tool_output_limit()),
+            max_tool_retries: env_parse("ASTRA_MAX_TOOL_RETRIES", cfg.max_tool_retries()),
+            retry_base_ms: env_parse("ASTRA_RETRY_BASE_MS", cfg.retry_base_ms()),
+            max_retrieved: env_parse("ASTRA_MAX_RETRIEVED", cfg.max_retrieved()),
             max_turn_input_tokens: env_parse(
                 "ASTRA_MAX_TURN_INPUT_TOKENS",
-                d.max_turn_input_tokens,
+                cfg.max_turn_input_tokens(),
             ),
         }
     }

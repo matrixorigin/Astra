@@ -427,6 +427,7 @@ pub(crate) async fn stream_chat_sse(
     // Seed persisted hard-blocks from cross-session learning so blocked tools
     // never appear in the visible schema set for a new CLI turn.
     extend_restricted_with_blocked_tools(&mut initial_restricted, p.observability_hub.as_ref());
+    initial_restricted.extend(p.resume_restricted_tools.iter().cloned());
 
     let current_session_id = p.session_id.map(|s| s.to_string());
     let existing_root_mailbox = if let Some(slot) = p.root_mailbox_slot.as_deref_mut() {

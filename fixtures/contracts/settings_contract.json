@@ -13,7 +13,7 @@
     "MATRIXONE_USER": "agent",
     "MATRIXONE_PASSWORD": "super-secret",
     "ASTRA_DATABASE": "agent_db",
-    "ASTRA_JWT_SECRET": "override-jwt-secret-key-123456",
+    "ASTRA_JWT_SECRET": "override-jwt-secret-key-at-least-32-chars-",
     "ASTRA_BRIDGE_SECRET": "bridge-secret-prod"
   },
   "expected_override_settings": {

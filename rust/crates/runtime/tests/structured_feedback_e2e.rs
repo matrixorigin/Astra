@@ -250,10 +250,15 @@ fn bridge_feedback_store_is_shared_across_clones() {
     );
     let matrixone = astra_runtime::MatrixOneSettings {
         host: "localhost".into(),
-        port: 6001,
+        port: 6379,
         user: "test".into(),
         password: "test".into(),
         database: "test".into(),
+        db_pool_max_connections: 2,
+        db_pool_min_connections: 1,
+        db_pool_acquire_timeout_secs: 10,
+        db_pool_idle_timeout_secs: 60,
+        db_pool_max_lifetime_secs: 300,
     };
     let bridge = InProcessChatTurnBridge::new(matrixone, encryptor);
     let bridge2 = bridge.clone();

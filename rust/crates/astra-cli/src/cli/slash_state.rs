@@ -336,6 +336,7 @@ pub(crate) async fn handle_state_command(
 
                     recent_tools: &[],
                     tool_health_entries: &[],
+                    resume_restricted_tools: &[],
                     session_lessons: &[],
                     latest_skill_diagnosis: None,
                     latest_turn_quality_feedback: None,
@@ -464,6 +465,7 @@ pub(crate) async fn handle_state_command(
 
                             recent_tools: &[],
                             tool_health_entries: &[],
+                            resume_restricted_tools: &[],
                             session_lessons: &[],
                             latest_skill_diagnosis: None,
                             latest_turn_quality_feedback: None,
@@ -570,6 +572,7 @@ pub(crate) async fn handle_state_command(
 
                                     recent_tools: &[],
                                     tool_health_entries: &[],
+                                    resume_restricted_tools: &[],
                                     session_lessons: &[],
                                     latest_skill_diagnosis: None,
                                     latest_turn_quality_feedback: None,

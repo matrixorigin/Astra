@@ -319,6 +319,7 @@ pub(crate) struct ChatTurnParams<'a> {
 
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
+    pub(crate) resume_restricted_tools: &'a [String],
     /// P6 seam: cross-session lessons loaded once at session bootstrap.
     /// Passed through to the ToolExecutor via `set_session_lessons` so
     /// every SelfModel snapshot surfaces prior-session advice.
@@ -538,6 +539,7 @@ impl<'a> ChatTurnParams<'a> {
 
             recent_tools: &[],
             tool_health_entries: &[],
+            resume_restricted_tools: &[],
             session_lessons: &[],
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,

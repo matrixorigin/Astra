@@ -4556,6 +4556,9 @@ fn apply_resume_recovery_state(
 ) {
     state.last_turn_interrupted = interruption.is_some();
     state.resume_guidance = build_step_resume_guidance(interruption, compaction_state);
+    state.resume_restricted_tools = interruption
+        .map(astra_turn_core::interruption::resume_restricted_tools_from_interruption_json)
+        .unwrap_or_default();
 }
 
 fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
@@ -5642,6 +5645,23 @@ mod resume_tests {
             state.history,
             vec![("from-cloud".to_string(), "still-here".to_string())]
         );
+    }
+
+    #[test]
+    fn apply_resume_recovery_state_restores_resume_restricted_tools() {
+        let mut state = SessionState::default();
+        apply_resume_recovery_state(
+            &mut state,
+            Some(&serde_json::json!({
+                "kind": "budget_exhausted",
+                "resumable": true,
+                "stall_signal": "redundant_reads=4",
+                "resume_restricted_tools": ["view", "read_file", "view"]
+            })),
+            None,
+        );
+
+        assert_eq!(state.resume_restricted_tools, vec!["read_file", "view"]);
     }
 
     #[serial_test::serial]

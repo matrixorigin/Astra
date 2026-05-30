@@ -557,7 +557,6 @@ async fn intercept_skill_calls(
         &state.skills.pinned,
         &state.skills.discovered,
         &state.skills.invoked,
-        &state.skills.search,
     );
     let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
 

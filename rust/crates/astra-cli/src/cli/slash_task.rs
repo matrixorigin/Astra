@@ -301,6 +301,7 @@ pub(crate) async fn handle_task_command(
                     cli_context: Some(&bg_cli_context),
                     recent_tools: &[],
                     tool_health_entries: &[],
+                    resume_restricted_tools: &[],
                     session_lessons: &[],
                     latest_skill_diagnosis: None,
                     latest_turn_quality_feedback: None,

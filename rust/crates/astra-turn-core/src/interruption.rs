@@ -8,7 +8,6 @@
 //! API continuation, observability) a machine-readable interruption contract.
 
 use serde::{Deserialize, Serialize};
-use std::fmt::Write;
 
 /// Classification of why the agentic loop was interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,6 +144,11 @@ pub struct InterruptionRecord {
     /// field deserialize with `stall_signal = None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_signal: Option<String>,
+    /// Tool names that should stay hidden on the resumed turn so the
+    /// model cannot immediately re-enter the exploratory lane that
+    /// already exhausted the budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_restricted_tools: Vec<String>,
 }
 
 impl InterruptionRecord {
@@ -165,6 +169,9 @@ impl InterruptionRecord {
             error_detail: state_summary.error_detail,
             user_message,
             stall_signal: state_summary.stall_signal,
+            resume_restricted_tools: dedup_sorted_tool_names(
+                &state_summary.resume_restricted_tools,
+            ),
         }
     }
 
@@ -197,6 +204,20 @@ impl InterruptionRecord {
             obj.insert(
                 "stall_signal".to_string(),
                 serde_json::Value::String(sig.clone()),
+            );
+        }
+        if !self.resume_restricted_tools.is_empty()
+            && let Some(obj) = v.as_object_mut()
+        {
+            obj.insert(
+                "resume_restricted_tools".to_string(),
+                serde_json::Value::Array(
+                    self.resume_restricted_tools
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
         }
         v
@@ -266,6 +287,87 @@ pub struct InterruptionStateSummary {
     /// [`InterruptionRecord::stall_signal`] for semantics. Leave `None`
     /// when no loop-guard condition was active at interruption time.
     pub stall_signal: Option<String>,
+    /// Tool names that should stay restricted when the session resumes.
+    pub resume_restricted_tools: Vec<String>,
+}
+
+/// Dedup, trim, lowercase, and sort tool names for resume restriction lists.
+///
+/// Distinct from [`crate::tool_allowlist::normalize_tool_names`] which returns
+/// a [`HashSet`] and delegates to ASCII sanitization; this version preserves
+/// order determinism via sort and is tailored for serialization into
+/// interruption records.
+fn dedup_sorted_tool_names(tools: &[String]) -> Vec<String> {
+    let mut vec: Vec<String> = tools
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    vec.sort();
+    vec.dedup();
+    vec
+}
+
+#[must_use]
+pub fn resume_tool_family_for_exploration(family: &str) -> &'static [&'static str] {
+    match family {
+        "read" => &["read_file", "view"],
+        "search" => &["glob", "grep", "rg"],
+        "diff" => &["git_diff", "git_log"],
+        _ => &[],
+    }
+}
+
+#[must_use]
+pub fn resume_tool_family_for_tool(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        // Read family
+        "read_file" | "view" => &["read_file", "view"],
+        // Search family — file search and web search
+        "glob" | "grep" | "rg" | "web_search" => &["glob", "grep", "rg", "web_search"],
+        // Diff family
+        "git_diff" | "git_log" => &["git_diff", "git_log"],
+        // Bash
+        "bash" => &["bash"],
+        // Memory family
+        "memory" | "memory_search" | "memory_retrieve" | "memory_profile" => &[
+            "memory",
+            "memory_search",
+            "memory_retrieve",
+            "memory_profile",
+        ],
+        // Skill / consultative family
+        "skill" | "discover_skills" => &["skill", "discover_skills"],
+        _ => &[],
+    }
+}
+
+/// Extract resume restricted tools from an interruption JSON blob.
+///
+/// **Prefer the typed [`InterruptionRecord::resume_restricted_tools`] field**
+/// when it is available.  This function exists for backward compatibility
+/// with older checkpoints that only carry a `stall_signal` string.
+///
+/// The primary source is the `resume_restricted_tools` array, computed by the
+/// server at interruption time.  Older interruption records may only carry a
+/// `stall_signal` string; those are accepted as-is and produce an empty list
+/// (the server now always embeds the resolved tool list).
+#[must_use]
+pub fn resume_restricted_tools_from_interruption_json(
+    interruption_json: &serde_json::Value,
+) -> Vec<String> {
+    interruption_json
+        .get("resume_restricted_tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            let names: Vec<String> = arr
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect();
+            dedup_sorted_tool_names(&names)
+        })
+        .unwrap_or_default()
 }
 
 fn parse_kv_stall_signal(signal: &str) -> std::collections::BTreeMap<&str, &str> {
@@ -344,6 +446,51 @@ fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
     None
 }
 
+/// Parsed fields from an interruption record, used to build resume guidance.
+#[derive(Debug)]
+struct ResumeInput<'j> {
+    kind: &'j str,
+    turns: u64,
+    tool_calls: u64,
+    has_checkpoint: bool,
+    user_msg: &'j str,
+    stall_signal: Option<&'j str>,
+    error_detail: Option<&'j str>,
+    resume_restricted_tools: Vec<String>,
+}
+
+impl<'j> ResumeInput<'j> {
+    fn from_json(v: &'j serde_json::Value) -> Option<Self> {
+        let kind = v.get("kind")?.as_str()?;
+        let turns = v
+            .get("turns_completed")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let tool_calls = v
+            .get("tool_calls_completed")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let has_checkpoint = v
+            .get("has_checkpoint")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let user_msg = v.get("user_message").and_then(|x| x.as_str()).unwrap_or("");
+        let stall_signal = v.get("stall_signal").and_then(|x| x.as_str());
+        let error_detail = v.get("error_detail").and_then(|x| x.as_str());
+        let resume_restricted_tools = resume_restricted_tools_from_interruption_json(v);
+        Some(Self {
+            kind,
+            turns,
+            tool_calls,
+            has_checkpoint,
+            user_msg,
+            stall_signal,
+            error_detail,
+            resume_restricted_tools,
+        })
+    }
+}
+
 /// Build a system-level resume guidance message from a persisted interruption record.
 ///
 /// When a session is restored from a checkpoint that was written during an
@@ -364,145 +511,112 @@ pub fn build_resume_guidance_with_context(
     interruption_json: &serde_json::Value,
     compaction_context: Option<&CompactionResumeContext>,
 ) -> Option<String> {
-    let kind = interruption_json.get("kind")?.as_str()?;
+    let inp = ResumeInput::from_json(interruption_json)?;
     let resumable = interruption_json
         .get("resumable")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let tool_calls = interruption_json
-        .get("tool_calls_completed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let turns = interruption_json
-        .get("turns_completed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let has_checkpoint = interruption_json
-        .get("has_checkpoint")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let user_msg = interruption_json
-        .get("user_message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
     if !resumable {
         return None;
     }
 
-    let mut guidance = String::new();
-    guidance.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
-    writeln!(guidance, "  Reason: {kind}").ok();
+    let mut g = String::new();
+    g.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
+    use std::fmt::Write;
+    writeln!(g, "  Reason: {}", inp.kind).ok();
     writeln!(
-        guidance,
-        "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed"
+        g,
+        "  Progress: {} turn(s), {} tool call(s) completed",
+        inp.turns, inp.tool_calls
     )
     .ok();
-    if has_checkpoint {
-        guidance.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
+    if inp.has_checkpoint {
+        g.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
     }
 
-    let stall_signal = interruption_json
-        .get("stall_signal")
-        .and_then(|v| v.as_str());
-
     // Kind-specific advice
-    match kind {
-        "empty_completion" => {
-            guidance.push_str(
-                "  Action: Continue from the preserved context and produce a direct final answer. \
-                 Do not stop after hidden reasoning with no user-visible output.\n",
-            );
-        }
+    match inp.kind {
+        "empty_completion" => g.push_str(
+            "  Action: Continue from the preserved context and produce a direct final answer. \
+             Do not stop after hidden reasoning with no user-visible output.\n",
+        ),
         "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
-            guidance.push_str(
+            g.push_str(
                 "  Action: Prioritize completing the most important remaining work first. \
                   Avoid exploratory tool calls — focus on delivering a result.\n",
             );
-            if let Some(sig) = stall_signal {
-                if let Some(ss) = summarize_stall_signal_for_user(sig) {
-                    writeln!(guidance, "  Cause: {}.", ss.cause).ok();
-                    writeln!(guidance, "  Correction: {}.", ss.correction).ok();
-                }
+            if let Some(sig) = inp.stall_signal.and_then(summarize_stall_signal_for_user) {
+                writeln!(g, "  Cause: {}.", sig.cause).ok();
+                writeln!(g, "  Correction: {}.", sig.correction).ok();
             }
-            if let Some(detail) = interruption_json
-                .get("error_detail")
-                .and_then(|v| v.as_str())
-                .filter(|detail| detail.contains("Likely cause:"))
-            {
-                writeln!(guidance, "  Runtime detail: {detail}").ok();
+            if let Some(detail) = inp.error_detail.filter(|d| d.contains("Likely cause:")) {
+                writeln!(g, "  Runtime detail: {detail}").ok();
             }
         }
-        "rate_limited" | "cooldown_rejected" | "server_overload" => {
-            guidance.push_str(
-                "  Action: The rate limit has likely expired. Resume normally, \
-                 but batch tool calls to minimize API round-trips.\n",
-            );
-        }
+        "rate_limited" | "cooldown_rejected" | "server_overload" => g.push_str(
+            "  Action: The rate limit has likely expired. Resume normally, \
+             but batch tool calls to minimize API round-trips.\n",
+        ),
         "context_overflow" => {
-            guidance.push_str(
+            g.push_str(
                 "  Action: Context was compacted. Some older tool results may be \
                  summarized. Re-read any files you need before making edits.\n",
             );
-            // Enrich with compaction effectiveness context if available.
-            if let Some(ctx) = compaction_context {
-                if ctx.compaction_attempts > 0 {
-                    write!(
-                        guidance,
-                        "  Compaction: {} attempt(s), ~{} tokens freed total",
-                        ctx.compaction_attempts, ctx.total_tokens_freed
-                    )
-                    .ok();
-                    if ctx.last_was_insufficient {
-                        guidance.push_str(
-                            " (last compaction was insufficient — context may still be tight)",
-                        );
-                    }
-                    guidance.push('\n');
-                    guidance.push_str(
-                        "  Tip: Keep responses concise and avoid requesting large file dumps.\n",
-                    );
+            if let Some(ctx) = compaction_context.filter(|c| c.compaction_attempts > 0) {
+                write!(
+                    g,
+                    "  Compaction: {} attempt(s), ~{} tokens freed total",
+                    ctx.compaction_attempts, ctx.total_tokens_freed
+                )
+                .ok();
+                if ctx.last_was_insufficient {
+                    g.push_str(" (last compaction was insufficient — context may still be tight)");
                 }
+                g.push('\n');
+                g.push_str(
+                    "  Tip: Keep responses concise and avoid requesting large file dumps.\n",
+                );
             }
         }
-        "user_cancelled" => {
-            guidance.push_str(
-                "  Action: The user cancelled the previous run. Wait for their \
-                 instructions before proceeding.\n",
-            );
-        }
-        "critical_verdict" => {
-            guidance.push_str(
-                "  Action: The previous run was stopped by TurnGuard due to repeated \
-                 errors and stalls. Review what went wrong, try a different approach, \
-                 and avoid the tool patterns that caused failures.\n",
-            );
-        }
-        "harness_paused" => {
-            guidance.push_str(
-                "  Action: The previous run was paused by the harness due to a \
-                 read-heavy stall without any mutation. Reuse the evidence already \
-                 gathered and take one concrete next action: edit the relevant file, \
-                 run targeted verification, or explicitly report why the task cannot \
-                 be completed. If one specific fact is still missing, fetch only that \
-                 fact instead of reopening broad or overlapping reads.\n",
-            );
-        }
-        "approval_rejected" => {
-            guidance.push_str(
-                "  Action: Tool approvals were repeatedly denied. Use only read-only \
-                 tools or ask the user for explicit permission before attempting \
-                 write operations.\n",
-            );
-        }
+        "user_cancelled" => g.push_str(
+            "  Action: The user cancelled the previous run. Wait for their \
+             instructions before proceeding.\n",
+        ),
+        "critical_verdict" => g.push_str(
+            "  Action: The previous run was stopped by TurnGuard due to repeated \
+             errors and stalls. Review what went wrong, try a different approach, \
+             and avoid the tool patterns that caused failures.\n",
+        ),
+        "harness_paused" => g.push_str(
+            "  Action: The previous run was paused by the harness due to a \
+             read-heavy stall without any mutation. Reuse the evidence already \
+             gathered and take one concrete next action: edit the relevant file, \
+             run targeted verification, or explicitly report why the task cannot \
+             be completed. If one specific fact is still missing, fetch only that \
+             fact instead of reopening broad or overlapping reads.\n",
+        ),
+        "approval_rejected" => g.push_str(
+            "  Action: Tool approvals were repeatedly denied. Use only read-only \
+             tools or ask the user for explicit permission before attempting \
+             write operations.\n",
+        ),
         _ => {
-            if !user_msg.is_empty() {
-                writeln!(guidance, "  Detail: {user_msg}").ok();
+            if !inp.user_msg.is_empty() {
+                writeln!(g, "  Detail: {}", inp.user_msg).ok();
             }
         }
     }
 
-    Some(guidance)
+    if !inp.resume_restricted_tools.is_empty() {
+        writeln!(
+            g,
+            "  Resume guard: these tools are blocked on resume to avoid repeating the failed path: {}",
+            inp.resume_restricted_tools.join(", ")
+        )
+        .ok();
+    }
+
+    Some(g)
 }
 
 /// Context about compaction history for enriching resume guidance.
@@ -517,9 +631,6 @@ pub struct CompactionResumeContext {
 }
 
 /// Map an [`ErrorKind`] to an [`InterruptionKind`] and [`ResumeAction`].
-///
-/// This is the structured replacement for [`classify_error`]. When the caller
-/// already has a [`ClassifiedError`], use this instead of re-parsing the string.
 #[must_use]
 pub fn interruption_from_error_kind(
     kind: astra_core::ErrorKind,
@@ -562,131 +673,6 @@ pub fn interruption_from_error_kind(
         )),
         _ => None,
     }
-}
-
-/// Classify a streaming/API error string into an [`InterruptionKind`] and
-/// [`ResumeAction`], if the error matches a known pattern.
-///
-/// Used as a catch-all at the end of the fatal-error path so that *every*
-/// early exit produces a structured interruption record rather than a bare
-/// string error.
-///
-/// Prefer [`interruption_from_error_kind`] when a [`ClassifiedError`] is available.
-#[must_use]
-pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
-    let lower = error.to_lowercase();
-
-    // Auth / credential failures. Keep this list synced with the
-    // providers we ship (Bedrock / Anthropic direct / OpenAI / MiniMax).
-    // Session f5d6ef02 regression: Bedrock emits "Could not validate
-    // credentials" which none of the original patterns matched — five
-    // turn_errors in that session were labelled [unknown] with vacuous
-    // guidance.
-    //
-    // NOTE: `403` / `forbidden` also covers IAM/region-permission denials
-    // that aren't strictly a credential-refresh problem. The resume
-    // description below is worded generically ("invalid — please refresh")
-    // because for our UX both cases need user intervention, not a retry.
-    let has_token = lower.contains("token");
-    let has_expired = lower.contains("expired");
-    // NOTE: bare "401" / "403" substring match is intentionally avoided —
-    // unrelated error payloads (timeouts in ms, byte offsets, body snippets
-    // containing the digits) produced spurious credential-refresh prompts.
-    // We require the status code to appear in an HTTP-shaped phrase.
-    if lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("403 forbidden")
-        || lower.contains("status: 403")
-        || lower.contains("status code: 403")
-        || lower.contains("http 403")
-        || lower.contains("forbidden")
-        || lower.contains("unauthorized")
-        || lower.contains("authentication")
-        // Tightened: require the verb context so we don't match benign
-        // strings like "credential helper not found" from git/keystore.
-        || lower.contains("validate credentials")
-        || lower.contains("invalid credentials")
-        || lower.contains("missing credentials")
-        || lower.contains("credentials are")
-        // AWS STS / OAuth session-token expiry — covers all shapes:
-        // "expired token", "token is expired", "token has expired",
-        // "security token ... is expired".
-        || (has_token && has_expired)
-        || (lower.contains("invalid") && lower.contains("key"))
-        || lower.contains("api key")
-    {
-        return Some((
-            InterruptionKind::AuthFailure,
-            ResumeAction::RequiresIntervention {
-                description: "API key or credentials are invalid — please refresh.".into(),
-            },
-        ));
-    }
-
-    // Rate limiting (429 / TPM / RPM)
-    if lower.contains("429")
-        || lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("too many requests")
-        || lower.contains("tpm")
-        || lower.contains("rpm")
-    {
-        return Some((
-            InterruptionKind::RateLimited,
-            ResumeAction::WaitAndRetry { delay_seconds: 30 },
-        ));
-    }
-
-    // Context window overflow
-    if lower.contains("context_length_exceeded")
-        || lower.contains("context window")
-        || lower.contains("context_window")
-        || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
-        || lower.contains("maximum context length")
-    {
-        return Some((
-            InterruptionKind::ContextOverflow,
-            ResumeAction::CompactAndRetry,
-        ));
-    }
-
-    // Server overload (503 / 529)
-    if lower.contains("503")
-        || lower.contains("529")
-        || lower.contains("overload")
-        || lower.contains("service unavailable")
-    {
-        return Some((
-            InterruptionKind::ServerOverload,
-            ResumeAction::WaitAndRetry { delay_seconds: 60 },
-        ));
-    }
-
-    if lower.contains("stream_transport")
-        || lower.contains("stream transport")
-        || lower.contains("transport error")
-        || lower.contains("network error")
-    {
-        return Some((
-            InterruptionKind::StreamTransport,
-            ResumeAction::ContinueImmediately,
-        ));
-    }
-
-    if lower.contains("stream_idle")
-        || lower.contains("stream idle")
-        || lower.contains("stream stalled")
-    {
-        return Some((
-            InterruptionKind::StreamIdle,
-            ResumeAction::ContinueImmediately,
-        ));
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -744,6 +730,7 @@ mod tests {
                 remaining_turns: 0,
                 error_detail: None,
                 stall_signal: None,
+                resume_restricted_tools: Vec::new(),
             },
         );
         let json = record.to_json();
@@ -769,6 +756,7 @@ mod tests {
                 remaining_turns: 131,
                 error_detail: None,
                 stall_signal: Some("single_tool_streak=18".to_string()),
+                resume_restricted_tools: Vec::new(),
             },
         );
         let json = record.to_json();
@@ -802,6 +790,7 @@ mod tests {
                 remaining_turns: 8,
                 error_detail: Some("429 Too Many Requests".to_string()),
                 stall_signal: None,
+                resume_restricted_tools: Vec::new(),
             },
         );
         assert!(record.user_message.contains("rate_limited"));
@@ -821,6 +810,7 @@ mod tests {
                 remaining_turns: 5,
                 error_detail: Some("context_length_exceeded".to_string()),
                 stall_signal: None,
+                resume_restricted_tools: Vec::new(),
             },
         );
         assert!(record.kind.is_resumable());
@@ -839,6 +829,7 @@ mod tests {
                 remaining_turns: 7,
                 error_detail: Some("agentic loop completed without final text".to_string()),
                 stall_signal: None,
+                resume_restricted_tools: Vec::new(),
             },
         );
         assert!(record.user_message.contains("without a final answer"));
@@ -857,6 +848,7 @@ mod tests {
                 remaining_turns: 0,
                 error_detail: None,
                 stall_signal: Some("redundant_reads=5".to_string()),
+                resume_restricted_tools: Vec::new(),
             },
         );
         assert!(record.user_message.contains("Cause:"));
@@ -973,6 +965,23 @@ mod tests {
     }
 
     #[test]
+    fn resume_guidance_surfaces_resume_guard_tools() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 20,
+            "turns_completed": 14,
+            "remaining_turns": 135,
+            "user_message": "[budget_exhausted] 20 tool call(s) completed.",
+            "resume_restricted_tools": ["bash", "read_file"]
+        });
+        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        assert!(guidance.contains("Resume guard:"));
+        assert!(guidance.contains("bash, read_file"));
+    }
+
+    #[test]
     fn resume_guidance_harness_paused_allows_single_missing_fact() {
         let irj = serde_json::json!({
             "kind": "harness_paused",
@@ -1062,88 +1071,6 @@ mod tests {
     fn resume_guidance_missing_fields_returns_none() {
         let irj = serde_json::json!({});
         assert!(build_resume_guidance(&irj).is_none());
-    }
-
-    // ── classify_error tests ──
-
-    #[test]
-    fn classify_error_auth_401() {
-        let (kind, action) = classify_error("HTTP 401 Unauthorized").unwrap();
-        assert_eq!(kind, InterruptionKind::AuthFailure);
-        matches!(action, ResumeAction::RequiresIntervention { .. });
-    }
-
-    #[test]
-    fn classify_error_server_503() {
-        let (kind, action) = classify_error("503 Service Unavailable").unwrap();
-        assert_eq!(kind, InterruptionKind::ServerOverload);
-        matches!(action, ResumeAction::WaitAndRetry { .. });
-    }
-
-    #[test]
-    fn classify_error_overload_529() {
-        let (kind, _) = classify_error("Error: 529 overloaded").unwrap();
-        assert_eq!(kind, InterruptionKind::ServerOverload);
-    }
-
-    #[test]
-    fn classify_error_unknown_returns_none() {
-        assert!(classify_error("some random error").is_none());
-    }
-
-    /// Session f5d6ef02 regression: Bedrock/AWS auth layers emit
-    /// "Could not validate credentials" which the classifier missed
-    /// — it contains neither "401", "unauthorized", "authentication",
-    /// nor "api key". Five consecutive turn_errors in one session were
-    /// labelled `[unknown]` with vacuous guidance, hiding what was
-    /// actually a recoverable credential-refresh situation.
-    #[test]
-    fn classify_error_bedrock_validate_credentials() {
-        let (kind, _) = classify_error("Error: Could not validate credentials").unwrap();
-        assert_eq!(
-            kind,
-            InterruptionKind::AuthFailure,
-            "Bedrock-style 'Could not validate credentials' must map to AuthFailure \
-             so the UI can surface 'please re-authenticate' instead of 'unknown error'"
-        );
-    }
-
-    #[test]
-    fn classify_error_aws_expired_token() {
-        // Another common AWS STS shape that ends up in the same
-        // code path when session tokens expire mid-run.
-        let (kind, _) =
-            classify_error("The security token included in the request is expired").unwrap();
-        assert_eq!(kind, InterruptionKind::AuthFailure);
-    }
-
-    #[test]
-    fn classify_error_forbidden_403_maps_to_auth() {
-        // 403 is closer to "auth" than to "server error" for our UX —
-        // it's a permissions/credentials problem the user can fix,
-        // not a transient outage.
-        let (kind, _) = classify_error("HTTP 403 Forbidden").unwrap();
-        assert_eq!(kind, InterruptionKind::AuthFailure);
-    }
-
-    #[test]
-    fn classify_error_rate_limit_429() {
-        let (kind, action) = classify_error("Error 429: Too Many Requests").unwrap();
-        assert_eq!(kind, InterruptionKind::RateLimited);
-        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
-    }
-
-    #[test]
-    fn classify_error_context_overflow() {
-        let (kind, action) = classify_error("context_length_exceeded: prompt is too long").unwrap();
-        assert_eq!(kind, InterruptionKind::ContextOverflow);
-        assert!(matches!(action, ResumeAction::CompactAndRetry));
-    }
-
-    #[test]
-    fn classify_error_maximum_context_length() {
-        let (kind, _) = classify_error("maximum context length exceeded").unwrap();
-        assert_eq!(kind, InterruptionKind::ContextOverflow);
     }
 
     // ── new interruption kind tests ──

@@ -512,13 +512,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.restricted_tools,
         ctx.widen_selection_pending,
     );
-    let _restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
-    // Per-tool outcome bias derived from recent memory. Bounded by the scoring
-    // pipeline so it nudges ties without overriding strong text signals (hard
-    // exclusions remain in `restricted_vec`). 3600s window keeps bias
-    // responsive within a session but lets stale evidence age out.
-    let _outcome_bias = ctx.turn_guard.health.outcome_bias_by_tool(3600);
-
     ctx.step_recorder.record_perceive(
         semantic_query_str,
         &[],

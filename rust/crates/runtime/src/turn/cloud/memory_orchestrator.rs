@@ -1022,13 +1022,14 @@ mod tests {
     fn mark_surfaced_then_filter_removes_those_ids() {
         let client = std::sync::Arc::new(FeedbackCapturingClient::new());
         let orch = MemoryOrchestrator::new(client);
-        orch.mark_surfaced("sess", &["a".into(), "b".into()]);
+        let sid = "mark_surfaced_then_filter_removes_those_ids";
+        orch.mark_surfaced(sid, &["a".into(), "b".into()]);
         let candidates = vec![
             memory("a", "semantic", "alpha"),
             memory("b", "semantic", "beta"),
             memory("c", "semantic", "gamma"),
         ];
-        let filtered = orch.filter_already_surfaced("sess", candidates);
+        let filtered = orch.filter_already_surfaced(sid, candidates);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].memory_id, "c");
     }
@@ -1037,17 +1038,19 @@ mod tests {
     fn filter_passes_everything_when_nothing_seen() {
         let client = std::sync::Arc::new(FeedbackCapturingClient::new());
         let orch = MemoryOrchestrator::new(client);
+        let sid = "filter_passes_everything_when_nothing_seen";
         let candidates = vec![memory("a", "semantic", "x")];
-        assert_eq!(orch.filter_already_surfaced("sess", candidates).len(), 1);
+        assert_eq!(orch.filter_already_surfaced(sid, candidates).len(), 1);
     }
 
     #[test]
     fn reset_session_surface_clears_dedup_set() {
         let client = std::sync::Arc::new(FeedbackCapturingClient::new());
         let orch = MemoryOrchestrator::new(client);
-        orch.mark_surfaced("sess", &["a".into()]);
-        orch.reset_session_surface("sess");
-        let filtered = orch.filter_already_surfaced("sess", vec![memory("a", "semantic", "x")]);
+        let sid = "reset_session_surface_clears_dedup_set";
+        orch.mark_surfaced(sid, &["a".into()]);
+        orch.reset_session_surface(sid);
+        let filtered = orch.filter_already_surfaced(sid, vec![memory("a", "semantic", "x")]);
         assert_eq!(filtered.len(), 1, "after reset, ids flow through again");
     }
 
@@ -1055,8 +1058,10 @@ mod tests {
     fn mark_surfaced_is_per_session() {
         let client = std::sync::Arc::new(FeedbackCapturingClient::new());
         let orch = MemoryOrchestrator::new(client);
-        orch.mark_surfaced("sess1", &["a".into()]);
-        let kept = orch.filter_already_surfaced("sess2", vec![memory("a", "semantic", "x")]);
+        let sid1 = "mark_surfaced_is_per_session_a";
+        let sid2 = "mark_surfaced_is_per_session_b";
+        orch.mark_surfaced(sid1, &["a".into()]);
+        let kept = orch.filter_already_surfaced(sid2, vec![memory("a", "semantic", "x")]);
         assert_eq!(kept.len(), 1, "session boundaries isolate the dedup set");
     }
 

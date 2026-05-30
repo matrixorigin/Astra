@@ -112,8 +112,6 @@ pub struct TurnGuard {
     round_had_error: bool,
     /// Fingerprint of the most recently emitted deprioritize warning.
     last_deprioritize_warning_fingerprint: Option<String>,
-    /// Fingerprint of the most recently emitted timeout guidance.
-    last_timeout_guidance_fingerprint: Option<String>,
     /// Fingerprint of the most recently emitted cache guidance.
     last_cache_warning_fingerprint: Option<String>,
     /// Fingerprint of the most recently emitted escalation guidance.
@@ -168,7 +166,6 @@ impl TurnGuard {
             last_cache_hit_total: 0,
             round_had_error: false,
             last_deprioritize_warning_fingerprint: None,
-            last_timeout_guidance_fingerprint: None,
             last_cache_warning_fingerprint: None,
             last_escalation_fingerprint: None,
             pending_correction: None,
@@ -282,8 +279,11 @@ impl TurnGuard {
         quality
     }
 
-    /// Record a tool timeout (from SchedulingContract enforcement).
-    /// Distinct from generic errors — timeouts are infrastructure issues.
+    /// Record a single-tool timeout for test injection.
+    ///
+    /// Production code should use [`record_step_abort`] which handles
+    /// batch-level timeout recording from the tool pipeline.
+    #[cfg(test)]
     pub fn record_tool_timeout(&mut self, tool_name: &str) {
         self.round_had_error = true;
         self.health.record_timeout(tool_name);
@@ -504,29 +504,7 @@ impl TurnGuard {
             self.last_deprioritize_warning_fingerprint = None;
         }
 
-        // 5a. Timeout-dominant tool guidance
-        // When most failures are timeouts, give softer guidance (infrastructure issue).
-        let mut fresh_timeout_guidance = false;
-        let timeout_dominant = self.health.timeout_dominant_tools();
-        let timeout_fingerprint = tool_fingerprint(timeout_dominant.iter().copied());
-        if let Some(fingerprint) = timeout_fingerprint {
-            if self.last_timeout_guidance_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                injections.push(format!(
-                    "⏱ Tools [{}] are timing out (infrastructure issue, not a bug). \
-                     Consider: (1) trying a simpler/faster alternative, \
-                     (2) breaking large operations into smaller ones, \
-                     (3) retrying later if the issue is transient.",
-                    timeout_dominant.join(", ")
-                ));
-                severity = severity.max(VerdictSeverity::Warning);
-                fresh_timeout_guidance = true;
-                self.last_timeout_guidance_fingerprint = Some(fingerprint);
-            }
-        } else {
-            self.last_timeout_guidance_fingerprint = None;
-        }
-
-        // 5b. Cache duplication warning
+        // 5a. Cache duplication warning
         // When the LLM keeps making identical tool calls, flag token waste.
         // High cache-hit counts also contribute to nudge_count so the escalation
         // path can reach Critical even when there are zero tool errors (the model
@@ -715,8 +693,6 @@ impl TurnGuard {
                     "reward_hacking"
                 } else if fresh_deprioritize_warning {
                     "deprioritize"
-                } else if fresh_timeout_guidance {
-                    "timeout_guidance"
                 } else if cache_warning_emitted {
                     "cache_waste"
                 } else {

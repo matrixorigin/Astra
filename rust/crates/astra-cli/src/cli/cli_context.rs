@@ -155,19 +155,27 @@ mod tests {
 
     #[test]
     fn from_launch_options_rejects_invalid_session_id() {
-        let err = CliContext::from_launch_options(
-            false,
-            None,
-            &[],
-            &[],
-            &[],
-            false,
-            Some("not-a-uuid".into()),
-            None,
-        )
-        .expect_err("invalid session id should fail");
+        temp_env::with_vars(
+            [
+                ("ASTRA_CLI_MAX_TURNS", None::<&str>),
+                ("ASTRA_CLI_SESSION_ID", None::<&str>),
+            ],
+            || {
+                let err = CliContext::from_launch_options(
+                    false,
+                    None,
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                    Some("not-a-uuid".into()),
+                    None,
+                )
+                .expect_err("invalid session id should fail");
 
-        assert!(err.contains("ASTRA_CLI_SESSION_ID/--session-id must be a valid UUID"));
+                assert!(err.contains("ASTRA_CLI_SESSION_ID/--session-id must be a valid UUID"));
+            },
+        );
     }
 
     #[test]

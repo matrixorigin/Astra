@@ -1,0 +1,33 @@
+# Astra Server Configuration
+#
+# The server loads configuration in this order (later overrides earlier):
+#   1. /etc/astra/server.toml           (system-level, for production deployments)
+#   2. ~/.astra/server.toml             (user-level, for dev/self-hosted)
+#   3. Environment variables (ASTRA_*)  (highest precedence, for containers)
+#
+# All fields shown with their default values. Commented-out fields use defaults.
+
+# ── Database Connection Pool ──────────────────────────────────────────────────
+[database]
+max_connections = 10          # Max connections in pool (env: ASTRA_DB_POOL_MAX_CONNECTIONS)
+min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CONNECTIONS)
+# connect_timeout_s = 5       # Connection acquisition timeout (seconds)
+# max_lifetime_s = 300        # Max connection lifetime before recycling (seconds)
+# idle_timeout_s = 60         # Idle timeout before closing unused connections (seconds)
+
+# ── Authentication & JWT ─────────────────────────────────────────────────────
+[auth]
+# jwt_secret = "CHANGE-ME"              # Required in production (≥32 chars)
+# jwt_algorithm = "HS256"               # HS256, HS384, HS512
+# access_ttl_minutes = 10080            # Access token TTL (default: 7 days)
+# refresh_ttl_days = 30                 # Refresh token TTL
+# bridge_secret = "CHANGE-ME"           # Bridge HMAC secret (≥32 chars)
+# auth_mode = "local_jwt"               # local_jwt | trusted_moi
+# token_encryption_key = ""             # Fernet key for LLM API key encryption
+# NB: Dev setups without proper secrets need ASTRA_ALLOW_INSECURE_DEFAULTS=1
+
+# ── HTTP API Server ──────────────────────────────────────────────────────────
+[api]
+host = "0.0.0.0"               # Listen address (env: ASTRA_API_HOST)
+port = 8000                    # Listen port (env: ASTRA_API_PORT)
+# cors_origins = []            # Allowed CORS origins (empty = no restriction)

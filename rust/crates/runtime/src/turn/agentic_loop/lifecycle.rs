@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -127,7 +127,6 @@ async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
         &state.skills.pinned,
         &state.skills.discovered,
         &state.skills.invoked,
-        &state.skills.search,
     );
     let Some(skill_name) = crate::turn::skill_tool::select_auto_routed_skill_with_config(
         &query,
@@ -811,71 +810,164 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     Some(review_message)
 }
 
+/// Unified diagnosis of all stall conditions evaluated at interruption time.
+///
+/// Computes the signal string, human-readable summary, and restricted tool
+/// list in a single pass to avoid re-evaluating the same three stall
+/// conditions (exploration family streak, redundant reads, single-tool
+/// streak) across three separate functions.
+struct StallDiagnosis {
+    signal: Option<String>,
+    summary: Option<String>,
+    restricted_tools: Vec<String>,
+}
+
+fn trailing_single_tool_resume_restrictions(state: &AgenticLoopState) -> Vec<String> {
+    // Reverse-iterate tool_call_records to collect single-tool rounds
+    // from most-recent backwards, stopping at the first multi-tool round.
+    let mut restricted = BTreeSet::new();
+    let mut current_round: Option<u32> = None;
+    let mut current_tools: BTreeSet<String> = BTreeSet::new();
+
+    for record in state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .filter(|r| !r.is_synthetic_placeholder())
+    {
+        let Some(round) = record.round else {
+            continue;
+        };
+
+        match current_round {
+            None => {
+                current_round = Some(round);
+                current_tools.insert(record.name.clone());
+            }
+            Some(r) if r == round => {
+                current_tools.insert(record.name.clone());
+            }
+            Some(_) => {
+                if current_tools.len() == 1 {
+                    let Some(name) = current_tools.iter().next() else {
+                        continue; // defensive: skip malformed round
+                    };
+                    for tool in astra_turn_core::interruption::resume_tool_family_for_tool(name) {
+                        restricted.insert((*tool).to_string());
+                    }
+                    current_round = Some(round);
+                    current_tools.clear();
+                    current_tools.insert(record.name.clone());
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    if current_tools.len() == 1 {
+        let Some(name) = current_tools.iter().next() else {
+            return restricted.into_iter().collect(); // defensive
+        };
+        for tool in astra_turn_core::interruption::resume_tool_family_for_tool(name) {
+            restricted.insert((*tool).to_string());
+        }
+    }
+
+    restricted.into_iter().collect()
+}
+
+fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
+    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+
+    // 1. Exploration family streak (read/search/diff dominance)
+    if let Some((family, streak)) =
+        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
+        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
+    {
+        let mut summary_text = match family {
+            "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
+            "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
+            "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
+            _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
+        };
+        // Enrich with redundant read detail when co-occurring
+        if family == "read" {
+            let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+                &state.stall.tool_call_records,
+            );
+            if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD
+            {
+                summary_text.push_str(&format!(
+                    "; {redundant_reads} redundant overlapping reads on unchanged files"
+                ));
+            }
+        }
+        let summary = Some(summary_text);
+        return StallDiagnosis {
+            signal: Some(format!("exploration_family={family};streak={streak}")),
+            summary,
+            restricted_tools: astra_turn_core::interruption::resume_tool_family_for_exploration(
+                family,
+            )
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect(),
+        };
+    }
+
+    // 2. Redundant overlapping reads
+    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+        &state.stall.tool_call_records,
+    );
+    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
+        return StallDiagnosis {
+            signal: Some(format!("redundant_reads={redundant_reads}")),
+            summary: Some(format!(
+                "{redundant_reads} redundant overlapping reads on unchanged files"
+            )),
+            restricted_tools: vec!["read_file".to_string(), "view".to_string()],
+        };
+    }
+
+    // 3. Single-tool streak
+    if single_tool_streak >= 3 {
+        return StallDiagnosis {
+            signal: Some(format!("single_tool_streak={single_tool_streak}")),
+            summary: Some(format!(
+                "a single-tool streak of {single_tool_streak} consecutive rounds"
+            )),
+            restricted_tools: trailing_single_tool_resume_restrictions(state),
+        };
+    }
+
+    StallDiagnosis {
+        signal: None,
+        summary: None,
+        restricted_tools: Vec::new(),
+    }
+}
+
 /// Build an interruption state summary from the current loop state.
 pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
     error_detail: Option<String>,
 ) -> InterruptionStateSummary {
-    let stall_signal = interruption_stall_signal(state);
+    let diag = compute_stall_diagnosis(state);
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
         tool_calls_completed: completed_tool_calls(state),
         turns_completed: current_agentic_step(state),
         remaining_turns: state.remaining_turns as u32,
         error_detail,
-        stall_signal,
+        stall_signal: diag.signal,
+        resume_restricted_tools: diag.restricted_tools,
     }
 }
 
 pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some((family, streak)) =
-        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
-        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
-    {
-        parts.push(match family {
-            "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
-            "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
-            "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
-            _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
-        });
-    }
-    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-        &state.stall.tool_call_records,
-    );
-    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
-        parts.push(format!(
-            "{redundant_reads} redundant overlapping reads on unchanged files"
-        ));
-    }
-    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    if single_tool_streak >= 3 && parts.is_empty() {
-        parts.push(format!(
-            "a single-tool streak of {single_tool_streak} consecutive rounds"
-        ));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("; "))
-    }
-}
-
-fn interruption_stall_signal(state: &AgenticLoopState) -> Option<String> {
-    if let Some((family, streak)) =
-        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
-        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
-    {
-        return Some(format!("exploration_family={family};streak={streak}"));
-    }
-    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-        &state.stall.tool_call_records,
-    );
-    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
-        return Some(format!("redundant_reads={redundant_reads}"));
-    }
-    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    (streak >= 3).then(|| format!("single_tool_streak={streak}"))
+    compute_stall_diagnosis(state).summary
 }
 
 pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
@@ -1776,6 +1868,10 @@ mod tests {
             summary.stall_signal.as_deref(),
             Some("exploration_family=read;streak=5")
         );
+        assert_eq!(
+            summary.resume_restricted_tools,
+            vec!["read_file".to_string(), "view".to_string()]
+        );
         let diagnosis = interruption_diagnosis_summary(&state).expect("diagnosis");
         assert!(
             diagnosis.contains("5 consecutive read-dominant exploratory rounds"),
@@ -1785,6 +1881,34 @@ mod tests {
             diagnosis.contains("redundant overlapping reads"),
             "expected redundant-read detail, got {diagnosis}"
         );
+    }
+
+    #[test]
+    fn interruption_state_summary_blocks_trailing_single_tool_lane() {
+        let mut state = make_state();
+        state.stall.tool_call_records = (0..3)
+            .map(|round| ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                round: Some(round),
+                ..Default::default()
+            })
+            .collect();
+        state.messages = vec![
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+        ];
+
+        let summary = interruption_state_summary(&state, None);
+        assert_eq!(
+            summary.stall_signal.as_deref(),
+            Some("single_tool_streak=3")
+        );
+        assert_eq!(summary.resume_restricted_tools, vec!["bash".to_string()]);
     }
 
     #[test]
