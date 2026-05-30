@@ -18,6 +18,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-check

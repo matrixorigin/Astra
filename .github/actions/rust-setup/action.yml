@@ -1,5 +1,5 @@
 name: "Rust CI Setup"
-description: "Checkout, install Rust toolchain + nextest, configure build cache"
+description: "Install Rust toolchain + nextest, configure build cache"
 
 inputs:
   shared-key:
@@ -14,8 +14,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/checkout@v4
-
     - uses: dtolnay/rust-toolchain@stable
 
     - uses: taiki-e/install-action@nextest
