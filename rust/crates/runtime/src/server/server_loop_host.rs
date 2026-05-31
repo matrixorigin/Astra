@@ -41,6 +41,7 @@ use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
+use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::RequestedTurnInteractionMode;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -1807,14 +1808,18 @@ impl ServerAgenticLoopHost {
     /// 4. Convert result to `EdgeToolExecResult`
     ///
     /// Events are streamed incrementally through `event_tx`.
+    ///
+    /// **P0-3**: When the in-memory ledger times out and an edge dispatch
+    /// service is wired (cross-pod deployment), falls back to DB-polling
+    /// for results delivered by another pod.
     async fn deliver_edge_tools_via_ledger(
         &mut self,
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         use astra_turn_core::cloud_tool_delivery::{
             cloud_tool_requires_approval_for_delivery, collect_approval_batches,
-            sse_maps_through_tool_request, wait_approval_ledger_for_tool,
-            wait_tool_result_ledger_for_tool,
+            local_tool_execution_delivery, sse_maps_through_tool_request,
+            wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
         };
         use astra_turn_core::headless_tool_assembly::{
             ensure_tool_call_ids, parse_flat_tool_call_event,
@@ -1981,6 +1986,7 @@ impl ServerAgenticLoopHost {
                         ledger_wait,
                     )
                     .await;
+
                     let duration_ms = started.elapsed().as_millis() as u64;
                     let sse_maps = delivery.sse_maps.clone();
                     let output = delivery
@@ -5043,6 +5049,7 @@ mod tests {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
+            run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),

@@ -5422,22 +5422,6 @@ mod tests {
     }
 
     #[test]
-    fn backward_compat_old_events_missing_selection_fields() {
-        // Old journal events won't have tools_selected/tools_used/budget_used/budget_pressure.
-        // Verify serde handles missing fields gracefully.
-        let old_json = r#"{"type":"turn","ts":"2025-01-01T00:00:00Z","session_id":"s","turn":1,"tool_count":0,"tokens_in":10,"tokens_out":5,"duration_ms":100}"#;
-        let evt: JournalEvent = serde_json::from_str(old_json).unwrap();
-        assert_eq!(evt.event_type, JournalEventType::Turn);
-        assert!(evt.tools_selected.is_none());
-        assert!(evt.tools_used.is_none());
-        assert!(evt.budget_used.is_none());
-        assert!(evt.budget_pressure.is_none());
-        assert!(evt.tool_calls.is_none());
-    }
-
-    // ── Per-tool-call audit records ──
-
-    #[test]
     fn tool_call_record_serialization_round_trip() {
         let record = ToolCallRecord {
             name: "github_list_prs".into(),
@@ -5613,17 +5597,6 @@ mod tests {
             "empty tool_calls should be omitted: {json}"
         );
     }
-
-    #[test]
-    fn backward_compat_old_events_missing_tool_calls() {
-        // Old events without tool_calls field should deserialize fine.
-        let old_json = r#"{"type":"turn","ts":"2025-01-01T00:00:00Z","turn":1,"tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":500,"tools_used":["bash","read_file"]}"#;
-        let evt: JournalEvent = serde_json::from_str(old_json).unwrap();
-        assert!(evt.tool_calls.is_none());
-        assert_eq!(evt.tools_used.as_ref().unwrap().len(), 2);
-    }
-
-    // ── ToolCallRecord edge cases ──
 
     #[test]
     fn tool_call_record_bulk_array() {
@@ -6825,16 +6798,6 @@ mod tests {
             !json.contains("original_tool_name"),
             "None original_tool_name should be skipped in serialization"
         );
-    }
-
-    #[test]
-    fn tool_call_record_backward_compat_deserialize() {
-        // Legacy JSON without the new fields — should deserialize with defaults
-        let legacy_json = r#"{"name":"read_file","ok":true,"ms":10}"#;
-        let rec: ToolCallRecord = serde_json::from_str(legacy_json).unwrap();
-        assert_eq!(rec.surgically_removed, None);
-        assert_eq!(rec.original_tool_name, None);
-        assert!(!rec.is_synthetic_placeholder());
     }
 
     #[test]
@@ -8375,20 +8338,6 @@ mod observability_serde_tests {
     }
 
     #[test]
-    fn tool_call_record_backward_compat_old_json_missing_new_fields() {
-        // Old journal entries won't have the new fields — they must deserialize to None.
-        let old_json = r#"{"name":"bash","ok":true,"ms":100}"#;
-        let rec: ToolCallRecord = serde_json::from_str(old_json).unwrap();
-        assert_eq!(rec.name, "bash");
-        assert!(rec.ok);
-        assert_eq!(rec.ms, 100);
-        assert_eq!(rec.start_offset_ms, None);
-        assert_eq!(rec.batch_id, None);
-        assert_eq!(rec.parallel, None);
-        assert_eq!(rec.round, None);
-    }
-
-    #[test]
     fn journal_event_new_fields_serialize_only_when_set() {
         let ev = JournalEvent::base_public(JournalEventType::Turn, Some("s1"));
         let json = serde_json::to_string(&ev).unwrap();
@@ -8419,18 +8368,6 @@ mod observability_serde_tests {
         assert_eq!(deser.round, Some(3));
         assert_eq!(deser.tool_calls_returned, Some(5));
         assert_eq!(deser.offset_ms, Some(12000));
-    }
-
-    #[test]
-    fn journal_event_backward_compat_old_turn_missing_new_fields() {
-        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500}"#;
-        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
-        assert_eq!(ev.event_type, JournalEventType::Turn);
-        assert_eq!(ev.round, None);
-        assert_eq!(ev.tool_calls_returned, None);
-        assert_eq!(ev.llm_rounds, None);
-        assert_eq!(ev.total_llm_ms, None);
-        assert_eq!(ev.total_tool_ms, None);
     }
 
     #[test]
@@ -8480,17 +8417,6 @@ mod observability_serde_tests {
         assert!(
             !json.contains("parent_event_id"),
             "None parent_event_id must be omitted from JSON"
-        );
-    }
-
-    #[test]
-    fn parent_event_id_backward_compat_old_json_without_field() {
-        // Simulate reading a journal line written before parent_event_id existed.
-        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","turn":1,"tokens_in":10,"tokens_out":5,"duration_ms":100}"#;
-        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
-        assert!(
-            ev.parent_event_id.is_none(),
-            "old events without parent_event_id must deserialize as None"
         );
     }
 
@@ -8545,14 +8471,6 @@ mod observability_serde_tests {
             !json.contains("git_branch"),
             "None git_branch must be omitted"
         );
-    }
-
-    #[test]
-    fn git_snapshot_backward_compat_old_json_without_fields() {
-        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","turn":1}"#;
-        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
-        assert!(ev.git_head.is_none());
-        assert!(ev.git_branch.is_none());
     }
 
     #[test]

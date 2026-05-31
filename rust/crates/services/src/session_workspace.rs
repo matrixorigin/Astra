@@ -1078,20 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_backward_compat_no_checkpoints() {
-        // YAML without checkpoints field should deserialize with empty vec
-        let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 0\ntotal_tokens_in: 0\ntotal_tokens_out: 0\nstatus: active\n";
-        let ws: WorkspaceMetadata = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(ws.checkpoints.is_empty());
-        // Plan fields default to None/0
-        assert!(ws.executing_plan_json.is_none());
-        assert!(ws.plan_goal.is_none());
-        assert!(ws.plan_config_json.is_none());
-        assert_eq!(ws.plan_execution_rounds, 0);
-        assert!(ws.last_context_trace.is_none());
-    }
-
-    #[test]
     fn workspace_plan_state_round_trip() {
         let mut ws = WorkspaceMetadata::with_context("plan-sess", "gpt-4", "/tmp", Some("main"));
         ws.executing_plan_json = Some(

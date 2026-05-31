@@ -165,10 +165,38 @@ pub(crate) async fn post_tool_result_handler(
             "kind": "tool_result",
             "user_id": user.user_id,
             "edge_id": edge_id,
-            "body": serde_json::to_value(&body).unwrap_or_default(),
+            "body": serde_json::to_value(&body).map_err(|e| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to serialize tool_result body for ledger: {e}"),
+                )
+            })?,
         }),
     )
     .map_err(|err| ledger_insert_error_response(&key, err))?;
+
+    // Cross-pod: also call deliver_result so other pods' turn bridges
+    // waiting on wait_result() can see this result.
+    let dispatch_svc = &state.execution.edge_dispatch_service;
+    let result_json = serde_json::to_string(&body).map_err(|e| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to serialize tool_result for cross-pod delivery: {e}"),
+        )
+    })?;
+    if let Err(e) = dispatch_svc
+        .deliver_result(&body.request_id, &result_json)
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::edge_callback",
+            user_id = %user.user_id,
+            request_id = %body.request_id,
+            error = %e,
+            "Edge: failed to cross-pod deliver tool result"
+        );
+    }
+
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -207,6 +235,15 @@ pub(crate) async fn post_approval_respond_handler(
             astra_thin_client::ApprovalKind::Explicit => "explicit",
         });
         let approval_turn = find_latest_approval_required(session_id, &body.request_id)
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "astra_runtime::edge_callback",
+                    session_id = %session_id,
+                    request_id = %body.request_id,
+                    error = %e,
+                    "approval journal lookup failed, treating as no prior request"
+                );
+            })
             .ok()
             .flatten()
             .and_then(|request| request.turn);
@@ -255,7 +292,12 @@ pub(crate) async fn post_approval_respond_handler(
             "kind": "approval_respond",
             "user_id": user.user_id,
             "edge_id": edge_id,
-            "body": serde_json::to_value(&body).unwrap_or_default(),
+            "body": serde_json::to_value(&body).map_err(|e| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to serialize approval_respond body for ledger: {e}"),
+                )
+            })?,
         }),
         body.session_id.is_some(),
     )

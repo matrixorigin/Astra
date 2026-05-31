@@ -34,14 +34,10 @@ const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
 const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
 /// Get the step checkpoint directory for a session.
-/// Try to decrypt checkpoint content. Falls back to plain JSON for backward compat.
+/// Decrypt checkpoint content. All checkpoints are encrypted.
 pub(crate) fn decrypt_checkpoint(content: &str) -> Option<String> {
-    if content.starts_with('{') {
-        // Backward compat: unencrypted JSON
-        return Some(content.to_string());
-    }
     let bytes = hex_decode(content.trim())?;
-    let decrypted = journal_crypto().decrypt_with_legacy_support(&bytes)?;
+    let decrypted = journal_crypto().decrypt(&bytes)?;
     String::from_utf8(decrypted).ok()
 }
 
@@ -431,8 +427,13 @@ impl FileBackedEventStore {
             if line.trim().is_empty() {
                 continue;
             }
-            // Try decrypt first, fall back to plain JSON for backward compat
-            let json = decrypt_checkpoint(line).unwrap_or_else(|| line.to_string());
+            // Decrypt checkpoint event
+            let json = decrypt_checkpoint(line).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "failed to decrypt checkpoint",
+                )
+            })?;
             if let Ok(event) = serde_json::from_str::<StepEvent>(&json) {
                 events.push(event);
             }
@@ -678,21 +679,6 @@ mod tests {
         let json_str = serde_json::to_string(&heavy).unwrap();
         let restored: HeavyCheckpoint = serde_json::from_str(&json_str).unwrap();
         assert_eq!(restored.interruption, Some(irj));
-    }
-
-    #[test]
-    fn heavy_checkpoint_without_interruption_deserializes() {
-        // Backward compat: old checkpoints without the interruption field.
-        let json_str = r#"{
-            "light": {"protocol_version": 1, "cursor": {"phase": "Perceive", "slots": [], "parallel": false}, "step_id": "s", "task_id": "t", "agent_id": "a", "progress": 0.5, "total_tokens": 0, "created_at": 0},
-            "messages": [],
-            "budget_remaining_tokens": 0,
-            "budget_remaining_rounds": 0,
-            "blocked_tools": [],
-            "recent_tools": []
-        }"#;
-        let heavy: HeavyCheckpoint = serde_json::from_str(json_str).unwrap();
-        assert!(heavy.interruption.is_none());
     }
 
     #[test]
@@ -1004,7 +990,15 @@ mod tests {
         let valid_event = make_event("e1", "s1", StepEventType::StepCreated);
         let valid_json = serde_json::to_string(&valid_event).unwrap();
 
-        let content = format!("{}\nNOT VALID JSON\n{{\n{}\n", valid_json, valid_json,);
+        // Encrypt all lines (both valid and malformed) before writing
+        let encrypted_valid = encrypt_checkpoint(&valid_json);
+        let encrypted_malformed = encrypt_checkpoint("NOT VALID JSON");
+        let encrypted_malformed2 = encrypt_checkpoint("{");
+
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            encrypted_valid, encrypted_malformed, encrypted_malformed2, encrypted_valid
+        );
         std::fs::write(events_path_for(&session_id), &content).unwrap();
 
         // Load should skip malformed lines, keep valid ones

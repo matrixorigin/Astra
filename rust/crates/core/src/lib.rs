@@ -14,7 +14,7 @@ use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 /// Global cap on the sum of `max_connections` across all pools.
 /// Prevents unbounded pool creation from exhausting database connections.
 /// Override with `ASTRA_DB_GLOBAL_MAX_CONNECTIONS` env var.
-const DEFAULT_GLOBAL_MAX_CONNECTIONS: u64 = 200;
+const DEFAULT_GLOBAL_MAX_CONNECTIONS: u64 = 500;
 
 /// Running counter of allocated connections across all pools.
 /// Checked against `DEFAULT_GLOBAL_MAX_CONNECTIONS` before creating new pools.

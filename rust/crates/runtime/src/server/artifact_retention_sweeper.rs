@@ -193,13 +193,19 @@ async fn apply_artifact_retention_policy(
     Ok(ArtifactRetentionAction::MarkedExpiring)
 }
 
-pub(crate) fn spawn_artifact_retention_sweeper(pool: SharedPool) {
+pub(crate) fn spawn_artifact_retention_sweeper(
+    pool: SharedPool,
+    lease: Arc<crate::server::sweeper_lease::SweeperLease>,
+) {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            if !lease.is_leader().await {
+                continue;
+            }
             if let Err(error) = run_artifact_retention_gc_once(pool.clone(), 1_000).await {
                 tracing::warn!(
                     target: "astra_runtime::artifact_retention_sweeper",

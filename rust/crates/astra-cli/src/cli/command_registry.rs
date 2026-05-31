@@ -175,11 +175,7 @@ const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
 
 const HEALTH_SUBCOMMANDS: &[(&str, &str)] = &[("detail", "Per-tool breakdown")];
 
-const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("log", "Server-owned sync log hint"),
-    ("pull", "Deprecated: server-owned"),
-    ("push", "Deprecated: server-owned"),
-];
+const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[("log", "Server-owned sync log hint")];
 
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("latest", "Review HEAD (default)"),

@@ -91,13 +91,19 @@ pub async fn expire_due_device_leases_once(
     Ok(expired)
 }
 
-pub(crate) fn spawn_device_lease_expiry_sweeper(pool: SharedPool) {
+pub(crate) fn spawn_device_lease_expiry_sweeper(
+    pool: SharedPool,
+    lease: Arc<crate::server::sweeper_lease::SweeperLease>,
+) {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            if !lease.is_leader().await {
+                continue;
+            }
             if let Err(error) = expire_due_device_leases_once(pool.clone(), 500).await {
                 tracing::warn!(
                     target: "astra_runtime::device_lease_sweeper",

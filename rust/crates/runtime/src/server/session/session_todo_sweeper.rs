@@ -28,6 +28,7 @@
 
 use astra_core::SharedPool;
 use sqlx::Row;
+use std::sync::Arc;
 
 const STALE_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
 const STALE_THRESHOLD_HOURS: u64 = 24;
@@ -166,7 +167,10 @@ pub(crate) async fn run_archive_gc_once(pool: SharedPool) -> Result<u64, String>
 /// Spawn the stale-in_progress sweeper. Tick every 5 minutes;
 /// missed ticks are coalesced (`Delay`) so a paused server doesn't
 /// cause a ticker burst on resume.
-pub(crate) fn spawn_session_todo_stale_sweeper(pool: SharedPool) {
+pub(crate) fn spawn_session_todo_stale_sweeper(
+    pool: SharedPool,
+    lease: Arc<crate::server::sweeper_lease::SweeperLease>,
+) {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(STALE_SWEEP_INTERVAL_SECS));
@@ -176,6 +180,9 @@ pub(crate) fn spawn_session_todo_stale_sweeper(pool: SharedPool) {
         interval.tick().await;
         loop {
             interval.tick().await;
+            if !lease.is_leader().await {
+                continue;
+            }
             match run_stale_in_progress_sweep(pool.clone()).await {
                 Ok(0) => {} // quiet success: nothing to do this tick
                 Ok(n) => tracing::info!(
@@ -197,13 +204,19 @@ pub(crate) fn spawn_session_todo_stale_sweeper(pool: SharedPool) {
 /// stale `completed` rows; second pass hard-deletes long-retained
 /// `archived` rows. Fires on the first tick so a freshly-started server
 /// still performs backlog cleanup immediately.
-pub(crate) fn spawn_session_todo_archive_sweeper(pool: SharedPool) {
+pub(crate) fn spawn_session_todo_archive_sweeper(
+    pool: SharedPool,
+    lease: Arc<crate::server::sweeper_lease::SweeperLease>,
+) {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(ARCHIVE_SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            if !lease.is_leader().await {
+                continue;
+            }
             let auto_archive_days = completed_auto_archive_days();
             match run_completed_auto_archive_once(pool.clone()).await {
                 Ok(0) => {}
@@ -354,7 +367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
     async fn completed_auto_archive_only_moves_old_completed_rows() {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),

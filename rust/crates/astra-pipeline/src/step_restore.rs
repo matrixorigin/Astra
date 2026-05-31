@@ -103,7 +103,7 @@ pub fn restore_session(session_id: &str) -> Result<Option<RestoredSession>, Rest
     restore_session_with_policy(session_id, VersionPolicy::Compatible)
 }
 
-/// Restore with explicit version policy (no migration).
+/// Restore with explicit version policy.
 pub fn restore_session_with_policy(
     session_id: &str,
     policy: VersionPolicy,
@@ -115,7 +115,7 @@ pub fn restore_session_with_policy(
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
     };
 
-    // Step 2: Validate protocol version (no migration)
+    // Step 2: Validate protocol version
     validate_checkpoint_version(&heavy, policy)?;
 
     // Step 3: Extract resume turn and warm cache

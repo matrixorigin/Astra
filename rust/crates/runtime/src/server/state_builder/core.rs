@@ -215,6 +215,9 @@ pub(super) fn install_execution_services(
         .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
             shared_pool,
         )))
+        .with_edge_dispatch_service(Arc::new(DatabaseEdgeDispatchService::from_shared(
+            shared_pool,
+        )))
         .with_task_lease_service(Arc::new(DatabaseTaskLeaseService::from_shared(
             shared_pool,
             Arc::clone(lease_hold_cache),

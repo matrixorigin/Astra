@@ -699,6 +699,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
+            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),

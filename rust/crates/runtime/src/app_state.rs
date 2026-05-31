@@ -121,6 +121,7 @@ impl Default for AdminState {
 pub(crate) struct ExecutionServicesState {
     pub(crate) task_service: Arc<dyn TaskService>,
     pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
+    pub(crate) edge_dispatch_service: Arc<dyn EdgeDispatchService>,
     pub(crate) task_lease_service: Arc<dyn TaskLeaseService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
 }
@@ -130,6 +131,7 @@ impl Default for ExecutionServicesState {
         Self {
             task_service: Arc::new(UnconfiguredTaskService),
             edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
+            edge_dispatch_service: Arc::new(UnconfiguredEdgeDispatchService),
             task_lease_service: Arc::new(UnconfiguredTaskLeaseService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
         }
@@ -596,6 +598,14 @@ impl AppState {
         edge_registry_service: Arc<dyn EdgeRegistryService>,
     ) -> Self {
         self.execution.edge_registry_service = edge_registry_service;
+        self
+    }
+
+    pub fn with_edge_dispatch_service(
+        mut self,
+        edge_dispatch_service: Arc<dyn EdgeDispatchService>,
+    ) -> Self {
+        self.execution.edge_dispatch_service = edge_dispatch_service;
         self
     }
 

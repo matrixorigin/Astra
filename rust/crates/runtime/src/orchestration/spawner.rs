@@ -607,11 +607,12 @@ impl DynamicAgentSpawner {
             .map_err(SpawnError::DepthLimitExceeded)?;
 
         // 2. Generate IDs
-        let agent_name = input.name.clone().unwrap_or_else(|| {
-            format!("{}_{}", input.agent_type, &Uuid::new_v4().to_string()[..8])
-        });
+        let agent_name = input
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}_{}", input.agent_type, &Uuid::new_v4().to_string()));
         let run_id = Uuid::new_v4().to_string();
-        let agent_id = format!("{}@{}", agent_name, &run_id[..8]);
+        let agent_id = format!("{}@{}", agent_name, &run_id);
 
         // 3. Determine model and turns
         let model = input

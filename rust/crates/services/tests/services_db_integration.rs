@@ -2981,7 +2981,7 @@ async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
 // contract introduced by the idempotency audit (PR: fix/at-most-once-idempotency-audit).
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn it_register_skill_idempotent_retry_returns_200() {
     let (shared_pool, settings) = setup_pool_and_settings().await;
     let raw_pool = shared_pool.get().clone();
@@ -3024,7 +3024,7 @@ async fn it_register_skill_idempotent_retry_returns_200() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn it_register_skill_conflict_different_code_returns_409() {
     let (shared_pool, settings) = setup_pool_and_settings().await;
     let raw_pool = shared_pool.get().clone();
@@ -3063,7 +3063,7 @@ async fn it_register_skill_conflict_different_code_returns_409() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn it_publish_skill_idempotent_retry_returns_200() {
     let (shared_pool, settings) = setup_pool_and_settings().await;
     let raw_pool = shared_pool.get().clone();

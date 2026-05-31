@@ -51,6 +51,7 @@ pub mod server_tool_executor;
 pub(crate) mod session;
 mod skillify_agent_executor;
 mod state_builder;
+pub mod sweeper_lease;
 mod task_handlers;
 pub mod team;
 mod user_skill_handlers;

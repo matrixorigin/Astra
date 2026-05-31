@@ -450,21 +450,7 @@ impl DefaultToolExecutor {
 
             // ── Git operations (gix-based) ───────────────────────────
             // Consolidated git tool — single entry point for all git operations.
-            "git" => string_to_result(crate::git_gix::git_dispatch(pr, args)),
-            // Legacy aliases (backward compat during transition, will be removed).
-            "git_status" => string_to_result(crate::git_gix::git_status(pr, args)),
-            "git_diff" => string_to_result(crate::git_gix::git_diff(pr, args, 0.0, 0)),
-            "git_log" => string_to_result(crate::git_gix::git_log(pr, args)),
-            "git_show" => string_to_result(crate::git_gix::git_show(pr, args, 0.0, 0)),
-            "git_blame" => string_to_result(crate::git_gix::git_blame(pr, args)),
-            "git_commit" => outcome_to_result(crate::git_gix::git_commit_with_metadata(pr, args)),
-            "git_file_history" => string_to_result(crate::git_gix::git_file_history(pr, args)),
-            "git_log_search" => string_to_result(crate::git_gix::git_log_search(pr, args)),
-            "git_contributors" => string_to_result(crate::git_gix::git_contributors(pr, args)),
-            "git_revert_commit" => {
-                outcome_to_result(crate::git_gix::git_revert_commit_with_metadata(pr, args))
-            }
-            "git_stash" => outcome_to_result(crate::git_gix::git_stash_with_metadata(pr, args)),
+            "git" => outcome_to_result(crate::git_gix::git_dispatch(pr, args)),
 
             // ── GitHub API ───────────────────────────────────────────
             "github" => {
@@ -494,14 +480,6 @@ impl DefaultToolExecutor {
                 };
                 self.dispatch_github(resolved_name, args).await
             }
-            // Legacy aliases
-            "github_list_prs"
-            | "github_get_pr"
-            | "github_ci_status"
-            | "github_list_issues"
-            | "github_get_issue"
-            | "github_repo_stats"
-            | "github_create_issue" => self.dispatch_github(name, args).await,
 
             // ── Code intelligence (tree-sitter) ──────────────────────
             "symbols" => self.dispatch_symbols(args),
@@ -674,7 +652,7 @@ fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
             .is_some_and(|action| match action {
                 "commit" | "revert_commit" => true,
                 "stash" => args
-                    .get("sub_action")
+                    .get("stash_action")
                     .and_then(Value::as_str)
                     .is_some_and(git_stash_action_mutates_workspace),
                 _ => false,
@@ -1213,7 +1191,10 @@ mod tests {
         let tracked = tmp.path().join("tracked.txt");
         std::fs::write(&tracked, "initial\n").unwrap();
         let initial = exec
-            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .execute(
+                "git",
+                &serde_json::json!({"action": "commit", "message": "initial"}),
+            )
             .await;
         assert!(
             !initial.is_error,
@@ -1229,8 +1210,8 @@ mod tests {
         std::fs::write(&tracked, "changed\n").unwrap();
         let change = exec
             .execute(
-                "git_commit",
-                &serde_json::json!({"message": "change tracked"}),
+                "git",
+                &serde_json::json!({"action": "commit", "message": "change tracked"}),
             )
             .await;
         assert!(!change.is_error, "change commit failed: {}", change.output);
@@ -1239,7 +1220,7 @@ mod tests {
         assert!(!second.is_error, "second log failed: {}", second.output);
         assert!(
             second.output.contains("change tracked"),
-            "git_commit must invalidate cached git log output: {}",
+            "git commit must invalidate cached git log output: {}",
             second.output
         );
         assert_ne!(
@@ -1260,7 +1241,10 @@ mod tests {
         let tracked = tmp.path().join("tracked.txt");
         std::fs::write(&tracked, "initial\n").unwrap();
         let initial = exec
-            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .execute(
+                "git",
+                &serde_json::json!({"action": "commit", "message": "initial"}),
+            )
             .await;
         assert!(
             !initial.is_error,
@@ -1271,8 +1255,8 @@ mod tests {
         std::fs::write(&tracked, "stashed\n").unwrap();
         let push = exec
             .execute(
-                "git_stash",
-                &serde_json::json!({"action": "push", "message": "save tracked"}),
+                "git",
+                &serde_json::json!({"action": "stash", "stash_action": "push", "message": "save tracked"}),
             )
             .await;
         assert!(!push.is_error, "stash push failed: {}", push.output);
@@ -1286,7 +1270,10 @@ mod tests {
         );
 
         let drop = exec
-            .execute("git_stash", &serde_json::json!({"action": "drop"}))
+            .execute(
+                "git",
+                &serde_json::json!({"action": "stash", "stash_action": "drop"}),
+            )
             .await;
         assert!(!drop.is_error, "stash drop failed: {}", drop.output);
 
@@ -1298,7 +1285,7 @@ mod tests {
                 .and_then(|m| m.get("cached"))
                 .and_then(|v| v.as_bool()),
             Some(true),
-            "git_stash drop changes refs/stash, so cached git stash list must be invalidated"
+            "git stash drop changes refs/stash, so cached git stash list must be invalidated"
         );
         assert!(
             !after_drop.output.contains("save tracked"),
@@ -1468,7 +1455,7 @@ mod tests {
     async fn dispatch_github_without_client_gives_actionable_guidance() {
         let (_tmp, exec) = test_executor();
         let result = exec
-            .execute("github_list_prs", &serde_json::json!({}))
+            .execute("github", &serde_json::json!({"action": "list_prs"}))
             .await;
         assert!(result.is_error);
         assert!(
@@ -1618,15 +1605,18 @@ mod tests {
         let tracked = tmp.path().join("tracked.txt");
         std::fs::write(&tracked, "original\n").unwrap();
         let initial = exec
-            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .execute(
+                "git",
+                &serde_json::json!({"action": "commit", "message": "initial"}),
+            )
             .await;
         assert!(!initial.is_error, "got: {}", initial.output);
 
         std::fs::write(&tracked, "changed\n").unwrap();
         let committed = exec
             .execute(
-                "git_commit",
-                &serde_json::json!({"message": "change tracked"}),
+                "git",
+                &serde_json::json!({"action": "commit", "message": "change tracked"}),
             )
             .await;
         assert!(!committed.is_error, "got: {}", committed.output);
@@ -1639,8 +1629,8 @@ mod tests {
 
         let reverted = exec
             .execute(
-                "git_revert_commit",
-                &serde_json::json!({"commit_sha": commit_sha}),
+                "git",
+                &serde_json::json!({"action": "revert_commit", "commit_sha": commit_sha}),
             )
             .await;
         assert!(!reverted.is_error, "got: {}", reverted.output);

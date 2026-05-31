@@ -68,9 +68,12 @@ static WS_CONNECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Poll cadence for background lifecycle runs streamed over WebSocket.
-const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// 500ms keeps per-run DB QPS at 2 (vs 10 at 100ms) while still
+/// delivering <1s event visibility for streamed run lifecycle.
+const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
-const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 300;
+/// At 500ms poll cadence, 60 consecutive errors ≈ 30s wall time.
+const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 60;
 
 fn ws_connection_limit_reached_with(current: usize) -> bool {
     current >= MAX_WS_CONNECTIONS

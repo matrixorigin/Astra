@@ -570,7 +570,7 @@ pub(crate) fn build_context_manifest_projection(
             session_id: input.session_id.to_string(),
             item_order: 2,
             zone: "system_tool_schemas".to_string(),
-            source_table: "tool_runner_registry".to_string(),
+            source_table: "tool_registry".to_string(),
             source_id: "visible_tools".to_string(),
             source_hash: None,
             included: true,

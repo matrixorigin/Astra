@@ -157,6 +157,56 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
         pool_tx,
     );
 
+    // ── Phase 2a: Register in DB edge registry for cross-pod routing ─
+    let edge_registry = state.execution.edge_registry_service.clone();
+    let edge_id_for_registry = format!("ws-{}", uuid::Uuid::new_v4());
+    let _ = edge_registry
+        .register_or_update(
+            &user_id,
+            &edge_agent_id,
+            &edge_id_for_registry,
+            hostname.as_deref(),
+            workspace_dir.as_deref(),
+            None,
+        )
+        .await;
+
+    // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
+    let dispatch_user_id = user_id.clone();
+    let dispatch_agent_id = edge_agent_id.clone();
+    let dispatch_svc = state.execution.edge_dispatch_service.clone();
+    let dispatch_sink = ws_sink.clone();
+    let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
+
+    let dispatch_task = tokio::spawn(async move {
+        // 2000ms interval keeps per-connection DB QPS at 0.5
+        // (vs 5 at 200ms). Cross-pod dispatch targets ~2s end-to-end.
+        let mut interval = tokio::time::interval(Duration::from_millis(2000));
+        loop {
+            tokio::select! {
+                _ = dispatch_cancel_rx.changed() => break,
+                _ = interval.tick() => {
+                    match dispatch_svc.poll_pending(&dispatch_user_id, &dispatch_agent_id).await {
+                        Ok(rows) if !rows.is_empty() => {
+                            let mut dispatched_ids = Vec::new();
+                            for row in &rows {
+                                if let Ok(msg) = serde_json::from_str::<EdgeServerMessage>(&row.payload_json) {
+                                    if send_edge_msg(&dispatch_sink, msg).await.is_ok() {
+                                        dispatched_ids.push(row.dispatch_id);
+                                    }
+                                }
+                            }
+                            if !dispatched_ids.is_empty() {
+                                let _ = dispatch_svc.mark_dispatched(&dispatched_ids).await;
+                            }
+                        }
+                        _ => {} // no pending dispatches or error
+                    }
+                }
+            }
+        }
+    });
+
     // ── Phase 3: Bidirectional message loop ──────────────────────────
     let heartbeat_interval = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
 
@@ -200,11 +250,35 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                         &edge_agent_id,
                                         &request_id,
                                         EdgeToolResult {
-                                            output,
+                                            output: output.clone(),
                                             is_error,
                                             duration_ms,
                                         },
                                     );
+
+                                    // Cross-pod: also deliver result via dispatch table
+                                    // so other pods' turn bridges waiting on wait_result() can see it.
+                                    let dispatch_svc = &state.execution.edge_dispatch_service;
+                                    let status = if is_error { "error" } else { "success" };
+                                    let result_body = serde_json::json!({
+                                        "request_id": &request_id,
+                                        "status": status,
+                                        "output": output,
+                                        "duration_ms": duration_ms,
+                                    });
+                                    let result_json = serde_json::to_string(&result_body).unwrap_or_default();
+                                    if let Err(e) = dispatch_svc
+                                        .deliver_result(&request_id, &result_json)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user.user_id,
+                                            request_id = %request_id,
+                                            error = %e,
+                                            "Edge WS: failed to deliver tool result for cross-pod"
+                                        );
+                                    }
                                 }
                                 Ok(EdgeClientMessage::Ping) => {
                                     let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong).await;
@@ -245,7 +319,17 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
 
     // ── Cleanup ──────────────────────────────────────────────────────
     forward_task.abort();
+    dispatch_task.abort();
+    // Drop cancel sender so the dispatch task can break its loop cleanly.
+    drop(dispatch_cancel_tx);
     pool_for_cleanup.unregister(&user_id_cleanup, &edge_agent_id_cleanup);
+
+    // Unregister from DB edge registry so other pods stop routing to this edge.
+    let _ = state
+        .execution
+        .edge_registry_service
+        .unregister(&user_id_cleanup, &edge_agent_id_cleanup)
+        .await;
 
     tracing::info!(
         user_id = %user_id_cleanup,

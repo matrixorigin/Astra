@@ -313,6 +313,7 @@ mod tests {
             messaging: Default::default(),
             cancellation: Default::default(),
             error_recovery: Default::default(),
+            run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),

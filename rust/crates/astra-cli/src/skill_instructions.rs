@@ -30,8 +30,7 @@
 //!
 //! Skills are discovered from (highest priority first):
 //! 1. `{cwd}/.astra/skills/` — project-level
-//! 2. `{cwd}/skills/` — project-level (explicit)
-//! 3. `~/.astra/skills/` — user-level global skills
+//! 2. `~/.astra/skills/` — user-level global skills
 //!
 //! # Three-Level Loading
 //!
@@ -39,39 +38,33 @@
 //! - **Level 2 (Instructions)**: Full SKILL.md content loaded on skill invocation
 //! - **Level 3 (Resources)**: Templates, scripts, references loaded on demand
 
-// Legacy skill types are deprecated in favor of astra_runtime::skills::*.
-// Allow dead code and deprecation warnings within this module.
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 // ── Skill Discovery Paths ─────────────────────────────────────────────────
 
 /// Standard skill directory search order (high → low priority):
 ///
 /// 1. `{cwd}/.astra/skills/`  — project-level
-/// 2. `{cwd}/skills/`         — project-level (legacy / explicit)
-/// 3. `~/.astra/skills/`      — user-level global skills
+/// 2. `~/.astra/skills/`      — user-level global skills
 pub fn skill_search_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(3);
+    let mut paths = Vec::with_capacity(2);
 
     if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd.join(".astra").join("skills")); // 1. project .astra/skills/
-        paths.push(cwd.join("skills")); // 2. project skills/
+        paths.push(cwd.join(".astra").join("skills"));
     } else {
         paths.push(PathBuf::from(".astra/skills"));
-        paths.push(PathBuf::from("skills"));
     }
 
     if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".astra").join("skills")); // 3. ~/.astra/skills/
+        paths.push(home.join(".astra").join("skills"));
     }
 
     paths
 }
 
 /// Skill instruction parsed from SKILL.md file.
-#[deprecated(note = "Use astra_skills::manifest::SkillManifest + LoadedSkill instead")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInstruction {
     /// Unique skill identifier (from frontmatter or filename).
@@ -87,7 +80,6 @@ pub struct SkillInstruction {
 
     // ── Extended fields ──
     /// When this skill should be activated (natural-language hint for the model).
-    /// Analogous to CC's `whenToUse` frontmatter field.
     #[serde(default)]
     pub when_to_use: Option<String>,
 
@@ -114,7 +106,7 @@ impl Default for SkillInstruction {
         Self {
             name: String::new(),
             description: String::new(),
-            user_invocable: true, // matches serde default_true
+            user_invocable: true,
             allowed_tools: Vec::new(),
             when_to_use: None,
             model: None,
@@ -131,7 +123,6 @@ fn default_true() -> bool {
 
 /// Metadata-only view of a skill (Level 1 loading).
 /// Used for discovery and selection without loading full instructions.
-#[deprecated(note = "Use astra_skills::manifest::SkillManifest instead")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -198,4 +189,19 @@ pub fn parse_skill_md(content: &str) -> Result<SkillInstruction, String> {
     instruction.instruction_tokens = (markdown_body.len() as u32) / 4;
 
     Ok(instruction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_search_paths_returns_non_empty() {
+        let paths = skill_search_paths();
+        assert!(!paths.is_empty());
+        // All paths end with .astra/skills
+        for p in &paths {
+            assert!(p.ends_with(".astra/skills"));
+        }
+    }
 }

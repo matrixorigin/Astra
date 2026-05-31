@@ -1472,20 +1472,10 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
 /// replaced by the anomaly-based `LoopCircuitBreaker` in `astra-turn-core`.
 /// Agents run unlimited by default; intervention fires only on stall/regression.
 ///
-/// These constants are retained temporarily for test compatibility but the
-/// directive itself always returns empty.
+/// Round budget threshold - when LLM rounds reach this, guidance may change.
 pub const ROUND_BUDGET_THRESHOLD: u32 = 8;
+/// Round budget hard limit - maximum rounds before circuit breaker intervention.
 pub const ROUND_BUDGET_HARD_LIMIT: u32 = 15;
-
-#[deprecated(note = "Circuit breaker replaces countdown budget. Always returns empty.")]
-pub fn round_budget_directive(_round_index: u32) -> String {
-    String::new()
-}
-
-#[deprecated(note = "Circuit breaker replaces countdown budget. Always returns empty.")]
-pub fn round_budget_directive_with(_round_index: u32, _warning: u32, _limit: u32) -> String {
-    String::new()
-}
 
 /// Threshold for the parallel-batching nudge: how many consecutive trailing
 /// single-tool rounds we tolerate before injecting a corrective directive.
@@ -1615,15 +1605,6 @@ fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
         .count()
 }
 
-#[deprecated(note = "Circuit breaker replaces countdown budget. Always returns empty.")]
-pub fn synthesize_or_batch_directive(
-    _messages: &[serde_json::Value],
-    _round_index: u32,
-    _warning: u32,
-) -> String {
-    String::new()
-}
-
 /// Combined late-round guidance block used by bridge/server dynamic prompt
 /// assembly. Keeps the policy centralized so both paths surface the same
 /// round-budget, synthesis, and batching nudges.
@@ -1740,7 +1721,6 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
      Please try a different approach or summarize what you've found so far.";
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -2890,26 +2870,6 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_or_batch_directive_requires_late_round_and_trailing_tools() {
-        let early = synthesize_or_batch_directive(
-            &[serde_json::json!({"role": "tool", "content": "a"})],
-            ROUND_BUDGET_THRESHOLD - 1,
-            ROUND_BUDGET_THRESHOLD,
-        );
-        assert!(early.is_empty(), "early rounds should not get the nudge");
-
-        let no_trailing_tools = synthesize_or_batch_directive(
-            &[serde_json::json!({"role": "assistant", "content": "done"})],
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_THRESHOLD,
-        );
-        assert!(
-            no_trailing_tools.is_empty(),
-            "non-tool endings should not get the nudge"
-        );
-    }
-
-    #[test]
     fn tool_round_guidance_combines_budget_synthesis_and_parallel_feedback() {
         let messages = vec![
             serde_json::json!({"role": "user", "content": "inspect the repo"}),
@@ -3153,29 +3113,62 @@ mod tests {
         assert!(breakdown.guidance_signals.round_budget_warning);
     }
 
+    // ─── Round budget sentinel constants ─────────────────────────────────
+    //
+    // These constants are consumed by the circuit breaker (astra-turn-core::stall)
+    // and by tool_round_guidance callers that pass explicit thresholds. The
+    // tool_round_guidance trace function itself no longer emits budget warnings
+    // — circuit breaker handles stalls — so these constants serve as documented
+    // defaults for CLI / server loops that read them.
+
     #[test]
-    fn round_budget_defaults_allow_at_least_8_rounds_before_warning() {
-        // With the raised defaults, round 7 should NOT trigger a warning.
-        let directive = round_budget_directive(7);
-        assert!(
-            directive.is_empty(),
-            "round 7 should not trigger budget warning with raised defaults, got: {directive}"
-        );
+    fn round_budget_threshold_is_8() {
+        // Consumers (CLI bridge, server agentic loop) read this constant to
+        // configure circuit-breaker windows. If this changes, all of those
+        // call sites must be audited.
+        assert_eq!(ROUND_BUDGET_THRESHOLD, 8);
     }
 
     #[test]
-    fn round_budget_defaults_hard_limit_at_15() {
-        // Directive is always empty now (circuit breaker replaces countdown).
-        let at_limit = round_budget_directive(15);
-        assert!(
-            at_limit.is_empty(),
-            "round budget directive should always be empty"
+    fn round_budget_hard_limit_is_15() {
+        // Consumers read this constant for the absolute ceiling. Circuit
+        // breaker replaces the old countdown budget, so this is a sentinel
+        // value, not an active throttle inside tool_round_guidance.
+        assert_eq!(ROUND_BUDGET_HARD_LIMIT, 15);
+    }
+
+    #[test]
+    fn tool_round_guidance_below_threshold_neuters_budget_signals() {
+        // Round 5 is below ROUND_BUDGET_THRESHOLD (8). Budget signals should
+        // always be false — circuit breaker handles stalls, not the prompt.
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &[serde_json::json!({"role": "tool", "content": "output"})],
+            5,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
         );
-        let before_limit = round_budget_directive(14);
-        assert!(
-            before_limit.is_empty(),
-            "round budget directive should always be empty"
+        assert!(!guidance.contains("Round Budget Warning"));
+        assert!(!guidance.contains("Synthesize Or Batch"));
+        assert!(!signals.round_budget_warning);
+        assert!(!signals.synthesize_or_batch);
+    }
+
+    #[test]
+    fn tool_round_guidance_at_hard_limit_neuters_budget_signals() {
+        // Even at the hard limit, round budget directives are neutered.
+        // The circuit breaker (astra-turn-core::stall) issues the abort,
+        // not the prompt builder.
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &[serde_json::json!({"role": "tool", "content": "output"})],
+            ROUND_BUDGET_HARD_LIMIT,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
         );
+        assert!(!guidance.contains("Round Budget Warning"));
+        assert!(!signals.round_budget_warning);
+        assert!(!signals.synthesize_or_batch);
+        // Parallel batching nudge may or may not fire depending on streak;
+        // we only assert on budget signals here.
     }
 
     // ─── Parallel batching nudge (real-session-shaped fixtures) ─────────

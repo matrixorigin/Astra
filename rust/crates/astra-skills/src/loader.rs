@@ -16,8 +16,7 @@ use super::version::{Dependency, Version};
 
 /// Intermediate deserialization target for SKILL.md YAML frontmatter.
 ///
-/// Supports both legacy fields (from `skill_instructions.rs`) and new framework
-/// extensions. All new fields are optional for backward compatibility.
+/// Skill manifest loaded from YAML/JSON.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct RawFrontmatter {
     name: String,
@@ -477,7 +476,7 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
 /// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor (CC-compatible)
-/// 3. `{cwd}/skills/`         — project-level (legacy)
+/// 3. `{cwd}/skills/`         — project-level
 /// 4. `~/.astra/skills/`      — user-level global skills
 /// 5. `~/.claude/skills/`     — Claude Code user-level skills (CC-compatible)
 ///
@@ -522,6 +521,7 @@ pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> 
     paths.extend(astra);
     paths.extend(claude);
     // Legacy: skills/ in cwd only (not walked up).
+    // Kept for ecosystem compatibility (CC framework).
     paths.push(cwd.join("skills"));
 
     if let Some(home) = home {
@@ -705,7 +705,7 @@ Run in isolation.
     }
 
     #[test]
-    fn parse_legacy_depends_on() {
+    fn parse_depends_on() {
         let content = r#"---
 name: legacy
 description: "Legacy deps"
@@ -1015,7 +1015,7 @@ Hooked body."#;
         );
         assert!(
             cli_paths.contains(&cwd.join("skills")),
-            "CLI discovery must preserve legacy cwd/skills lookup: {cli_paths:?}"
+            "CLI discovery must preserve cwd/skills lookup: {cli_paths:?}"
         );
         assert!(
             cli_paths.contains(&home.join(".astra").join("skills"))

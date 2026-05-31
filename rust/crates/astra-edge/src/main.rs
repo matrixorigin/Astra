@@ -249,6 +249,8 @@ async fn main() {
     eprintln!();
 
     let mut exit_with_error = false;
+    let mut reconnect_delay_secs: u64 = 1;
+    let max_reconnect_delay_secs: u64 = 60;
     loop {
         let edge_span = tracing::info_span!(
             "edge.agent",
@@ -257,10 +259,14 @@ async fn main() {
         );
         match run_edge_connection(&args).instrument(edge_span).await {
             Ok(()) => {
+                reconnect_delay_secs = 1; // reset on clean disconnect
                 if !args.reconnect {
                     break;
                 }
-                tracing::info!("Disconnected, reconnecting in 5s...");
+                tracing::info!(
+                    delay = reconnect_delay_secs,
+                    "Disconnected, reconnecting..."
+                );
             }
             Err(e) => {
                 tracing::error!(error = %e, "Connection error");
@@ -268,10 +274,14 @@ async fn main() {
                     exit_with_error = true;
                     break;
                 }
-                tracing::info!("Reconnecting in 5s...");
+                tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Exponential backoff with jitter
+        // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
+        let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
+        tokio::time::sleep(Duration::from_secs_f64(jitter)).await;
+        reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
     }
 
     astra_logging::shutdown_otel();

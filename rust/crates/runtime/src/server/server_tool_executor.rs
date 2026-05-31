@@ -885,6 +885,14 @@ pub struct ServerToolExecutor {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Optional edge connection pool for routing to remote edge agents.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    /// Optional cross-pod edge dispatch relay (DB-backed).
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    /// Optional edge registry for cross-pod edge agent discovery.
+    edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
+    /// Attached edge agent ID for this run. When set, cross-pod dispatch
+    /// routes to this specific agent instead of arbitrarily picking the first
+    /// one from the registry.
+    attached_edge_agent_id: Option<String>,
     /// Optional observability session for self-mod and rollback-backed session state.
     observability_session:
         Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
@@ -1014,6 +1022,9 @@ impl ServerToolExecutor {
             auxiliary_event_writer: None,
             resource_governor: None,
             edge_connection_pool: None,
+            edge_dispatch_service: None,
+            edge_registry_service: None,
+            attached_edge_agent_id: None,
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             self_mod_pinned_tools: Mutex::new(pinned_tools),
@@ -1724,6 +1735,27 @@ impl ServerToolExecutor {
     ) {
         self.edge_connection_pool = Some(pool);
     }
+
+    pub fn set_edge_dispatch_service(
+        &mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    ) {
+        self.edge_dispatch_service = Some(svc);
+    }
+
+    pub fn set_edge_registry_service(
+        &mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    ) {
+        self.edge_registry_service = Some(svc);
+    }
+
+    /// Set the edge agent ID that this run is attached to. When set, cross-pod
+    /// dispatch routes tool requests to this specific agent instead of picking
+    /// the first agent from the registry.
+    pub fn set_attached_edge_agent_id(&mut self, edge_agent_id: String) {
+        self.attached_edge_agent_id = Some(edge_agent_id);
+    }
     /// Set the observability session for rollback-backed session-state tools.
     pub fn set_observability_session(
         &mut self,
@@ -1752,6 +1784,85 @@ impl ServerToolExecutor {
                     is_error: result.is_error,
                     exit_semantics: None,
                 };
+            }
+        }
+        // ── Cross-pod edge dispatch fallback ─────────────────────────
+        // Local pool had no matching edge connection; try routing via the
+        // DB-backed dispatch relay so a different pod can deliver the tool
+        // call to the edge client.
+        if let (Some(dispatch), Some(registry)) =
+            (&self.edge_dispatch_service, &self.edge_registry_service)
+        {
+            if let Ok(agents) = registry.list_by_user(&self.user_id).await {
+                // Match the agent this run is attached to; fall back to first()
+                // when no specific assignment exists (e.g. web-agent mode).
+                let target_agent = self
+                    .attached_edge_agent_id
+                    .as_deref()
+                    .and_then(|target_id| agents.iter().find(|a| a.edge_agent_id == target_id))
+                    .or_else(|| agents.first());
+                if let Some(agent) = target_agent {
+                    let request_id = format!(
+                        "xp-{}-{}",
+                        self.session_id,
+                        uuid::Uuid::new_v4()
+                            .to_string()
+                            .split('-')
+                            .next()
+                            .unwrap_or("0")
+                    );
+                    let timeout_secs = 300u64;
+                    let msg =
+                        astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+                            request_id: request_id.clone(),
+                            tool: name.to_string(),
+                            args: args.clone(),
+                            timeout_secs,
+                        };
+                    let payload_json = match serde_json::to_string(&msg) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            return astra_tools::ToolResult::error(format!(
+                                "dispatch payload serialization failed: {e}"
+                            ));
+                        }
+                    };
+
+                    if dispatch
+                        .insert_dispatch(
+                            &self.user_id,
+                            &agent.edge_agent_id,
+                            &request_id,
+                            &payload_json,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        match dispatch
+                            .wait_result(
+                                &request_id,
+                                std::time::Duration::from_secs(timeout_secs + 10),
+                            )
+                            .await
+                        {
+                            Ok(Some(result_json)) => {
+                                let (output, is_error) =
+                                    astra_thin_client::ToolResultRequest::parse_output_and_error(
+                                        &result_json,
+                                    );
+                                return astra_tools::ToolResult {
+                                    output,
+                                    metadata: None,
+                                    is_error,
+                                    exit_semantics: None,
+                                };
+                            }
+                            _ => {
+                                // Timeout or error — fall through to local execution
+                            }
+                        }
+                    }
+                }
             }
         }
         // ── Fire-and-forget resource usage recording (Phase 5) ────────
@@ -1791,7 +1902,7 @@ impl ServerToolExecutor {
         // ── Approval gate check ──────────────────────────────────────
         if let Some(gate) = &self.approval_gate {
             if gate.requires_approval(name) {
-                let request_id = format!("srv-{}-{}", self.session_id, uuid_v4_short());
+                let request_id = format!("srv-{}-{}", self.session_id, Uuid::new_v4());
                 let decision = gate.request_approval(&request_id, name, args).await;
                 match decision {
                     astra_tools::ApprovalDecision::Approved => { /* proceed */ }
@@ -1811,7 +1922,7 @@ impl ServerToolExecutor {
         }
 
         // ── Progress: tool started ───────────────────────────────────
-        let call_id = format!("{name}-{}", uuid_v4_short());
+        let call_id = format!("{name}-{}", Uuid::new_v4());
         if let Some(cb) = &self.progress_callback {
             cb.tool_started(&call_id, name, args).await;
         }
@@ -1966,31 +2077,31 @@ impl ServerToolExecutor {
             "bash" => self.server_bash(args).await,
             "grep" => self.default_executor.execute("grep", args).await,
             "glob" => self.default_executor.execute("glob", args).await,
-            // ── Git operations ─────────────────────────────────────────
-            // All git ops delegate to DefaultToolExecutor.
-            "git" => self.default_executor.execute("git", args).await,
-            "git_status" => self.default_executor.execute("git_status", args).await,
-            "git_diff" => self.default_executor.execute("git_diff", args).await,
-            "git_log" => self.default_executor.execute("git_log", args).await,
-            "git_file_history" => {
-                self.default_executor
-                    .execute("git_file_history", args)
-                    .await
-            }
-            "git_contributors" => {
-                self.default_executor
-                    .execute("git_contributors", args)
-                    .await
-            }
-            "git_log_search" => self.default_executor.execute("git_log_search", args).await,
-            "git_show" => self.default_executor.execute("git_show", args).await,
-            "git_blame" => self.default_executor.execute("git_blame", args).await,
             "symbols" => self.default_executor.execute("symbols", args).await,
-            "git_commit" => self.default_executor.execute("git_commit", args).await,
-            "git_stash" => self.default_executor.execute("git_stash", args).await,
-            "git_revert_commit" => {
+            // ── Git operations ─────────────────────────────────────────
+            // All git ops remap to the unified `git` tool with an `action`
+            // parameter, since DefaultToolExecutor only handles `"git"`.
+            "git" => self.default_executor.execute("git", args).await,
+            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame"
+            | "git_file_history" | "git_log_search" | "git_contributors" | "git_commit"
+            | "git_revert_commit" | "git_push" => {
+                let action = name.strip_prefix("git_").unwrap_or(name);
+                let mut map = args.as_object().cloned().unwrap_or_default();
+                map.insert("action".to_string(), json!(action));
                 self.default_executor
-                    .execute("git_revert_commit", args)
+                    .execute("git", &Value::Object(map))
+                    .await
+            }
+            "git_stash" => {
+                // Remap: the `git_stash` tool uses `action` for the stash
+                // sub-action, but `git_dispatch` reads `stash_action`.
+                let mut map = args.as_object().cloned().unwrap_or_default();
+                if let Some(action_val) = map.remove("action") {
+                    map.insert("stash_action".to_string(), action_val);
+                }
+                map.insert("action".to_string(), json!("stash"));
+                self.default_executor
+                    .execute("git", &Value::Object(map))
                     .await
             }
             // ── GitHub operations ────────────────────────────────────────
@@ -2180,7 +2291,7 @@ impl ServerToolExecutor {
             );
         };
 
-        let request_id = format!("ask-{}-{}", self.session_id, uuid_v4_short());
+        let request_id = format!("ask-{}-{}", self.session_id, Uuid::new_v4());
         let content = ask_user_content_preview(&prompt);
         self.persist_ask_user_auxiliary_event(
             "ask_user_prompted",
@@ -4729,16 +4840,6 @@ fn format_timeout_seconds(timeout_secs: f64) -> String {
         text.pop();
     }
     format!("{text}s")
-}
-
-/// Generate a short UUID-like identifier for call tracking.
-fn uuid_v4_short() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:08x}", (ts & 0xFFFF_FFFF) as u32)
 }
 
 fn edit_type_label(edit_type: EditType) -> &'static str {

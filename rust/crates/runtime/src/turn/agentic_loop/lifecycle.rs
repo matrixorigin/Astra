@@ -8,7 +8,8 @@ use serde_json::Value;
 use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, RunControlStatus,
+    try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_services::SessionArtifactStore;
@@ -1031,6 +1032,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     turn_index: usize,
 ) -> Result<PreparedTurnIteration, String> {
     let quiet = host.is_quiet();
+    let mut last_db_poll = std::time::Instant::now();
+    let db_poll_interval = std::time::Duration::from_millis(500);
 
     while state
         .cancellation
@@ -1038,6 +1041,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         .as_ref()
         .is_some_and(|f| f.load(Ordering::Acquire))
     {
+        // Check in-memory cancel flags (fast path, same pod)
         if state
             .cancellation
             .flag
@@ -1059,10 +1063,52 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 AgenticLoopOutcome::Cancelled,
             ));
         }
+
+        // Periodic DB poll for cross-pod cancel/pause
+        if last_db_poll.elapsed() >= db_poll_interval {
+            if let Some(ref rc) = state.run_control {
+                if let Some(run_id) = state.current_run_id.as_deref() {
+                    match rc.control_status(run_id).await {
+                        Some(RunControlStatus::Cancelled) => {
+                            if let Some(ref flag) = state.cancellation.flag {
+                                flag.store(true, Ordering::SeqCst);
+                            }
+                            if let Some(ref token) = state.cancellation.token {
+                                token.cancel();
+                            }
+                            try_write_heavy_checkpoint(state);
+                            state.interruption = Some(InterruptionRecord::new(
+                                InterruptionKind::UserCancelled,
+                                ResumeAction::ContinueImmediately,
+                                interruption_state_summary(state, None),
+                            ));
+                            return Ok(PreparedTurnIteration::Finished(
+                                AgenticLoopOutcome::Cancelled,
+                            ));
+                        }
+                        Some(RunControlStatus::Paused) => {
+                            // DB says paused, keep waiting — sync in-memory flag
+                            if let Some(ref flag) = state.cancellation.pause_flag {
+                                flag.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        _ => {
+                            // Run is no longer paused — clear in-memory flag and break
+                            if let Some(ref flag) = state.cancellation.pause_flag {
+                                flag.store(false, Ordering::SeqCst);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            last_db_poll = std::time::Instant::now();
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    if state
+    // Fast-path in-memory cancel check (same pod)
+    let in_memory_cancelled = state
         .cancellation
         .flag
         .as_ref()
@@ -1071,8 +1117,36 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             .cancellation
             .token
             .as_ref()
-            .is_some_and(|t| t.is_cancelled())
-    {
+            .is_some_and(|t| t.is_cancelled());
+
+    // Cross-pod DB check for cancel (only if in-memory didn't already catch it)
+    let db_cancelled = if !in_memory_cancelled {
+        if let Some(ref rc) = state.run_control {
+            if let Some(run_id) = state.current_run_id.as_deref() {
+                matches!(
+                    rc.control_status(run_id).await,
+                    Some(RunControlStatus::Cancelled)
+                )
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if in_memory_cancelled || db_cancelled {
+        // Sync in-memory flag if DB detected cancel
+        if db_cancelled {
+            if let Some(ref flag) = state.cancellation.flag {
+                flag.store(true, Ordering::SeqCst);
+            }
+            if let Some(ref token) = state.cancellation.token {
+                token.cancel();
+            }
+        }
         try_write_heavy_checkpoint(state);
         state.interruption = Some(InterruptionRecord::new(
             InterruptionKind::UserCancelled,
@@ -1082,6 +1156,24 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         return Ok(PreparedTurnIteration::Finished(
             AgenticLoopOutcome::Cancelled,
         ));
+    }
+
+    // Cross-pod DB check for pause (between turns)
+    if state.run_control.is_some() {
+        if let Some(run_id) = state.current_run_id.as_deref() {
+            if let Some(ref rc) = state.run_control {
+                if matches!(
+                    rc.control_status(run_id).await,
+                    Some(RunControlStatus::Paused)
+                ) {
+                    if let Some(ref flag) = state.cancellation.pause_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    // Recurse to re-enter the pause loop
+                    return Box::pin(prepare_turn_iteration(host, state, turn_index)).await;
+                }
+            }
+        }
     }
 
     if state.remaining_turns == 0 {

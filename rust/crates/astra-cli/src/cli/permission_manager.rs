@@ -960,27 +960,11 @@ impl PermissionSettings {
     /// fsyncs the parent directory. This guarantees that an interrupted
     /// save (SIGINT, crash, OS shutdown) never leaves a partially-written
     /// `permissions.json` on disk.
-    fn save_to_file(&self, dir: &Path, path: &Path, backup_path: &Path) -> io::Result<()> {
+    fn save_to_file(&self, dir: &Path, path: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)?;
 
-        // Issue #326 P1.5b: every save stamps the current
-        // grammar version so the next load knows the file is
-        // structured. We clone-and-stamp so `save` stays
-        // `&self`-compatible with the existing call sites.
         let mut to_serialize = self.clone();
         to_serialize.grammar_version = astra_turn_core::permission::rule_grammar::GRAMMAR_VERSION;
-
-        // If this is the first time we're stamping a v2 over a
-        // pre-existing v1 file, write a `.v1.bak.json` sibling
-        // so the user can roll back manually. We skip the
-        // backup if the file doesn't exist yet (brand-new
-        // session / first save) or if it's already at the
-        // current version.
-        if path.exists() && self.grammar_version == 0 && !backup_path.exists() {
-            if let Ok(existing) = fs::read(path) {
-                let _ = fs::write(backup_path, existing);
-            }
-        }
 
         let json = serde_json::to_string_pretty(&to_serialize)?;
 
@@ -997,19 +981,12 @@ impl PermissionSettings {
 
     /// Save to the project-level settings file.
     ///
-    /// Issue #326 P5d: also takes a process-wide exclusive `flock`
-    /// on `.kiro/permissions.lock` for the duration of the
-    /// load-merge-save sequence in [`Self::modify`]. Direct callers
-    /// of `save` (i.e. the existing `add_allow_rule` path) get the
-    /// atomic-rename guarantee but skip the lock; they're racy
-    /// against another astra process writing the same file. Use
-    /// `modify` (preferred) when correctness across concurrent
-    /// processes matters.
+    /// Writes atomically via temp file + rename. Use `modify` (preferred) when
+    /// correctness across concurrent processes matters.
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
         let dir = project_root.join(".kiro");
         let path = dir.join("permissions.json");
-        let backup_path = dir.join("permissions.v1.bak.json");
-        self.save_to_file(&dir, &path, &backup_path)
+        self.save_to_file(&dir, &path)
     }
 
     fn user_settings_dir(home: &Path) -> PathBuf {
@@ -1032,8 +1009,7 @@ impl PermissionSettings {
     fn save_user_in_home(&self, home: &Path) -> io::Result<()> {
         let dir = Self::user_settings_dir(home);
         let path = Self::user_settings_path(home);
-        let backup_path = dir.join("permissions.v1.bak.json");
-        self.save_to_file(&dir, &path, &backup_path)
+        self.save_to_file(&dir, &path)
     }
 
     /// Load → mutate → save with a process-wide exclusive lock.

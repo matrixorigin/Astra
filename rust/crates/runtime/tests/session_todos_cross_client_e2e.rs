@@ -54,7 +54,7 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
 async fn edge_created_task_visible_on_cloud() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-x-client-{}", uuid::Uuid::new_v4());
@@ -80,7 +80,7 @@ async fn edge_created_task_visible_on_cloud() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
 async fn snapshot_restore_roundtrips_through_mo() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-snap-{}", uuid::Uuid::new_v4());
@@ -108,7 +108,7 @@ async fn snapshot_restore_roundtrips_through_mo() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
 async fn snapshot_restore_after_cross_client_allocations_reuses_ids_without_collision() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-snap-x-client-{}", uuid::Uuid::new_v4());
@@ -156,7 +156,7 @@ async fn snapshot_restore_after_cross_client_allocations_reuses_ids_without_coll
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
 async fn deleted_and_cancelled_are_distinct_transitions() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-states-{}", uuid::Uuid::new_v4());
@@ -209,7 +209,7 @@ async fn deleted_and_cancelled_are_distinct_transitions() {
 /// (the worst case — edge + cloud racing) and asserts all returned ids
 /// are unique and densely packed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
 async fn concurrent_next_task_id_is_unique() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-race-{}", uuid::Uuid::new_v4());

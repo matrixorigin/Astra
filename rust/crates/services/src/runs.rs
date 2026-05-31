@@ -537,8 +537,19 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
 
-    /// Append an event to the run's event log.
-    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String>;
+    /// Append multiple events in a single batch. This is the canonical write
+    /// path. Single-event callers should use `append_event` which delegates here.
+    async fn append_events_batch(
+        &self,
+        run_id: &str,
+        events: &[serde_json::Value],
+    ) -> Result<(), String>;
+
+    /// Append a single event. Default implementation delegates to
+    /// `append_events_batch`.
+    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
+        self.append_events_batch(run_id, &[event]).await
+    }
 
     /// List runs for a user with pagination.
     async fn list_user_runs(
@@ -951,18 +962,25 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(projections.get(run_id).cloned())
     }
 
-    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
-        let latest_event_type = extract_event_type(&event);
+    async fn append_events_batch(
+        &self,
+        run_id: &str,
+        events: &[serde_json::Value],
+    ) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let latest_event_type = extract_event_type(events.last().unwrap());
         let updated = {
             let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(run_id) {
-                run.events.push(event);
-                run.last_event_idx = run.events.len() as i64 - 1;
-                run.updated_at = chrono::Utc::now().to_rfc3339();
-                Some(run.clone())
-            } else {
-                None
-            }
+            let Some(run) = runs.get_mut(run_id) else {
+                return Ok(());
+            };
+            let start_idx = run.events.len() as i64;
+            run.events.extend(events.iter().cloned());
+            run.last_event_idx = start_idx + events.len() as i64 - 1;
+            run.updated_at = chrono::Utc::now().to_rfc3339();
+            Some(run.clone())
         };
         if let Some(run) = updated {
             self.sync_projection(&run, Some(latest_event_type), None)
@@ -1115,7 +1133,7 @@ pub struct ToolOutputBatchItem {
 
 /// MatrixOne durable run store.
 ///
-/// Events are append-only in `agent_run_events`; `run_counters` owns event_idx
+/// Events are append-only in `agent_run_events`; `agent_runs` owns event_idx counter via CAS
 /// allocation so reconnect and replay never scan `MAX(event_idx)`.
 #[derive(Clone)]
 pub struct DatabaseRunStateStore {
@@ -1266,7 +1284,7 @@ impl DatabaseRunStateStore {
         let lease_expires_at = chrono::Utc::now()
             + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(45));
         let result = sqlx::query(
-            "UPDATE run_counters
+            "UPDATE agent_runs
              SET owner_pod_id = ?,
                  owner_lease_expires_at = ?,
                  run_generation = run_generation + 1,
@@ -1282,26 +1300,7 @@ impl DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("acquire_owner_lease", run_id, source))?;
 
-        if result.rows_affected() == 0 {
-            return Ok(false);
-        }
-
-        sqlx::query(
-            "UPDATE agent_runs
-             SET owner_pod_id = ?,
-                 owner_lease_expires_at = ?,
-                 run_generation = run_generation + 1,
-                 updated_at = NOW(6)
-             WHERE run_id = ?",
-        )
-        .bind(owner_pod_id)
-        .bind(lease_expires_at.naive_utc())
-        .bind(run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("sync_owner_lease_to_run", run_id, source))?;
-
-        Ok(true)
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn insert_tool_output_batch(
@@ -1422,88 +1421,6 @@ impl DatabaseRunStateStore {
         Ok(())
     }
 
-    async fn append_event_inner(
-        &self,
-        run_id: &str,
-        event: serde_json::Value,
-    ) -> DbStoreResult<()> {
-        let idempotency_key = extract_optional_string(&event, "idempotency_key");
-        if let Some(key) = idempotency_key.as_deref() {
-            let existing = sqlx::query(
-                "SELECT id FROM agent_run_events WHERE run_id = ? AND idempotency_key = ? LIMIT 1",
-            )
-            .bind(run_id)
-            .bind(key)
-            .fetch_optional(self.pool.get())
-            .await
-            .map_err(|source| db_error("lookup_run_event_idempotency", run_id, source))?;
-            if existing.is_some() {
-                return Ok(());
-            }
-        }
-
-        let run = self
-            .load_run_metadata(run_id)
-            .await?
-            .ok_or_else(|| db_error("load_run_for_append", run_id, sqlx::Error::RowNotFound))?;
-        let payload_json =
-            serde_json::to_string(&event).map_err(|source| DatabaseRunStateStoreError::Json {
-                operation: "serialize_run_event",
-                entity: run_id.to_string(),
-                source,
-            })?;
-        let event_type = extract_event_type(&event);
-        let event_id = extract_optional_string(&event, "event_id")
-            .or_else(|| extract_optional_string(&event, "id"))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let event_hash = sha256_hex(payload_json.as_bytes());
-
-        let event_idx = self.allocate_event_idx(run_id).await?;
-
-        let insert = sqlx::query(
-            "INSERT INTO agent_run_events
-             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
-              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(run_id)
-        .bind(event_idx)
-        .bind(&run.user_id)
-        .bind(&run.session_id)
-        .bind(&event_type)
-        .bind(event_id)
-        .bind(&run.agent_id)
-        .bind(idempotency_key)
-        .bind(event_hash)
-        .bind(&self.owner_pod_id)
-        .bind(payload_json)
-        .execute(self.pool.get())
-        .await;
-
-        if let Err(source) = insert {
-            let msg = source.to_string();
-            if msg.contains("uq_run_event_idempotency") || msg.contains("Duplicate") {
-                return Ok(());
-            }
-            return Err(db_error("insert_run_event", run_id, source));
-        }
-
-        sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6) WHERE run_id = ?",
-        )
-        .bind(event_idx)
-        .bind(run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("update_run_last_event_idx", run_id, source))?;
-
-        self.sync_projection(run_id, Some(event_type.as_str()), None)
-            .await?;
-
-        Ok(())
-    }
-
     async fn load_run_metadata(&self, run_id: &str) -> DbStoreResult<Option<DurableRunRecord>> {
         let row = sqlx::query("SELECT * FROM agent_runs WHERE run_id = ?")
             .bind(run_id)
@@ -1602,34 +1519,261 @@ impl DatabaseRunStateStore {
         self.upsert_run_projection(&projection).await
     }
 
-    async fn allocate_event_idx(&self, run_id: &str) -> DbStoreResult<i64> {
-        for _ in 0..32 {
-            let row = sqlx::query("SELECT next_event_idx FROM run_counters WHERE run_id = ?")
+    /// Allocate a contiguous block of `count` event indices in one CAS operation.
+    /// Returns the starting index. The caller owns [start, start+count).
+    async fn allocate_event_indices_batch(&self, run_id: &str, count: i64) -> DbStoreResult<i64> {
+        if count <= 0 {
+            return Ok(0);
+        }
+        for attempt in 0u32..64 {
+            let row = sqlx::query("SELECT last_event_idx FROM agent_runs WHERE run_id = ?")
                 .bind(run_id)
                 .fetch_one(self.pool.get())
                 .await
-                .map_err(|source| db_error("select_run_counter", run_id, source))?;
-            let next = row.try_get::<i64, _>("next_event_idx").unwrap_or(0);
+                .map_err(|source| db_error("select_last_event_idx", run_id, source))?;
+            let current: i64 = row.get(0);
             let result = sqlx::query(
-                "UPDATE run_counters
-                 SET next_event_idx = next_event_idx + 1, updated_at = NOW(6)
-                 WHERE run_id = ? AND next_event_idx = ?",
+                "UPDATE agent_runs
+                 SET last_event_idx = last_event_idx + ?
+                 WHERE run_id = ? AND last_event_idx = ?",
             )
+            .bind(count)
             .bind(run_id)
-            .bind(next)
+            .bind(current)
             .execute(self.pool.get())
             .await
-            .map_err(|source| db_error("cas_increment_run_counter", run_id, source))?;
+            .map_err(|source| db_error("cas_increment_last_event_idx", run_id, source))?;
             if result.rows_affected() == 1 {
-                return Ok(next);
+                return Ok(current + 1);
             }
-            tokio::task::yield_now().await;
+            // Exponential backoff with jitter: 1ms → 2ms → 4ms → … capping at 128ms.
+            // `fastrand` jitter prevents thundering herd across pods.
+            let base_ms = 1u64 << attempt.min(7);
+            let jitter_ms = fastrand::u64(0..base_ms.min(64));
+            tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
         }
         Err(db_error(
-            "allocate_event_idx",
+            "allocate_event_indices_batch",
             run_id,
             sqlx::Error::Protocol("run counter CAS exhausted".to_string()),
         ))
+    }
+
+    /// Append multiple events in a single batch, minimizing DB round-trips.
+    /// Loads run metadata once, allocates all indices in one CAS, does one
+    /// bulk INSERT, one last_event_idx UPDATE, and one projection sync.
+    async fn append_events_batch(
+        &self,
+        run_id: &str,
+        events: &[serde_json::Value],
+    ) -> DbStoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // ── Idempotency dedup ──
+        // Pre-filter events whose idempotency_key already exists (optimization).
+        // INSERT IGNORE acts as the safety net: if another pod concurrently writes
+        // the same key between the SELECT and INSERT, the duplicate row is
+        // silently skipped instead of failing the entire batch.
+        let idem_keys: Vec<String> = events
+            .iter()
+            .filter_map(|e| extract_optional_string(e, "idempotency_key"))
+            .collect();
+
+        let existing: std::collections::HashSet<String> = if !idem_keys.is_empty() {
+            let ph = idem_keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT idempotency_key FROM agent_run_events WHERE run_id = ? AND idempotency_key IN ({})",
+                ph
+            );
+            let mut q = sqlx::query(&sql).bind(run_id);
+            for k in &idem_keys {
+                q = q.bind(k);
+            }
+            q.fetch_all(self.pool.get())
+                .await
+                .map_err(|source| db_error("lookup_batch_idempotency", run_id, source))?
+                .iter()
+                .map(|r: &sqlx::mysql::MySqlRow| r.get::<String, _>("idempotency_key"))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| {
+                extract_optional_string(e, "idempotency_key")
+                    .map(|k| !existing.contains(k.as_str()))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Load run metadata once for the whole batch.
+        let run = self.load_run_metadata(run_id).await?.ok_or_else(|| {
+            db_error(
+                "load_run_for_batch_append",
+                run_id,
+                sqlx::Error::RowNotFound,
+            )
+        })?;
+
+        // Allocate all indices in one CAS.
+        let start_idx = self
+            .allocate_event_indices_batch(run_id, events.len() as i64)
+            .await?;
+
+        // Build bulk INSERT. MatrixOne / MySQL supports multi-row VALUES.
+        // Column list is defined once; the number of `?` placeholders per row
+        // (12) is derived from BatchEventRow's field count (created_at uses NOW(6)).
+        const EVENT_INSERT_COLUMNS: &str =
+            "(id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
+              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)";
+        let mut query = String::from("INSERT IGNORE INTO agent_run_events ");
+        query.push_str(EVENT_INSERT_COLUMNS);
+        query.push_str(" VALUES ");
+
+        // Number of bind placeholders must match column count (13 cols, 1 is NOW(6)).
+        const BIND_COUNT: usize = 12;
+
+        #[derive(Debug)]
+        struct BatchEventRow {
+            id: String,
+            run_id: String,
+            event_idx: i64,
+            user_id: String,
+            session_id: String,
+            event_type: String,
+            event_id: String,
+            agent_id: String,
+            idempotency_key: Option<String>,
+            event_hash: String,
+            producer_pod_id: String,
+            payload_json: String,
+        }
+
+        impl BatchEventRow {
+            fn bind_all<'q>(
+                &'q self,
+                mut exec: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+            ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+                exec = exec
+                    .bind(&self.id)
+                    .bind(&self.run_id)
+                    .bind(self.event_idx)
+                    .bind(&self.user_id)
+                    .bind(&self.session_id)
+                    .bind(&self.event_type)
+                    .bind(&self.event_id)
+                    .bind(&self.agent_id)
+                    .bind(&self.idempotency_key)
+                    .bind(&self.event_hash)
+                    .bind(&self.producer_pod_id)
+                    .bind(&self.payload_json);
+                exec
+            }
+        }
+
+        let mut rows: Vec<BatchEventRow> = Vec::with_capacity(events.len());
+
+        for (i, event) in events.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            // Build one row's placeholders: BIND_COUNT `?`s + `NOW(6)` for created_at.
+            query.push('(');
+            for j in 0..BIND_COUNT {
+                if j > 0 {
+                    query.push_str(", ");
+                }
+                query.push('?');
+            }
+            query.push_str(", NOW(6))");
+
+            let payload_json = serde_json::to_string(event).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "serialize_run_event_batch",
+                    entity: run_id.to_string(),
+                    source,
+                }
+            })?;
+            let event_type = extract_event_type(event);
+            let event_id = extract_optional_string(event, "event_id")
+                .or_else(|| extract_optional_string(event, "id"))
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let event_hash = sha256_hex(payload_json.as_bytes());
+            let idempotency_key = extract_optional_string(event, "idempotency_key");
+
+            rows.push(BatchEventRow {
+                id: Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                event_idx: start_idx + i as i64,
+                user_id: run.user_id.clone(),
+                session_id: run.session_id.clone(),
+                event_type,
+                event_id,
+                agent_id: run.agent_id.clone().unwrap_or_default(),
+                idempotency_key,
+                event_hash,
+                producer_pod_id: self.owner_pod_id.clone(),
+                payload_json,
+            });
+        }
+
+        let mut exec = sqlx::query(&query);
+        for row in &rows {
+            exec = row.bind_all(exec);
+        }
+        match exec.execute(self.pool.get()).await {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(db_err)) => {
+                // MySQL error 1062 / SQLSTATE 23000 = duplicate key.
+                // INSERT IGNORE should prevent this, but if a UNIQUE constraint
+                // fires anyway (e.g. on a non-idempotency-key column), propagate.
+                if db_err.code() == Some(std::borrow::Cow::Borrowed("23000"))
+                    && db_err.message().contains("idempotency_key")
+                {
+                    tracing::warn!(
+                        target: "astra_services::runs",
+                        run_id = %run_id,
+                        "Idempotency key conflict in batch insert, skipping"
+                    );
+                } else {
+                    return Err(db_error(
+                        "insert_run_events_batch",
+                        run_id,
+                        sqlx::Error::Database(db_err),
+                    ));
+                }
+            }
+            Err(source) => {
+                return Err(db_error("insert_run_events_batch", run_id, source));
+            }
+        };
+
+        // Update last_event_idx to the highest allocated index.
+        // Use events.len() (allocated range), not actually_inserted, because
+        // INSERT IGNORE may skip duplicate keys in the middle of the batch,
+        // creating gaps. The allocated range is monotonic and correct.
+        let last_idx = start_idx + events.len() as i64 - 1;
+        sqlx::query(
+            "UPDATE agent_runs SET last_event_idx = CASE WHEN ? > last_event_idx THEN ? ELSE last_event_idx END, updated_at = NOW(6) WHERE run_id = ?",
+        )
+        .bind(last_idx)
+        .bind(last_idx)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("update_run_last_event_idx_batch", run_id, source))?;
+
+        self.sync_projection(run_id, None, None).await?;
+
+        Ok(())
     }
 }
 
@@ -1670,6 +1814,12 @@ impl RunStateStore for DatabaseRunStateStore {
             + chrono::Duration::from_std(self.lease_ttl)
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         let events = std::mem::take(&mut record.events);
+
+        // New run: last_event_idx must be -1 (no events written yet) so the
+        // first batch append allocates indices starting at 0.
+        if !events.is_empty() {
+            record.last_event_idx = -1;
+        }
 
         let insert_result = if run_requires_session_exclusive_start(&record) {
             sqlx::query(
@@ -1764,22 +1914,8 @@ impl RunStateStore for DatabaseRunStateStore {
             return Err("session already has an active run".to_string());
         }
 
-        sqlx::query(
-            "INSERT INTO run_counters
-             (run_id, next_event_idx, owner_pod_id, owner_lease_expires_at, run_generation, created_at, updated_at)
-             VALUES (?, 0, ?, ?, ?, NOW(6), NOW(6))
-             ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
-        )
-        .bind(&record.run_id)
-        .bind(&self.owner_pod_id)
-        .bind(lease_expires_at.naive_utc())
-        .bind(record.run_generation as i64)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("insert_run_counter", &record.run_id, source).to_string())?;
-
-        for event in events {
-            self.append_event_inner(&record.run_id, event)
+        if !events.is_empty() {
+            self.append_events_batch(&record.run_id, &events)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1939,7 +2075,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let result = sqlx::query(
             "UPDATE agent_runs
              SET checkpoint_version = ?, checkpoint_json = ?, updated_at = NOW(6)
-             WHERE run_id = ?",
+             WHERE run_id = ? AND status NOT IN ('completed', 'failed')",
         )
         .bind(&checkpoint_version)
         .bind(checkpoint_json)
@@ -1948,6 +2084,10 @@ impl RunStateStore for DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("save_checkpoint", run_id, source).to_string())?;
         if result.rows_affected() == 0 {
+            // Run was deleted or already finished — rollback and signal no-op.
+            tx.rollback().await.map_err(|source| {
+                db_error("rollback_save_checkpoint", run_id, source).to_string()
+            })?;
             return Ok(false);
         }
         tx.commit()
@@ -2032,8 +2172,15 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
-        self.append_event_inner(run_id, event)
+    // `append_event` not overridden — trait default delegates to
+    // `append_events_batch` which uses bulk INSERT internally.
+
+    async fn append_events_batch(
+        &self,
+        run_id: &str,
+        events: &[serde_json::Value],
+    ) -> Result<(), String> {
+        DatabaseRunStateStore::append_events_batch(self, run_id, events)
             .await
             .map_err(|e| e.to_string())
     }
@@ -3198,6 +3345,97 @@ mod tests {
             "store has {} runs, expected ≤ {max}",
             runs.len()
         );
+    }
+
+    // ── Batch event append tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn append_events_batch_stores_events_in_order() {
+        let store = InMemoryRunStateStore::new();
+        let run = durable_run_record("batch-order");
+        store.insert_run(run).await.unwrap();
+
+        let events = vec![
+            make_event("tool_call", json!({"tool": "read_file"})),
+            make_event("tool_result", json!({"output": "hello"})),
+            make_event("text_delta", json!({"chunk": "done"})),
+        ];
+        store
+            .append_events_batch("batch-order", &events)
+            .await
+            .unwrap();
+
+        let loaded = store.load_run("batch-order").await.unwrap().unwrap();
+        assert_eq!(loaded.events.len(), 3);
+        assert_eq!(loaded.events[0]["event_type"], "tool_call");
+        assert_eq!(loaded.events[1]["event_type"], "tool_result");
+        assert_eq!(loaded.events[2]["event_type"], "text_delta");
+        assert_eq!(loaded.last_event_idx, 2);
+    }
+
+    #[tokio::test]
+    async fn append_events_batch_empty_is_noop() {
+        let store = InMemoryRunStateStore::new();
+        let run = durable_run_record("batch-empty");
+        store.insert_run(run).await.unwrap();
+
+        store.append_events_batch("batch-empty", &[]).await.unwrap();
+
+        let loaded = store.load_run("batch-empty").await.unwrap().unwrap();
+        assert_eq!(loaded.events.len(), 0);
+        assert_eq!(loaded.last_event_idx, -1); // unchanged
+    }
+
+    #[tokio::test]
+    async fn append_events_batch_single_event() {
+        let store = InMemoryRunStateStore::new();
+        let run = durable_run_record("batch-single");
+        store.insert_run(run).await.unwrap();
+
+        store
+            .append_events_batch("batch-single", &[make_event("run_started", json!({}))])
+            .await
+            .unwrap();
+
+        let loaded = store.load_run("batch-single").await.unwrap().unwrap();
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.last_event_idx, 0);
+    }
+
+    #[tokio::test]
+    async fn append_events_batch_preserves_sequential_semantics() {
+        // Batch and sequential append must produce identical state.
+        let store_batch = InMemoryRunStateStore::new();
+        let store_seq = InMemoryRunStateStore::new();
+
+        let events: Vec<_> = (0..5)
+            .map(|i| make_event("text_delta", json!({"chunk": i.to_string()})))
+            .collect();
+
+        store_batch
+            .insert_run(durable_run_record("r-batch"))
+            .await
+            .unwrap();
+        store_seq
+            .insert_run(durable_run_record("r-seq"))
+            .await
+            .unwrap();
+
+        store_batch
+            .append_events_batch("r-batch", &events)
+            .await
+            .unwrap();
+        for e in &events {
+            store_seq.append_event("r-seq", e.clone()).await.unwrap();
+        }
+
+        let batch = store_batch.load_run("r-batch").await.unwrap().unwrap();
+        let seq = store_seq.load_run("r-seq").await.unwrap().unwrap();
+        assert_eq!(batch.events.len(), seq.events.len());
+        assert_eq!(batch.last_event_idx, seq.last_event_idx);
+        for (i, (be, se)) in batch.events.iter().zip(seq.events.iter()).enumerate() {
+            assert_eq!(be, se, "event {i} differs between batch and sequential");
+        }
     }
 }
 

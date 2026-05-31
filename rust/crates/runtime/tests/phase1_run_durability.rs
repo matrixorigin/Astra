@@ -536,7 +536,7 @@ async fn l2_lease_race_has_single_owner() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l2_event_idx_and_idempotency_use_run_counters() {
+async fn l2_event_idx_and_idempotency_use_agent_runs() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
     let store = DatabaseRunStateStore::new(pool.clone());
@@ -576,14 +576,14 @@ async fn l2_event_idx_and_idempotency_use_run_counters() {
         .collect::<Vec<_>>();
     assert_eq!(idx, [0, 1, 2]);
 
-    let counter = sqlx::query("SELECT next_event_idx FROM run_counters WHERE run_id = ?")
+    let counter = sqlx::query("SELECT last_event_idx FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .fetch_one(pool.get())
         .await
         .unwrap()
-        .try_get::<i64, _>("next_event_idx")
+        .try_get::<i64, _>("last_event_idx")
         .unwrap();
-    assert_eq!(counter, 3);
+    assert_eq!(counter, 2);
 }
 
 #[tokio::test]
@@ -873,7 +873,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     assert!(recovered.iter().any(|run| run.run_id == run_id));
 
     sqlx::query(
-        "UPDATE run_counters
+        "UPDATE agent_runs
          SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
          WHERE run_id = ?",
     )
@@ -887,7 +887,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .acquire_owner_lease(&run_id, "phase1-pod-b", Duration::from_secs(30))
             .await
             .unwrap(),
-        "new pod should take over the durable run_counters lease after restart"
+        "new pod should take over the durable agent_runs lease after restart"
     );
     *active_store.write().await = store_b.clone();
 

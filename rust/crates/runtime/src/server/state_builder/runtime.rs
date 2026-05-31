@@ -61,6 +61,10 @@ pub(super) async fn build_runtime_wiring(
     );
 
     let resource_governor = initialize_resource_governor(shared_pool).await;
+    let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let mut run_lifecycle = AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
         Arc::clone(run_encryptor),
@@ -70,13 +74,16 @@ pub(super) async fn build_runtime_wiring(
     .with_pool(shared_pool.clone())
     .with_delegation_engine(Arc::clone(&delegation_engine))
     .with_edge_connection_pool(state.edge_connection_pool.clone())
+    .with_edge_dispatch_service(state.execution.edge_dispatch_service.clone())
+    .with_edge_registry_service(state.execution.edge_registry_service.clone())
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_hook_db_writer(state.turn_persistence.hook_db_writer.clone())
     .with_observer_worker(state.turn_persistence.observer_worker.clone())
     .with_tool_event_writer(state.turn_persistence.tool_event_writer.clone())
-    .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone());
+    .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone())
+    .with_run_concurrency_limit(run_concurrency_limit);
     if let Some(svc) = memory_extraction_service.as_ref() {
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
     }

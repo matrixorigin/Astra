@@ -2363,6 +2363,11 @@ pub struct AgenticRunLifecycleService {
     shared_pool: Option<SharedPool>,
     /// Edge callback ledger shared with the API server.
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    /// P0-3: Cross-pod edge dispatch service. When configured, tool results
+    /// delivered to another pod are visible via DB polling fallback.
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    /// P0-3: Edge registry for cross-pod edge agent discovery.
+    edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     /// Durable run engine for persistence, replay, status, and recovery.
     run_engine: RunEngine,
     /// Optional delegation engine for multi-agent coordination.
@@ -2406,6 +2411,10 @@ pub struct AgenticRunLifecycleService {
     /// Incremented before spawn, decremented when the task exits.
     /// Used by `drain_background_tasks` for graceful shutdown.
     background_task_count: Arc<AtomicUsize>,
+    /// Global admission control: limits the number of concurrently executing
+    /// agentic loop tasks across all users. A permit is acquired before
+    /// spawn and automatically released when the task completes.
+    run_semaphore: Arc<tokio::sync::Semaphore>,
     /// Harness sink registry for server-side harness observation (Phase 2A).
     #[cfg(feature = "harness")]
     harness_registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
@@ -2429,6 +2438,8 @@ impl AgenticRunLifecycleService {
             encryptor,
             shared_pool: None,
             edge_callback_ledger,
+            edge_dispatch_service: None,
+            edge_registry_service: None,
             run_engine,
             delegation_engine: None,
             server_agent_spawners: Arc::new(RwLock::new(HashMap::new())),
@@ -2449,6 +2460,7 @@ impl AgenticRunLifecycleService {
             tool_event_writer: None,
             auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
+            run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
             #[cfg(feature = "harness")]
             harness_registry: None,
             memory_extraction_service: None,
@@ -2490,6 +2502,23 @@ impl AgenticRunLifecycleService {
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
+        self
+    }
+
+    /// P0-3: Wire the cross-pod edge dispatch service for horizontal scaling.
+    pub fn with_edge_dispatch_service(
+        mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    ) -> Self {
+        self.edge_dispatch_service = Some(svc);
+        self
+    }
+
+    pub fn with_edge_registry_service(
+        mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    ) -> Self {
+        self.edge_registry_service = Some(svc);
         self
     }
 
@@ -2535,6 +2564,18 @@ impl AgenticRunLifecycleService {
     ) -> Self {
         self.auxiliary_event_writer = Some(writer);
         self
+    }
+
+    /// Configure the maximum number of concurrent agentic loop tasks.
+    /// Default: 50. Set via env `ASTRA_RUN_CONCURRENCY_LIMIT`.
+    pub fn with_run_concurrency_limit(mut self, limit: usize) -> Self {
+        self.run_semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_run_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        self.run_semaphore.clone()
     }
 
     fn dynamic_agent_progress_broadcaster(&self) -> Arc<ProgressBroadcaster> {
@@ -2980,6 +3021,9 @@ impl AgenticRunLifecycleService {
         loop_state.cancellation.pause_flag = Some(pause_flag.clone());
         loop_state.cancellation.token = Some(llm_cancel_token.clone());
         loop_state.delegation_engine = self.delegation_engine.clone();
+        // Wire cross-pod cancel/pause provider so the agentic loop can poll
+        // DB for control signals from other pods in horizontally-scaled deployments.
+        loop_state.run_control = Some(Arc::new(self.run_engine.clone()));
     }
 
     async fn persist_run_start(
@@ -3523,6 +3567,7 @@ impl AgenticRunLifecycleService {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
+            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -3784,13 +3829,6 @@ impl AgenticRunLifecycleService {
         )
     }
 
-    fn run_control_state_unavailable(action: &str) -> (StatusCode, Json<ErrorResponse>) {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Run control state unavailable for {action}"),
-        )
-    }
-
     fn durable_persist_error(action: &str, error: String) -> (StatusCode, Json<ErrorResponse>) {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4016,6 +4054,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
+            if let Some(svc) = &self.edge_dispatch_service {
+                executor.set_edge_dispatch_service(Arc::clone(svc));
+            }
+            if let Some(svc) = &self.edge_registry_service {
+                executor.set_edge_registry_service(Arc::clone(svc));
+            }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
             if let Some(shared) = &self.shared_pool {
@@ -4116,6 +4160,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_session_id = session_id.clone();
         let bg_resource_governor = self.resource_governor.clone();
         let bg_user_id = user_id.clone();
+        let _bg_cancel_flag = cancel_flag.clone();
+        let _bg_pause_flag = pause_flag.clone();
+        let _bg_llm_cancel_token = llm_cancel_token.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -4131,12 +4178,31 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
+        // ── Global admission control: limit concurrent agentic loop tasks ──
+        // Wait up to 30 s for a slot (previously immediate 503);
+        // if no slot frees up, return 503.
+        let permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.run_semaphore.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(_elapsed) => {
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server at capacity, please retry",
+                ));
+            }
+        };
+
         // Background task tracking: background_task_count is incremented before
         // spawn and decremented via RAII guard on exit. serve()'s shutdown path
         // calls drain_background_tasks() to wait for in-flight runs.
         let bg_task_count_1 = Arc::clone(&self.background_task_count);
         bg_task_count_1.fetch_add(1, Ordering::Release);
         tokio::spawn(async move {
+            let _permit = permit; // RAII: released when this task completes
             // RAII guard: decrement counter when this task exits (normal or panic).
             struct TaskCountGuard(Arc<AtomicUsize>);
             impl Drop for TaskCountGuard {
@@ -4145,6 +4211,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
             let _guard = TaskCountGuard(bg_task_count_1);
+
             // Pre-flight: check daily token budget before starting the agentic loop.
             if let Some(ref gov) = bg_resource_governor {
                 use astra_services::resource_governor::LimitCheck;
@@ -4293,15 +4360,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     gov.record_tokens(&bg_user_id, total).await;
                 }
             }
-            if persist_terminal_events {
-                for event in terminal_events {
-                    astra_core::log_persist!(
-                        run_engine.append_event(&bg_run_id, event).await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "append_terminal_event"
-                    );
-                }
+            if persist_terminal_events && !terminal_events.is_empty() {
+                astra_core::log_persist!(
+                    run_engine
+                        .append_events_batch(&bg_run_id, &terminal_events)
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "append_terminal_events_batch"
+                );
             }
 
             if persist_terminal_events {
@@ -4395,22 +4462,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let fanout_run_id = run_id.clone();
         let fanout_run_engine = self.run_engine.clone();
         tokio::spawn(async move {
+            let mut pending_deltas: Vec<Value> = Vec::new();
             while let Some(event) = fanout_rx.recv().await {
                 if live_delta_event_for_persistence(&event) {
                     if let Some(run) = fanout_runs.write().await.get_mut(&fanout_run_id) {
                         run.events.push(event.clone());
                     }
-                    astra_core::log_persist!(
-                        fanout_run_engine
-                            .append_event(&fanout_run_id, event.clone())
-                            .await,
-                        "run_lifecycle",
-                        &fanout_run_id,
-                        "append_live_delta_event"
-                    );
+                    pending_deltas.push(event.clone());
                 }
                 let _ = live_tx_for_fanout.send(event.clone());
                 let _ = client_event_tx.send(event).await;
+            }
+            // Flush accumulated text_deltas in a single batch at turn end.
+            if !pending_deltas.is_empty() {
+                astra_core::log_persist!(
+                    fanout_run_engine
+                        .append_events_batch(&fanout_run_id, &pending_deltas)
+                        .await,
+                    "run_lifecycle",
+                    &fanout_run_id,
+                    "append_live_delta_batch"
+                );
             }
         });
 
@@ -4559,6 +4631,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
+            if let Some(svc) = &self.edge_dispatch_service {
+                executor.set_edge_dispatch_service(Arc::clone(svc));
+            }
+            if let Some(svc) = &self.edge_registry_service {
+                executor.set_edge_registry_service(Arc::clone(svc));
+            }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
                 executor = executor.with_workspace_artifact_store(
@@ -4623,12 +4701,30 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
+        // ── Global admission control: limit concurrent agentic loop tasks ──
+        // Wait up to 30 s for a slot; if no slot frees up, return 503.
+        let permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.run_semaphore.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(_elapsed) => {
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server at capacity, please retry",
+                ));
+            }
+        };
+
         // Background task tracking (same pattern as the create_run spawn above).
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
         let bg_task_count_2 = Arc::clone(&self.background_task_count);
         bg_task_count_2.fetch_add(1, Ordering::Release);
         tokio::spawn(async move {
+            let _permit = permit; // RAII: released when this task completes
             struct TaskCountGuard(Arc<AtomicUsize>);
             impl Drop for TaskCountGuard {
                 fn drop(&mut self) {
@@ -4762,13 +4858,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "usage"
             );
 
-            // Persist terminal events to durable store.
-            for event in terminal_events {
+            // Persist terminal events to durable store in a single batch.
+            if !terminal_events.is_empty() {
                 astra_core::log_persist!(
-                    run_engine.append_event(&bg_run_id, event).await,
+                    run_engine
+                        .append_events_batch(&bg_run_id, &terminal_events)
+                        .await,
                     "run_lifecycle",
                     &bg_run_id,
-                    "append_terminal_event"
+                    "append_terminal_events_batch"
                 );
             }
 
@@ -5160,72 +5258,39 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let pause_event = json!({"event_type": "run_paused", "data": {}});
-        {
-            let mut runs = self.runs.write().await;
-            let Some(run) = runs.get_mut(&run_id) else {
-                return Err(Self::run_control_state_unavailable("pause"));
-            };
-            if run.status.try_transition(&RunStatus::Paused).is_err() {
-                return Err(Self::run_state_conflict("pause", run.status.as_str()));
-            }
-            run.pause_flag.store(true, Ordering::SeqCst);
-        }
-
+        // Always write to DB first — the source of truth for cross-pod control.
         if let Err(error) = self
             .run_engine
             .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
             .await
         {
-            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
-                run.pause_flag.store(false, Ordering::SeqCst);
-            }
             return Err(Self::durable_persist_error("pause status", error));
         }
-        let append_result = self
+        if let Err(error) = self
             .run_engine
             .append_event(&run_id, pause_event.clone())
-            .await;
-
+            .await
         {
-            let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(&run_id) {
-                run.status = RunStatus::Paused;
-                run.pause_flag.store(true, Ordering::SeqCst);
-                run.waiting_for = Some("user_resume".to_string());
-                run.events.push(pause_event);
-            }
-        }
-
-        if let Err(error) = append_result {
-            let rollback_result = self
+            // Rollback DB status. Ignore rollback failures — durable state
+            // still says PAUSED, but the event was never written, so the run
+            // is in a safe state (no partial event). On pod restart, the
+            // LR/checkpoint logic handles reconciliation.
+            let _ = self
                 .run_engine
                 .persist_status(&run_id, STATUS_RUNNING, None, None)
                 .await;
-            let rollback_succeeded = rollback_result.is_ok();
-            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
-                run.status = if rollback_succeeded {
-                    RunStatus::Running
-                } else {
-                    RunStatus::Paused
-                };
-                run.pause_flag.store(!rollback_succeeded, Ordering::SeqCst);
-                run.waiting_for = if rollback_succeeded {
-                    None
-                } else {
-                    Some("user_resume".to_string())
-                };
-                run.events.pop();
-            }
-            // If rollback persistence also fails, keep memory aligned with the
-            // durable PAUSED state that actually survived.
-            if let Err(rollback_err) = rollback_result {
-                tracing::error!(
-                    %run_id,
-                    error = %rollback_err,
-                    "pause-event append failed and rollback persist_status(RUNNING) also failed; durable status may diverge from memory",
-                );
-            }
             return Err(Self::durable_persist_error("pause event", error));
+        }
+
+        // Only update in-memory state after both DB writes succeeded.
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(&run_id) {
+                run.pause_flag.store(true, Ordering::SeqCst);
+                run.status = RunStatus::Paused;
+                run.waiting_for = Some("user_resume".to_string());
+                run.events.push(pause_event);
+            }
         }
         if let Some(de) = &self.delegation_engine {
             de.pause_children_of(&run_id).await;
@@ -5270,65 +5335,35 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
-        {
-            let mut runs = self.runs.write().await;
-            let Some(run) = runs.get_mut(&run_id) else {
-                return Err(Self::run_control_state_unavailable("resume"));
-            };
-            if run.status.try_transition(&RunStatus::Running).is_err() {
-                return Err(Self::run_state_conflict("resume", run.status.as_str()));
-            }
-        }
-
-        self.run_engine
+        // Always write to DB first — the source of truth for cross-pod control.
+        if let Err(error) = self
+            .run_engine
             .persist_status(&run_id, STATUS_RUNNING, None, None)
             .await
-            .map_err(|error| Self::durable_persist_error("resume status", error))?;
-        let append_result = self
+        {
+            return Err(Self::durable_persist_error("resume status", error));
+        }
+        if let Err(error) = self
             .run_engine
             .append_event(&run_id, resume_event.clone())
-            .await;
-
+            .await
         {
-            let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(&run_id) {
-                run.status = RunStatus::Running;
-                run.pause_flag.store(false, Ordering::SeqCst);
-                run.waiting_for = None;
-                run.events.push(resume_event);
-            }
-        }
-
-        if let Err(error) = append_result {
-            let rollback_result = self
+            let _ = self
                 .run_engine
                 .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
                 .await;
-            let rollback_succeeded = rollback_result.is_ok();
-            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
-                run.status = if rollback_succeeded {
-                    RunStatus::Paused
-                } else {
-                    RunStatus::Running
-                };
-                run.pause_flag.store(rollback_succeeded, Ordering::SeqCst);
-                run.waiting_for = if rollback_succeeded {
-                    Some("user_resume".to_string())
-                } else {
-                    None
-                };
-                run.events.pop();
-            }
-            // Mirror of the pause branch above: keep memory aligned with the
-            // durable RUNNING state if the rollback write never lands.
-            if let Err(rollback_err) = rollback_result {
-                tracing::error!(
-                    %run_id,
-                    error = %rollback_err,
-                    "resume-event append failed and rollback persist_status(PAUSED) also failed; durable status may diverge from memory",
-                );
-            }
             return Err(Self::durable_persist_error("resume event", error));
+        }
+
+        // Only update in-memory state after both DB writes succeeded.
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(&run_id) {
+                run.pause_flag.store(false, Ordering::SeqCst);
+                run.status = RunStatus::Running;
+                run.waiting_for = None;
+                run.events.push(resume_event);
+            }
         }
         if let Some(de) = &self.delegation_engine {
             de.resume_children_of(&run_id).await;
@@ -5357,6 +5392,8 @@ pub struct ServerSpawnAgentExecutor {
     shared_pool: Option<SharedPool>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     runtime_contexts: Arc<RwLock<HashMap<String, ServerSpawnRuntimeContext>>>,
@@ -5374,6 +5411,8 @@ impl ServerSpawnAgentExecutor {
             shared_pool: None,
             edge_callback_ledger,
             edge_connection_pool: None,
+            edge_dispatch_service: None,
+            edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
             runtime_contexts: Arc::new(RwLock::new(HashMap::new())),
@@ -5390,6 +5429,22 @@ impl ServerSpawnAgentExecutor {
         pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     ) -> Self {
         self.edge_connection_pool = pool;
+        self
+    }
+
+    pub fn with_edge_dispatch_service(
+        mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    ) -> Self {
+        self.edge_dispatch_service = Some(svc);
+        self
+    }
+
+    pub fn with_edge_registry_service(
+        mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    ) -> Self {
+        self.edge_registry_service = Some(svc);
         self
     }
 
@@ -5448,6 +5503,12 @@ impl ServerSpawnAgentExecutor {
         }
         if let Some(pool) = self.edge_connection_pool.clone() {
             executor = executor.with_edge_connection_pool(pool);
+        }
+        if let Some(svc) = self.edge_dispatch_service.clone() {
+            executor = executor.with_edge_dispatch_service(svc);
+        }
+        if let Some(svc) = self.edge_registry_service.clone() {
+            executor = executor.with_edge_registry_service(svc);
         }
         if let Some(service) = self.skill_service.clone() {
             executor = executor.with_skill_service(service);
@@ -5672,6 +5733,8 @@ pub struct ServerSubRunExecutor {
     shared_pool: Option<SharedPool>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -5690,6 +5753,8 @@ impl ServerSubRunExecutor {
             shared_pool: None,
             edge_callback_ledger,
             edge_connection_pool: None,
+            edge_dispatch_service: None,
+            edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -5715,6 +5780,22 @@ impl ServerSubRunExecutor {
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
+        self
+    }
+
+    pub fn with_edge_dispatch_service(
+        mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    ) -> Self {
+        self.edge_dispatch_service = Some(svc);
+        self
+    }
+
+    pub fn with_edge_registry_service(
+        mut self,
+        svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    ) -> Self {
+        self.edge_registry_service = Some(svc);
         self
     }
 
@@ -5937,6 +6018,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ..Default::default()
             },
             error_recovery: Default::default(),
+            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -6043,6 +6125,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             }
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
+            }
+            if let Some(svc) = &self.edge_dispatch_service {
+                executor.set_edge_dispatch_service(Arc::clone(svc));
+            }
+            if let Some(svc) = &self.edge_registry_service {
+                executor.set_edge_registry_service(Arc::clone(svc));
             }
             if let Some(shared) = self.shared_pool.as_ref() {
                 executor.set_plan_repository(std::sync::Arc::new(
@@ -6783,12 +6871,16 @@ mod tests {
             self.inner.load_run_projection(run_id).await
         }
 
-        async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
+        async fn append_events_batch(
+            &self,
+            run_id: &str,
+            events: &[serde_json::Value],
+        ) -> Result<(), String> {
             let call = self.next_append_call();
             if self.fail_append_calls.contains(&call) {
                 return Err(format!("injected append_event failure on call {call}"));
             }
-            self.inner.append_event(run_id, event).await
+            self.inner.append_events_batch(run_id, events).await
         }
 
         async fn list_user_runs(
@@ -8317,18 +8409,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_run_running_cache_miss_returns_service_unavailable() {
+    async fn pause_run_running_succeeds_via_db() {
         let svc = test_service_with_engine();
         let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
-        let e = err(svc.pause_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(e.1.0.detail, "Run control state unavailable for pause");
+        let result = ok(svc.pause_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(result.status, STATUS_PAUSED);
+        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_PAUSED);
     }
 
     #[tokio::test]
-    async fn resume_run_paused_cache_miss_returns_service_unavailable() {
+    async fn resume_run_paused_succeeds_via_db() {
         let svc = test_service_with_engine();
         let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
@@ -8337,15 +8430,15 @@ mod tests {
             .await
             .unwrap();
 
-        let e = err(svc.resume_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(e.1.0.detail, "Run control state unavailable for resume");
+        let result = ok(svc.resume_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(result.status, STATUS_RUNNING);
+        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
     }
 
     #[tokio::test]
-    async fn pause_run_append_failure_with_failed_rollback_keeps_memory_aligned_with_durable_pause()
-    {
-        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[2], &[1]));
+    async fn pause_run_append_failure_rollback_succeeds_keeps_running() {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
         let svc = test_service_with_store(store);
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
 
@@ -8354,24 +8447,23 @@ mod tests {
         assert!(e.1.0.detail.contains("pause event"));
 
         let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
-        assert_eq!(durable.status, STATUS_PAUSED);
-        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert!(durable.waiting_for.is_none());
         assert_eq!(durable.events.len(), 1);
         assert_eq!(durable.events[0]["event_type"], "run_started");
 
         let runs = svc.runs.read().await;
         let live = runs.get(&run.run_id).expect("live run state");
-        assert_eq!(live.status, RunStatus::Paused);
-        assert_eq!(live.waiting_for.as_deref(), Some("user_resume"));
-        assert!(live.pause_flag.load(Ordering::SeqCst));
+        assert_eq!(live.status, RunStatus::Running);
+        assert!(live.waiting_for.is_none());
+        assert!(!live.pause_flag.load(Ordering::SeqCst));
         assert_eq!(live.events.len(), 1);
         assert_eq!(live.events[0]["event_type"], "run_started");
     }
 
     #[tokio::test]
-    async fn resume_run_append_failure_with_failed_rollback_keeps_memory_aligned_with_durable_running()
-     {
-        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[3], &[2]));
+    async fn resume_run_append_failure_rollback_succeeds_keeps_paused() {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[2]));
         let svc = test_service_with_store(store);
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
@@ -8381,16 +8473,16 @@ mod tests {
         assert!(e.1.0.detail.contains("resume event"));
 
         let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
-        assert_eq!(durable.status, STATUS_RUNNING);
-        assert!(durable.waiting_for.is_none());
+        assert_eq!(durable.status, STATUS_PAUSED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
         assert_eq!(durable.events.len(), 2);
         assert_eq!(durable.events[1]["event_type"], "run_paused");
 
         let runs = svc.runs.read().await;
         let live = runs.get(&run.run_id).expect("live run state");
-        assert_eq!(live.status, RunStatus::Running);
-        assert!(live.waiting_for.is_none());
-        assert!(!live.pause_flag.load(Ordering::SeqCst));
+        assert_eq!(live.status, RunStatus::Paused);
+        assert_eq!(live.waiting_for.as_deref(), Some("user_resume"));
+        assert!(live.pause_flag.load(Ordering::SeqCst));
         assert_eq!(live.events.len(), 2);
         assert_eq!(live.events[1]["event_type"], "run_paused");
     }
@@ -9075,5 +9167,100 @@ mod tests {
         let durable = engine.load_run("waiting-run").await.unwrap().unwrap();
         assert_eq!(result.status, STATUS_CANCELLED);
         assert_eq!(durable.status, STATUS_CANCELLED);
+    }
+
+    /// Admission control: semaphore rejects when at capacity, allows after release.
+    #[tokio::test]
+    async fn run_semaphore_admission_control() {
+        // Limit = 1: only one concurrent run permitted.
+        let svc = AgenticRunLifecycleService::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
+        )
+        .with_run_concurrency_limit(1);
+        let sem = svc.test_run_semaphore();
+
+        // 1st acquire succeeds.
+        let permit1 = sem.clone().try_acquire_owned().expect("first permit");
+        // 2nd acquire must fail — at capacity.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "second acquire must fail when at capacity"
+        );
+
+        // After release, re-acquire succeeds.
+        drop(permit1);
+        let permit2 = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("re-acquire after release");
+        drop(permit2);
+    }
+
+    /// Admission control: limit=2, third acquire must fail, release creates room.
+    #[tokio::test]
+    async fn run_semaphore_limit_two() {
+        let svc = AgenticRunLifecycleService::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
+        )
+        .with_run_concurrency_limit(2);
+        let sem = svc.test_run_semaphore();
+
+        let p1 = sem.clone().try_acquire_owned().expect("first");
+        let p2 = sem.clone().try_acquire_owned().expect("second");
+        assert!(sem.clone().try_acquire_owned().is_err(), "third must fail");
+
+        drop(p1);
+        // Now one slot open, re-acquire works.
+        let p3 = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("re-acquire after one drop");
+        drop(p2);
+        drop(p3);
+    }
+
+    /// Admission with timeout: `acquire_owned` + `timeout` rejects after
+    /// the deadline while a short release window lets a waiter proceed.
+    #[tokio::test]
+    async fn run_semaphore_admission_timeout_waits_and_proceeds() {
+        let svc = AgenticRunLifecycleService::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
+        )
+        .with_run_concurrency_limit(1);
+        let sem = svc.test_run_semaphore();
+
+        // 1st acquire: capacity exhausted.
+        let p1 = sem.clone().try_acquire_owned().expect("first");
+        // Spawn a waiter with a short timeout — it will time out.
+        let sem2 = sem.clone();
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sem2.acquire_owned()).await;
+        assert!(
+            timeout_result.is_err(),
+            "waiter should time out when no slot opens"
+        );
+
+        // Now spawn a waiter and release the slot quickly — waiter should get it.
+        let sem3 = sem.clone();
+        let waiter = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), sem3.acquire_owned())
+                .await
+                .expect("timeout should not fire")
+                .expect("acquire_owned")
+        });
+        // Small yield to let the waiter enter acquire_owned.
+        tokio::task::yield_now().await;
+        drop(p1); // release the slot
+        let p2 = waiter.await.expect("waiter panicked");
+        drop(p2);
     }
 }

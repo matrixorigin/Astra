@@ -758,6 +758,13 @@ pub struct CancellationState {
     pub token: Option<Arc<CancellationToken>>,
 }
 
+/// Cross-pod cancel/pause status provider for horizontally-scaled deployments.
+///
+/// When the run is running on a different pod than the one that received the
+/// cancel/pause request, the in-memory `AtomicBool` flags won't be updated.
+/// Re-exported from [`crate::turn::run_control::RunControlProvider`].
+pub use crate::turn::run_control::{RunControlProvider, RunControlStatus};
+
 /// Error recovery state for the agentic loop.
 #[derive(Default)]
 pub struct ErrorRecoveryState {
@@ -1064,6 +1071,13 @@ pub struct AgenticLoopState {
     pub hooks: StopHookState,
     pub cancellation: CancellationState,
     pub error_recovery: ErrorRecoveryState,
+
+    // ── Horizontal scaling ──
+    /// Optional cross-pod cancel/pause status provider.
+    /// When set, the agentic loop periodically polls the database for the
+    /// authoritative run status, enabling cross-pod control without
+    /// sticky sessions. See [`RunControlProvider`].
+    pub run_control: Option<Arc<dyn RunControlProvider>>,
 
     // ── Context Pipeline ──
     /// Session-scoped pipeline orchestrator. When `Some`, the pipeline manages
@@ -2189,6 +2203,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         api_token: String::new(),
         delegation_engine: None,
         delegations_this_turn: 0,
+        run_control: None,
         project_context: None,
         checkpoint_gate: None,
         last_llm_context_manifest_trace: None,
@@ -2549,6 +2564,7 @@ pub(crate) mod tests {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            run_control: None,
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,

@@ -22,6 +22,7 @@ pub mod loop_dispatcher;
 pub mod memory_prefetch;
 pub mod permission_gate;
 pub mod prompt_cache;
+pub mod run_control;
 pub mod session_current_date;
 pub mod session_end_debounce;
 /// Re-exported from astra-turn-types

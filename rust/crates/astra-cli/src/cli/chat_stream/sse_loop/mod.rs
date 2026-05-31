@@ -748,6 +748,7 @@ pub(crate) async fn stream_chat_sse(
             consecutive_same_error: 0,
             last_error_category: None,
         },
+        run_control: None,
         pipeline_session: Some({
             let config = astra_turn_core::pipeline_config::PipelineConfig::default();
             let session_current_date =

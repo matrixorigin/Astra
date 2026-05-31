@@ -41,7 +41,7 @@ use astra_services::{
     },
 };
 
-use astra_core::{STATUS_RUNNING, STATUS_WAITING};
+use astra_core::{STATUS_CANCELLED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING};
 
 /// Durable run execution engine.
 ///
@@ -344,9 +344,38 @@ impl RunEngine {
         self.store.append_event(run_id, event).await
     }
 
+    /// Append multiple events in a single batch.
+    pub async fn append_events_batch(
+        &self,
+        run_id: &str,
+        events: &[serde_json::Value],
+    ) -> Result<(), String> {
+        self.store.append_events_batch(run_id, events).await
+    }
+
     /// Load a run from the durable store (cache miss or recovery path).
     pub async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
         self.store.load_run(run_id).await
+    }
+
+    /// Check whether the run has been cancelled or paused externally
+    /// (e.g. by another pod in a horizontally-scaled deployment).
+    /// Returns `Some("cancelled")` if cancelled, `Some("paused")` if paused,
+    /// or `None` if the run is still active. Also returns `Some("cancelled")`
+    /// when the run record cannot be found (e.g. was deleted by a different pod).
+    pub async fn check_control_status(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunControlStatus>, String> {
+        let record = self.store.load_run(run_id).await?;
+        Ok(match record {
+            None => Some(RunControlStatus::Cancelled),
+            Some(r) => match r.status.as_str() {
+                STATUS_CANCELLED => Some(RunControlStatus::Cancelled),
+                s if s == STATUS_PAUSED => Some(RunControlStatus::Paused),
+                _ => None,
+            },
+        })
     }
 
     /// Find all runs in WAITING status (for the resume engine to re-evaluate).
@@ -471,6 +500,16 @@ impl RunEngine {
     /// Access the underlying store (for advanced queries).
     pub fn store(&self) -> &Arc<dyn RunStateStore> {
         &self.store
+    }
+}
+
+use crate::turn::run_control::{RunControlProvider, RunControlStatus};
+
+#[async_trait::async_trait]
+impl RunControlProvider for RunEngine {
+    #[allow(clippy::blocks_in_conditions)]
+    async fn control_status(&self, run_id: &str) -> Option<RunControlStatus> {
+        self.check_control_status(run_id).await.ok().flatten()
     }
 }
 

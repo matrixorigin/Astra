@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_append_and_load_roundtrip() {
         let store = test_store().await;
         let sid = &format!("db-test-roundtrip-{}", uuid::Uuid::new_v4());
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_load_snapshot_latest() {
         let store = test_store().await;
         let sid = &format!("db-test-snap-latest-{}", uuid::Uuid::new_v4());
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_truncate_gc() {
         let store = test_store().await;
         let sid = &format!("db-test-truncate-{}", uuid::Uuid::new_v4());
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_fork() {
         let store = test_store().await;
         let parent = &format!("db-test-fork-parent-{}", uuid::Uuid::new_v4());
@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_load_after() {
         let store = test_store().await;
         let sid = &format!("db-test-load-after-{}", uuid::Uuid::new_v4());
@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_load_nonexistent_returns_empty() {
         let store = test_store().await;
         let sid = &format!("db-test-nonexistent-{}", uuid::Uuid::new_v4());
@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live DB"]
     async fn db_fork_preserves_tool_results() {
         let store = test_store().await;
         let parent = &format!("db-test-fork-tool-parent-{}", uuid::Uuid::new_v4());

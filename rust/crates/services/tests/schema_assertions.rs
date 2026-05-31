@@ -259,19 +259,6 @@ async fn phase1_run_durability_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
-    let run_counters = column_names(&pool, &schema, "run_counters").await;
-    for expected in [
-        "next_event_idx",
-        "owner_pod_id",
-        "owner_lease_expires_at",
-        "run_generation",
-    ] {
-        assert!(
-            run_counters.iter().any(|column| column == expected),
-            "run_counters missing {expected}"
-        );
-    }
-
     assert_eq!(
         unique_key_columns(&pool, &schema, "agent_run_events", "uq_run_event_idx").await,
         ["run_id", "event_idx"],
@@ -296,6 +283,9 @@ async fn phase1_run_durability_schema_contract() {
         "depth",
         "retry_of",
         "retry_scope",
+        "owner_pod_id",
+        "owner_lease_expires_at",
+        "run_generation",
     ] {
         assert!(
             agent_runs.iter().any(|column| column == expected),
@@ -408,14 +398,12 @@ async fn phase3_context_manifest_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
-    let reasons =
-        sqlx::query("SELECT reason FROM context_manifest_reason_types WHERE is_active = 1")
-            .fetch_all(pool.get())
-            .await
-            .expect("load context manifest reasons")
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("reason").unwrap())
-            .collect::<Vec<_>>();
+    // reason types are a Rust constant (CONTEXT_MANIFEST_REASONS), not a DB table.
+    let reasons = astra_services::context_manifest::CONTEXT_MANIFEST_REASONS
+        .iter()
+        .map(|(r, _, _)| r.to_string())
+        .chain(std::iter::once("other".to_string()))
+        .collect::<Vec<_>>();
     for expected in [
         "initial_turn",
         "normal_turn",
@@ -885,19 +873,6 @@ async fn phase6_artifact_retention_preview_schema_contract() {
         required_templates.len() >= 18,
         "required Phase 6 template set is incomplete"
     );
-
-    let runner_columns = column_names(&pool, &schema, "tool_runner_registry").await;
-    for expected in [
-        "tool_name",
-        "preview_template_version",
-        "normalize_version",
-        "default_raw_ref_scheme",
-    ] {
-        assert!(
-            runner_columns.iter().any(|column| column == expected),
-            "tool_runner_registry missing {expected}"
-        );
-    }
 
     let scheme_rows = sqlx::query(
         "SELECT scheme FROM raw_ref_scheme_registry

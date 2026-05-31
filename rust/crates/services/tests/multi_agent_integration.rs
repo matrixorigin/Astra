@@ -259,3 +259,200 @@ async fn push_tasks_pack_held_accepts_holder_rejects_other() {
 
     cleanup_task(&pool, &task_id).await;
 }
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_renew_extends_expiry_and_version() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("lease-renew")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    let granted = lease
+        .try_claim_lease(&user, &task_id, "agent-renew", "e1", 60)
+        .await
+        .expect("claim");
+    let (initial_ver, initial_exp) = match granted {
+        LeaseClaimResult::Granted {
+            lease_version,
+            expires_at,
+        } => (lease_version, expires_at),
+        other => panic!("expected Granted, got {other:?}"),
+    };
+
+    // Small delay to ensure expiry time advances
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let renewed = lease
+        .renew_lease(&user, &task_id, "agent-renew", "e1", 120)
+        .await
+        .expect("renew")
+        .expect("renewed lease");
+
+    assert!(
+        renewed.lease_version > initial_ver,
+        "version should increment"
+    );
+    assert!(
+        renewed.expires_at >= initial_exp,
+        "expiry should not decrease"
+    );
+    assert_eq!(renewed.holder_agent_id, "agent-renew");
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_expired_cannot_be_renewed() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("lease-expire")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    // Claim with minimal TTL (30s is the floor)
+    lease
+        .try_claim_lease(&user, &task_id, "agent-expire", "e1", 30)
+        .await
+        .expect("claim");
+
+    // Manually expire the lease in DB for test speed
+    sqlx::query(
+        "UPDATE task_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE task_id = ?",
+    )
+    .bind(&task_id)
+    .execute(&pool)
+    .await
+    .expect("expire lease");
+
+    let result = lease
+        .renew_lease(&user, &task_id, "agent-expire", "e1", 60)
+        .await
+        .expect("renew attempt");
+
+    assert!(result.is_none(), "expired lease should not renew");
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_release_clears_hold_cache() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("lease-release")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    lease
+        .try_claim_lease(&user, &task_id, "agent-release", "e1", 60)
+        .await
+        .expect("claim");
+
+    assert!(
+        cache
+            .held_task_ids_for_agent("agent-release")
+            .contains(&task_id),
+        "hold cache should track claimed lease"
+    );
+
+    let released = lease
+        .release_lease(&user, &task_id, "agent-release")
+        .await
+        .expect("release");
+    assert!(released, "lease should be released");
+
+    assert!(
+        !cache
+            .held_task_ids_for_agent("agent-release")
+            .contains(&task_id),
+        "hold cache should clear on release"
+    );
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_wrong_agent_cannot_release() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("lease-wrong-agent")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    lease
+        .try_claim_lease(&user, &task_id, "agent-owner", "e1", 60)
+        .await
+        .expect("claim");
+
+    let released = lease
+        .release_lease(&user, &task_id, "agent-other")
+        .await
+        .expect("release attempt");
+    assert!(!released, "wrong agent should not release");
+
+    // Verify original holder still holds
+    let view = lease
+        .get_lease(&user, &task_id)
+        .await
+        .expect("get lease")
+        .expect("lease exists");
+    assert_eq!(view.holder_agent_id, "agent-owner");
+
+    cleanup_task(&pool, &task_id).await;
+}

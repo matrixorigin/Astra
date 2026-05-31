@@ -1,7 +1,7 @@
 use super::*;
 use crate::server::run::lifecycle::AgenticRunLifecycleService;
 
-mod bridge;
+pub(crate) mod bridge;
 mod core;
 mod runtime;
 
@@ -64,7 +64,7 @@ pub async fn build_server_state(
         &matrix_rt,
     );
 
-    bridge::spawn_runtime_sweepers(shared_pool.clone());
+    crate::server::sweeper_lease::spawn_runtime_sweepers(shared_pool.clone());
     Ok(state.with_matrix_cloud_runtime(Some(matrix_rt)))
 }
 

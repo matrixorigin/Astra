@@ -58,11 +58,8 @@ fn encrypt_persisted_ledger_line(line: &str) -> String {
 }
 
 fn decrypt_persisted_ledger_line(line: &str) -> Option<String> {
-    if line.starts_with('{') {
-        return Some(line.to_string());
-    }
     let bytes = hex_decode(line.trim())?;
-    let decrypted = ledger_crypto().decrypt_with_legacy_support(&bytes)?;
+    let decrypted = ledger_crypto().decrypt(&bytes)?;
     String::from_utf8(decrypted).ok()
 }
 

@@ -504,18 +504,11 @@ async fn hard_delete_session_rows(
 ) -> Result<u64, String> {
     let mut deleted = 0_u64;
 
-    for (label, statement) in [
-        (
-            "user_skill_evaluations",
-            "DELETE FROM user_skill_evaluations
+    for (label, statement) in [(
+        "user_skill_evaluations",
+        "DELETE FROM user_skill_evaluations
              WHERE run_id IN (SELECT run_id FROM agent_runs WHERE session_id = ?)",
-        ),
-        (
-            "run_counters",
-            "DELETE FROM run_counters
-             WHERE run_id IN (SELECT run_id FROM agent_runs WHERE session_id = ?)",
-        ),
-    ] {
+    )] {
         deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
     }
 

@@ -794,23 +794,6 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
-        "CREATE TABLE IF NOT EXISTS run_counters (
-            run_id VARCHAR(64) PRIMARY KEY,
-            next_event_idx BIGINT NOT NULL DEFAULT 0,
-            owner_pod_id VARCHAR(128) NULL,
-            owner_lease_expires_at DATETIME(6) NULL,
-            run_generation BIGINT NOT NULL DEFAULT 0,
-            request_id VARCHAR(64) NULL,
-            trace_id VARCHAR(64) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_run_counters_owner_lease (owner_pod_id, owner_lease_expires_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) PRIMARY KEY,
             run_id VARCHAR(64) NOT NULL,
@@ -1167,21 +1150,26 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
+    // ── Sweeper leader election (prevents duplicate background work in
+    // multi-pod deployments). One row per sweeper type; pods CAS-update
+    // the lease every TTL/2 seconds. Only the lease holder runs work.
+    query("DROP TABLE IF EXISTS sweeper_leases")
+        .execute(&pool)
+        .await?;
     query(
-        "CREATE TABLE IF NOT EXISTS context_manifest_reason_types (
-            reason VARCHAR(64) PRIMARY KEY,
-            reason_class VARCHAR(64) NOT NULL,
-            description TEXT NOT NULL,
-            default_zone VARCHAR(64) NULL,
-            is_active SMALLINT NOT NULL DEFAULT 1,
+        "CREATE TABLE IF NOT EXISTS sweeper_leases (
+            sweeper_name VARCHAR(128) PRIMARY KEY,
+            owner_pod_id VARCHAR(256) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            version INT UNSIGNED NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ctx_reason_class (reason_class, reason)
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         )",
     )
     .execute(&pool)
     .await?;
 
+    // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
     query(
         "CREATE TABLE IF NOT EXISTS context_manifests (
             manifest_id VARCHAR(128) PRIMARY KEY,
@@ -1262,22 +1250,6 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
-        "CREATE TABLE IF NOT EXISTS tool_runner_registry (
-            tool_name VARCHAR(128) PRIMARY KEY,
-            runner_version VARCHAR(64) NOT NULL,
-            preview_template_version VARCHAR(64) NOT NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1',
-            default_raw_ref_scheme VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_tool_runner_status (status, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
         "CREATE TABLE IF NOT EXISTS raw_ref_scheme_registry (
             scheme VARCHAR(64) PRIMARY KEY,
             resolver_name VARCHAR(128) NOT NULL,
@@ -1290,20 +1262,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-
-    for (reason, reason_class, default_zone) in crate::context_manifest::CONTEXT_MANIFEST_REASONS {
-        query(
-            "INSERT IGNORE INTO context_manifest_reason_types
-             (reason, reason_class, description, default_zone, is_active, created_at)
-             VALUES (?, ?, ?, ?, 1, NOW(6))",
-        )
-        .bind(reason)
-        .bind(reason_class)
-        .bind(format!("Seeded context manifest reason: {reason}"))
-        .bind(*default_zone)
-        .execute(&pool)
-        .await?;
-    }
 
     for (scheme, resolver, backing, access_check, example) in [
         (
@@ -1410,17 +1368,6 @@ pub async fn ensure_core_schema(
         )
         .bind(fts_field_weights)
         .bind(tool_name)
-        .execute(&pool)
-        .await?;
-
-        query(
-            "INSERT IGNORE INTO tool_runner_registry
-             (tool_name, runner_version, preview_template_version, normalize_version,
-              default_raw_ref_scheme, status, created_at, updated_at)
-             VALUES (?, 'v1', 'v1', ?, 'artifact', 'active', NOW(6), NOW(6))",
-        )
-        .bind(tool_name)
-        .bind(normalize_version)
         .execute(&pool)
         .await?;
     }
@@ -2163,6 +2110,72 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
+            dispatch_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            edge_agent_id VARCHAR(128) NOT NULL,
+            request_id VARCHAR(128) NOT NULL,
+            payload_json JSON NOT NULL,
+            result_json JSON NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            pod_id VARCHAR(128) NULL,
+            dispatched_at DATETIME(6) NULL,
+            completed_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_edge_dispatch_request_id (request_id),
+            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status),
+            INDEX idx_edge_dispatch_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Migration: enforce request_id uniqueness on edge_pending_dispatch
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        "uq_edge_dispatch_request_id",
+        "ALTER TABLE edge_pending_dispatch ADD UNIQUE KEY uq_edge_dispatch_request_id (request_id)",
+    )
+    .await?;
+
+    // Migration: add columns that may be missing on tables created by
+    // earlier iterations of this branch's DDL (before schema was finalised).
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        "result_json",
+        "ALTER TABLE edge_pending_dispatch ADD COLUMN result_json JSON NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        "pod_id",
+        "ALTER TABLE edge_pending_dispatch ADD COLUMN pod_id VARCHAR(128) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        "dispatched_at",
+        "ALTER TABLE edge_pending_dispatch ADD COLUMN dispatched_at DATETIME(6) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        "completed_at",
+        "ALTER TABLE edge_pending_dispatch ADD COLUMN completed_at DATETIME(6) NULL",
+    )
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS mcp_servers (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
             owner_user_id VARCHAR(128) NOT NULL,
@@ -2426,39 +2439,6 @@ pub async fn ensure_core_schema(
     // for rationale; CLAUDE.md §3 compliance: primary key matches the only
     // access pattern (filter by session_id); single secondary index covers
     // the "open todos ordered by recency" query.
-    //
-    // U-3 drift defense: per the no-compat directive, if an existing
-    // `session_todos` table predates the user_id column we DROP it
-    // and let CREATE TABLE rebuild fresh. Production starts on the
-    // new shape; dev/test envs that ran an older migration would
-    // otherwise hit "unknown column user_id" on next write since
-    // CREATE TABLE IF NOT EXISTS is a no-op when the table exists.
-    let has_user_id_col: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS \
-         WHERE TABLE_SCHEMA = DATABASE() \
-           AND TABLE_NAME = 'session_todos' \
-           AND COLUMN_NAME = 'user_id'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(1);
-    let table_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES \
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'session_todos'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(0);
-    if table_exists > 0 && has_user_id_col == 0 {
-        tracing::warn!(
-            "session_todos table predates user_id column; dropping and recreating per no-compat directive"
-        );
-        if let Err(e) = query("DROP TABLE session_todos").execute(&pool).await {
-            tracing::warn!(
-                "failed to drop legacy session_todos: {e}; CREATE TABLE will likely error"
-            );
-        }
-    }
     query(
         "CREATE TABLE IF NOT EXISTS session_todos (
             session_id VARCHAR(64) NOT NULL,

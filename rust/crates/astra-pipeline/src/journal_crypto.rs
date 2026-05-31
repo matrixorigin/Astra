@@ -2,16 +2,13 @@
 //!
 //! Wraps file I/O with AES-256-GCM encryption via the `ring` crate.
 //! The active key comes from `ASTRA_JOURNAL_KEY` (hex) or a locally persisted
-//! random secret under the session-artifact root. Legacy machine-id-derived
-//! ciphertext remains readable on a best-effort basis during migration, but
-//! new writes never derive keys from public host identity.
+//! random secret under the session-artifact root.
 
 use astra_services::SessionArtifactStore;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 const NONCE_LEN: usize = 12; // AES-256-GCM uses 96-bit (12-byte) nonces
 const KEY_LEN: usize = 32;
@@ -82,12 +79,6 @@ impl JournalCrypto {
             .open_in_place(nonce, Aad::empty(), &mut in_out)
             .ok()?;
         Some(plaintext.to_vec())
-    }
-
-    /// Decrypt with a best-effort legacy machine-id fallback for pre-rotation data.
-    pub fn decrypt_with_legacy_support(&self, encrypted: &[u8]) -> Option<Vec<u8>> {
-        self.decrypt(encrypted)
-            .or_else(|| legacy_machine_crypto().and_then(|legacy| legacy.decrypt(encrypted)))
     }
 }
 
@@ -215,32 +206,6 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
         return Ok(());
     };
     std::fs::File::open(parent)?.sync_all()
-}
-
-fn legacy_machine_crypto() -> Option<&'static JournalCrypto> {
-    static LEGACY: OnceLock<Option<JournalCrypto>> = OnceLock::new();
-    LEGACY
-        .get_or_init(|| legacy_machine_key().map(|bytes| JournalCrypto::new(&bytes)))
-        .as_ref()
-}
-
-fn legacy_machine_key() -> Option<[u8; KEY_LEN]> {
-    use sha2::{Digest, Sha256};
-
-    let machine_id = std::fs::read_to_string("/etc/machine-id")
-        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
-        .ok()?;
-    let trimmed = machine_id.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"astra-journal-v1:");
-    hasher.update(trimmed.as_bytes());
-    let hash = hasher.finalize();
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&hash);
-    Some(key)
 }
 
 #[cfg(test)]

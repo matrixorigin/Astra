@@ -102,16 +102,12 @@ impl ToolExecutionOutcome {
         }
     }
 
-    /// DEPRECATED constructor retained for legacy call sites that still rely on
-    /// the "output starts with `Error`" heuristic to infer failure.
+    /// Constructor for text output.
     ///
     /// **Do not use in new code.** Prefer [`Self::ok`] / [`Self::error`] so the
     /// error flag is explicit at the call site. A successful output that
     /// happens to start with the literal text `"Error"` would be misclassified
     /// here — which is exactly the bug commit 454f9f47 set out to eliminate.
-    #[deprecated(
-        note = "prefer ToolExecutionOutcome::ok / ::error; prefix-inference misclassifies success strings that begin with 'Error'"
-    )]
     pub fn text(output: String) -> Self {
         let is_error = output.starts_with("Error");
         Self {
@@ -2611,35 +2607,53 @@ pub fn git_push(project_root: &Path, args: &Value) -> String {
 /// Consolidated `git` tool dispatcher. Routes `args.action` to the
 /// appropriate git sub-operation. Replaces 11 separate git_* tools with
 /// a single `git { action: "...", ...params }` interface.
-pub fn git_dispatch(project_root: &Path, args: &Value) -> String {
+///
+/// For `action: "stash"`, the sub-action is read from `stash_action`
+/// (push, apply, pop, list, drop) to avoid collision with the top-level
+/// `action` field.
+pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
     let action = match args.get("action").and_then(Value::as_str) {
         Some(a) => a,
         None => {
-            return "Missing required parameter: action. \
-                    Use one of: status, diff, log, show, blame, \
-                    file_history, log_search, contributors, commit, \
-                    revert_commit, stash, push"
-                .to_string();
+            return ToolExecutionOutcome::error(
+                "Missing required parameter: action. \
+                 Use one of: status, diff, log, show, blame, \
+                 file_history, log_search, contributors, commit, \
+                 revert_commit, stash, push"
+                    .to_string(),
+            );
         }
     };
     match action {
-        "status" => git_status(project_root, args),
-        "diff" => git_diff(project_root, args, 0.0, 0),
-        "log" => git_log(project_root, args),
-        "show" => git_show(project_root, args, 0.0, 0),
-        "blame" => git_blame(project_root, args),
-        "file_history" => git_file_history(project_root, args),
-        "log_search" => git_log_search(project_root, args),
-        "contributors" => git_contributors(project_root, args),
-        "commit" => git_commit_with_metadata(project_root, args).output,
-        "revert_commit" => git_revert_commit_with_metadata(project_root, args).output,
-        "stash" => git_stash_with_metadata(project_root, args).output,
-        "push" => git_push(project_root, args),
-        other => format!(
+        "status" => ToolExecutionOutcome::ok(git_status(project_root, args)),
+        "diff" => ToolExecutionOutcome::ok(git_diff(project_root, args, 0.0, 0)),
+        "log" => ToolExecutionOutcome::ok(git_log(project_root, args)),
+        "show" => ToolExecutionOutcome::ok(git_show(project_root, args, 0.0, 0)),
+        "blame" => ToolExecutionOutcome::ok(git_blame(project_root, args)),
+        "file_history" => ToolExecutionOutcome::ok(git_file_history(project_root, args)),
+        "log_search" => ToolExecutionOutcome::ok(git_log_search(project_root, args)),
+        "contributors" => ToolExecutionOutcome::ok(git_contributors(project_root, args)),
+        "commit" => git_commit_with_metadata(project_root, args),
+        "revert_commit" => git_revert_commit_with_metadata(project_root, args),
+        "stash" => {
+            // Remap: read `stash_action` and set it as `action` for the
+            // inner stash function which expects action ∈ {push,apply,pop,list,drop}.
+            let stash_action = args.get("stash_action").and_then(Value::as_str);
+            let remapped_args = if let Some(sa) = stash_action {
+                let mut map = args.as_object().cloned().unwrap_or_default();
+                map.insert("action".to_string(), Value::String(sa.to_string()));
+                Value::Object(map)
+            } else {
+                args.clone()
+            };
+            git_stash_with_metadata(project_root, &remapped_args)
+        }
+        "push" => ToolExecutionOutcome::ok(git_push(project_root, args)),
+        other => ToolExecutionOutcome::error(format!(
             "Unknown git action: '{other}'. Valid actions: status, diff, log, \
              show, blame, file_history, log_search, contributors, commit, \
              revert_commit, stash, push"
-        ),
+        )),
     }
 }
 
@@ -4092,11 +4106,12 @@ mod tests {
     fn consolidated_git_dispatches_status() {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "status"}));
+        let output = &result.output;
         assert!(
-            result.contains("##")
-                || result.contains("nothing to commit")
-                || result.contains("On branch"),
-            "git status action should return valid status: {result}"
+            output.contains("##")
+                || output.contains("nothing to commit")
+                || output.contains("On branch"),
+            "git status action should return valid status: {output}"
         );
     }
 
@@ -4104,7 +4119,7 @@ mod tests {
     fn consolidated_git_dispatches_log() {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "log", "n": 3}));
-        assert!(!result.is_empty(), "git log should return commits");
+        assert!(!result.output.is_empty(), "git log should return commits");
     }
 
     #[test]
@@ -4112,7 +4127,8 @@ mod tests {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "diff"}));
         assert!(
-            !result.starts_with("Unknown git action") && !result.starts_with("Missing required"),
+            !result.output.starts_with("Unknown git action")
+                && !result.output.starts_with("Missing required"),
             "diff must be recognized as valid action"
         );
     }
@@ -4121,9 +4137,11 @@ mod tests {
     fn consolidated_git_unknown_action_returns_error() {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "nonexistent"}));
+        assert!(result.is_error);
         assert!(
-            result.contains("Unknown git action"),
-            "unknown action must produce error: {result}"
+            result.output.contains("Unknown git action"),
+            "unknown action must produce error: {}",
+            result.output
         );
     }
 
@@ -4134,15 +4152,15 @@ mod tests {
         // After fix: shows HEAD commit (same as CLI `git show`).
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "show"}));
+        let output = &result.output;
         assert!(
-            result.contains("commit ") && result.contains("Author:"),
-            "git show without ref must default to HEAD, got: {result}"
+            output.contains("commit ") && output.contains("Author:"),
+            "git show without ref must default to HEAD, got: {output}"
         );
-        // Must not START with "Error:" — commit message body may
-        // contain the word "Error" but that's not a tool failure.
+        // Must not be an error
         assert!(
-            !result.starts_with("Error:"),
-            "must not return error when ref omitted, got: {result}"
+            !result.is_error,
+            "must not return error when ref omitted, got: {output}"
         );
     }
 
@@ -4150,9 +4168,10 @@ mod tests {
     fn consolidated_git_show_with_ref_works() {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "show", "ref": "HEAD"}));
+        let output = &result.output;
         assert!(
-            result.contains("commit ") && result.contains("Author:"),
-            "git show with ref=HEAD must work, got: {result}"
+            output.contains("commit ") && output.contains("Author:"),
+            "git show with ref=HEAD must work, got: {output}"
         );
     }
 
@@ -4160,9 +4179,11 @@ mod tests {
     fn consolidated_git_missing_action_returns_error() {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"file": "foo.rs"}));
+        assert!(result.is_error);
         assert!(
-            result.contains("Missing required parameter"),
-            "missing action must produce helpful error: {result}"
+            result.output.contains("Missing required parameter"),
+            "missing action must produce helpful error: {}",
+            result.output
         );
     }
 

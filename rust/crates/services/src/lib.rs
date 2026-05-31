@@ -215,9 +215,10 @@ pub use models::{
     resolve_active_llm_model, resolve_memory_model, resolve_reasoning_model,
 };
 pub use multi_agent::{
-    DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
-    LeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
-    UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
+    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
+    EdgeAgentRecord, EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, LeaseClaimResult,
+    TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
+    UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,

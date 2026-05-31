@@ -133,6 +133,28 @@ impl ToolResultRequest {
             result_hash: Some(result_hash),
         }
     }
+
+    /// Parse a dispatch result JSON string back into `(output, is_error)`.
+    ///
+    /// The JSON is the serialized `ToolResultRequest` produced by
+    /// `edge_callback_handlers` / `deliver_result`.  Both the tool-executor
+    /// fallback path and the turn-bridge polling path need to extract the
+    /// same two fields — this avoids duplicated parsing logic.
+    pub fn parse_output_and_error(result_json: &str) -> (String, bool) {
+        let v: serde_json::Value = serde_json::from_str(result_json)
+            .unwrap_or_else(|_| serde_json::json!({"output": result_json}));
+        let output = v
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_error = v
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "error")
+            .unwrap_or(false);
+        (output, is_error)
+    }
 }
 
 /// `POST /approval/respond` (§5.5).

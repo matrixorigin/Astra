@@ -466,18 +466,10 @@ impl DatabaseContextManifestStore {
         turn_id: &str,
         component: &str,
     ) -> Result<String, ContextManifestError> {
-        let exists =
-            sqlx::query("SELECT reason FROM context_manifest_reason_types WHERE reason = ?")
-                .bind(proposed_reason)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| ContextManifestError::Database {
-                    operation: "context_manifest_reason_lookup",
-                    entity: proposed_reason.to_string(),
-                    source,
-                })?
-                .is_some();
-        if exists {
+        let known = CONTEXT_MANIFEST_REASONS
+            .iter()
+            .any(|(reason, _, _)| *reason == proposed_reason);
+        if known {
             return Ok(proposed_reason.to_string());
         }
         sqlx::query(

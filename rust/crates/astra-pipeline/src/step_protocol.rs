@@ -27,15 +27,12 @@
 //! - **DB-first events**: `StepEventStore` trait (in-memory or MatrixOne).
 //! - **Tool-level retry**: `ToolRetryPolicy` per tool classification.
 //! - **Memory governance**: `MemoryGovernanceAction` for retrieval/promotion/purge tracking.
-//! - **Migration**: `MigrationRegistry` for version upgrade hooks.
-//!
 //! # Hardening additions
 //!
 //! - **Memory governance**: `MemoryGovernanceAction` enum carried in `MemoryContext` for lifecycle tracking.
 //! - **IdempotencyCache trait**: Abstraction over in-memory and MatrixOne-backed caches.
 //! - **Checkpoint triggers**: `CheckpointTrigger` / `CheckpointTier` for strategy-driven checkpointing.
 //! - **Canonical idempotency keys**: `compute_idempotency_key` uses `canonical_json` for determinism.
-//! - **Migration registry**: `MigrationRegistry` for `VersionPolicy::Migrate` checkpoint upgrades.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,13 +42,11 @@ use astra_text_utils::str_preview::prefix_chars;
 // ─── Protocol Version ────────────────────────────────────────────────────────
 
 /// Version encoding: major * 1000 + minor. E.g., 1000 = v1.0, 1001 = v1.1, 2000 = v2.0.
-/// This makes Compatible (same major) and Migrate (major N-1) semantics meaningful.
 pub const PROTOCOL_VERSION_MAJOR: u32 = 1;
 pub const PROTOCOL_VERSION_MINOR: u32 = 0;
 pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_MAJOR * 1000 + PROTOCOL_VERSION_MINOR;
 
 /// How to handle version mismatches on checkpoint restore.
-/// Negotiation chain: Strict → Compatible → Migrate → Discard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VersionPolicy {
     /// Reject any mismatch (safe default for production)
@@ -60,100 +55,15 @@ pub enum VersionPolicy {
     /// Accept if major version matches (same major = version / 1000).
     /// E.g., v1.0 (1000) and v1.1 (1001) are compatible.
     Compatible,
-    /// Try compatible decode → try N-1 migration → discard.
-    /// Recommended for long-lived deployments with registered MigrationFn.
-    Migrate,
 }
 
-// ─── Migration Registry ──────────────────────────────────────────────────────
-
-/// Type alias for migration functions.
-/// Input: (source_version, checkpoint_json) → Result<migrated_json, error_message>
-pub type MigrationFn = fn(u32, &serde_json::Value) -> Result<serde_json::Value, String>;
-
-/// Registry of version migrations (for VersionPolicy::Migrate).
-#[derive(Debug, Default)]
-pub struct MigrationRegistry {
-    /// Map from source_version → migration function
-    migrations: HashMap<u32, MigrationFn>,
-}
-
-impl MigrationRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register(&mut self, from_version: u32, f: MigrationFn) {
-        self.migrations.insert(from_version, f);
-    }
-
-    pub fn migrate(
-        &self,
-        from_version: u32,
-        data: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        if let Some(f) = self.migrations.get(&from_version) {
-            f(from_version, data)
-        } else {
-            Err(format!(
-                "No migration registered for version {}",
-                from_version
-            ))
-        }
-    }
-
-    pub fn has_migration(&self, from_version: u32) -> bool {
-        self.migrations.contains_key(&from_version)
-    }
-
-    /// Create a registry with built-in migrations.
-    ///
-    /// Currently registers:
-    /// - v0 → v1000: legacy checkpoint upgrade (adds protocol_version field)
-    pub fn with_defaults() -> Self {
-        let mut reg = Self::new();
-        reg.register(0, migrate_v0_to_v1000);
-        reg
-    }
-}
-
-/// Migration: v0 (pre-versioning) → v1000.
-/// Adds `protocol_version` field if missing.
-fn migrate_v0_to_v1000(_from: u32, data: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut migrated = data.clone();
-    if let Some(obj) = migrated.as_object_mut() {
-        // Add protocol_version to the light checkpoint (or top level)
-        if !obj.contains_key("protocol_version") {
-            obj.insert(
-                "protocol_version".to_string(),
-                serde_json::json!(PROTOCOL_VERSION),
-            );
-        }
-        // If this is a Heavy checkpoint, ensure the inner light has it too
-        if let Some(light) = obj.get_mut("light")
-            && let Some(light_obj) = light.as_object_mut()
-            && !light_obj.contains_key("protocol_version")
-        {
-            light_obj.insert(
-                "protocol_version".to_string(),
-                serde_json::json!(PROTOCOL_VERSION),
-            );
-        }
-        Ok(migrated)
-    } else {
-        Err("checkpoint data is not a JSON object".to_string())
-    }
-}
-
-/// Result of version negotiation (for Compatible/Migrate policies).
+/// Result of version negotiation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionVerdict {
     /// Exact match — proceed normally
     ExactMatch,
     /// Compatible (same major, different minor) — proceed with caution
     CompatibleDecode { found: u32 },
-    /// Migrated from older version — proceed, data may be lossy
-    Migrated { from: u32, to: u32 },
 }
 
 pub fn check_protocol_version_with_policy(
@@ -193,31 +103,10 @@ pub fn check_protocol_version_with_policy(
                 })
             }
         }
-        VersionPolicy::Migrate => {
-            // Step 1: try compatible decode (same major)
-            let expected_major = PROTOCOL_VERSION / 1000;
-            let found_major = version / 1000;
-            if expected_major == found_major {
-                return Ok(VersionVerdict::CompatibleDecode { found: version });
-            }
-            // Step 2: try migration (major N-1 → N)
-            if found_major + 1 == expected_major {
-                return Ok(VersionVerdict::Migrated {
-                    from: version,
-                    to: PROTOCOL_VERSION,
-                });
-            }
-            // Step 3: too old, discard
-            Err(ProtocolError::VersionMismatch {
-                expected: PROTOCOL_VERSION,
-                found: version,
-                policy,
-            })
-        }
     }
 }
 
-/// Convenience: strict check (returns Ok(()) for backward compat)
+/// Convenience: strict check (returns Ok(()) for exact match)
 pub fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
     check_protocol_version_with_policy(version, VersionPolicy::Strict).map(|_| ())
 }
@@ -244,7 +133,6 @@ impl std::fmt::Display for ProtocolError {
                 let action = match policy {
                     VersionPolicy::Strict => "Discard checkpoint and restart",
                     VersionPolicy::Compatible => "Incompatible major version, discarding",
-                    VersionPolicy::Migrate => "No migration path, discarding",
                 };
                 write!(
                     f,
@@ -817,9 +705,8 @@ pub struct HeavyCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
     /// Pointer to the `astra-config` version store: which `RuntimeConfig`
-    /// this session ran under. `None` on legacy checkpoints from before
-    /// Step 2a of the config-versions rollout; consumers treat that as
-    /// "unknown / fall back to `RuntimeConfig::load()` at resume time".
+    /// this session ran under. Consumers fall back to `RuntimeConfig::load()`
+    /// at resume time when absent.
     ///
     /// Opaque `String` here (not a `VersionId`) so astra-pipeline does
     /// not have to pull in astra-config just to serialize this field —
@@ -1655,40 +1542,8 @@ mod tests {
     }
 
     #[test]
-    fn version_migrate_same_major_compat() {
-        // version 1050 → same major (1) → CompatibleDecode
-        let result = check_protocol_version_with_policy(1050, VersionPolicy::Migrate);
-        assert!(result.is_ok());
-        assert!(matches!(
-            result.unwrap(),
-            VersionVerdict::CompatibleDecode { .. }
-        ));
-    }
-
-    #[test]
-    fn version_migrate_prev_major() {
-        // version 50 → major 0, expected major 1 → Migrated
-        let result = check_protocol_version_with_policy(50, VersionPolicy::Migrate);
-        assert!(result.is_ok());
-        assert!(matches!(
-            result.unwrap(),
-            VersionVerdict::Migrated { from: 50, to: 1000 }
-        ));
-    }
-
-    #[test]
-    fn version_migrate_zero_rejected() {
-        let result = check_protocol_version_with_policy(0, VersionPolicy::Migrate);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn version_exact_match_all_policies() {
-        for policy in [
-            VersionPolicy::Strict,
-            VersionPolicy::Compatible,
-            VersionPolicy::Migrate,
-        ] {
+    fn version_exact_match_both_policies() {
+        for policy in [VersionPolicy::Strict, VersionPolicy::Compatible] {
             let result = check_protocol_version_with_policy(PROTOCOL_VERSION, policy);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), VersionVerdict::ExactMatch);
@@ -2772,101 +2627,6 @@ mod tests {
         assert_eq!(key1, key2);
     }
 
-    // ── Migration Registry ──
-
-    #[test]
-    fn migration_registry_basic() {
-        let mut reg = MigrationRegistry::new();
-        assert!(!reg.has_migration(0));
-
-        fn v0_to_v1(_ver: u32, data: &serde_json::Value) -> Result<serde_json::Value, String> {
-            let mut obj = data.clone();
-            if let Some(map) = obj.as_object_mut() {
-                map.insert("protocol_version".into(), serde_json::json!(1));
-            }
-            Ok(obj)
-        }
-
-        reg.register(0, v0_to_v1);
-        assert!(reg.has_migration(0));
-        assert!(!reg.has_migration(99));
-
-        let old_data = serde_json::json!({"cursor": "test"});
-        let migrated = reg.migrate(0, &old_data).unwrap();
-        assert_eq!(migrated["protocol_version"], 1);
-        assert_eq!(migrated["cursor"], "test");
-    }
-
-    #[test]
-    fn migration_registry_missing_version() {
-        let reg = MigrationRegistry::new();
-        let result = reg.migrate(42, &serde_json::json!({}));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("42"));
-    }
-
-    #[test]
-    fn migration_registry_with_defaults_has_v0() {
-        let reg = MigrationRegistry::with_defaults();
-        assert!(
-            reg.has_migration(0),
-            "v0→v1000 migration must be registered"
-        );
-        assert!(!reg.has_migration(1), "no v1 migration expected");
-        assert!(!reg.has_migration(999), "no v999 migration expected");
-    }
-
-    #[test]
-    fn migrate_v0_adds_protocol_version() {
-        let reg = MigrationRegistry::with_defaults();
-        let legacy = serde_json::json!({
-            "cursor": {"current_step": 0, "slots": []},
-            "turn_state": {"turn": 3}
-        });
-        let migrated = reg.migrate(0, &legacy).unwrap();
-        assert_eq!(migrated["protocol_version"], PROTOCOL_VERSION);
-        // Original fields preserved
-        assert_eq!(migrated["cursor"]["current_step"], 0);
-        assert_eq!(migrated["turn_state"]["turn"], 3);
-    }
-
-    #[test]
-    fn migrate_v0_preserves_existing_version_field() {
-        let reg = MigrationRegistry::with_defaults();
-        let already_versioned = serde_json::json!({
-            "protocol_version": 500,
-            "cursor": {"current_step": 0}
-        });
-        let migrated = reg.migrate(0, &already_versioned).unwrap();
-        // Does NOT overwrite existing protocol_version
-        assert_eq!(migrated["protocol_version"], 500);
-    }
-
-    #[test]
-    fn migrate_v0_heavy_checkpoint_adds_to_inner_light() {
-        let reg = MigrationRegistry::with_defaults();
-        let heavy = serde_json::json!({
-            "light": {
-                "cursor": {"current_step": 2},
-                "turn_state": {"turn": 5}
-            },
-            "full_conversation": []
-        });
-        let migrated = reg.migrate(0, &heavy).unwrap();
-        // Top level gets protocol_version
-        assert_eq!(migrated["protocol_version"], PROTOCOL_VERSION);
-        // Inner light also gets it
-        assert_eq!(migrated["light"]["protocol_version"], PROTOCOL_VERSION);
-    }
-
-    #[test]
-    fn migrate_non_object_returns_error() {
-        let reg = MigrationRegistry::with_defaults();
-        let result = reg.migrate(0, &serde_json::json!("not an object"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not a JSON object"));
-    }
-
     // ── Version Display per Policy ──
 
     #[test]
@@ -2887,16 +2647,6 @@ mod tests {
             policy: VersionPolicy::Compatible,
         };
         assert!(err.to_string().contains("Incompatible major version"));
-    }
-
-    #[test]
-    fn version_display_migrate_says_no_path() {
-        let err = ProtocolError::VersionMismatch {
-            expected: 2000,
-            found: 50,
-            policy: VersionPolicy::Migrate,
-        };
-        assert!(err.to_string().contains("No migration path"));
     }
 
     // ── Recovery Boundary: validate() hardened ──
@@ -3153,18 +2903,6 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION_MINOR, 0);
         assert_eq!(PROTOCOL_VERSION / 1000, PROTOCOL_VERSION_MAJOR);
         assert_eq!(PROTOCOL_VERSION % 1000, PROTOCOL_VERSION_MINOR);
-    }
-
-    #[test]
-    fn version_migrate_too_old_rejects() {
-        // major 0 → ok (N-1 migration). But if current major were 3, major 0 would be too old.
-        // Simulate: pretend expected major=1, found major=0 → ok for N-1
-        let result = check_protocol_version_with_policy(50, VersionPolicy::Migrate);
-        assert!(result.is_ok()); // major 0 is N-1 of major 1
-
-        // But version in a completely different range (future major 5) is rejected
-        let result = check_protocol_version_with_policy(5000, VersionPolicy::Migrate);
-        assert!(result.is_err()); // major 5 is not same nor N-1
     }
 
     #[test]

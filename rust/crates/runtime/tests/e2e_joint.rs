@@ -964,16 +964,6 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
 
         if reconnect == 8 {
             sqlx::query(
-                "UPDATE run_counters
-                 SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND),
-                     updated_at = NOW(6)
-                 WHERE run_id = ?",
-            )
-            .bind(&run_id)
-            .execute(pool.get())
-            .await
-            .expect("S04 simulated pod restart must expire run_counters lease");
-            sqlx::query(
                 "UPDATE agent_runs
                  SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND),
                      updated_at = NOW(6)
@@ -991,7 +981,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
                 .expect("S04 replacement pod must attempt lease takeover");
             assert!(
                 won,
-                "S04 replacement pod must take over run_counters lease after simulated restart"
+                "S04 replacement pod must take over agent_runs lease after simulated restart"
             );
             *shared_store.write().await = replacement;
         }

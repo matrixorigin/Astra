@@ -183,8 +183,9 @@ pub use astra_services::{
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
     },
     multi_agent::{
-        DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService,
-        TaskLeaseHoldCache, TaskLeaseService, UnconfiguredEdgeRegistryService,
+        DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
+        EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, TaskLeaseHoldCache,
+        TaskLeaseService, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
         UnconfiguredTaskLeaseService,
     },
     reflect::{

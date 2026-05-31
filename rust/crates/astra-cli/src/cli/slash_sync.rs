@@ -10,7 +10,7 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
     cli_section!("Sync Engine Status");
     eprintln!();
     match sub {
-        "push" | "pull" | "log" => {
+        "log" => {
             cli_info!(
                 "/sync {sub} is server-owned; use the API/server diagnostics for cloud sync state."
             );
@@ -19,7 +19,7 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
             cli_dim!("Cloud sync is managed by the astra-server API.");
         }
         _ => {
-            cli_info!("Usage: /sync [push|pull|log]");
+            cli_info!("Usage: /sync [log]");
             cli_dim!("Cloud sync commands no longer connect to MatrixOne from the CLI.");
         }
     }

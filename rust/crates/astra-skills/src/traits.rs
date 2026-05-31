@@ -76,7 +76,7 @@ pub trait SkillExecutor: Send + Sync {
     fn supports(&self, context: &ExecutionContext) -> bool;
 }
 
-// ── SkillResolver (backward-compatible) ──────────────────────────────────────
+// ── SkillResolver ──────────────────────────────────────────────────────────
 
 /// Lightweight description of a skill for tool schema generation.
 #[derive(Clone, Debug)]

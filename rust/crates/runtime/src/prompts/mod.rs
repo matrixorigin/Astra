@@ -30,8 +30,7 @@ pub use system::{
     build_skill_listing_section_with_caps, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
     detect_task_type, load_overrides, parallel_batching_nudge_directive,
-    parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
-    sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
+    parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
     tool_round_guidance, tool_round_guidance_trace_with, tool_round_guidance_with,
     trailing_single_tool_round_streak,
 };

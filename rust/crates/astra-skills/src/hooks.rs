@@ -2718,7 +2718,7 @@ mod tests {
     // ── Config loading tests ────────────────────────────────────────
 
     #[test]
-    fn load_hooks_json_legacy_array_returns_empty() {
+    fn load_hooks_json_array_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let astra = dir.path().join(".astra");
         std::fs::create_dir_all(&astra).unwrap();
@@ -3108,8 +3108,8 @@ session_hooks:
     }
 
     #[test]
-    fn load_session_hooks_legacy_array_returns_empty() {
-        // Legacy format (plain array) has no session_hooks key → empty
+    fn load_session_hooks_array_returns_empty() {
+        // Plain array format has no session_hooks key → empty
         let dir = tempfile::tempdir().unwrap();
         let astra = dir.path().join(".astra");
         std::fs::create_dir_all(&astra).unwrap();

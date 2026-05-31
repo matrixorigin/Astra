@@ -8737,61 +8737,6 @@ async fn b1_think_before_act_directive_in_system_prompt() {
     );
 }
 
-/// B2: round_budget_directive always returns empty (budget pressure removed).
-#[tokio::test]
-async fn b2_round_budget_no_directive_early_rounds() {
-    for round in 0..astra_runtime::prompts::ROUND_BUDGET_THRESHOLD {
-        let directive = astra_runtime::prompts::round_budget_directive(round);
-        assert!(
-            directive.is_empty(),
-            "round {round} should have no budget directive, got: {directive}"
-        );
-    }
-}
-
-/// B2: round_budget_directive returns empty even at threshold (neutered).
-#[tokio::test]
-async fn b2_round_budget_warning_at_threshold() {
-    let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
-    let directive = astra_runtime::prompts::round_budget_directive(threshold);
-    assert!(
-        directive.is_empty(),
-        "round budget directive should always be empty (circuit breaker replaces it)"
-    );
-}
-
-/// B2: round_budget_directive returns empty even at hard limit (neutered).
-#[tokio::test]
-async fn b2_round_budget_hard_limit() {
-    let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
-    let directive = astra_runtime::prompts::round_budget_directive(hard);
-    assert!(
-        directive.is_empty(),
-        "round budget directive should always be empty (circuit breaker replaces it)"
-    );
-}
-
-/// B2: round_budget_directive returns empty past hard limit (neutered).
-#[tokio::test]
-async fn b2_round_budget_past_hard_limit() {
-    let past = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT + 5;
-    let directive = astra_runtime::prompts::round_budget_directive(past);
-    assert!(
-        directive.is_empty(),
-        "round budget directive should always be empty (circuit breaker replaces it)"
-    );
-}
-
-/// B2: round_budget_directive_with always returns empty (neutered).
-#[tokio::test]
-async fn b2_round_budget_custom_thresholds() {
-    use astra_runtime::prompts::round_budget_directive_with;
-
-    assert!(round_budget_directive_with(4, 5, 10).is_empty());
-    assert!(round_budget_directive_with(5, 5, 10).is_empty());
-    assert!(round_budget_directive_with(10, 5, 10).is_empty());
-}
-
 /// B2: Bridge reads round_index from payload and injects directive into dynamic prompt.
 /// When round_index >= threshold, the system prompt sent to the mock LLM should contain
 /// the round budget warning. We verify by checking that the mock LLM receives the directive
@@ -8872,18 +8817,6 @@ async fn b2_round_index_defaults_to_zero() {
         "should produce normal text without round_index"
     );
     cap.wait_persist_idle().await;
-}
-
-/// B2: Round budget warning includes remaining count.
-#[tokio::test]
-async fn b2_round_budget_warning_shows_remaining() {
-    let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
-    // Directive is always empty now (circuit breaker replaces countdown).
-    let directive = astra_runtime::prompts::round_budget_directive(threshold);
-    assert!(
-        directive.is_empty(),
-        "round budget directive should always be empty"
-    );
 }
 
 /// B1: Planning directive in section-based prompt builder too.

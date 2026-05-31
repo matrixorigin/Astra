@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 pub(crate) const DEFAULT_MEMORIA_URL: &str = "http://127.0.0.1:8100";
 
 /// Default max connections for the shared DB pool.
+/// Sized for 50 concurrent runs + sweepers + HTTP handlers + WS overhead.
 /// Override with `ASTRA_DB_POOL_MAX_CONNECTIONS`.
-pub(crate) const DEFAULT_DB_POOL_MAX_CONNECTIONS: u32 = 10;
+pub(crate) const DEFAULT_DB_POOL_MAX_CONNECTIONS: u32 = 80;
 
 /// Default min idle connections for the shared DB pool.
 /// Override with `ASTRA_DB_POOL_MIN_CONNECTIONS`.
@@ -696,7 +697,7 @@ pub struct MatrixOneSettings {
     pub user: String,
     pub password: String,
     pub database: String,
-    /// Max connections in the shared pool (env `ASTRA_DB_POOL_MAX_CONNECTIONS`, default 10).
+    /// Max connections in the shared pool (env `ASTRA_DB_POOL_MAX_CONNECTIONS`, default 40).
     pub db_pool_max_connections: u32,
     /// Min idle connections in the shared pool (env `ASTRA_DB_POOL_MIN_CONNECTIONS`, default 1).
     pub db_pool_min_connections: u32,
