@@ -12,7 +12,7 @@ fn web_traceability_agent_events_schema_source_contract() {
         "turn_seq BIGINT NULL",
         "round_index BIGINT NULL",
         "tool_call_id VARCHAR(128) NULL",
-        "parent_agent_id VARCHAR(128) NULL",
+        "parent_agent_id VARCHAR(255) NULL",
         "trace_kind VARCHAR(64) NULL",
     ] {
         assert!(source.contains(column), "agent_events missing {column}");

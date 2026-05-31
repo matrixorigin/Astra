@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use super::hold_cache::TaskLeaseHoldCache;
+use super::metrics::SharedMultiAgentMetrics;
 use crate::task_orchestrator::{
     AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskRecord,
 };
@@ -169,6 +170,7 @@ pub(crate) fn clamp_ttl_sec(ttl_sec: i64) -> i64 {
 pub struct DatabaseTaskLeaseService {
     pool: sqlx::Pool<sqlx::MySql>,
     hold_cache: std::sync::Arc<TaskLeaseHoldCache>,
+    metrics: Option<SharedMultiAgentMetrics>,
 }
 
 impl DatabaseTaskLeaseService {
@@ -176,7 +178,11 @@ impl DatabaseTaskLeaseService {
         pool: sqlx::Pool<sqlx::MySql>,
         hold_cache: std::sync::Arc<TaskLeaseHoldCache>,
     ) -> Self {
-        Self { pool, hold_cache }
+        Self {
+            pool,
+            hold_cache,
+            metrics: None,
+        }
     }
 
     pub fn from_shared(
@@ -186,7 +192,13 @@ impl DatabaseTaskLeaseService {
         Self {
             pool: shared.get().clone(),
             hold_cache,
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: SharedMultiAgentMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -226,6 +238,12 @@ pub trait TaskLeaseService: Send + Sync {
 
 #[async_trait]
 impl TaskLeaseService for DatabaseTaskLeaseService {
+    #[tracing::instrument(skip(self), fields(
+        user_id = %user_id,
+        task_id = %task_id,
+        agent_id = %agent_id,
+        ttl_sec
+    ))]
     async fn try_claim_lease(
         &self,
         user_id: &str,
@@ -234,12 +252,27 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         edge_id: &str,
         ttl_sec: i64,
     ) -> Result<LeaseClaimResult, String> {
+        let _start = std::time::Instant::now();
         let ttl = clamp_ttl_sec(ttl_sec);
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| format!("lease tx begin: {e}"))?;
+
+        // Lock task_leases FIRST — ensures release_lease (which locks
+        // task_leases) wins the race: if release has the lock, claim
+        // blocks until after the lease is deleted, then sees None → Granted.
+        let lease_row = sqlx::query(
+            "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
+             CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
+             FROM task_leases WHERE task_id = ? AND user_id = ? FOR UPDATE",
+        )
+        .bind(task_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("lease select: {e}"))?;
 
         let owner: Option<String> =
             sqlx::query_scalar("SELECT user_id FROM agent_tasks WHERE task_id = ? FOR UPDATE")
@@ -255,17 +288,6 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             return Err("task not owned by user".to_string());
         }
 
-        let lease_row = sqlx::query(
-            "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
-             CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
-             FROM task_leases WHERE task_id = ? AND user_id = ? FOR UPDATE",
-        )
-        .bind(task_id)
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| format!("lease select: {e}"))?;
-
         if let Some(ref r) = lease_row {
             let holder: String = r.try_get("holder_agent_id").map_err(|e| e.to_string())?;
             let exp: String = r.try_get("expires_at").map_err(|e| e.to_string())?;
@@ -273,6 +295,11 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             if active != 0 && holder != agent_id {
                 // Read-only path: no changes to persist — rollback to
                 // release the pool connection cleanly.
+                tracing::warn!(
+                    %holder,
+                    %exp,
+                    "task_lease: contested — held by another agent"
+                );
                 let _ = tx.rollback().await;
                 return Ok(LeaseClaimResult::Contested {
                     holder_agent_id: holder,
@@ -342,52 +369,80 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
 
         self.hold_cache.record_hold(agent_id, task_id);
 
+        if let Some(ref m) = self.metrics {
+            m.lease_claim_latency.record(_start.elapsed());
+        }
+
         Ok(LeaseClaimResult::Granted {
             lease_version: ver,
             expires_at: exp,
         })
     }
 
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, task_id = %task_id, agent_id = %agent_id))]
     async fn release_lease(
         &self,
         user_id: &str,
         task_id: &str,
         agent_id: &str,
     ) -> Result<bool, String> {
-        let n = sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("lease release tx begin: {e}"))?;
+
+        // Lock the lease row first to prevent concurrent acquire/release races.
+        // SELECT FOR UPDATE ensures no other transaction can claim or release
+        // this lease until we commit.
+        let existing = sqlx::query(
+            "SELECT holder_agent_id FROM task_leases \
+             WHERE task_id = ? AND user_id = ? AND holder_agent_id = ? \
+             FOR UPDATE",
+        )
+        .bind(task_id)
+        .bind(user_id)
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("lease release lock: {e}"))?;
+
+        if existing.is_none() {
+            tracing::warn!("task_lease: release on lease not held by agent");
+            let _ = tx.rollback().await;
+            return Ok(false);
+        }
+
+        // UPDATE agent_tasks first: clear agent_id BEFORE deleting the lease.
+        // This prevents any race where another pod sees the lease deleted
+        // but agent_id still set — the agent_id is NULL before the lease disappears.
+        sqlx::query(
+            "UPDATE agent_tasks SET agent_id = NULL, updated_at = NOW(6) \
+             WHERE task_id = ? AND user_id = ? AND agent_id = ?",
+        )
+        .bind(task_id)
+        .bind(user_id)
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("clear agent_id after lease release: {e}"))?;
+
+        sqlx::query(
             "DELETE FROM task_leases WHERE task_id = ? AND user_id = ? AND holder_agent_id = ?",
         )
         .bind(task_id)
         .bind(user_id)
         .bind(agent_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| format!("lease release: {e}"))?
-        .rows_affected();
+        .map_err(|e| format!("lease delete: {e}"))?;
 
-        if n > 0 {
-            if let Err(e) = sqlx::query(
-                "UPDATE agent_tasks SET agent_id = NULL WHERE task_id = ? AND user_id = ? AND agent_id = ?",
-            )
-            .bind(task_id)
-            .bind(user_id)
-            .bind(agent_id)
-            .execute(&self.pool)
+        tx.commit()
             .await
-            {
-                tracing::warn!(
-                    target: "astra_services::multi_agent",
-                    task_id = %task_id,
-                    agent_id = %agent_id,
-                    error = %e,
-                    "failed to clear agent_id after lease release"
-                );
-            }
-            self.hold_cache.release_hold(agent_id, task_id);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+            .map_err(|e| format!("lease release commit: {e}"))?;
+
+        self.hold_cache.release_hold(agent_id, task_id);
+        Ok(true)
     }
 
     async fn get_lease(
@@ -418,6 +473,7 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         }))
     }
 
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, task_id = %task_id, agent_id = %agent_id, ttl_sec))]
     async fn renew_lease(
         &self,
         user_id: &str,
@@ -445,6 +501,7 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         .rows_affected();
 
         if n == 0 {
+            tracing::warn!("task_lease: renew failed (lease expired or not held)");
             return Ok(None);
         }
         self.get_lease(user_id, task_id).await

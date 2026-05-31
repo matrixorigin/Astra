@@ -259,16 +259,37 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                     // Cross-pod: also deliver result via dispatch table
                                     // so other pods' turn bridges waiting on wait_result() can see it.
                                     let dispatch_svc = &state.execution.edge_dispatch_service;
-                                    let status = if is_error { "error" } else { "success" };
-                                    let result_body = serde_json::json!({
-                                        "request_id": &request_id,
-                                        "status": status,
-                                        "output": output,
-                                        "duration_ms": duration_ms,
-                                    });
-                                    let result_json = serde_json::to_string(&result_body).unwrap_or_default();
+                                    let status = if is_error { "error".to_string() } else { "success".to_string() };
+                                    let duration = duration_ms.unwrap_or(0);
+                                    let tool_result = astra_thin_client::ToolResultRequest::new_with_hash(
+                                        request_id.clone(),
+                                        Some(edge_agent_id.clone()),
+                                        status,
+                                        output,
+                                        duration,
+                                    );
+                                    let result_json = match serde_json::to_string(&tool_result) {
+                                        Ok(json) => json,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target: "astra_runtime::edge_ws",
+                                                user_id = %user.user_id,
+                                                request_id = %request_id,
+                                                error = %e,
+                                                "Edge WS: failed to serialize tool result body"
+                                            );
+                                            // Fallback: use serde_json to build valid JSON safely.
+                                            serde_json::to_string(&serde_json::json!({
+                                                "request_id": request_id,
+                                                "status": "error",
+                                                "output": "serialization failed",
+                                                "duration_ms": 0,
+                                            }))
+                                            .unwrap_or_else(|_| r#"{"status":"error","output":"serialization failed"}"#.to_string())
+                                        }
+                                    };
                                     if let Err(e) = dispatch_svc
-                                        .deliver_result(&request_id, &result_json)
+                                        .deliver_result(&request_id, &edge_agent_id, &result_json)
                                         .await
                                     {
                                         tracing::warn!(

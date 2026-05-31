@@ -92,6 +92,11 @@ pub struct SessionUpdateRequest {
 pub struct ToolResultRequest {
     pub request_id: String,
     pub status: String,
+    /// The edge agent ID that produced this result.
+    /// Required for cross-pod delivery — matches the dispatch table's edge_agent_id.
+    /// `None` for non-edge clients; server-side validation rejects `None`.
+    #[serde(default)]
+    pub edge_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +125,7 @@ impl ToolResultRequest {
     /// the hash is always present — no more scattered `compute_result_hash` calls.
     pub fn new_with_hash(
         request_id: String,
+        edge_agent_id: Option<String>,
         status: String,
         output: String,
         duration_ms: u64,
@@ -127,6 +133,7 @@ impl ToolResultRequest {
         let result_hash = Self::compute_result_hash(&request_id, &output);
         Self {
             request_id,
+            edge_agent_id,
             status,
             output: Some(output),
             duration_ms: Some(duration_ms),
@@ -1057,5 +1064,87 @@ mod tests {
             }
             e => panic!("unexpected {e:?}"),
         }
+    }
+
+    // ── ToolResultRequest serialization / parse_output_and_error ──────
+
+    #[test]
+    fn tool_result_parse_output_and_error_success() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"success","output":"hello","duration_ms":42}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        assert_eq!(output, "hello");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn tool_result_parse_output_and_error_error_status() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"error","output":"fail"}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        assert_eq!(output, "fail");
+        assert!(is_error);
+    }
+
+    #[test]
+    fn tool_result_parse_output_and_error_non_json_fallback() {
+        // When input is not JSON, fallback uses the whole string as output
+        let (output, is_error) = ToolResultRequest::parse_output_and_error("plain text result");
+        assert_eq!(output, "plain text result");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn tool_result_parse_output_and_error_missing_output() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"success"}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        assert_eq!(output, "");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn tool_result_new_with_hash_includes_edge_agent_id() {
+        let req = ToolResultRequest::new_with_hash(
+            "req-1".into(),
+            Some("agent-1".into()),
+            "success".into(),
+            "done".into(),
+            100,
+        );
+        assert_eq!(req.request_id, "req-1");
+        assert_eq!(req.edge_agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(req.output.as_deref(), Some("done"));
+        assert!(req.result_hash.is_some());
+    }
+
+    #[test]
+    fn tool_result_serde_roundtrip_preserves_edge_agent_id() {
+        let req = ToolResultRequest {
+            request_id: "r1".into(),
+            edge_agent_id: Some("ea-1".into()),
+            status: "success".into(),
+            output: Some("ok".into()),
+            duration_ms: Some(10),
+            result_hash: Some("abc123".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ToolResultRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    /// Edge clients that lack edge_agent_id (pre-multi-agent or non-edge)
+    /// must not crash deserialization — the field is optional.
+    #[test]
+    fn tool_result_deser_missing_edge_agent_id_yields_none() {
+        let json = r#"{"request_id":"r1","status":"success","output":"ok","duration_ms":10}"#;
+        let req: ToolResultRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.request_id, "r1");
+        assert_eq!(req.edge_agent_id, None);
+    }
+
+    /// edge_agent_id=None in validation must be rejected by the server.
+    #[test]
+    fn tool_result_deser_null_edge_agent_id() {
+        let json = r#"{"request_id":"r1","edge_agent_id":null,"status":"success","output":"ok"}"#;
+        let req: ToolResultRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.edge_agent_id, None);
     }
 }

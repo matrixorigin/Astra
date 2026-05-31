@@ -185,7 +185,11 @@ pub(crate) async fn post_tool_result_handler(
         )
     })?;
     if let Err(e) = dispatch_svc
-        .deliver_result(&body.request_id, &result_json)
+        .deliver_result(
+            &body.request_id,
+            body.edge_agent_id.as_deref().unwrap_or(""),
+            &result_json,
+        )
         .await
     {
         tracing::warn!(
@@ -620,6 +624,7 @@ mod edge_callback_insert_tests {
     fn tool_result_hash_mismatch_is_rejected() {
         let body = astra_thin_client::ToolResultRequest {
             request_id: "req-1".to_string(),
+            edge_agent_id: Some("test-agent".to_string()),
             status: "completed".to_string(),
             output: Some("actual".to_string()),
             duration_ms: Some(1),
@@ -635,6 +640,7 @@ mod edge_callback_insert_tests {
     fn tool_result_hash_matching_payload_is_accepted() {
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             "req-1".to_string(),
+            Some("test-agent".to_string()),
             "completed".to_string(),
             "actual".to_string(),
             1,

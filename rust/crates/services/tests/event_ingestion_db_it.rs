@@ -78,7 +78,11 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
 
 /// Verifies that concurrent writes with the same event_id both succeed
 /// without surfacing duplicate key errors to the caller.
-#[tokio::test]
+///
+/// Uses a multi-threaded runtime with a Barrier so both workers actually
+/// race their INSERT IGNORE at the same time — proving the DB layer
+/// handles the collision gracefully.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_ingest_concurrent_duplicate_key_no_error() {
     let shared = common::setup_pool().await;
@@ -90,12 +94,17 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
 
     let config = IngestionConfig::default();
 
-    // Spawn two workers concurrently on the same pool
+    // Barrier ensures both workers actually race their INSERT, rather than
+    // one completing before the other starts (which would mask races).
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
     let pool1 = pool.clone();
     let event1 = event.clone();
+    let b1 = barrier.clone();
     let handle1 = tokio::spawn(async move {
         let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool1, config);
         sender.enqueue_async(event1).await;
+        b1.wait().await;
         shutdown.signal();
         handle.await.unwrap();
     });
@@ -103,14 +112,16 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let pool2 = pool.clone();
     let event2 = event.clone();
     let config = IngestionConfig::default();
+    let b2 = barrier.clone();
     let handle2 = tokio::spawn(async move {
         let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool2, config);
         sender.enqueue_async(event2).await;
+        b2.wait().await;
         shutdown.signal();
         handle.await.unwrap();
     });
 
-    // Both should complete without panicking
+    // Both should complete without panicking — INSERT IGNORE handles the race
     let (r1, r2) = tokio::join!(handle1, handle2);
     r1.expect("first concurrent worker panicked");
     r2.expect("second concurrent worker panicked");

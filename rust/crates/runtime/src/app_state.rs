@@ -208,6 +208,9 @@ pub struct AppState {
     /// Prometheus-style metrics registry. Shared across handlers and the
     /// pipeline so /metrics exposes a single source of truth.
     pub(crate) metrics_registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
+    /// Multi-agent coordination metrics — scraped into metrics_registry on each
+    /// /metrics request for a unified exposition endpoint.
+    pub(crate) multi_agent_metrics: astra_services::multi_agent::SharedMultiAgentMetrics,
     #[cfg(feature = "harness")]
     pub harness_registry: crate::server::harness::handlers::HarnessSinkRegistry,
 }
@@ -298,6 +301,7 @@ impl AppState {
             plan_repo: Arc::new(astra_plan::InMemoryPlanRepository::new()),
             cors_origins: None,
             metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),
+            multi_agent_metrics: astra_services::multi_agent::shared_metrics(),
             #[cfg(feature = "harness")]
             harness_registry: crate::server::harness::handlers::HarnessSinkRegistry::new(),
         }

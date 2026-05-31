@@ -3798,6 +3798,75 @@ pub(crate) mod tests {
         assert_eq!(final_text, "ok");
     }
 
+    #[tokio::test]
+    async fn cancel_wins_over_pause() {
+        // When cancel arrives while the agentic loop is paused, cancel
+        // must take precedence — the loop should exit with Cancelled
+        // immediately, not stay paused.
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        let cancel_clone = cancel_flag.clone();
+        let pause_clone = pause_flag.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut host = MockHost::new(vec![text_result("should not run", 10, 5, Some(42))]);
+            let mut state = make_state();
+            state.cancellation.flag = Some(cancel_clone);
+            state.cancellation.pause_flag = Some(pause_clone);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (outcome, host.current_turn, state.final_text)
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(
+            !handle.is_finished(),
+            "loop should stay paused while only pause is set"
+        );
+
+        // Now set cancel — the loop should abort, not keep waiting
+        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (outcome, turns, final_text) = handle.await.unwrap();
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)),
+            "cancel must win over pause, got {outcome:?}"
+        );
+        assert_eq!(
+            turns, 0,
+            "no turns should execute when cancelled during pause"
+        );
+        assert!(final_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pause_cancel_at_same_time_cancelled_immediately() {
+        // When both pause and cancel are set from the start, the loop
+        // should return Cancelled without waiting.
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        let cancel_clone = cancel_flag.clone();
+        let pause_clone = pause_flag.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut host = MockHost::new(vec![text_result("should not run", 10, 5, Some(42))]);
+            let mut state = make_state();
+            state.cancellation.flag = Some(cancel_clone);
+            state.cancellation.pause_flag = Some(pause_clone);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (outcome, host.current_turn, state.final_text)
+        });
+
+        // Should complete quickly since cancel is checked inside the pause loop
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let (outcome, turns, final_text) = result.unwrap().unwrap();
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)),
+            "both pause+ cancel → must cancel, got {outcome:?}"
+        );
+        assert_eq!(turns, 0);
+        assert!(final_text.is_empty());
+    }
+
     #[test]
     fn waiting_variant_carries_reason() {
         let outcome = AgenticLoopOutcome::Waiting("tool_approval".to_string());

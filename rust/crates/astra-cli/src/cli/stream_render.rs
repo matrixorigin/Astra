@@ -621,6 +621,7 @@ struct CliSseStreamHost<'a> {
     token: String,
     auth_profile: Option<&'a str>,
     executor_id: &'a str,
+    edge_agent_id: String,
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     render_policy: RenderPolicy,
     perm_manager: Option<&'a mut crate::cli::permission_manager::PermissionManager>,
@@ -899,6 +900,7 @@ impl<'a> CliSseStreamHost<'a> {
             token: ctx.token.to_string(),
             auth_profile,
             executor_id: ctx.executor_id,
+            edge_agent_id: ctx.executor_id.to_string(),
             executor: ctx.executor,
             render_policy: ctx.render_policy,
             perm_manager: ctx.perm_manager,
@@ -1196,6 +1198,7 @@ impl<'a> CliSseStreamHost<'a> {
 
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             request_id.to_string(),
+            Some(self.edge_agent_id.clone()),
             status,
             output,
             duration_ms,
@@ -1757,6 +1760,7 @@ impl<'a> CliSseStreamHost<'a> {
 
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             req.request_id.clone(),
+            Some(self.edge_agent_id.clone()),
             status.to_string(),
             output,
             duration_ms,
@@ -3327,6 +3331,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         });
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             request_id.to_string(),
+            Some(self.edge_agent_id.clone()),
             status.clone(),
             output,
             duration_ms,
@@ -4056,6 +4061,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // Post tool result to cloud API.
             let body = astra_thin_client::ToolResultRequest::new_with_hash(
                 req.request_id.clone(),
+                Some(self.edge_agent_id.clone()),
                 status.to_string(),
                 output,
                 duration_ms,
@@ -7434,6 +7440,7 @@ mod tests {
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest {
             request_id: "req-1".to_string(),
+            edge_agent_id: Some("test-agent".to_string()),
             status: "ok".to_string(),
             output: Some("done".to_string()),
             duration_ms: Some(1),
@@ -7508,6 +7515,7 @@ mod tests {
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest {
             request_id: "req-1".to_string(),
+            edge_agent_id: Some("test-agent".to_string()),
             status: "ok".to_string(),
             output: Some("done".to_string()),
             duration_ms: Some(1),

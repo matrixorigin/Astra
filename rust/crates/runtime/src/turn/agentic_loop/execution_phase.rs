@@ -512,17 +512,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::Abort => {
                 state.stall.forced_round_budget_phase2 = true;
                 let diagnosis = interruption_diagnosis_summary(state);
-                let mut abort_msg = format!(
-                    "[Circuit breaker abort at round {}. The agent did not recover \
-                     after correction — stall or regression persists. Any progress \
-                     and tool results from earlier rounds are preserved above.]",
-                    state.llm_rounds_completed,
-                );
-                if let Some(diagnosis) = diagnosis.as_deref() {
-                    abort_msg.push_str(&format!(
-                        "\nLikely cause: {diagnosis}. Resume by reusing existing evidence and only fetching one genuinely new fact if still needed."
-                    ));
-                }
+                // Rich, contextual abort message: includes the diagnosis,
+                // the most recent preserved tool calls, and a concrete
+                // next-step line tied to the stall pattern. Used when the
+                // model has not yet produced any free-form text — the old
+                // behaviour was to leave users with a single red banner.
+                let abort_msg = super::lifecycle::build_circuit_breaker_abort_message(state);
                 if state.final_text.trim().is_empty() {
                     state.final_text = abort_msg.clone();
                 } else {

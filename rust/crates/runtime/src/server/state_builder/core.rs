@@ -210,16 +210,17 @@ pub(super) fn install_execution_services(
     shared_pool: &SharedPool,
     lease_hold_cache: &Arc<TaskLeaseHoldCache>,
 ) -> AppState {
+    let metrics = state.multi_agent_metrics.clone();
     state
         .with_task_service(Arc::new(MatrixOneTaskService::from_shared(shared_pool)))
-        .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
-            shared_pool,
-        )))
-        .with_edge_dispatch_service(Arc::new(DatabaseEdgeDispatchService::from_shared(
-            shared_pool,
-        )))
-        .with_task_lease_service(Arc::new(DatabaseTaskLeaseService::from_shared(
-            shared_pool,
-            Arc::clone(lease_hold_cache),
-        )))
+        .with_edge_registry_service(Arc::new(
+            DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
+        ))
+        .with_edge_dispatch_service(Arc::new(
+            DatabaseEdgeDispatchService::from_shared(shared_pool).with_metrics(metrics.clone()),
+        ))
+        .with_task_lease_service(Arc::new(
+            DatabaseTaskLeaseService::from_shared(shared_pool, Arc::clone(lease_hold_cache))
+                .with_metrics(metrics),
+        ))
 }

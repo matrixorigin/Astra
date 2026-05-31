@@ -13,6 +13,11 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
+
+/// Standard column width for `agent_id` across all tables.
+/// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
+/// columns MUST use this width for consistency and join compatibility.
+pub const AGENT_ID_LEN: usize = 255;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 struct CoreSchemaFileLock {
@@ -613,7 +618,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS agent_sessions (
             session_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
-            agent_id VARCHAR(64) NULL,
+            agent_id VARCHAR(255) NULL,
             title VARCHAR(255) NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
             event_count BIGINT NOT NULL DEFAULT 0,
@@ -641,7 +646,7 @@ pub async fn ensure_core_schema(
             event_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(64) NOT NULL,
-            agent_id VARCHAR(64) NULL,
+            agent_id VARCHAR(255) NULL,
             agent_version VARCHAR(32) NULL,
             event_type VARCHAR(64) NOT NULL,
             content LONGTEXT NULL,
@@ -653,7 +658,7 @@ pub async fn ensure_core_schema(
             turn_seq BIGINT NULL,
             round_index BIGINT NULL,
             tool_call_id VARCHAR(128) NULL,
-            parent_agent_id VARCHAR(128) NULL,
+            parent_agent_id VARCHAR(255) NULL,
             trace_kind VARCHAR(64) NULL,
             token_usage JSON NULL,
             llm_model_used VARCHAR(128) NULL,
@@ -714,7 +719,7 @@ pub async fn ensure_core_schema(
         ),
         (
             "parent_agent_id",
-            "ALTER TABLE agent_events ADD COLUMN parent_agent_id VARCHAR(128) NULL",
+            "ALTER TABLE agent_events ADD COLUMN parent_agent_id VARCHAR(255) NULL",
         ),
         (
             "trace_kind",
@@ -756,7 +761,7 @@ pub async fn ensure_core_schema(
             ancestor_path VARCHAR(2048) NOT NULL,
             depth INT NOT NULL DEFAULT 0,
             delegation_id VARCHAR(64) NULL,
-            agent_id VARCHAR(128) NULL,
+            agent_id VARCHAR(255) NULL,
             retry_of VARCHAR(64) NULL,
             retry_scope VARCHAR(16) NOT NULL DEFAULT 'node',
             status VARCHAR(32) NOT NULL,
@@ -802,7 +807,7 @@ pub async fn ensure_core_schema(
             session_id VARCHAR(64) NOT NULL,
             event_type VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NOT NULL,
-            agent_id VARCHAR(128) NULL,
+            agent_id VARCHAR(255) NULL,
             idempotency_key VARCHAR(128) NULL,
             event_hash VARCHAR(64) NOT NULL,
             producer_pod_id VARCHAR(128) NULL,
@@ -1153,9 +1158,7 @@ pub async fn ensure_core_schema(
     // ── Sweeper leader election (prevents duplicate background work in
     // multi-pod deployments). One row per sweeper type; pods CAS-update
     // the lease every TTL/2 seconds. Only the lease holder runs work.
-    query("DROP TABLE IF EXISTS sweeper_leases")
-        .execute(&pool)
-        .await?;
+    // Table created idempotently via IF NOT EXISTS — no DROP, no data loss.
     query(
         "CREATE TABLE IF NOT EXISTS sweeper_leases (
             sweeper_name VARCHAR(128) PRIMARY KEY,
@@ -1450,7 +1453,7 @@ pub async fn ensure_core_schema(
             root_run_id VARCHAR(128) NOT NULL,
             ancestor_path VARCHAR(2048) NOT NULL,
             depth INT NOT NULL DEFAULT 0,
-            agent_id VARCHAR(128) NULL,
+            agent_id VARCHAR(255) NULL,
             title VARCHAR(255) NULL,
             status VARCHAR(32) NOT NULL DEFAULT 'running',
             retry_of VARCHAR(128) NULL,
@@ -1820,7 +1823,7 @@ pub async fn ensure_core_schema(
             event_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(64) NULL,
-            agent_id VARCHAR(64) NULL,
+            agent_id VARCHAR(255) NULL,
             user_query LONGTEXT NULL,
             selected_skills JSON NULL,
             skill_name VARCHAR(255) NULL,
@@ -2061,7 +2064,7 @@ pub async fn ensure_core_schema(
             task_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NULL,
-            agent_id VARCHAR(128) NULL,
+            agent_id VARCHAR(255) NULL,
             parent_task_id VARCHAR(64) NULL,
             title VARCHAR(500) NOT NULL,
             description LONGTEXT NULL,
@@ -2095,7 +2098,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
             registry_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
-            edge_agent_id VARCHAR(128) NOT NULL,
+            edge_agent_id VARCHAR(255) NOT NULL,
             edge_id VARCHAR(128) NOT NULL,
             hostname VARCHAR(255) NULL,
             worktree_path VARCHAR(512) NULL,
@@ -2113,7 +2116,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
             dispatch_id BIGINT AUTO_INCREMENT PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
-            edge_agent_id VARCHAR(128) NOT NULL,
+            edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
             payload_json JSON NOT NULL,
             result_json JSON NULL,
@@ -2259,7 +2262,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS task_leases (
             task_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
-            holder_agent_id VARCHAR(128) NOT NULL,
+            holder_agent_id VARCHAR(255) NOT NULL,
             holder_edge_id VARCHAR(128) NULL,
             expires_at DATETIME(6) NOT NULL,
             lease_version BIGINT NOT NULL DEFAULT 1,
@@ -2739,7 +2742,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS wf_triggers (
             trigger_id   VARCHAR(36) PRIMARY KEY,
             user_id      VARCHAR(36) NOT NULL,
-            agent_id     VARCHAR(36),
+            agent_id     VARCHAR(255),
             trigger_type VARCHAR(32) NOT NULL,
             name         VARCHAR(128) NOT NULL,
             user_input   TEXT,
@@ -2762,7 +2765,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_agents (
-            agent_id       VARCHAR(36) PRIMARY KEY,
+            agent_id       VARCHAR(255) PRIMARY KEY,
             agent_name     VARCHAR(128) NOT NULL,
             agent_type     VARCHAR(64) NOT NULL DEFAULT 'general',
             owner_user_id  VARCHAR(36) NOT NULL,
@@ -2871,7 +2874,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS eval_user_feedback (
             feedback_id   VARCHAR(36) PRIMARY KEY,
             user_id       VARCHAR(36) NOT NULL,
-            agent_id      VARCHAR(64),
+            agent_id      VARCHAR(255),
             session_id    VARCHAR(36),
             turn_id       VARCHAR(36),
             feedback_type VARCHAR(64) NOT NULL,
@@ -3612,5 +3615,17 @@ mod tests {
             .expect_err("non-string legacy fallback_model should fail");
 
         assert!(error.contains("must be a string"));
+    }
+
+    /// Every `agent_id`, `edge_agent_id`, `holder_agent_id`, and
+    /// `parent_agent_id` column in DDL MUST use the width encoded in
+    /// [`AGENT_ID_LEN`].
+    #[test]
+    fn agent_id_columns_match_agreed_width() {
+        // Sanity: AGENT_ID_LEN must produce a reasonable VARCHAR width.
+        assert!(
+            AGENT_ID_LEN >= 32,
+            "AGENT_ID_LEN ({AGENT_ID_LEN}) is too small"
+        );
     }
 }

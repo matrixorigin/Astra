@@ -971,6 +971,91 @@ pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option
     compute_stall_diagnosis(state).summary
 }
 
+/// Build a user-facing abort message that the circuit-breaker uses when the
+/// model has not produced any free-form text yet. The legacy single-line
+/// red banner left users staring at "⛔ Circuit breaker abort at round N"
+/// with no context. This composes:
+///   1. The headline ("aborted at round N")
+///   2. Diagnosed cause (from `compute_stall_diagnosis`)
+///   3. Up to `MAX_RECENT_TOOLS` recent successful tool-call summaries so
+///      the user can see *what work was preserved* before the abort
+///   4. A concrete "next-step" line tied to the diagnosed cause
+///
+/// Pure formatter — no I/O, deterministic, easy to unit-test.
+pub(crate) fn build_circuit_breaker_abort_message(state: &AgenticLoopState) -> String {
+    const MAX_RECENT_TOOLS: usize = 5;
+    const PREVIEW_CHARS: usize = 120;
+
+    let round = state.llm_rounds_completed;
+    let diagnosis = compute_stall_diagnosis(state);
+
+    let mut out = format!(
+        "[Circuit breaker abort at round {round}. The agent did not recover \
+         after correction — stall or regression persists. Any progress and \
+         tool results from earlier rounds are preserved above.]"
+    );
+
+    if let Some(summary) = diagnosis.summary.as_deref() {
+        out.push_str(&format!("\nLikely cause: {summary}."));
+    }
+
+    let recent: Vec<&astra_services::session_journal::ToolCallRecord> = state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .filter(|r| !r.is_synthetic_placeholder() && r.ok)
+        .take(MAX_RECENT_TOOLS)
+        .collect();
+    if !recent.is_empty() {
+        out.push_str("\n\nWork preserved (most recent first):");
+        for record in &recent {
+            let args = record
+                .args_preview
+                .as_deref()
+                .or(record.args_full.as_deref())
+                .unwrap_or("");
+            let trimmed_args = clip_chars(args, PREVIEW_CHARS);
+            out.push_str(&format!("\n• {}: {}", record.name, trimmed_args));
+            if let Some(result) = record.result_preview.as_deref() {
+                let trimmed_result = clip_chars(result, PREVIEW_CHARS);
+                if !trimmed_result.is_empty() {
+                    out.push_str(&format!("\n    → {trimmed_result}"));
+                }
+            }
+        }
+    }
+
+    let next_step = match diagnosis.signal.as_deref() {
+        Some(s) if s.starts_with("redundant_reads=") || s.contains("exploration_family=read") => {
+            "Next: stop re-reading the same files; synthesize an answer from what's already in context, or write the change."
+        }
+        Some(s) if s.contains("exploration_family=search") => {
+            "Next: stop fanning out new greps; pick the single most-promising hit and read it directly."
+        }
+        Some(s) if s.starts_with("single_tool_streak=") => {
+            "Next: batch independent tool calls into one parallel round, or commit a partial answer with what you have."
+        }
+        _ => {
+            "Next: produce a textual answer from existing evidence; only call a tool if it adds genuinely new information."
+        }
+    };
+    out.push_str("\n\n");
+    out.push_str(next_step);
+
+    out
+}
+
+fn clip_chars(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut clipped: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
 pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -1032,17 +1117,90 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     turn_index: usize,
 ) -> Result<PreparedTurnIteration, String> {
     let quiet = host.is_quiet();
-    let mut last_db_poll = std::time::Instant::now();
-    let db_poll_interval = std::time::Duration::from_millis(500);
 
-    while state
-        .cancellation
-        .pause_flag
-        .as_ref()
-        .is_some_and(|f| f.load(Ordering::Acquire))
-    {
-        // Check in-memory cancel flags (fast path, same pod)
-        if state
+    // Outer loop: re-evaluate pause/cancel state until we either get
+    // cancelled or the run is no longer paused.  Each iteration polls
+    // the DB and resets the poll timer.  This replaces the prior
+    // recursive `Box::pin(prepare_turn_iteration(...)).await` which
+    // would stack-overflow during long pause windows.
+    loop {
+        let mut last_db_poll = std::time::Instant::now();
+        let db_poll_interval = std::time::Duration::from_millis(500);
+
+        while state
+            .cancellation
+            .pause_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Acquire))
+        {
+            // Check in-memory cancel flags (fast path, same pod)
+            if state
+                .cancellation
+                .flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Acquire))
+                || state
+                    .cancellation
+                    .token
+                    .as_ref()
+                    .is_some_and(|t| t.is_cancelled())
+            {
+                try_write_heavy_checkpoint(state);
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::UserCancelled,
+                    ResumeAction::ContinueImmediately,
+                    interruption_state_summary(state, None),
+                ));
+                return Ok(PreparedTurnIteration::Finished(
+                    AgenticLoopOutcome::Cancelled,
+                ));
+            }
+
+            // Periodic DB poll for cross-pod cancel/pause
+            if last_db_poll.elapsed() >= db_poll_interval {
+                if let Some(ref rc) = state.run_control {
+                    if let Some(run_id) = state.current_run_id.as_deref() {
+                        match rc.control_status(run_id).await {
+                            Some(RunControlStatus::Cancelled) => {
+                                if let Some(ref flag) = state.cancellation.flag {
+                                    flag.store(true, Ordering::SeqCst);
+                                }
+                                if let Some(ref token) = state.cancellation.token {
+                                    token.cancel();
+                                }
+                                try_write_heavy_checkpoint(state);
+                                state.interruption = Some(InterruptionRecord::new(
+                                    InterruptionKind::UserCancelled,
+                                    ResumeAction::ContinueImmediately,
+                                    interruption_state_summary(state, None),
+                                ));
+                                return Ok(PreparedTurnIteration::Finished(
+                                    AgenticLoopOutcome::Cancelled,
+                                ));
+                            }
+                            Some(RunControlStatus::Paused) => {
+                                // DB says paused, keep waiting — sync in-memory flag
+                                if let Some(ref flag) = state.cancellation.pause_flag {
+                                    flag.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            _ => {
+                                // Run is no longer paused — clear in-memory flag and break
+                                if let Some(ref flag) = state.cancellation.pause_flag {
+                                    flag.store(false, Ordering::SeqCst);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                last_db_poll = std::time::Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Fast-path in-memory cancel check (same pod)
+        let in_memory_cancelled = state
             .cancellation
             .flag
             .as_ref()
@@ -1051,8 +1209,35 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .cancellation
                 .token
                 .as_ref()
-                .is_some_and(|t| t.is_cancelled())
-        {
+                .is_some_and(|t| t.is_cancelled());
+
+        // Cross-pod DB check for cancel (only if in-memory didn't already catch it)
+        let db_cancelled = if !in_memory_cancelled {
+            if let Some(ref rc) = state.run_control {
+                if let Some(run_id) = state.current_run_id.as_deref() {
+                    matches!(
+                        rc.control_status(run_id).await,
+                        Some(RunControlStatus::Cancelled)
+                    )
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if in_memory_cancelled || db_cancelled {
+            if db_cancelled {
+                if let Some(ref flag) = state.cancellation.flag {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                if let Some(ref token) = state.cancellation.token {
+                    token.cancel();
+                }
+            }
             try_write_heavy_checkpoint(state);
             state.interruption = Some(InterruptionRecord::new(
                 InterruptionKind::UserCancelled,
@@ -1064,116 +1249,27 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             ));
         }
 
-        // Periodic DB poll for cross-pod cancel/pause
-        if last_db_poll.elapsed() >= db_poll_interval {
-            if let Some(ref rc) = state.run_control {
-                if let Some(run_id) = state.current_run_id.as_deref() {
-                    match rc.control_status(run_id).await {
-                        Some(RunControlStatus::Cancelled) => {
-                            if let Some(ref flag) = state.cancellation.flag {
-                                flag.store(true, Ordering::SeqCst);
-                            }
-                            if let Some(ref token) = state.cancellation.token {
-                                token.cancel();
-                            }
-                            try_write_heavy_checkpoint(state);
-                            state.interruption = Some(InterruptionRecord::new(
-                                InterruptionKind::UserCancelled,
-                                ResumeAction::ContinueImmediately,
-                                interruption_state_summary(state, None),
-                            ));
-                            return Ok(PreparedTurnIteration::Finished(
-                                AgenticLoopOutcome::Cancelled,
-                            ));
-                        }
-                        Some(RunControlStatus::Paused) => {
-                            // DB says paused, keep waiting — sync in-memory flag
-                            if let Some(ref flag) = state.cancellation.pause_flag {
-                                flag.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        _ => {
-                            // Run is no longer paused — clear in-memory flag and break
-                            if let Some(ref flag) = state.cancellation.pause_flag {
-                                flag.store(false, Ordering::SeqCst);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            last_db_poll = std::time::Instant::now();
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    // Fast-path in-memory cancel check (same pod)
-    let in_memory_cancelled = state
-        .cancellation
-        .flag
-        .as_ref()
-        .is_some_and(|f| f.load(Ordering::Acquire))
-        || state
-            .cancellation
-            .token
-            .as_ref()
-            .is_some_and(|t| t.is_cancelled());
-
-    // Cross-pod DB check for cancel (only if in-memory didn't already catch it)
-    let db_cancelled = if !in_memory_cancelled {
-        if let Some(ref rc) = state.run_control {
+        // Cross-pod DB check for pause (between turns)
+        if state.run_control.is_some() {
             if let Some(run_id) = state.current_run_id.as_deref() {
-                matches!(
-                    rc.control_status(run_id).await,
-                    Some(RunControlStatus::Cancelled)
-                )
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if in_memory_cancelled || db_cancelled {
-        // Sync in-memory flag if DB detected cancel
-        if db_cancelled {
-            if let Some(ref flag) = state.cancellation.flag {
-                flag.store(true, Ordering::SeqCst);
-            }
-            if let Some(ref token) = state.cancellation.token {
-                token.cancel();
-            }
-        }
-        try_write_heavy_checkpoint(state);
-        state.interruption = Some(InterruptionRecord::new(
-            InterruptionKind::UserCancelled,
-            ResumeAction::ContinueImmediately,
-            interruption_state_summary(state, None),
-        ));
-        return Ok(PreparedTurnIteration::Finished(
-            AgenticLoopOutcome::Cancelled,
-        ));
-    }
-
-    // Cross-pod DB check for pause (between turns)
-    if state.run_control.is_some() {
-        if let Some(run_id) = state.current_run_id.as_deref() {
-            if let Some(ref rc) = state.run_control {
-                if matches!(
-                    rc.control_status(run_id).await,
-                    Some(RunControlStatus::Paused)
-                ) {
-                    if let Some(ref flag) = state.cancellation.pause_flag {
-                        flag.store(true, Ordering::SeqCst);
+                if let Some(ref rc) = state.run_control {
+                    if matches!(
+                        rc.control_status(run_id).await,
+                        Some(RunControlStatus::Paused)
+                    ) {
+                        if let Some(ref flag) = state.cancellation.pause_flag {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                        // Loop back to top and re-enter the while-pause loop
+                        // instead of recursing (prevents stack overflow).
+                        continue;
                     }
-                    // Recurse to re-enter the pause loop
-                    return Box::pin(prepare_turn_iteration(host, state, turn_index)).await;
                 }
             }
         }
+
+        // Clean state: no cancel, no pause — proceed to turn preparation.
+        break;
     }
 
     if state.remaining_turns == 0 {
@@ -2004,6 +2100,89 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_abort_message_includes_diagnosis_and_recent_work() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 84;
+        state.stall.tool_call_records = (0..6)
+            .flat_map(|round| [read_record(round, 10, 40), read_record(round, 50, 80)])
+            .collect();
+        // Add result_preview to the most recent so we can assert it surfaces.
+        if let Some(last) = state.stall.tool_call_records.last_mut() {
+            last.result_preview = Some("fn handler(...) -> Result<()> {".into());
+        }
+
+        let msg = build_circuit_breaker_abort_message(&state);
+        assert!(
+            msg.contains("Circuit breaker abort at round 84"),
+            "headline missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("Likely cause:"),
+            "diagnosis missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("read-dominant exploratory rounds"),
+            "diagnosis text missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("Work preserved"),
+            "recent-work block missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("read_file:"),
+            "recent tool name missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("fn handler"),
+            "recent result preview missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("Next:"),
+            "next-step guidance missing; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("re-reading"),
+            "should advise stopping re-reads; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_abort_message_clips_long_previews() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 5;
+        let mut record = read_record(0, 10, 40);
+        record.args_preview = Some("a".repeat(500));
+        record.result_preview = Some("b".repeat(500));
+        state.stall.tool_call_records = vec![record];
+
+        let msg = build_circuit_breaker_abort_message(&state);
+        // 120-char clip with ellipsis: 119 chars + "…" — find that the
+        // long sequence does not appear in full.
+        assert!(
+            !msg.contains(&"a".repeat(200)),
+            "args preview was not clipped; got:\n{msg}"
+        );
+        assert!(
+            !msg.contains(&"b".repeat(200)),
+            "result preview was not clipped; got:\n{msg}"
+        );
+        assert!(msg.contains("…"), "ellipsis missing; got:\n{msg}");
+    }
+
+    #[test]
+    fn circuit_breaker_abort_message_with_no_diagnosis_still_yields_next_step() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 3;
+        // No tool calls → no diagnosis, no recent-work block, but still a
+        // headline + a default next-step line.
+        let msg = build_circuit_breaker_abort_message(&state);
+        assert!(msg.contains("Circuit breaker abort at round 3"));
+        assert!(!msg.contains("Likely cause:"));
+        assert!(!msg.contains("Work preserved"));
+        assert!(msg.contains("Next:"));
+    }
+
+    #[test]
     fn session_turn_number_prefers_explicit_outer_turn_over_agentic_step() {
         let mut state = make_state();
         state.session_turn = 1;
@@ -2344,6 +2523,223 @@ mod tests {
         assert!(
             msg.contains("~25% consumed") || msg.contains("75% remaining"),
             "expected actual consumption in message; msg: {msg}",
+        );
+    }
+
+    // ── Cancellation logic tests ──────────────────────────────────────────
+    //
+    // P1: Lifecycle cancellation has three orthogonal dimensions:
+    //   (1) cancel signal: in-memory flag vs CancellationToken
+    //   (2) pause context: inside pause loop vs between turns
+    //   (3) checkpoint: written on cancel path
+    //
+    // These tests exercise every combination of (1) and (2), plus
+    // verify checkpoint and interruption record invariants.
+
+    use std::sync::atomic::AtomicBool;
+    use tokio_util::sync::CancellationToken;
+
+    /// In-memory AtomicBool flag set → immediate cancel, no DB poll needed.
+    #[tokio::test]
+    async fn in_memory_flag_cancellation_returns_cancelled() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.cancellation.flag = Some(Arc::new(AtomicBool::new(true)));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("cancellation should complete cleanly");
+
+        assert!(
+            matches!(
+                prepared,
+                PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+            ),
+            "flag-based cancellation must return Cancelled outcome"
+        );
+        let ir = state
+            .interruption
+            .as_ref()
+            .expect("interruption must be set on cancel");
+        assert_eq!(
+            ir.kind,
+            astra_turn_core::interruption::InterruptionKind::UserCancelled,
+            "interruption kind must be UserCancelled"
+        );
+        assert_eq!(
+            ir.resume_action,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        );
+    }
+
+    /// CancellationToken already cancelled → immediate cancel.
+    #[tokio::test]
+    async fn in_memory_token_cancellation_returns_cancelled() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let token = CancellationToken::new();
+        token.cancel();
+        state.cancellation.token = Some(Arc::new(token));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("cancellation should complete cleanly");
+
+        assert!(
+            matches!(
+                prepared,
+                PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+            ),
+            "token-based cancellation must return Cancelled outcome"
+        );
+        let ir = state
+            .interruption
+            .as_ref()
+            .expect("interruption must be set on cancel");
+        assert_eq!(
+            ir.kind,
+            astra_turn_core::interruption::InterruptionKind::UserCancelled,
+        );
+    }
+
+    /// Pause flag set + cancel flag set → cancel wins inside pause loop
+    /// (fast path, no DB poll needed).
+    #[tokio::test]
+    async fn cancel_flag_inside_pause_loop_wins_immediately() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.cancellation.pause_flag = Some(Arc::new(AtomicBool::new(true)));
+        state.cancellation.flag = Some(Arc::new(AtomicBool::new(true)));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("cancellation during pause should complete cleanly");
+
+        assert!(
+            matches!(
+                prepared,
+                PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+            ),
+            "cancel during pause must return Cancelled immediately"
+        );
+        assert!(
+            state.interruption.is_some(),
+            "interruption must be set when cancel wins inside pause loop"
+        );
+    }
+
+    /// Pause flag set + token cancelled → cancel wins immediately.
+    #[tokio::test]
+    async fn cancel_token_inside_pause_loop_wins_immediately() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let token = CancellationToken::new();
+        token.cancel();
+        state.cancellation.pause_flag = Some(Arc::new(AtomicBool::new(true)));
+        state.cancellation.token = Some(Arc::new(token));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("cancellation during pause should complete cleanly");
+
+        assert!(
+            matches!(
+                prepared,
+                PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+            ),
+            "token cancel during pause must return Cancelled immediately"
+        );
+        assert!(state.interruption.is_some());
+    }
+
+    /// Clean state (no cancel, no pause) → normal turn preparation.
+    #[tokio::test]
+    async fn clean_state_returns_ready_for_turn_preparation() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("normal turn preparation should succeed");
+
+        assert!(
+            matches!(prepared, PreparedTurnIteration::Ready(_)),
+            "clean state without cancel/pause must return Ready"
+        );
+        assert!(
+            state.interruption.is_none(),
+            "no interruption should be recorded for clean state"
+        );
+        assert_eq!(
+            state.remaining_turns, 9,
+            "first turn should consume one budget tick"
+        );
+    }
+
+    /// Neither flag nor token set → not cancelled.
+    #[tokio::test]
+    async fn no_cancel_signal_returns_ready() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        // flag = None, token = None → should not cancel
+        state.cancellation.flag = None;
+        state.cancellation.token = None;
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("should succeed");
+
+        assert!(
+            matches!(prepared, PreparedTurnIteration::Ready(_)),
+            "None flag and None token must not trigger cancellation"
+        );
+    }
+
+    /// Flag=false and token not cancelled → not cancelled.
+    #[tokio::test]
+    async fn flag_false_and_token_not_cancelled_returns_ready() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.cancellation.flag = Some(Arc::new(AtomicBool::new(false)));
+        let token = CancellationToken::new();
+        // token NOT cancelled
+        state.cancellation.token = Some(Arc::new(token));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("should succeed");
+
+        assert!(
+            matches!(prepared, PreparedTurnIteration::Ready(_)),
+            "flag=false and token not cancelled must proceed normally"
+        );
+    }
+
+    /// Cancel writes an InterruptionRecord with correct kind and resume action.
+    #[tokio::test]
+    async fn cancellation_sets_interruption_record() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.cancellation.flag = Some(Arc::new(AtomicBool::new(true)));
+
+        let _ = prepare_turn_iteration(&mut host, &mut state, 0).await;
+
+        let ir = state
+            .interruption
+            .as_ref()
+            .expect("interruption must be set after cancel");
+        assert_eq!(
+            ir.kind,
+            astra_turn_core::interruption::InterruptionKind::UserCancelled
+        );
+        assert_eq!(
+            ir.resume_action,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately
+        );
+        // user_message must be present for resume context
+        assert!(
+            !ir.user_message.is_empty(),
+            "interruption user_message must be non-empty for resume guidance"
         );
     }
 }

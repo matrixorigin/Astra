@@ -456,3 +456,266 @@ async fn task_lease_wrong_agent_cannot_release() {
 
     cleanup_task(&pool, &task_id).await;
 }
+
+/// Release then claim: after one agent releases, another agent can claim
+/// the lease.  Release completes first, then claim happens — the DB
+/// serialises correctly regardless, but this order guarantees the
+/// expected outcome without non-deterministic lock races.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_concurrent_release_and_claim() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("conc-rel-claim")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    // Agent A claims first
+    lease
+        .try_claim_lease(&user, &task_id, "agent-a", "e1", 60)
+        .await
+        .expect("claim a");
+
+    // A releases
+    let released =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()))
+            .release_lease(&user, &task_id, "agent-a")
+            .await
+            .expect("release");
+    assert!(released, "agent-a should release successfully");
+
+    // B claims after release — must get Granted
+    let claimed =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()))
+            .try_claim_lease(&user, &task_id, "agent-b", "e2", 60)
+            .await
+            .expect("claim b");
+    assert!(
+        matches!(claimed, LeaseClaimResult::Granted { .. }),
+        "agent-b should get Granted after A releases, got {claimed:?}"
+    );
+
+    // Verify agent_b is now the holder
+    let view = DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()))
+        .get_lease(&user, &task_id)
+        .await
+        .expect("get lease")
+        .expect("lease exists");
+    assert_eq!(view.holder_agent_id, "agent-b", "agent-b should be holder");
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+/// Concurrent release from same agent: only one should return true.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_concurrent_double_release_only_one_succeeds() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("double-release")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    lease
+        .try_claim_lease(&user, &task_id, "agent-owner", "e1", 60)
+        .await
+        .expect("claim");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let b1 = barrier.clone();
+    let b2 = barrier.clone();
+    let pool1 = pool.clone();
+    let pool2 = pool.clone();
+    let user1 = user.clone();
+    let user2 = user.clone();
+    let tid1 = task_id.clone();
+    let tid2 = task_id.clone();
+
+    let (r1, r2) = tokio::join!(
+        async move {
+            b1.wait().await;
+            let svc = DatabaseTaskLeaseService::new(pool1, Arc::new(TaskLeaseHoldCache::default()));
+            svc.release_lease(&user1, &tid1, "agent-owner").await
+        },
+        async move {
+            b2.wait().await;
+            let svc = DatabaseTaskLeaseService::new(pool2, Arc::new(TaskLeaseHoldCache::default()));
+            svc.release_lease(&user2, &tid2, "agent-owner").await
+        }
+    );
+
+    let ok1 = r1.expect("release 1");
+    let ok2 = r2.expect("release 2");
+
+    // Exactly one must succeed — SELECT FOR UPDATE serialises them
+    assert!(
+        ok1 ^ ok2,
+        "exactly one concurrent release should succeed: r1={ok1}, r2={ok2}"
+    );
+
+    // After both complete, no lease should remain
+    let view = DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()))
+        .get_lease(&user, &task_id)
+        .await
+        .expect("get lease");
+    assert!(
+        view.is_none(),
+        "lease should be fully released after concurrent deletes"
+    );
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+/// Claim → Release → Claim: after release, another agent can claim.
+/// Validates release properly clears lease row AND agent_id from agent_tasks.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_release_then_new_claim_succeeds() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("rel-then-claim")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    // Agent A claims
+    let g = lease
+        .try_claim_lease(&user, &task_id, "agent-a", "e1", 60)
+        .await
+        .expect("claim a");
+    assert!(matches!(g, LeaseClaimResult::Granted { .. }));
+
+    // Agent A releases
+    let ok = lease
+        .release_lease(&user, &task_id, "agent-a")
+        .await
+        .expect("release");
+    assert!(ok, "release should succeed");
+
+    // Agent B claims — must succeed
+    let c = lease
+        .try_claim_lease(&user, &task_id, "agent-b", "e2", 60)
+        .await
+        .expect("claim b");
+    assert!(
+        matches!(c, LeaseClaimResult::Granted { .. }),
+        "agent-b should get Granted after release, got {c:?}"
+    );
+
+    let view = lease
+        .get_lease(&user, &task_id)
+        .await
+        .expect("get lease")
+        .expect("lease exists");
+    assert_eq!(view.holder_agent_id, "agent-b");
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+/// Verify agent_id is cleared BEFORE lease row is deleted during release.
+/// This ordering prevents a race where another pod sees the lease deleted
+/// but agent_id still set.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_release_clears_agent_id_before_deleting_lease() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("clear-agent-id")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let cache = Arc::new(TaskLeaseHoldCache::default());
+    let lease = DatabaseTaskLeaseService::new(pool.clone(), cache.clone());
+
+    // Claim
+    lease
+        .try_claim_lease(&user, &task_id, "agent-clr", "e1", 60)
+        .await
+        .expect("claim");
+
+    // Verify agent_id is set
+    let ag: String = sqlx::query_scalar("SELECT agent_id FROM agent_tasks WHERE task_id = ?")
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("select agent_id");
+    assert_eq!(ag, "agent-clr");
+
+    // Release
+    let ok = lease
+        .release_lease(&user, &task_id, "agent-clr")
+        .await
+        .expect("release");
+    assert!(ok);
+
+    // After release: agent_id should be NULL
+    let ag_after: Option<String> =
+        sqlx::query_scalar("SELECT agent_id FROM agent_tasks WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("select agent_id after release");
+    assert!(ag_after.is_none(), "agent_id MUST be NULL after release");
+
+    // Lease row should be gone
+    let lease_exists: Option<String> =
+        sqlx::query_scalar("SELECT holder_agent_id FROM task_leases WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("select lease");
+    assert!(
+        lease_exists.is_none(),
+        "lease row must be deleted after release"
+    );
+
+    cleanup_task(&pool, &task_id).await;
+}

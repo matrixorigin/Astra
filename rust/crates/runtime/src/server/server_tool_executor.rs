@@ -889,10 +889,6 @@ pub struct ServerToolExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     /// Optional edge registry for cross-pod edge agent discovery.
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    /// Attached edge agent ID for this run. When set, cross-pod dispatch
-    /// routes to this specific agent instead of arbitrarily picking the first
-    /// one from the registry.
-    attached_edge_agent_id: Option<String>,
     /// Optional observability session for self-mod and rollback-backed session state.
     observability_session:
         Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
@@ -1024,7 +1020,6 @@ impl ServerToolExecutor {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            attached_edge_agent_id: None,
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             self_mod_pinned_tools: Mutex::new(pinned_tools),
@@ -1750,13 +1745,6 @@ impl ServerToolExecutor {
         self.edge_registry_service = Some(svc);
     }
 
-    /// Set the edge agent ID that this run is attached to. When set, cross-pod
-    /// dispatch routes tool requests to this specific agent instead of picking
-    /// the first agent from the registry.
-    pub fn set_attached_edge_agent_id(&mut self, edge_agent_id: String) {
-        self.attached_edge_agent_id = Some(edge_agent_id);
-    }
-    /// Set the observability session for rollback-backed session-state tools.
     pub fn set_observability_session(
         &mut self,
         session: Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
@@ -1794,14 +1782,8 @@ impl ServerToolExecutor {
             (&self.edge_dispatch_service, &self.edge_registry_service)
         {
             if let Ok(agents) = registry.list_by_user(&self.user_id).await {
-                // Match the agent this run is attached to; fall back to first()
-                // when no specific assignment exists (e.g. web-agent mode).
-                let target_agent = self
-                    .attached_edge_agent_id
-                    .as_deref()
-                    .and_then(|target_id| agents.iter().find(|a| a.edge_agent_id == target_id))
-                    .or_else(|| agents.first());
-                if let Some(agent) = target_agent {
+                // Use the first available edge agent for cross-pod dispatch
+                if let Some(agent) = agents.first() {
                     let request_id = format!(
                         "xp-{}-{}",
                         self.session_id,

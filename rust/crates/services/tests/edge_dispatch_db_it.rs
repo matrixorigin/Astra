@@ -52,30 +52,24 @@ async fn edge_dispatch_full_lifecycle() {
         .expect("insert_dispatch");
     assert!(dispatch_id > 0, "dispatch_id should be positive");
 
-    // 2. Poll returns the pending dispatch
+    // 2. Poll atomically claims and marks as dispatched within a transaction
     let rows = svc
         .poll_pending(&user_id, &agent_id)
         .await
         .expect("poll_pending");
     assert_eq!(rows.len(), 1, "should have 1 pending dispatch");
     assert_eq!(rows[0].dispatch_id, dispatch_id);
-    assert_eq!(rows[0].status, "pending");
 
-    // 3. Mark as dispatched
-    svc.mark_dispatched(&[dispatch_id])
-        .await
-        .expect("mark_dispatched");
-
-    // 4. Poll again — now empty (status is 'dispatched', not 'pending')
+    // 3. Poll again — now empty (row was claimed in step 2)
     let rows = svc
         .poll_pending(&user_id, &agent_id)
         .await
-        .expect("poll_pending after mark_dispatched");
-    assert!(rows.is_empty(), "should be empty after marking dispatched");
+        .expect("poll_pending after claim");
+    assert!(rows.is_empty(), "should be empty after claiming");
 
-    // 5. Deliver result
+    // 4. Deliver result (with edge_agent_id for auth)
     let ok = svc
-        .deliver_result(&request_id, r#"{"output":"hello"}"#)
+        .deliver_result(&request_id, &agent_id, r#"{"output":"hello"}"#)
         .await
         .expect("deliver_result");
     assert!(ok, "deliver_result should return true for existing request");
@@ -104,12 +98,50 @@ async fn edge_dispatch_deliver_result_nonexistent_returns_false() {
     let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
 
     let ok = svc
-        .deliver_result("no-such-request", "{}")
+        .deliver_result("no-such-request", "any-agent", "{}")
         .await
         .expect("deliver_result");
     assert!(
         !ok,
         "deliver_result for nonexistent request should return false"
+    );
+}
+
+/// deliver_result with wrong edge_agent_id must return false (security boundary).
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
+    require_env();
+    let (pool, _settings) = common::setup_pool_and_settings().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+
+    let user_id = format!("ed-usr-{}", unique_suffix());
+    let agent_id = format!("ed-agent-{}", unique_suffix());
+    let request_id = Uuid::new_v4().to_string();
+
+    // Insert dispatch with agent_id
+    svc.insert_dispatch(&user_id, &agent_id, &request_id, r#"{"test":true}"#)
+        .await
+        .expect("insert_dispatch");
+
+    // Try to deliver with a DIFFERENT agent — must be rejected
+    let ok = svc
+        .deliver_result(&request_id, "wrong-agent-id", r#"{"output":"stolen"}"#)
+        .await
+        .expect("deliver_result");
+    assert!(
+        !ok,
+        "deliver_result with wrong agent_id MUST return false — cross-agent injection"
+    );
+
+    // Verify the original agent can still deliver
+    let ok = svc
+        .deliver_result(&request_id, &agent_id, r#"{"output":"legit"}"#)
+        .await
+        .expect("deliver_result");
+    assert!(
+        ok,
+        "correct agent_id should succeed after wrong agent rejection"
     );
 }
 
@@ -177,7 +209,7 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
         .expect("insert_dispatch");
 
     // Complete it
-    svc.deliver_result(&request_id, r#"{"done":true}"#)
+    svc.deliver_result(&request_id, &agent_id, r#"{"done":true}"#)
         .await
         .expect("deliver_result");
 
@@ -407,4 +439,134 @@ async fn edge_registry_register_twice_updates() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].edge_id, edge_id2);
     assert_eq!(list[0].hostname, Some("host2".to_string()));
+}
+
+// ── Concurrent poll_pending tests ────────────────────────────────────
+
+/// Two concurrent poll_pending calls must NOT claim the same row.
+/// The first transaction commits (SET dispatched), the second sees
+/// status='dispatched' and skips it. Assert exactly one winner
+/// and the dispatch status is correct.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_concurrent_poll_single_winner() {
+    require_env();
+    let (pool, _settings) = common::setup_pool_and_settings().await;
+
+    let user_id = format!("ed-cc-usr-{}", unique_suffix());
+    let agent_id = format!("ed-cc-agent-{}", unique_suffix());
+    let request_id = Uuid::new_v4().to_string();
+
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    svc.insert_dispatch(&user_id, &agent_id, &request_id, r#"{"tool":"bash"}"#)
+        .await
+        .expect("insert_dispatch");
+
+    use tokio::sync::Barrier;
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let b1 = barrier.clone();
+    let b2 = barrier.clone();
+    let pool1 = pool.get().clone();
+    let pool2 = pool.get().clone();
+    let user1 = user_id.clone();
+    let user2 = user_id.clone();
+    let ag1 = agent_id.clone();
+    let ag2 = agent_id.clone();
+
+    let (r1, r2) = tokio::join!(
+        async move {
+            b1.wait().await;
+            let svc = DatabaseEdgeDispatchService::new(pool1);
+            svc.poll_pending(&user1, &ag1).await
+        },
+        async move {
+            b2.wait().await;
+            let svc = DatabaseEdgeDispatchService::new(pool2);
+            svc.poll_pending(&user2, &ag2).await
+        }
+    );
+
+    let rows1 = r1.expect("poll 1");
+    let rows2 = r2.expect("poll 2");
+
+    let total = rows1.len() + rows2.len();
+    assert_eq!(total, 1, "exactly one poll call should claim the row");
+    assert!(
+        rows1.is_empty() ^ rows2.is_empty(),
+        "one poll should be empty, the other gets the row"
+    );
+
+    // Verify the claimed row has status='dispatched'
+    let claimed_rows = if !rows1.is_empty() { &rows1 } else { &rows2 };
+    assert_eq!(claimed_rows[0].request_id, request_id);
+    assert_eq!(
+        claimed_rows[0].status, "dispatched",
+        "claimed row status must be 'dispatched'"
+    );
+
+    // poll_pending again — must be empty
+    let rows3 = svc.poll_pending(&user_id, &agent_id).await.expect("poll 3");
+    assert!(rows3.is_empty(), "no more pending after concurrent claim");
+}
+
+/// With N pending rows and M concurrent pollers, verify exactly N rows
+/// are claimed total and status='dispatched' on each.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_concurrent_poll_multi_row_multi_poller() {
+    require_env();
+    let (pool, _settings) = common::setup_pool_and_settings().await;
+
+    let user_id = format!("ed-cm-usr-{}", unique_suffix());
+    let agent_id = format!("ed-cm-agent-{}", unique_suffix());
+
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+
+    // Insert 3 pending rows
+    let mut request_ids = Vec::new();
+    for i in 0..3 {
+        let rid = format!("{}-{}", Uuid::new_v4(), i);
+        svc.insert_dispatch(&user_id, &agent_id, &rid, r#"{"test":true}"#)
+            .await
+            .expect("insert_dispatch");
+        request_ids.push(rid);
+    }
+
+    // 4 concurrent pollers for 3 rows — one poller must get nothing
+    use tokio::sync::Barrier;
+    let n = 4;
+    let barrier = std::sync::Arc::new(Barrier::new(n));
+    let mut handles = Vec::new();
+
+    for _ in 0..n {
+        let pool = pool.get().clone();
+        let user = user_id.clone();
+        let agent = agent_id.clone();
+        let b = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            b.wait().await;
+            let svc = DatabaseEdgeDispatchService::new(pool);
+            svc.poll_pending(&user, &agent).await
+        }));
+    }
+
+    let mut total_claimed = 0usize;
+    for h in handles {
+        let rows = h.await.expect("join").expect("poll");
+        for row in &rows {
+            assert_eq!(
+                row.status, "dispatched",
+                "every claimed row must have status='dispatched'"
+            );
+        }
+        total_claimed += rows.len();
+    }
+
+    assert_eq!(total_claimed, 3, "exactly 3 rows should be claimed total");
+    // No more pending
+    let remaining = svc
+        .poll_pending(&user_id, &agent_id)
+        .await
+        .expect("final poll");
+    assert!(remaining.is_empty(), "no rows should remain after claim");
 }

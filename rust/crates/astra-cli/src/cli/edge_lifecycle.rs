@@ -447,6 +447,7 @@ async fn reexecute_pending_requests(
 
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             request_id.clone(),
+            Some(executor_id.to_string()),
             status.to_string(),
             output,
             0, // reconnection re-execution doesn't track timing

@@ -110,7 +110,18 @@ async fn finish_server_shutdown(
     bg_handles: Vec<tokio::task::JoinHandle<()>>,
     run_lifecycle: Arc<dyn astra_services::RunLifecycleService>,
     matrix_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
+    edge_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
 ) {
+    // 0. Drain edge WebSocket connections — send Closing to each edge and wait
+    //    for clean disconnect before tearing down background services.
+    let edge_count = edge_pool.drain().await;
+    if edge_count > 0 {
+        tracing::info!(
+            target: "astra_runtime::serve",
+            edge_count,
+            "drained edge WebSocket connections"
+        );
+    }
     // 1. Stop background sweepers and wait for them to exit.
     bg_cancel.cancel();
     for h in bg_handles {
@@ -186,12 +197,20 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // so we can drain ingestion + sync sidecars after axum returns.
     let matrix_runtime = state.matrix_cloud_runtime.clone();
     let run_lifecycle = state.execution.run_lifecycle_service.clone();
+    let edge_pool = state.edge_connection_pool.clone();
 
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(http_shutdown_signal())
         .await?;
 
-    finish_server_shutdown(bg_cancel, bg_handles, run_lifecycle, matrix_runtime).await;
+    finish_server_shutdown(
+        bg_cancel,
+        bg_handles,
+        run_lifecycle,
+        matrix_runtime,
+        edge_pool,
+    )
+    .await;
     Ok(())
 }
 
@@ -389,8 +408,14 @@ mod tests {
         });
         let run_lifecycle = Arc::new(RecordingRunLifecycleService::default());
 
-        super::finish_server_shutdown(bg_cancel, vec![bg_handle], run_lifecycle.clone(), None)
-            .await;
+        super::finish_server_shutdown(
+            bg_cancel,
+            vec![bg_handle],
+            run_lifecycle.clone(),
+            None,
+            astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
+        )
+        .await;
 
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         assert_eq!(run_lifecycle.drain_calls.load(Ordering::SeqCst), 1);

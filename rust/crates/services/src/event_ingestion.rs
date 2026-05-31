@@ -856,9 +856,12 @@ mod tests {
     #[test]
     fn test_is_duplicate_key_error() {
         // MySQL error 1062 is handled at the SQL layer via INSERT IGNORE.
-        // The integration tests verify idempotency behavior directly.
-        // This placeholder test documents the error code for reference.
-        assert_eq!(1062, 1062, "MySQL duplicate key error code");
+        // Delegate to astra_core which has the real implementation and
+        // its own thorough test suite (see crates/core/src/lib.rs).
+        let dup = sqlx::Error::Protocol("1062: Duplicate entry 'test' for key 'PRIMARY'".into());
+        assert!(astra_core::is_duplicate_key_error(&dup));
+        let unrelated = sqlx::Error::Protocol("connection reset by peer".into());
+        assert!(!astra_core::is_duplicate_key_error(&unrelated));
     }
 
     #[test]

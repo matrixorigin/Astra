@@ -2004,6 +2004,7 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let body = ToolResultRequest {
             request_id: "tr-1".into(),
+            edge_agent_id: Some("edge-abc".into()),
             status: "success".into(),
             output: Some("out".into()),
             duration_ms: Some(12),

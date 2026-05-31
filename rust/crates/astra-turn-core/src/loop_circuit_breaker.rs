@@ -139,6 +139,14 @@ pub struct LoopCircuitBreaker {
     /// Resets to 0 whenever `produced_mutation` is true, giving each new
     /// read-only streak a fresh budget of self-check prompts.
     introspect_emissions_since_last_write: usize,
+    /// Tool signatures observed in the trip-time tail window. Frozen at the
+    /// moment of `Closed → Open` transition. HalfOpen recovery checks
+    /// whether the post-correction round introduces signatures OUTSIDE this
+    /// set — which is the precise question "did the agent break the pattern
+    /// that got it killed?" Re-running the full window detectors during
+    /// HalfOpen overweights pre-correction stale rounds and Aborts agents
+    /// that genuinely pivoted (root cause of session 3d5ded08 overkill).
+    trip_tail_signatures: BTreeSet<String>,
 }
 
 impl LoopCircuitBreaker {
@@ -150,6 +158,7 @@ impl LoopCircuitBreaker {
             half_open_rounds: 0,
             consecutive_read_only: 0,
             introspect_emissions_since_last_write: 0,
+            trip_tail_signatures: BTreeSet::new(),
         }
     }
 
@@ -291,24 +300,58 @@ impl LoopCircuitBreaker {
             || self.detect_prolonged_read_only_stall()
         {
             self.state = BreakerState::Open;
+            self.trip_tail_signatures = self.collect_trip_tail_signatures();
             BreakerAction::InjectCorrection
         } else {
             BreakerAction::Continue
         }
     }
 
+    /// Snapshot the union of tool signatures across the tail window that
+    /// caused the trip. Used by HalfOpen to decide recovery without
+    /// re-running window detectors over pre-correction stale rounds.
+    fn collect_trip_tail_signatures(&self) -> BTreeSet<String> {
+        // Use the widest detector window (read_only_stall_threshold) so we
+        // capture every signature the agent was cycling through.
+        let n = self
+            .config
+            .read_only_stall_threshold
+            .max(self.config.stall_threshold)
+            .max(self.config.repetition_threshold)
+            .min(self.rounds.len());
+        if n == 0 {
+            return BTreeSet::new();
+        }
+        let tail = &self.rounds[self.rounds.len() - n..];
+        tail.iter()
+            .flat_map(|r| r.tool_signatures.iter().cloned())
+            .collect()
+    }
+
     fn evaluate_half_open(&mut self) -> BreakerAction {
         self.half_open_rounds += 1;
         let latest = &self.rounds[self.rounds.len() - 1];
 
-        // Recovery: agent produced a mutation or broke ALL stall patterns.
-        let still_stalling = self.detect_repetition_stall()
-            || self.detect_no_progress_stall()
-            || self.detect_prolonged_read_only_stall();
-        if latest.produced_mutation || !still_stalling {
+        // Recovery means: the agent did something the trip-time pattern
+        // could not produce. Three concrete forms:
+        //   1. produced a mutation
+        //   2. answered with text only (no tool calls)
+        //   3. introduced a tool signature outside the trip-time stale set
+        // We deliberately do NOT re-run the window detectors here — those
+        // include N-1 pre-correction stale rounds and would falsely
+        // condemn a single post-correction round that genuinely pivoted.
+        let broke_pattern = latest.produced_mutation
+            || latest.tool_count == 0
+            || latest
+                .tool_signatures
+                .iter()
+                .any(|sig| !self.trip_tail_signatures.contains(sig));
+
+        if broke_pattern {
             self.state = BreakerState::Closed;
             self.half_open_rounds = 0;
             self.consecutive_read_only = 0;
+            self.trip_tail_signatures.clear();
             BreakerAction::Continue
         } else if self.half_open_rounds >= self.config.half_open_patience {
             BreakerAction::Abort
@@ -1122,5 +1165,131 @@ mod tests {
     fn default_max_introspect_emissions_is_3() {
         let cfg = BreakerConfig::default();
         assert_eq!(cfg.max_introspect_emissions, 3);
+    }
+
+    // ─── HalfOpen recovery: judge the post-correction round only ─────────
+    //
+    // Root cause of overkill aborts (session 3d5ded08):
+    // `evaluate_half_open` re-runs the full N-round window detectors. The
+    // first 1-2 post-correction rounds are drowned by N-1 stale rounds from
+    // before the trip, so even a clean novel signature can't lift the
+    // window's verdict. Patience expires → Abort despite genuine recovery.
+    //
+    // Fix: HalfOpen judges the LATEST round against the trip-time stall
+    // pattern only. Mutation, empty (text-only) round, or any signature
+    // outside the trip-time stale set counts as recovery.
+
+    /// HalfOpen with one novel signature in latest round must recover.
+    /// Pre-fix bug: detect_prolonged_read_only_stall sees N-1 stale rounds
+    /// and 1 novel round; the lone novel sig is a subset-failure relative to
+    /// the prior window so the detector still says "stalling" → Abort.
+    #[test]
+    fn half_open_recovers_when_latest_round_breaks_trip_pattern() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig {
+            read_only_stall_threshold: 6,
+            stall_threshold: 100,
+            half_open_patience: 2,
+            ..Default::default()
+        });
+        // Trip via repeating 3 patterns for 6 rounds (no novel sigs after round 3).
+        let stale = ["grep:a", "grep:b", "grep:c"];
+        for i in 0..6 {
+            cb.observe(signal(&[stale[i % 3]], false));
+        }
+        assert_eq!(cb.state(), BreakerState::Open);
+        cb.correction_injected();
+
+        // Post-correction: a single completely novel signature.
+        let action = cb.observe(signal(&["read_file:newly_focused.rs"], false));
+        assert_eq!(
+            action,
+            BreakerAction::Continue,
+            "novel sig after correction is genuine recovery, not a stall"
+        );
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    /// HalfOpen with an empty (text-only) round must recover — model is
+    /// trying to wrap up with prose, that's the desired behavior.
+    #[test]
+    fn half_open_recovers_on_empty_text_round() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig {
+            read_only_stall_threshold: 6,
+            stall_threshold: 100,
+            half_open_patience: 2,
+            ..Default::default()
+        });
+        let stale = ["grep:a", "grep:b", "grep:c"];
+        for i in 0..6 {
+            cb.observe(signal(&[stale[i % 3]], false));
+        }
+        cb.correction_injected();
+
+        let empty = RoundSignal {
+            tool_signatures: BTreeSet::new(),
+            produced_mutation: false,
+            task_completed: false,
+            tool_count: 0,
+        };
+        assert_eq!(cb.observe(empty), BreakerAction::Continue);
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    /// HalfOpen still aborts if model keeps hitting only the trip-time
+    /// stale signatures. underkill protection.
+    #[test]
+    fn half_open_aborts_when_latest_repeats_trip_stale_pattern() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig {
+            read_only_stall_threshold: 6,
+            stall_threshold: 100,
+            half_open_patience: 2,
+            ..Default::default()
+        });
+        let stale = ["grep:a", "grep:b", "grep:c"];
+        for i in 0..6 {
+            cb.observe(signal(&[stale[i % 3]], false));
+        }
+        cb.correction_injected();
+
+        // Two more rounds that only call the same stale signatures.
+        assert_eq!(
+            cb.observe(signal(&["grep:a"], false)),
+            BreakerAction::Continue
+        );
+        assert_eq!(
+            cb.observe(signal(&["grep:b"], false)),
+            BreakerAction::Abort,
+            "patience expired with zero novel work — must abort"
+        );
+    }
+
+    /// Real-world scenario from session 3d5ded08: 89 rounds of mostly read-only
+    /// exploration. After breaker trips and injects correction, the model
+    /// shifts to a different file. With the bug this aborts; post-fix it
+    /// recovers. Uses default thresholds.
+    #[test]
+    fn session_3d5ded08_reproduction_recovers_post_fix() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
+        // Simulate the trip: 12 read-only rounds cycling 4 files (no novel
+        // signature after round 4 → detect_prolonged_read_only_stall trips).
+        let cycle = ["read_file:a", "read_file:b", "read_file:c", "read_file:d"];
+        for i in 0..12 {
+            let action = cb.observe(signal(&[cycle[i % 4]], false));
+            // Last round trips.
+            if i == 11 {
+                assert_eq!(action, BreakerAction::InjectCorrection);
+            }
+        }
+        cb.correction_injected();
+
+        // Model honors the correction by reading a genuinely new file.
+        // Pre-fix: this gets eaten by the 12-round window and patience burns down.
+        // Post-fix: novel sig → immediate recovery.
+        assert_eq!(
+            cb.observe(signal(&["read_file:e_new"], false)),
+            BreakerAction::Continue,
+            "genuine pivot after correction must not be killed by stale-window logic"
+        );
+        assert_eq!(cb.state(), BreakerState::Closed);
     }
 }

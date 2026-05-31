@@ -2648,7 +2648,7 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
             };
             git_stash_with_metadata(project_root, &remapped_args)
         }
-        "push" => ToolExecutionOutcome::ok(git_push(project_root, args)),
+        "push" => git_push_with_metadata(project_root, args),
         other => ToolExecutionOutcome::error(format!(
             "Unknown git action: '{other}'. Valid actions: status, diff, log, \
              show, blame, file_history, log_search, contributors, commit, \

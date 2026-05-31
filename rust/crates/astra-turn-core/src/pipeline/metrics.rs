@@ -112,6 +112,24 @@ impl MetricsRegistry {
         cell.fetch_add(delta, Ordering::Relaxed);
     }
 
+    /// Set a counter series to an absolute value. Unknown metrics / wrong kind
+    /// are silently ignored to keep hot paths panic-free.
+    pub fn set_counter_absolute(&self, name: &str, labels: &[(&str, &str)], value: u64) {
+        let labels = canonical_labels(labels);
+        let mut guard = self.inner.write().expect("metrics registry poisoned");
+        let Some(family) = guard.get_mut(name) else {
+            return;
+        };
+        if family.kind != MetricKind::Counter {
+            return;
+        }
+        let cell = family
+            .series
+            .entry(labels)
+            .or_insert_with(|| AtomicU64::new(0));
+        cell.store(value, Ordering::Relaxed);
+    }
+
     /// Set a gauge series to an absolute value. Unknown metrics are ignored.
     pub fn set_gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
         let labels = canonical_labels(labels);

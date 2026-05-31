@@ -340,6 +340,48 @@ impl EdgeConnectionPool {
         self.connections.len()
     }
 
+    /// Gracefully shut down all edge connections: send `Closing` to each,
+    /// wait a short grace period for clean disconnect, then clear the pool.
+    /// Already-closed senders are silently skipped.
+    ///
+    /// Returns the number of connections that were still alive before drain.
+    pub async fn drain(&self) -> usize {
+        use crate::edge_ws_protocol::EdgeServerMessage;
+
+        let closing = EdgeServerMessage::Closing {
+            reason: "server is shutting down".into(),
+        };
+
+        // Per-sender drain: send Closing, then unregister.
+        // DashMap retain takes &K, &mut V — we copy keys inline so we can call
+        // unregister (which requires a shared reference to self).
+        let keys: Vec<String> = self
+            .connections
+            .iter()
+            .filter(|entry| !entry.value().sender.is_closed())
+            .map(|entry| entry.key().clone())
+            .collect();
+        let count = keys.len();
+
+        for key in &keys {
+            if let Some(entry) = self.connections.get(key) {
+                let _ = entry.sender.send(closing.clone());
+            }
+        }
+
+        // Brief grace for edges to process the Closing frame.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Parse user_id:edge_agent_id back; unregister cleans up pending results.
+        for key in &keys {
+            if let Some((user_id, edge_agent_id)) = key.split_once(':') {
+                self.unregister(user_id, edge_agent_id);
+            }
+        }
+
+        count
+    }
+
     /// Get pending tool requests for a user. Only returns requests that are
     /// still in the pending set — completed requests should already have been
     /// removed via [`ack_completed_for_user`] before calling this method.
@@ -588,5 +630,100 @@ mod tests {
 
         assert!(pool.get_pending_requests_for_user("alice").is_empty());
         assert_eq!(pool.get_pending_requests_for_user("bob").len(), 1);
+    }
+
+    // ── drain ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_empty_pool_returns_zero() {
+        let pool = EdgeConnectionPool::new();
+        let count = pool.drain().await;
+        assert_eq!(count, 0);
+        assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_closes_live_connections_and_clears_pool() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pool.register("user-1", "edge-a", None, None, tx);
+        assert_eq!(pool.connection_count(), 1);
+
+        let count = pool.drain().await;
+        assert_eq!(count, 1);
+        assert_eq!(pool.connection_count(), 0);
+
+        // Edge should receive a Closing frame.
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, EdgeServerMessage::Closing { .. }));
+    }
+
+    #[tokio::test]
+    async fn drain_skips_already_closed_senders() {
+        let pool = EdgeConnectionPool::new();
+
+        // Live connection
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        pool.register("user-1", "edge-a", None, None, tx1);
+
+        // Already-closed connection
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        pool.register("user-1", "edge-b", None, None, tx2);
+        drop(rx2); // close
+
+        assert_eq!(pool.connection_count(), 2);
+
+        let count = pool.drain().await;
+
+        // Only the live connection counts; the closed sender is skipped.
+        assert_eq!(count, 1);
+        // Closed connections are intentionally left in the pool (they cannot
+        // be drained); call cleanup_stale to remove them.
+        assert_eq!(pool.connection_count(), 1);
+        pool.cleanup_stale();
+        assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_clears_in_flight_results_for_live_connections() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pool.register("user-1", "edge-a", None, None, tx);
+
+        // Dispatch a tool call so there's an in-flight oneshot.
+        let pool_clone = pool.clone();
+        let handle = tokio::spawn(async move {
+            pool_clone
+                .execute_tool("user-1", "edge-a", "bash", &json!({"command":"ls"}))
+                .await
+        });
+
+        // Read the ToolRequest so the oneshot is stored in pending_results.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _msg = rx.recv().await.unwrap();
+
+        // Drain should unregister the connection, dropping the oneshot sender.
+        let count = pool.drain().await;
+        assert_eq!(count, 1);
+
+        // The execute_tool caller gets None (oneshot was dropped).
+        let result = handle.await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_tolerates_concurrent_drain_calls() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        pool.register("user-1", "edge-a", None, None, tx);
+
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+        let (c1, c2) = tokio::join!(p1.drain(), p2.drain());
+
+        // Both should succeed; pool ends empty.
+        assert!(c1 <= 1);
+        assert!(c2 <= 1);
+        assert_eq!(pool.connection_count(), 0);
     }
 }
