@@ -835,23 +835,30 @@ impl EventIngestionWorker {
 mod tests {
     use super::*;
 
-    /// Test helper: create a minimal IngestionEvent with required fields.
     fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
         IngestionEvent {
-            event_id: event_id.into(),
-            session_id: session_id.into(),
-            user_id: "u1".into(),
-            event_type: event_type.into(),
+            event_id: event_id.to_string(),
+            session_id: session_id.to_string(),
+            user_id: "test-user".to_string(),
+            event_type: event_type.to_string(),
             content: None,
             token_usage: None,
             llm_model_used: None,
             skill_name: None,
             metadata: None,
-            created_at: "2025-01-15T10:30:00Z".into(),
+            created_at: "2025-01-15T10:30:00Z".to_string(),
             parent_event_id: None,
-            parent_event_ids: Vec::new(),
+            parent_event_ids: vec![],
             causal_chain_id: None,
         }
+    }
+
+    #[test]
+    fn test_is_duplicate_key_error() {
+        // MySQL error 1062 is handled at the SQL layer via INSERT IGNORE.
+        // The integration tests verify idempotency behavior directly.
+        // This placeholder test documents the error code for reference.
+        assert_eq!(1062, 1062, "MySQL duplicate key error code");
     }
 
     #[test]

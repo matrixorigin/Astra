@@ -320,6 +320,39 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     output
 }
 
+#[cfg(test)]
+mod truncate_output_tests {
+    // Regression: multi-byte UTF-8 chars at the byte boundary must not panic.
+    // Bug: `end byte index 2000 is not a char boundary; it is inside '─'`
+
+    #[test]
+    fn multibyte_at_boundary_no_panic() {
+        let prefix = "x".repeat(97);
+        let mb = "─".repeat(10); // 3 bytes each
+        let suffix = "y".repeat(200);
+        let s = format!("{prefix}{mb}{suffix}");
+        let result = super::truncate_output(s, 100);
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn emoji_4byte_at_boundary_no_panic() {
+        let prefix = "a".repeat(98);
+        let emoji = "🔥🔥🔥"; // 4 bytes each
+        let suffix = "z".repeat(200);
+        let s = format!("{prefix}{emoji}{suffix}");
+        let result = super::truncate_output(s, 100);
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn all_multibyte_no_panic() {
+        let s = "─".repeat(100); // 300 bytes
+        let result = super::truncate_output(s, 100);
+        assert!(result.ends_with("[truncated]"));
+    }
+}
+
 /// Normalize empty/whitespace-only tool output to a short marker.
 /// Prevents model confusion from truly empty tool results.
 /// Prevents model confusion from truly empty tool results.
@@ -3978,12 +4011,13 @@ impl ToolExecutor {
 
         // Build preview: first ~2KB, cut at newline boundary
         let preview_end = output.len().min(PERSIST_PREVIEW_BYTES);
+        let preview_end = output.floor_char_boundary(preview_end);
         let preview_end = output[..preview_end]
             .rfind('\n')
             .filter(|&pos| pos > preview_end / 2)
             .map(|pos| pos + 1)
             .unwrap_or(preview_end);
-        let preview = &output[..output.floor_char_boundary(preview_end)];
+        let preview = &output[..preview_end];
         let total_lines = output.lines().count();
 
         format!(

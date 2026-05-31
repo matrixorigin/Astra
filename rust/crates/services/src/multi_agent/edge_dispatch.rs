@@ -239,12 +239,14 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
     }
 
     async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
+        let secs = older_than.as_secs() as i64;
         let n = sqlx::query(
             "DELETE FROM edge_pending_dispatch \
-             WHERE created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
-             AND status IN ('completed', 'failed')",
+             WHERE (status = 'completed' AND completed_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND)) \
+                OR (status = 'failed' AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND))",
         )
-        .bind(older_than.as_secs() as i64)
+        .bind(secs)
+        .bind(secs)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_dispatch cleanup: {e}"))?;

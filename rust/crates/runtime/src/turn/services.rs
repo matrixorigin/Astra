@@ -448,7 +448,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
                 .map(|v| v as i32);
             let metadata_json = event.metadata.as_ref().map(|metadata| metadata.to_string());
             query(
-                "INSERT INTO agent_events \
+                "INSERT IGNORE INTO agent_events \
                  (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
                   parent_event_id, causal_chain_id, `metadata`, reasoning_content, \
                   meta_tool_name, meta_duration_ms, created_at) \

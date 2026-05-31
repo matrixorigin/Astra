@@ -584,12 +584,13 @@ pub fn maybe_persist_large_output(
     }
 
     let preview_end = output.len().min(PERSIST_PREVIEW_BYTES);
+    let preview_end = output.floor_char_boundary(preview_end);
     let preview_end = output[..preview_end]
         .rfind('\n')
         .filter(|&pos| pos > preview_end / 2)
         .map(|pos| pos + 1)
         .unwrap_or(preview_end);
-    let preview = &output[..output.floor_char_boundary(preview_end)];
+    let preview = &output[..preview_end];
     let total_lines = output.lines().count();
 
     format!(
@@ -780,6 +781,54 @@ mod tests {
         // Should cut at a newline
         assert!(result.ends_with("[truncated]"));
         assert!(!result.contains("line three"));
+    }
+
+    // ── UTF-8 char boundary regression ───────────────────────────────────
+    // The bug: `end byte index 2000 is not a char boundary; it is inside '─'`
+    // `floor_char_boundary` must be used before slicing to avoid panics on
+    // multi-byte UTF-8 characters like '─' (3 bytes), '🔥' (4 bytes), etc.
+
+    #[test]
+    fn truncate_output_multibyte_at_boundary() {
+        // Build a string where a multi-byte char straddles the max_bytes boundary
+        let prefix = "x".repeat(97); // 97 ASCII bytes
+        let mb = "─".repeat(10); // '─' is 3 bytes each, total 30
+        let suffix = "y".repeat(200);
+        let s = format!("{prefix}{mb}{suffix}");
+        // max_bytes=100 falls inside the first '─' (bytes 97..99, char at 97..100)
+        let result = truncate_output(s, 100);
+        assert!(result.ends_with("[truncated]"));
+        // Must not panic — if floor_char_boundary is missing, this panics
+    }
+
+    #[test]
+    fn truncate_output_4byte_emoji_at_boundary() {
+        let prefix = "a".repeat(98);
+        let emoji = "🔥🔥🔥"; // 4 bytes each
+        let suffix = "z".repeat(200);
+        let s = format!("{prefix}{emoji}{suffix}");
+        // max_bytes=100 falls inside the first 🔥 (bytes 98..101, char at 98..102)
+        let result = truncate_output(s, 100);
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_output_exact_multibyte_start() {
+        // max_bytes is exactly at a multi-byte char start — should work fine
+        let prefix = "x".repeat(99); // 99 ASCII bytes
+        let mb = "─".repeat(5);
+        let suffix = "y".repeat(100);
+        let s = format!("{prefix}{mb}{suffix}");
+        let result = truncate_output(s, 99); // exactly at char boundary
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_output_all_multibyte() {
+        // Entirely multi-byte string, boundary falls inside a char
+        let s = "─".repeat(100); // 300 bytes
+        let result = truncate_output(s, 100); // 100 is not a multiple of 3
+        assert!(result.ends_with("[truncated]"));
     }
 
     #[test]
@@ -1009,6 +1058,33 @@ mod tests {
         let result = maybe_persist_large_output(out.clone(), AGGREGATE_SOFT_LIMIT + 1, "bash");
         // Error output is never persisted
         assert_eq!(result, out);
+    }
+
+    // ── UTF-8 char boundary regression for persist preview ───────────────
+
+    #[test]
+    fn persist_preview_multibyte_at_boundary() {
+        // The preview clips at PERSIST_PREVIEW_BYTES (2000). Ensure it doesn't
+        // panic when a multi-byte char straddles that boundary.
+        let prefix = "x".repeat(1997); // 1997 ASCII bytes
+        let mb = "─".repeat(10); // '─' = 3 bytes each
+        let suffix = "y".repeat(PERSIST_THRESHOLD + 1000); // push past threshold
+        let s = format!("{prefix}{mb}{suffix}");
+        assert!(s.len() > PERSIST_THRESHOLD);
+        let result = maybe_persist_large_output(s, AGGREGATE_SOFT_LIMIT + 1, "bash");
+        // Must not panic; if it succeeded, the preview was built safely
+        assert!(result.contains("<persisted-output>"));
+    }
+
+    #[test]
+    fn persist_preview_4byte_emoji_at_boundary() {
+        let prefix = "a".repeat(1998); // 1998 bytes
+        let emoji = "🔥🔥🔥"; // 4 bytes each
+        let suffix = "z".repeat(PERSIST_THRESHOLD + 1000);
+        let s = format!("{prefix}{emoji}{suffix}");
+        assert!(s.len() > PERSIST_THRESHOLD);
+        let result = maybe_persist_large_output(s, AGGREGATE_SOFT_LIMIT + 1, "bash");
+        assert!(result.contains("<persisted-output>"));
     }
 
     // ── git_status_codes ───────────────────────────────────────────────
