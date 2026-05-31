@@ -44,6 +44,50 @@ pub fn str_replace_fail(what: &str, why: &str, next: &str) -> String {
     format!("❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: {what}\nWHY:  {why}\nNEXT: {next}")
 }
 
+/// Anchor (`old_str`) shorter than this is considered "too short to locate a
+/// large insertion uniquely without re-failing on minor whitespace drift".
+const MIN_ANCHOR_BYTES_FOR_LARGE_REPLACEMENT: usize = 32;
+
+/// Replacement (`new_str`) larger than this should go through `write_file`
+/// rather than `str_replace`. Threshold chosen to absorb typical
+/// section-level edits (~30-50 lines) while rejecting full-file pastes that
+/// belong in `write_file`.
+const MAX_REPLACEMENT_BYTES_FOR_SHORT_ANCHOR: usize = 4096;
+
+/// Guard against the "short old_str + huge new_str" anti-pattern that
+/// dominates failed edit retries: the model uses a section header (e.g.
+/// `## Anti-Patterns`) as anchor and pastes a multi-KB block, so any
+/// whitespace drift causes a retry that re-emits the entire payload.
+///
+/// Returns `None` when the edit is acceptable, otherwise a structured error
+/// pointing the model toward `write_file` or a longer anchor.
+pub fn check_anchor_vs_replacement_size(
+    edit_label: &str,
+    old_str: &str,
+    new_str: &str,
+    replace_all: bool,
+) -> Option<String> {
+    if replace_all {
+        return None;
+    }
+    if old_str.len() >= MIN_ANCHOR_BYTES_FOR_LARGE_REPLACEMENT
+        || new_str.len() <= MAX_REPLACEMENT_BYTES_FOR_SHORT_ANCHOR
+    {
+        return None;
+    }
+    Some(str_replace_fail(
+        &format!(
+            "{edit_label} rejected: anchor too short for replacement size (old_str {} bytes, new_str {} bytes).",
+            old_str.len(),
+            new_str.len(),
+        ),
+        "Short anchors with multi-KB replacements fail repeatedly on minor whitespace drift, and each retry re-emits the entire new_str — a pattern that wastes context and rarely succeeds.",
+        &format!(
+            "Either (a) extend old_str to ≥{MIN_ANCHOR_BYTES_FOR_LARGE_REPLACEMENT} bytes (typically 3+ adjacent lines including surrounding context) so the anchor uniquely locates the target, or (b) call write_file with the complete file content for full-section rewrites."
+        ),
+    ))
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut acc, component| {
@@ -780,6 +824,12 @@ pub fn prepare_str_replace(
         .get("allow_structural_change")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    if let Some(err) =
+        check_anchor_vs_replacement_size("str_replace", old_str, new_str, replace_all)
+    {
+        return Err(ToolResult::error(err));
+    }
+
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
         Err(e) => return Err(ToolResult::error(e)),
@@ -1003,6 +1053,11 @@ pub fn prepare_multi_edit(
                 "old_str and new_str are byte-for-byte identical.",
                 "Remove this edit, or fix new_str to reflect the intended change.",
             )));
+        }
+        if let Some(err) =
+            check_anchor_vs_replacement_size(&format!("edit[{i}]"), old_str, new_str, false)
+        {
+            return Err(ToolResult::error(err));
         }
         let count = working.matches(old_str).count();
         if count == 0 {
@@ -1516,33 +1571,32 @@ fn tree_sitter_has_error(source: &str, lang: crate::code_intel::Language) -> Opt
 
 /// Build a structured error message for failed str_replace lookups.
 ///
-/// Output starts with a prominent `❌ STR_REPLACE FAILED — FILE NOT MODIFIED`
-/// banner, followed by WHAT/WHY/NEXT sections so the caller (typically an LLM)
-/// can immediately see the failure category and recovery action. Diagnostic
-/// hints (whitespace match, line-by-line near-misses) are appended below.
+/// Output is intentionally compact: WHAT/WHY/NEXT banner plus structured
+/// boolean signals (whitespace_normalized_match, first_line_at_lines,
+/// individual_line_match_ratio). It does NOT echo file content — the prior
+/// `read_file` tool_result is still in the prompt and is the source of truth.
+/// Echoing nearby lines wastes tokens, breaks prompt-cache prefix matching
+/// (the echoed window depends on per-call old_str), and encourages the model
+/// to retry by re-emitting the full new_str instead of fixing the anchor.
 fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
     let mut msg = str_replace_fail(
         &format!("old_str not found in {path_str}."),
-        "The exact byte sequence does not appear in the current file content.",
-        "Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:",
+        "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
+        "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
     );
     msg.push('\n');
-    let mut has_specific_hint = false;
 
     let normalized_old = normalize_ws(old_str);
     let normalized_content = normalize_ws(content);
     if normalized_content.contains(&normalized_old) {
-        msg.push_str(
-            "Hint: A whitespace-normalized match exists. Check indentation/trailing spaces.\n",
-        );
+        msg.push_str("whitespace_normalized_match: true (check indentation/trailing whitespace)\n");
         if let Some(first_line) = old_lines.first() {
             let normalized_first = normalize_ws(first_line);
             for (idx, line) in lines.iter().enumerate() {
                 if normalize_ws(line) == normalized_first {
-                    msg.push_str(&format!("  Possible match at line {}\n", idx + 1));
-                    append_nearby_file_context(&mut msg, path_str, &lines, idx, old_lines.len());
+                    msg.push_str(&format!("first_line_at: L{}\n", idx + 1));
                     break;
                 }
             }
@@ -1550,6 +1604,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
         return msg;
     }
 
+    let mut has_specific_hint = false;
     if let Some(first_line) = old_lines.first() {
         let needle = first_line.trim();
         if !needle.is_empty() {
@@ -1564,13 +1619,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
             }
             if !matches.is_empty() {
                 has_specific_hint = true;
-                msg.push_str(&format!(
-                    "Hint: First line of old_str ('{}') found at line(s): {:?}\n",
-                    truncate_chars(needle, 60),
-                    matches
-                ));
-                let line_idx = matches[0] - 1;
-                append_nearby_file_context(&mut msg, path_str, &lines, line_idx, old_lines.len());
+                msg.push_str(&format!("first_line_at: {matches:?}\n"));
             }
         }
     }
@@ -1588,59 +1637,16 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
         if matching_count > 0 {
             has_specific_hint = true;
             msg.push_str(&format!(
-                "Hint: {matching_count}/{} lines from old_str exist individually in the file.\n",
+                "individual_line_match_ratio: {matching_count}/{}\n",
                 old_lines.len()
             ));
         }
     }
 
     if !has_specific_hint {
-        msg.push_str(
-            "Hint: Use read_file with start_line/end_line to verify the exact content before retrying.\n",
-        );
+        msg.push_str("no_partial_match: true (old_str doesn't appear under any normalization)\n");
     }
     msg
-}
-
-fn append_nearby_file_context(
-    msg: &mut String,
-    path_str: &str,
-    lines: &[&str],
-    anchor_idx: usize,
-    old_line_count: usize,
-) {
-    if lines.is_empty() {
-        return;
-    }
-    let span_len = old_line_count.max(1);
-    let start = anchor_idx.saturating_sub(5);
-    let end = anchor_idx
-        .saturating_add(span_len)
-        .saturating_add(5)
-        .min(lines.len());
-    msg.push_str(&format!(
-        "Exact nearby file context (read_file path={path_str} start_line={} end_line={}):\n",
-        start + 1,
-        end
-    ));
-    msg.push_str("Actual file content:\n");
-    for (line_offset, line_content) in lines[start..end].iter().enumerate() {
-        msg.push_str(&format!(
-            "  {}: {}\n",
-            start + line_offset + 1,
-            line_content
-        ));
-    }
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
 }
 
 const LCS_LINE_LIMIT: usize = 4000;
@@ -2417,19 +2423,24 @@ mod tests {
         assert!(content.contains("println!(\"bye\");"), "got: {content}");
     }
 
-    // Issue #2: whitespace hint should show old_lines.len() context, not min(5)
     #[test]
-    fn str_replace_not_found_hint_whitespace_branch_shows_full_old_str_span() {
-        // old_str has 8 lines. The whitespace hint should show all 8, not capped at 5.
+    fn str_replace_not_found_hint_whitespace_branch_emits_signal_only() {
         let content =
             "  fn big() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    f();\n  }\n";
         let old_str = "fn big() {\n  a();\n  b();\n  c();\n  d();\n  e();\n  f();\n}";
         let msg = str_replace_not_found_hint("f.txt", content, old_str);
-        assert!(msg.contains("whitespace-normalized"), "got: {msg}");
-        // Should show context through line with "f()" (line 7), not stop at 5 lines
         assert!(
-            msg.contains("f();"),
-            "should show all old_str lines of context, got: {msg}"
+            msg.contains("whitespace_normalized_match: true"),
+            "got: {msg}"
+        );
+        // Hint must NOT echo file content — model already has it from prior read_file
+        assert!(
+            !msg.contains("Actual file content"),
+            "hint should not echo file content, got: {msg}"
+        );
+        assert!(
+            !msg.contains("f();"),
+            "hint should not echo file lines, got: {msg}"
         );
     }
 
@@ -2440,8 +2451,11 @@ mod tests {
             "  fn hello() {\n    println!(\"hi\");\n  }\n",
             "fn hello() {\n  println!(\"hi\");\n}",
         );
-        assert!(msg.contains("whitespace-normalized"), "got: {msg}");
-        assert!(msg.contains("line 1"), "got: {msg}");
+        assert!(
+            msg.contains("whitespace_normalized_match: true"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("first_line_at: L1"), "got: {msg}");
     }
 
     #[test]
@@ -2527,7 +2541,6 @@ mod tests {
         );
     }
 
-    // ─── Issue #3: not-found hint O(n*m) → use HashSet ──────────────────
     #[test]
     fn str_replace_not_found_hint_first_line_match_branch() {
         let msg = str_replace_not_found_hint(
@@ -2535,9 +2548,11 @@ mod tests {
             "fn foo() {\n    bar();\n    baz();\n}\n",
             "fn foo() {\n    bar();\n    qux();\n}",
         );
-        assert!(msg.contains("First line"), "got: {msg}");
-        assert!(msg.contains("fn foo()"), "got: {msg}");
-        assert!(msg.contains("Actual file content"), "got: {msg}");
+        assert!(msg.contains("first_line_at:"), "got: {msg}");
+        assert!(
+            !msg.contains("Actual file content"),
+            "hint should not echo file content, got: {msg}"
+        );
     }
 
     #[test]
@@ -2547,14 +2562,15 @@ mod tests {
             "totally different content\nno matches at all\n",
             "something completely unrelated",
         );
-        assert!(msg.contains("read_file"), "got: {msg}");
+        assert!(msg.contains("no_partial_match: true"), "got: {msg}");
+        assert!(msg.contains("prior read_file tool_result"), "got: {msg}");
     }
 
     #[test]
     fn str_replace_not_found_hint_individual_lines_branch() {
         let msg = str_replace_not_found_hint("f.txt", "aaa\nbbb\nccc\n", "aaa\nXXX\nccc");
         assert!(
-            msg.contains("lines from old_str exist individually"),
+            msg.contains("individual_line_match_ratio: 2/3"),
             "got: {msg}"
         );
     }
@@ -2667,16 +2683,15 @@ mod tests {
         assert!(msg.contains("old_str not found"), "got: {msg}");
     }
 
-    // ─── not-found hint: multiline with zero individual matches ─────────
     #[test]
     fn str_replace_not_found_hint_no_individual_line_matches() {
         let msg =
             str_replace_not_found_hint("f.txt", "real content here\n", "xxxxxxx\nyyyyyyy\nzzzzzzz");
         assert!(
-            msg.contains("read_file"),
+            msg.contains("no_partial_match: true"),
             "expected generic fallback, got: {msg}"
         );
-        assert!(!msg.contains("lines from old_str exist"), "got: {msg}");
+        assert!(!msg.contains("individual_line_match_ratio"), "got: {msg}");
     }
 
     // ─── unified_diff edge cases ────────────────────────────────────────
@@ -2872,45 +2887,27 @@ mod tests {
         }
     }
 
-    // ─── First-line hint gives a repair-ready context window ─────────────
     #[test]
-    fn str_replace_not_found_hint_first_line_shows_surrounding_context_window() {
-        // File has 6 lines; old_str has 3 lines starting at line 2.
+    fn str_replace_not_found_hint_first_line_does_not_echo_file_content() {
         let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
         let old_str = "fn foo() {\n    bar();\n    qux();\n}";
         let msg = str_replace_not_found_hint("f.txt", content, old_str);
 
-        assert!(msg.contains("Actual file content"), "got: {msg}");
-        assert!(msg.contains("read_file path=f.txt"), "got: {msg}");
-        assert!(msg.contains("1: header"), "got: {msg}");
+        assert!(msg.contains("first_line_at:"), "got: {msg}");
         assert!(
-            msg.contains("6: footer"),
-            "should include surrounding context after the target span, got: {msg}"
+            !msg.contains("Actual file content"),
+            "hint must not echo file content, got: {msg}"
+        );
+        assert!(
+            !msg.contains("header"),
+            "hint must not echo file lines, got: {msg}"
+        );
+        assert!(
+            !msg.contains("footer"),
+            "hint must not echo file lines, got: {msg}"
         );
     }
 
-    // ─── truncate_chars ─────────────────────────────────────────────────
-    #[test]
-    fn truncate_chars_short_string_unchanged() {
-        assert_eq!(truncate_chars("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_chars_exact_length_no_ellipsis() {
-        assert_eq!(truncate_chars("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_chars_truncates_with_ellipsis() {
-        assert_eq!(truncate_chars("hello world", 5), "hello...");
-    }
-
-    #[test]
-    fn truncate_chars_empty_string() {
-        assert_eq!(truncate_chars("", 5), "");
-    }
-
-    // ─── Issue #3: DiffOp should be Copy ────────────────────────────────
     #[test]
     fn diff_op_is_copy() {
         let op = DiffOp::Equal(0, 0, "line");

@@ -1,6 +1,7 @@
 use super::*;
+#[cfg(test)]
 use astra_text_utils::str_preview::truncate_str;
-use astra_tools::fs_ops::str_replace_fail;
+use astra_tools::fs_ops::{check_anchor_vs_replacement_size, str_replace_fail};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
@@ -753,6 +754,12 @@ impl ToolExecutor {
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+
+        if let Some(err) =
+            check_anchor_vs_replacement_size("str_replace", old_str, new_str, replace_all)
+        {
+            return err;
+        }
 
         // Staleness check
         if let Err(e) = self.check_staleness(&path) {
@@ -1769,6 +1776,11 @@ impl ToolExecutor {
                     "Provide a new_str that actually differs from old_str, or remove the edit from the batch.",
                 );
             }
+            if let Some(err) =
+                check_anchor_vs_replacement_size(&format!("edit[{i}]"), old_str, new_str, false)
+            {
+                return err;
+            }
             let count = working.matches(old_str).count();
             if count == 0 {
                 // Try the fuzzy cascade. If it returns a unique
@@ -2594,35 +2606,34 @@ fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &s
 // semantics) can rely on a single sentinel: `❌ STR_REPLACE FAILED — FILE NOT MODIFIED`.
 // The "old_str not found" path additionally appends diagnostic hints below.
 
-/// When old_str not found, try to find close matches and report locations.
+/// When old_str not found, emit structured signals about near-misses.
+///
+/// Output is intentionally compact: WHAT/WHY/NEXT banner plus boolean signals
+/// (whitespace_normalized_match, first_line_at, individual_line_match_ratio,
+/// no_partial_match). It does NOT echo file content — the prior `read_file`
+/// tool_result is still in the prompt and is the source of truth. Echoing
+/// nearby lines wastes tokens, breaks prompt-cache prefix matching (echoed
+/// window depends on per-call old_str), and encourages the model to retry
+/// by re-emitting the full new_str instead of fixing the anchor.
 fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
     let mut msg = str_replace_fail(
         "old_str not found in file.",
-        "The exact byte sequence does not appear in the current file content.",
-        "Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:",
+        "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
+        "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
     );
     msg.push('\n');
 
-    // Strategy 1: Try whitespace-normalized match
     let normalized_old = normalize_ws(old_str);
     let normalized_content = normalize_ws(content);
     if normalized_content.contains(&normalized_old) {
-        msg.push_str(
-            "Hint: A whitespace-normalized match exists. Check indentation/trailing spaces.\n",
-        );
-        // Find which line in the file the first old line matches (normalized)
+        msg.push_str("whitespace_normalized_match: true (check indentation/trailing whitespace)\n");
         if let Some(first_line) = old_lines.first() {
             let norm_first = normalize_ws(first_line);
             for (i, line) in lines.iter().enumerate() {
                 if normalize_ws(line) == norm_first {
-                    msg.push_str(&format!("  Possible match at line {}\n", i + 1));
-                    // Show a few lines of actual content
-                    let end = (i + old_lines.len()).min(lines.len());
-                    for (j, line_content) in lines[i..end].iter().enumerate() {
-                        msg.push_str(&format!("  {}: {}\n", i + j + 1, line_content));
-                    }
+                    msg.push_str(&format!("first_line_at: L{}\n", i + 1));
                     break;
                 }
             }
@@ -2630,7 +2641,7 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
         return msg;
     }
 
-    // Strategy 2: Find the first line of old_str in the file
+    let mut has_specific_hint = false;
     if let Some(first_line) = old_lines.first() {
         let needle = first_line.trim();
         if !needle.is_empty() {
@@ -2644,24 +2655,12 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                 }
             }
             if !matches.is_empty() {
-                msg.push_str(&format!(
-                    "Hint: First line of old_str ('{}') found at line(s): {:?}\n",
-                    truncate_str(needle, 60),
-                    matches
-                ));
-                // Show context around first match
-                let line_idx = matches[0] - 1;
-                let start = line_idx;
-                let end = (line_idx + old_lines.len()).min(lines.len());
-                msg.push_str("Actual file content:\n");
-                for (j, line_content) in lines[start..end].iter().enumerate() {
-                    msg.push_str(&format!("  {}: {}\n", start + j + 1, line_content));
-                }
+                has_specific_hint = true;
+                msg.push_str(&format!("first_line_at: {matches:?}\n"));
             }
         }
     }
 
-    // Strategy 3: If multi-line, check how many lines match
     if old_lines.len() > 1 {
         let file_line_set: std::collections::HashSet<&str> =
             lines.iter().map(|l| l.trim()).collect();
@@ -2673,15 +2672,16 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
             })
             .count();
         if matching_count > 0 {
+            has_specific_hint = true;
             msg.push_str(&format!(
-                "Hint: {matching_count}/{} lines from old_str exist individually in the file.\n",
+                "individual_line_match_ratio: {matching_count}/{}\n",
                 old_lines.len()
             ));
         }
     }
 
-    if msg.ends_with("not found in file.\n") {
-        msg.push_str("Hint: Use read_file with start_line/end_line to verify the exact content before retrying.\n");
+    if !has_specific_hint {
+        msg.push_str("no_partial_match: true (old_str doesn't appear under any normalization)\n");
     }
     msg
 }
@@ -3093,10 +3093,17 @@ type Handler interface {
         let old_str = "fn hello() {\n  println!(\"hi\");\n}";
         let msg = str_replace_not_found_hint(content, old_str);
         assert!(
-            msg.contains("whitespace-normalized"),
+            msg.contains("whitespace_normalized_match: true"),
             "should hint whitespace: {msg}"
         );
-        assert!(msg.contains("line"), "should show line number: {msg}");
+        assert!(
+            msg.contains("first_line_at: L1"),
+            "should show line number: {msg}"
+        );
+        assert!(
+            !msg.contains("Actual file content"),
+            "hint must not echo file content: {msg}"
+        );
     }
 
     #[test]
@@ -3105,12 +3112,13 @@ type Handler interface {
         let old_str = "fn target() {\n    wrong body\n}";
         let msg = str_replace_not_found_hint(content, old_str);
         assert!(
-            msg.contains("fn target()"),
-            "should show first line match: {msg}"
+            msg.contains("first_line_at:"),
+            "should show first_line signal: {msg}"
         );
+        assert!(msg.contains("2"), "should show line number: {msg}");
         assert!(
-            msg.contains("2") || msg.contains("line"),
-            "should show line number: {msg}"
+            !msg.contains("Actual file content"),
+            "hint must not echo file content: {msg}"
         );
     }
 
@@ -3217,8 +3225,8 @@ type Handler interface {
         let old_str = "fn alpha() {}\nfn WRONG() {}\nfn gamma() {}";
         let msg = str_replace_not_found_hint(content, old_str);
         assert!(
-            msg.contains("lines from old_str exist"),
-            "should report partial: {msg}"
+            msg.contains("individual_line_match_ratio: 2/3"),
+            "should report partial ratio: {msg}"
         );
     }
 
@@ -3322,46 +3330,54 @@ type Handler interface {
         assert_eq!(actual, "let x = \u{201C}world\u{201D};");
     }
 
-    // F1: edge_tools whitespace hint should show all old_lines context, not capped at 5
     #[test]
-    fn str_replace_not_found_hint_whitespace_full_span_edge_tools() {
+    fn str_replace_not_found_hint_whitespace_emits_signal_only_edge_tools() {
         let content =
             "  fn big() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    f();\n  }\n";
         let old_str = "fn big() {\n  a();\n  b();\n  c();\n  d();\n  e();\n  f();\n}";
         let msg = str_replace_not_found_hint(content, old_str);
         assert!(
-            msg.contains("whitespace-normalized"),
-            "should trigger whitespace hint, got: {msg}"
+            msg.contains("whitespace_normalized_match: true"),
+            "should emit whitespace signal, got: {msg}"
         );
         assert!(
-            msg.contains("f();"),
-            "should show all 8 lines of context (not capped at 5), got: {msg}"
+            !msg.contains("Actual file content"),
+            "hint must not echo file content, got: {msg}"
+        );
+        assert!(
+            !msg.contains("f();"),
+            "hint must not echo file lines, got: {msg}"
         );
     }
 
-    // F2: first-line hint should show exactly old_lines.len() context, not +1
     #[test]
-    fn str_replace_not_found_hint_first_line_no_extra_line_edge_tools() {
+    fn str_replace_not_found_hint_first_line_does_not_echo_file_edge_tools() {
         let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
         let old_str = "fn foo() {\n    bar();\n    qux();\n}";
         let msg = str_replace_not_found_hint(content, old_str);
         assert!(
-            msg.contains("Actual file content"),
-            "should trigger first-line hint, got: {msg}"
+            msg.contains("first_line_at:"),
+            "should emit first_line signal, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Actual file content"),
+            "hint must not echo file content, got: {msg}"
         );
         assert!(
             !msg.contains("footer"),
-            "should not show extra line beyond old_str span, got: {msg}"
+            "hint must not echo file lines, got: {msg}"
+        );
+        assert!(
+            !msg.contains("header"),
+            "hint must not echo file lines, got: {msg}"
         );
     }
 
-    // F3: individual-lines check should use HashSet for O(n+m) perf
-    // (This is a correctness test — same behavior, ensures the optimization doesn't break anything)
     #[test]
     fn str_replace_not_found_hint_individual_lines_edge_tools() {
         let msg = str_replace_not_found_hint("aaa\nbbb\nccc\n", "aaa\nXXX\nccc");
         assert!(
-            msg.contains("lines from old_str exist individually"),
+            msg.contains("individual_line_match_ratio: 2/3"),
             "got: {msg}"
         );
     }
@@ -3757,7 +3773,12 @@ type Handler interface {
     }
 
     #[test]
-    fn read_file_full_read_dedups_only_within_same_turn() {
+    fn read_file_full_read_dedups_across_turns_when_mtime_unchanged() {
+        // Dedup is mtime-scoped, not turn-scoped. The prior tool_result is
+        // still in the prompt across turn boundaries; re-emitting full file
+        // content there waste tokens and breaks prompt-cache prefix matching.
+        // Compaction (which evicts prior tool_results) calls clear_file_state
+        // to invalidate dedup state.
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("full.txt");
         std::fs::write(&file_path, "MARK_A\nMARK_B\n").unwrap();
@@ -3775,7 +3796,7 @@ type Handler interface {
 
         let second_same_turn = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
         assert!(
-            second_same_turn.contains("earlier read in this turn"),
+            second_same_turn.contains("earlier read"),
             "same-turn repeat should stub: {second_same_turn}"
         );
 
@@ -3785,8 +3806,8 @@ type Handler interface {
 
         let next_turn = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
         assert!(
-            next_turn.contains("MARK_A") && !next_turn.contains("earlier read in this turn"),
-            "next turn must be able to re-read content: {next_turn}"
+            next_turn.contains("earlier read"),
+            "later turn with unchanged mtime must still stub (prior tool_result is still in prompt): {next_turn}"
         );
     }
 
@@ -3854,7 +3875,7 @@ type Handler interface {
     }
 
     #[test]
-    fn read_file_range_dedup_resets_across_turns() {
+    fn read_file_range_dedup_persists_across_turns_when_mtime_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         write_large_file(dir.path(), "turns.txt", 200);
 
@@ -3884,9 +3905,11 @@ type Handler interface {
             .journal_turn_index
             .store(2, std::sync::atomic::Ordering::Relaxed);
         let next_turn = executor.read_file(&args);
+        // Range was already covered; mtime unchanged; later turn must still
+        // dedup (prior tool_result is still in the prompt).
         assert!(
-            next_turn.contains("line 1") && !next_turn.contains("Same read_file request"),
-            "next turn must be able to re-read the same range: {next_turn}"
+            next_turn.contains("Same read_file request") || next_turn.contains("already read"),
+            "later turn with unchanged mtime must still stub: {next_turn}"
         );
     }
 

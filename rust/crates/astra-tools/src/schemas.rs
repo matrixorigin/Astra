@@ -152,7 +152,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create, overwrite, or delete a file. For writes, provide `path` and `content`. WARNING: overwrites existing files silently — read first if you need to preserve content. For deletes, set `delete=true` and omit `content`. Retry `write_file` with corrected args; do not switch to bash or python just to write a file.",
+                "description": "Create, overwrite, or delete a file. For writes, provide `path` and `content`. Use this for new files, complete rewrites, or large changes (>4KB) — `str_replace` is a diff channel and should not be used for full-section replacements. WARNING: overwrites existing files silently — read first if you need to preserve content. For deletes, set `delete=true` and omit `content`. Retry `write_file` with corrected args; do not switch to bash or python just to write a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -172,7 +172,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace text in a file. Supports single replacement or batched `edits`. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate. Use replace_all=true to replace all matching occurrences.",
+                "description": "Replace text in a file (diff channel — for targeted edits, not full rewrites). Supports single replacement or batched `edits`. Use the smallest old_str that uniquely identifies the target — typically 2-4 adjacent lines (≥3 lines preferred when new_str is large). For full-section rewrites or changes >4KB, use `write_file` with the complete file content instead. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate, or use replace_all=true.",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -59,15 +59,10 @@ pub(crate) struct FileState {
     pub(super) cached_content: Option<String>,
     /// Merged line ranges already read (sorted, non-overlapping).
     /// Used to detect when a new ranged read is fully covered by prior reads.
-    /// Reset on write or mtime change. Dedup only trusts these ranges within
-    /// the turn that recorded them because older turn content may have been
-    /// compacted out of the model context.
+    /// Reset on write or mtime change. Persists across turn boundaries:
+    /// compaction (which evicts prior tool_results from the prompt) calls
+    /// `clear_file_state` to invalidate this state.
     pub(super) read_ranges: Vec<(u64, u64)>,
-    /// Turn index that recorded the latest successful read. Read dedup is
-    /// scoped to this turn so later turns can re-read unchanged files and get
-    /// real content instead of "refer to earlier result" stubs. `None` means
-    /// the latest state came from a write/edit rather than a successful read.
-    pub(super) last_read_turn_index: Option<u32>,
 }
 
 /// Merge a new `(start, end)` into a sorted, non-overlapping range list.
@@ -192,22 +187,18 @@ impl ToolExecutor {
         content: Option<String>,
     ) {
         let ts = Self::file_mtime_ms(path);
-        let turn_index = self.journal_turn_index.load(Ordering::Acquire);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
         if let Ok(mut state) = self.file_state.lock() {
             let prev = state.get(&key);
             let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
-            // Carry forward read_ranges only when they were produced by a read
-            // in this same turn; earlier-turn coverage may no longer be in the
-            // model context after compaction/replay.
+            // Carry forward read_ranges across turns as long as the file
+            // hasn't changed on disk. Compaction (which wipes the prompt and
+            // therefore prior read tool_results) calls clear_file_state to
+            // invalidate this state.
             let mut ranges = prev
-                .filter(|fs| {
-                    fs.from_read
-                        && fs.timestamp_ms == ts
-                        && fs.last_read_turn_index == Some(turn_index)
-                })
+                .filter(|fs| fs.from_read && fs.timestamp_ms == ts)
                 .map(|fs| fs.read_ranges.clone())
                 .unwrap_or_default();
             // Merge the new range into the list.
@@ -244,7 +235,6 @@ impl ToolExecutor {
                     last_dedup_key,
                     cached_content,
                     read_ranges: ranges,
-                    last_read_turn_index: Some(turn_index),
                 },
             );
             enforce_limits(&mut state);
@@ -282,7 +272,6 @@ impl ToolExecutor {
                     last_dedup_key: ReadDedupKey::Full,
                     cached_content,
                     read_ranges: vec![],
-                    last_read_turn_index: None,
                 },
             );
             enforce_limits(&mut state);
@@ -355,9 +344,11 @@ impl ToolExecutor {
             .unwrap_or(false)
     }
 
-    /// Consecutive identical partial read (outline or same raw line range) with unchanged
-    /// mtime — stub **before** disk read for
-    /// the same offset/limit as the immediately previous read.
+    /// Identical partial read (outline or same raw line range) with unchanged
+    /// mtime — stub **before** disk read for the same offset/limit as a prior
+    /// read. Dedup is mtime-scoped (not turn-scoped): the prior read's
+    /// tool_result remains in the model's prompt across turn boundaries until
+    /// compaction, which calls `clear_file_state` to invalidate dedup state.
     pub(super) fn can_dedup_identical_partial_read(
         &self,
         path: &Path,
@@ -370,7 +361,6 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
-        let current_turn = self.journal_turn_index.load(Ordering::Acquire);
         let key = self.file_state_key(path);
         self.file_state
             .lock()
@@ -379,7 +369,6 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
-                        && fs.last_read_turn_index == Some(current_turn)
                         && fs.last_dedup_key == *requested)
                         .then_some(())
                 })
@@ -387,25 +376,21 @@ impl ToolExecutor {
             .is_some()
     }
 
-    /// Check if we can dedup a read within the current turn (previous op was a
-    /// full read, unchanged mtime).
+    /// Check if we can dedup a full read (previous op was a full read,
+    /// unchanged mtime). Mtime-scoped, not turn-scoped — see
+    /// `can_dedup_identical_partial_read` for rationale.
     pub(super) fn can_dedup_read(&self, path: &Path) -> bool {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return false;
         }
-        let current_turn = self.journal_turn_index.load(Ordering::Acquire);
         let key = self.file_state_key(path);
         self.file_state
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(&key).map(|fs| {
-                    fs.from_read
-                        && !fs.is_partial
-                        && fs.timestamp_ms == current_ts
-                        && fs.last_read_turn_index == Some(current_turn)
-                })
+                s.get(&key)
+                    .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
             })
             .unwrap_or(false)
     }
@@ -413,13 +398,12 @@ impl ToolExecutor {
     /// Check if a ranged read is fully covered by previously read ranges
     /// (file unchanged). Returns true when the requested `start..end` is a
     /// subset of the union of all prior reads — the content is already in
-    /// the conversation context.
+    /// the conversation context. Mtime-scoped, not turn-scoped.
     pub(super) fn is_range_already_read(&self, path: &Path, start: u64, end: u64) -> bool {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return false;
         }
-        let current_turn = self.journal_turn_index.load(Ordering::Acquire);
         let key = self.file_state_key(path);
         self.file_state
             .lock()
@@ -428,7 +412,6 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
-                        && fs.last_read_turn_index == Some(current_turn)
                         && ranges_cover(&fs.read_ranges, start, end))
                     .then_some(())
                 })
@@ -679,7 +662,13 @@ mod tests {
     }
 
     #[test]
-    fn read_ranges_reset_when_turn_advances_without_mtime_change() {
+    fn read_ranges_persist_across_turns_when_mtime_unchanged() {
+        // Dedup is mtime-scoped, not turn-scoped. The prior read's tool_result
+        // is still in the model's prompt across turn boundaries until
+        // compaction (which calls clear_file_state). Per-turn invalidation
+        // forced redundant re-reads (observed in session 949c8350: turn 16
+        // re-read the same file 5x because each turn started with empty
+        // dedup state).
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ranges.rs");
         std::fs::write(&file, "line1\nline2\nline3\nline4\n").unwrap();
@@ -709,8 +698,28 @@ mod tests {
 
         let state = exe.file_state.lock().unwrap();
         let fs = state.get(&key).unwrap();
-        assert_eq!(fs.last_read_turn_index, Some(2));
-        assert_eq!(fs.read_ranges, vec![(3, 4)]);
+        // Both ranges persist across the turn boundary because mtime is
+        // unchanged. They merge into [(1, 4)].
+        assert_eq!(fs.read_ranges, vec![(1, 4)]);
+    }
+
+    #[test]
+    fn dedup_fires_across_turn_boundary_when_mtime_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dedup.rs");
+        std::fs::write(&file, "fn x() {}\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+
+        exe.journal_turn_index.store(1, Ordering::Release);
+        exe.record_read(&file, false, ReadDedupKey::Full);
+
+        // Different turn, same mtime — dedup must still fire.
+        exe.journal_turn_index.store(5, Ordering::Release);
+        assert!(
+            exe.can_dedup_read(&file),
+            "full re-read in a later turn with unchanged mtime must dedup"
+        );
     }
 
     #[test]
@@ -729,7 +738,6 @@ mod tests {
         let state = exe.file_state.lock().unwrap();
         let fs = state.get(&key).unwrap();
         assert!(!fs.from_read);
-        assert_eq!(fs.last_read_turn_index, None);
         assert!(fs.read_ranges.is_empty());
     }
 }

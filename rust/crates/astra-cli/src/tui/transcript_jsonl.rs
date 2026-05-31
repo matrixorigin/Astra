@@ -30,11 +30,19 @@ pub(crate) fn transcript_path(session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty() {
         return None;
     }
-    dirs::home_dir().map(|h| {
-        h.join(".astra")
-            .join("transcripts")
-            .join(format!("{session_id}.jsonl"))
-    })
+    std::env::var_os("HOME")
+        .and_then(|h| {
+            if h.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(h))
+            }
+        })
+        .map(|h| {
+            h.join(".astra")
+                .join("transcripts")
+                .join(format!("{session_id}.jsonl"))
+        })
 }
 
 /// Append a single event to the session's transcript. Idempotent on
@@ -119,7 +127,7 @@ mod tests {
     use crate::tui::turn_event::{SystemLevel, ToolStatus, TurnEvent};
 
     /// Run `f` with `$HOME` pointing at a fresh tempdir so
-    /// `dirs::home_dir()` resolves there. Ensures tests don't scribble
+    /// `transcript_path` resolves there. Ensures tests don't scribble
     /// into the developer's real `~/.astra/`.
     fn with_tmp_home<F: FnOnce(&std::path::Path)>(f: F) {
         let home = crate::tests::HomeGuard::temp();
