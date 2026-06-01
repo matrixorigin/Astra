@@ -51,7 +51,8 @@ impl BoundedSessionCache {
     fn insert(&mut self, path: PathBuf, value: bool) {
         let is_new = !self.entries.contains_key(&path);
         // Evict oldest entry (FIFO) only when inserting a net-new key at capacity.
-        if is_new && self.entries.len() >= Self::MAX
+        if is_new
+            && self.entries.len() >= Self::MAX
             && let Some(evicted) = self.order.pop_front()
         {
             self.entries.remove(&evicted);
