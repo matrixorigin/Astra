@@ -17,7 +17,8 @@
 //! before being written to the learning snapshot on disk.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+
+use tokio::sync::Mutex;
 
 use astra_turn_types::StructuredFeedback;
 
@@ -56,8 +57,8 @@ impl FeedbackStore {
     }
 
     /// Store a feedback rule for a session. Deduplicates by rule text.
-    pub fn add(&self, session_id: &str, feedback: StructuredFeedback) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+    pub async fn add(&self, session_id: &str, feedback: StructuredFeedback) {
+        let mut inner = self.inner.lock().await;
 
         // LRU eviction of oldest session if at capacity
         if !inner.sessions.contains_key(session_id) {
@@ -88,10 +89,10 @@ impl FeedbackStore {
     }
 
     /// Number of stored rules for a session.
-    pub fn len(&self, session_id: &str) -> usize {
+    pub async fn len(&self, session_id: &str) -> usize {
         self.inner
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .await
             .sessions
             .get(session_id)
             .map(|s| s.rules.len())
@@ -99,13 +100,13 @@ impl FeedbackStore {
     }
 
     /// Whether a session has any rules.
-    pub fn is_empty(&self, session_id: &str) -> bool {
-        self.len(session_id) == 0
+    pub async fn is_empty(&self, session_id: &str) -> bool {
+        self.len(session_id).await == 0
     }
 
     /// Build a context injection string for a specific session.
-    pub fn build_injection(&self, session_id: &str) -> String {
-        self.build_injection_filtered(session_id, None)
+    pub async fn build_injection(&self, session_id: &str) -> String {
+        self.build_injection_filtered(session_id, None).await
     }
 
     /// Build injection text, optionally filtering rules by relevance to the
@@ -113,8 +114,12 @@ impl FeedbackStore {
     /// keywords overlap with the message are injected first ("relevant"),
     /// followed by up to `MAX_IRRELEVANT_RULES` others so the model still
     /// has background context without unbounded token growth.
-    pub fn build_injection_filtered(&self, session_id: &str, user_message: Option<&str>) -> String {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+    pub async fn build_injection_filtered(
+        &self,
+        session_id: &str,
+        user_message: Option<&str>,
+    ) -> String {
+        let inner = self.inner.lock().await;
         let Some(entry) = inner.sessions.get(session_id) else {
             return String::new();
         };
@@ -184,10 +189,10 @@ impl FeedbackStore {
     }
 
     /// Get a snapshot of rules for a session.
-    pub fn rules(&self, session_id: &str) -> Vec<StructuredFeedback> {
+    pub async fn rules(&self, session_id: &str) -> Vec<StructuredFeedback> {
         self.inner
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .await
             .sessions
             .get(session_id)
             .map(|s| s.rules.clone())
@@ -195,17 +200,13 @@ impl FeedbackStore {
     }
 
     /// Number of tracked sessions.
-    pub fn session_count(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sessions
-            .len()
+    pub async fn session_count(&self) -> usize {
+        self.inner.lock().await.sessions.len()
     }
 
     /// Remove all rules for a session. Call on session close for explicit cleanup.
-    pub fn clear_session(&self, session_id: &str) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+    pub async fn clear_session(&self, session_id: &str) {
+        let mut inner = self.inner.lock().await;
         inner.sessions.remove(session_id);
         inner.order.retain(|s| s != session_id);
     }
@@ -243,151 +244,155 @@ mod tests {
 
     // ── Session isolation ──
 
-    #[test]
-    fn sessions_are_isolated() {
+    #[tokio::test]
+    async fn sessions_are_isolated() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("rule A"));
-        store.add("s2", make_fb("rule B"));
+        store.add("s1", make_fb("rule A")).await;
+        store.add("s2", make_fb("rule B")).await;
 
-        assert_eq!(store.len("s1"), 1);
-        assert_eq!(store.len("s2"), 1);
-        assert!(store.build_injection("s1").contains("rule A"));
-        assert!(!store.build_injection("s1").contains("rule B"));
-        assert!(store.build_injection("s2").contains("rule B"));
-        assert!(!store.build_injection("s2").contains("rule A"));
+        assert_eq!(store.len("s1").await, 1);
+        assert_eq!(store.len("s2").await, 1);
+        assert!(store.build_injection("s1").await.contains("rule A"));
+        assert!(!store.build_injection("s1").await.contains("rule B"));
+        assert!(store.build_injection("s2").await.contains("rule B"));
+        assert!(!store.build_injection("s2").await.contains("rule A"));
     }
 
-    #[test]
-    fn unknown_session_returns_empty() {
+    #[tokio::test]
+    async fn unknown_session_returns_empty() {
         let store = FeedbackStore::new();
-        assert!(store.is_empty("nonexistent"));
-        assert!(store.build_injection("nonexistent").is_empty());
-        assert!(store.rules("nonexistent").is_empty());
+        assert!(store.is_empty("nonexistent").await);
+        assert!(store.build_injection("nonexistent").await.is_empty());
+        assert!(store.rules("nonexistent").await.is_empty());
     }
 
     // ── Dedup ──
 
-    #[test]
-    fn deduplicates_within_session() {
+    #[tokio::test]
+    async fn deduplicates_within_session() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("rule A"));
-        store.add("s1", make_fb("rule A"));
-        assert_eq!(store.len("s1"), 1);
+        store.add("s1", make_fb("rule A")).await;
+        store.add("s1", make_fb("rule A")).await;
+        assert_eq!(store.len("s1").await, 1);
     }
 
-    #[test]
-    fn deduplicates_case_insensitive() {
+    #[tokio::test]
+    async fn deduplicates_case_insensitive() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("Don't use mocks"));
-        store.add("s1", make_fb("don't use mocks"));
+        store.add("s1", make_fb("Don't use mocks")).await;
+        store.add("s1", make_fb("don't use mocks")).await;
         assert_eq!(
-            store.len("s1"),
+            store.len("s1").await,
             1,
             "case-insensitive dedup should prevent duplicate"
         );
     }
 
-    #[test]
-    fn same_rule_different_sessions_not_deduped() {
+    #[tokio::test]
+    async fn same_rule_different_sessions_not_deduped() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("rule A"));
-        store.add("s2", make_fb("rule A"));
-        assert_eq!(store.len("s1"), 1);
-        assert_eq!(store.len("s2"), 1);
+        store.add("s1", make_fb("rule A")).await;
+        store.add("s2", make_fb("rule A")).await;
+        assert_eq!(store.len("s1").await, 1);
+        assert_eq!(store.len("s2").await, 1);
     }
 
     // ── Capacity ──
 
-    #[test]
-    fn evicts_oldest_rule_at_capacity() {
+    #[tokio::test]
+    async fn evicts_oldest_rule_at_capacity() {
         let store = FeedbackStore::new();
         for i in 0..MAX_RULES_PER_SESSION + 3 {
-            store.add("s1", make_fb(&format!("rule {i}")));
+            store.add("s1", make_fb(&format!("rule {i}"))).await;
         }
-        assert_eq!(store.len("s1"), MAX_RULES_PER_SESSION);
-        let rules = store.rules("s1");
+        assert_eq!(store.len("s1").await, MAX_RULES_PER_SESSION);
+        let rules = store.rules("s1").await;
         assert_eq!(rules[0].rule, "rule 3");
     }
 
-    #[test]
-    fn evicts_oldest_session_at_capacity() {
+    #[tokio::test]
+    async fn evicts_oldest_session_at_capacity() {
         let store = FeedbackStore::new();
         for i in 0..MAX_SESSIONS + 5 {
-            store.add(&format!("s{i}"), make_fb("rule"));
+            store.add(&format!("s{i}"), make_fb("rule")).await;
         }
-        assert!(store.session_count() <= MAX_SESSIONS);
+        assert!(store.session_count().await <= MAX_SESSIONS);
         // Oldest sessions should be evicted
-        assert!(store.is_empty("s0"));
-        assert!(!store.is_empty(&format!("s{}", MAX_SESSIONS + 4)));
+        assert!(store.is_empty("s0").await);
+        assert!(!store.is_empty(&format!("s{}", MAX_SESSIONS + 4)).await);
     }
 
     // ── Injection format ──
 
-    #[test]
-    fn empty_session_empty_injection() {
+    #[tokio::test]
+    async fn empty_session_empty_injection() {
         let store = FeedbackStore::new();
-        assert!(store.build_injection("s1").is_empty());
+        assert!(store.build_injection("s1").await.is_empty());
     }
 
-    #[test]
-    fn injection_includes_reason_when_stated() {
+    #[tokio::test]
+    async fn injection_includes_reason_when_stated() {
         let store = FeedbackStore::new();
-        store.add(
-            "s1",
-            make_fb_full("use real DB", "mocks diverged", "General"),
-        );
-        let inj = store.build_injection("s1");
+        store
+            .add(
+                "s1",
+                make_fb_full("use real DB", "mocks diverged", "General"),
+            )
+            .await;
+        let inj = store.build_injection("s1").await;
         assert!(inj.contains("Why: mocks diverged"));
     }
 
-    #[test]
-    fn injection_omits_reason_when_not_stated() {
+    #[tokio::test]
+    async fn injection_omits_reason_when_not_stated() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("use real DB"));
-        let inj = store.build_injection("s1");
+        store.add("s1", make_fb("use real DB")).await;
+        let inj = store.build_injection("s1").await;
         assert!(!inj.contains("Why:"));
     }
 
-    #[test]
-    fn injection_includes_apply_when_when_specific() {
+    #[tokio::test]
+    async fn injection_includes_apply_when_when_specific() {
         let store = FeedbackStore::new();
-        store.add(
-            "s1",
-            make_fb_full("use real DB", "Not stated", "integration tests"),
-        );
-        let inj = store.build_injection("s1");
+        store
+            .add(
+                "s1",
+                make_fb_full("use real DB", "Not stated", "integration tests"),
+            )
+            .await;
+        let inj = store.build_injection("s1").await;
         assert!(inj.contains("When: integration tests"));
     }
 
-    #[test]
-    fn injection_omits_apply_when_when_general() {
+    #[tokio::test]
+    async fn injection_omits_apply_when_when_general() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("use real DB"));
-        let inj = store.build_injection("s1");
+        store.add("s1", make_fb("use real DB")).await;
+        let inj = store.build_injection("s1").await;
         assert!(!inj.contains("When:"));
     }
 
     // ── Thread safety ──
 
-    #[test]
-    fn clear_session_removes_rules_and_order() {
+    #[tokio::test]
+    async fn clear_session_removes_rules_and_order() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("rule A"));
-        store.add("s2", make_fb("rule B"));
-        assert_eq!(store.session_count(), 2);
+        store.add("s1", make_fb("rule A")).await;
+        store.add("s2", make_fb("rule B")).await;
+        assert_eq!(store.session_count().await, 2);
 
-        store.clear_session("s1");
-        assert!(store.is_empty("s1"));
-        assert_eq!(store.session_count(), 1);
-        assert!(!store.is_empty("s2"));
+        store.clear_session("s1").await;
+        assert!(store.is_empty("s1").await);
+        assert_eq!(store.session_count().await, 1);
+        assert!(!store.is_empty("s2").await);
     }
 
-    #[test]
-    fn clear_nonexistent_session_is_noop() {
+    #[tokio::test]
+    async fn clear_nonexistent_session_is_noop() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb("rule A"));
-        store.clear_session("nonexistent");
-        assert_eq!(store.session_count(), 1);
+        store.add("s1", make_fb("rule A")).await;
+        store.clear_session("nonexistent").await;
+        assert_eq!(store.session_count().await, 1);
     }
 
     // ── Relevance filtering ──
@@ -402,30 +407,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn filtered_injection_includes_relevant_rules_first() {
+    #[tokio::test]
+    async fn filtered_injection_includes_relevant_rules_first() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb_with_apply("don't use mocks", "testing"));
-        store.add("s1", make_fb_with_apply("use JSON output", "API responses"));
-        store.add("s1", make_fb_with_apply("prefer async", "database queries"));
+        store
+            .add("s1", make_fb_with_apply("don't use mocks", "testing"))
+            .await;
+        store
+            .add("s1", make_fb_with_apply("use JSON output", "API responses"))
+            .await;
+        store
+            .add("s1", make_fb_with_apply("prefer async", "database queries"))
+            .await;
 
-        let injection = store.build_injection_filtered("s1", Some("write tests without mocks"));
+        let injection = store
+            .build_injection_filtered("s1", Some("write tests without mocks"))
+            .await;
         assert!(
             injection.contains("don't use mocks"),
             "relevant rule should be included"
         );
     }
 
-    #[test]
-    fn filtered_injection_caps_irrelevant_rules() {
+    #[tokio::test]
+    async fn filtered_injection_caps_irrelevant_rules() {
         let store = FeedbackStore::new();
         for i in 0..6 {
-            store.add(
-                "s1",
-                make_fb_with_apply(&format!("rule about topic{i}"), "General"),
-            );
+            store
+                .add(
+                    "s1",
+                    make_fb_with_apply(&format!("rule about topic{i}"), "General"),
+                )
+                .await;
         }
-        let injection = store.build_injection_filtered("s1", Some("deploy to production"));
+        let injection = store
+            .build_injection_filtered("s1", Some("deploy to production"))
+            .await;
         let rule_count = injection.matches("- Rule:").count();
         assert_eq!(
             rule_count, 3,
@@ -433,31 +450,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filtered_injection_all_relevant_bypass_cap() {
+    #[tokio::test]
+    async fn filtered_injection_all_relevant_bypass_cap() {
         let store = FeedbackStore::new();
-        store.add(
-            "s1",
-            make_fb_with_apply("always deploy with --dry-run", "General"),
-        );
-        store.add(
-            "s1",
-            make_fb_with_apply("deploy to staging first", "General"),
-        );
-        store.add(
-            "s1",
-            make_fb_with_apply("check deploy logs after", "General"),
-        );
-        store.add("s1", make_fb_with_apply("deploy needs approval", "General"));
-        store.add(
-            "s1",
-            make_fb_with_apply("run deploy in background", "General"),
-        );
-        store.add(
-            "s1",
-            make_fb_with_apply("deploy only from main branch", "General"),
-        );
-        let injection = store.build_injection_filtered("s1", Some("deploy the service"));
+        store
+            .add(
+                "s1",
+                make_fb_with_apply("always deploy with --dry-run", "General"),
+            )
+            .await;
+        store
+            .add(
+                "s1",
+                make_fb_with_apply("deploy to staging first", "General"),
+            )
+            .await;
+        store
+            .add(
+                "s1",
+                make_fb_with_apply("check deploy logs after", "General"),
+            )
+            .await;
+        store
+            .add("s1", make_fb_with_apply("deploy needs approval", "General"))
+            .await;
+        store
+            .add(
+                "s1",
+                make_fb_with_apply("run deploy in background", "General"),
+            )
+            .await;
+        store
+            .add(
+                "s1",
+                make_fb_with_apply("deploy only from main branch", "General"),
+            )
+            .await;
+        let injection = store
+            .build_injection_filtered("s1", Some("deploy the service"))
+            .await;
         let rule_count = injection.matches("- Rule:").count();
         assert_eq!(
             rule_count, 6,
@@ -465,51 +496,65 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filtered_injection_without_message_returns_all() {
+    #[tokio::test]
+    async fn filtered_injection_without_message_returns_all() {
         let store = FeedbackStore::new();
         for i in 0..6 {
-            store.add(
-                "s1",
-                make_fb_with_apply(&format!("rule about topic{i}"), "General"),
-            );
+            store
+                .add(
+                    "s1",
+                    make_fb_with_apply(&format!("rule about topic{i}"), "General"),
+                )
+                .await;
         }
-        let injection = store.build_injection_filtered("s1", None);
+        let injection = store.build_injection_filtered("s1", None).await;
         let rule_count = injection.matches("- Rule:").count();
         assert_eq!(rule_count, 6, "no filter should return all rules");
     }
 
-    #[test]
-    fn unfiltered_build_injection_still_returns_all() {
+    #[tokio::test]
+    async fn unfiltered_build_injection_still_returns_all() {
         let store = FeedbackStore::new();
         for i in 0..6 {
-            store.add(
-                "s1",
-                make_fb_with_apply(&format!("rule about topic{i}"), "General"),
-            );
+            store
+                .add(
+                    "s1",
+                    make_fb_with_apply(&format!("rule about topic{i}"), "General"),
+                )
+                .await;
         }
-        let injection = store.build_injection("s1");
+        let injection = store.build_injection("s1").await;
         let rule_count = injection.matches("- Rule:").count();
         assert_eq!(rule_count, 6, "unfiltered should return all rules");
     }
 
-    #[test]
-    fn filtered_injection_case_insensitive() {
+    #[tokio::test]
+    async fn filtered_injection_case_insensitive() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb_with_apply("Don't use Mocks", "Testing"));
-        let injection = store.build_injection_filtered("s1", Some("write tests with mocks"));
+        store
+            .add("s1", make_fb_with_apply("Don't use Mocks", "Testing"))
+            .await;
+        let injection = store
+            .build_injection_filtered("s1", Some("write tests with mocks"))
+            .await;
         assert!(
             injection.contains("Don't use Mocks"),
             "case-insensitive match should find 'Mocks' via 'mocks'"
         );
     }
 
-    #[test]
-    fn filtered_injection_chinese_keyword_match() {
+    #[tokio::test]
+    async fn filtered_injection_chinese_keyword_match() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb_with_apply("不要用bash执行git命令", "General"));
-        store.add("s1", make_fb_with_apply("always run clippy", "General"));
-        let injection = store.build_injection_filtered("s1", Some("用bash运行测试"));
+        store
+            .add("s1", make_fb_with_apply("不要用bash执行git命令", "General"))
+            .await;
+        store
+            .add("s1", make_fb_with_apply("always run clippy", "General"))
+            .await;
+        let injection = store
+            .build_injection_filtered("s1", Some("用bash运行测试"))
+            .await;
         // "bash" overlaps — should match
         assert!(
             injection.contains("bash"),
@@ -517,25 +562,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrent_access() {
+    #[tokio::test]
+    async fn concurrent_access() {
         use std::sync::Arc;
         let store = Arc::new(FeedbackStore::new());
         let handles: Vec<_> = (0..10)
             .map(|i| {
                 let s = store.clone();
-                std::thread::spawn(move || {
+                tokio::spawn(async move {
                     let sid = format!("s{}", i % 3);
-                    s.add(&sid, make_fb(&format!("rule {i}")));
-                    s.len(&sid)
+                    s.add(&sid, make_fb(&format!("rule {i}"))).await;
+                    s.len(&sid).await
                 })
             })
             .collect();
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
-        // 10 rules across 3 sessions
-        let total: usize = (0..3).map(|i| store.len(&format!("s{i}"))).sum();
-        assert_eq!(total, 10);
+        // 10 rules added across 3 sessions — each Add should succeed,
+        // so total lengths should sum to 10.
+        assert_eq!(
+            store.len("s0").await + store.len("s1").await + store.len("s2").await,
+            10
+        );
     }
 }

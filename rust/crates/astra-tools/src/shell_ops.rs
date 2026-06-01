@@ -2774,7 +2774,22 @@ async fn run_readonly_command_with_partial(
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
-            Err(e) => return Err(format!("Error: {command_kind} failed: {e}")),
+            Err(e) => {
+                let error_msg = format!("Error: {command_kind} failed: {e}");
+                sigkill_process_group(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                drain_command_chunks(
+                    &mut rx,
+                    &mut stdout_text,
+                    &mut stderr_text,
+                    max_stdout_bytes,
+                    &mut stdout_capped,
+                    max_stderr_bytes,
+                    &mut stderr_capped,
+                );
+                return Err(error_msg);
+            }
         }
     }
 
@@ -2926,7 +2941,22 @@ pub(crate) async fn run_bash_with_detach(
                     }
                 }
             }
-            Err(e) => return Err(format!("Error: bash command failed: {e}")),
+            Err(e) => {
+                let error_msg = format!("Error: bash command failed: {e}");
+                sigkill_process_group(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                drain_command_chunks(
+                    &mut rx,
+                    &mut stdout_text,
+                    &mut stderr_text,
+                    max_stdout_bytes,
+                    &mut stdout_capped,
+                    max_stderr_bytes,
+                    &mut stderr_capped,
+                );
+                return Err(error_msg);
+            }
         }
     }
 

@@ -1890,7 +1890,7 @@ impl InProcessChatTurnBridge {
                 if session_id.is_empty() {
                     String::new()
                 } else {
-                    let injection = feedback_store.build_injection_filtered(&session_id, Some(user_content_for_signal));
+                    let injection = feedback_store.build_injection_filtered(&session_id, Some(user_content_for_signal)).await;
                     if injection.is_empty() {
                         String::new()
                     } else {
@@ -1942,7 +1942,7 @@ impl InProcessChatTurnBridge {
                                 });
                             }
                         }
-                        feedback_store.add(&session_id, fb);
+                        feedback_store.add(&session_id, fb).await;
                     }
                 }
                 let hint = crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)

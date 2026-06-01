@@ -89,7 +89,12 @@ fn try_allocate_with_cap(max: u64, cap: u64) -> Result<(), ConnectionQuotaError>
             });
         }
         if GLOBAL_CONNECTION_ALLOCATED
-            .compare_exchange(current, current.saturating_add(max), Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                current,
+                current.saturating_add(max),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
             return Ok(());
