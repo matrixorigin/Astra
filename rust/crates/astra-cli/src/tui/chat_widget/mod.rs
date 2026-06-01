@@ -40,9 +40,9 @@ use super::history_cell::{
     task::TaskCell, tool::ToolCell, turn_summary::TurnSummaryCell, user::UserCell,
 };
 use super::transcript_jsonl;
-use astra_turn_core::compaction_types::CompactionEvent;
 use super::turn_event::TurnEvent;
 use crate::VerdictEvent;
+use astra_turn_core::compaction_types::CompactionEvent;
 
 /// Events the ChatWidget knows how to route. Grouped by origin so
 /// `handle_event` can scale to more variants without bloating a

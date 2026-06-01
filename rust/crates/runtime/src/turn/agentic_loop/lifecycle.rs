@@ -7,13 +7,14 @@ use serde_json::Value;
 
 use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
+use super::super::cloud::compaction_engine::{CompactionEngine, TokenBudget};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, RunControlStatus,
     try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_services::SessionArtifactStore;
-use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
+use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
@@ -1117,7 +1118,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
 /// ratio against `max_turn_input_tokens`. When no limit is configured
 /// (`max_turn_input_tokens == 0`) returns `(0.0, 0)`.
 #[inline]
-fn estimate_context_pressure(
+pub(crate) fn estimate_context_pressure(
     messages: &[serde_json::Value],
     pinned_tool_schema_tokens: usize,
     max_turn_input_tokens: u64,
@@ -1125,9 +1126,54 @@ fn estimate_context_pressure(
     if max_turn_input_tokens == 0 {
         return (0.0, 0);
     }
-    let tokens =
-        crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
+    let tokens = crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
+}
+
+/// Run the compaction pipeline and record results (event + audit).
+///
+/// Shared by pre-turn proactive compression and resume-time compression to
+/// avoid ~30 lines of duplicated TokenBudget → pipeline selection → compress →
+/// event → audit logic.
+fn run_proactive_compaction<H: AgenticLoopHost>(
+    pressure: f64,
+    tokens_measured: u64,
+    state: &mut AgenticLoopState,
+    quiet: bool,
+    host: &mut H,
+    kind: CompactionKind,
+    audit_label: &str,
+) {
+    let max_tokens = state.max_turn_input_tokens;
+    let budget = TokenBudget {
+        max_prompt_tokens: max_tokens,
+        last_measured_tokens: tokens_measured,
+        current_round_index: Some(state.current_round_index),
+    };
+    let pipeline = if pressure >= CompactionTier::aggressive_trigger(max_tokens) {
+        CompactionEngine::aggressive_pipeline()
+    } else {
+        CompactionEngine::default_pipeline_for(max_tokens)
+    };
+    let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+    if outcome.total_tokens_freed > 0 && !quiet {
+        let event = CompactionEvent::new(
+            kind,
+            pressure,
+            outcome.total_tokens_freed,
+            tokens_measured,
+            max_tokens,
+        );
+        host.on_compaction(event);
+        if let Some(ref mut sess) = state.pipeline_session {
+            sess.record_compaction_audit(
+                audit_label,
+                outcome.layer_results.len() as u32,
+                outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
+            );
+            sess.stats.record_compaction(outcome.total_tokens_freed);
+        }
+    }
 }
 
 pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
@@ -1707,8 +1753,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
-        let (pressure, pressure_estimate_tokens) =
-            estimate_context_pressure(&state.messages, state.pinned_tool_schema_tokens as usize, state.max_turn_input_tokens);
+        let (pressure, pressure_estimate_tokens) = estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        );
 
         // Pre-turn LLM compact: if pressure exceeds the model-adaptive
         // trigger, let the host run an optional cache-friendly inline-summary
@@ -1725,7 +1774,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // compaction is imminent.
         if pressure >= CompactionTier::pre_turn_warning(state.max_turn_input_tokens) && !quiet {
             let warning = CompactionEvent::new(
-                "pressure_warning",
+                CompactionKind::PressureWarning,
                 pressure,
                 0, // no tokens freed yet
                 pressure_estimate_tokens,
@@ -1774,7 +1823,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         if mc.results_compacted > 0 {
             if !quiet {
                 let event = CompactionEvent::new(
-                    "microcompact",
+                    CompactionKind::Microcompact,
                     pressure,
                     mc.tokens_saved as u64,
                     pressure_estimate_tokens,
@@ -1803,48 +1852,32 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // them, the guard under-estimates pressure and skips compaction
         // (observed in session 540c37d1 where budget_pressure=0.887 but
         // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
-        let (post_mc_pressure, post_mc_tokens) =
-            estimate_context_pressure(&state.messages, state.pinned_tool_schema_tokens as usize, state.max_turn_input_tokens);
+        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        );
 
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
         // the LLM, preventing 413 errors instead of reacting to them.
         if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
-            let budget = super::super::cloud::compaction_engine::TokenBudget {
-                max_prompt_tokens: state.max_turn_input_tokens,
-                last_measured_tokens: post_mc_tokens,
-                current_round_index: Some(state.current_round_index),
-            };
-            let pipeline = if post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
-                super::super::cloud::compaction_engine::CompactionEngine::aggressive_pipeline()
+            let is_aggressive =
+                post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens);
+            let (kind, label) = if is_aggressive {
+                (CompactionKind::AggressiveCompression, "aggressive")
             } else {
-                super::super::cloud::compaction_engine::CompactionEngine::default_pipeline()
+                (CompactionKind::DefaultCompression, "default")
             };
-            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
-            if outcome.total_tokens_freed > 0 && !quiet {
-                let tier = if post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
-                    "aggressive_compression"
-                } else {
-                    "default_compression"
-                };
-                let event = CompactionEvent::new(
-                    tier,
-                    post_mc_pressure,
-                    outcome.total_tokens_freed,
-                    post_mc_tokens,
-                    state.max_turn_input_tokens,
-                );
-                host.on_compaction(event);
-                // Record compression audit for pipeline journal
-                if let Some(ref mut sess) = state.pipeline_session {
-                    sess.record_compaction_audit(
-                        tier,
-                        outcome.layer_results.len() as u32,
-                        outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
-                    );
-                    sess.stats.record_compaction(outcome.total_tokens_freed);
-                }
-            }
+            run_proactive_compaction(
+                post_mc_pressure,
+                post_mc_tokens,
+                state,
+                quiet,
+                host,
+                kind,
+                label,
+            );
         }
     }
 
@@ -1853,30 +1886,21 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // proactively compress before the first LLM call.  This prevents an
     // immediate 413 when resuming from a CompactAndRetry interruption.
     if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let (estimated_pressure, estimated_tokens) =
-            estimate_context_pressure(&state.messages, state.pinned_tool_schema_tokens as usize, state.max_turn_input_tokens);
+        let (estimated_pressure, estimated_tokens) = estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        );
         if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
-            let budget = super::super::cloud::compaction_engine::TokenBudget {
-                max_prompt_tokens: state.max_turn_input_tokens,
-                last_measured_tokens: estimated_tokens,
-                current_round_index: Some(state.current_round_index),
-            };
-            let pipeline = if estimated_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
-                super::super::cloud::compaction_engine::CompactionEngine::aggressive_pipeline()
-            } else {
-                super::super::cloud::compaction_engine::CompactionEngine::default_pipeline()
-            };
-            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
-            if outcome.total_tokens_freed > 0 && !quiet {
-                let event = CompactionEvent::new(
-                    "resume",
-                    estimated_pressure,
-                    outcome.total_tokens_freed,
-                    estimated_tokens,
-                    state.max_turn_input_tokens,
-                );
-                host.on_compaction(event);
-            }
+            run_proactive_compaction(
+                estimated_pressure,
+                estimated_tokens,
+                state,
+                quiet,
+                host,
+                CompactionKind::Resume,
+                "resume",
+            );
         }
     }
 
@@ -2751,6 +2775,205 @@ mod tests {
         assert!(
             !ir.user_message.is_empty(),
             "interruption user_message must be non-empty for resume guidance"
+        );
+    }
+
+    // ── estimate_context_pressure tests ────────────────────────────
+    //
+    // Session 540c37d1: the old estimate_tokens (without schema tokens)
+    // underestimated CJK tokens by ~50%, causing pressure to read 0.61
+    // when it was actually 0.89. These tests ensure the unified function
+    // returns correct pressure across all scenarios.
+
+    #[test]
+    fn estimate_context_pressure_zero_max_tokens() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let (pressure, tokens) = estimate_context_pressure(&messages, 0, 0);
+        assert_eq!(pressure, 0.0, "zero max_tokens → zero pressure");
+        assert_eq!(tokens, 0, "zero max_tokens → zero token count");
+    }
+
+    #[test]
+    fn estimate_context_pressure_empty_messages() {
+        let messages: Vec<serde_json::Value> = vec![];
+        let (pressure, _tokens) = estimate_context_pressure(&messages, 0, 100_000);
+        // estimate_tokens has a base overhead even for empty messages,
+        // so pressure is non-zero. What matters: it's well below warning.
+        assert!(pressure < 0.2, "empty messages pressure stays low");
+
+        // With zero max_tokens: returns (0.0, 0) via guard.
+        let (pressure_zero, tokens_zero) = estimate_context_pressure(&messages, 0, 0);
+        assert_eq!(pressure_zero, 0.0);
+        assert_eq!(tokens_zero, 0);
+    }
+
+    #[test]
+    fn estimate_context_pressure_normal_ascii() {
+        let messages = vec![
+            json!({"role": "system", "content": "You are a helpful assistant."}),
+            json!({"role": "user", "content": "What is 2+2?"}),
+        ];
+        let (pressure, tokens) = estimate_context_pressure(&messages, 5_000, 100_000);
+        assert!(
+            pressure > 0.0,
+            "non-empty messages produce non-zero pressure"
+        );
+        assert!(
+            pressure < 0.3,
+            "short messages with schema well under budget; got {pressure}"
+        );
+        assert!(tokens > 0, "tokens must be > 0");
+    }
+
+    #[test]
+    fn estimate_context_pressure_schema_tokens_raise_pressure() {
+        let messages: Vec<serde_json::Value> = (0..10)
+            .map(|i| json!({"role": "user", "content": format!("message {}", i)}))
+            .collect();
+        let (p_without, _) = estimate_context_pressure(&messages, 0, 100_000);
+        let (p_with, _) = estimate_context_pressure(&messages, 50_000, 100_000);
+        assert!(
+            p_with > p_without,
+            "50K schema tokens must raise pressure above baseline"
+        );
+    }
+
+    #[test]
+    fn estimate_context_pressure_cjk_messages_count_tokens() {
+        let messages: Vec<serde_json::Value> = (0..50)
+            .map(|i| {
+                json!({"role": "user", "content": format!("这是第{}条中文消息，包含较多的中文字符以确保token估算准确。", i)})
+            })
+            .collect();
+        let (pressure, tokens) = estimate_context_pressure(&messages, 10_000, 100_000);
+        assert!(tokens > 5_000, "50 CJK messages produce substantial tokens");
+        assert!(
+            pressure > 0.05,
+            "50 CJK messages produce measurable pressure"
+        );
+    }
+
+    #[test]
+    fn estimate_context_pressure_scales_with_message_count() {
+        let make_messages = |n: usize| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|i| json!({"role": "user", "content": format!("message number {}", i)}))
+                .collect()
+        };
+        let (p10, _) = estimate_context_pressure(&make_messages(10), 0, 100_000);
+        let (p50, _) = estimate_context_pressure(&make_messages(50), 0, 100_000);
+        let (p100, _) = estimate_context_pressure(&make_messages(100), 0, 100_000);
+        assert!(p100 > p50, "100 msgs > 50 msgs pressure");
+        assert!(p50 > p10, "50 msgs > 10 msgs pressure");
+        assert!(p100 > p10, "100 msgs > 10 msgs pressure");
+    }
+
+    // ── Full pipeline integration test ─────────────────────────────
+    //
+    // Verifies that prepare_turn_iteration runs the complete compaction
+    // pipeline — pressure estimation → warning emission → microcompact
+    // → re-estimation → proactive compression — without panicking.
+
+    fn high_pressure_cjk_state(max_tokens: u64, schema_tokens: usize) -> AgenticLoopState {
+        let mut state = make_state();
+        state.max_turn_input_tokens = max_tokens;
+        state.pinned_tool_schema_tokens = schema_tokens as u64;
+        state.messages = (0..150)
+            .map(|i| {
+                json!({"role": "user", "content": format!("这是第{}条测试消息，用于模拟高压力场景，包含足够多的中文字符来产生真实的token估算。会话540c37d1显示CJK文本的token估算往往被低估，这个测试确保修复后不会退化。", i)})
+            })
+            .collect();
+        state
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_with_cjk_pressure_runs_full_pipeline() {
+        // Small context window (32K) + CJK messages + schema tokens
+        // pushes pressure well above the 0.70 trigger for ≤32K windows.
+        let mut host = MockHost::new(Vec::new());
+        let mut state = high_pressure_cjk_state(32_000, 10_000);
+
+        let result = prepare_turn_iteration(&mut host, &mut state, 1).await;
+        assert!(
+            result.is_ok(),
+            "prepare_turn_iteration must not fail under high pressure: {:?}",
+            result.err()
+        );
+
+        // Messages should have been compacted (count reduced from 150).
+        assert!(
+            state.messages.len() < 150,
+            "messages must be compacted under high pressure; got {}",
+            state.messages.len()
+        );
+        // CJK + schema tokens at 32K window must trigger at least
+        // CompactHistory-level compaction (significant reduction).
+        assert!(
+            state.messages.len() <= 100,
+            "CJK session must be significantly compacted (≤100 from 150); got {}",
+            state.messages.len()
+        );
+
+        // Verify a compaction boundary marker was inserted.
+        let has_boundary = state
+            .messages
+            .iter()
+            .any(|m| m.get("_compact_boundary").is_some());
+        assert!(
+            has_boundary,
+            "compaction must insert a boundary marker in the message list"
+        );
+
+        // Emissions are suppressed when quiet=true, but the pipeline
+        // itself must execute without panicking — that's the contract.
+    }
+
+    /// Resume-time compaction: when turn_index==0 and there are >10
+    /// messages (e.g. restored from checkpoint), pressure estimation
+    /// should trigger proactive compression before the first LLM call.
+    #[tokio::test]
+    async fn prepare_turn_resume_compacts_high_pressure() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 32_000;
+        state.pinned_tool_schema_tokens = 10_000;
+        state.messages = (0..100)
+            .map(|i| {
+                json!({"role": "user", "content": format!("CJK压力测试第{}条消息——确保恢复路径也能正常压缩上下文窗口。", i)})
+            })
+            .collect();
+
+        // turn_index == 0 triggers resume compaction path
+        let result = prepare_turn_iteration(&mut host, &mut state, 0).await;
+        assert!(
+            result.is_ok(),
+            "resume compaction must not fail: {:?}",
+            result.err()
+        );
+        assert!(
+            state.messages.len() < 100,
+            "resume compaction must reduce message count from 100; got {}",
+            state.messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_with_low_pressure_skips_compaction() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 200_000; // large window
+        state.messages = (0..5)
+            .map(|i| json!({"role": "user", "content": format!("msg {}", i)}))
+            .collect();
+
+        let result = prepare_turn_iteration(&mut host, &mut state, 1).await;
+        assert!(result.is_ok());
+
+        // Low pressure should leave all 5 messages intact.
+        assert_eq!(
+            state.messages.len(),
+            5,
+            "low-pressure messages must not be compacted"
         );
     }
 }

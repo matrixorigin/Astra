@@ -326,8 +326,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             let (mut tool_msg, tr) =
                 headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &cached.output);
-            // Add folding metadata so fold_old_read_only_results can decay
-            // cache-hit results the same way it decays fresh tool results.
+            // Add round-index metadata for cache-hit result tracking.
             if let Some(obj) = tool_msg.as_object_mut() {
                 obj.insert(
                     "_round_index".to_string(),

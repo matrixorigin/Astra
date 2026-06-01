@@ -15,7 +15,7 @@ use astra_turn_core::agentic_turn_ingest::{
     agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
-use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
+use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 use uuid::Uuid;
@@ -1072,7 +1072,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 match outcome {
                     super::super::compaction_replay::CompactionReplayOutcome::Compacted(result) => {
-                        let tier_label = result.tier.label();
+                        let tier_label = result.tier.to_string();
                         // Feed compaction stats into pipeline for reserve estimation.
                         if let Some(ref mut sess) = state.pipeline_session {
                             sess.recovery.record_reactive_compact();
@@ -1080,14 +1080,23 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         }
                         let tokens_freed = result.pipeline_outcome.total_tokens_freed;
                         if !prep.quiet {
-                            let pressure = state.last_measured_prompt_tokens
-                                .unwrap_or(0) as f64
-                                / state.max_turn_input_tokens as f64;
+                            // In a retry context we know we overflowed the
+                            // context window, so use max_turn_input_tokens as
+                            // the floor for tokens_before when measured value
+                            // is unavailable (rather than 0, which is misleading).
+                            let tokens_before = state
+                                .last_measured_prompt_tokens
+                                .unwrap_or(state.max_turn_input_tokens);
+                            let pressure = if state.max_turn_input_tokens == 0 {
+                                0.0
+                            } else {
+                                (tokens_before as f64 / state.max_turn_input_tokens as f64).min(1.0)
+                            };
                             let event = CompactionEvent::new(
-                                &format!("retry_{}", tier_label),
+                                result.tier,
                                 pressure,
                                 tokens_freed,
-                                state.last_measured_prompt_tokens.unwrap_or(0),
+                                tokens_before,
                                 state.max_turn_input_tokens,
                             );
                             host.on_compaction(event);
@@ -1106,7 +1115,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                                 astra_services::session_journal::JournalEvent::compaction_retry(
                                     Some(sid),
                                     session_turn_number(state),
-                                    tier_label,
+                                    &tier_label,
                                     tokens_freed,
                                     budget_likely_satisfied,
                                     state.consecutive_context_window_errors,
@@ -2575,7 +2584,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             if !prep.quiet {
                 let pressure = measured as f64 / state.max_turn_input_tokens as f64;
                 let event = CompactionEvent::new(
-                    "reactive_budget",
+                    CompactionKind::ReactiveBudget,
                     pressure,
                     total_freed,
                     measured,

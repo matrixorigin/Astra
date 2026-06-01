@@ -9,8 +9,8 @@
 //! which handles prompt-level work: schema pruning, section reduction).
 //! This module handles message-level compaction — removing old turns,
 //! summarizing tool results, truncating large outputs — and only triggers
-//! AFTER a 413 has been observed. The local [`RetryTier`] below is NOT
-//! the same enum as the pipeline's `CompactionTier`; it represents
+//! AFTER a 413 has been observed. The [`CompactionKind`] variants
+//! `RetryDefault`/`RetryAggressive`/`RetryEmergency` represent
 //! escalation across retry attempts, not preemptive pressure bands.
 //!
 //! The pipeline's `RecoveryState` is informed of PTL errors and compaction
@@ -24,6 +24,7 @@
 //! `ResumeAction::CompactAndRetry` (for cross-session resume).
 
 use super::cloud::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudget};
+use astra_turn_core::compaction_types::CompactionKind;
 use serde_json::Value;
 
 /// Maximum number of automatic compact-and-retry cycles per turn.
@@ -63,32 +64,10 @@ pub struct CompactionReplayResult {
     /// Full pipeline outcome (for trace/journal).
     pub pipeline_outcome: PipelineOutcome,
     /// Which compaction tier was used.
-    pub tier: RetryTier,
+    pub tier: CompactionKind,
 }
 
-/// Retry-attempt escalation tier for telemetry — NOT the same as the
-/// pipeline's [`astra_turn_core::compaction_types::CompactionTier`].
-/// These three levels map to the three `CompactionEngine` variants
-/// (default / aggressive / emergency) and escalate with each consecutive
-/// context-window error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetryTier {
-    Default,
-    Aggressive,
-    Emergency,
-}
-
-impl RetryTier {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Aggressive => "aggressive",
-            Self::Emergency => "emergency",
-        }
-    }
-}
-
-/// Tracks compaction effectiveness across retries within a turn.
+/// Outcome of a compaction-replay attempt.
 ///
 /// When compaction frees tokens but the next LLM call still fails with a
 /// context-window error, this indicates "insufficient compaction" — the freed
@@ -234,16 +213,19 @@ pub(crate) fn try_compact_for_retry_tiered(
 
     // Tiered escalation: default → aggressive → emergency.
     let (pipeline, tier) = if retry_count <= 1 {
-        (CompactionEngine::default_pipeline(), RetryTier::Default)
+        (
+            CompactionEngine::default_pipeline_for(max_tokens),
+            CompactionKind::RetryDefault,
+        )
     } else if retry_count == 2 {
         (
             CompactionEngine::aggressive_pipeline(),
-            RetryTier::Aggressive,
+            CompactionKind::RetryAggressive,
         )
     } else {
         (
             CompactionEngine::emergency_pipeline(),
-            RetryTier::Emergency,
+            CompactionKind::RetryEmergency,
         )
     };
     let outcome = pipeline.compress_if_needed(messages, &budget);
@@ -442,8 +424,8 @@ mod tests {
 
         let r1 = r1.unwrap();
         let r2 = r2.unwrap();
-        assert_eq!(r1.tier, RetryTier::Default);
-        assert_eq!(r2.tier, RetryTier::Aggressive);
+        assert_eq!(r1.tier, CompactionKind::RetryDefault);
+        assert_eq!(r2.tier, CompactionKind::RetryAggressive);
 
         // Aggressive pipeline should free at least as many tokens
         assert!(
@@ -460,7 +442,7 @@ mod tests {
         let r = try_compact_for_retry_tiered(&mut msgs, Some(200_000), 100_000, 3);
         assert!(r.is_some(), "emergency tier should compact");
         let r = r.unwrap();
-        assert_eq!(r.tier, RetryTier::Emergency);
+        assert_eq!(r.tier, CompactionKind::RetryEmergency);
     }
 
     #[test]

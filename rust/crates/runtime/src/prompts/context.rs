@@ -55,7 +55,6 @@ pub fn estimate_tokens(
     schema_token_total: usize,
     system_prompt_tokens: usize,
 ) -> usize {
-    const PER_MESSAGE_OVERHEAD: usize = 4;
     const MODEL_FRAMING: usize = 300; // JSON wrappers, role tokens, separators
 
     let sys_tokens = if system_prompt_tokens > 0 {
@@ -71,8 +70,10 @@ pub fn estimate_tokens(
     message_tokens + sys_tokens + schema_token_total + MODEL_FRAMING
 }
 
+pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;
+
 /// Estimate tokens for a single message (content + tool_calls arguments).
-fn estimate_single_message_tokens(m: &serde_json::Value) -> usize {
+pub(crate) fn estimate_single_message_tokens(m: &serde_json::Value) -> usize {
     let content_tokens = m
         .get("content")
         .and_then(|v| v.as_str())
@@ -119,7 +120,6 @@ pub struct CacheAwareEstimate {
 }
 
 fn estimate_message_batch_tokens(messages: &[serde_json::Value]) -> usize {
-    const PER_MESSAGE_OVERHEAD: usize = 4;
     messages
         .iter()
         .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
@@ -1024,21 +1024,21 @@ mod tests {
     #[test]
     fn capped_output_tokens_default_16k() {
         let b = budget_for_model(None); // 128K, 0.15
-                                        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 16_384 (large model)
+        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 16_384 (large model)
         assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
     #[test]
     fn capped_output_tokens_scales_for_small_model() {
         let b = budget_for_model(Some("gpt-3.5")); // 16K, 0.12
-                                                   // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920 (small model cap)
+        // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920 (small model cap)
         assert_eq!(capped_output_tokens(&b), 1920);
     }
 
     #[test]
     fn capped_output_tokens_claude_16k() {
         let b = budget_for_model(Some("claude-3.5-sonnet")); // 200K, 0.20
-                                                             // full_reserve = 200_000 * 0.20 = 40_000 → capped to 16_384 (large model)
+        // full_reserve = 200_000 * 0.20 = 40_000 → capped to 16_384 (large model)
         assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
@@ -1461,7 +1461,7 @@ mod tests {
         // Should use default values
         assert!((b.compact_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(b.keep_recent_turns, 3); // default preserve_recent_turns
-                                            // 4000 tokens * 4 chars = 16000 chars
+        // 4000 tokens * 4 chars = 16000 chars
         assert_eq!(b.memory_budget_chars, 16000);
     }
 

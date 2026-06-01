@@ -48,6 +48,19 @@ mod tests {
             pressure_with_schema > pressure_without_schema,
             "schema tokens must increase pressure: without={pressure_without_schema}, with={pressure_with_schema}"
         );
+        // 50K schema tokens in a 128K window produce at least a tier jump
+        // (Normal→TrimSchemas = +0.3). Without schema the 40 CJK messages
+        // alone land in Normal (0.0), so the delta must be meaningful.
+        assert!(
+            pressure_with_schema - pressure_without_schema >= 0.15,
+            "50K schema tokens must increase pressure by at least 0.15: delta={}",
+            pressure_with_schema - pressure_without_schema
+        );
+        // With schema tokens, must at least reach TrimSchemas (0.3).
+        assert!(
+            pressure_with_schema >= 0.3,
+            "40 CJK messages + 50K schema tokens must reach at least TrimSchemas: got {pressure_with_schema}"
+        );
     }
 
     /// Realistic scenario from session 540c37d1: ~130 messages (50+ turns
@@ -75,10 +88,24 @@ mod tests {
 
         let pressure = budget_pressure_for_chat_turn(&messages, None, 50_000);
 
+        // At minimum must trigger TrimSchemas (0.3).
         assert!(
             pressure >= 0.3,
-            "CJK-heavy session ({count} msgs) with schema tokens should reach at least TrimSchemas: got {pressure}",
+            "CJK-heavy session ({count} msgs) with schema tokens must reach at least TrimSchemas: got {pressure}",
             count = messages.len(),
+        );
+
+        // The continuous pressure estimate (ratio of estimated tokens to
+        // effective input limit) must exceed 0.6 — this is the real
+        // regression guard for session 540c37d1 where CJK underestimation
+        // kept pressure artificially low.
+        let (continuous_pressure, _) =
+            crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
+                &messages, 50_000, 128_000,
+            );
+        assert!(
+            continuous_pressure >= 0.6,
+            "continuous CJK pressure must reach CompactHistory (≥0.6), got {continuous_pressure}"
         );
     }
 
@@ -86,6 +113,7 @@ mod tests {
     #[test]
     fn pressure_grows_with_message_count() {
         let mut pressures = Vec::new();
+        let mut continuous_pressures = Vec::new();
         for count in [10, 20, 40, 60, 80] {
             let messages: Vec<_> = (0..count)
                 .map(|i| {
@@ -93,6 +121,10 @@ mod tests {
                 })
                 .collect();
             pressures.push(budget_pressure_for_chat_turn(&messages, None, 40_000));
+            let (cp, _) = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
+                &messages, 0, 40_000,
+            );
+            continuous_pressures.push(cp);
         }
 
         for i in 1..pressures.len() {
@@ -103,6 +135,14 @@ mod tests {
                 pressures[i - 1]
             );
         }
+        // 80 CJK messages must produce noticeably higher continuous
+        // pressure than 10.  Tiered pressure can stay flat within a band
+        // (both in Normal=0.0), but the continuous estimator must grow.
+        assert!(
+            continuous_pressures[4] - continuous_pressures[0] >= 0.01,
+            "80 CJK messages must be at least +0.01 continuous pressure over 10: delta={}",
+            continuous_pressures[4] - continuous_pressures[0]
+        );
     }
 
     /// Empty messages + no schema = Normal tier (0.0)

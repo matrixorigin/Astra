@@ -1,10 +1,10 @@
 use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::{cli::permission_manager::PermissionManager, ExplainMode};
+use crate::{ExplainMode, cli::permission_manager::PermissionManager};
 
 /// Atomic counter pair published by streaming tools (currently
 /// bash) while they run. Consumers read `lines` / `bytes` on a

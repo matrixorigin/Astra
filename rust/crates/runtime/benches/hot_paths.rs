@@ -2,18 +2,18 @@
 //!
 //! Run: `cargo bench -p astra-runtime --bench hot_paths`
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;
 
 use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
-use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens, CompactionTier};
+use astra_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
-use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
-use astra_runtime::tool_registry::tool_pool::{
-    select_two_phase, SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource,
-};
 use astra_runtime::tool_registry::ConversationState;
 use astra_runtime::tool_registry::TOOL_CATALOG;
+use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
+use astra_runtime::tool_registry::tool_pool::{
+    SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource, select_two_phase,
+};
 use astra_runtime::turn::cloud::compaction::compact_tiered;
 
 // ── Token Estimation ───────────────────────────────────────────────

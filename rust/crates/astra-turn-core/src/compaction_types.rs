@@ -103,6 +103,53 @@ impl CompactionTier {
     }
 }
 
+// ───────────────────────────── CompactionKind ─────────────────────────────
+
+/// Kinds of compaction events emitted by the compression pipeline.
+///
+/// Each variant maps to a specific compaction trigger or phase in the
+/// agentic loop lifecycle. The `Display` impl produces the stderr-formatted
+/// label and the `Serialize`/`Deserialize` impls use `snake_case` for JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionKind {
+    /// Pre-turn pressure advisory (before compaction triggers).
+    PressureWarning,
+    /// Tool-result clearing microcompact.
+    Microcompact,
+    /// Default-tier proactive compression pipeline.
+    DefaultCompression,
+    /// Aggressive-tier proactive compression pipeline.
+    AggressiveCompression,
+    /// Compression on resume from checkpoint.
+    Resume,
+    /// Mid-turn reactive budget compaction.
+    ReactiveBudget,
+    /// Compaction before retrying a 413 error (default tier).
+    RetryDefault,
+    /// Compaction before retrying a 413 error (aggressive tier).
+    RetryAggressive,
+    /// Compaction before retrying a 413 error (emergency tier).
+    RetryEmergency,
+}
+
+impl std::fmt::Display for CompactionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::PressureWarning => "pressure_warning",
+            Self::Microcompact => "microcompact",
+            Self::DefaultCompression => "default_compression",
+            Self::AggressiveCompression => "aggressive_compression",
+            Self::Resume => "resume",
+            Self::ReactiveBudget => "reactive_budget",
+            Self::RetryDefault => "retry_default",
+            Self::RetryAggressive => "retry_aggressive",
+            Self::RetryEmergency => "retry_emergency",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 // ───────────────────────────── CompactionEvent ────────────────────────────
 
 /// Structured compaction event for real-time UX feedback.
@@ -113,9 +160,8 @@ impl CompactionTier {
 /// without parsing stderr heuristics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionEvent {
-    /// Human-readable label: "microcompact", "default_compression",
-    /// "aggressive_compression", "reactive_budget", "retry".
-    pub kind: String,
+    /// Compaction kind for type-safe event discrimination.
+    pub kind: CompactionKind,
     /// Pressure when compaction fired (0.0–1.0).
     pub pressure: f64,
     /// Tokens freed by this compaction round.
@@ -133,7 +179,7 @@ pub struct CompactionEvent {
 impl CompactionEvent {
     /// Build a compaction event from the raw numbers.
     pub fn new(
-        kind: &str,
+        kind: CompactionKind,
         pressure: f64,
         tokens_freed: u64,
         tokens_before: u64,
@@ -142,16 +188,16 @@ impl CompactionEvent {
         let tokens_after = tokens_before.saturating_sub(tokens_freed);
         // Dimmed prefix so the line is visually distinct from agent output.
         let summary = format!(
-            "  ♻ {}: freed ~{} tokens ({:.0}→{:.0} of {:.0}), pressure {:.0}%",
+            "  ♻ {}: freed ~{} tokens ({}→{} of {}), pressure {:.0}%",
             kind,
             tokens_freed,
             tokens_before,
             tokens_after,
-            max_tokens.try_into().unwrap_or(0),
+            max_tokens,
             pressure * 100.0,
         );
         Self {
-            kind: kind.to_string(),
+            kind,
             pressure,
             tokens_freed,
             tokens_before,
@@ -175,7 +221,13 @@ mod tests {
 
     #[test]
     fn compaction_event_summary_includes_before_after() {
-        let ev = CompactionEvent::new("reactive_budget", 0.88, 18_000, 185_000, 200_000);
+        let ev = CompactionEvent::new(
+            CompactionKind::ReactiveBudget,
+            0.88,
+            18_000,
+            185_000,
+            200_000,
+        );
         assert!(ev.summary.contains("♻"));
         assert!(ev.summary.contains("reactive_budget"));
         assert!(ev.summary.contains("185"));
@@ -187,15 +239,27 @@ mod tests {
 
     #[test]
     fn compaction_event_should_warn_at_70_percent() {
-        let low = CompactionEvent::new("default", 0.69, 1000, 50000, 100000);
-        let high = CompactionEvent::new("aggressive", 0.70, 2000, 70000, 100000);
+        let low = CompactionEvent::new(
+            CompactionKind::DefaultCompression,
+            0.69,
+            1000,
+            50000,
+            100000,
+        );
+        let high = CompactionEvent::new(
+            CompactionKind::AggressiveCompression,
+            0.70,
+            2000,
+            70000,
+            100000,
+        );
         assert!(!low.should_warn());
         assert!(high.should_warn());
     }
 
     #[test]
     fn compaction_event_tokens_after_saturates() {
-        let ev = CompactionEvent::new("test", 0.5, 500, 300, 500);
+        let ev = CompactionEvent::new(CompactionKind::DefaultCompression, 0.5, 500, 300, 500);
         assert_eq!(ev.tokens_after, 0);
     }
 
@@ -256,5 +320,47 @@ mod tests {
                 "aggressive={aggressive} must be above trigger={trigger} for {max_tokens}-token window"
             );
         }
+    }
+
+    #[test]
+    fn pre_turn_trigger_at_128k_boundary_is_correct() {
+        // 131071 (just below 128K) → 0.80 (standard window)
+        // 131072 (128K exactly) → 0.85 (large window)
+        let below = CompactionTier::pre_turn_trigger(131_071);
+        let at = CompactionTier::pre_turn_trigger(131_072);
+        let above = CompactionTier::pre_turn_trigger(131_073);
+
+        assert!(
+            (below - 0.80).abs() < 0.01,
+            "131071 should be ~0.80 (standard), got {below}"
+        );
+        assert!(
+            (at - 0.85).abs() < 0.01,
+            "131072 should be ~0.85 (large), got {at}"
+        );
+        assert!(
+            at > below,
+            "trigger must step up at 128K boundary: {below} → {at}"
+        );
+        assert!(
+            (above - 0.85).abs() < 0.01,
+            "131073 should stay at ~0.85 (large), got {above}"
+        );
+    }
+
+    #[test]
+    fn aggressive_trigger_at_128k_boundary() {
+        let below = CompactionTier::aggressive_trigger(131_071);
+        let at = CompactionTier::aggressive_trigger(131_072);
+
+        assert!(
+            at >= below,
+            "aggressive must not decrease at 128K: {below} → {at}"
+        );
+        // aggressive_trigger should be ≥ 0.90 for large windows.
+        assert!(
+            at >= 0.90,
+            "aggressive trigger at 128K must be at least 0.90, got {at}"
+        );
     }
 }

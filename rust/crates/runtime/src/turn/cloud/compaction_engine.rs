@@ -10,6 +10,7 @@
 //! 3. **TieredCompaction** — drop middle messages, keep system + first user + recent.
 //! 4. **ReactiveCompact** — emergency: keep system + first user + last 4.
 
+use astra_turn_core::compaction_types::CompactionTier;
 pub use astra_turn_core::compression_types::{
     CompressionLayer, CompressionResult, PipelineOutcome, TokenBudget,
 };
@@ -29,7 +30,7 @@ pub struct CompactionEngine {
 
 impl Default for CompactionEngine {
     fn default() -> Self {
-        Self::default_pipeline()
+        Self::default_pipeline_for(64_000)
     }
 }
 
@@ -95,52 +96,69 @@ impl CompactionEngine {
     }
 
     /// Build a pipeline from RuntimeConfig's CompressionConfig.
-    pub fn from_config(config: &CompressionConfig) -> Self {
+    ///
+    /// `max_tokens` is the model's context-window limit, used to compute
+    /// adaptive thresholds via `CompactionTier` so that large-window models
+    /// aren't over-compressed.
+    pub fn from_config(config: &CompressionConfig, max_tokens: u64) -> Self {
+        let base = CompactionTier::pre_turn_trigger(max_tokens);
         let mut p = Self::new();
+        // Layer cascade (light → heavy) with CompactionTier-derived base.
+        // Trigger thresholds increase with layer weight (lower threshold =
+        // earlier activation). Each multiplier is a fraction of the
+        // adaptive trigger level derived from the model's context window:
+        //
+        //   0.625 × base   DuplicateReadElimination  (lightest — just stubs)
+        //   0.750 × base   ToolResultTruncation       (truncates old results)
+        //   0.9375 × base  TieredCompaction            (drops old turns)
+        //   0.95  fixed    ReactiveCompact             (absolute last resort)
+        p.add_layer(Box::new(DuplicateReadElimination::new(
+            (base * 0.625).clamp(0.0, 1.0),
+        )));
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(3600),
             config.max_tool_result_length as usize,
-            config.compression_threshold * 0.75,
-        )));
-        p.add_layer(Box::new(DuplicateReadElimination::new(
-            config.compression_threshold * 0.625,
+            (base * 0.75).clamp(0.0, 1.0),
         )));
         p.add_layer(Box::new(TieredCompaction::new(
             config.preserve_recent_turns as usize,
-            config.compression_threshold * 0.9375,
+            (base * 0.9375).clamp(0.0, 1.0),
         )));
         p.add_layer(Box::new(ReactiveCompact::new(0.95)));
         p
     }
 
-    /// Default pipeline (balanced thresholds from default config).
-    pub fn default_pipeline() -> Self {
-        Self::from_config(&CompressionConfig::default())
+    /// Default pipeline for the given context window size.
+    /// Uses CompactionTier-derived adaptive thresholds.
+    pub fn default_pipeline_for(max_tokens: u64) -> Self {
+        Self::from_config(&CompressionConfig::default(), max_tokens)
     }
 
     /// Aggressive pipeline for second-chance compaction retries.
+    /// All thresholds set to 0.0 so every layer fires unconditionally.
     pub fn aggressive_pipeline() -> Self {
         let mut p = Self::new();
+        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(300),
             512,
             0.0,
         )));
-        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
         p.add_layer(Box::new(TieredCompaction::new(2, 0.0)));
         p.add_layer(Box::new(ReactiveCompact::new(0.0)));
         p
     }
 
     /// Emergency pipeline — absolute last resort before propagating error.
+    /// All thresholds set to 0.0 so every layer fires unconditionally.
     pub fn emergency_pipeline() -> Self {
         let mut p = Self::new();
+        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(0),
             128,
             0.0,
         )));
-        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
         p.add_layer(Box::new(TieredCompaction::new(1, 0.0)));
         p.add_layer(Box::new(ReactiveCompact::new(0.0)));
         p
@@ -600,8 +618,10 @@ impl CompressionLayer for TieredCompaction {
 
         let freed_tokens: usize = dropped
             .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .map(|s| crate::prompts::estimate_str_tokens(s))
+            .map(|m| {
+                crate::prompts::estimate_single_message_tokens(m)
+                    + crate::prompts::PER_MESSAGE_OVERHEAD
+            })
             .sum();
 
         let user_queries: Vec<&str> = dropped
@@ -770,8 +790,10 @@ impl CompressionLayer for ReactiveCompact {
 
         let freed_tokens: usize = dropped
             .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .map(|s| crate::prompts::estimate_str_tokens(s))
+            .map(|m| {
+                crate::prompts::estimate_single_message_tokens(m)
+                    + crate::prompts::PER_MESSAGE_OVERHEAD
+            })
             .sum();
 
         let boundary = serde_json::json!({
@@ -818,25 +840,7 @@ impl CompressionLayer for ReactiveCompact {
 
 // ───────────────────────────── Proactive Context Folding (disabled) ─────
 
-/// Result of proactive folding.
-#[derive(Debug, Clone)]
-pub struct FoldingResult {
-    pub folded_count: usize,
-    pub tokens_freed_estimate: u64,
-}
-
-/// No-op. Previously folded read-only tool results to 200 chars after 2 rounds,
-/// which destroyed content the model needed for edits. All context compaction is
-/// now handled by the single unified pass in `compact_tool_results_adaptive`.
-pub fn fold_old_read_only_results(_messages: &mut [Value], _current_round: u32) -> FoldingResult {
-    FoldingResult {
-        folded_count: 0,
-        tokens_freed_estimate: 0,
-    }
-}
-
 // ───────────────────────────── Tests ─────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,7 +1059,8 @@ mod tests {
         // Low pressure — no layer should fire
         let mut msgs = make_agentic_session(3, 2, 500);
         let b = budget(200_000, 30_000); // 15% pressure
-        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
         assert!(outcome.layer_results.is_empty());
         assert!(outcome.budget_satisfied);
     }
@@ -1066,7 +1071,8 @@ mod tests {
     fn pipeline_empty_messages_no_panic() {
         let mut msgs: Vec<Value> = vec![];
         let b = budget(80_000, 90_000);
-        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
         assert!(msgs.is_empty());
         assert_eq!(outcome.total_tokens_freed, 0);
     }
@@ -1075,7 +1081,8 @@ mod tests {
     fn pipeline_system_only_no_panic() {
         let mut msgs = vec![json!({"role": "system", "content": "sys"})];
         let b = budget(80_000, 90_000);
-        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
         assert_eq!(msgs.len(), 1);
         assert_eq!(outcome.total_tokens_freed, 0);
     }
@@ -1087,7 +1094,8 @@ mod tests {
             json!({"role": "user", "content": "next"}),
         ];
         let b = budget(80_000, 40_000);
-        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
         assert!(msgs[0].get("tool_calls").is_none());
         assert!(outcome.budget_satisfied);
     }
@@ -1985,7 +1993,7 @@ mod tests {
     fn from_config_default_preserves_correct_turn_count() {
         // Default config: preserve_recent_turns=3, compression_threshold=0.8.
         // from_config should create TieredCompaction that keeps 3 turn pairs.
-        let pipeline = CompactionEngine::default_pipeline();
+        let pipeline = CompactionEngine::default_pipeline_for(64_000);
 
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
@@ -2163,7 +2171,8 @@ mod tests {
 
         // Context is at 90% — default pipeline should fire L1 and possibly L3
         let b = budget(100_000, 90_000);
-        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
 
         assert!(outcome.total_tokens_freed > 0);
 
@@ -2202,7 +2211,8 @@ mod tests {
         // Very high pressure — both pipelines should fire
         let b = budget(80_000, 120_000); // 150% pressure
 
-        let out_default = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let out_default =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
         let out_aggressive =
             CompactionEngine::aggressive_pipeline().compress_if_needed(&mut msgs_aggressive, &b);
 
@@ -2275,40 +2285,6 @@ mod tests {
     }
 
     // ── Proactive Folding ──────────────────────────────────────────────
-
-    #[test]
-    fn fold_is_noop_preserves_all_content() {
-        let long_content = "x".repeat(500);
-        let mut msgs = vec![json!({
-            "role": "tool",
-            "tool_call_id": "call-1",
-            "content": &long_content,
-            "_tool_name": "read_file",
-            "_round_index": 0
-        })];
-
-        let result = fold_old_read_only_results(&mut msgs, 10);
-
-        assert_eq!(result.folded_count, 0);
-        assert_eq!(result.tokens_freed_estimate, 0);
-        assert_eq!(msgs[0]["content"].as_str().unwrap(), long_content);
-    }
-
-    #[test]
-    fn fold_noop_never_truncates_regardless_of_round_distance() {
-        let long_content = "x".repeat(5000);
-        let mut msgs = vec![
-            json!({"role": "tool", "content": &long_content, "_tool_name": "read_file", "_round_index": 0}),
-            json!({"role": "tool", "content": &long_content, "_tool_name": "grep", "_round_index": 0}),
-            json!({"role": "tool", "content": &long_content, "_tool_name": "git_show", "_round_index": 1}),
-        ];
-
-        let result = fold_old_read_only_results(&mut msgs, 100);
-        assert_eq!(result.folded_count, 0);
-        for msg in &msgs {
-            assert_eq!(msg["content"].as_str().unwrap().len(), 5000);
-        }
-    }
 
     #[test]
     fn tool_truncation_skips_results_in_protected_head() {

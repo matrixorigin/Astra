@@ -19,6 +19,7 @@ pub use context::{
     budget_for_model, budget_for_model_with_override, capped_output_tokens, estimate_str_tokens,
     estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
 };
+pub(crate) use context::{PER_MESSAGE_OVERHEAD, estimate_single_message_tokens};
 pub use system::{
     CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
     PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT, ROUND_BUDGET_THRESHOLD, STALL_NUDGE,

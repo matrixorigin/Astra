@@ -7,16 +7,16 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState, HostTurnResult,
-        TurnInteractionMode,
+        AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
+        interaction_scoped_tool_restrictions,
     },
 };
 use astra_turn_core::compaction_types::CompactionEvent;
@@ -25,14 +25,14 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{
+    ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
     cli::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
-    ExplainMode,
 };
 
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
-    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
+    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
@@ -1567,5 +1567,39 @@ mod tests {
             "plan-mode cleanup must not delete entries it never owned"
         );
         assert_eq!(restricted.len(), 1);
+    }
+
+    #[test]
+    fn on_compaction_forwards_via_channel() {
+        // Verify that compaction events forwarded through the stream channel
+        // arrive with correct kind and summary.
+        use crate::cli::chat_stream::StreamEvent;
+        use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let event = CompactionEvent {
+            kind: CompactionKind::ReactiveBudget,
+            pressure: 0.85,
+            tokens_freed: 12000,
+            tokens_before: 48000,
+            tokens_after: 36000,
+            max_tokens: 64000,
+            summary: "reactive budget compaction".into(),
+        };
+
+        // Same pattern used by CliAgenticLoopHost::on_compaction:
+        let _ = tx.send(StreamEvent::Compaction(event));
+
+        let received = rx.try_recv().expect("must receive compaction event");
+        match received {
+            StreamEvent::Compaction(e) => {
+                assert_eq!(e.kind, CompactionKind::ReactiveBudget);
+                assert_eq!(e.pressure, 0.85);
+                assert_eq!(e.tokens_freed, 12000);
+                assert_eq!(e.summary, "reactive budget compaction");
+            }
+            other => panic!("expected Compaction event, got {other:?}"),
+        }
     }
 }
