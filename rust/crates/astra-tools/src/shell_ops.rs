@@ -5017,4 +5017,22 @@ printf 'probe.txt:1:needle\n'
             result.output
         );
     }
+
+    // ── sigkill_process_group ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sigkill_process_group_kills_child() {
+        use tokio::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("999")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep 999");
+        assert!(child.try_wait().unwrap().is_none());
+        super::sigkill_process_group(&mut child).await;
+        let status = child.wait().await.expect("wait after sigkill");
+        assert!(!status.success(), "process should have been killed");
+    }
 }

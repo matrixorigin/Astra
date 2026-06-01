@@ -69,6 +69,8 @@ fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::proce
         if start.elapsed() >= GIT_SUBPROCESS_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
             eprintln!(
                 "  ⚠️ git {} timed out after {}s",
                 args.first().unwrap_or(&""),

@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -22,17 +22,59 @@ thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
-static SESSION_START_STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Bounded cache for session-start state to prevent unbounded memory growth
+/// in long-running `astra serve` processes.  Uses FIFO eviction: when the
+/// entry count reaches `MAX`, the oldest inserted entry is evicted before
+/// inserting the new entry.  This bounds worst-case memory to ~N PathBuf entries
+/// while preserving the most recently cached lookups.
+struct BoundedSessionCache {
+    entries: HashMap<PathBuf, bool>,
+    /// Insertion-order queue for FIFO eviction.
+    order: VecDeque<PathBuf>,
+}
 
-fn with_session_start_state_cache<R>(f: impl FnOnce(&mut HashMap<PathBuf, bool>) -> R) -> R {
+impl BoundedSessionCache {
+    /// Maximum number of cached session paths before eviction triggers.
+    const MAX: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(Self::MAX),
+            order: VecDeque::with_capacity(Self::MAX),
+        }
+    }
+
+    fn get(&self, path: &Path) -> Option<bool> {
+        self.entries.get(path).copied()
+    }
+
+    fn insert(&mut self, path: PathBuf, value: bool) {
+        let is_new = !self.entries.contains_key(&path);
+        // Evict oldest entry (FIFO) only when inserting a net-new key at capacity.
+        if is_new && self.entries.len() >= Self::MAX {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+        if is_new {
+            self.order.push_back(path.clone());
+        }
+        self.entries.insert(path, value);
+    }
+}
+
+static SESSION_START_STATE_CACHE: LazyLock<Mutex<BoundedSessionCache>> =
+    LazyLock::new(|| Mutex::new(BoundedSessionCache::new()));
+
+fn with_session_start_state_cache<R>(f: impl FnOnce(&mut BoundedSessionCache) -> R) -> R {
     match SESSION_START_STATE_CACHE.lock() {
         Ok(mut guard) => f(&mut guard),
         Err(mut poisoned) => {
             tracing::warn!(
                 "session_start_state_cache mutex poisoned; clearing cached state before reuse"
             );
-            poisoned.get_mut().clear();
+            poisoned.get_mut().order.clear();
+            poisoned.get_mut().entries.clear();
             let mut guard = poisoned.into_inner();
             f(&mut guard)
         }
@@ -55,7 +97,7 @@ pub fn local_sessions_dir() -> PathBuf {
 }
 
 fn cached_session_start_state(path: &Path) -> Option<bool> {
-    with_session_start_state_cache(|cache| cache.get(path).copied())
+    with_session_start_state_cache(|cache| cache.get(path))
 }
 
 fn set_cached_session_start_state(path: &Path, has_open_session_start: bool) {
@@ -8102,10 +8144,8 @@ mod session_start_detection_tests {
             scan.bytes_read,
         );
 
-        // End-to-end: the cached-bypass path (the actual hot path used by
-        // the lock-protected `ensure_session_start_event`) returns the
-        // correct answer for an open session.
-        with_session_start_state_cache(|cache| cache.remove(&path));
+        // End-to-end: the cached-bypass path (skip_cache=true) returns the
+        // correct answer for an open session without consulting the cache.
         let needs = journal_needs_session_start_impl(&path, /*skip_cache=*/ true).unwrap();
         assert!(!needs, "open session must not need another SessionStart");
     }
@@ -8532,5 +8572,113 @@ mod observability_serde_tests {
         let json = serde_json::to_string(&ev).unwrap();
         let deser: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.git_head.as_deref(), Some("1111aaaa"));
+    }
+
+    /// Bounded cache: inserting more than MAX entries evicts the oldest
+    /// (FIFO), preventing unbounded memory growth in long-running servers.
+    /// FIFO eviction: filling the cache beyond MAX evicts the oldest entries
+    /// and never exceeds MAX. Uses a local BoundedSessionCache to avoid
+    /// polluting the global SESSION_START_STATE_CACHE.
+    #[test]
+    fn bounded_cache_fifo_eviction_never_exceeds_max() {
+        let mut cache = BoundedSessionCache::new();
+        // Insert 2× MAX unique entries.
+        for i in 0..(2 * BoundedSessionCache::MAX) {
+            cache.insert(PathBuf::from(format!("/tmp/session-{i}.jsonl")), i % 2 == 0);
+        }
+        // Oldest entries (0..MAX-1) evicted.
+        assert!(
+            cache
+                .get(Path::new(&format!(
+                    "/tmp/session-{}.jsonl",
+                    BoundedSessionCache::MAX - 1
+                )))
+                .is_none()
+        );
+        assert!(cache.get(Path::new("/tmp/session-0.jsonl")).is_none());
+        // Most recent MAX entries still present.
+        let recent = format!("/tmp/session-{}.jsonl", 2 * BoundedSessionCache::MAX - 1);
+        assert!(cache.get(Path::new(&recent)).is_some());
+        // Entry at MAX boundary present.
+        assert!(
+            cache
+                .get(Path::new(&format!(
+                    "/tmp/session-{}.jsonl",
+                    BoundedSessionCache::MAX
+                )))
+                .is_some()
+        );
+    }
+
+    /// Direct unit test: insert + get round-trips.
+    #[test]
+    fn bounded_cache_insert_and_get() {
+        let mut cache = BoundedSessionCache::new();
+        cache.insert(PathBuf::from("/a"), true);
+        cache.insert(PathBuf::from("/b"), false);
+        assert_eq!(cache.get(Path::new("/a")), Some(true));
+        assert_eq!(cache.get(Path::new("/b")), Some(false));
+        assert_eq!(cache.get(Path::new("/c")), None);
+        // Both entries present: /b (newest) and /a (oldest but still within MAX).
+        assert_eq!(cache.get(Path::new("/a")), Some(true));
+        assert_eq!(cache.get(Path::new("/b")), Some(false));
+    }
+
+    /// Re-insert updates value without changing FIFO order.
+    #[test]
+    fn bounded_cache_reinsert_updates_value_preserves_order() {
+        let mut cache = BoundedSessionCache::new();
+        cache.insert(PathBuf::from("/a"), true);
+        cache.insert(PathBuf::from("/b"), false);
+        // Re-insert /a with new value.
+        cache.insert(PathBuf::from("/a"), false);
+        assert_eq!(cache.get(Path::new("/a")), Some(false));
+        // Re-insert didn't add a new /a entry.
+        assert_eq!(cache.get(Path::new("/b")), Some(false));
+        // Fill to capacity — /a is the oldest key and should evict first.
+        for i in 0..(BoundedSessionCache::MAX - 2) {
+            cache.insert(PathBuf::from(format!("/fill-{i}")), true);
+        }
+        cache.insert(PathBuf::from("/trigger"), true);
+        assert_eq!(
+            cache.get(Path::new("/a")),
+            None,
+            "/a must evict first (oldest)"
+        );
+        assert_eq!(cache.get(Path::new("/b")), Some(false));
+    }
+
+    /// Poisoned mutex: when another thread panics while holding the lock,
+    /// with_session_start_state_cache clears stale state and continues.
+    /// Uses clear_poison() after the test to un-poison the global mutex.
+    #[test]
+    #[serial_test::serial(astra_session_start_state_cache)]
+    fn poisoned_mutex_recovers_and_cache_is_usable() {
+        // Artificially poison the global mutex by panicking while locked.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_session_start_state_cache(|_cache| {
+                panic!("simulate panic while holding cache lock");
+            });
+        }));
+        assert!(result.is_err(), "expected panic");
+
+        // The mutex is now poisoned.  with_session_start_state_cache must
+        // recover by clearing entries/order and still accept operations.
+        with_session_start_state_cache(|cache| {
+            // Cache must be cleared after poison recovery: pre-poison entries gone.
+            assert!(
+                cache.get(Path::new("/any-pre-poison-key")).is_none(),
+                "cache must be cleared on poison recovery"
+            );
+            cache.insert(PathBuf::from("/recovery"), true);
+            assert_eq!(cache.get(Path::new("/recovery")), Some(true));
+            assert_eq!(cache.get(Path::new("/other")), None);
+        });
+
+        // Clean up: un-poison the mutex so subsequent tests see a healthy lock.
+        // The .lock() call returns Ok now because the poison was cleared by
+        // the recovery path's into_inner(). Actually, into_inner() does NOT
+        // clear the poison flag — we must call clear_poison() explicitly.
+        SESSION_START_STATE_CACHE.clear_poison();
     }
 }

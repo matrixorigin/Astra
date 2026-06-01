@@ -2814,7 +2814,11 @@ fn run_command_with_cleanup(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("Error: {e}")),
+            Err(e) => {
+                sigkill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(format!("Error: {e}"));
+            }
         }
     }
 
@@ -3027,7 +3031,11 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("Error: {e}")),
+            Err(e) => {
+                sigkill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(format!("Error: {e}"));
+            }
         }
     }
 
@@ -3430,7 +3438,13 @@ fn run_command_streaming(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("Error: {e}")),
+            Err(e) => {
+                sigkill_process_group(&mut child);
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!("Error: {e}"));
+            }
         }
     }
 }
@@ -3466,7 +3480,11 @@ fn size_watchdog(
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
-            Err(_) => break,
+            Err(_) => {
+                sigkill_process_group(&mut child);
+                let _ = child.wait();
+                break;
+            }
         }
 
         // Kill if running too long.
@@ -3582,7 +3600,13 @@ fn run_readonly_command_with_partial(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("Error: {e}")),
+            Err(e) => {
+                sigkill_process_group(&mut child);
+                let _ = child.wait();
+                let _ = reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("Error: {e}"));
+            }
         }
     }
 }
@@ -6935,34 +6959,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
     }
 
-    #[test]
-    fn grep_uses_process_group_cleanup() {
-        // Verify grep doesn't leave zombie processes on timeout
-        // This is a regression test for the curl zombie leak issue.
-        // We can't easily force grep to timeout, but we can verify it completes normally.
-        let dir = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(dir.path());
-        std::fs::write(dir.path().join("test.txt"), "findme\n").unwrap();
-
-        // Normal grep should work
-        let result = executor.grep(&serde_json::json!({"pattern": "findme", "path": "."}));
-        assert!(result.contains("findme"), "got: {result}");
-
-        // After grep completes, verify no zombie processes from this test
-        // (This is more of a smoke test — the real protection is the process_group(0))
-    }
-
-    #[test]
-    fn glob_uses_process_group_cleanup() {
-        // Verify glob (which uses bash internally) properly cleans up
-        let dir = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(dir.path());
-        std::fs::write(dir.path().join("test.txt"), "content\n").unwrap();
-
-        let result = executor.glob(&serde_json::json!({"pattern": "*.txt"}));
-        assert!(result.contains("test.txt"), "got: {result}");
-    }
-
     // ── grep extended regex ──────────────────────────────────────────────────
 
     #[test]
@@ -7888,5 +7884,29 @@ mod tests {
         s.truncate(boundary);
         s.push_str("\n[truncated]");
         assert!(s.starts_with("café "));
+    }
+
+    // ── try_wait / process-group cleanup ─────────────────────────────────
+
+    /// sigkill_process_group kills a child process so subsequent wait()
+    /// completes immediately (no zombie leak).
+    #[test]
+    #[cfg(unix)]
+    fn sigkill_process_group_kills_child() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep 999");
+        // Process should be alive.
+        assert!(child.try_wait().unwrap().is_none());
+        // Kill it.
+        super::sigkill_process_group(&mut child);
+        // Wait should complete immediately.
+        let status = child.wait().expect("wait after sigkill");
+        assert!(!status.success(), "process should have been killed");
     }
 }

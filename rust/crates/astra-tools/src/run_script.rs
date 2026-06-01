@@ -990,11 +990,15 @@ pub async fn run_script(
         Ok(Err(e)) => {
             kill_process_group(&child);
             let _ = child.kill().await;
+            let (_stdout_content, _stderr_content) =
+                tokio::try_join!(stdout_handle, stderr_handle)?;
             Err(RunScriptError::Io(e))
         }
         Err(_) => {
             kill_process_group(&child);
             let _ = child.kill().await;
+            let (_stdout_content, _stderr_content) =
+                tokio::try_join!(stdout_handle, stderr_handle)?;
             Err(RunScriptError::Timeout(config.timeout))
         }
     }
