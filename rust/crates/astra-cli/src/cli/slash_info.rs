@@ -1588,7 +1588,7 @@ pub(crate) async fn handle_info_command(
                     pair
                 })
                 .collect();
-            let history_tokens = prompts::estimate_tokens(&est_messages);
+            let history_tokens = prompts::estimate_tokens(&est_messages, 0, 0);
             let budget = &state.context_budget;
             let limit = budget.model_limit;
             let usage_pct = if limit > 0 {

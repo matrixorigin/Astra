@@ -8,7 +8,7 @@
 //! These tests encode the invariant: **within a single user turn, tool results
 //! must survive long enough for the model to act on them.**
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ fn read_results_survive_through_edit_round() {
 
     // Now simulate what happens before round 4 (the edit round):
     // The system runs fold_old_read_only_results with current_round=4.
-    astra_runtime::turn::context_compression::fold_old_read_only_results(&mut messages, 4);
+    astra_runtime::turn::cloud::compaction_engine::fold_old_read_only_results(&mut messages, 4);
 
     // INVARIANT: The round-0 file reads must still be usable.
     // The model needs the full code content to craft a str_replace.
@@ -170,7 +170,7 @@ fn no_partial_content_folding_ever() {
         ));
     }
 
-    astra_runtime::turn::context_compression::fold_old_read_only_results(&mut messages, 9);
+    astra_runtime::turn::cloud::compaction_engine::fold_old_read_only_results(&mut messages, 9);
 
     let content = messages[2]["content"].as_str().unwrap();
 
@@ -228,7 +228,7 @@ fn fold_then_microcompact_no_useless_stubs() {
     ];
 
     // Step 1: fold runs (round 5)
-    astra_runtime::turn::context_compression::fold_old_read_only_results(&mut messages, 5);
+    astra_runtime::turn::cloud::compaction_engine::fold_old_read_only_results(&mut messages, 5);
 
     // Step 2: microcompact runs at low pressure
     astra_turn_core::microcompact::compact_tool_results_adaptive(
@@ -361,7 +361,7 @@ fn mutation_evidence_survives_all_compaction_stages() {
     }
 
     // Run both compaction stages (fold is a no-op, unified adaptive is the real pass)
-    astra_runtime::turn::context_compression::fold_old_read_only_results(&mut messages, 7);
+    astra_runtime::turn::cloud::compaction_engine::fold_old_read_only_results(&mut messages, 7);
     astra_turn_core::microcompact::compact_tool_results_adaptive(
         &mut messages,
         0.85,

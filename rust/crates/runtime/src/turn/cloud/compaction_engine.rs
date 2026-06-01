@@ -23,17 +23,17 @@ use std::time::{Duration, SystemTime};
 // ───────────────────────────── Pipeline ──────────────────────────────────
 
 /// Ordered pipeline of compression layers.
-pub struct CompressionPipeline {
+pub struct CompactionEngine {
     layers: Vec<Box<dyn CompressionLayer>>,
 }
 
-impl Default for CompressionPipeline {
+impl Default for CompactionEngine {
     fn default() -> Self {
         Self::default_pipeline()
     }
 }
 
-impl CompressionPipeline {
+impl CompactionEngine {
     pub fn new() -> Self {
         Self { layers: Vec::new() }
     }
@@ -995,7 +995,7 @@ mod tests {
         let mut msgs = make_agentic_session(6, 3, 3000);
         let b = budget(100_000, 85_000); // 85% pressure
 
-        let mut pipeline = CompressionPipeline::new();
+        let mut pipeline = CompactionEngine::new();
         pipeline.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(0),
             200,
@@ -1021,7 +1021,7 @@ mod tests {
         // Pressure just above L1's trigger but well within L1's ability to resolve
         let b = budget(100_000, 70_000); // 70% pressure
 
-        let mut pipeline = CompressionPipeline::new();
+        let mut pipeline = CompactionEngine::new();
         pipeline.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(0),
             128,
@@ -1055,7 +1055,7 @@ mod tests {
         // Low pressure — no layer should fire
         let mut msgs = make_agentic_session(3, 2, 500);
         let b = budget(200_000, 30_000); // 15% pressure
-        let outcome = CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
         assert!(outcome.layer_results.is_empty());
         assert!(outcome.budget_satisfied);
     }
@@ -1066,7 +1066,7 @@ mod tests {
     fn pipeline_empty_messages_no_panic() {
         let mut msgs: Vec<Value> = vec![];
         let b = budget(80_000, 90_000);
-        let outcome = CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
         assert!(msgs.is_empty());
         assert_eq!(outcome.total_tokens_freed, 0);
     }
@@ -1075,7 +1075,7 @@ mod tests {
     fn pipeline_system_only_no_panic() {
         let mut msgs = vec![json!({"role": "system", "content": "sys"})];
         let b = budget(80_000, 90_000);
-        let outcome = CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
         assert_eq!(msgs.len(), 1);
         assert_eq!(outcome.total_tokens_freed, 0);
     }
@@ -1087,7 +1087,7 @@ mod tests {
             json!({"role": "user", "content": "next"}),
         ];
         let b = budget(80_000, 40_000);
-        let outcome = CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
         assert!(msgs[0].get("tool_calls").is_none());
         assert!(outcome.budget_satisfied);
     }
@@ -1985,7 +1985,7 @@ mod tests {
     fn from_config_default_preserves_correct_turn_count() {
         // Default config: preserve_recent_turns=3, compression_threshold=0.8.
         // from_config should create TieredCompaction that keeps 3 turn pairs.
-        let pipeline = CompressionPipeline::default_pipeline();
+        let pipeline = CompactionEngine::default_pipeline();
 
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
@@ -2163,7 +2163,7 @@ mod tests {
 
         // Context is at 90% — default pipeline should fire L1 and possibly L3
         let b = budget(100_000, 90_000);
-        let outcome = CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
 
         assert!(outcome.total_tokens_freed > 0);
 
@@ -2202,9 +2202,9 @@ mod tests {
         // Very high pressure — both pipelines should fire
         let b = budget(80_000, 120_000); // 150% pressure
 
-        let out_default = CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs, &b);
+        let out_default = CompactionEngine::default_pipeline().compress_if_needed(&mut msgs, &b);
         let out_aggressive =
-            CompressionPipeline::aggressive_pipeline().compress_if_needed(&mut msgs_aggressive, &b);
+            CompactionEngine::aggressive_pipeline().compress_if_needed(&mut msgs_aggressive, &b);
 
         // Aggressive should free at least as much
         assert!(
@@ -2220,7 +2220,7 @@ mod tests {
         let mut msgs = make_agentic_session(20, 4, 3000);
         let b = budget(50_000, 200_000); // massively over budget
 
-        let outcome = CompressionPipeline::emergency_pipeline().compress_if_needed(&mut msgs, &b);
+        let outcome = CompactionEngine::emergency_pipeline().compress_if_needed(&mut msgs, &b);
 
         assert!(outcome.total_tokens_freed > 0);
         // Must have system + first user + at least boundary + tail

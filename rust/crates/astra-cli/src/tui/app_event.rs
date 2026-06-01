@@ -58,4 +58,7 @@ pub(crate) enum TuiAppEvent {
     TurnError(String),
     ExplainReport(Vec<serde_json::Value>),
     VerdictReport(Vec<crate::VerdictEvent>),
+
+    // ── Context compaction (real-time UX) ───────────────────────────────
+    Compaction(astra_turn_core::compaction_types::CompactionEvent),
 }

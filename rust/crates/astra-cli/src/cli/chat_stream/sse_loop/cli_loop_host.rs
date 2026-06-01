@@ -7,31 +7,32 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
-        interaction_scoped_tool_restrictions,
+        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState, HostTurnResult,
+        TurnInteractionMode,
     },
 };
+use astra_turn_core::compaction_types::CompactionEvent;
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{
-    ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
     cli::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
+    ExplainMode,
 };
 
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
-    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
+    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
 };
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
@@ -780,6 +781,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             HeadlessStderrStyle::Normal => eprintln!("{}", line),
         }
         self.pending_clear_lines += 1;
+    }
+
+    fn on_compaction(&mut self, event: CompactionEvent) {
+        // Stderr fallback (always visible).
+        self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
+        // Structured event for TUI / stream consumers.
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(crate::cli::StreamEvent::Compaction(event));
+        }
     }
 
     fn is_quiet(&self) -> bool {

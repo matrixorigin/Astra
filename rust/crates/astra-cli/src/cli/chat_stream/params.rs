@@ -1,10 +1,10 @@
 use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::{ExplainMode, cli::permission_manager::PermissionManager};
+use crate::{cli::permission_manager::PermissionManager, ExplainMode};
 
 /// Atomic counter pair published by streaming tools (currently
 /// bash) while they run. Consumers read `lines` / `bytes` on a
@@ -141,6 +141,8 @@ pub enum StreamEvent {
     ExplainText(String),
     /// Verdict audit events from the turn.
     VerdictReport(Vec<crate::VerdictEvent>),
+    /// Structured compaction event for real-time UX feedback.
+    Compaction(astra_turn_core::compaction_types::CompactionEvent),
 }
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;

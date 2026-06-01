@@ -1267,7 +1267,7 @@ mod tests {
         assert!(micro_cleared > 0);
 
         // Step 2: estimate tokens and determine tier
-        let est = crate::prompts::estimate_tokens(&after_micro);
+        let est = crate::prompts::estimate_tokens(&after_micro, 0, 0);
         let tier = budget.compaction_tier(est);
 
         // Step 3: tiered compaction
@@ -1280,7 +1280,7 @@ mod tests {
         );
 
         // Verify: output is bounded
-        let final_tokens = crate::prompts::estimate_tokens(&result.messages);
+        let final_tokens = crate::prompts::estimate_tokens(&result.messages, 0, 0);
         let effective_limit = budget.effective_input_limit();
         assert!(
             final_tokens < effective_limit,

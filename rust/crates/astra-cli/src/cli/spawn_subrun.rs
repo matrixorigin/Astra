@@ -303,6 +303,7 @@ fn stream_event_to_agent_live_kind(
         )),
         StreamEvent::Thinking(_)
         | StreamEvent::AgentLive(_)
+        | StreamEvent::Compaction(_)
         | StreamEvent::ExplainReport(_)
         | StreamEvent::ExplainText(_)
         | StreamEvent::VerdictReport(_) => None,

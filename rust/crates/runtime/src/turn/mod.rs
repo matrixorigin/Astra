@@ -6,7 +6,6 @@ pub mod budget_messaging;
 pub mod chat_turn_budget_pressure;
 pub mod cloud;
 pub mod compaction_replay;
-pub mod context_compression;
 pub(crate) mod context_pipeline_adapter;
 pub mod harness_adapter;
 pub mod headless_tool_pipeline;

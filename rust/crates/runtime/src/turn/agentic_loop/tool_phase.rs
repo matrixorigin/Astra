@@ -1648,7 +1648,7 @@ fn introspect_token_pressure(state: &super::host::AgenticLoopState) -> f64 {
     if state.max_turn_input_tokens == 0 {
         return 0.0;
     }
-    let fresh_estimate = crate::prompts::estimate_tokens_precise(
+    let fresh_estimate = crate::prompts::estimate_tokens(
         &state.messages,
         state.pinned_tool_schema_tokens as usize,
         0,
@@ -1784,7 +1784,7 @@ mod tests {
             json!({"role": "user", "content": "hello world"}),
         ];
         state.pinned_tool_schema_tokens = 120;
-        let expected = crate::prompts::estimate_tokens_precise(
+        let expected = crate::prompts::estimate_tokens(
             &state.messages,
             state.pinned_tool_schema_tokens as usize,
             0,

@@ -148,6 +148,18 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::ExplainReport(_) | StreamEvent::VerdictReport(_) => {
             serde_json::json!({"type": "ignored"})
         }
+        StreamEvent::Compaction(event) => {
+            serde_json::json!({
+                "type": "compaction",
+                "kind": event.kind,
+                "pressure": event.pressure,
+                "tokens_freed": event.tokens_freed,
+                "tokens_before": event.tokens_before,
+                "tokens_after": event.tokens_after,
+                "max_tokens": event.max_tokens,
+                "summary": event.summary,
+            })
+        }
     };
     serde_json::to_string(&value).unwrap_or_default()
 }

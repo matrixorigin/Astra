@@ -3194,6 +3194,7 @@ fn handle_app_event(
         TuiAppEvent::AgentLive(_)
         | TuiAppEvent::AgentLiveBatch(_)
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}

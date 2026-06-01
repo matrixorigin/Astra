@@ -2,18 +2,18 @@
 //!
 //! Run: `cargo bench -p astra-runtime --bench hot_paths`
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use serde_json::json;
 
 use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
-use astra_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_tokens};
+use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens, CompactionTier};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
-use astra_runtime::tool_registry::ConversationState;
-use astra_runtime::tool_registry::TOOL_CATALOG;
 use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
 use astra_runtime::tool_registry::tool_pool::{
-    SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource, select_two_phase,
+    select_two_phase, SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource,
 };
+use astra_runtime::tool_registry::ConversationState;
+use astra_runtime::tool_registry::TOOL_CATALOG;
 use astra_runtime::turn::cloud::compaction::compact_tiered;
 
 // ── Token Estimation ───────────────────────────────────────────────
@@ -58,12 +58,12 @@ fn bench_estimate_tokens_messages(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("estimate_tokens");
     group.bench_with_input(BenchmarkId::new("2_messages", 2), &small_msgs, |b, msgs| {
-        b.iter(|| estimate_tokens(black_box(msgs)))
+        b.iter(|| estimate_tokens(black_box(msgs), 0, 0))
     });
     group.bench_with_input(
         BenchmarkId::new("20_messages", 20),
         &large_msgs,
-        |b, msgs| b.iter(|| estimate_tokens(black_box(msgs))),
+        |b, msgs| b.iter(|| estimate_tokens(black_box(msgs), 0, 0)),
     );
     group.finish();
 }

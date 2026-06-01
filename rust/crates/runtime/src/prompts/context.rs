@@ -38,34 +38,19 @@ pub fn estimate_str_tokens(s: &str) -> usize {
 }
 
 /// Approximate token count with CJK-aware estimation.
-/// Adds overhead per message for role/formatting tokens, plus estimated
-/// system prompt and tool schema overhead that the LLM API counts but
-/// we don't see in the messages array.
-pub fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
-    const PER_MESSAGE_OVERHEAD: usize = 4; // role + separators
-    // System prompt (~1.2K tokens) + tool schemas (~1.5K tokens avg) + model framing
-    const FIXED_OVERHEAD: usize = 3000;
-    let message_tokens: usize = messages
-        .iter()
-        .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
-        .sum();
-    message_tokens + FIXED_OVERHEAD
-}
-
-/// Precise token estimation using actual overhead measurements instead of the
-/// hardcoded 3,000-token `FIXED_OVERHEAD`.
+/// Adds overhead per message for role/formatting tokens, plus system prompt
+/// and tool schema overhead that the LLM API counts but we don't see in the
+/// messages array.
 ///
 /// * `schema_token_total` — sum of measured token costs for all selected tool
-///   schemas (from `ToolRegistry::token_cost`).
+///   schemas (from `ToolRegistry::token_cost`). Pass 0 if unavailable.
 /// * `system_prompt_tokens` — estimated tokens of the system prompt, or 0 to
-///   use the default 1,200 estimate.
+///   use the default 14,000 estimate.
 ///
-/// This produces more accurate compaction-tier decisions, especially under
-/// CJK-heavy conversations where the old estimate was 50% too low.
-/// Calibrated default: the full system prompt (~52 KB) is approximately 14 000 tokens.
+/// Calibrated default: the full system prompt (~52 KB) is approximately 14,000 tokens.
 pub const DEFAULT_SYSTEM_PROMPT_TOKENS: usize = 14_000;
 
-pub fn estimate_tokens_precise(
+pub fn estimate_tokens(
     messages: &[serde_json::Value],
     schema_token_total: usize,
     system_prompt_tokens: usize,
@@ -755,29 +740,10 @@ mod tests {
     }
 
     #[test]
-    fn estimate_tokens_unchanged_behavior() {
-        let messages = vec![msg(&"x".repeat(400))];
-        // 400/4 = 100 + 4 overhead + 3000 fixed = 3104
-        assert_eq!(estimate_tokens(&messages), 3104);
-    }
-
-    #[test]
-    fn estimate_tokens_with_tool_calls_unchanged() {
-        let messages = vec![tool_msg(&"y".repeat(200))];
-        // 200/4 = 50 args + 15 structural overhead + 4 msg overhead + 3000 fixed = 3069
-        assert_eq!(estimate_tokens(&messages), 3069);
-    }
-
-    #[test]
-    fn estimate_tokens_empty() {
-        assert_eq!(estimate_tokens(&[]), 3000);
-    }
-
-    #[test]
-    fn estimate_tokens_precise_includes_schema_tokens() {
+    fn estimate_tokens_includes_schema_tokens() {
         let msgs = vec![msg(&"x".repeat(400))];
-        let without_schema = estimate_tokens_precise(&msgs, 0, 0);
-        let with_schema = estimate_tokens_precise(&msgs, 50_000, 0);
+        let without_schema = estimate_tokens(&msgs, 0, 0);
+        let with_schema = estimate_tokens(&msgs, 50_000, 0);
         assert!(
             with_schema > without_schema + 40_000,
             "schema_token_total must be included: without={without_schema}, with={with_schema}",
@@ -819,6 +785,76 @@ mod tests {
         );
     }
 
+    /// Regression test for session 540c37d1:
+    /// Without schema token accounting, CJK-heavy conversations are severely
+    /// underestimated (pressure ~0.61 when real was ~0.89), so compaction
+    /// never triggered.
+    ///
+    /// `estimate_tokens` with schema tokens must produce a substantially
+    /// higher estimate than without, ensuring compaction gates fire.
+    #[test]
+    fn estimate_with_schema_dwarfs_estimate_without_schema_for_cjk() {
+        // Simulate session 540c37d1: ~50 CJK-heavy messages + tool results
+        let mut messages = Vec::new();
+        for i in 0..25 {
+            messages.push(msg(&format!(
+                "第{i}个回合：请帮我深入分析这段代码的问题，包括错误处理、性能瓶颈和可维护性"
+            )));
+            messages.push(msg(&format!(
+                "好的，让我详细分析第{i}个回合的问题。首先从错误处理的角度来看..."
+            )));
+        }
+        // Add some tool result messages (simulating file reads / greps)
+        for i in 0..10 {
+            messages.push(msg(&format!(
+                "{{\"result\": \"文件 file_{i}.rs 读取完成，共 200 行，发现以下潜在问题：...\", \"success\": true}}"
+            )));
+        }
+
+        let without_schema = estimate_tokens(&messages, 0, 0);
+        let with_schema = estimate_tokens(&messages, 50_000, 0);
+
+        // Schema-aware estimate must be at least 50% higher
+        let ratio = with_schema as f64 / without_schema as f64;
+        assert!(
+            ratio > 1.5,
+            "with schema ({with_schema}) must be >1.5× without schema ({without_schema}) for CJK-heavy sessions; got {ratio:.2}x"
+        );
+    }
+
+    /// `estimate_tokens` with schema tokens must produce estimates
+    /// that push past compaction thresholds when the session is truly large.
+    /// With a 128K model and 0.75 compact_threshold, the trim-start is at
+    /// 0.75 * 0.80 * 0.85 * 128K ≈ 65K effective tokens.
+    #[test]
+    fn estimate_crosses_compact_threshold_for_large_cjk_session() {
+        let mut messages = Vec::new();
+        // Build a large CJK conversation with tool results
+        for i in 0..40 {
+            messages.push(msg(&format!(
+                "请继续分析和修复第{i}个文件中的问题代码，关注性能和安全"
+            )));
+            messages.push(msg(&format!(
+                "正在分析第{i}个文件。发现错误处理缺失、循环内有分配、SQL注入风险等问题。建议：1. 引入Result类型 2. 预分配vector 3. 使用参数化查询..."
+            )));
+            if i < 25 {
+                messages.push(msg(&format!(
+                    "{{\"lines\": \"// file_{i}.rs 原始文件内容\\nfn main() {{\\n    let x = 1;\\n}}\", \"matches\": 3, \"path\": \"src/file_{i}.rs\"}}"
+                )));
+            }
+        }
+
+        let estimated = estimate_tokens(&messages, 50_000, 0);
+        // With 40 user + 40 assistant + 25 tool msgs (~105 total), CJK content,
+        // 50K schema + 14K system prompt, the estimate should exceed 65K,
+        // the TrimSchemas trigger for the default 128K model.
+        assert!(
+            estimated > 65_000,
+            "CJK session ({count} msgs) with schema tokens should cross TrimSchemas trigger: got {estimated}",
+            count = messages.len(),
+        );
+    }
+
     #[test]
     fn estimate_str_tokens_cjk_punctuation() {
         // CJK punctuation (U+3000-303F, FF00-FFEF) counts as CJK tokens
@@ -834,9 +870,14 @@ mod tests {
 
     #[test]
     fn estimate_tokens_cjk_message() {
-        // CJK message: "分析一下这个文件" = 8 CJK chars × 1.5 = 12 tokens + 4 overhead + 3000 fixed
+        // CJK message: "分析一下这个文件" = 8 CJK chars × 1.5 = 12 tokens
+        // + 4 overhead + 14_000 sys + 300 framing = 14_316
         let messages = vec![msg("分析一下这个文件")];
-        assert_eq!(estimate_tokens(&messages), 12 + 4 + 3000);
+        let est = estimate_tokens(&messages, 0, 0);
+        assert!(
+            est > 14_000,
+            "CJK message should estimate > 14K tokens, got {est}"
+        );
     }
 
     // ── Phase 6.1: Mixed EN/CN regression tests ──
@@ -983,21 +1024,21 @@ mod tests {
     #[test]
     fn capped_output_tokens_default_16k() {
         let b = budget_for_model(None); // 128K, 0.15
-        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 16_384 (large model)
+                                        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 16_384 (large model)
         assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
     #[test]
     fn capped_output_tokens_scales_for_small_model() {
         let b = budget_for_model(Some("gpt-3.5")); // 16K, 0.12
-        // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920 (small model cap)
+                                                   // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920 (small model cap)
         assert_eq!(capped_output_tokens(&b), 1920);
     }
 
     #[test]
     fn capped_output_tokens_claude_16k() {
         let b = budget_for_model(Some("claude-3.5-sonnet")); // 200K, 0.20
-        // full_reserve = 200_000 * 0.20 = 40_000 → capped to 16_384 (large model)
+                                                             // full_reserve = 200_000 * 0.20 = 40_000 → capped to 16_384 (large model)
         assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
@@ -1063,17 +1104,21 @@ mod tests {
     }
 
     #[test]
-    fn estimate_tokens_empty_messages_has_fixed_overhead() {
-        let tokens = estimate_tokens(&[]);
-        // Just FIXED_OVERHEAD (3000) with no messages
-        assert_eq!(tokens, 3000);
+    fn estimate_tokens_empty_messages_has_base_overhead() {
+        // Empty messages still account for system prompt + model framing.
+        // DEFAULT_SYSTEM_PROMPT_TOKENS (14_000) + MODEL_FRAMING (300) = 14_300
+        let tokens = estimate_tokens(&[], 0, 0);
+        assert!(
+            tokens >= 14_000,
+            "empty messages should have base overhead, got {tokens}"
+        );
     }
 
     #[test]
     fn estimate_tokens_message_without_content() {
-        let tokens = estimate_tokens(&[json!({"role": "user"})]);
+        let tokens = estimate_tokens(&[json!({"role": "user"})], 0, 0);
         // Should not panic on missing content
-        assert!(tokens > 3000); // overhead + per-message overhead
+        assert!(tokens > 14_000); // overhead + per-message overhead
     }
 
     #[test]
@@ -1416,7 +1461,7 @@ mod tests {
         // Should use default values
         assert!((b.compact_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(b.keep_recent_turns, 3); // default preserve_recent_turns
-        // 4000 tokens * 4 chars = 16000 chars
+                                            // 4000 tokens * 4 chars = 16000 chars
         assert_eq!(b.memory_budget_chars, 16000);
     }
 

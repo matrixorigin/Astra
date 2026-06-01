@@ -40,6 +40,7 @@ use super::history_cell::{
     task::TaskCell, tool::ToolCell, turn_summary::TurnSummaryCell, user::UserCell,
 };
 use super::transcript_jsonl;
+use astra_turn_core::compaction_types::CompactionEvent;
 use super::turn_event::TurnEvent;
 use crate::VerdictEvent;
 
@@ -138,6 +139,9 @@ pub(crate) enum WireEvent {
     TurnError(String),
     ExplainReport(Vec<serde_json::Value>),
     VerdictReport(Vec<crate::VerdictEvent>),
+    /// Structured compaction event — renders as a system info cell
+    /// so the user sees live context-health feedback in scrollback.
+    Compaction(CompactionEvent),
 }
 
 /// Per-turn metrics the outer loop collects and hands to
@@ -859,6 +863,9 @@ impl ChatWidget {
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
             WireEvent::ExplainReport(items) => self.on_explain_report(items),
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
+            WireEvent::Compaction(event) => {
+                self.commit_system(SystemCell::info(event.summary));
+            }
         }
     }
 

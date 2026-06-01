@@ -49,8 +49,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
@@ -65,7 +65,7 @@ use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{SessionTask, TaskManager};
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
@@ -133,8 +133,8 @@ pub struct HostTurnResult {
 }
 
 pub use astra_turn_core::interaction_types::{
-    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
+    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -191,6 +191,16 @@ pub trait AgenticLoopHost: Send {
     /// hasn't been updated yet.
     fn turn_interaction_mode(&self) -> TurnInteractionMode {
         TurnInteractionMode::NonInteractive
+    }
+
+    /// Emit a structured compaction event for real-time UX feedback.
+    ///
+    /// Default implementation falls back to [`emit_headless_line`] so
+    /// existing hosts get stderr output without changes. Hosts that
+    /// have a UI layer (CLI / TUI) should override to emit a structured
+    /// event (e.g. `StreamEvent::Compaction`) for richer rendering.
+    fn on_compaction(&mut self, event: CompactionEvent) {
+        self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary);
     }
 
     /// Whether the current turn is still in read-only plan authoring mode.
@@ -1125,7 +1135,7 @@ pub struct AgenticLoopState {
     pub compaction_effectiveness: super::super::compaction_replay::CompactionEffectivenessTracker,
 
     /// Measured token cost of the tool schemas injected into the LLM request.
-    /// Passed to `estimate_tokens_precise` so pressure estimates include the
+    /// Passed to `estimate_tokens` so pressure estimates include the
     /// schema overhead the API will count. 0 = unknown (legacy / sub-runs).
     pub pinned_tool_schema_tokens: u64,
     /// Cache-sensitive sticky tool schema set for the current user turn.
@@ -1598,9 +1608,9 @@ fn apply_harness_pause_recovery_threshold(
 
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::adaptive_tuning::{
-    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
-    apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
-    should_emit_adaptive_scenario_event,
+    apply_adaptive_execution_profile, apply_per_turn_adaptation, apply_tactical_actions,
+    maybe_run_tuning_cycle, record_loop_completion_feedback, should_emit_adaptive_scenario_event,
+    DEFAULT_TUNING_CYCLE_INTERVAL,
 };
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;
@@ -1634,20 +1644,20 @@ pub const DELEGATE_TOOL_NAME: &str =
 
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::delegate_interception::{
-    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
-    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
-    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
-    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
+    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
+    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name,
+    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
+    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
 };
 
 #[allow(unused_imports)]
 use super::super::harness_adapter::harness_at;
 #[allow(unused_imports)]
 pub(crate) use super::execution_phase::{
-    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
+    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
 };
 #[allow(unused_imports)]
 pub(crate) use super::finalization::{
@@ -1656,10 +1666,10 @@ pub(crate) use super::finalization::{
 };
 #[allow(unused_imports)]
 pub(crate) use super::lifecycle::{
-    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
+    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
 };
 #[allow(unused_imports)]
-pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
+pub(crate) use super::tool_phase::{execute_tool_phase, TurnToolPhaseControl};
 
 #[cfg(feature = "harness")]
 pub(crate) fn set_harness_interruption(
@@ -2829,7 +2839,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-        // Edge tool counted
+                                                // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -3009,7 +3019,7 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 0); // No turns executed
         assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
-        // EmptyCompletion interruption recorded
+                                               // EmptyCompletion interruption recorded
         let interruption = state
             .interruption
             .as_ref()
@@ -3181,13 +3191,11 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(!state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -3292,18 +3300,14 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(
-            state
-                .final_text
-                .contains("Turn budget exhausted after 2 agentic turn(s)")
-        );
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(state
+            .final_text
+            .contains("Turn budget exhausted after 2 agentic turn(s)"));
+        assert!(!state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -3918,14 +3922,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine()
-    -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine(
+    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run::engine::RunEngine;
-        use astra_services::AgentProfileRegistry;
         use astra_services::coordination::{AgentProfile, AgentTier};
+        use astra_services::AgentProfileRegistry;
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -4929,18 +4933,14 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Follow these instructions carefully.")
-        );
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Follow these instructions carefully."));
 
         // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
@@ -5000,24 +5000,20 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(
-            msg2[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: other-skill")
-        );
+        assert!(msg2[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: other-skill"));
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -5152,12 +5148,10 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(
-            skill_msgs[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
+        assert!(skill_msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -5798,9 +5792,9 @@ pub(crate) mod tests {
     async fn compact_tier_gate_skips_mechanical_compression() {
         // When compact_tier_applied >= CompactHistory (e.g. after a pre-turn LLM
         // summary), handle_token_budget must NOT run the tier-1 mechanical
-        // CompressionPipeline again. We verify this by populating the history
+        // CompactionEngine again. We verify this by populating the history
         // with otherwise-compressible tool_result payloads: if the guard is
-        // broken, CompressionPipeline would rewrite them to `[Cleared]` and the
+        // broken, CompactionEngine would rewrite them to `[Cleared]` and the
         // original text would disappear. With the guard honoured the messages
         // stay intact and spill-to-disk (an independent tier-2 recovery) runs.
         let session_id = format!(
@@ -6404,8 +6398,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    fn make_session()
-    -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
+    fn make_session(
+    ) -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
         ))
@@ -7876,7 +7870,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_all_8_default_rules_fire() {
-        use astra_learning::auto_tuning::{FeedbackSignal, SignalType, default_rules};
+        use astra_learning::auto_tuning::{default_rules, FeedbackSignal, SignalType};
 
         let hub = make_hub();
         // Load default evolution rules so the tuning engine has something to evaluate
@@ -9331,7 +9325,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic::headless_round::{ToolBatch, partition_tool_batches};
+        use crate::turn::agentic::headless_round::{partition_tool_batches, ToolBatch};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![

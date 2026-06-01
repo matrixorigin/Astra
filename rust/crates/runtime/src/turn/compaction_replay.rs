@@ -23,7 +23,7 @@
 //! propagates as a structured `InterruptionRecord` with
 //! `ResumeAction::CompactAndRetry` (for cross-session resume).
 
-use super::context_compression::{CompressionPipeline, PipelineOutcome, TokenBudget};
+use super::cloud::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudget};
 use serde_json::Value;
 
 /// Maximum number of automatic compact-and-retry cycles per turn.
@@ -68,7 +68,7 @@ pub struct CompactionReplayResult {
 
 /// Retry-attempt escalation tier for telemetry — NOT the same as the
 /// pipeline's [`astra_turn_core::compaction_types::CompactionTier`].
-/// These three levels map to the three `CompressionPipeline` variants
+/// These three levels map to the three `CompactionEngine` variants
 /// (default / aggressive / emergency) and escalate with each consecutive
 /// context-window error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,8 +213,8 @@ pub(crate) fn try_compact_for_retry_tiered(
     // pre-request pressure estimate in `agentic_loop::lifecycle` so a
     // CompactAndRetry triggered precisely by large tool_calls is not
     // silently skipped.
-    let measured =
-        last_measured_tokens.unwrap_or_else(|| crate::prompts::estimate_tokens(messages) as u64);
+    let measured = last_measured_tokens
+        .unwrap_or_else(|| crate::prompts::estimate_tokens(messages, 0, 0) as u64);
 
     let max_tokens = if model_context_limit > 0 {
         model_context_limit
@@ -234,15 +234,15 @@ pub(crate) fn try_compact_for_retry_tiered(
 
     // Tiered escalation: default → aggressive → emergency.
     let (pipeline, tier) = if retry_count <= 1 {
-        (CompressionPipeline::default_pipeline(), RetryTier::Default)
+        (CompactionEngine::default_pipeline(), RetryTier::Default)
     } else if retry_count == 2 {
         (
-            CompressionPipeline::aggressive_pipeline(),
+            CompactionEngine::aggressive_pipeline(),
             RetryTier::Aggressive,
         )
     } else {
         (
-            CompressionPipeline::emergency_pipeline(),
+            CompactionEngine::emergency_pipeline(),
             RetryTier::Emergency,
         )
     };
@@ -343,21 +343,6 @@ pub fn try_compact_for_retry_checked(
 }
 
 /// Build a concise summary string for the compaction event (for logs/journal).
-pub(crate) fn compaction_summary(result: &CompactionReplayResult) -> String {
-    let layers = result.layer_descriptions.join(", ");
-    format!(
-        "compacted ~{} tokens ({} messages removed) via [{}]; budget {}",
-        result.tokens_freed,
-        result.messages_removed,
-        layers,
-        if result.budget_likely_satisfied {
-            "likely satisfied"
-        } else {
-            "still pressured"
-        }
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,26 +421,6 @@ mod tests {
             result.is_some(),
             "expected compaction to run with estimated tokens"
         );
-    }
-
-    #[test]
-    fn compaction_summary_format() {
-        let result = CompactionReplayResult {
-            tokens_freed: 5000,
-            messages_removed: 12,
-            layer_descriptions: vec!["ToolResultTruncation: ~2000 tokens".into()],
-            budget_likely_satisfied: true,
-            tier: RetryTier::Default,
-            pipeline_outcome: PipelineOutcome {
-                layer_results: Vec::new(),
-                total_tokens_freed: 5000,
-                budget_satisfied: true,
-            },
-        };
-        let s = compaction_summary(&result);
-        assert!(s.contains("5000"));
-        assert!(s.contains("12 messages"));
-        assert!(s.contains("likely satisfied"));
     }
 
     #[test]

@@ -749,7 +749,8 @@ fn display_plan_updates_live(
                     | StreamEvent::AgentLive(_)
                     | StreamEvent::ExplainReport(_)
                     | StreamEvent::ExplainText(_)
-                    | StreamEvent::VerdictReport(_) => continue,
+                    | StreamEvent::VerdictReport(_)
+                    | StreamEvent::Compaction(_) => continue,
                 }
             }
             PlanUpdate::ApprovalNeeded {

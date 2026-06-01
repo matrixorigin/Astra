@@ -312,6 +312,10 @@ fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         StreamEvent::WaitingForModel => TuiAppEvent::WaitingForModel,
         StreamEvent::ModelResponding => TuiAppEvent::ModelResponding,
         StreamEvent::StatusLine(text) => TuiAppEvent::StatusLine(text),
+        StreamEvent::Compaction(event) => {
+            // Forward to both TUI and status line.
+            TuiAppEvent::Compaction(event)
+        }
         StreamEvent::AgentLive(event) => TuiAppEvent::AgentLive(event),
         StreamEvent::PermissionAutoApproved { tool, reason } => {
             TuiAppEvent::PermissionAutoApproved { tool, reason }

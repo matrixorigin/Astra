@@ -13,7 +13,7 @@ use super::host::{
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_services::SessionArtifactStore;
-use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
 use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
@@ -1111,6 +1111,25 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
 }
 
+/// Estimate context pressure from raw message token count.
+///
+/// Returns `(pressure, estimated_tokens)` where pressure is a 0.0–1.0
+/// ratio against `max_turn_input_tokens`. When no limit is configured
+/// (`max_turn_input_tokens == 0`) returns `(0.0, 0)`.
+#[inline]
+fn estimate_context_pressure(
+    messages: &[serde_json::Value],
+    pinned_tool_schema_tokens: usize,
+    max_turn_input_tokens: u64,
+) -> (f64, u64) {
+    if max_turn_input_tokens == 0 {
+        return (0.0, 0);
+    }
+    let tokens =
+        crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
+    (tokens as f64 / max_turn_input_tokens as f64, tokens)
+}
+
 pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -1688,28 +1707,31 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
-        let pressure = if state.max_turn_input_tokens > 0 {
-            let fresh_estimate = crate::prompts::estimate_tokens_precise(
-                &state.messages,
-                state.pinned_tool_schema_tokens as usize,
-                0,
-            ) as u64;
-            fresh_estimate as f64 / state.max_turn_input_tokens as f64
-        } else {
-            0.0
-        };
+        let (pressure, pressure_estimate_tokens) =
+            estimate_context_pressure(&state.messages, state.pinned_tool_schema_tokens as usize, state.max_turn_input_tokens);
 
-        // Pre-turn LLM compact: if pressure exceeds 80%, let the host run an
-        // optional cache-friendly inline-summary pass before the next LLM call.
-        // Server hosts can build the exact system prompt + history prefix;
-        // generic hosts keep the default no-op behavior. When it succeeds the
-        // host bumps `state.compact_tier_applied` so the later budget guard
-        // won't re-run mechanical compression.
-        if pressure >= 0.80
+        // Pre-turn LLM compact: if pressure exceeds the model-adaptive
+        // trigger, let the host run an optional cache-friendly inline-summary
+        // pass before the next LLM call.
+        if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
             && state.compact_tier_applied < CompactionTier::CompactHistory
             && state.messages.len() > 10
         {
             host.maybe_pre_turn_compact(state, pressure, quiet).await;
+        }
+
+        // Pre-turn pressure warning: when context is near the model-adaptive
+        // warning threshold, emit a non-intrusive advisory so the user knows
+        // compaction is imminent.
+        if pressure >= CompactionTier::pre_turn_warning(state.max_turn_input_tokens) && !quiet {
+            let warning = CompactionEvent::new(
+                "pressure_warning",
+                pressure,
+                0, // no tokens freed yet
+                pressure_estimate_tokens,
+                state.max_turn_input_tokens,
+            );
+            host.on_compaction(warning);
         }
 
         // Adaptive microcompact: scale aggressiveness with context pressure.
@@ -1751,15 +1773,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         if mc.results_compacted > 0 {
             if !quiet {
-                host.emit_headless_line(
-                    HeadlessStderrStyle::Dim,
-                    format!(
-                        "  ♻ Compacted {} old tool result(s), ~{} tokens saved (pressure {:.0}%)",
-                        mc.results_compacted,
-                        mc.tokens_saved,
-                        pressure * 100.0,
-                    ),
+                let event = CompactionEvent::new(
+                    "microcompact",
+                    pressure,
+                    mc.tokens_saved as u64,
+                    pressure_estimate_tokens,
+                    state.max_turn_input_tokens,
                 );
+                host.on_compaction(event);
             }
             state.step_recorder.record_compaction(
                 mc.results_compacted as u32,
@@ -1777,51 +1798,47 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
 
         // Re-estimate pressure after microcompact (messages may have shrunk).
-        let post_mc_tokens = crate::prompts::estimate_tokens(&state.messages) as u64;
-        let post_mc_pressure = if state.max_turn_input_tokens > 0 {
-            post_mc_tokens as f64 / state.max_turn_input_tokens as f64
-        } else {
-            0.0
-        };
+        // Use the same precise estimation as the pre-microcompact check
+        // above so that pinned tool schema tokens are included — without
+        // them, the guard under-estimates pressure and skips compaction
+        // (observed in session 540c37d1 where budget_pressure=0.887 but
+        // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
+        let (post_mc_pressure, post_mc_tokens) =
+            estimate_context_pressure(&state.messages, state.pinned_tool_schema_tokens as usize, state.max_turn_input_tokens);
 
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
         // the LLM, preventing 413 errors instead of reacting to them.
-        if post_mc_pressure >= 0.75 {
-            let budget = super::super::context_compression::TokenBudget {
+        if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
+            let budget = super::super::cloud::compaction_engine::TokenBudget {
                 max_prompt_tokens: state.max_turn_input_tokens,
                 last_measured_tokens: post_mc_tokens,
                 current_round_index: Some(state.current_round_index),
             };
-            let pipeline = if post_mc_pressure >= 0.90 {
-                super::super::context_compression::CompressionPipeline::aggressive_pipeline()
+            let pipeline = if post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
+                super::super::cloud::compaction_engine::CompactionEngine::aggressive_pipeline()
             } else {
-                super::super::context_compression::CompressionPipeline::default_pipeline()
+                super::super::cloud::compaction_engine::CompactionEngine::default_pipeline()
             };
             let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
             if outcome.total_tokens_freed > 0 && !quiet {
-                let tier = if post_mc_pressure >= 0.90 {
-                    "aggressive"
+                let tier = if post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
+                    "aggressive_compression"
                 } else {
-                    "default"
+                    "default_compression"
                 };
-                host.emit_headless_line(
-                    HeadlessStderrStyle::Yellow,
-                    format!(
-                        "  ⚡ Proactive {} compression: freed ~{} tokens at {:.0}% pressure",
-                        tier,
-                        outcome.total_tokens_freed,
-                        post_mc_pressure * 100.0,
-                    ),
+                let event = CompactionEvent::new(
+                    tier,
+                    post_mc_pressure,
+                    outcome.total_tokens_freed,
+                    post_mc_tokens,
+                    state.max_turn_input_tokens,
                 );
+                host.on_compaction(event);
                 // Record compression audit for pipeline journal
                 if let Some(ref mut sess) = state.pipeline_session {
                     sess.record_compaction_audit(
-                        if post_mc_pressure >= 0.90 {
-                            "aggressive_compression"
-                        } else {
-                            "default_compression"
-                        },
+                        tier,
                         outcome.layer_results.len() as u32,
                         outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
                     );
@@ -1836,35 +1853,29 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // proactively compress before the first LLM call.  This prevents an
     // immediate 413 when resuming from a CompactAndRetry interruption.
     if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let estimated_tokens = crate::prompts::estimate_tokens(&state.messages) as f64;
-        let estimated_pressure = estimated_tokens / state.max_turn_input_tokens as f64;
-        if estimated_pressure >= 0.75 {
-            let budget = super::super::context_compression::TokenBudget {
+        let (estimated_pressure, estimated_tokens) =
+            estimate_context_pressure(&state.messages, state.pinned_tool_schema_tokens as usize, state.max_turn_input_tokens);
+        if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
+            let budget = super::super::cloud::compaction_engine::TokenBudget {
                 max_prompt_tokens: state.max_turn_input_tokens,
-                last_measured_tokens: estimated_tokens as u64,
+                last_measured_tokens: estimated_tokens,
                 current_round_index: Some(state.current_round_index),
             };
-            let pipeline = if estimated_pressure >= 0.90 {
-                super::super::context_compression::CompressionPipeline::aggressive_pipeline()
+            let pipeline = if estimated_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
+                super::super::cloud::compaction_engine::CompactionEngine::aggressive_pipeline()
             } else {
-                super::super::context_compression::CompressionPipeline::default_pipeline()
+                super::super::cloud::compaction_engine::CompactionEngine::default_pipeline()
             };
             let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
             if outcome.total_tokens_freed > 0 && !quiet {
-                let tier = if estimated_pressure >= 0.90 {
-                    "aggressive"
-                } else {
-                    "default"
-                };
-                host.emit_headless_line(
-                    HeadlessStderrStyle::Yellow,
-                    format!(
-                        "  ⚡ Resume {} compression: freed ~{} tokens at ~{:.0}% est. pressure",
-                        tier,
-                        outcome.total_tokens_freed,
-                        estimated_pressure * 100.0,
-                    ),
+                let event = CompactionEvent::new(
+                    "resume",
+                    estimated_pressure,
+                    outcome.total_tokens_freed,
+                    estimated_tokens,
+                    state.max_turn_input_tokens,
                 );
+                host.on_compaction(event);
             }
         }
     }

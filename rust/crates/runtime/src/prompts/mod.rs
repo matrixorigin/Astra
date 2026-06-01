@@ -18,7 +18,6 @@ pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
     budget_for_model, budget_for_model_with_override, capped_output_tokens, estimate_str_tokens,
     estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
-    estimate_tokens_precise,
 };
 pub use system::{
     CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
@@ -322,15 +321,16 @@ mod tests {
     #[test]
     fn estimate_tokens_empty() {
         // Empty messages still have fixed overhead (system prompt + tools)
-        assert_eq!(estimate_tokens(&[]), 3000);
+        let est = estimate_tokens(&[], 0, 0);
+        assert!(est >= 14_000, "should have base overhead, got {est}");
     }
 
     #[test]
     fn estimate_tokens_basic() {
         let msgs = vec![serde_json::json!({"role": "user", "content": "hello world"})];
-        let est = estimate_tokens(&msgs);
-        // "hello world" = 11 chars → 11/4 = 2 tokens + 4 overhead + 3000 fixed ≈ 3006
-        assert!(est > 3000 && est < 3020, "got {est}");
+        let est = estimate_tokens(&msgs, 0, 0);
+        // "hello world" = 11 chars → 11/4 = 2 tokens + 4 overhead + 14_000 + 300 ≈ 14_306
+        assert!(est > 14_000 && est < 14_500, "got {est}");
     }
 
     #[test]
@@ -338,7 +338,7 @@ mod tests {
         let short = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let long = vec![serde_json::json!({"role": "user", "content": "a".repeat(4000)})];
         // Long should be significantly more than short (not just overhead)
-        assert!(estimate_tokens(&long) > estimate_tokens(&short) + 500);
+        assert!(estimate_tokens(&long, 0, 0) > estimate_tokens(&short, 0, 0) + 500);
     }
 
     #[test]
