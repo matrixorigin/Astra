@@ -3622,10 +3622,9 @@ mod tests {
     /// [`AGENT_ID_LEN`].
     #[test]
     fn agent_id_columns_match_agreed_width() {
-        // Sanity: AGENT_ID_LEN must produce a reasonable VARCHAR width.
-        assert!(
-            AGENT_ID_LEN >= 32,
-            "AGENT_ID_LEN ({AGENT_ID_LEN}) is too small"
-        );
+        // sanity: AGENT_ID_LEN must produce a reasonable VARCHAR width
+        if AGENT_ID_LEN < 32 {
+            panic!("AGENT_ID_LEN ({AGENT_ID_LEN}) is too small");
+        }
     }
 }

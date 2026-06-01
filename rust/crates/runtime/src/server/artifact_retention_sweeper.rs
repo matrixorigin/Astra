@@ -203,8 +203,17 @@ pub(crate) fn spawn_artifact_retention_sweeper(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if !lease.is_leader().await {
-                continue;
+            match lease.check_leader().await {
+                crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
+                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::artifact_retention_sweeper",
+                        error = %e,
+                        "sweeper lease check unavailable, skipping sweep"
+                    );
+                    continue;
+                }
             }
             if let Err(error) = run_artifact_retention_gc_once(pool.clone(), 1_000).await {
                 tracing::warn!(

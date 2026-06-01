@@ -24,6 +24,9 @@ mod manifest_loader;
 mod mcp_client;
 mod skill_instructions;
 
+#[cfg(test)]
+mod test_utils;
+
 mod cli;
 mod explain_dag;
 
@@ -452,6 +455,9 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    pub(crate) use super::test_utils::HomeGuard;
+    pub(crate) use super::test_utils::isolate_credentials;
+
     use super::*;
     use axum::{Router, routing::get, routing::post};
     use cli::cloud_sync::{
@@ -469,100 +475,6 @@ mod tests {
         });
         tokio::task::yield_now().await;
         base
-    }
-
-    /// Guard that serializes tests touching ASTRA_CLI_CREDENTIALS_DIR.
-    /// Multiple async tests concurrently setting this env var is a data race;
-    /// the guard ensures they execute sequentially.
-    use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    pub(crate) struct CredentialsGuard {
-        _lock: MutexGuard<'static, ()>,
-        _dir: tempfile::TempDir,
-    }
-
-    impl Drop for CredentialsGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("ASTRA_CLI_CREDENTIALS_DIR");
-            }
-        }
-    }
-
-    fn creds_lock() -> MutexGuard<'static, ()> {
-        static CREDS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        CREDS_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Set credentials dir to a temp path so tests don't pollute ~/.astra/credentials.json.
-    /// Returns a guard that holds a mutex — tests using this are serialized.
-    pub(crate) fn isolate_credentials() -> CredentialsGuard {
-        let lock = creds_lock();
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: protected by CREDS_LOCK; no concurrent set_var.
-        unsafe { std::env::set_var("ASTRA_CLI_CREDENTIALS_DIR", dir.path()) };
-        CredentialsGuard {
-            _lock: lock,
-            _dir: dir,
-        }
-    }
-
-    pub(crate) struct HomeGuard {
-        _lock: MutexGuard<'static, ()>,
-        prev: Option<OsString>,
-        current: PathBuf,
-        _dir: Option<tempfile::TempDir>,
-    }
-
-    fn home_lock() -> MutexGuard<'static, ()> {
-        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        HOME_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    impl HomeGuard {
-        fn set_impl(path: PathBuf, dir: Option<tempfile::TempDir>) -> Self {
-            let lock = home_lock();
-            let prev = std::env::var_os("HOME");
-            unsafe { std::env::set_var("HOME", &path) };
-            Self {
-                _lock: lock,
-                prev,
-                current: path,
-                _dir: dir,
-            }
-        }
-
-        pub(crate) fn temp() -> Self {
-            let dir = tempfile::tempdir().expect("create temp home dir");
-            Self::set_impl(dir.path().to_path_buf(), Some(dir))
-        }
-
-        pub(crate) fn set(path: impl AsRef<Path>) -> Self {
-            Self::set_impl(path.as_ref().to_path_buf(), None)
-        }
-
-        pub(crate) fn path(&self) -> &Path {
-            &self.current
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
     }
 
     mod auth_tests;

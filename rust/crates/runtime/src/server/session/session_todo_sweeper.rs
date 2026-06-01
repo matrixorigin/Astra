@@ -180,8 +180,17 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
         interval.tick().await;
         loop {
             interval.tick().await;
-            if !lease.is_leader().await {
-                continue;
+            match lease.check_leader().await {
+                crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
+                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        error = %e,
+                        "stale sweep lease check unavailable, skipping"
+                    );
+                    continue;
+                }
             }
             match run_stale_in_progress_sweep(pool.clone()).await {
                 Ok(0) => {} // quiet success: nothing to do this tick
@@ -214,8 +223,17 @@ pub(crate) fn spawn_session_todo_archive_sweeper(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if !lease.is_leader().await {
-                continue;
+            match lease.check_leader().await {
+                crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
+                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        error = %e,
+                        "archive sweep lease check unavailable, skipping"
+                    );
+                    continue;
+                }
             }
             let auto_archive_days = completed_auto_archive_days();
             match run_completed_auto_archive_once(pool.clone()).await {

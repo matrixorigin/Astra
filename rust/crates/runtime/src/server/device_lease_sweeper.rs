@@ -101,8 +101,17 @@ pub(crate) fn spawn_device_lease_expiry_sweeper(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if !lease.is_leader().await {
-                continue;
+            match lease.check_leader().await {
+                crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
+                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::device_lease_sweeper",
+                        error = %e,
+                        "sweeper lease check unavailable, skipping sweep"
+                    );
+                    continue;
+                }
             }
             if let Err(error) = expire_due_device_leases_once(pool.clone(), 500).await {
                 tracing::warn!(

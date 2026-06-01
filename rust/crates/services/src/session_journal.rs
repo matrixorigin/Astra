@@ -1062,7 +1062,7 @@ pub struct JournalEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds (prompt building).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_ms: Option<u64>,
     /// Cache read tokens (prompt cache hits).
     #[serde(skip_serializing_if = "Option::is_none")]
