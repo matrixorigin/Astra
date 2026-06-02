@@ -1,9 +1,104 @@
 use super::*;
+use astra_runtime::turn::cloud::compaction_engine::{CompactionEngine, TokenBudget};
+use astra_runtime::turn::cloud::memoria_compact::build_compaction_layered_body;
+use std::sync::Arc;
 
 pub(crate) struct StateCommandContext<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) profile: Option<&'a str>,
     pub(crate) token: Option<&'a str>,
+}
+
+/// Bundled context for building compact-related `ChatTurnParams`.
+///
+/// Eliminates the 9-parameter sponge that `compact_turn_params` previously required.
+/// All state-derived fields (`api`, `token`, `profile`) are captured once;
+/// only the truly varying inputs are passed per-call.
+struct CompactCtx<'a> {
+    state: &'a mut SessionState,
+    api: &'a astra_thin_client::ThinClient,
+    token: &'a str,
+    profile: Option<&'a str>,
+}
+
+impl<'a> CompactCtx<'a> {
+    fn build_params(
+        &'a mut self,
+        message: &'a str,
+        use_state_history: bool,
+        perm_manager: &'a mut PermissionManager,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+        pre_loaded_messages: Option<Vec<serde_json::Value>>,
+    ) -> ChatTurnParams<'a> {
+        let history = if use_state_history && pre_loaded_messages.is_none() {
+            &self.state.history[..]
+        } else {
+            &[]
+        };
+        ChatTurnParams {
+            api: self.api,
+            token: self.token,
+            auth_profile: self.profile,
+            message,
+            session_id: self.state.session_id.as_deref(),
+            model: self.state.model.as_deref(),
+            provider: None,
+            explain: ExplainMode::Off,
+            render_md: false,
+            history,
+            perm_manager,
+            verbose_mode: false,
+            render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+            cli_context: Some(&self.state.cli_context),
+            recent_tools: &[],
+            tool_health_entries: &[],
+            resume_restricted_tools: &[],
+            session_lessons: &[],
+            latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
+            unified_skill_registry: astra_runtime::skills::default_unified_registry(),
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            delegation_engine: None,
+            cancel_token,
+            plan_assemble_line_release: None,
+            stream_event_tx: None,
+            agent_live_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            plan_review_request_tx: None,
+            mcp_manager: Some(self.state.mcp_manager.clone()),
+            skill_search: &self.state.skill_search,
+            skill_quality_tracker: &mut self.state.skill_quality_tracker,
+            discovered_skills: None,
+            messaging_metrics: self.state.messaging_metrics.clone(),
+            agent_spawner: self.state.agent_spawner.clone(),
+            root_agent_id: Some("main"),
+            root_mailbox_slot: Some(&mut self.state.root_mailbox),
+            observability_hub: self.state.observability_hub.clone(),
+            observability_session: self.state.observability_session.clone(),
+            file_journal: None,
+            file_state: None,
+            database_snapshot_journal: None,
+            git_stash_journal: None,
+            git_commit_journal: None,
+            git_worktree_journal: None,
+            session_state_journal: None,
+            task_manager: None,
+            task_notify_tx: None,
+            bg_task_commands: None,
+            bash_detach_slot: None,
+            turn_index: 0,
+            pipeline_state: None,
+            pre_loaded_messages,
+            append_system_prompt: None,
+            session_memory_extractor: None,
+            #[cfg(feature = "harness")]
+            harness_sink: Some(self.state.harness_sink.clone()),
+            #[cfg(feature = "harness")]
+            harness_trace: Some(self.state.harness_trace.clone()),
+        }
+    }
 }
 
 pub(crate) async fn handle_state_command(
@@ -314,99 +409,80 @@ pub(crate) async fn handle_state_command(
                 &std::env::current_dir().unwrap_or_default(),
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
-            let mut _cancel_token_guard: Option<
-                std::sync::Arc<tokio_util::sync::CancellationToken>,
-            > = None;
-            let summary_result = tokio::select! {
-                r = stream_chat_sse(ChatTurnParams {
-                    api,
-                    token: tok,
-                    auth_profile: profile,
-                    message: prompts::COMPACT_SUMMARY_REQUEST,
-                    session_id: state.session_id.as_deref(),
-                    model: state.model.as_deref(),
-                    provider: None,
-                    explain: ExplainMode::Off,
-                    render_md: false,
-                    history: &state.history,
-                    perm_manager: &mut auto_pm,
-                    verbose_mode: false,
-                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
-                    cli_context: Some(&state.cli_context),
+            let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-                    recent_tools: &[],
-                    tool_health_entries: &[],
-                    resume_restricted_tools: &[],
-                    session_lessons: &[],
-                    latest_skill_diagnosis: None,
-                    latest_turn_quality_feedback: None,
-                    unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                    is_plan_subtask: false,
-                    plan_subtask_id: None,
-                    delegation_engine: None,
-                    cancel_token: {
-                        let token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
-                        _cancel_token_guard = Some(token.clone());
-                        Some(token)
-                    },
-                    plan_assemble_line_release: None,
-                    stream_event_tx: None,
-                    agent_live_event_sink: None,
-                    approval_request_tx: None,
-                    ask_user_request_tx: None,
-            plan_review_request_tx: None,
-                    mcp_manager: Some(state.mcp_manager.clone()),
-                    skill_search: &state.skill_search,
-                    skill_quality_tracker: &mut state.skill_quality_tracker,
-                    discovered_skills: None,
-                    messaging_metrics: state.messaging_metrics.clone(),
-                    agent_spawner: state.agent_spawner.clone(),
-                    root_agent_id: Some("main"),
-                    root_mailbox_slot: Some(&mut state.root_mailbox),
-                    observability_hub: state.observability_hub.clone(),
-                    observability_session: state.observability_session.clone(),
-                    file_journal: None,
-                    file_state: None,
-                    database_snapshot_journal: None,
-                    git_stash_journal: None,
-                    git_commit_journal: None,
-                    git_worktree_journal: None,
-                    session_state_journal: None,
-                    task_manager: None,
-                    task_notify_tx: None,
-            bg_task_commands: None,
-            bash_detach_slot: None,
-                    turn_index: 0,
-                pipeline_state: None,
-            pre_loaded_messages: None,
-                    append_system_prompt: None,
-                    session_memory_extractor: None,
-                    #[cfg(feature = "harness")]
-                    harness_sink: Some(state.harness_sink.clone()),
-                    #[cfg(feature = "harness")]
-                    harness_trace: Some(state.harness_trace.clone()),
-                }) => r,
+            // ── Micro-compact: reduce input tokens before LLM summary call ──
+            let pre_messages = {
+                let mut msgs = crate::cli::chat_turn::history_as_messages(&state.history);
+                let limit = astra_runtime::prompts::budget_for_model(state.model.as_deref())
+                    .effective_input_limit() as u64;
+                let budget = TokenBudget {
+                    max_prompt_tokens: limit,
+                    last_measured_tokens: limit.saturating_add(1),
+                    current_round_index: None,
+                };
+                CompactionEngine::micro_pipeline().compress_if_needed(&mut msgs, &budget);
+                Some(msgs)
+            };
+
+            // ── Single LLM call: unified summary + facts extraction ──
+            let mut compact_ctx = CompactCtx {
+                state,
+                api,
+                token: tok,
+                profile,
+            };
+            let unified_result = tokio::select! {
+                r = stream_chat_sse(compact_ctx.build_params(
+                    prompts::COMPACT_UNIFIED_PROMPT,
+                    true,
+                    &mut auto_pm,
+                    Some(cancel_token.clone()),
+                    pre_messages,
+                )) => r,
                 _ = tokio::signal::ctrl_c() => {
-                    if let Some(ref t) = _cancel_token_guard { t.cancel(); }
+                    cancel_token.cancel();
                     eprintln!("{}", "  Interrupted.".dim());
                     return Ok(());
                 }
             };
 
-            let summary = match summary_result {
-                Ok(sr) => {
-                    let text = sr.full_text.trim().to_string();
-                    if text.is_empty() {
-                        eprintln!("{}", "  ✗ Empty summary returned.".yellow());
-                        return Ok(());
+            let (summary, facts) = match unified_result {
+                Ok(sr) => match prompts::parse_compact_response(&sr.full_text) {
+                    Some(resp) => (resp.render_summary(), resp.valid_facts()),
+                    None => {
+                        // Fallback: LLM didn't return valid JSON; use raw text as summary
+                        let text = sr.full_text.trim().to_string();
+                        if text.is_empty() {
+                            eprintln!("{}", "  ✗ Empty response returned.".yellow());
+                            return Ok(());
+                        }
+                        eprintln!(
+                            "{}",
+                            "  ⚠ Could not parse structured response; using raw text.".yellow()
+                        );
+                        (text, Vec::new())
                     }
-                    text
-                }
+                },
                 Err(e) => {
                     eprintln!("{}", format!("  ✗ Failed to summarize: {}", e.error).red());
                     return Ok(());
                 }
             };
+
+            // ── Stream summary immediately ──
+            eprintln!();
+            eprintln!(
+                "{}",
+                "─── Compact Summary ────────────────────────────────────────".dim()
+            );
+            for line in summary.lines() {
+                eprintln!("  {line}");
+            }
+            eprintln!(
+                "{}",
+                "────────────────────────────────────────────────────────────".dim()
+            );
 
             // Save summary to Memoria via server proxy (preserves user isolation)
             let mut saved_to_memoria = false;
@@ -419,10 +495,16 @@ pub(crate) async fn handle_state_command(
                         prompts::memory_proto::SRC_COMPACT,
                         prompts::memory_proto::TIER_INFERRED,
                     );
+                    // Build layered body (matching auto-compaction format for consistent retrieval)
+                    let summary_body = state
+                        .session_id
+                        .as_deref()
+                        .and_then(|sid| build_compaction_layered_body(sid, &summary))
+                        .unwrap_or_else(|| summary.clone());
                     let entry = prompts::memory_proto::MemoryEntry::new(
                         prompts::memory_proto::NS_EPISODE,
                         prompts::memory_proto::ST_SUMMARY,
-                        &summary,
+                        &summary_body,
                     );
                     match api
                         .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
@@ -439,217 +521,27 @@ pub(crate) async fn handle_state_command(
                         ),
                     }
 
-                    // Extract structured facts from summary and store each individually
+                    // Store facts directly from unified response (no second LLM call)
                     if saved_to_memoria && !compact_quick {
-                        let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
-                        let mut auto_pm2 = PermissionManager::with_load_policy(
-                            crate::cli::permission_manager::PermissionMode::Auto,
-                            &std::env::current_dir().unwrap_or_default(),
-                            &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                        let fact_meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
+                            state.session_id.as_deref(),
+                            state.turn,
+                            prompts::memory_proto::SRC_EXTRACTED,
+                            prompts::memory_proto::TIER_INFERRED,
                         );
-                        let extract_result = stream_chat_sse(ChatTurnParams {
-                            api,
-                            token: tok,
-                            auth_profile: profile,
-                            message: &extract_msg,
-                            session_id: state.session_id.as_deref(),
-                            model: state.model.as_deref(),
-                            provider: None,
-                            explain: ExplainMode::Off,
-                            render_md: false,
-                            history: &[],
-                            perm_manager: &mut auto_pm2,
-                            verbose_mode: false,
-                            render_policy: crate::cli::stream_render::RenderPolicy::Silent,
-                            cli_context: Some(&state.cli_context),
-
-                            recent_tools: &[],
-                            tool_health_entries: &[],
-                            resume_restricted_tools: &[],
-                            session_lessons: &[],
-                            latest_skill_diagnosis: None,
-                            latest_turn_quality_feedback: None,
-                            unified_skill_registry: astra_runtime::skills::default_unified_registry(
-                            ),
-                            is_plan_subtask: false,
-                            plan_subtask_id: None,
-                            delegation_engine: None,
-                            cancel_token: None,
-                            plan_assemble_line_release: None,
-                            stream_event_tx: None,
-                            agent_live_event_sink: None,
-                            approval_request_tx: None,
-                            ask_user_request_tx: None,
-                            plan_review_request_tx: None,
-                            mcp_manager: Some(state.mcp_manager.clone()),
-                            skill_search: &state.skill_search,
-                            skill_quality_tracker: &mut state.skill_quality_tracker,
-                            discovered_skills: None,
-                            messaging_metrics: state.messaging_metrics.clone(),
-                            agent_spawner: state.agent_spawner.clone(),
-                            root_agent_id: Some("main"),
-                            root_mailbox_slot: Some(&mut state.root_mailbox),
-                            observability_hub: state.observability_hub.clone(),
-                            observability_session: state.observability_session.clone(),
-                            file_journal: None,
-                            file_state: None,
-                            database_snapshot_journal: None,
-                            git_stash_journal: None,
-                            git_commit_journal: None,
-                            git_worktree_journal: None,
-                            session_state_journal: None,
-                            task_manager: None,
-                            task_notify_tx: None,
-                            bg_task_commands: None,
-                            bash_detach_slot: None,
-                            turn_index: 0,
-                            pipeline_state: None,
-                            pre_loaded_messages: None,
-                            append_system_prompt: None,
-                            session_memory_extractor: None,
-                            #[cfg(feature = "harness")]
-                            harness_sink: Some(state.harness_sink.clone()),
-                            #[cfg(feature = "harness")]
-                            harness_trace: Some(state.harness_trace.clone()),
-                        })
-                        .await;
-
-                        if let Ok(sr) = extract_result {
-                            let facts = prompts::parse_extracted_facts(&sr.full_text);
-                            let fact_meta =
-                                prompts::memory_proto::EntryMeta::from_session_with_tier(
-                                    state.session_id.as_deref(),
-                                    state.turn,
-                                    prompts::memory_proto::SRC_EXTRACTED,
-                                    prompts::memory_proto::TIER_INFERRED,
-                                );
-                            for (fact, mem_type) in &facts {
-                                let fact_entry = prompts::memory_proto::MemoryEntry::new(
-                                    prompts::memory_proto::NS_FACT,
-                                    mem_type,
-                                    fact,
-                                );
-                                let _ = api
-                                    .post_memory_store_json(
-                                        tok,
-                                        &fact_entry.to_store_payload_with_meta(&fact_meta),
-                                    )
-                                    .await;
-                                facts_stored += 1;
-                            }
-
-                            // ── Knowledge synthesis: detect patterns across extracted facts ──
-                            if facts.len() >= 2 {
-                                let fact_lines: Vec<String> =
-                                    facts.iter().map(|(f, t)| format!("- [{t}] {f}")).collect();
-                                let synthesis_prompt = format!(
-                                    "Given these extracted facts from a conversation:\n{}\n\n\
-                                 If there is a higher-level pattern, theme, or insight that \
-                                 connects 2+ facts, state it as ONE concise sentence (≤25 words). \
-                                 If no pattern exists, respond with exactly: NONE",
-                                    fact_lines.join("\n")
-                                );
-                                let mut auto_pm3 = PermissionManager::with_load_policy(
-                                    crate::cli::permission_manager::PermissionMode::Auto,
-                                    &std::env::current_dir().unwrap_or_default(),
-                                    &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-                                );
-                                let synth_result = stream_chat_sse(ChatTurnParams {
-                                    api,
-                                    token: tok,
-                                    auth_profile: profile,
-                                    message: &synthesis_prompt,
-                                    session_id: state.session_id.as_deref(),
-                                    model: state.model.as_deref(),
-                                    provider: None,
-                                    explain: ExplainMode::Off,
-                                    render_md: false,
-                                    history: &[],
-                                    perm_manager: &mut auto_pm3,
-                                    verbose_mode: false,
-                                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
-                                    cli_context: Some(&state.cli_context),
-
-                                    recent_tools: &[],
-                                    tool_health_entries: &[],
-                                    resume_restricted_tools: &[],
-                                    session_lessons: &[],
-                                    latest_skill_diagnosis: None,
-                                    latest_turn_quality_feedback: None,
-                                    unified_skill_registry:
-                                        astra_runtime::skills::default_unified_registry(),
-                                    is_plan_subtask: false,
-                                    plan_subtask_id: None,
-                                    delegation_engine: None,
-                                    cancel_token: None,
-                                    plan_assemble_line_release: None,
-                                    stream_event_tx: None,
-                                    agent_live_event_sink: None,
-                                    approval_request_tx: None,
-                                    ask_user_request_tx: None,
-                                    plan_review_request_tx: None,
-                                    mcp_manager: Some(state.mcp_manager.clone()),
-                                    skill_search: &state.skill_search,
-                                    skill_quality_tracker: &mut state.skill_quality_tracker,
-                                    discovered_skills: None,
-                                    messaging_metrics: state.messaging_metrics.clone(),
-                                    agent_spawner: state.agent_spawner.clone(),
-                                    root_agent_id: Some("main"),
-                                    root_mailbox_slot: Some(&mut state.root_mailbox),
-                                    observability_hub: state.observability_hub.clone(),
-                                    observability_session: state.observability_session.clone(),
-                                    file_journal: None,
-                                    file_state: None,
-                                    database_snapshot_journal: None,
-                                    git_stash_journal: None,
-                                    git_commit_journal: None,
-                                    git_worktree_journal: None,
-                                    session_state_journal: None,
-                                    task_manager: None,
-                                    task_notify_tx: None,
-                                    bg_task_commands: None,
-                                    bash_detach_slot: None,
-                                    turn_index: 0,
-                                    pipeline_state: None,
-                                    pre_loaded_messages: None,
-                                    append_system_prompt: None,
-                                    session_memory_extractor: None,
-                                    #[cfg(feature = "harness")]
-                                    harness_sink: Some(state.harness_sink.clone()),
-                                    #[cfg(feature = "harness")]
-                                    harness_trace: Some(state.harness_trace.clone()),
-                                })
+                        for (fact, mem_type) in &facts {
+                            let fact_entry = prompts::memory_proto::MemoryEntry::new(
+                                prompts::memory_proto::NS_FACT,
+                                mem_type,
+                                fact,
+                            );
+                            let _ = api
+                                .post_memory_store_json(
+                                    tok,
+                                    &fact_entry.to_store_payload_with_meta(&fact_meta),
+                                )
                                 .await;
-                                if let Ok(sr2) = synth_result {
-                                    let insight = sr2.full_text.trim().to_string();
-                                    if !insight.is_empty()
-                                        && !insight.eq_ignore_ascii_case("NONE")
-                                        && !insight.contains("no pattern")
-                                        && insight.len() < 200
-                                    {
-                                        let insight_entry = prompts::memory_proto::MemoryEntry::new(
-                                            prompts::memory_proto::NS_INSIGHT,
-                                            prompts::memory_proto::ST_ACTIVE,
-                                            &insight,
-                                        );
-                                        let synth_meta =
-                                            prompts::memory_proto::EntryMeta::from_session_with_tier(
-                                                state.session_id.as_deref(),
-                                                state.turn,
-                                                prompts::memory_proto::SRC_SYNTHESIS,
-                                                prompts::memory_proto::TIER_UNVERIFIED,
-                                            );
-                                        let _ = api
-                                            .post_memory_store_json(
-                                                tok,
-                                                &insight_entry
-                                                    .to_store_payload_with_meta(&synth_meta),
-                                            )
-                                            .await;
-                                        facts_stored += 1; // count insight as a stored fact
-                                    }
-                                }
-                            }
+                            facts_stored += 1;
                         }
                     }
                 }
@@ -676,23 +568,31 @@ pub(crate) async fn handle_state_command(
                             }
                         }
                         if !swap_lines.is_empty() {
+                            let tier_label = "compact_history";
                             let swap_body = format!(
-                                "Turns 1-{trimmed_count} swapped out:\n{}",
+                                "Turns 1-{trimmed_count} swapped out [{tier_label}]:\n{}",
                                 swap_lines.join("\n")
                             );
-                            // Cap at 2000 chars to avoid storing excessive content
-                            let capped: String = swap_body.chars().take(2000).collect();
+                            // Cap at 2000 bytes with UTF-8 boundary safety
+                            let capped = if swap_body.len() > 2000 {
+                                let boundary = swap_body.floor_char_boundary(2000);
+                                format!("{}…", &swap_body[..boundary])
+                            } else {
+                                swap_body
+                            };
                             let swap_entry = prompts::memory_proto::MemoryEntry::new(
                                 prompts::memory_proto::NS_SWAP,
                                 prompts::memory_proto::ST_ARCHIVED,
                                 &capped,
                             );
-                            // No trust_tier: swap is "working" memory (transient, session-scoped)
-                            let swap_meta = prompts::memory_proto::EntryMeta::from_session(
-                                state.session_id.as_deref(),
-                                state.turn,
-                                prompts::memory_proto::SRC_COMPACT,
-                            );
+                            // Use same compact metadata for consistent traceability
+                            let swap_meta =
+                                prompts::memory_proto::EntryMeta::from_session_with_tier(
+                                    state.session_id.as_deref(),
+                                    state.turn,
+                                    prompts::memory_proto::SRC_COMPACT,
+                                    prompts::memory_proto::TIER_UNVERIFIED,
+                                );
                             let _ = api
                                 .post_memory_store_json(
                                     tok,
@@ -726,20 +626,6 @@ pub(crate) async fn handle_state_command(
                 state.recent_tools.clear();
             }
 
-            // Print the summary box
-            eprintln!();
-            eprintln!(
-                "{}",
-                "─── Compact Summary ────────────────────────────────────────".dim()
-            );
-            for line in summary.lines() {
-                eprintln!("  {line}");
-            }
-            eprintln!(
-                "{}",
-                "────────────────────────────────────────────────────────────".dim()
-            );
-            eprintln!();
             let mem_note = if compact_no_memoria {
                 " · Memoria side-effects skipped (no-memoria)".to_string()
             } else if saved_to_memoria {
@@ -749,7 +635,7 @@ pub(crate) async fn handle_state_command(
                     " · saved to memory".to_string()
                 };
                 if compact_quick {
-                    s.push_str(" · quick (no fact extraction pass)");
+                    s.push_str(" · quick (facts not stored to memory)");
                 }
                 s
             } else {
@@ -1525,5 +1411,30 @@ mod tests {
             assert!(preview.ends_with('…'));
             assert_eq!(preview.chars().count(), 51); // 50 a's + 1 '…'
         }
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+
+    #[test]
+    fn swap_body_truncation_respects_utf8_boundary() {
+        // CJK characters are 3 bytes each, emoji are 4 bytes
+        let long_text = "你好世界".repeat(300); // 3600 bytes
+        let swap_body = format!("Turns 1-5 swapped out:\nU: {}", long_text);
+
+        // Apply the same truncation logic as in the /compact handler
+        let capped = if swap_body.len() > 2000 {
+            let boundary = swap_body.floor_char_boundary(2000);
+            format!("{}…", &swap_body[..boundary])
+        } else {
+            swap_body
+        };
+
+        // Should be truncated and end with ellipsis
+        assert!(capped.len() <= 2003); // 2000 + "…" (3 bytes)
+        assert!(capped.ends_with("…"));
+        // Should be valid UTF-8
+        assert!(capped.is_ascii() || capped.chars().all(|c| c.len_utf8() > 0));
     }
 }

@@ -7,9 +7,7 @@
 mod context;
 mod system;
 
-pub use astra_prompts::extraction::{
-    COMPACT_SUMMARY_REQUEST, MEMORY_EXTRACTOR_PROMPT, parse_extracted_facts,
-};
+pub use astra_prompts::extraction::{COMPACT_UNIFIED_PROMPT, parse_compact_response};
 pub use astra_prompts::skills::{
     SystemSkill, build_skill_dev_prefix, build_skill_instructions, builtin_concise_skill,
     builtin_markdown_skill, builtin_system_skills,
@@ -102,15 +100,6 @@ mod tests {
         assert!(prefix.contains("when_to_use"));
         assert!(prefix.contains("Success criteria"));
         assert!(prefix.contains("allowed_tools"));
-    }
-
-    #[test]
-    fn compact_summary_request_is_non_empty() {
-        assert!(!COMPACT_SUMMARY_REQUEST.is_empty());
-        assert!(COMPACT_SUMMARY_REQUEST.contains("250 words"));
-        assert!(COMPACT_SUMMARY_REQUEST.contains("### Goals"));
-        assert!(COMPACT_SUMMARY_REQUEST.contains("### Key Facts"));
-        assert!(COMPACT_SUMMARY_REQUEST.contains("5 sections"));
     }
 
     #[test]
@@ -232,89 +221,6 @@ mod tests {
             p.contains("Never guess"),
             "should warn against guessing paths"
         );
-    }
-
-    // ── Memory Extractor tests ──
-
-    #[test]
-    fn memory_extractor_prompt_is_well_formed() {
-        assert!(!MEMORY_EXTRACTOR_PROMPT.is_empty());
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("JSON array"));
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("\"fact\""));
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("\"type\""));
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("semantic"));
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("profile"));
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("procedural"));
-        assert!(MEMORY_EXTRACTOR_PROMPT.contains("working"));
-    }
-
-    #[test]
-    fn parse_extracted_facts_valid_json() {
-        let raw = r#"[
-            {"fact": "User prefers Rust.", "type": "profile"},
-            {"fact": "Project uses cargo workspace.", "type": "procedural"}
-        ]"#;
-        let facts = parse_extracted_facts(raw);
-        assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].0, "User prefers Rust.");
-        assert_eq!(facts[0].1, "profile");
-        assert_eq!(facts[1].0, "Project uses cargo workspace.");
-        assert_eq!(facts[1].1, "procedural");
-    }
-
-    #[test]
-    fn parse_extracted_facts_with_code_fences() {
-        let raw = "```json\n[\n  {\"fact\": \"Uses cargo test.\", \"type\": \"semantic\"}\n]\n```";
-        let facts = parse_extracted_facts(raw);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].0, "Uses cargo test.");
-    }
-
-    #[test]
-    fn parse_extracted_facts_empty_array() {
-        let raw = "[]";
-        let facts = parse_extracted_facts(raw);
-        assert!(facts.is_empty());
-    }
-
-    #[test]
-    fn parse_extracted_facts_with_preamble() {
-        let raw =
-            "Here are the facts:\n[{\"fact\": \"Prefers vim.\", \"type\": \"profile\"}]\nDone.";
-        let facts = parse_extracted_facts(raw);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].0, "Prefers vim.");
-    }
-
-    #[test]
-    fn parse_extracted_facts_invalid_type_defaults_to_semantic() {
-        let raw = r#"[{"fact": "Some fact.", "type": "unknown_type"}]"#;
-        let facts = parse_extracted_facts(raw);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].1, "semantic");
-    }
-
-    #[test]
-    fn parse_extracted_facts_missing_type_defaults_to_semantic() {
-        let raw = r#"[{"fact": "No type field."}]"#;
-        let facts = parse_extracted_facts(raw);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].1, "semantic");
-    }
-
-    #[test]
-    fn parse_extracted_facts_skips_empty_facts() {
-        let raw = r#"[{"fact": "", "type": "semantic"}, {"fact": "Good one.", "type": "profile"}]"#;
-        let facts = parse_extracted_facts(raw);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].0, "Good one.");
-    }
-
-    #[test]
-    fn parse_extracted_facts_garbage_returns_empty() {
-        let raw = "This is not JSON at all, sorry!";
-        let facts = parse_extracted_facts(raw);
-        assert!(facts.is_empty());
     }
 
     // ── Token estimation & context budget tests ──

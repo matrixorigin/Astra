@@ -345,7 +345,7 @@ pub use turn::{
         },
         compaction::{
             CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger, compact_tiered,
-            compact_tiered_with_result, compact_with_summary,
+            compact_tiered_with_result,
         },
         memoria_compact::{
             HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,

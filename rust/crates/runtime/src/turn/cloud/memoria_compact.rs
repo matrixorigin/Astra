@@ -1307,7 +1307,7 @@ fn adjusted_message_budget_chars(
 ///    `"Compaction of session <sid-prefix>: <N>-char summary"`.
 ///
 /// Returns `None` when the summary is empty — caller skips the store.
-fn build_compaction_layered_body(session_id: &str, summary: &str) -> Option<String> {
+pub fn build_compaction_layered_body(session_id: &str, summary: &str) -> Option<String> {
     let summary_trimmed = summary.trim();
     if summary_trimmed.is_empty() {
         return None;
@@ -1633,12 +1633,23 @@ pub async fn compact_with_memoria(
     if config.store_on_compact {
         let working_content = build_working_memory_content(messages, 2000);
         if !working_content.is_empty() {
+            let tier_name = match params.tier {
+                CompactionTier::Normal => "normal",
+                CompactionTier::TrimSchemas => "trim_schemas",
+                CompactionTier::CompactHistory => "compact_history",
+                CompactionTier::AggressivePrune => "aggressive_prune",
+            };
             let store_content = format!(
-                "[session:{}] Recent conversation:\n{}",
-                sid, working_content
+                "[compact session={sid} turn={} source=auto tier={tier_name}]\n{working_content}",
+                params.turn_number,
             );
             if let Err(e) = client
-                .store(&store_content, "working", Some(sid), None)
+                .store(
+                    &store_content,
+                    "working",
+                    Some(sid),
+                    Some(astra_prompts::memory_proto::TIER_INFERRED),
+                )
                 .await
             {
                 eprintln!("[compact] Failed to store working memory: {e}");

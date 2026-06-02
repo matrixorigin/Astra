@@ -163,6 +163,23 @@ impl CompactionEngine {
         p.add_layer(Box::new(ReactiveCompact::new(0.0)));
         p
     }
+
+    /// Micro-compact pipeline for manual `/compact` preprocessing.
+    ///
+    /// Runs only ToolResultTruncation + DuplicateReadElimination (no
+    /// message-dropping layers). Designed to reduce input tokens before
+    /// the LLM summary call without losing conversation structure.
+    /// All thresholds are 0.0 so layers fire unconditionally.
+    pub fn micro_pipeline() -> Self {
+        let mut p = Self::new();
+        p.add_layer(Box::new(ToolResultTruncation::new(
+            Duration::from_secs(0),
+            2000,
+            0.0,
+        )));
+        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
+        p
+    }
 }
 
 // ───────────────────────────── Shared helpers ───────────────────────────
@@ -1188,6 +1205,43 @@ mod tests {
             long_content,
             "recent result ({}s ago) should be preserved",
             now - recent_ts
+        );
+    }
+
+    #[test]
+    fn tool_truncation_safe_utf8_boundary_cjk() {
+        // Deterministic test: CJK truncation must always land on a valid
+        // UTF-8 char boundary. Complements proptest
+        // prop_truncation_always_valid_utf8 which covers the same invariant
+        // with random input.
+        let content = "你好世界".repeat(200); // 800 CJK chars, multi-byte UTF-8
+        let max_keep = 100;
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "content": &content,
+            "_timestamp": 1
+        })];
+        let b = budget(80_000, 70_000);
+        let layer = ToolResultTruncation::new(Duration::from_secs(0), max_keep, 0.0);
+        layer.compress(&mut msgs, &b);
+
+        let result = msgs[0]["content"].as_str().unwrap();
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "CJK truncation must be valid UTF-8"
+        );
+        assert!(
+            result.contains('…'),
+            "result must contain truncation marker"
+        );
+        assert!(
+            result.len() < content.len(),
+            "truncation must shorten the content"
+        );
+        let suffix_start = result.find('…').unwrap_or(result.len());
+        assert!(
+            content.starts_with(&result[..suffix_start]),
+            "truncated result must be a prefix of original"
         );
     }
 
@@ -2888,5 +2942,165 @@ mod tests {
                     turns, tools_per_turn);
             }
         }
+
+        /// Micro-pipeline truncates tool results while preserving non-tool
+        /// messages. This is the T2 acceptance test: verify that
+        /// ToolResultTruncation + DuplicateReadElimination fire before
+        /// the LLM summary in `/compact`.
+        #[test]
+        fn micro_pipeline_truncates_tool_results_preserves_structure() {
+            let mut messages = vec![
+                json!({"role":"system","content":"You are a helpful assistant."}),
+                json!({"role":"user","content":"read foo.rs and bar.rs"}),
+                json!({
+                    "role":"assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"foo.rs\"}"}},
+                        {"id":"call_2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"bar.rs\"}"}}
+                    ]
+                }),
+                json!({"role":"tool","tool_call_id":"call_1","content": "fn main() {}\n".repeat(500), "_timestamp": 1}),
+                json!({"role":"tool","tool_call_id":"call_2","content": "fn bar() {}\n".repeat(400), "_timestamp": 1}),
+                json!({"role":"assistant","content":"I've read both files."}),
+            ];
+
+            let original_len = messages.len();
+            let tool1_orig = messages[3]["content"].as_str().unwrap().len();
+            let tool2_orig = messages[4]["content"].as_str().unwrap().len();
+
+            let budget = TokenBudget {
+                max_prompt_tokens: 64_000,
+                last_measured_tokens: 64_001,
+                current_round_index: None,
+            };
+
+            let engine = CompactionEngine::micro_pipeline();
+            let outcome = engine.compress_if_needed(&mut messages, &budget);
+
+            // Tool results must shrink
+            let tool1_new = messages[3]["content"].as_str().unwrap();
+            let tool2_new = messages[4]["content"].as_str().unwrap();
+            assert!(
+                tool1_new.len() < tool1_orig,
+                "tool1 should be truncated: {} → {}",
+                tool1_orig,
+                tool1_new.len()
+            );
+            assert!(
+                tool2_new.len() < tool2_orig,
+                "tool2 should be truncated: {} → {}",
+                tool2_orig,
+                tool2_new.len()
+            );
+            assert!(
+                tool1_new.len() < 5000,
+                "tool1 still too large after truncation: {}",
+                tool1_new.len()
+            );
+
+            // Structure preserved: same number of messages
+            assert_eq!(messages.len(), original_len);
+
+            // Non-tool messages untouched
+            assert_eq!(
+                messages[0]["content"].as_str().unwrap(),
+                "You are a helpful assistant."
+            );
+            assert_eq!(
+                messages[1]["content"].as_str().unwrap(),
+                "read foo.rs and bar.rs"
+            );
+            assert_eq!(
+                messages[5]["content"].as_str().unwrap(),
+                "I've read both files."
+            );
+
+            // Outcome reports tokens freed
+            assert!(
+                outcome.total_tokens_freed > 0,
+                "should have freed tokens, got {}",
+                outcome.total_tokens_freed
+            );
+        }
+    }
+
+    // ── Factory method tests ──────────────────────────────────────────
+
+    #[test]
+    fn factory_default_pipeline_for_varying_context_sizes() {
+        // Small context window (32K) — should fire compression under pressure
+        let p32 = CompactionEngine::default_pipeline_for(32_000);
+        let mut msgs = make_agentic_session(6, 2, 2000);
+        let b = budget(16_000, 40_000); // way over 32K limit
+        let outcome = p32.compress_if_needed(&mut msgs, &b);
+        assert!(outcome.total_tokens_freed > 0);
+
+        // Large context window (200K) — lightly over budget, L1 may fire but
+        // total freed should be modest compared to the small-window case
+        let p200 = CompactionEngine::default_pipeline_for(200_000);
+        let mut msgs2 = make_agentic_session(3, 1, 500);
+        let b2 = budget(190_000, 205_000);
+        let outcome2 = p200.compress_if_needed(&mut msgs2, &b2);
+        // With a large window and a tiny session, freed tokens should be negligible
+        assert!(
+            outcome2.total_tokens_freed < 2000,
+            "large window + small session should free minimal tokens"
+        );
+    }
+
+    #[test]
+    fn factory_aggressive_pipeline_fires_unconditionally() {
+        // Aggressive pipeline with 0.0 thresholds should fire even when
+        // budget is not exceeded.
+        let mut msgs = make_agentic_session(4, 2, 2000);
+        let b = budget(1_000_000, 500); // plenty of room
+        let outcome = CompactionEngine::aggressive_pipeline().compress_if_needed(&mut msgs, &b);
+        assert!(
+            outcome.total_tokens_freed > 0,
+            "aggressive should fire at 0.0 threshold"
+        );
+    }
+
+    #[test]
+    fn factory_emergency_more_aggressive_than_aggressive() {
+        let msgs_template = make_agentic_session(10, 4, 3000);
+        let b = budget(50_000, 200_000);
+
+        let mut msgs_a = msgs_template.clone();
+        let outcome_a = CompactionEngine::aggressive_pipeline().compress_if_needed(&mut msgs_a, &b);
+
+        let mut msgs_e = msgs_template.clone();
+        let outcome_e = CompactionEngine::emergency_pipeline().compress_if_needed(&mut msgs_e, &b);
+
+        // Emergency should be at least as aggressive
+        assert!(
+            outcome_e.total_tokens_freed >= outcome_a.total_tokens_freed,
+            "emergency ({}) >= aggressive ({})",
+            outcome_e.total_tokens_freed,
+            outcome_a.total_tokens_freed
+        );
+        // Emergency keeps fewer messages
+        assert!(
+            msgs_e.len() <= msgs_a.len(),
+            "emergency ({}) <= aggressive ({}) messages",
+            msgs_e.len(),
+            msgs_a.len()
+        );
+    }
+
+    #[test]
+    fn factory_micro_pipeline_only_l1_l2_no_message_dropping() {
+        let mut msgs = make_agentic_session(5, 2, 1000);
+        let original_count = msgs.len();
+        let b = budget(10_000, 50_000); // way over
+        let _outcome = CompactionEngine::micro_pipeline().compress_if_needed(&mut msgs, &b);
+        // Micro pipeline only runs L1 (duplicate reads) + L2 (tool truncation).
+        // Micro pipeline should either free or no-op.
+        assert_eq!(
+            msgs.len(),
+            original_count,
+            "micro pipeline must not drop messages"
+        );
     }
 }

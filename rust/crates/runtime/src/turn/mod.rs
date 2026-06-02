@@ -5,8 +5,10 @@ pub mod bridge;
 pub mod budget_messaging;
 pub mod chat_turn_budget_pressure;
 pub mod cloud;
-pub mod compaction_engine;
 pub mod compaction_replay;
+/// Re-export compaction engine types and helpers for convenience.
+pub use cloud::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudget};
+pub use cloud::memoria_compact::build_compaction_layered_body;
 pub(crate) mod context_pipeline_adapter;
 pub mod harness_adapter;
 pub mod headless_tool_pipeline;

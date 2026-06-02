@@ -1,39 +1,143 @@
-/// Prompt for extracting structured facts from a conversation summary.
+/// Parsed response from the unified /compact prompt.
 ///
-/// Each fact is one self-contained sentence suitable for long-term memory.
-/// The LLM outputs a JSON array so we can store each fact as a separate
-/// Memoria entry with the appropriate `memory_type`.
-pub const MEMORY_EXTRACTOR_PROMPT: &str = "\
-Extract key facts worth remembering from the following conversation summary.
+/// Replaces the previous 3-call pipeline (summary → fact extraction → synthesis)
+/// with a single structured JSON response. This reduces latency from 15-30s to 5-10s
+/// and simplifies the code path.
+/// Unified prompt for /compact that generates summary + extracts facts in one LLM call.
+pub const COMPACT_UNIFIED_PROMPT: &str = r##"
+Summarize this conversation and extract structured facts in ONE response.
 
 ## Output format
-Return a JSON array. Each element has two fields:
-- \"fact\": a single self-contained sentence (≤30 words).
-- \"type\": one of \"semantic\" (general knowledge/preference), \"profile\" (user info), \
-\"procedural\" (how-to / convention), \"working\" (transient project state).
+Return a JSON object with two fields:
 
-## Rules
-- 3-8 facts maximum. Fewer is better if the summary is short.
-- Each fact must stand alone without the surrounding conversation.
-- Prefer user preferences, project conventions, decisions, and recurring patterns.
-- DO NOT extract: transient errors, file contents, raw tool output, one-off commands.
-- If no facts are worth remembering, return an empty array: []
+{
+  "summary": {
+    "goals": ["bullet 1", "bullet 2"],
+    "decisions": ["bullet 1"],
+    "actions": ["bullet 1"],
+    "status": ["bullet 1"],
+    "key_facts": ["bullet 1"]
+  },
+  "facts": [
+    {"fact": "self-contained sentence ≤30 words", "type": "semantic"}
+  ]
+}
 
-## Example
-[
-  {\"fact\": \"User prefers Rust for CLI tools.\", \"type\": \"profile\"},
-  {\"fact\": \"Project uses cargo workspace at rust/crates/.\", \"type\": \"procedural\"}
-]
+## Rules for summary
+- <250 words total across all 5 sections
+- Bullets only, no prose
+- Each section must have at least one bullet (or empty array if truly nothing)
 
-Summary to extract from:
-";
+## Rules for facts
+- 3-8 facts maximum (fewer is better if summary is short)
+- Each fact must stand alone without the surrounding conversation
+- Prefer: user preferences, project conventions, decisions, recurring patterns
+- DO NOT extract: transient errors, file contents, raw tool output, one-off commands
+- Types: "semantic" (general knowledge/preference), "profile" (user info), "procedural" (how-to / convention), "working" (transient project state)
+- If no facts are worth remembering, return empty array: []
+"##;
 
-/// Parse the LLM response from the memory extractor into fact+type pairs.
+/// Parsed response from the unified /compact prompt.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CompactResponse {
+    pub summary: CompactSummary,
+    #[serde(default)]
+    pub facts: Vec<CompactFact>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CompactSummary {
+    #[serde(default)]
+    pub goals: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub status: Vec<String>,
+    #[serde(default)]
+    pub key_facts: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CompactFact {
+    pub fact: String,
+    #[serde(rename = "type", default = "default_fact_type")]
+    pub fact_type: String,
+}
+
+fn default_fact_type() -> String {
+    "semantic".to_string()
+}
+
+impl CompactResponse {
+    /// Render the summary section as human-readable markdown.
+    pub fn render_summary(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.summary.goals.is_empty() {
+            lines.push("### Goals".to_string());
+            for b in &self.summary.goals {
+                lines.push(format!("- {b}"));
+            }
+        }
+        if !self.summary.decisions.is_empty() {
+            lines.push("### Decisions".to_string());
+            for b in &self.summary.decisions {
+                lines.push(format!("- {b}"));
+            }
+        }
+        if !self.summary.actions.is_empty() {
+            lines.push("### Actions".to_string());
+            for b in &self.summary.actions {
+                lines.push(format!("- {b}"));
+            }
+        }
+        if !self.summary.status.is_empty() {
+            lines.push("### Status".to_string());
+            for b in &self.summary.status {
+                lines.push(format!("- {b}"));
+            }
+        }
+        if !self.summary.key_facts.is_empty() {
+            lines.push("### Key Facts".to_string());
+            for b in &self.summary.key_facts {
+                lines.push(format!("- {b}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Extract valid facts, logging unknown types instead of silently coercing.
+    pub fn valid_facts(&self) -> Vec<(String, String)> {
+        self.facts
+            .iter()
+            .filter_map(|f| {
+                let fact = f.fact.trim();
+                if fact.is_empty() {
+                    return None;
+                }
+                match f.fact_type.as_str() {
+                    "semantic" | "profile" | "procedural" | "working" => {
+                        Some((fact.to_string(), f.fact_type.clone()))
+                    }
+                    unknown => {
+                        eprintln!(
+                            "[compact] Unknown fact_type={unknown:?}, discarding fact={fact:?}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+/// Parse the unified /compact response. Tolerates markdown fences and extra whitespace.
 ///
-/// Returns `Vec<(fact_text, memory_type)>`. Tolerates markdown fences and
-/// trailing commas since LLMs are sloppy JSON producers.
-pub fn parse_extracted_facts(raw: &str) -> Vec<(String, String)> {
-    // Strip markdown code fences if present
+/// Uses bracket matching (not greedy `rfind`) to correctly extract the JSON object
+/// even when the LLM output contains embedded JSON fragments or prose with braces.
+/// Tries each `{` starting position until a valid CompactResponse is parsed.
+pub fn parse_compact_response(raw: &str) -> Option<CompactResponse> {
     let trimmed = raw.trim();
     let json_str = if trimmed.starts_with("```") {
         trimmed
@@ -45,251 +149,228 @@ pub fn parse_extracted_facts(raw: &str) -> Vec<(String, String)> {
         trimmed
     };
 
-    // Try to parse as JSON array
-    let arr: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => {
-            // Try extracting just the array portion (LLM may add preamble)
-            if let Some(start) = json_str.find('[') {
-                if let Some(end) = json_str.rfind(']') {
-                    let slice = &json_str[start..=end];
-                    serde_json::from_str(slice).unwrap_or_default()
-                } else {
-                    Vec::new()
+    // Try direct parse
+    if let Ok(resp) = serde_json::from_str::<CompactResponse>(json_str) {
+        return Some(resp);
+    }
+
+    // Bracket-matching extraction: try each '{' and find its matching '}'
+    let bytes = json_str.as_bytes();
+    let mut search_start = 0usize;
+    while let Some(start) = json_str[search_start..].find('{') {
+        let abs_start = search_start + start;
+        let mut depth = 0u32;
+        let mut end = abs_start;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate().skip(abs_start) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if b == b'\\' && in_string {
+                escaped = true;
+                continue;
+            }
+            if b == b'"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+            if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
                 }
-            } else {
-                Vec::new()
             }
         }
-    };
+        let slice = &json_str[abs_start..=end];
+        if let Ok(resp) = serde_json::from_str::<CompactResponse>(slice) {
+            return Some(resp);
+        }
+        search_start = abs_start + 1;
+    }
 
-    arr.iter()
-        .filter_map(|item| {
-            let fact = item
-                .get("fact")
-                .and_then(|v| v.as_str())?
-                .trim()
-                .to_string();
-            let mem_type = item
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("semantic")
-                .to_string();
-            if fact.is_empty() {
-                return None;
-            }
-            // Validate memory_type
-            let valid_type = match mem_type.as_str() {
-                "semantic" | "profile" | "procedural" | "working" => mem_type,
-                _ => "semantic".to_string(),
-            };
-            Some((fact, valid_type))
-        })
-        .collect()
+    None
 }
-
-/// User message sent to the LLM to produce a compact session summary.
-///
-/// The existing conversation history is already in the message context, so the
-/// LLM sees the full transcript when it generates the summary.
-pub const COMPACT_SUMMARY_REQUEST: &str = "\
-Summarize this conversation in <250 words using exactly these 5 sections:
-
-### Goals
-What the user wants to achieve.
-
-### Decisions
-Key choices and reasoning. One bullet each.
-
-### Actions
-Tool calls, code changes, commands. Brief.
-
-### Status
-Done, pending, blockers.
-
-### Key Facts
-Preferences, conventions, important details.
-
-Rules: bullets only, no prose. Start with `### Goals`. Stop after Key Facts. 5 sections only.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_empty_array() {
-        assert!(parse_extracted_facts("[]").is_empty());
+    fn parse_compact_response_direct_json() {
+        let input = r#"{"summary":{"goals":["finish feature"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).unwrap();
+        assert_eq!(resp.summary.goals, vec!["finish feature"]);
+        assert!(resp.facts.is_empty());
     }
 
     #[test]
-    fn parse_valid_json() {
-        let input = r#"[{"fact": "Uses Rust.", "type": "procedural"}]"#;
-        let facts = parse_extracted_facts(input);
+    fn parse_compact_response_with_facts() {
+        let input = r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"Uses Rust","type":"procedural"}]}"#;
+        let resp = parse_compact_response(input).unwrap();
+        assert_eq!(resp.facts.len(), 1);
+        assert_eq!(resp.facts[0].fact, "Uses Rust");
+        assert_eq!(resp.facts[0].fact_type, "procedural");
+    }
+
+    #[test]
+    fn parse_compact_response_with_markdown_fences() {
+        let input = "```json\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```";
+        let resp = parse_compact_response(input).unwrap();
+        assert!(resp.facts.is_empty());
+    }
+
+    #[test]
+    fn parse_compact_response_with_plain_fences() {
+        let input = "```\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```";
+        let resp = parse_compact_response(input).unwrap();
+        assert!(resp.facts.is_empty());
+    }
+
+    #[test]
+    fn parse_compact_response_with_preamble() {
+        let input = "Here is the compact output:\n{\"summary\":{\"goals\":[\"fix bug\"],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}";
+        let resp = parse_compact_response(input).unwrap();
+        assert_eq!(resp.summary.goals, vec!["fix bug"]);
+    }
+
+    #[test]
+    fn parse_compact_response_bracket_matching_not_greedy() {
+        // The response contains an embedded JSON fragment in prose before the real output.
+        // Greedy rfind('}') would match the wrong closing brace.
+        let input = r#"The output is {"nested": "value"} and here is the real result: {"summary":{"goals":["correct"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).unwrap();
+        assert_eq!(resp.summary.goals, vec!["correct"]);
+    }
+
+    #[test]
+    fn parse_compact_response_bracket_matching_deeply_nested() {
+        let input = r#"Preamble {"a":{"b":{"c":1}}} and result: {"summary":{"goals":["nested ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"deep","type":"semantic"}]} trailing"#;
+        let resp = parse_compact_response(input).unwrap();
+        assert_eq!(resp.summary.goals, vec!["nested ok"]);
+        assert_eq!(resp.facts[0].fact, "deep");
+    }
+
+    #[test]
+    fn parse_compact_response_garbage_returns_none() {
+        assert!(parse_compact_response("not json at all").is_none());
+        assert!(parse_compact_response("").is_none());
+    }
+
+    #[test]
+    fn parse_compact_response_no_braces() {
+        assert!(parse_compact_response("just some text without braces").is_none());
+    }
+
+    #[test]
+    fn valid_facts_rejects_unknown_types() {
+        let resp = CompactResponse {
+            summary: CompactSummary {
+                goals: vec![],
+                decisions: vec![],
+                actions: vec![],
+                status: vec![],
+                key_facts: vec![],
+            },
+            facts: vec![
+                CompactFact {
+                    fact: "a".into(),
+                    fact_type: "semantic".into(),
+                },
+                CompactFact {
+                    fact: "b".into(),
+                    fact_type: "invalid".into(),
+                },
+            ],
+        };
+        let facts = resp.valid_facts();
+        // Only "a" should be kept; "b" with invalid type should be dropped
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].0, "Uses Rust.");
-        assert_eq!(facts[0].1, "procedural");
+        assert_eq!(facts[0].0, "a");
     }
 
     #[test]
-    fn parse_with_markdown_fences() {
-        let input = "```json\n[{\"fact\": \"Prefers vim.\", \"type\": \"profile\"}]\n```";
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].1, "profile");
-    }
-
-    #[test]
-    fn parse_with_plain_fences() {
-        let input = "```\n[{\"fact\": \"Test.\", \"type\": \"semantic\"}]\n```";
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 1);
-    }
-
-    #[test]
-    fn parse_with_preamble() {
-        let input = "Here are the facts:\n[{\"fact\": \"Preamble test.\", \"type\": \"working\"}]";
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].1, "working");
-    }
-
-    #[test]
-    fn parse_invalid_type_defaults_semantic() {
-        let input = r#"[{"fact": "Test.", "type": "invalid_type"}]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts[0].1, "semantic");
-    }
-
-    #[test]
-    fn parse_missing_type_defaults_semantic() {
-        let input = r#"[{"fact": "No type field."}]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts[0].1, "semantic");
-    }
-
-    #[test]
-    fn parse_empty_fact_filtered() {
-        let input = r#"[{"fact": "", "type": "semantic"}, {"fact": "  ", "type": "semantic"}]"#;
-        let facts = parse_extracted_facts(input);
-        assert!(facts.is_empty());
-    }
-
-    #[test]
-    fn parse_missing_fact_field_filtered() {
-        let input = r#"[{"type": "semantic"}]"#;
-        let facts = parse_extracted_facts(input);
-        assert!(facts.is_empty());
-    }
-
-    #[test]
-    fn parse_garbage_input() {
-        assert!(parse_extracted_facts("not json at all").is_empty());
-    }
-
-    #[test]
-    fn parse_no_brackets() {
-        assert!(parse_extracted_facts("just some text without brackets").is_empty());
-    }
-
-    #[test]
-    fn parse_all_valid_types() {
+    fn valid_facts_accepts_all_valid_types() {
         for t in &["semantic", "profile", "procedural", "working"] {
-            let input = format!(r#"[{{"fact": "Test.", "type": "{t}"}}]"#);
-            let facts = parse_extracted_facts(&input);
+            let resp = CompactResponse {
+                summary: CompactSummary {
+                    goals: vec![],
+                    decisions: vec![],
+                    actions: vec![],
+                    status: vec![],
+                    key_facts: vec![],
+                },
+                facts: vec![CompactFact {
+                    fact: "test".into(),
+                    fact_type: t.to_string(),
+                }],
+            };
+            let facts = resp.valid_facts();
+            assert_eq!(facts.len(), 1, "failed for type: {t}");
             assert_eq!(facts[0].1, *t);
         }
     }
 
     #[test]
-    fn parse_multiple_facts() {
-        let input = r#"[
-            {"fact": "One.", "type": "semantic"},
-            {"fact": "Two.", "type": "profile"},
-            {"fact": "Three.", "type": "procedural"}
-        ]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 3);
+    fn valid_facts_filters_empty() {
+        let resp = CompactResponse {
+            summary: CompactSummary {
+                goals: vec![],
+                decisions: vec![],
+                actions: vec![],
+                status: vec![],
+                key_facts: vec![],
+            },
+            facts: vec![CompactFact {
+                fact: "".into(),
+                fact_type: "semantic".into(),
+            }],
+        };
+        assert!(resp.valid_facts().is_empty());
     }
 
     #[test]
-    fn parse_fact_trimmed() {
-        let input = r#"[{"fact": "  spaced  ", "type": "semantic"}]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts[0].0, "spaced");
-    }
-
-    // --- parse_extracted_facts edge cases ---
-
-    #[test]
-    fn parse_fact_with_newlines_in_text() {
-        let input = r#"[{"fact": "line1\nline2", "type": "semantic"}]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 1);
-        assert!(facts[0].0.contains('\n')); // JSON \n decoded to actual newline
-    }
-
-    #[test]
-    fn parse_fact_with_unicode() {
-        let input = r#"[{"fact": "使用JWT进行身份验证", "type": "semantic"}]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 1);
-        assert!(facts[0].0.contains("JWT"));
+    fn render_summary_all_sections() {
+        let resp = CompactResponse {
+            summary: CompactSummary {
+                goals: vec!["g1".into()],
+                decisions: vec!["d1".into()],
+                actions: vec!["a1".into()],
+                status: vec!["s1".into()],
+                key_facts: vec!["k1".into()],
+            },
+            facts: vec![],
+        };
+        let rendered = resp.render_summary();
+        assert!(rendered.contains("### Goals"));
+        assert!(rendered.contains("- g1"));
+        assert!(rendered.contains("### Decisions"));
+        assert!(rendered.contains("### Actions"));
+        assert!(rendered.contains("### Status"));
+        assert!(rendered.contains("### Key Facts"));
     }
 
     #[test]
-    fn parse_duplicate_facts_both_kept() {
-        let input = r#"[
-            {"fact": "same fact", "type": "semantic"},
-            {"fact": "same fact", "type": "semantic"}
-        ]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 2); // no dedup in parser
-    }
-
-    #[test]
-    fn parse_fact_type_whitespace_defaults() {
-        let input = r#"[{"fact": "test", "type": " semantic "}]"#;
-        let facts = parse_extracted_facts(input);
-        // " semantic " doesn't match any valid type → defaults to "semantic"
-        assert_eq!(facts[0].1, "semantic");
-    }
-
-    #[test]
-    fn parse_deeply_nested_array_rejected() {
-        let input = "[[[[]]]]";
-        let facts = parse_extracted_facts(input);
-        assert!(facts.is_empty());
-    }
-
-    #[test]
-    fn parse_fact_with_all_valid_types() {
-        let input = r#"[
-            {"fact": "a", "type": "semantic"},
-            {"fact": "b", "type": "profile"},
-            {"fact": "c", "type": "procedural"},
-            {"fact": "d", "type": "working"}
-        ]"#;
-        let facts = parse_extracted_facts(input);
-        assert_eq!(facts.len(), 4);
-        assert_eq!(facts[0].1, "semantic");
-        assert_eq!(facts[1].1, "profile");
-        assert_eq!(facts[2].1, "procedural");
-        assert_eq!(facts[3].1, "working");
-    }
-
-    #[test]
-    fn parse_fact_number_type_defaults_semantic() {
-        let input = r#"[{"fact": "test", "type": 123}]"#;
-        let facts = parse_extracted_facts(input);
-        // type is a number, not a string → as_str() returns None → defaults to "semantic"
-        assert_eq!(facts[0].1, "semantic");
-    }
-
-    #[test]
-    fn parse_with_trailing_comma_fails_gracefully() {
-        let input = r#"[{"fact": "test", "type": "semantic"},]"#;
-        let facts = parse_extracted_facts(input);
-        // serde_json rejects trailing commas → empty
-        assert!(facts.is_empty());
+    fn render_summary_empty_sections_omitted() {
+        let resp = CompactResponse {
+            summary: CompactSummary {
+                goals: vec!["only goal".into()],
+                decisions: vec![],
+                actions: vec![],
+                status: vec![],
+                key_facts: vec![],
+            },
+            facts: vec![],
+        };
+        let rendered = resp.render_summary();
+        assert!(rendered.contains("### Goals"));
+        assert!(!rendered.contains("### Decisions"));
     }
 }

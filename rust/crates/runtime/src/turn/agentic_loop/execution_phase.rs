@@ -2550,14 +2550,14 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     if !state.budget_wrapup_injected
         && state.compaction_effectiveness.attempt_count < MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS
     {
-        let budget = super::super::compaction_engine::TokenBudget {
+        let budget = super::super::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
             current_round_index: Some(state.current_round_index),
         };
         let mut total_freed = 0;
         if state.compact_tier_applied < CompactionTier::CompactHistory {
-            let pipeline = super::super::compaction_engine::CompactionEngine::aggressive_pipeline();
+            let pipeline = super::super::CompactionEngine::aggressive_pipeline();
             let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
             total_freed = outcome.total_tokens_freed;
         }
