@@ -346,6 +346,8 @@ pub(crate) async fn handle_task_command(
                     harness_sink: Some(bg_harness_sink.clone()),
                     #[cfg(feature = "harness")]
                     harness_trace: Some(bg_harness_trace.clone()),
+                    #[cfg(feature = "harness")]
+                    benchmark_profile: None,
                 })
                 .await;
 

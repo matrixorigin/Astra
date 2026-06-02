@@ -816,11 +816,17 @@ pub(crate) async fn stream_chat_sse(
             {
                 match p.harness_sink.as_ref() {
                     Some(sink) => {
-                        let base_kernel = std::sync::Arc::new(
-                            astra_harness::StandardKernel::with_default_verifiers(
-                                sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>
+                        let sink_for_kernel =
+                            sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>;
+                        let base_kernel = std::sync::Arc::new(match p.benchmark_profile {
+                            Some(profile) => astra_harness::StandardKernel::with_profile(
+                                sink_for_kernel,
+                                profile,
                             ),
-                        );
+                            None => astra_harness::StandardKernel::with_default_verifiers(
+                                sink_for_kernel,
+                            ),
+                        });
                         let session_id = p.session_id.map(|s| s.to_string());
                         let recording = if let Some(ref trace_arc) = p.harness_trace {
                             // Share SessionState's trace Arc so /inspect reads live data

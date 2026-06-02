@@ -1553,6 +1553,8 @@ async fn plan_executor_task(
                     harness_sink: ctx.harness_sink.clone(),
                     #[cfg(feature = "harness")]
                     harness_trace: ctx.harness_trace.clone(),
+                    #[cfg(feature = "harness")]
+                    benchmark_profile: None,
                 })
                 .await;
 
