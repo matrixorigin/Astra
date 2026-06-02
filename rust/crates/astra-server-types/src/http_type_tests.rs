@@ -97,6 +97,21 @@ fn admin_token_create_request_defaults_applied() {
 }
 
 #[test]
+fn admin_token_list_query_all_fields() {
+    let input = json!({
+        "token_type": "api_key",
+        "provider": "taas",
+        "scope": "user",
+        "scope_id": "u123"
+    });
+    let q: AdminTokenListQuery = serde_json::from_value(input).unwrap();
+    assert_eq!(q.token_type.as_deref(), Some("api_key"));
+    assert_eq!(q.provider.as_deref(), Some("taas"));
+    assert_eq!(q.scope.as_deref(), Some("user"));
+    assert_eq!(q.scope_id.as_deref(), Some("u123"));
+}
+
+#[test]
 fn admin_audit_list_query_defaults_applied() {
     let q: AdminAuditListQuery = serde_json::from_str("{}").unwrap();
     assert_eq!(q.limit, 100);

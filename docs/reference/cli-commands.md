@@ -115,8 +115,13 @@ astra-admin model delete gpt-4
 astra-admin model load .models.yaml
 
 # Token management
-astra-admin token list [--token-type llm] [--scope global]
-astra-admin token create --type llm --provider openai --scope global [--scope-id acme] [--token-value "$OPENAI_API_KEY"]
+astra-admin token list [--token-type llm] [--provider openai] [--scope global] [--scope-id USER_OR_REPO]
+astra-admin token create --type llm --provider openai --scope global [--token-value "$OPENAI_API_KEY"]
+astra-admin token create --type api_key --provider github --scope user --scope-id USER_ID [--token-value "$API_KEY"]
+
+# TAAS token key binding
+astra-admin taas list-keys [--user-id ASTRA_USER_ID]
+astra-admin taas bind-key --user-id ASTRA_USER_ID --token-value "$TAAS_TOKEN_KEY"
 
 # Skill management
 astra-admin skill list [--limit 50] [--offset 0]
