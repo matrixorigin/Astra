@@ -118,9 +118,9 @@ pub enum CompactionKind {
     /// Tool-result clearing microcompact.
     Microcompact,
     /// Default-tier proactive compression pipeline.
-    DefaultCompression,
+    ProactiveDefault,
     /// Aggressive-tier proactive compression pipeline.
-    AggressiveCompression,
+    ProactiveAggressive,
     /// Compression on resume from checkpoint.
     Resume,
     /// Mid-turn reactive budget compaction.
@@ -138,8 +138,8 @@ impl std::fmt::Display for CompactionKind {
         let s = match self {
             Self::PressureWarning => "pressure_warning",
             Self::Microcompact => "microcompact",
-            Self::DefaultCompression => "default_compression",
-            Self::AggressiveCompression => "aggressive_compression",
+            Self::ProactiveDefault => "proactive_default",
+            Self::ProactiveAggressive => "proactive_aggressive",
             Self::Resume => "resume",
             Self::ReactiveBudget => "reactive_budget",
             Self::RetryDefault => "retry_default",
@@ -239,15 +239,9 @@ mod tests {
 
     #[test]
     fn compaction_event_should_warn_at_70_percent() {
-        let low = CompactionEvent::new(
-            CompactionKind::DefaultCompression,
-            0.69,
-            1000,
-            50000,
-            100000,
-        );
+        let low = CompactionEvent::new(CompactionKind::ProactiveDefault, 0.69, 1000, 50000, 100000);
         let high = CompactionEvent::new(
-            CompactionKind::AggressiveCompression,
+            CompactionKind::ProactiveAggressive,
             0.70,
             2000,
             70000,
@@ -259,7 +253,7 @@ mod tests {
 
     #[test]
     fn compaction_event_tokens_after_saturates() {
-        let ev = CompactionEvent::new(CompactionKind::DefaultCompression, 0.5, 500, 300, 500);
+        let ev = CompactionEvent::new(CompactionKind::ProactiveDefault, 0.5, 500, 300, 500);
         assert_eq!(ev.tokens_after, 0);
     }
 

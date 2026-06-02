@@ -23,7 +23,7 @@
 //! propagates as a structured `InterruptionRecord` with
 //! `ResumeAction::CompactAndRetry` (for cross-session resume).
 
-use super::cloud::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudget};
+use super::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudget};
 use astra_turn_core::compaction_types::CompactionKind;
 use serde_json::Value;
 

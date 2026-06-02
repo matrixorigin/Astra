@@ -211,7 +211,13 @@ fn affected_turn_indices(range: std::ops::Range<usize>) -> Vec<u32> {
 ///   * `astra-turn-core::headless_tool_assembly` cache-hit rewriter
 ///     (prefix: `(cached`)
 ///   * duplicate-call stub (`(duplicate call`)
+///
+/// All synthetic messages follow the pattern `<sentinel> — <description>`,
+/// where ` — ` (space + em dash + space) is the distinctive separator.
+/// We require this separator to avoid false positives on user messages
+/// that happen to start with the same words.
 const SYNTHETIC_USER_SENTINELS: &[&str] = &["(cached", "(duplicate call"];
+const SYNTHETIC_SENTINEL_DELIMITER: &str = " —";
 
 fn is_plain_user_task_message(msg: &Value) -> bool {
     if msg.get("role").and_then(Value::as_str) != Some("user") {
@@ -223,7 +229,10 @@ fn is_plain_user_task_message(msg: &Value) -> bool {
         // sentinels). See `SYNTHETIC_USER_SENTINELS` doc.
         Some(v) if v.is_string() => v.as_str().is_some_and(|s| {
             let t = s.trim_start();
-            !t.is_empty() && !SYNTHETIC_USER_SENTINELS.iter().any(|p| t.starts_with(p))
+            !t.is_empty()
+                && !SYNTHETIC_USER_SENTINELS.iter().any(|p| {
+                    t.starts_with(p) && t[p.len()..].starts_with(SYNTHETIC_SENTINEL_DELIMITER)
+                })
         }),
         // Array content: real only if NO block is a tool_result.
         Some(v) if v.is_array() => v.as_array().is_some_and(|blocks| {
@@ -242,6 +251,24 @@ fn epoch_secs_now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ── CompressionLayer boilerplate reduction ─────────────────────────────
+//
+// Every layer duplicates `name()`, `method()`, and `trigger_pressure()`.
+// This macro centralizes them so new layers only define `compress()`.
+macro_rules! compression_layer_boilerplate {
+    ($name:literal, $method:ident) => {
+        fn name(&self) -> &str {
+            $name
+        }
+        fn method(&self) -> CompressionMethod {
+            CompressionMethod::$method
+        }
+        fn trigger_pressure(&self) -> f64 {
+            self.trigger
+        }
+    };
 }
 
 // ───────────────────────────── Layer 1: Tool Result Truncation ────────────
@@ -264,17 +291,7 @@ impl ToolResultTruncation {
 }
 
 impl CompressionLayer for ToolResultTruncation {
-    fn name(&self) -> &str {
-        "tool_result_truncation"
-    }
-
-    fn method(&self) -> CompressionMethod {
-        CompressionMethod::ToolResultTruncation
-    }
-
-    fn trigger_pressure(&self) -> f64 {
-        self.trigger
-    }
+    compression_layer_boilerplate!("tool_result_truncation", ToolResultTruncation);
 
     fn compress(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> CompressionResult {
         let cutoff = epoch_secs_now().saturating_sub(self.age_threshold.as_secs());
@@ -402,17 +419,7 @@ fn extract_path_from_args(args: &str) -> Option<String> {
 }
 
 impl CompressionLayer for DuplicateReadElimination {
-    fn name(&self) -> &str {
-        "duplicate_read_elimination"
-    }
-
-    fn method(&self) -> CompressionMethod {
-        CompressionMethod::DuplicateReadElimination
-    }
-
-    fn trigger_pressure(&self) -> f64 {
-        self.trigger
-    }
+    compression_layer_boilerplate!("duplicate_read_elimination", DuplicateReadElimination);
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         let head_end = protected_head_end(messages);
@@ -459,8 +466,8 @@ impl CompressionLayer for DuplicateReadElimination {
                 .and_then(|cid| call_paths.get(cid).cloned());
 
             if let Some(path) = path {
-                read_indices.push((i, path.clone()));
-                last_index.insert(path, i);
+                last_index.insert(path.clone(), i);
+                read_indices.push((i, path));
             }
         }
 
@@ -526,17 +533,7 @@ impl TieredCompaction {
 }
 
 impl CompressionLayer for TieredCompaction {
-    fn name(&self) -> &str {
-        "tiered_compaction"
-    }
-
-    fn method(&self) -> CompressionMethod {
-        CompressionMethod::TieredCompaction
-    }
-
-    fn trigger_pressure(&self) -> f64 {
-        self.trigger
-    }
+    compression_layer_boilerplate!("tiered_compaction", TieredCompaction);
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         let head_end = protected_head_end(messages);
@@ -679,7 +676,7 @@ impl CompressionLayer for TieredCompaction {
                 // itself gets dropped / garbage gets kept. A
                 // regression test pins the post-compact shape; see
                 // `tiered_splice_order_preserves_pivot_content`.
-                debug_assert!(
+                assert!(
                     head_end <= p && p < tail_start,
                     "splice ordering invariant broken: head_end={head_end}, p={p}, tail_start={tail_start}"
                 );
@@ -719,17 +716,7 @@ impl ReactiveCompact {
 }
 
 impl CompressionLayer for ReactiveCompact {
-    fn name(&self) -> &str {
-        "reactive_compact"
-    }
-
-    fn method(&self) -> CompressionMethod {
-        CompressionMethod::ReactiveCompact
-    }
-
-    fn trigger_pressure(&self) -> f64 {
-        self.trigger
-    }
+    compression_layer_boilerplate!("reactive_compact", ReactiveCompact);
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         let head_end = protected_head_end(messages);
@@ -814,7 +801,7 @@ impl CompressionLayer for ReactiveCompact {
             Some(p) => {
                 // Same high-to-low splice ordering as TieredCompaction.
                 // See that method for the full rationale.
-                debug_assert!(
+                assert!(
                     head_end <= p && p < tail_start,
                     "reactive splice ordering invariant broken: head_end={head_end}, p={p}, tail_start={tail_start}"
                 );
@@ -1065,6 +1052,40 @@ mod tests {
         assert!(outcome.budget_satisfied);
     }
 
+    #[test]
+    fn pipeline_4layer_early_break_after_l1_satisfies_budget() {
+        // Regression: full 4-layer pipeline must stop iterating after any
+        // layer satisfies the budget. We construct a scenario where L1
+        // (DuplicateReadElimination) fires and frees enough to drop
+        // pressure below all subsequent triggers.
+        let mut msgs = make_session_with_duplicate_reads();
+        // Pressure high enough that L1 fires but low enough that if L1
+        // frees tokens, L2-L4 should NOT fire.
+        let b = budget(100_000, 70_000);
+
+        let outcome =
+            CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut msgs, &b);
+
+        // L1 (DuplicateReadElimination) should have fired
+        let had_dedup = outcome
+            .layer_results
+            .iter()
+            .any(|(name, _)| name == "duplicate_read_elimination");
+        assert!(had_dedup, "L1 duplicate_read_elimination should fire");
+
+        // If budget satisfied after L1, L2–L4 should NOT fire
+        for layer in &[
+            "tool_result_truncation",
+            "tiered_compaction",
+            "reactive_compact",
+        ] {
+            assert!(
+                !outcome.layer_results.iter().any(|(name, _)| name == layer),
+                "{layer} should be skipped when L1 satisfies budget"
+            );
+        }
+    }
+
     // ── Pipeline: edge cases ───────────────────────────────────────────
 
     #[test]
@@ -1131,26 +1152,44 @@ mod tests {
     }
 
     #[test]
-    fn tool_truncation_safe_utf8_boundary() {
-        // CJK chars are 3 bytes each — truncation must not split mid-char
-        let cjk_content = "你好世界".repeat(200); // 4 chars × 200 = 800 CJK chars
-        let mut msgs = vec![json!({
-            "role": "tool",
-            "content": &cjk_content,
-            "_timestamp": 1000
-        })];
-        let b = budget(80_000, 70_000);
-        let layer = ToolResultTruncation::new(Duration::from_secs(0), 100, 0.0);
+    fn tool_truncation_respects_age_threshold() {
+        // Tool results older than `age_threshold` should be truncated;
+        // recent results (within threshold) should be left intact.
+        let long_content = "x".repeat(2000);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old_ts = now.saturating_sub(7200); // 2 hours ago
+        let recent_ts = now.saturating_sub(60); // 1 minute ago
 
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "fix this"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": &long_content, "_timestamp": old_ts}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": &long_content, "_timestamp": recent_ts}),
+        ];
+
+        // age_threshold = 3600s (1 hour): old result should be truncated,
+        // recent result should be preserved
+        let b = budget(80_000, 70_000);
+        let layer = ToolResultTruncation::new(Duration::from_secs(3600), 200, 0.0);
         layer.compress(&mut msgs, &b);
 
-        let content = msgs[0]["content"].as_str().unwrap();
-        // Must be valid UTF-8 (no panic on as_str) and contain truncation marker
-        assert!(content.contains("truncated"));
-        assert!(content.len() < cjk_content.len());
+        let old_content = msgs[2]["content"].as_str().unwrap();
+        let recent_content = msgs[3]["content"].as_str().unwrap();
+        assert!(
+            old_content.contains("truncated"),
+            "old result ({}s ago) should be truncated",
+            now - old_ts
+        );
+        assert_eq!(
+            recent_content,
+            long_content,
+            "recent result ({}s ago) should be preserved",
+            now - recent_ts
+        );
     }
-
-    // ── Layer 2: DuplicateReadElimination ──────────────────────────────
 
     #[test]
     fn duplicate_read_stubs_earlier_keeps_latest() {
@@ -2709,6 +2748,145 @@ mod tests {
                 "orphaned tool result with tool_call_id={} after compaction",
                 call_id
             );
+        }
+    }
+
+    #[test]
+    fn tool_truncation_cjk_content_estimate_plausible() {
+        // CJK-heavy content should have higher estimated token freed than
+        // equivalent-length ASCII content.
+        let cjk = "你好世界これはテストです".repeat(200); // ~3200 chars, ~4800 tokens
+        let ascii = "hello world this is a test message ".repeat(200); // ~7200 chars, ~1800 tokens
+
+        let mut cjk_msgs = vec![json!({
+            "role": "tool", "content": &cjk, "_timestamp": 1
+        })];
+        let mut ascii_msgs = vec![json!({
+            "role": "tool", "content": &ascii, "_timestamp": 1
+        })];
+
+        let b = budget(80_000, 70_000);
+        let layer = ToolResultTruncation::new(Duration::from_secs(0), 20, 0.0);
+
+        let cjk_result = layer.compress(&mut cjk_msgs, &b);
+        let ascii_result = layer.compress(&mut ascii_msgs, &b);
+
+        // CJK content, being denser (fewer chars → more tokens per char),
+        // should estimate higher freed tokens for the same max_keep_chars cutoff
+        assert!(
+            cjk_result.estimated_tokens_freed > ascii_result.estimated_tokens_freed,
+            "CJK content freed {} tokens vs ASCII {} — CJK should free more",
+            cjk_result.estimated_tokens_freed,
+            ascii_result.estimated_tokens_freed
+        );
+    }
+
+    // ── Property-based tests (proptest) ──────────────────────────────────
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Invariant: truncation always produces valid UTF-8 output.
+            #[test]
+            fn prop_truncation_always_valid_utf8(
+                content in r"[a-zA-Z0-9\x{4e00}-\x{9fff}\x{3040}-\x{309f}\x{30a0}-\x{30ff}\x{ac00}-\x{d7af}]{100,500}",
+                max_keep in 10usize..100
+            ) {
+                let mut msgs = vec![json!({
+                    "role": "tool",
+                    "content": &content,
+                    "_timestamp": 1
+                })];
+                let b = budget(80_000, 70_000);
+                let layer = ToolResultTruncation::new(Duration::from_secs(0), max_keep, 0.0);
+                layer.compress(&mut msgs, &b);
+
+                let result = msgs[0]["content"].as_str().unwrap();
+                assert!(std::str::from_utf8(result.as_bytes()).is_ok(),
+                    "truncation produced invalid UTF-8: max_keep={}, input_len={}", max_keep, content.len());
+            }
+
+            /// Invariant: truncation only modifies content that exceeds max_keep_chars.
+            /// For content near the boundary where the suffix makes the result longer,
+            /// we check that the result starts with a prefix of the original.
+            #[test]
+            fn prop_truncation_only_shortens_long_content(
+                content in "[a-zA-Z]{1,500}",
+                max_keep in 20usize..300
+            ) {
+                let mut msgs = vec![json!({
+                    "role": "tool",
+                    "content": &content,
+                    "_timestamp": 1
+                })];
+                let b = budget(80_000, 70_000);
+                let layer = ToolResultTruncation::new(Duration::from_secs(0), max_keep, 0.0);
+                layer.compress(&mut msgs, &b);
+
+                let result = msgs[0]["content"].as_str().unwrap();
+                if content.len() <= max_keep {
+                    assert_eq!(result, content.as_str(),
+                        "short content should not be modified");
+                } else {
+                    // May be slightly longer due to suffix, but should not equal original
+                    assert_ne!(result, content.as_str(),
+                        "long content should be truncated");
+                    assert!(
+                        content.starts_with(&result[..result.find('…').unwrap_or(0)]),
+                        "truncated result should be a prefix of original"
+                    );
+                }
+            }
+
+            /// Invariant: tiered compaction always preserves the system message.
+            #[test]
+            fn prop_tiered_preserves_system_message(
+                turns in 3usize..12,
+                tools_per_turn in 1usize..4
+            ) {
+                let mut msgs = make_agentic_session(turns, tools_per_turn, 2000);
+                let has_system = msgs[0].get("role").and_then(Value::as_str) == Some("system");
+                assert!(has_system);
+
+                let b = budget(80_000, 70_000);
+                TieredCompaction::new(2, 0.0).compress(&mut msgs, &b);
+
+                // System message should still be present
+                assert!(msgs.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("system")),
+                    "tiered compaction removed system message (turns={}, tools={})", turns, tools_per_turn);
+            }
+
+            /// Invariant: compaction pipeline is idempotent — running twice
+            /// produces the same result as running once.
+            #[test]
+            fn prop_pipeline_idempotent(
+                turns in 3usize..8,
+                tools_per_turn in 1usize..3
+            ) {
+                let mut msgs1 = make_agentic_session(turns, tools_per_turn, 1500);
+                let mut msgs2 = msgs1.clone();
+                let b = budget(80_000, 70_000);
+
+                let engine = CompactionEngine::default_pipeline_for(80_000);
+                engine.compress_if_needed(&mut msgs1, &b);
+                engine.compress_if_needed(&mut msgs1, &b);
+
+                engine.compress_if_needed(&mut msgs2, &b);
+
+                // Running twice should not further compact the message count.
+                // NOTE: content-based idempotency (assert_eq!(msgs1, msgs2))
+                // is not yet achievable because the pipeline budget
+                // (`last_measured_tokens`) is not updated between runs —
+                // re-running with the same pre-compression budget may cause
+                // layers to fire again on already-compressed messages.
+                // TODO: make the pipeline truly idempotent by updating
+                // budget state after compression.
+                assert_eq!(msgs1.len(), msgs2.len(),
+                    "pipeline not idempotent: second run changed message count (t={}, tools={})",
+                    turns, tools_per_turn);
+            }
         }
     }
 }

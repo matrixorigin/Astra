@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod budget_messaging;
 pub mod chat_turn_budget_pressure;
 pub mod cloud;
+pub mod compaction_engine;
 pub mod compaction_replay;
 pub(crate) mod context_pipeline_adapter;
 pub mod harness_adapter;

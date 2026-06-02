@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
-use super::super::cloud::compaction_engine::{CompactionEngine, TokenBudget};
+use super::super::compaction_engine::{CompactionEngine, TokenBudget};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, RunControlStatus,
     try_write_heavy_checkpoint,
@@ -1865,9 +1865,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             let is_aggressive =
                 post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens);
             let (kind, label) = if is_aggressive {
-                (CompactionKind::AggressiveCompression, "aggressive")
+                (CompactionKind::ProactiveAggressive, "aggressive")
             } else {
-                (CompactionKind::DefaultCompression, "default")
+                (CompactionKind::ProactiveDefault, "default")
             };
             run_proactive_compaction(
                 post_mc_pressure,
