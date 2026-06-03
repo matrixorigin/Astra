@@ -1,11 +1,12 @@
 use super::encryption::FernetTokenEncryptor;
 use super::jwt::decode_jwt_claims;
 use crate::admin::{
-    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
-    AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord,
-    AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
-    AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
-    AdminUserRoleRequestData, AuthenticatedUser,
+    ADMIN_TOKEN_SCOPE_GLOBAL, ADMIN_TOKEN_SCOPE_REPO, ADMIN_TOKEN_SCOPE_USER, AdminAuditFilter,
+    AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminFeedbackStatsFilter,
+    AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord, AdminInitializer,
+    AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader, AdminTokenRecord,
+    AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord, AdminUserRoleRequestData,
+    AuthenticatedUser,
 };
 use crate::pagination::clamp_admin_audit_limit;
 use astra_core::{
@@ -367,16 +368,48 @@ impl AdminTokenReader for DatabaseAdminTokenReader {
             has_where = true;
         }
 
+        if let Some(provider) = filter.provider {
+            query_builder.push(if has_where { " AND " } else { " WHERE " });
+            query_builder.push("provider = ");
+            query_builder.push_bind(provider);
+            has_where = true;
+        }
+
         if let Some(scope) = filter.scope.as_deref() {
             let clause = match scope {
-                "user" => Some("scope_user_id IS NOT NULL"),
-                "repo" => Some("scope_repo IS NOT NULL"),
-                "global" => Some("scope_user_id IS NULL AND scope_repo IS NULL"),
+                ADMIN_TOKEN_SCOPE_USER => Some("scope_user_id IS NOT NULL"),
+                ADMIN_TOKEN_SCOPE_REPO => Some("scope_repo IS NOT NULL"),
+                ADMIN_TOKEN_SCOPE_GLOBAL => Some("scope_user_id IS NULL AND scope_repo IS NULL"),
                 _ => None,
             };
             if let Some(clause) = clause {
                 query_builder.push(if has_where { " AND " } else { " WHERE " });
                 query_builder.push(clause);
+                has_where = true;
+            }
+        }
+
+        if let Some(scope_id) = filter.scope_id {
+            query_builder.push(if has_where { " AND " } else { " WHERE " });
+            match filter.scope.as_deref() {
+                Some(ADMIN_TOKEN_SCOPE_REPO) => {
+                    query_builder.push("scope_repo = ");
+                    query_builder.push_bind(scope_id);
+                }
+                Some(ADMIN_TOKEN_SCOPE_GLOBAL) => {
+                    query_builder.push("1 = 0");
+                }
+                Some(ADMIN_TOKEN_SCOPE_USER) => {
+                    query_builder.push("scope_user_id = ");
+                    query_builder.push_bind(scope_id);
+                }
+                _ => {
+                    query_builder.push("(scope_user_id = ");
+                    query_builder.push_bind(scope_id.clone());
+                    query_builder.push(" OR scope_repo = ");
+                    query_builder.push_bind(scope_id);
+                    query_builder.push(")");
+                }
             }
         }
 
@@ -417,6 +450,9 @@ impl AdminTokenWriter for DatabaseAdminTokenWriter {
         &self,
         request: AdminTokenCreateRequestData,
     ) -> Result<AdminTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        request
+            .validate()
+            .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
         let token_id = Uuid::new_v4().to_string();
         let provider = request.provider.unwrap_or_else(|| "unknown".to_string());
         let encrypted_value = request
@@ -425,12 +461,12 @@ impl AdminTokenWriter for DatabaseAdminTokenWriter {
             .map(|value| self.encryptor.encrypt(value))
             .transpose()
             .map_err(internal_error)?;
-        let scope_user_id = if request.scope == "user" {
+        let scope_user_id = if request.scope == ADMIN_TOKEN_SCOPE_USER {
             request.scope_id.clone()
         } else {
             None
         };
-        let scope_repo = if request.scope == "repo" {
+        let scope_repo = if request.scope == ADMIN_TOKEN_SCOPE_REPO {
             request.scope_id.clone()
         } else {
             None

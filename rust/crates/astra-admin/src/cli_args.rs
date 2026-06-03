@@ -30,6 +30,8 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Token(TokenCmd),
     #[command(subcommand)]
+    Taas(TaasCmd),
+    #[command(subcommand)]
     Skill(SkillCmd),
     #[command(subcommand)]
     Prompt(PromptCmd),
@@ -175,7 +177,11 @@ pub(crate) struct TokenListArgs {
     #[arg(long)]
     pub token_type: Option<String>,
     #[arg(long)]
+    pub provider: Option<String>,
+    #[arg(long)]
     pub scope: Option<String>,
+    #[arg(long)]
+    pub scope_id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -190,6 +196,26 @@ pub(crate) struct TokenCreateArgs {
     pub scope_id: Option<String>,
     #[arg(long)]
     pub token_value: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum TaasCmd {
+    ListKeys(TaasListKeysArgs),
+    BindKey(TaasBindKeyArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaasListKeysArgs {
+    #[arg(long)]
+    pub user_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaasBindKeyArgs {
+    #[arg(long)]
+    pub user_id: String,
+    #[arg(long)]
+    pub token_value: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -305,5 +331,65 @@ mod tests {
     fn default_api_url() {
         let cli = Cli::try_parse_from(["astra-admin", "init"]).unwrap();
         assert_eq!(cli.api_url, None);
+    }
+
+    #[test]
+    fn parse_token_list_filters() {
+        let cli = Cli::try_parse_from([
+            "astra-admin",
+            "token",
+            "list",
+            "--token-type",
+            "api_key",
+            "--provider",
+            "taas",
+            "--scope",
+            "user",
+            "--scope-id",
+            "u123",
+        ])
+        .unwrap();
+        if let Some(Command::Token(TokenCmd::List(args))) = cli.command {
+            assert_eq!(args.token_type.as_deref(), Some("api_key"));
+            assert_eq!(args.provider.as_deref(), Some("taas"));
+            assert_eq!(args.scope.as_deref(), Some("user"));
+            assert_eq!(args.scope_id.as_deref(), Some("u123"));
+        } else {
+            panic!("expected token list command");
+        }
+    }
+
+    #[test]
+    fn parse_taas_bind_key_requires_token_value() {
+        let result = Cli::try_parse_from(["astra-admin", "taas", "bind-key", "--user-id", "u123"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_taas_commands() {
+        let bind = Cli::try_parse_from([
+            "astra-admin",
+            "taas",
+            "bind-key",
+            "--user-id",
+            "u123",
+            "--token-value",
+            "taas-key",
+        ])
+        .unwrap();
+        if let Some(Command::Taas(TaasCmd::BindKey(args))) = bind.command {
+            assert_eq!(args.user_id, "u123");
+            assert_eq!(args.token_value, "taas-key");
+        } else {
+            panic!("expected taas bind-key command");
+        }
+
+        let list =
+            Cli::try_parse_from(["astra-admin", "taas", "list-keys", "--user-id", "u123"]).unwrap();
+        if let Some(Command::Taas(TaasCmd::ListKeys(args))) = list.command {
+            assert_eq!(args.user_id.as_deref(), Some("u123"));
+        } else {
+            panic!("expected taas list-keys command");
+        }
     }
 }

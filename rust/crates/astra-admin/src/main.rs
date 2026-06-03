@@ -18,6 +18,10 @@ use http_helpers::*;
 use input::*;
 use interactive::run_interactive;
 
+const TAAS_TOKEN_TYPE: &str = "api_key";
+const TAAS_TOKEN_PROVIDER: &str = "taas";
+const TAAS_TOKEN_SCOPE: &str = "user";
+
 /// Parse `POST /models` or `PUT /models/{name}` JSON and print `is_active` / `connectivity`.
 fn print_model_load_server_result(body: &str, model_name: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -606,8 +610,14 @@ async fn main() -> Result<(), String> {
             if let Some(token_type) = args.token_type {
                 q.push(("token_type", token_type));
             }
+            if let Some(provider) = args.provider {
+                q.push(("provider", provider));
+            }
             if let Some(scope) = args.scope {
                 q.push(("scope", scope));
+            }
+            if let Some(scope_id) = args.scope_id {
+                q.push(("scope_id", scope_id));
             }
             let body = api
                 .get_bearer_path_query_text(&token, paths::ADMIN_TOKENS, &q)
@@ -627,6 +637,42 @@ async fn main() -> Result<(), String> {
                         "provider": args.provider,
                         "scope": args.scope,
                         "scope_id": args.scope_id,
+                        "token_value": args.token_value
+                    }),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
+        Command::Taas(TaasCmd::ListKeys(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let mut q = vec![
+                ("token_type", TAAS_TOKEN_TYPE.to_string()),
+                ("provider", TAAS_TOKEN_PROVIDER.to_string()),
+                ("scope", TAAS_TOKEN_SCOPE.to_string()),
+            ];
+            if let Some(user_id) = args.user_id {
+                q.push(("scope_id", user_id));
+            }
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_TOKENS, &q)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
+        Command::Taas(TaasCmd::BindKey(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_TOKENS,
+                    &serde_json::json!({
+                        "token_type": TAAS_TOKEN_TYPE,
+                        "provider": TAAS_TOKEN_PROVIDER,
+                        "scope": TAAS_TOKEN_SCOPE,
+                        "scope_id": args.user_id,
                         "token_value": args.token_value
                     }),
                 )

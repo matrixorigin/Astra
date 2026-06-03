@@ -415,7 +415,9 @@ pub struct LearningTriggerResponse {
 #[derive(Deserialize, Default)]
 pub struct AdminTokenListQuery {
     pub token_type: Option<String>,
+    pub provider: Option<String>,
     pub scope: Option<String>,
+    pub scope_id: Option<String>,
 }
 
 #[cfg(feature = "server")]

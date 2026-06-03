@@ -20,7 +20,9 @@ pub(super) async fn admin_list_tokens_handler(
         .token_reader
         .list_tokens(AdminTokenFilter {
             token_type: query.token_type,
+            provider: query.provider,
             scope: query.scope,
+            scope_id: query.scope_id,
         })
         .await?;
 
@@ -35,17 +37,17 @@ pub(super) async fn admin_create_token_handler(
     Json(request): Json<AdminTokenCreateRequest>,
 ) -> Result<(StatusCode, Json<AdminTokenResponse>), (StatusCode, Json<ErrorResponse>)> {
     state.admin.authorizer.require_admin(&headers).await?;
-    let created = state
-        .admin
-        .token_writer
-        .create_token(AdminTokenCreateRequestData {
-            token_type: request.token_type,
-            provider: request.provider,
-            scope: request.scope,
-            scope_id: request.scope_id,
-            token_value: request.token_value,
-        })
-        .await?;
+    let request_data = AdminTokenCreateRequestData {
+        token_type: request.token_type,
+        provider: request.provider,
+        scope: request.scope,
+        scope_id: request.scope_id,
+        token_value: request.token_value,
+    };
+    request_data
+        .validate()
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+    let created = state.admin.token_writer.create_token(request_data).await?;
 
     Ok((StatusCode::CREATED, Json(AdminTokenResponse::from(created))))
 }

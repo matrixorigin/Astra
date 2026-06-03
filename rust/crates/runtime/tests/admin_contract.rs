@@ -131,11 +131,17 @@ impl AdminTokenReader for StubAdminTokenReader {
         if let Some(token_type) = filter.token_type {
             tokens.retain(|token| token.token_type == token_type);
         }
+        if let Some(provider) = filter.provider {
+            tokens.retain(|token| token.provider.as_deref() == Some(provider.as_str()));
+        }
         if let Some(scope) = filter.scope {
             match scope.as_str() {
                 "user" | "repo" | "global" => tokens.retain(|token| token.scope == scope),
                 _ => {}
             }
+        }
+        if let Some(scope_id) = filter.scope_id {
+            tokens.retain(|token| token.scope_id.as_deref() == Some(scope_id.as_str()));
         }
 
         Ok(tokens)
@@ -539,6 +545,44 @@ async fn admin_token_create_matches_shared_contract() {
 }
 
 #[tokio::test]
+async fn admin_token_create_rejects_invalid_taas_binding() {
+    let (status, json) = post_json(
+        build_app_with_admin(),
+        "/admin/tokens",
+        &[("authorization", "Bearer admin-token")],
+        serde_json::json!({
+            "token_type": "api_key",
+            "provider": "taas",
+            "scope": "user",
+            "scope_id": "contract-user-123"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["detail"], "TAAS token bindings require token_value");
+}
+
+#[tokio::test]
+async fn admin_token_create_rejects_invalid_scope_shape() {
+    let (status, json) = post_json(
+        build_app_with_admin(),
+        "/admin/tokens",
+        &[("authorization", "Bearer admin-token")],
+        serde_json::json!({
+            "token_type": "llm",
+            "provider": "openai",
+            "scope": "global",
+            "scope_id": "contract-user-123"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["detail"], "scope_id must be omitted for global tokens");
+}
+
+#[tokio::test]
 async fn admin_async_jobs_match_shared_contract() {
     let contract = load_contract();
     let app = build_app_with_admin();
@@ -671,6 +715,39 @@ async fn admin_tokens_variants_match_shared_contract() {
         assert_eq!(status.as_u16(), expected.status, "{label}");
         assert_contract_json(&json, &expected.json, label);
     }
+
+    let (status, json) = read_json(
+        app.clone(),
+        "/admin/tokens?provider=github&scope=user&scope_id=contract-user-123",
+        auth,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json,
+        serde_json::json!([{
+            "token_id": "contract-user-token",
+            "token_type": "api",
+            "provider": "github",
+            "scope": "user",
+            "scope_id": "contract-user-123",
+            "created_at": "2026-01-02T09:30:00"
+        }])
+    );
+
+    let (status, json) = read_json(app, "/admin/tokens?scope_id=contract-user-123", auth).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json,
+        serde_json::json!([{
+            "token_id": "contract-user-token",
+            "token_type": "api",
+            "provider": "github",
+            "scope": "user",
+            "scope_id": "contract-user-123",
+            "created_at": "2026-01-02T09:30:00"
+        }])
+    );
 }
 
 #[tokio::test]
