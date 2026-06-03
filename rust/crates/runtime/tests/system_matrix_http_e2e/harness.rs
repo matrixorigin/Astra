@@ -112,6 +112,33 @@ fn build_hs256_jwt(secret: &str, claims: Value) -> String {
     format!("{signing_input}.{signature_b64}")
 }
 
+/// Normalized JWT secret matching [`astra_core::config`] / auth service.
+pub fn e2e_normalized_jwt_secret() -> String {
+    let secret = std::env::var("ASTRA_JWT_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
+    if secret.len() >= 32 {
+        secret
+    } else {
+        let mut padded = secret;
+        padded.extend(std::iter::repeat_n('0', 32 - padded.len()));
+        padded
+    }
+}
+
+/// Build a local-JWT access token for negative-path tests (expired / custom claims).
+pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> String {
+    build_hs256_jwt(
+        &e2e_normalized_jwt_secret(),
+        json!({
+            "sub": user_id,
+            "username": username,
+            "token_type": "access",
+            "exp": exp_unix,
+            "iat": exp_unix.saturating_sub(3600),
+            "jti": Uuid::new_v4().to_string()
+        }),
+    )
+}
+
 fn set_env_var_for_e2e(name: &str, value: &str) {
     // SAFETY: this is guarded by `SERVER_STATE_ENV_LOCK`, so no concurrent env mutation/read among
     // system E2E bootstrap paths.
@@ -182,6 +209,15 @@ async fn build_state_with_mode(
 #[derive(Clone, Default)]
 pub struct E2eMemoriaStub {
     pub calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// When true, [`MemoriaForwarder::forward`] returns an error (simulates Memoria outage).
+    pub fail_forward: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl E2eMemoriaStub {
+    pub fn set_fail_forward(&self, fail: bool) {
+        use std::sync::atomic::Ordering;
+        self.fail_forward.store(fail, Ordering::Relaxed);
+    }
 }
 
 #[async_trait]
@@ -192,6 +228,10 @@ impl MemoriaForwarder for E2eMemoriaStub {
         endpoint: &str,
         body: Value,
     ) -> Result<Value, String> {
+        use std::sync::atomic::Ordering;
+        if self.fail_forward.load(Ordering::Relaxed) {
+            return Err(format!("memoria unavailable (e2e stub): {endpoint}"));
+        }
         self.calls.lock().await.push((endpoint.to_string(), body));
         if endpoint.contains("retrieve") {
             return Ok(json!({ "memories": [] }));

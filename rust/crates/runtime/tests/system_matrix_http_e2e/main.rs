@@ -126,6 +126,8 @@ mod journey_full;
 mod journey_full_capture_matrix;
 mod journey_meta_matrix;
 mod journey_remote_skills;
+mod journey_saas_negative_matrix;
+mod journey_saas_platform_matrix;
 mod journey_session_artifacts_matrix;
 mod journey_session_http_db_matrix;
 mod journey_stream_persistence;
@@ -160,12 +162,6 @@ async fn e2e_matrix_tasks_lease_and_db_assertions() {
     require_system_e2e_env();
     journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
 }
-
-// The real-LLM tool-chain path for `session_todos` lives in the harness
-// suite (`rust/crates/astra-test-harness/cases/session_todos_create_and_list.yaml`):
-// scripted `test_llm_rounds` here don't exercise server-side tool dispatch,
-// so a real model decision is the correct way to cover it. Direct MO
-// contract asserts live in `session_todos_cross_client_e2e.rs`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
@@ -579,4 +575,354 @@ async fn e2e_matrix_delegate_http_boundaries() {
 async fn e2e_matrix_admin_tokens_smoke() {
     require_system_e2e_env();
     journey_admin_smoke_matrix::run_admin_tokens_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3"]
+async fn e2e_matrix_saas_resource_limits_read_and_admin_override() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_resource_limits_read_and_admin_override().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3"]
+async fn e2e_matrix_saas_resource_daily_session_cap_denies_chat() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_resource_daily_session_cap_denies_chat().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3"]
+async fn e2e_matrix_saas_resource_concurrent_session_cap_denies_chat() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_resource_concurrent_session_cap_denies_chat().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.2"]
+async fn e2e_matrix_saas_admin_config_crud_rbac() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_admin_config_crud_rbac().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.2"]
+async fn e2e_matrix_saas_admin_grant_revoke_rbac_flow() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_admin_grant_revoke_rbac_flow().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3"]
+async fn e2e_matrix_saas_resource_usage_per_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_resource_usage_per_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.1"]
+async fn e2e_matrix_saas_auth_refresh_cycle() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_auth_refresh_cycle().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.4"]
+async fn e2e_matrix_saas_session_cross_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_session_cross_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.4"]
+async fn e2e_matrix_saas_events_and_audit_cross_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_events_and_audit_cross_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.1 auth negatives"]
+async fn e2e_matrix_saas_auth_negative_paths() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_auth_negative_paths().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3 resource negatives"]
+async fn e2e_matrix_saas_resource_governance_negative_paths() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_resource_governance_negative_paths().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3 concurrent cap recovery"]
+async fn e2e_matrix_saas_resource_concurrent_cap_recovery() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_resource_concurrent_cap_recovery().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 task lease negatives"]
+async fn e2e_matrix_saas_task_lease_negative_paths() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_task_lease_negative_paths().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.1 logout/expired JWT"]
+async fn e2e_matrix_saas_auth_logout_and_expired_token() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_auth_logout_and_expired_token().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.3 bash/disk limits contract"]
+async fn e2e_matrix_saas_resource_limits_extended_fields() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_resource_limits_extended_fields().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 lease contested/reclaim"]
+async fn e2e_matrix_saas_task_lease_contested_and_expired_reclaim() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_task_lease_contested_and_expired_reclaim().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 edge callback success"]
+async fn e2e_matrix_saas_edge_tool_result_success_path() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_edge_tool_result_success_path().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.7 Memoria degradation"]
+async fn e2e_matrix_saas_memoria_proxy_degradation() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_memoria_proxy_degradation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.3 run isolation"]
+async fn e2e_matrix_saas_run_cross_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_run_cross_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.3 run state conflict"]
+async fn e2e_matrix_saas_run_double_pause_conflict() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_run_double_pause_conflict().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 edges/status"]
+async fn e2e_matrix_saas_edges_status_smoke() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_edges_status_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 approval callback"]
+async fn e2e_matrix_saas_approval_respond_success_path() {
+    require_system_e2e_env();
+    journey_saas_negative_matrix::run_saas_approval_respond_success_path().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1/§7.4 health+me"]
+async fn e2e_matrix_saas_platform_health_and_auth_me() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_platform_health_and_auth_me().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1 refresh rotation"]
+async fn e2e_matrix_saas_auth_refresh_token_rotation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_auth_refresh_token_rotation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4/§5.7 memory isolation"]
+async fn e2e_matrix_saas_memory_proxy_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_memory_proxy_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.6 models list+encryption"]
+async fn e2e_matrix_saas_models_list_and_key_encryption() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_models_list_and_key_encryption().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1/§6.1 session CRUD"]
+async fn e2e_matrix_saas_session_lifecycle_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_session_lifecycle_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.3/§6.6 usage increment"]
+async fn e2e_matrix_saas_resource_usage_increments_after_chat() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_resource_usage_increments_after_chat().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 run cancel isolation"]
+async fn e2e_matrix_saas_run_cancel_cross_user_and_owner() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_run_cancel_cross_user_and_owner().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.2 approval deny"]
+async fn e2e_matrix_saas_approval_respond_deny_path() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_approval_respond_deny_path().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 pause/resume"]
+async fn e2e_matrix_saas_chat_run_pause_resume_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_chat_run_pause_resume_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.2 admin tokens"]
+async fn e2e_matrix_saas_admin_tokens_rbac_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_admin_tokens_rbac_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1 register/login"]
+async fn e2e_matrix_saas_auth_register_login_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_auth_register_login_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1 duplicate email"]
+async fn e2e_matrix_saas_auth_duplicate_email_register() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_auth_duplicate_email_register().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 GET /runs"]
+async fn e2e_matrix_saas_runs_list_pagination_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_runs_list_pagination_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.2 edge register"]
+async fn e2e_matrix_saas_edge_agent_registration_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_edge_agent_registration_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.2 admin cleanup"]
+async fn e2e_matrix_saas_admin_cleanup_rbac_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_admin_cleanup_rbac_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.2 admin audit"]
+async fn e2e_matrix_saas_admin_audit_rbac_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_admin_audit_rbac_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skills isolation"]
+async fn e2e_matrix_saas_skills_cross_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_skills_cross_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 team isolation"]
+async fn e2e_matrix_saas_team_cross_user_isolation() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_team_cross_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 session replay"]
+async fn e2e_matrix_saas_session_replay_compare_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_session_replay_compare_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 session replay POST"]
+async fn e2e_matrix_saas_session_replay_post_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_session_replay_post_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.2 admin feedback stats"]
+async fn e2e_matrix_saas_admin_feedback_stats_rbac() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_admin_feedback_stats_rbac().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 run projection"]
+async fn e2e_matrix_saas_run_projection_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_run_projection_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 session audit smoke"]
+async fn e2e_matrix_saas_session_audit_after_chat_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_session_audit_after_chat_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.2 task lease renew/release"]
+async fn e2e_matrix_saas_task_lease_renew_release_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_task_lease_renew_release_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1 platform snapshot"]
+async fn e2e_matrix_saas_platform_snapshot_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_platform_snapshot_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.1 session activity/transcript"]
+async fn e2e_matrix_saas_session_activity_transcript_artifacts_smoke() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_session_activity_transcript_artifacts_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 events/session positive"]
+async fn e2e_matrix_saas_events_session_after_chat_positive() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_events_session_after_chat_positive().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 delegate HTTP"]
+async fn e2e_matrix_saas_delegate_http_boundaries() {
+    require_system_e2e_env();
+    journey_saas_platform_matrix::run_saas_delegate_http_boundaries().await;
 }

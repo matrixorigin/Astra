@@ -144,7 +144,10 @@ impl DatabaseEventService {
             agent_version: row.try_get("agent_version").ok(),
             parent_event_id: row.try_get("parent_event_id").ok(),
             parent_event_ids: Vec::new(),
-            causal_chain_id: row.try_get("causal_chain_id").map_err(internal_error)?,
+            causal_chain_id: row
+                .try_get::<Option<String>, _>("causal_chain_id")
+                .map_err(internal_error)?
+                .unwrap_or_default(),
             metadata: serde_json::from_str(&metadata_json)
                 .unwrap_or(serde_json::Value::Object(Default::default())),
             created_at: row.try_get("created_at").unwrap_or_default(),

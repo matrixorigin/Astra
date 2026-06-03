@@ -41,6 +41,8 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
+	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
+	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
@@ -618,7 +620,7 @@ sweep:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online test-sdk-offline test-sdk-online
+.PHONY: test test-offline test-online test-saas test-saas-coverage test-sdk-offline test-sdk-online
 test: test-offline test-online
 
 .PHONY: test-dashboard
@@ -730,6 +732,116 @@ test-online:
 	@echo ""
 	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
 	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
+
+# SaaS platform E2E (docs/testing/saas-test-plan.md §5): resource governance, admin RBAC,
+# auth refresh, session reaper. Requires MatrixOne + .env secrets (same as test-online).
+# Serial (--test-threads=1): parallel runs share astra_runtime_test and each bootstrap
+# calls recover_active_runs(), which marks other tests' in-flight runs as failed.
+.PHONY: test-saas
+test-saas:
+	@if [ ! -f .env ]; then \
+		echo "No .env found — creating from .env.example..."; \
+		cp .env.example .env; \
+	fi
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	TEST_DB=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
+	echo "Running SaaS platform E2E (ASTRA_TEST_DB_IT=1, database=$$TEST_DB, --test-threads=1)..."; \
+	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_TEST_DB_IT=1 ASTRA_TEST_BRIDGE_SECRET=$${ASTRA_TEST_BRIDGE_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
+	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
+	CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) \
+		-p astra-runtime \
+		--features bridge-e2e-hooks \
+		--test system_matrix_http_e2e \
+		-- --ignored --nocapture e2e_matrix_saas_ --test-threads=1 \
+	&& ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_TEST_DB_IT=1 \
+	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
+	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
+	CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) \
+		-p astra-services \
+		--test session_reaper_db_integration \
+		-- --ignored --nocapture reaper_marks_stale --test-threads=1 \
+	|| { echo "❌ test-saas failed (Rust)"; exit 1; }; \
+	echo "Rust SaaS E2E passed"; \
+	API_PORT=$${ASTRA_API_PORT:-8000}; \
+	HEALTH=$$(curl -sf -o /dev/null -w '%{http_code}' "http://127.0.0.1:$$API_PORT/health" 2>/dev/null || echo 000); \
+	if [ "$$HEALTH" = "200" ]; then \
+		if command -v npm >/dev/null 2>&1; then \
+			echo "Running @astra/sdk SaaS remote (http://127.0.0.1:$$API_PORT)..."; \
+			cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts && \
+			ASTRA_SDK_BASE_URL="http://127.0.0.1:$$API_PORT" npm run test:integration:saas \
+			|| { echo "❌ test-saas failed (SDK)"; exit 1; }; \
+		else \
+			echo "Skipping @astra/sdk SaaS remote (npm not in PATH; install Node or run: cd packages/sdk && npm run test:integration:saas)"; \
+		fi; \
+	else \
+		echo "Skipping @astra/sdk SaaS remote (astra-server not healthy on :$$API_PORT)"; \
+	fi; \
+	echo "✅ SaaS platform E2E passed"
+
+# SaaS E2E line coverage (llvm-cov): same Rust tests as test-saas, serial execution.
+# Reports: coverage/saas-llvm/summary.txt (+ file-lines.txt, html/)
+# Tip: run `make dev-stop` first if dev-api holds DB connections (pool cap errors).
+SAAS_COV_DIR := coverage/saas-llvm
+.PHONY: test-saas-coverage
+test-saas-coverage:
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
+		echo "cargo-llvm-cov not found; install with: cargo install cargo-llvm-cov"; exit 1; \
+	}
+	@rustup component add llvm-tools-preview --toolchain stable >/dev/null 2>&1 || { \
+		echo "llvm-tools-preview required; run: rustup component add llvm-tools-preview"; exit 1; \
+	}
+	@if [ ! -f .env ]; then \
+		echo "No .env found — creating from .env.example..."; \
+		cp .env.example .env; \
+	fi
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	TEST_DB=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
+	mkdir -p $(SAAS_COV_DIR); \
+	echo "Running SaaS E2E with llvm coverage (database=$$TEST_DB, --test-threads=1)..."; \
+	echo "NOTE: if tests fail with connection cap, run: make dev-stop"; \
+	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_TEST_DB_IT=1 ASTRA_TEST_BRIDGE_SECRET=$${ASTRA_TEST_BRIDGE_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
+	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
+	CARGO_INCREMENTAL=0 cargo llvm-cov test $(CARGO_MANIFEST_FLAG) \
+		--no-report --ignore-run-fail \
+		-p astra-runtime \
+		--features bridge-e2e-hooks \
+		--test system_matrix_http_e2e \
+		-- --ignored e2e_matrix_saas_ --test-threads=1; \
+	RUNTIME_EXIT=$$?; \
+	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_TEST_DB_IT=1 \
+	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
+	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
+	CARGO_INCREMENTAL=0 cargo llvm-cov test $(CARGO_MANIFEST_FLAG) \
+		--no-report --ignore-run-fail \
+		-p astra-services \
+		--test session_reaper_db_integration \
+		-- --ignored reaper_marks_stale; \
+	SERVICES_EXIT=$$?; \
+	if [ $$RUNTIME_EXIT -ne 0 ] || [ $$SERVICES_EXIT -ne 0 ]; then \
+		echo "⚠️  Some SaaS tests failed; generating coverage report anyway (--ignore-run-fail)"; \
+	fi; \
+	echo "Generating coverage reports -> $(SAAS_COV_DIR)/"; \
+	cargo llvm-cov report $(CARGO_MANIFEST_FLAG) \
+		--summary-only \
+		-p astra-runtime -p astra-services \
+		| tee $(SAAS_COV_DIR)/summary.txt; \
+	cargo llvm-cov report $(CARGO_MANIFEST_FLAG) \
+		--text \
+		-p astra-runtime -p astra-services \
+		-show-instantiations=false \
+		-show-regions=false \
+		| tee $(SAAS_COV_DIR)/file-lines.txt; \
+	cargo llvm-cov report $(CARGO_MANIFEST_FLAG) \
+		--html \
+		-p astra-runtime -p astra-services \
+		--output-dir $(SAAS_COV_DIR)/html; \
+	echo "✅ Line coverage report: $(SAAS_COV_DIR)/summary.txt (+ html/)"
 
 # Live-LLM suite: hits real provider APIs listed in .models.yaml.
 # Picks ONE model per distinct provider at runtime — what's in the yaml gets
