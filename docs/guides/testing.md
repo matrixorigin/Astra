@@ -38,7 +38,6 @@ cargo check --manifest-path rust/Cargo.toml
 - `fixtures/contracts/` — JSON fixtures for contract tests that load shared request/response shapes.
 - `tests/fixtures/golden_sessions/` — golden session payloads for selected flows.
 - Capability ↔ route ↔ E2E mapping: [`docs/testing/system-e2e-matrix.md`](../testing/system-e2e-matrix.md).
-- 发布质量测试计划：[`docs/testing/release-test-plan.md`](../testing/release-test-plan.md)（GA 前质量验证，非 CI）
 - SaaS 能力测试计划：[`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md)（`make test-saas`；含 Rust HTTP E2E + 可选 `@astra/sdk` 远程）
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
 

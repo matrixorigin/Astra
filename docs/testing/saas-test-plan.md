@@ -2,7 +2,7 @@
 
 > **目的**：验证 Astra 作为 **托管云服务（SaaS）** 对外交付时，平台侧能力是否达标——用户通过 CLI / SDK / Web 连接云端 API，而非直连数据库。  
 > **范围**：认证与租户隔离、Cloud 运行时、资源治理、Admin 运维、多客户端协议、部署拓扑、可观测性与安全。  
-> **说明**：本文聚焦 **SaaS 发布质量验证**，不涉及 CI 流水线或 PR 门禁。与 [发布质量测试计划](./release-test-plan.md) 互补：后者覆盖 Engine 全能力；本文 **专门刻画 SaaS 形态下的必测项**。  
+> **说明**：本文聚焦 **SaaS 发布质量验证**，不涉及 CI 流水线或 PR 门禁；**专门刻画 SaaS 形态下的必测项**。  
 > **相关文档**：[部署架构](../design/deployment-architecture.md) · [Edge-Cloud 分执行](../design/edge-cloud-execution.md) · [多 Agent Cloud Runtime](../design/multi-agent-cloud-runtime.md) · [信任与安全](../design/trust-and-safety.md) · [系统 E2E 矩阵](./system-e2e-matrix.md)
 
 ---
@@ -48,7 +48,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 |----------|----------|--------------|
 | **接入与认证** | 注册/登录/刷新/登出；未授权 401/403 明确 | Auth E2E + 安全测试 |
 | **Thin Client 协议** | CLI、SDK、Web 共用同一 HTTP 协议，无 hidden state | SDK E2E + §4 场景 |
-| **Cloud 运行时** | `/chat/turn` enrichment、SSE、审计链完整 | Edge-Cloud E2E（见 release-test-plan §3.6） |
+| **Cloud 运行时** | `/chat/turn` enrichment、SSE、审计链完整 | Edge-Cloud E2E（system_matrix + bridge hooks） |
 | **租户与用户隔离** | 用户 A 无法读/写用户 B 的 Session/Memory/Team | 隔离矩阵测试 |
 | **资源治理** | 超配额拒绝；Admin 可 override；计量准确 | ResourceGovernor + Admin API |
 | **Admin 运维** | 冷启动、模型加载、用户/Token/配置管理 | Admin smoke + 部署验收 |
@@ -83,7 +83,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 
 ## 4. 第一层：Cloud 运行时协议（SaaS 核心路径）
 
-> 详细用例见 [release-test-plan.md §3.6、§4.8](./release-test-plan.md)。本节强调 **SaaS 视角的必过项**。
+> 本节强调 **SaaS 视角的 Cloud 运行时必过项**。
 
 ### 4.1 `/chat/turn` — SaaS 价值载体
 
@@ -530,7 +530,7 @@ SaaS 平台（第二层）
 | 安全 + 渗透 | 安全 + QA | ~1 周 |
 | **合计（SaaS GA）** | | **~8 周** |
 
-可与 [release-test-plan.md §10](./release-test-plan.md) 并行；div overlap 部分（Edge-Cloud）只测一次。
+Edge-Cloud 与 Engine 能力重叠部分只测一次。
 
 ---
 
@@ -566,13 +566,3 @@ SaaS 平台（第二层）
 | Multi-Account 无自动化 | 租户隔离 | 专项手工 + 脚本化 smoke |
 | Marketplace install/rollback | 技能生态 SaaS | Beta 后迭代 |
 
----
-
-## 14. 与 release-test-plan 的关系
-
-| 文档 | 侧重点 |
-|------|--------|
-| [release-test-plan.md](./release-test-plan.md) | Engine 全能力 GA（Harness、Benchmark、Golden） |
-| **本文（saas-test-plan.md）** | **托管服务形态**：认证、治理、多客户端、运维、规模化 |
-
-**执行建议：** 同一轮发布中，§3–§5 与 release-test-plan 重叠项 **合并执行一次**；本文 **§5–§7、§10 第四层** 为 SaaS 增量必测。
