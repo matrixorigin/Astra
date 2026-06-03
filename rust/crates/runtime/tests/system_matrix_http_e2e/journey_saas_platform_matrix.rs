@@ -3,21 +3,21 @@
 //!
 //! Maps to `docs/testing/saas-test-plan.md` §5.1–§5.6.
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role, post_empty,
-    post_json, put_json, revoke_astra_admin_role,
+    E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role, post_empty, post_json,
+    put_json, revoke_astra_admin_role,
 };
 use super::journey_tasks_runs;
-use astra_services::session_journal::{JournalEventType, read_journal};
 use astra_services::ADMIN_CONFIG_KEY_REASONING_MODEL;
+use astra_services::session_journal::{JournalEventType, read_journal};
 
 struct E2eUserAuth {
     auth_header: String,
@@ -166,7 +166,10 @@ pub async fn run_saas_resource_limits_read_and_admin_override() {
     .await
     .expect("resource_limits row");
     assert_eq!(row.try_get::<i32, _>("max_sessions_per_day").ok(), Some(99));
-    assert_eq!(row.try_get::<i32, _>("max_concurrent_sessions").ok(), Some(7));
+    assert_eq!(
+        row.try_get::<i32, _>("max_concurrent_sessions").ok(),
+        Some(7)
+    );
 
     let (st_lim2, lim2) = get_json(app, "/resources/limits", Some(auth), &[]).await;
     assert_eq!(st_lim2, StatusCode::OK);
@@ -213,14 +216,12 @@ pub async fn run_saas_resource_daily_session_cap_denies_chat() {
         body
     };
 
-    let (st1, chat1) = post_json(
-        app,
-        "/chat",
-        Some(auth),
-        chat_body(None),
-    )
-    .await;
-    assert_eq!(st1, StatusCode::OK, "first /chat creates session under cap: {chat1}");
+    let (st1, chat1) = post_json(app, "/chat", Some(auth), chat_body(None)).await;
+    assert_eq!(
+        st1,
+        StatusCode::OK,
+        "first /chat creates session under cap: {chat1}"
+    );
     assert!(chat1.get("run_id").is_some(), "run_id: {chat1}");
 
     // Second auto-provisioned session hits daily cap (check_session_create on new session).
@@ -236,8 +237,7 @@ pub async fn run_saas_resource_daily_session_cap_denies_chat() {
         .or_else(|| chat2["message"].as_str())
         .unwrap_or("");
     assert!(
-        err.to_ascii_lowercase().contains("limit")
-            || err.to_ascii_lowercase().contains("resource"),
+        err.to_ascii_lowercase().contains("limit") || err.to_ascii_lowercase().contains("resource"),
         "readable denial: {chat2}"
     );
 
@@ -279,8 +279,7 @@ pub async fn run_saas_resource_concurrent_session_cap_denies_chat() {
     .await;
     assert_eq!(st_cap, StatusCode::OK);
 
-    let holding_run =
-        seed_capacity_holding_run(pool, user_id, ctx.session_id.as_str()).await;
+    let holding_run = seed_capacity_holding_run(pool, user_id, ctx.session_id.as_str()).await;
 
     let (st_denied, denied) = post_json(
         app,
@@ -318,7 +317,11 @@ pub async fn run_saas_admin_config_crud_rbac() {
     revoke_astra_admin_role(pool, user_id).await;
 
     let (st_denied, _) = get_json(app, "/admin/config", Some(auth), &[]).await;
-    assert_eq!(st_denied, StatusCode::FORBIDDEN, "config list without admin");
+    assert_eq!(
+        st_denied,
+        StatusCode::FORBIDDEN,
+        "config list without admin"
+    );
 
     grant_astra_admin_role(pool, user_id).await;
 
@@ -332,13 +335,7 @@ pub async fn run_saas_admin_config_crud_rbac() {
     assert_eq!(st_put, StatusCode::OK, "PUT admin config: {put_j}");
     assert_eq!(put_j["value"].as_str(), Some(model_value.as_str()));
 
-    let (st_get, get_j) = get_json(
-        app,
-        &format!("/admin/config/{key}"),
-        Some(auth),
-        &[],
-    )
-    .await;
+    let (st_get, get_j) = get_json(app, &format!("/admin/config/{key}"), Some(auth), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "GET admin config: {get_j}");
     assert_eq!(get_j["value"].as_str(), Some(model_value.as_str()));
 
@@ -354,13 +351,7 @@ pub async fn run_saas_admin_config_crud_rbac() {
     assert_eq!(st_del, StatusCode::OK, "DELETE admin config: {del_j}");
     assert_eq!(del_j["deleted"].as_bool(), Some(true));
 
-    let (st_missing, _) = get_json(
-        app,
-        &format!("/admin/config/{key}"),
-        Some(auth),
-        &[],
-    )
-    .await;
+    let (st_missing, _) = get_json(app, &format!("/admin/config/{key}"), Some(auth), &[]).await;
     assert_eq!(st_missing, StatusCode::NOT_FOUND, "GET after delete");
 
     ctx.pool.close().await;
@@ -471,7 +462,11 @@ pub async fn run_saas_resource_usage_per_user_isolation() {
         }),
     )
     .await;
-    assert_eq!(st_chat, StatusCode::OK, "chat creates session for usage: {chat_j}");
+    assert_eq!(
+        st_chat,
+        StatusCode::OK,
+        "chat creates session for usage: {chat_j}"
+    );
 
     let (st_a, use_a) = get_json(app, "/resources/usage", Some(auth_a), &[]).await;
     assert_eq!(st_a, StatusCode::OK);
@@ -576,11 +571,7 @@ pub async fn run_saas_session_cross_user_isolation() {
     );
 
     let (st_del, _) = delete_json(app, &path, Some(&user_b.auth_header)).await;
-    assert_eq!(
-        st_del,
-        StatusCode::NOT_FOUND,
-        "B must not DELETE A session"
-    );
+    assert_eq!(st_del, StatusCode::NOT_FOUND, "B must not DELETE A session");
 
     let (st_list_b, list_b) = get_json(app, "/sessions", Some(&user_b.auth_header), &[]).await;
     assert_eq!(st_list_b, StatusCode::OK);
@@ -732,7 +723,11 @@ pub async fn run_saas_auth_refresh_token_rotation() {
     assert_eq!(st_ref, StatusCode::OK, "refresh: {ref_j}");
     let new_access = ref_j["access_token"].as_str().expect("new access");
     let new_refresh = ref_j["refresh_token"].as_str().expect("new refresh");
-    assert_ne!(new_refresh, old_refresh.as_str(), "refresh token must rotate");
+    assert_ne!(
+        new_refresh,
+        old_refresh.as_str(),
+        "refresh token must rotate"
+    );
 
     let (st_old, old_j) = post_json(
         app,
@@ -831,19 +826,15 @@ pub async fn run_saas_models_list_and_key_encryption() {
         "models list after create: {list1}"
     );
 
-    let encrypted: Option<String> = sqlx::query_scalar(
-        "SELECT api_key_encrypted FROM infra_llm_models WHERE model_name = ?",
-    )
-    .bind(&model_name)
-    .fetch_optional(pool)
-    .await
-    .expect("select api_key_encrypted");
+    let encrypted: Option<String> =
+        sqlx::query_scalar("SELECT api_key_encrypted FROM infra_llm_models WHERE model_name = ?")
+            .bind(&model_name)
+            .fetch_optional(pool)
+            .await
+            .expect("select api_key_encrypted");
     let encrypted = encrypted.expect("encrypted key row");
     assert!(!encrypted.is_empty(), "api_key_encrypted must be set");
-    assert_ne!(
-        encrypted, plain_key,
-        "DB must not store plaintext api key"
-    );
+    assert_ne!(encrypted, plain_key, "DB must not store plaintext api key");
 
     let _ = delete_json(app, &format!("/models/{model_name}"), Some(auth)).await;
     ctx.pool.close().await;
@@ -959,12 +950,7 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
     let run_id = chat_j["run_id"].as_str().expect("run_id").to_string();
 
     // Pause so the run stays cancellable (mock runs may finish quickly otherwise).
-    let (st_pause, _) = post_empty(
-        app,
-        &format!("/chat/runs/{run_id}/pause"),
-        Some(auth_a),
-    )
-    .await;
+    let (st_pause, _) = post_empty(app, &format!("/chat/runs/{run_id}/pause"), Some(auth_a)).await;
     assert_eq!(st_pause, StatusCode::OK, "pause before cancel");
 
     let (auth_b, _, _, _) = register_fresh_user(app, "cancel_b").await;
@@ -1118,11 +1104,7 @@ pub async fn run_saas_auth_duplicate_email_register() {
         }),
     )
     .await;
-    assert_eq!(
-        st_dup,
-        StatusCode::BAD_REQUEST,
-        "duplicate email: {j_dup}"
-    );
+    assert_eq!(st_dup, StatusCode::BAD_REQUEST, "duplicate email: {j_dup}");
     let detail = j_dup["detail"].as_str().unwrap_or("");
     assert!(
         detail.to_ascii_lowercase().contains("email"),
@@ -1229,7 +1211,10 @@ pub async fn run_saas_admin_cleanup_rbac_smoke() {
     grant_astra_admin_role(pool, user_id).await;
     let (st_ok, body) = post_json(app, "/admin/cleanup", Some(auth), json!({})).await;
     assert_eq!(st_ok, StatusCode::OK, "admin cleanup: {body}");
-    assert!(body.get("total_deleted").is_some(), "cleanup summary: {body}");
+    assert!(
+        body.get("total_deleted").is_some(),
+        "cleanup summary: {body}"
+    );
     assert!(body.get("tables").is_some(), "cleanup tables: {body}");
 
     ctx.pool.close().await;
@@ -1409,7 +1394,11 @@ pub async fn run_saas_admin_feedback_stats_rbac() {
 
     revoke_astra_admin_role(pool, user_id).await;
     let (st_denied, _) = get_json(app, "/admin/feedback/stats", Some(auth), &[]).await;
-    assert_eq!(st_denied, StatusCode::FORBIDDEN, "feedback stats without admin");
+    assert_eq!(
+        st_denied,
+        StatusCode::FORBIDDEN,
+        "feedback stats without admin"
+    );
 
     grant_astra_admin_role(pool, user_id).await;
     let (st_ok, stats_j) = get_json(app, "/admin/feedback/stats", Some(auth), &[]).await;

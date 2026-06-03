@@ -114,7 +114,8 @@ fn build_hs256_jwt(secret: &str, claims: Value) -> String {
 
 /// Normalized JWT secret matching [`astra_core::config`] / auth service.
 pub fn e2e_normalized_jwt_secret() -> String {
-    let secret = std::env::var("ASTRA_JWT_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
+    let secret =
+        std::env::var("ASTRA_JWT_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
     if secret.len() >= 32 {
         secret
     } else {

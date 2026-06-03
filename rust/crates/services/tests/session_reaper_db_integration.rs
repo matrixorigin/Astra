@@ -45,13 +45,12 @@ async fn reaper_marks_stale_active_session_idle_then_ended() {
         "expected idle transition, got {idle_result:?}"
     );
 
-    let status_idle: String = sqlx::query_scalar(
-        "SELECT status FROM agent_sessions WHERE session_id = ?",
-    )
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("status after idle sweep");
+    let status_idle: String =
+        sqlx::query_scalar("SELECT status FROM agent_sessions WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("status after idle sweep");
     assert_eq!(status_idle, "idle");
 
     // Pass 2: end sessions idle longer than the threshold.
@@ -67,13 +66,11 @@ async fn reaper_marks_stale_active_session_idle_then_ended() {
         "expected ended transition, got {end_result:?}"
     );
 
-    let row = sqlx::query(
-        "SELECT status, ended_at FROM agent_sessions WHERE session_id = ?",
-    )
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("final row");
+    let row = sqlx::query("SELECT status, ended_at FROM agent_sessions WHERE session_id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("final row");
     let status = row.try_get::<String, _>("status").expect("status");
     assert_eq!(status, "ended", "session should end after long idle");
     let ended_at_set: Option<i64> = sqlx::query_scalar(

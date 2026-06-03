@@ -3,9 +3,9 @@
 //!
 //! Maps to `docs/testing/saas-test-plan.md` §5.1–§5.3, §4.2 (P/N/B coverage).
 
-use axum::http::{Request, StatusCode};
-use axum::body::Body;
 use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -17,10 +17,10 @@ use super::harness::{
     grant_astra_admin_role, post_empty, post_json, post_json_with_headers, put_json,
     revoke_astra_admin_role,
 };
-use astra_services::session_journal::{JournalEventType, read_journal};
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
 };
+use astra_services::session_journal::{JournalEventType, read_journal};
 
 fn parse_sse_events(raw: &str) -> Vec<Value> {
     raw.lines()
@@ -85,11 +85,7 @@ pub async fn run_saas_auth_negative_paths() {
         ("resources limits", "/resources/limits"),
     ] {
         let (st, body) = get_json(app, path, None, &[]).await;
-        assert_eq!(
-            st,
-            StatusCode::UNAUTHORIZED,
-            "{label} without auth: {body}"
-        );
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{label} without auth: {body}");
     }
 
     // N: malformed bearer → 401
@@ -309,8 +305,7 @@ pub async fn run_saas_resource_concurrent_cap_recovery() {
     assert_eq!(st_cap, StatusCode::OK);
 
     // N: concurrent cap hit — seed a paused run (mock /chat completes before pause).
-    let holding_run =
-        seed_capacity_holding_run(pool, user_id, ctx.session_id.as_str()).await;
+    let holding_run = seed_capacity_holding_run(pool, user_id, ctx.session_id.as_str()).await;
 
     let (st_denied, denied) = post_json(
         app,
@@ -415,17 +410,11 @@ pub async fn run_saas_task_lease_negative_paths() {
     );
 
     // N: user B cannot access A's task (404, not 403 leak)
-    let (st_get_b, get_b) =
-        get_json(app, &format!("/tasks/{task_id}"), Some(&auth_b), &[]).await;
+    let (st_get_b, get_b) = get_json(app, &format!("/tasks/{task_id}"), Some(&auth_b), &[]).await;
     assert_eq!(st_get_b, StatusCode::NOT_FOUND, "B get task: {get_b}");
 
-    let (st_lease_b, lease_b) = get_json(
-        app,
-        &format!("/tasks/{task_id}/lease"),
-        Some(&auth_b),
-        &[],
-    )
-    .await;
+    let (st_lease_b, lease_b) =
+        get_json(app, &format!("/tasks/{task_id}/lease"), Some(&auth_b), &[]).await;
     assert_eq!(st_lease_b, StatusCode::NOT_FOUND, "B get lease: {lease_b}");
 
     let (st_claim_b, claim_b) = post_json_with_headers(
@@ -694,13 +683,12 @@ pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
 
     cleanup_task_rows(pool, &user_id, &task_id).await;
     for agent_id in [&agent_a, &agent_b] {
-        let _ = sqlx::query(
-            "DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
-        )
-        .bind(&user_id)
-        .bind(agent_id)
-        .execute(pool)
-        .await;
+        let _ =
+            sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
+                .bind(&user_id)
+                .bind(agent_id)
+                .execute(pool)
+                .await;
     }
 
     ctx.pool.close().await;
@@ -781,11 +769,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
                 }),
             )
             .await;
-            assert_eq!(
-                st_tool,
-                StatusCode::OK,
-                "valid /tools/result: {tool_j}"
-            );
+            assert_eq!(st_tool, StatusCode::OK, "valid /tools/result: {tool_j}");
             posted_result = true;
         }
         if s.contains("\"type\":\"turn_complete\"") {
@@ -876,11 +860,7 @@ pub async fn run_saas_memoria_proxy_degradation() {
         }),
     )
     .await;
-    assert_eq!(
-        st_ok,
-        StatusCode::OK,
-        "memory store after recovery: {ok_j}"
-    );
+    assert_eq!(st_ok, StatusCode::OK, "memory store after recovery: {ok_j}");
 
     ctx.pool.close().await;
 }
@@ -910,25 +890,15 @@ pub async fn run_saas_run_cross_user_isolation() {
 
     let (auth_b, _user_b) = register_login_user(app, "run_iso_b").await;
 
-    let (st_get, get_j) = get_json(
-        app,
-        &format!("/chat/runs/{run_id}"),
-        Some(&auth_b),
-        &[],
-    )
-    .await;
+    let (st_get, get_j) = get_json(app, &format!("/chat/runs/{run_id}"), Some(&auth_b), &[]).await;
     assert_eq!(
         st_get,
         StatusCode::FORBIDDEN,
         "B must not GET A run: {get_j}"
     );
 
-    let (st_pause, pause_j) = post_empty(
-        app,
-        &format!("/chat/runs/{run_id}/pause"),
-        Some(&auth_b),
-    )
-    .await;
+    let (st_pause, pause_j) =
+        post_empty(app, &format!("/chat/runs/{run_id}/pause"), Some(&auth_b)).await;
     assert_eq!(
         st_pause,
         StatusCode::FORBIDDEN,
@@ -981,20 +951,11 @@ pub async fn run_saas_run_double_pause_conflict() {
     assert_eq!(st_chat, StatusCode::OK, "create run: {chat_j}");
     let run_id = chat_j["run_id"].as_str().expect("run_id").to_string();
 
-    let (st_pause1, _) = post_empty(
-        app,
-        &format!("/chat/runs/{run_id}/pause"),
-        Some(auth),
-    )
-    .await;
+    let (st_pause1, _) = post_empty(app, &format!("/chat/runs/{run_id}/pause"), Some(auth)).await;
     assert_eq!(st_pause1, StatusCode::OK, "first pause");
 
-    let (st_pause2, pause2_j) = post_empty(
-        app,
-        &format!("/chat/runs/{run_id}/pause"),
-        Some(auth),
-    )
-    .await;
+    let (st_pause2, pause2_j) =
+        post_empty(app, &format!("/chat/runs/{run_id}/pause"), Some(auth)).await;
     assert_eq!(
         st_pause2,
         StatusCode::CONFLICT,
@@ -1050,11 +1011,7 @@ pub async fn run_saas_approval_respond_success_path() {
         }),
     )
     .await;
-    assert_eq!(
-        st_appr,
-        StatusCode::OK,
-        "approval/respond allow: {appr_j}"
-    );
+    assert_eq!(st_appr, StatusCode::OK, "approval/respond allow: {appr_j}");
 
     let decisions = read_journal(&ctx.session_id)
         .expect("read approval journal")
