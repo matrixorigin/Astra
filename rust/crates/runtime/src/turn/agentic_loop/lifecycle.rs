@@ -1149,6 +1149,10 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
         max_prompt_tokens: max_tokens,
         last_measured_tokens: tokens_measured,
         current_round_index: Some(state.current_round_index),
+        now_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
     };
     let pipeline = if pressure >= CompactionTier::aggressive_trigger(max_tokens) {
         CompactionEngine::aggressive_pipeline()

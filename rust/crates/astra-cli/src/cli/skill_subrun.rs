@@ -316,6 +316,7 @@ impl AgenticLoopHost for SubRunHost {
             turn_rollback_on_failure: false,
             tool_cache: &mut self.tool_cache,
             observability_hub: None,
+            incremental_state: None,
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);

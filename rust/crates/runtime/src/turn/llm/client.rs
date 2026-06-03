@@ -294,9 +294,8 @@ pub(crate) struct LlmCallResult {
     pub reasoning_signature: String,
     pub tool_calls: Vec<Value>,
     pub usage: Map<String, Value>,
-    #[allow(dead_code)] // consumed by bridge_inprocess and explain telemetry
     pub model_used: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // validated in tests; reserved for future telemetry
     pub duration_ms: u64,
     /// The finish_reason from the last SSE choice (e.g. "stop", "length", "tool_calls").
     /// `None` when the stream ended without an explicit finish_reason.

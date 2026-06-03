@@ -113,8 +113,7 @@ impl Frame<'_> {
     ///
     /// Usually the area argument is the size of the current frame or a sub-area of the current
     /// frame (which can be obtained using [`Layout`] to split the total area).
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn render_widget_ref<W: WidgetRef>(&mut self, widget: W, area: Rect) {
+    pub fn render_widget_ref<W: WidgetRef>(&mut self, widget: &W, area: Rect) {
         widget.render_ref(area, self.buffer);
     }
 

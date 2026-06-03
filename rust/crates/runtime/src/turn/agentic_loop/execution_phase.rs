@@ -2554,6 +2554,10 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
             current_round_index: Some(state.current_round_index),
+            now_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         };
         let mut total_freed = 0;
         if state.compact_tier_applied < CompactionTier::CompactHistory {

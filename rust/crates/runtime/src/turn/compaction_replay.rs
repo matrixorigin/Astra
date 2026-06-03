@@ -205,6 +205,7 @@ pub(crate) fn try_compact_for_retry_tiered(
         max_prompt_tokens: max_tokens,
         last_measured_tokens: measured,
         current_round_index: None,
+        now_secs: 0,
     };
 
     if !budget.is_over_budget() && budget.pressure() < 0.85 {

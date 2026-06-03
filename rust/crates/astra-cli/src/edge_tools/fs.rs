@@ -1939,7 +1939,7 @@ impl ToolExecutor {
         if let Ok(canon) = dir.canonicalize() {
             visited.insert(canon);
         }
-        self.list_dir_recursive(&dir, &dir, depth, 0, &mut out, &mut visited);
+        self.list_dir_recursive(&dir, depth, 0, &mut out, &mut visited);
         if out.is_empty() {
             "(empty)".to_string()
         } else {
@@ -1947,10 +1947,8 @@ impl ToolExecutor {
         }
     }
 
-    #[allow(clippy::only_used_in_recursion)]
     pub(crate) fn list_dir_recursive(
         &self,
-        base: &Path,
         dir: &Path,
         max_depth: usize,
         cur: usize,
@@ -1995,7 +1993,7 @@ impl ToolExecutor {
                         continue;
                     }
                 }
-                self.list_dir_recursive(base, &entry.path(), max_depth, cur + 1, out, visited);
+                self.list_dir_recursive(&entry.path(), max_depth, cur + 1, out, visited);
             }
         }
     }

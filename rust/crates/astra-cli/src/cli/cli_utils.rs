@@ -925,6 +925,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn persist_profile_last_session_updates_only_target_field() {
         let _creds_guard = crate::tests::isolate_credentials();
@@ -951,6 +952,7 @@ mod tests {
         assert_eq!(profile.refresh_token.as_deref(), Some("ref"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn persist_profile_memoria_api_key_updates_only_target_field() {
         let _creds_guard = crate::tests::isolate_credentials();
@@ -1030,6 +1032,7 @@ mod tests {
         assert!(!session_is_resumable(&sid));
     }
 
+    #[serial_test::serial]
     #[test]
     fn resumable_last_session_id_filters_ended_sessions() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -1172,6 +1175,7 @@ mod tests {
         assert!(dbg.contains("***"), "masked fields should show ***");
     }
 
+    #[serial_test::serial]
     #[test]
     fn test_credentials_file_permissions() {
         let _creds_guard = crate::tests::isolate_credentials();

@@ -135,6 +135,9 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     /// because no parent capture happened).
     pub prefix_store:
         Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    /// Incremental turn state for surviving interruptions.
+    /// Written during streaming; snapped on force-exit to recover partial data.
+    pub incremental_state: Option<Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
 }
 
 fn derive_turn_interaction_mode(
@@ -544,6 +547,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             turn_chain_id: state.bridge_turn_chain_id.as_deref(),
             user_query_event_id: state.bridge_user_query_event_id.as_deref(),
             observability_hub: state.telemetry.observability_hub.as_ref(),
+            incremental_state: self.incremental_state.clone(),
             append_system_prompt: self.append_system_prompt.as_deref(),
         })
         .await;
@@ -566,6 +570,17 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
         let turn_result = turn_result?;
+
+        // Write per-round token counts into incremental state immediately
+        // so force-exit recovery has accurate prompt/completion/cache tokens
+        // even when on_turn_completed never fires.
+        if let Some(ref inc) = self.incremental_state {
+            inc.set_prompt_tokens(turn_result.core.prompt_tokens);
+            inc.set_completion_tokens(turn_result.core.completion_tokens);
+            inc.set_cache_read_tokens(turn_result.core.cache_read_tokens);
+            inc.set_cache_creation_tokens(turn_result.core.cache_creation_tokens);
+        }
+
         if let Some(refreshed_token) = turn_result.refreshed_token.clone() {
             self.executor.set_cloud_token(refreshed_token.clone());
             self.token = refreshed_token;
@@ -882,6 +897,41 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // the start of every turn).
         self.executor.set_ask_user_request_tx(None);
         self.executor.set_plan_review_request_tx(None);
+
+        // Sync incremental state for interruption recovery.
+        // Token counts are updated per-round in execute_turn (so
+        // force-exit captures accurate cumulative totals).  Here we
+        // sync non-token fields: session_id, run_id, and tool records.
+        if let Some(ref inc) = self.incremental_state {
+            if let Some(ref sid) = state.current_session_id {
+                if !sid.is_empty() {
+                    inc.set_session_id(sid.clone());
+                }
+            }
+            if let Some(ref rid) = state.current_run_id {
+                inc.set_run_id(rid.clone());
+            }
+            let tool_records = state
+                .stall
+                .tool_call_records
+                .iter()
+                .filter(|record| {
+                    !record.is_synthetic_placeholder() && !record.was_blocked_by_policy()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let tools_used = tool_records.iter().map(|record| record.name.clone()).fold(
+                Vec::new(),
+                |mut acc, name| {
+                    if !acc.iter().any(|existing| existing == &name) {
+                        acc.push(name);
+                    }
+                    acc
+                },
+            );
+            inc.replace_tool_records(tool_records);
+            inc.replace_tools_used(tools_used);
+        }
 
         // Bug B step 3: capture the parent turn's cacheable prefix
         // so subsequent agent-spawn / delegate calls can inherit it

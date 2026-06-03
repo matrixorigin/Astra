@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: remember
 description: "Review and manage persistent memories — promote, clean up, and organize knowledge across sessions"
 version: "1.0.0"
@@ -94,6 +92,5 @@ After all actions, summarize what changed:
 - NEVER delete memories without explicit user confirmation
 - When merging, preserve the most specific and actionable version
 - If the user says "clean up everything", still present the plan before executing
-"#,
-    )
+"#.to_string()
 }

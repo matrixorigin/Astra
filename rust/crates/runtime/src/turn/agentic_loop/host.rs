@@ -1609,7 +1609,6 @@ fn apply_harness_pause_recovery_threshold(
     }
 }
 
-#[allow(unused_imports)]
 pub(crate) use super::super::agentic::adaptive_tuning::{
     DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
     apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
@@ -1617,7 +1616,6 @@ pub(crate) use super::super::agentic::adaptive_tuning::{
 };
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;
-#[allow(unused_imports)]
 pub(crate) use super::tool_support::{extract_file_path_from_tool, record_edge_tool_observability};
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────
@@ -1628,14 +1626,12 @@ pub enum AgenticLoopOutcome {
     /// Loop completed normally (final text produced or budget exhausted gracefully).
     Completed,
     /// Loop aborted due to a fatal error.
-    #[allow(dead_code)]
     // Preserved for dispatcher/adapter contract even though the core loop doesn't emit it in non-test builds yet.
     Error(String),
     /// Loop was cancelled externally via `cancel_flag` or `cancel_token`.
     Cancelled,
     /// Loop is waiting for external input (tool approval, user resume, webhook).
     /// The caller should provide the requested input and re-invoke the loop.
-    #[allow(dead_code)]
     // Preserved for dispatcher/adapter contract even though the core loop doesn't emit it in non-test builds yet.
     Waiting(String),
 }
@@ -1645,7 +1641,6 @@ pub enum AgenticLoopOutcome {
 pub const DELEGATE_TOOL_NAME: &str =
     super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME;
 
-#[allow(unused_imports)]
 pub(crate) use super::super::agentic::delegate_interception::{
     DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
     DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
@@ -1656,22 +1651,17 @@ pub(crate) use super::super::agentic::delegate_interception::{
     tool_call_arguments_value, tool_call_name,
 };
 
-#[allow(unused_imports)]
 use super::super::harness_adapter::harness_at;
-#[allow(unused_imports)]
 pub(crate) use super::execution_phase::{
     TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
 };
-#[allow(unused_imports)]
 pub(crate) use super::finalization::{
     finalize_and_render, finalize_turn_trace, run_agentic_loop_with_host,
     try_write_heavy_checkpoint,
 };
-#[allow(unused_imports)]
 pub(crate) use super::lifecycle::{
     PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
-#[allow(unused_imports)]
 pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
 
 #[cfg(feature = "harness")]

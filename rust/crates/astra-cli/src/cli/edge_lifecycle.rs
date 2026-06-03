@@ -790,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn completed_request_ids_ring_buffer() {
         let ctx = edge_lifecycle();
         if let Ok(mut ids) = ctx.completed_request_ids.lock() {
@@ -807,6 +808,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pending_request_guard_decrements_on_drop() {
         let ctx = edge_lifecycle();
         ctx.pending_tool_requests.store(0, Ordering::Relaxed);
@@ -818,6 +820,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn replay_guard_is_single_flight() {
         let ctx = edge_lifecycle();
         ctx.replay_in_flight.store(false, Ordering::Relaxed);
@@ -829,6 +832,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn enrich_register_body_persists_worktree_path() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let ctx = edge_lifecycle();

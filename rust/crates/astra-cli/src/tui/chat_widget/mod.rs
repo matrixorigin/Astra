@@ -2684,6 +2684,7 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
+    #[serial_test::serial]
     #[test]
     fn set_session_id_swaps_without_losing_history() {
         let mut w = fresh();

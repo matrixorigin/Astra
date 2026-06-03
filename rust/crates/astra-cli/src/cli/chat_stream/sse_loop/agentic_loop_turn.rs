@@ -1033,6 +1033,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// per-turn ingest can attach `recent_signals` to the session without
     /// needing a global singleton.
     pub observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
+    pub incremental_state: Option<Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
     pub append_system_prompt: Option<&'a str>,
 }
 struct ChatTurnSseFetchUi {
@@ -1163,6 +1164,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         turn_chain_id,
         user_query_event_id,
         observability_hub,
+        incremental_state,
         append_system_prompt,
     } = ctx;
 
@@ -1259,6 +1261,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         turn_rollback_on_failure: is_plan_subtask,
         tool_cache,
         observability_hub: observability_hub.cloned(),
+        incremental_state: incremental_state.clone(),
     };
 
     let sse_mark = Instant::now();

@@ -561,15 +561,14 @@ impl TextArea {
 
 // ─── Wrap computation ───────────────────────────────────────────────────────
 
-#[allow(clippy::single_range_in_vec_init)]
 fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
     if text.is_empty() {
-        return vec![0..0];
+        return std::iter::once(0..0).collect();
     }
 
     let w = width as usize;
     if w == 0 {
-        return vec![0..text.len()];
+        return std::iter::once(0..text.len()).collect();
     }
 
     let mut ranges = Vec::new();

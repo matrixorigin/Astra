@@ -343,10 +343,7 @@ pub use turn::{
             PartialCompactRequest, PartialCompactResult, TurnCountCompactConfig, TurnCountTrigger,
             apply_micro_compact, compact_partial, evaluate_turn_count_trigger,
         },
-        compaction::{
-            CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger, compact_tiered,
-            compact_tiered_with_result,
-        },
+        compaction::{CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger},
         memoria_compact::{
             HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
             MemoriaMemory, claude_code_session_memory_path, compact_with_memoria,

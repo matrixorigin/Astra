@@ -2318,8 +2318,6 @@ struct RunState {
     llm_cancel_token: Arc<CancellationToken>,
     /// Live fanout for clients that reattach to an active run after navigating away.
     live_tx: Option<broadcast::Sender<Value>>,
-    #[allow(dead_code)]
-    started_at: Instant,
     waiting_for: Option<String>,
 }
 
@@ -2981,7 +2979,6 @@ impl AgenticRunLifecycleService {
             pause_flag: pause_flag.clone(),
             llm_cancel_token: llm_cancel_token.clone(),
             live_tx: None,
-            started_at: Instant::now(),
             waiting_for: None,
         };
         (run_state, cancel_flag, pause_flag, llm_cancel_token)
@@ -7379,7 +7376,6 @@ mod tests {
             pause_flag: Arc::new(AtomicBool::new(false)),
             llm_cancel_token: cancel_token,
             live_tx: None,
-            started_at: Instant::now(),
             waiting_for: None,
         };
 

@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: stuck
 description: "Break through when stuck — use runtime diagnostics to identify the real blocker, then try a fundamentally different approach"
 version: "1.0.0"
@@ -94,6 +92,5 @@ If nothing works:
 - Do NOT keep trying the same approach with small variations
 - If `deprioritized_tools` lists a tool, do NOT use it
 - If `nudge_count` ≥ 3, you MUST stop and ask the user — no more autonomous attempts
-"#,
-    )
+"#.to_string()
 }

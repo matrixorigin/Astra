@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: verify
 description: "Run project tests, linters, and type checks to verify code correctness — auto-detects project type"
 version: "1.0.0"
@@ -73,6 +71,5 @@ For each check: ✅ passed, ❌ failed (with error summary), or ⏭ skipped (too
 ## When NOT to Use
 - Don't use for runtime/integration testing that requires external services
 - If the user specifies a scope (file or module), run only relevant tests
-"#,
-    )
+"#.to_string()
 }

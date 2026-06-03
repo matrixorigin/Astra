@@ -16,6 +16,8 @@ pub(crate) struct PartialTurnData {
     pub verdict_events: Vec<VerdictEvent>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub tool_calls_count: u32,
     #[allow(dead_code)]
     pub tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
@@ -40,6 +42,8 @@ impl std::fmt::Display for TurnFailure {
     }
 }
 
+impl std::error::Error for TurnFailure {}
+
 pub(crate) fn apply_partial_turn_data_to_error_event(
     event: &mut astra_services::session_journal::JournalEvent,
     partial: &PartialTurnData,
@@ -53,6 +57,12 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
     }
     if partial.completion_tokens > 0 {
         event.tokens_out = Some(partial.completion_tokens);
+    }
+    if partial.cache_read_tokens > 0 {
+        event.cache_read_tokens = Some(partial.cache_read_tokens);
+    }
+    if partial.cache_creation_tokens > 0 {
+        event.cache_creation_tokens = Some(partial.cache_creation_tokens);
     }
     if partial.tool_calls_count > 0 {
         event.tool_count = Some(partial.tool_calls_count);
@@ -174,6 +184,8 @@ mod tests {
             run_id: Some("run-123".into()),
             prompt_tokens: 42,
             completion_tokens: 21,
+            cache_read_tokens: 9,
+            cache_creation_tokens: 4,
             tool_calls_count: 1,
             ..Default::default()
         };
@@ -188,6 +200,8 @@ mod tests {
         );
         assert_eq!(event.tokens_in, Some(42));
         assert_eq!(event.tokens_out, Some(21));
+        assert_eq!(event.cache_read_tokens, Some(9));
+        assert_eq!(event.cache_creation_tokens, Some(4));
         assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
         assert_eq!(event.metadata.as_ref().unwrap()["run_id"], "run-123");
     }

@@ -1538,6 +1538,7 @@ mod tests {
         assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
     }
 
+    #[serial_test::serial]
     #[test]
     fn initialize_session_state_skips_cleanly_ended_session() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -1589,6 +1590,7 @@ mod tests {
         assert_eq!(state.turn, 0);
     }
 
+    #[serial_test::serial]
     #[test]
     fn initialize_session_state_treats_default_model_as_server_default() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -1603,6 +1605,7 @@ mod tests {
         assert_eq!(state.model, None);
     }
 
+    #[serial_test::serial]
     #[test]
     fn initialize_session_state_records_project_scoped_pending_recovery() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -1675,6 +1678,7 @@ mod tests {
         assert_eq!(state.turn, 0);
     }
 
+    #[serial_test::serial]
     #[test]
     fn initialize_session_state_explicit_session_id_suppresses_pending_recovery() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -1753,6 +1757,7 @@ mod tests {
         assert_eq!(pending_recovery_status_line(&SessionState::default()), None);
     }
 
+    #[serial_test::serial]
     #[test]
     fn initialize_session_state_ignores_pending_recovery_from_other_project() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -1978,6 +1983,7 @@ mod tests {
 
     // ── ASTRA_ACCESS_TOKEN env var ──────────────────────────────
 
+    #[serial_test::serial]
     #[test]
     fn current_access_token_prefers_env_var() {
         let _g = isolate_credentials();
@@ -1989,6 +1995,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn current_access_token_ignores_empty_env_var() {
         let _g = isolate_credentials();
@@ -2001,6 +2008,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn current_access_token_falls_back_to_file_without_env() {
         let _g = isolate_credentials();
@@ -2032,6 +2040,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn current_access_token_falls_back_to_file_when_env_token_expired() {
         let _g = isolate_credentials();

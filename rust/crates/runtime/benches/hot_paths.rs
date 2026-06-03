@@ -6,7 +6,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use serde_json::json;
 
 use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
-use astra_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_tokens};
+use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
 use astra_runtime::tool_registry::ConversationState;
 use astra_runtime::tool_registry::TOOL_CATALOG;
@@ -14,7 +14,6 @@ use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
 use astra_runtime::tool_registry::tool_pool::{
     SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource, select_two_phase,
 };
-use astra_runtime::turn::cloud::compaction::compact_tiered;
 
 // ── Token Estimation ───────────────────────────────────────────────
 
@@ -181,60 +180,7 @@ fn bench_two_phase_tool_pool(c: &mut Criterion) {
 
 // ── Tiered Compaction ──────────────────────────────────────────────
 
-fn build_conversation(n_turns: usize, tool_output_size: usize) -> Vec<serde_json::Value> {
-    let mut msgs = vec![json!({"role":"system","content":"You are a helpful assistant."})];
-    for i in 0..n_turns {
-        msgs.push(json!({"role":"user","content":format!("Question {}", i)}));
-        msgs.push(
-            json!({"role":"assistant","content":format!("Let me check tool_{}", i),
-            "tool_calls":[{"id":format!("t{}", i),"type":"function",
-                "function":{"name":"bash","arguments":"{}"}}]}),
-        );
-        msgs.push(json!({
-            "role":"tool",
-            "tool_call_id": format!("t{}", i),
-            "content": "x".repeat(tool_output_size)
-        }));
-        msgs.push(json!({"role":"assistant","content":format!("Here's the result for Q{}", i)}));
-    }
-    msgs
-}
-
-fn bench_compact_tiered(c: &mut Criterion) {
-    // 10 turns × 2000 char tool outputs = ~20k chars total
-    let msgs = build_conversation(10, 2000);
-    let budget_chars = 8000;
-    let keep_chars = 500;
-
-    let mut group = c.benchmark_group("compact_tiered");
-    for tier in [
-        CompactionTier::Normal,
-        CompactionTier::TrimSchemas,
-        CompactionTier::CompactHistory,
-        CompactionTier::AggressivePrune,
-    ] {
-        group.bench_with_input(
-            BenchmarkId::new(format!("{:?}", tier), msgs.len()),
-            &msgs,
-            |b, m| {
-                b.iter(|| {
-                    compact_tiered(
-                        black_box(m),
-                        black_box(budget_chars),
-                        black_box(keep_chars),
-                        tier,
-                        4,
-                    )
-                })
-            },
-        );
-    }
-    group.finish();
-}
-
-// ── SSE Frame Parsing ──────────────────────────────────────────────
-
-fn bench_find_sse_frame_end(c: &mut Criterion) {
+fn bench_sse_frame_end(c: &mut Criterion) {
     // Frame at start
     let early_frame = b"data: {\"type\":\"text\"}\n\ndata: {\"type\":\"done\"}\n\n";
     // Frame at end of 4KB buffer
@@ -365,8 +311,7 @@ criterion_group!(
     bench_build_tf,
     bench_pre_filter_dynamic,
     bench_two_phase_tool_pool,
-    bench_compact_tiered,
-    bench_find_sse_frame_end,
+    bench_sse_frame_end,
     bench_parse_sse_json_frame,
     bench_conversation_state,
 );

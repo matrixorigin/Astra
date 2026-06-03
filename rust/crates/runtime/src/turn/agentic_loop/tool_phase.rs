@@ -1794,7 +1794,6 @@ mod tests {
         assert!((introspect_token_pressure(&state) - expected).abs() < f64::EPSILON);
     }
 
-    #[allow(dead_code)]
     fn tool_record(name: &str, ok: bool) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),

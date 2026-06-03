@@ -602,6 +602,10 @@ pub(crate) struct EdgeSseContext<'a> {
     /// for tests and non-observable contexts; production supplies it from
     /// `CliAgenticLoopHost`.
     pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
+    /// Incremental turn snapshot mirrored during SSE consumption so forced
+    /// cancellation can recover partial text, ids, usage, and tool audit data.
+    pub incremental_state:
+        Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -683,6 +687,9 @@ struct CliSseStreamHost<'a> {
     observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Set when posting edge-side tool or approval results receives 401.
     auth_failure: bool,
+    /// Incremental turn snapshot mirrored live from SSE/tool events.
+    incremental_state:
+        Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
 }
 
 const EDGE_AUTH_FAILURE_MESSAGE: &str =
@@ -923,6 +930,7 @@ impl<'a> CliSseStreamHost<'a> {
             streaming_tool_exec,
             observability_hub: ctx.observability_hub,
             auth_failure: false,
+            incremental_state: ctx.incremental_state,
         }
     }
 
@@ -1520,6 +1528,20 @@ impl<'a> CliSseStreamHost<'a> {
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(&session_id);
         }
+    }
+
+    fn sync_incremental_accum(&self, accum: &ChatTurnSseAccum) {
+        let Some(incremental_state) = self.incremental_state.as_ref() else {
+            return;
+        };
+        sync_incremental_accum_state(incremental_state, accum);
+    }
+
+    fn sync_incremental_tool_result(&self, result: &EdgeToolExecResult) {
+        let Some(incremental_state) = self.incremental_state.as_ref() else {
+            return;
+        };
+        sync_incremental_tool_result_state(incremental_state, result);
     }
 
     fn emit_execution_boundary_opened(
@@ -2351,6 +2373,43 @@ impl CliSseStreamHost<'_> {
     }
 }
 
+fn sync_incremental_accum_state(
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+    accum: &ChatTurnSseAccum,
+) {
+    if let Some(session_id) = accum.session_id.as_deref().filter(|sid| !sid.is_empty()) {
+        incremental_state.set_session_id(session_id.to_string());
+    }
+    if let Some(run_id) = accum.run_id.as_deref().filter(|rid| !rid.is_empty()) {
+        incremental_state.set_run_id(run_id.to_string());
+    }
+    incremental_state.update_text(&accum.full_text);
+    if accum.has_usage {
+        incremental_state.set_prompt_tokens(accum.prompt_tokens);
+        incremental_state.set_completion_tokens(accum.completion_tokens);
+        incremental_state.set_cache_read_tokens(accum.cache_read_tokens);
+        incremental_state.set_cache_creation_tokens(accum.cache_creation_tokens);
+    }
+}
+
+fn sync_incremental_tool_result_state(
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+    result: &EdgeToolExecResult,
+) {
+    let error = (result.status != "ok").then(|| result.output.clone());
+    incremental_state.push_tool_record(astra_services::session_journal::ToolCallRecord {
+        tool_call_id: Some(result.request_id.clone()),
+        name: result.tool.clone(),
+        ok: result.status == "ok",
+        ms: result.duration_ms,
+        error,
+        output_bytes: Some(result.output.len().min(u32::MAX as usize) as u32),
+        result_preview: Some(tool_output_event_text(&result.tool, &result.output)),
+        ..Default::default()
+    });
+    incremental_state.add_tool_used(&result.tool);
+}
+
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_before_sse_read_loop(&mut self) {
@@ -2383,6 +2442,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(session_id);
         }
+    }
+
+    fn on_accum_update(&mut self, accum: &ChatTurnSseAccum) {
+        self.sync_incremental_accum(accum);
     }
 
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
@@ -2480,6 +2543,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         {
             self.emit_turn_rollback_committed(&active);
         }
+    }
+
+    fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
+        self.sync_incremental_tool_result(result);
     }
 
     async fn execute_tool(
@@ -6749,6 +6816,7 @@ mod tests {
     use super::*;
     use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
+    use astra_turn_core::turn_event_sink::IncrementalTurnState;
     use tempfile::tempdir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -7167,6 +7235,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn cloud_approval_uses_tui_sink_in_prompt_mode() {
         let server = MockServer::start().await;
@@ -7196,6 +7265,7 @@ mod tests {
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -7222,6 +7292,81 @@ mod tests {
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_sse_host_mirrors_live_state_into_incremental_snapshot() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let incremental_state =
+            std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: Some(incremental_state.clone()),
+            },
+            80,
+            false,
+        );
+
+        host.on_accum_update(&ChatTurnSseAccum {
+            session_id: Some("sess-live".to_string()),
+            run_id: Some("run-live".to_string()),
+            full_text: "partial answer".to_string(),
+            prompt_tokens: 21,
+            completion_tokens: 13,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 3,
+            has_usage: true,
+            ..Default::default()
+        });
+        host.on_tool_result(&EdgeToolExecResult {
+            request_id: "tool-1".to_string(),
+            tool: "bash".to_string(),
+            args: serde_json::json!({"command": "echo hi"}),
+            output: "hi".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 7,
+        });
+
+        let snap = incremental_state.snapshot();
+        assert_eq!(snap.session_id.as_deref(), Some("sess-live"));
+        assert_eq!(snap.run_id.as_deref(), Some("run-live"));
+        assert_eq!(snap.partial_text, "partial answer");
+        assert_eq!(snap.prompt_tokens, 21);
+        assert_eq!(snap.completion_tokens, 13);
+        assert_eq!(snap.cache_read_tokens, 5);
+        assert_eq!(snap.cache_creation_tokens, 3);
+        assert_eq!(snap.tools_used, vec!["bash"]);
+        assert_eq!(snap.tool_call_records.len(), 1);
+        assert_eq!(
+            snap.tool_call_records[0].tool_call_id.as_deref(),
+            Some("tool-1")
+        );
+        assert_eq!(snap.tool_call_records[0].name, "bash");
+        assert!(snap.tool_call_records[0].ok);
+        assert_eq!(snap.tool_call_records[0].ms, 7);
+    }
+
+    #[serial_test::serial]
     #[tokio::test]
     async fn cloud_approval_always_persists_benign_project_scope() {
         let server = MockServer::start().await;
@@ -7253,6 +7398,7 @@ mod tests {
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
                     observability_hub: None,
+                    incremental_state: None,
                 },
                 80,
                 false,
@@ -7285,6 +7431,7 @@ mod tests {
         ));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn cloud_approval_always_sensitive_write_is_session_only() {
         let server = MockServer::start().await;
@@ -7316,6 +7463,7 @@ mod tests {
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
                     observability_hub: None,
+                    incremental_state: None,
                 },
                 80,
                 false,
@@ -7352,6 +7500,7 @@ mod tests {
         ));
     }
 
+    #[serial_test::serial]
     #[test]
     fn edge_auth_failure_detector_only_matches_http_401_api_errors() {
         let unauthorized = astra_thin_client::ThinClientError::Api {
@@ -7367,6 +7516,7 @@ mod tests {
         assert!(!is_edge_auth_failure(&forbidden));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
@@ -7436,6 +7586,7 @@ mod tests {
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             observability_hub: None,
+            incremental_state: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest {
@@ -7454,6 +7605,7 @@ mod tests {
         assert_eq!(host.token, "fresh-token");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn edge_tool_result_refresh_failure_returns_terminal_auth_error() {
         let _creds_guard = crate::tests::isolate_credentials();
@@ -7511,6 +7663,7 @@ mod tests {
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             observability_hub: None,
+            incremental_state: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest {
@@ -8292,6 +8445,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn catch_tool_execution_panic_reports_error_output() {
         let (outcome, duration_ms) = catch_tool_execution_panic(async {
@@ -8773,6 +8927,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert_ne!(sig1, sig3);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_rolls_back_earlier_file_write_on_later_failure() {
         let server = MockServer::start().await;
@@ -8808,6 +8963,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -8865,6 +9021,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_restores_deleted_file_on_failure() {
         let server = MockServer::start().await;
@@ -8902,6 +9059,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -8952,6 +9110,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_restores_notebook_edit_on_failure() {
         let server = MockServer::start().await;
@@ -8994,6 +9153,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9051,6 +9211,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_reapplies_git_stash_on_failure() {
         let server = MockServer::start().await;
@@ -9088,6 +9249,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9138,6 +9300,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_reverts_git_commit_on_failure() {
         let server = MockServer::start().await;
@@ -9175,6 +9338,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9224,6 +9388,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_skips_later_requests_after_rollback() {
         let server = MockServer::start().await;
@@ -9260,6 +9425,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9356,6 +9522,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9437,6 +9604,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9502,6 +9670,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn turn_rollback_restores_written_file_on_failure() {
         let server = MockServer::start().await;
@@ -9537,6 +9706,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9591,6 +9761,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn turn_rollback_skips_later_requests_after_failure() {
         let server = MockServer::start().await;
@@ -9627,6 +9798,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9691,6 +9863,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn edge_tool_cache_invalidates_read_file_after_file_change() {
         let server = MockServer::start().await;
@@ -9725,6 +9898,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9757,6 +9931,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn successful_write_file_clears_cross_turn_read_cache_and_call_counts() {
         let server = MockServer::start().await;
@@ -9791,6 +9966,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9849,6 +10025,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn successful_str_replace_clears_cross_turn_read_cache_and_call_counts() {
         let server = MockServer::start().await;
@@ -9883,6 +10060,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -9949,6 +10127,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn edge_tool_cache_reuses_git_show_when_head_is_unchanged() {
         let server = MockServer::start().await;
@@ -9981,6 +10160,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10008,6 +10188,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn edge_tool_cache_invalidates_git_status_after_worktree_change() {
         let server = MockServer::start().await;
@@ -10041,6 +10222,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10067,6 +10249,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn turn_rollback_allows_bash_and_persists_through_mutation_rollback() {
         let server = MockServer::start().await;
@@ -10102,6 +10285,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10159,6 +10343,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn turn_rollback_allows_read_only_bash() {
         let server = MockServer::start().await;
@@ -10194,6 +10379,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10218,6 +10404,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn execute_tool_blocks_name_based_process_kill_for_bash() {
         let server = MockServer::start().await;
@@ -10250,6 +10437,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10326,6 +10514,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert_eq!(merged[0].duration_ms, host[0].duration_ms);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn turn_rollback_read_only_error_does_not_trigger_rollback() {
         let server = MockServer::start().await;
@@ -10362,6 +10551,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10460,6 +10650,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10538,6 +10729,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10598,6 +10790,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_rejects_mutating_bash_and_restores_prior_state() {
         let server = MockServer::start().await;
@@ -10633,6 +10826,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10687,6 +10881,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn transactional_batch_allows_read_only_bash() {
         let server = MockServer::start().await;
@@ -10722,6 +10917,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
+                incremental_state: None,
             },
             80,
             false,
@@ -10748,5 +10944,174 @@ diff --git a/src/a.rs b/src/a.rs\n\
             "{}",
             results[0].output
         );
+    }
+
+    // ── sync_incremental_accum / sync_incremental_tool_result ──────────
+    //
+    // These methods live on the private CliSseStreamHost. Because the host
+    // is too complex to construct in tests, we exercise the pure logic by
+    // calling IncrementalTurnState directly with the same filter/guard
+    // patterns used in the production code paths.
+
+    fn toy_accum(full_text: &str) -> ChatTurnSseAccum {
+        ChatTurnSseAccum {
+            full_text: full_text.into(),
+            ..Default::default()
+        }
+    }
+
+    fn toy_accum_with_ids(full_text: &str, session_id: &str, run_id: &str) -> ChatTurnSseAccum {
+        ChatTurnSseAccum {
+            full_text: full_text.into(),
+            session_id: Some(session_id.into()),
+            run_id: Some(run_id.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sync_incremental_accum_updates_text_even_without_ids() {
+        let state = IncrementalTurnState::default();
+        let accum = toy_accum("Hello SSE");
+        sync_incremental_accum_state(&state, &accum);
+        assert_eq!(state.snapshot().partial_text, "Hello SSE");
+    }
+
+    #[test]
+    fn sync_incremental_accum_set_session_and_run_ids_first_wins() {
+        let state = IncrementalTurnState::default();
+        let accum1 = toy_accum_with_ids("Hello", "sess-a", "run-1");
+        sync_incremental_accum_state(&state, &accum1);
+        // Second accum with different ids must be ignored (first-wins).
+        // update_text appends only the delta (new suffix), so use text that
+        // extends the first: "Hello, world!" appends ", world!" to "Hello".
+        let accum2 = toy_accum_with_ids("Hello, world!", "sess-b", "run-2");
+        sync_incremental_accum_state(&state, &accum2);
+        let snap = state.snapshot();
+        assert_eq!(snap.session_id.as_deref(), Some("sess-a"));
+        assert_eq!(snap.run_id.as_deref(), Some("run-1"));
+        assert_eq!(snap.partial_text, "Hello, world!");
+    }
+
+    #[test]
+    fn sync_incremental_accum_empty_session_id_is_skipped() {
+        let state = IncrementalTurnState::default();
+        let accum = ChatTurnSseAccum {
+            session_id: Some(String::new()),
+            run_id: Some("run-1".into()),
+            full_text: "data".into(),
+            ..Default::default()
+        };
+        sync_incremental_accum_state(&state, &accum);
+        let snap = state.snapshot();
+        assert!(
+            snap.session_id.is_none(),
+            "empty session_id must be filtered out"
+        );
+        assert_eq!(snap.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn sync_incremental_accum_empty_run_id_is_skipped() {
+        let state = IncrementalTurnState::default();
+        let accum = ChatTurnSseAccum {
+            session_id: Some("sess-a".into()),
+            run_id: Some(String::new()),
+            full_text: "data".into(),
+            ..Default::default()
+        };
+        sync_incremental_accum_state(&state, &accum);
+        let snap = state.snapshot();
+        assert_eq!(snap.session_id.as_deref(), Some("sess-a"));
+        assert!(snap.run_id.is_none(), "empty run_id must be filtered out");
+    }
+
+    #[test]
+    fn sync_incremental_accum_token_guarded_by_has_usage() {
+        let state = IncrementalTurnState::default();
+        let mut accum = toy_accum("data");
+        accum.prompt_tokens = 999;
+        accum.completion_tokens = 888;
+        accum.cache_read_tokens = 777;
+        accum.cache_creation_tokens = 666;
+        accum.has_usage = false;
+        sync_incremental_accum_state(&state, &accum);
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.prompt_tokens, 0,
+            "has_usage=false must skip token setters"
+        );
+        assert_eq!(snap.completion_tokens, 0);
+        assert_eq!(snap.cache_read_tokens, 0);
+        assert_eq!(snap.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn sync_incremental_accum_sets_tokens_when_has_usage_true() {
+        let state = IncrementalTurnState::default();
+        let mut accum = toy_accum("data");
+        accum.prompt_tokens = 300;
+        accum.completion_tokens = 200;
+        accum.cache_read_tokens = 50;
+        accum.cache_creation_tokens = 0;
+        accum.has_usage = true;
+        sync_incremental_accum_state(&state, &accum);
+
+        let snap = state.snapshot();
+        assert_eq!(snap.prompt_tokens, 300);
+        assert_eq!(snap.completion_tokens, 200);
+        assert_eq!(snap.cache_read_tokens, 50);
+        assert_eq!(snap.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn sync_incremental_tool_result_pushes_record_and_adds_tool_used() {
+        let state = IncrementalTurnState::default();
+        let result = EdgeToolExecResult {
+            request_id: "req-1".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({"path": "lib.rs"}),
+            output: "pub fn main() {}".into(),
+            tool_result_fields: None,
+            status: "ok".into(),
+            duration_ms: 42,
+        };
+        sync_incremental_tool_result_state(&state, &result);
+
+        let snap = state.snapshot();
+        assert_eq!(snap.tool_call_records.len(), 1);
+        assert_eq!(
+            snap.tool_call_records[0].tool_call_id.as_deref(),
+            Some("req-1")
+        );
+        assert_eq!(snap.tool_call_records[0].name, "read_file");
+        assert!(snap.tool_call_records[0].ok);
+        assert_eq!(snap.tool_call_records[0].ms, 42);
+        assert_eq!(snap.tools_used, vec!["read_file"]);
+    }
+
+    #[test]
+    fn sync_incremental_tool_result_error_status_records_error() {
+        let state = IncrementalTurnState::default();
+        let result = EdgeToolExecResult {
+            request_id: "req-err".into(),
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "rm -rf /"}),
+            output: "Permission denied".into(),
+            tool_result_fields: None,
+            status: "permission_denied".into(),
+            duration_ms: 1,
+        };
+        sync_incremental_tool_result_state(&state, &result);
+
+        let snap = state.snapshot();
+        assert_eq!(snap.tool_call_records.len(), 1);
+        assert!(!snap.tool_call_records[0].ok);
+        assert_eq!(
+            snap.tool_call_records[0].error.as_deref(),
+            Some("Permission denied")
+        );
+        assert_eq!(snap.tools_used, vec!["bash"]);
     }
 }

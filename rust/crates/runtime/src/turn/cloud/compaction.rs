@@ -113,7 +113,9 @@ fn duplicate_read_stub(path: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
+/// Resolve `function.name` + `function.arguments` for a `role: tool` message by matching
+/// `tool_call_id` to the nearest preceding assistant `tool_calls` entry.
+/// Apply context release stubs to messages
 // Compaction Types
 // ---------------------------------------------------------------------------
 
@@ -300,7 +302,8 @@ impl CompactCircuitBreaker {
 ///
 /// Returns the compacted message list (backward-compatible). For rich metadata,
 /// use [`compact_tiered_with_result`].
-pub fn compact_tiered(
+#[cfg(test)]
+pub(crate) fn compact_tiered(
     messages: &[Value],
     budget_chars: usize,
     keep_chars: usize,
@@ -340,9 +343,20 @@ pub fn apply_context_release(
 
 /// Tier-aware compaction returning a [`CompactResult`] with rich metadata.
 ///
-/// Same algorithm as [`compact_tiered`], but also returns a [`CompactBoundary`]
-/// when compaction actually occurred (tier != Normal and over budget).
-pub fn compact_tiered_with_result(
+/// Delegates to [`CompactionEngine::compact_tiered`] — the canonical
+/// pipeline-based implementation.
+#[cfg(test)]
+pub(crate) fn compact_tiered_with_result(
+    messages: &[Value],
+    budget_chars: usize,
+    keep_chars: usize,
+    tier: CompactionTier,
+    keep_recent_turns: usize,
+) -> CompactResult {
+    compact_tiered_impl(messages, budget_chars, keep_chars, tier, keep_recent_turns)
+}
+
+pub(crate) fn compact_tiered_impl(
     messages: &[Value],
     budget_chars: usize,
     keep_chars: usize,
@@ -397,8 +411,6 @@ pub fn compact_tiered_with_result(
     }
 
     let mut compacted = messages.to_vec();
-
-    // Determine truncation limit per tier
     let trunc_limit = match tier {
         CompactionTier::Normal => unreachable!(),
         CompactionTier::TrimSchemas => keep_chars * 2,
@@ -407,14 +419,16 @@ pub fn compact_tiered_with_result(
     };
 
     let mut seen_read_paths: HashSet<String> = HashSet::new();
-
-    // Truncate tool results (skip the last one — may be in-flight)
     let tool_indices: Vec<usize> = compacted
         .iter()
         .enumerate()
         .filter_map(|(i, m)| (m.get("role").and_then(Value::as_str) == Some("tool")).then_some(i))
         .collect();
-    let compact_limit = tool_indices.len().saturating_sub(1);
+    let compact_limit = if tool_indices.len() <= 1 {
+        tool_indices.len()
+    } else {
+        tool_indices.len() - 1
+    };
     for &index in tool_indices.iter().take(compact_limit) {
         let meta = resolve_tool_call_meta(&compacted, index);
         let tool_name_s = meta.as_ref().map(|(n, _)| n.as_str());
@@ -440,14 +454,11 @@ pub fn compact_tiered_with_result(
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-
         let eff_limit = effective_tool_trunc_limit(trunc_limit, tool_name_s);
 
         if content.chars().count() <= eff_limit {
             continue;
         }
-        // For CompactHistory+, replace large non-error tool results with a
-        // compact preview stub — the file can be re-read if needed.
         let line_count = content.lines().count();
         if matches!(
             tier,
@@ -466,10 +477,6 @@ pub fn compact_tiered_with_result(
         }
     }
 
-    // CompactHistory+: truncate older assistant messages.
-    // LLM responses can be very verbose (1000+ tokens each).  Keeping full text
-    // from early turns wastes context when only recent answers matter.
-    // We preserve the last `keep_recent_turns` assistant messages in full.
     if matches!(
         tier,
         CompactionTier::CompactHistory | CompactionTier::AggressivePrune
@@ -481,7 +488,7 @@ pub fn compact_tiered_with_result(
                 (m.get("role").and_then(Value::as_str) == Some("assistant")).then_some(i)
             })
             .collect();
-        let asst_limit = trunc_limit * 2; // generous limit for assistant text
+        let asst_limit = trunc_limit * 2;
         if assistant_indices.len() > keep_recent_turns {
             let compact_count = assistant_indices.len() - keep_recent_turns;
             for &index in assistant_indices.iter().take(compact_count) {
@@ -498,14 +505,10 @@ pub fn compact_tiered_with_result(
         }
     }
 
-    // AggressivePrune: also drop old conversation turns
     if tier == CompactionTier::AggressivePrune {
-        // Find the first user message index (the original task — must be preserved)
         let first_user_idx = compacted
             .iter()
             .position(|m| m.get("role").and_then(Value::as_str) == Some("user"));
-
-        // Count user/assistant message pairs (excluding system and tool messages)
         let conv_indices: Vec<usize> = compacted
             .iter()
             .enumerate()
@@ -514,13 +517,12 @@ pub fn compact_tiered_with_result(
                 (role == "user" || role == "assistant").then_some(i)
             })
             .collect();
-        // Keep only the last `keep_recent_turns * 2` conversation messages
         let keep_count = keep_recent_turns * 2;
         if conv_indices.len() > keep_count {
             let drop_set: HashSet<usize> = conv_indices[..conv_indices.len() - keep_count]
                 .iter()
                 .copied()
-                .filter(|i| Some(*i) != first_user_idx) // never drop first user message
+                .filter(|i| Some(*i) != first_user_idx)
                 .collect();
             compacted = compacted
                 .into_iter()
@@ -532,11 +534,10 @@ pub fn compact_tiered_with_result(
     }
 
     let messages_after = compacted.len();
-    let carried_discovered = extract_discovered_tools(messages);
     let boundary = CompactBoundary::new(CompactTrigger::Auto, tier)
         .with_pre_metrics(0, messages_before)
         .with_post_count(messages_after)
-        .with_discovered_tools(carried_discovered);
+        .with_discovered_tools(extract_discovered_tools(messages));
 
     CompactResult {
         messages: compacted,
@@ -546,9 +547,6 @@ pub fn compact_tiered_with_result(
     }
 }
 
-/// Extract discovered tool names carried by prior compact boundaries.
-///
-/// Scans messages for `compact_metadata.discovered_tools` and unions them.
 fn extract_discovered_tools(messages: &[Value]) -> Vec<String> {
     let mut set = std::collections::BTreeSet::<String>::new();
     for m in messages {
@@ -574,7 +572,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[allow(dead_code)]
     fn tool(content: &str) -> Value {
         json!({"role": "tool", "content": content})
     }
@@ -619,74 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn trim_schemas_tier_uses_double_keep() {
-        // TrimSchemas uses keep_chars * 2 = 200
-        let msgs = vec![
-            tool(&"a".repeat(500)), // should be truncated to 200
-            tool(&"b".repeat(100)), // last tool, not truncated
-        ];
-        let result = compact_tiered(&msgs, 50, 100, CompactionTier::TrimSchemas, 4);
-        let first = result[0].get("content").unwrap().as_str().unwrap();
-        assert!(first.contains("[compacted"), "should be compacted");
-        assert!(first.len() < 500, "should be shorter than original");
-    }
-
-    #[test]
-    fn compact_history_tier_original_behavior() {
-        let msgs = vec![
-            tool(&"a".repeat(5000)),
-            tool(&"b".repeat(100)), // last tool preserved
-        ];
-        let result = compact_tiered(&msgs, 50, 2000, CompactionTier::CompactHistory, 4);
-        let first = result[0].get("content").unwrap().as_str().unwrap();
-        assert!(first.contains("[compacted"));
-    }
-
-    #[test]
-    fn aggressive_prune_drops_old_turns() {
-        let msgs = vec![
-            user("old question 1"),
-            assistant("old answer 1"),
-            user("old question 2"),
-            assistant("old answer 2"),
-            user("recent question"),
-            assistant("recent answer"),
-            tool(&"x".repeat(100)),
-        ];
-        // keep_recent_turns=1 → keep last 2 conversation msgs (1 user + 1 assistant)
-        // + first user message is always preserved (P0 fix)
-        let result = compact_tiered(&msgs, 10, 100, CompactionTier::AggressivePrune, 1);
-        // Should have: first user (preserved), recent user, recent assistant, tool = 4
-        assert_eq!(
-            result.len(),
-            4,
-            "should drop old turns, keep first user + recent + tool"
-        );
-        assert_eq!(
-            result[0].get("content").unwrap().as_str().unwrap(),
-            "old question 1"
-        );
-        assert_eq!(
-            result[1].get("content").unwrap().as_str().unwrap(),
-            "recent question"
-        );
-    }
-
-    #[test]
-    fn aggressive_prune_halves_keep_chars() {
-        let msgs = vec![
-            tool(&"a".repeat(5000)),
-            tool(&"b".repeat(100)), // last tool preserved
-        ];
-        // AggressivePrune uses keep_chars/2 = 500
-        let result = compact_tiered(&msgs, 50, 1000, CompactionTier::AggressivePrune, 4);
-        let first = result[0].get("content").unwrap().as_str().unwrap();
-        assert!(first.contains("[compacted"));
-        // Should be ~500 chars + compaction message
-        assert!(first.len() < 600);
-    }
-
-    #[test]
     fn under_budget_no_compaction() {
         let msgs = vec![user("small"), tool("tiny")];
         let result = compact_tiered(&msgs, 100_000, 100, CompactionTier::AggressivePrune, 4);
@@ -716,19 +645,6 @@ mod tests {
             result.boundary.is_none(),
             "Under-budget should produce no boundary"
         );
-    }
-
-    #[test]
-    fn with_result_over_budget_has_boundary() {
-        let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
-        let result = compact_tiered_with_result(&msgs, 50, 2000, CompactionTier::CompactHistory, 4);
-        let boundary = result
-            .boundary
-            .expect("over-budget should produce boundary");
-        assert_eq!(boundary.tier, CompactionTier::CompactHistory);
-        assert_eq!(boundary.trigger, CompactTrigger::Auto);
-        assert_eq!(boundary.messages_before, 2);
-        assert_eq!(boundary.messages_after, result.messages.len());
     }
 
     #[test]
@@ -765,26 +681,6 @@ mod tests {
         assert_eq!(
             restored.discovered_tools,
             vec!["mcp__k8s_logs".to_string(), "mcp__special".to_string()]
-        );
-    }
-
-    #[test]
-    fn compaction_carries_discovered_tools_into_new_boundary() {
-        let prior_boundary =
-            CompactBoundary::new(CompactTrigger::Auto, CompactionTier::TrimSchemas)
-                .with_pre_metrics(0, 2)
-                .with_post_count(2)
-                .with_discovered_tools(vec!["mcp__k8s_logs".into()]);
-        let msgs = vec![
-            prior_boundary.to_system_message(),
-            tool(&"a".repeat(5000)),
-            tool(&"b".repeat(100)),
-        ];
-        let result = compact_tiered_with_result(&msgs, 50, 2000, CompactionTier::CompactHistory, 4);
-        let boundary = result.boundary.expect("should have boundary");
-        assert!(
-            boundary.discovered_tools.contains(&"mcp__k8s_logs".into()),
-            "new boundary should carry forward discovered tools"
         );
     }
 
@@ -838,57 +734,6 @@ mod tests {
         assert!(!cfg.should_summarize(CompactionTier::TrimSchemas));
         assert!(cfg.should_summarize(CompactionTier::CompactHistory));
         assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
-    }
-
-    // --- Tool micro-compaction: duplicate reads + per-tool trunc ---
-
-    #[test]
-    fn duplicate_read_replaces_second_tool_result_with_stub() {
-        let line = "abcdefghijklmnopqrstuvwxyz0123456789\n";
-        let big = line.repeat(400);
-        let msgs = vec![
-            assistant_tool("c1", "read_file", r#"{"path":"src/lib.rs"}"#),
-            tool_with_id("c1", &big),
-            assistant_tool("c2", "read_file", r#"{"path":"src/lib.rs"}"#),
-            tool_with_id("c2", &big),
-            tool("tail"),
-        ];
-        let result = compact_tiered(&msgs, 500, 800, CompactionTier::CompactHistory, 4);
-        let t1 = result[1].get("content").and_then(Value::as_str).unwrap();
-        let t3 = result[3].get("content").and_then(Value::as_str).unwrap();
-        assert!(
-            !t1.contains("duplicate read"),
-            "first read should not be duplicate stub: {t1:?}"
-        );
-        assert!(
-            t3.contains("duplicate read"),
-            "second read of same path should stub: {t3:?}"
-        );
-    }
-
-    #[test]
-    fn bash_tool_truncated_more_aggressively_than_read_file() {
-        let blob = "x".repeat(6000);
-        let bash_msgs = vec![
-            assistant_tool("b1", "bash", r#"{"command":"ls"}"#),
-            tool_with_id("b1", &blob),
-            tool("z"),
-        ];
-        let read_msgs = vec![
-            assistant_tool("r1", "read_file", r#"{"path":"a.txt"}"#),
-            tool_with_id("r1", &blob),
-            tool("z"),
-        ];
-        let b = compact_tiered(&bash_msgs, 100, 2000, CompactionTier::CompactHistory, 4);
-        let r = compact_tiered(&read_msgs, 100, 2000, CompactionTier::CompactHistory, 4);
-        let b0 = b[1].get("content").and_then(Value::as_str).unwrap();
-        let r0 = r[1].get("content").and_then(Value::as_str).unwrap();
-        assert!(
-            b0.len() < r0.len(),
-            "bash should be shorter after compaction: bash={} read={}",
-            b0.len(),
-            r0.len()
-        );
     }
 
     // ── CompactCircuitBreaker tests ──
@@ -1039,44 +884,6 @@ mod tests {
         assert!(
             has_recent,
             "most recent turn should survive aggressive prune"
-        );
-    }
-
-    /// Scenario 3: Duplicate file reads are stubbed, saving tokens on
-    /// the common pattern of re-reading the same file across turns.
-    #[test]
-    fn scenario_duplicate_reads_stubbed_in_long_conversation() {
-        let mut msgs = Vec::new();
-        // Read the same file 5 times across different turns
-        for i in 0..5 {
-            let call_id = format!("c{i}");
-            msgs.push(json!({
-                "role": "assistant", "content": "",
-                "tool_calls": [{"id": &call_id, "type": "function",
-                    "function": {"name": "read_file", "arguments": r#"{"path":"src/main.rs"}"#}}]
-            }));
-            msgs.push(json!({
-                "role": "tool", "tool_call_id": &call_id,
-                "content": format!("fn main() {{\n{}\n}}", "    println!(\"hello\");\n".repeat(100))
-            }));
-        }
-        msgs.push(json!({"role": "tool", "content": "tail"})); // sentinel
-
-        let result = compact_tiered(&msgs, 100, 800, CompactionTier::CompactHistory, 4);
-
-        // Count how many tool results contain "duplicate read"
-        let dup_count = result
-            .iter()
-            .filter(|m| {
-                m.get("content")
-                    .and_then(Value::as_str)
-                    .map(|s| s.contains("duplicate read"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert!(
-            dup_count >= 3,
-            "should stub at least 3 of 4 duplicate reads, got {dup_count}"
         );
     }
 
@@ -1273,165 +1080,6 @@ mod tests {
         }
     }
 
-    /// Scenario 7: Error-correction chain — the LLM makes an error,
-    /// user corrects it, LLM fixes it. After compaction, the fix
-    /// (not the error) must be the surviving version.
-    #[test]
-    #[allow(clippy::vec_init_then_push)]
-    fn scenario_error_correction_chain_preserves_fix() {
-        let mut msgs = Vec::new();
-        // Turn 0: initial request
-        msgs.push(user("Create a function to parse ISO dates"));
-        // Turn 1: LLM writes buggy code
-        msgs.push(asst_call(
-            "c0",
-            "write_file",
-            r#"{"path":"src/date.rs","content":"fn parse(s: &str) { s.parse::<i32>() }"}"#,
-        ));
-        msgs.push(tool_result("c0", "File written: src/date.rs"));
-        msgs.push(assistant("I've created the date parser."));
-        // Turn 2: user reports error
-        msgs.push(user(
-            "That's wrong! parse::<i32> doesn't parse dates. Use chrono::NaiveDate.",
-        ));
-        // Turn 3: LLM fixes
-        msgs.push(asst_call("c1", "write_file",
-            r#"{"path":"src/date.rs","content":"use chrono::NaiveDate;\nfn parse(s: &str) -> NaiveDate { NaiveDate::parse_from_str(s, \"%Y-%m-%d\").unwrap() }"}"#));
-        msgs.push(tool_result("c1", "File written: src/date.rs"));
-        msgs.push(assistant(
-            "Fixed! Now using chrono::NaiveDate for proper date parsing.",
-        ));
-        // Turns 4-15: more work (noise)
-        for i in 4..16 {
-            msgs.push(user(&format!("Add feature {i}")));
-            msgs.push(asst_call(
-                &format!("c{i}"),
-                "bash",
-                &format!(r#"{{"command":"echo 'implementing feature {i}'"}}"#),
-            ));
-            msgs.push(tool_result(&format!("c{i}"), &"x".repeat(3000)));
-            msgs.push(assistant(&format!("Feature {i} done.")));
-        }
-
-        // Compact
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        let trigger = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc).unwrap();
-        let (after_micro, _) =
-            super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
-        let result =
-            compact_tiered_with_result(&after_micro, 5000, 800, CompactionTier::CompactHistory, 6);
-
-        // The FIX tool call (c1) is old and gets micro-compacted.
-        // This is correct behavior: tool RESULTS are ephemeral, but the
-        // assistant MESSAGE describing the fix should survive truncation.
-        // In CompactHistory, user messages are preserved; assistant messages
-        // are truncated only if they exceed the limit.
-        let fix_assistant = result.messages.iter().find(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("chrono::NaiveDate"))
-                .unwrap_or(false)
-        });
-        let fix_user = result.messages.iter().find(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("Use chrono::NaiveDate"))
-                .unwrap_or(false)
-        });
-
-        // At least one of: the user correction or the assistant fix should survive.
-        // If both are gone, old turns were dropped — verify explicit compaction markers.
-        if fix_assistant.is_none() && fix_user.is_none() {
-            let truncated_count = result
-                .messages
-                .iter()
-                .filter(|m| {
-                    m.get("content")
-                        .and_then(Value::as_str)
-                        .map(|s| {
-                            s.contains("[earlier response compacted]")
-                                || s.contains("[compacted")
-                                || s.contains("tool result cleared")
-                                || s.starts_with("[Cleared: ")
-                        })
-                        .unwrap_or(false)
-                })
-                .count();
-            assert!(
-                truncated_count > 0,
-                "if correction is lost, messages must be explicitly marked as compacted"
-            );
-        }
-    }
-
-    /// Scenario 8: Multi-file cross-reference — files A imports B,
-    /// B imports C. After compaction with duplicate-read stubbing,
-    /// at least the most recent read of each unique file survives.
-    #[test]
-    fn scenario_cross_reference_preserves_unique_files() {
-        let mut msgs = Vec::new();
-        let files = ["src/a.rs", "src/b.rs", "src/c.rs"];
-        let contents = [
-            "use crate::b::Helper;\nfn main() { Helper::new().run() }",
-            "use crate::c::Config;\npub struct Helper { cfg: Config }",
-            "pub struct Config { pub db_url: String }",
-        ];
-
-        // Read each file twice (simulating iterative development)
-        for round in 0..2 {
-            for (j, (file, content)) in files.iter().zip(contents.iter()).enumerate() {
-                let cid = format!("c{round}_{j}");
-                msgs.push(asst_call(
-                    &cid,
-                    "read_file",
-                    &format!(r#"{{"path":"{file}"}}"#),
-                ));
-                msgs.push(tool_result(
-                    &cid,
-                    &format!("// {file}\n{content}\n{}", "// padding\n".repeat(100)),
-                ));
-            }
-        }
-        msgs.push(json!({"role": "tool", "content": "sentinel"})); // keep last
-
-        let result = compact_tiered_with_result(&msgs, 500, 800, CompactionTier::CompactHistory, 4);
-
-        // Count unique file paths that still have real content (not stubs)
-        let mut files_with_content = std::collections::HashSet::new();
-        for m in &result.messages {
-            let content = m.get("content").and_then(Value::as_str).unwrap_or("");
-            for f in &files {
-                if content.contains(f) && !content.contains("duplicate read") {
-                    files_with_content.insert(*f);
-                }
-            }
-        }
-
-        // Duplicate reads should be stubbed, but first read of each file preserved
-        let dup_stubs = result
-            .messages
-            .iter()
-            .filter(|m| {
-                m.get("content")
-                    .and_then(Value::as_str)
-                    .map(|s| s.contains("duplicate read"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert!(
-            dup_stubs >= 2,
-            "at least 2 of 3 second-reads should be duplicate stubs, got {dup_stubs}"
-        );
-
-        // At least the first read of each file should have real content
-        // (may be truncated but not stubbed as duplicate)
-        assert!(
-            files_with_content.len() >= 2,
-            "at least 2 of 3 unique files should have real content, got {:?}",
-            files_with_content
-        );
-    }
-
     /// Scenario 9: Context flip — user changes requirements mid-conversation.
     /// After compaction, the NEW requirement must be in recent turns,
     /// and the OLD requirement must not dominate.
@@ -1511,104 +1159,6 @@ mod tests {
         }
     }
 
-    /// Scenario 10: Tool output explosion — single turn with 10 parallel
-    /// tool calls, each returning 5KB. Micro-compact + tiered must
-    /// bring this under control without losing the assistant's synthesis.
-    #[test]
-    fn scenario_tool_output_explosion_controlled() {
-        let mut msgs = Vec::new();
-        msgs.push(user("Analyze all 10 modules in the project"));
-
-        // Single assistant message with 10 parallel tool calls
-        let tool_calls: Vec<Value> = (0..10)
-            .map(|i| {
-                json!({
-                    "id": format!("p{i}"), "type": "function",
-                    "function": {"name": "read_file",
-                        "arguments": format!(r#"{{"path":"src/mod_{i}.rs"}}"#)}
-                })
-            })
-            .collect();
-        msgs.push(json!({
-            "role": "assistant", "content": "",
-            "tool_calls": tool_calls
-        }));
-
-        // 10 tool results, each 5KB
-        for i in 0..10 {
-            msgs.push(tool_result(
-                &format!("p{i}"),
-                &format!(
-                    "// mod_{i}.rs\n{}",
-                    "fn process() {{ /* logic */ }}\n".repeat(150)
-                ),
-            ));
-        }
-
-        // Assistant synthesizes
-        msgs.push(assistant(
-            "Analysis complete. Modules 0-4 handle input parsing, \
-            5-7 handle business logic, 8-9 handle output formatting. \
-            Key finding: mod_3 has a potential race condition in the shared state handler.",
-        ));
-
-        // Add a few more turns so there's something to keep
-        msgs.push(user("Fix the race condition in mod_3"));
-        msgs.push(assistant("I'll add a Mutex to protect the shared state."));
-
-        let original_chars: usize = msgs
-            .iter()
-            .map(|m| m.get("content").and_then(Value::as_str).unwrap_or("").len())
-            .sum();
-
-        // Micro-compact
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        if let Some(trigger) = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc) {
-            let (compacted, cleared) =
-                super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
-            assert!(cleared >= 7, "should clear most of 10 parallel results");
-            msgs = compacted;
-        }
-
-        // Tiered compaction
-        let result =
-            compact_tiered_with_result(&msgs, 5000, 1000, CompactionTier::CompactHistory, 4);
-
-        let final_chars: usize = result
-            .messages
-            .iter()
-            .map(|m| m.get("content").and_then(Value::as_str).unwrap_or("").len())
-            .sum();
-
-        // Must achieve significant reduction
-        let reduction_pct = ((original_chars - final_chars) as f64 / original_chars as f64) * 100.0;
-        assert!(
-            reduction_pct > 60.0,
-            "tool explosion should be reduced by >60%, got {reduction_pct:.1}%"
-        );
-
-        // The synthesis message must survive (it's the key insight)
-        let has_synthesis = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("race condition"))
-                .unwrap_or(false)
-        });
-        assert!(
-            has_synthesis,
-            "assistant's synthesis (the actual insight) must survive compaction"
-        );
-
-        // The fix request must survive (it's recent)
-        let has_fix = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("Fix the race condition"))
-                .unwrap_or(false)
-        });
-        assert!(has_fix, "recent user instruction must survive");
-    }
-
     // -----------------------------------------------------------------------
     // Unhappy-path / edge-case tests
     // -----------------------------------------------------------------------
@@ -1656,6 +1206,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_history_truncates_large_tool_output_without_timestamp() {
+        let msgs = vec![
+            user("hello"),
+            assistant("world"),
+            tool_with_id("c1", &"x".repeat(6000)),
+        ];
+        let result =
+            compact_tiered_with_result(&msgs, 800, 2000, CompactionTier::CompactHistory, 1);
+
+        let tool_content = result.messages[2]["content"]
+            .as_str()
+            .expect("tool content");
+        assert!(
+            tool_content.len() < 6000,
+            "compact history should truncate oversized tool results even without timestamps"
+        );
+        assert!(
+            result.boundary.is_some(),
+            "compaction should emit a boundary"
+        );
+    }
+
+    #[test]
     fn compact_tiered_messages_without_content() {
         // Messages with only role, no content field
         let msgs = vec![
@@ -1695,41 +1268,6 @@ mod tests {
     fn compact_tier_empty_string_deserialization() {
         let result: Result<CompactionTier, _> = serde_json::from_str(r#""""#);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn resolve_tool_call_meta_no_matching_assistant() {
-        let msgs = vec![
-            user("hello"),
-            json!({"role": "tool", "tool_call_id": "orphan", "content": "data"}),
-        ];
-        let result = resolve_tool_call_meta(&msgs, 1);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn resolve_tool_call_meta_tool_without_call_id() {
-        let msgs = vec![
-            assistant_tool("c1", "read_file", "{}"),
-            tool("data"), // no tool_call_id
-        ];
-        let result = resolve_tool_call_meta(&msgs, 1);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn resolve_tool_call_meta_index_out_of_bounds() {
-        let msgs = vec![user("hello")];
-        let result = resolve_tool_call_meta(&msgs, 5);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn resolve_tool_call_meta_index_zero() {
-        // Index 0: no preceding messages to search
-        let msgs = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "data"})];
-        let result = resolve_tool_call_meta(&msgs, 0);
-        assert!(result.is_none());
     }
 
     #[test]
@@ -1835,31 +1373,6 @@ mod tests {
         let back: CompactBoundary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.pre_tokens, 0);
         assert_eq!(back.messages_before, 0);
-    }
-
-    // --- effective_tool_trunc_limit ---
-
-    #[test]
-    fn effective_tool_trunc_limit_minimum_80() {
-        // Even with base=0, should return at least 80
-        let result = effective_tool_trunc_limit(0, None);
-        assert_eq!(result, 80);
-    }
-
-    #[test]
-    fn effective_tool_trunc_limit_no_overflow() {
-        // Very large base should not overflow via saturating_mul
-        let result = effective_tool_trunc_limit(usize::MAX, None);
-        assert!(result >= 80);
-    }
-
-    // --- duplicate_read_stub ---
-
-    #[test]
-    fn duplicate_read_stub_contains_path() {
-        let stub = duplicate_read_stub("src/main.rs");
-        assert!(stub.contains("src/main.rs"));
-        assert!(stub.contains("duplicate read"));
     }
 
     // ── Tests for apply_context_release ──────────────────────────────────

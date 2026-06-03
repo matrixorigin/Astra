@@ -2154,6 +2154,7 @@ mod tests {
         assert!(sha.len() >= 7, "SHA too short: {}", sha);
     }
 
+    #[serial_test::serial]
     #[test]
     fn team_subcommands_hint_mentions_run_and_restore() {
         let hint = team_subcommands_hint();
@@ -2162,6 +2163,7 @@ mod tests {
         assert!(hint.contains("help"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ensure_team_run_session_creates_remote_session_when_missing() {
@@ -2200,6 +2202,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ensure_team_run_session_replaces_stale_remote_session() {

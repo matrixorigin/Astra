@@ -1017,7 +1017,7 @@ impl BuildTestDelta {
 /// Provides delta analysis: which errors were fixed, which are new,
 /// which persist. Helps the LLM understand the impact of each fix
 /// and avoid chasing regressions.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BuildTestTracker {
     /// Previous result's error signatures
     previous_sigs: HashSet<String>,
@@ -1030,7 +1030,6 @@ pub struct BuildTestTracker {
 }
 
 impl BuildTestTracker {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             previous_sigs: HashSet::new(),

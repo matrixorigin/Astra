@@ -1,5 +1,4 @@
 use astra_runtime::prompts::CompactionTier;
-use astra_runtime::turn::cloud::compaction::compact_tiered_with_result;
 use astra_services::{
     BASELINE_PREVIEW_TEMPLATES, BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k,
     ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore, RetrievalStage,
@@ -662,7 +661,7 @@ async fn l3_10_s01_second_compaction_records_post_compaction_drop_count() {
     let session_id = format!("session-{suffix}");
     let run_id = format!("run-{suffix}");
     let user_id = format!("user-{suffix}");
-    let messages = vec![
+    let mut messages = vec![
         json!({"role": "system", "content": "You are Astra."}),
         json!({"role": "tool", "content": "old verbose search output ".repeat(6000)}),
         json!({"role": "assistant", "content": "intermediate reasoning ".repeat(3000)}),
@@ -674,8 +673,13 @@ async fn l3_10_s01_second_compaction_records_post_compaction_drop_count() {
         .iter()
         .map(|message| message.to_string().len() / 4)
         .sum::<usize>();
-    let result =
-        compact_tiered_with_result(&messages, 800, 2000, CompactionTier::CompactHistory, 1);
+    let result = astra_runtime::turn::cloud::CompactionEngine::compact_tiered(
+        &mut messages,
+        800,
+        2000,
+        CompactionTier::CompactHistory,
+        1,
+    );
     let after_tokens = result
         .messages
         .iter()

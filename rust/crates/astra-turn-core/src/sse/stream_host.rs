@@ -190,6 +190,12 @@ pub trait SseStreamHost: Send {
     /// (for example, before flushing pending tool requests) can capture it here.
     fn on_session_id(&mut self, _session_id: &str) {}
 
+    /// Called after each event block updates the shared SSE accumulator.
+    ///
+    /// Hosts can use this to mirror session metadata, streamed assistant text,
+    /// and usage counters into their own incremental recovery state.
+    fn on_accum_update(&mut self, _accum: &ChatTurnSseAccum) {}
+
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
     async fn execute_tool(
@@ -260,6 +266,12 @@ pub trait SseStreamHost: Send {
         }
         results
     }
+
+    /// Called after a tool execution result has been produced by the host.
+    ///
+    /// Hosts can mirror tool audit data into an interruption-safe snapshot
+    /// before the wider turn finalization hooks run.
+    fn on_tool_result(&mut self, _result: &EdgeToolExecResult) {}
 }
 
 // ─── Generic SSE consumer ────────────────────────────────────────────────────
@@ -569,6 +581,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
         host.on_session_id(session_id);
         *reported_session_id = Some(session_id.to_string());
     }
+    host.on_accum_update(accum);
     host.on_render_effects(effects);
     if accum.tool_calls.len() > tc_len_before {
         let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
@@ -684,7 +697,10 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     // Execute tools — the host decides whether to parallelize.
     if !tool_batch.is_empty() {
         let results = host.execute_tools_batch(tool_batch).await;
-        tool_results.extend(results);
+        for result in results {
+            host.on_tool_result(&result);
+            tool_results.push(result);
+        }
     }
 }
 
@@ -1078,6 +1094,118 @@ mod tests {
         assert_eq!(
             order.lock().unwrap().as_slice(),
             &["session:sess-hook".to_string(), "tool:tr-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn accum_and_tool_result_hooks_receive_live_updates() {
+        let events = format!(
+            "{}{}{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"sess-live\",\"run_id\":\"run-live\""
+            ),
+            sse_event("usage", ",\"input_tokens\":21,\"output_tokens\":13"),
+            sse_event("text_delta", ",\"content\":\"partial answer\""),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\"}",
+            ),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+
+        #[derive(Default)]
+        struct LiveHookHost {
+            snapshots: Vec<(Option<String>, Option<String>, String, u64, u64)>,
+            tool_results: Vec<(String, String, String)>,
+        }
+
+        #[async_trait]
+        impl SseStreamHost for LiveHookHost {
+            fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+
+            fn on_stream_complete(&mut self) {}
+
+            fn on_accum_update(&mut self, accum: &ChatTurnSseAccum) {
+                self.snapshots.push((
+                    accum.session_id.clone(),
+                    accum.run_id.clone(),
+                    accum.full_text.clone(),
+                    accum.prompt_tokens,
+                    accum.completion_tokens,
+                ));
+            }
+
+            fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
+                self.tool_results.push((
+                    result.request_id.clone(),
+                    result.tool.clone(),
+                    result.output.clone(),
+                ));
+            }
+
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "hi".to_string(),
+                    tool_result_fields: None,
+                    status: "ok".to_string(),
+                    duration_ms: 1,
+                }
+            }
+
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                _tool: &str,
+                _approval_kind: ApprovalKind,
+                _session_id: Option<&str>,
+                _detail: Option<&str>,
+                _display_label: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let mut host = LiveHookHost::default();
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.accum.session_id.as_deref(), Some("sess-live"));
+        assert_eq!(result.accum.run_id.as_deref(), Some("run-live"));
+        assert_eq!(result.accum.full_text, "partial answer");
+        assert_eq!(result.accum.prompt_tokens, 21);
+        assert_eq!(result.accum.completion_tokens, 13);
+        assert!(
+            host.snapshots.iter().any(|snapshot| {
+                snapshot.0.as_deref() == Some("sess-live")
+                    && snapshot.1.as_deref() == Some("run-live")
+                    && snapshot.2 == "partial answer"
+                    && snapshot.3 == 21
+                    && snapshot.4 == 13
+            }),
+            "on_accum_update should see the live session/run/text/usage state"
+        );
+        assert_eq!(
+            host.tool_results,
+            vec![("tool-1".to_string(), "bash".to_string(), "hi".to_string())]
         );
     }
 

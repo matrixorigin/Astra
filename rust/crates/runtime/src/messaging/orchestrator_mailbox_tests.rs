@@ -141,8 +141,6 @@ mod tests {
     struct TestHarness {
         engine: DelegationEngine,
         router: Arc<AgentMailboxRouter>,
-        #[allow(dead_code)]
-        tracker: Arc<DelegationTracker>,
     }
 
     fn setup_harness(executor: Arc<dyn SubRunExecutor>) -> TestHarness {
@@ -157,11 +155,7 @@ mod tests {
             DelegationEngine::with_executor(profiles, run_engine, tracker.clone(), executor)
                 .with_mailbox_router(router.clone());
 
-        TestHarness {
-            engine,
-            router,
-            tracker,
-        }
+        TestHarness { engine, router }
     }
 
     /// Build a harness WITHOUT mailbox_router to test the no-router path.
@@ -177,11 +171,7 @@ mod tests {
             DelegationEngine::with_executor(profiles, run_engine, tracker.clone(), executor);
         // Intentionally NOT calling .with_mailbox_router()
 
-        TestHarness {
-            engine,
-            router,
-            tracker,
-        }
+        TestHarness { engine, router }
     }
 
     // ── Core fix: engine auto-registers parent ──────────────────────────

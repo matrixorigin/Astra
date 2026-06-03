@@ -45,6 +45,7 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     "## ⤴",
     "## ⚠",
     "Runtime correction:",
+    "[compact session=",
 ];
 
 /// True when `message` is a runtime-synthesized scaffolding message.
@@ -187,6 +188,14 @@ mod tests {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "Runtime correction: your previous response answered without tools"
+        )));
+    }
+
+    #[test]
+    fn compact_session_marker_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "assistant",
+            "[compact session=sess-123 turn=4 source=auto tier=normal]\nWorking memory summary"
         )));
     }
 

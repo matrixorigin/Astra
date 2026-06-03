@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: debug
 description: "Diagnose and fix bugs, test failures, and unexpected behavior systematically"
 version: "1.0.0"
@@ -83,6 +81,5 @@ If the first two hypotheses don't pan out:
 - Read the dependency's source, not just your code
 
 If still stuck, invoke the `stuck` skill.
-"#,
-    )
+"#.to_string()
 }

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use astra_services::session_workspace::ContextTraceBudgetSignal;
@@ -1222,6 +1223,11 @@ async fn run_chat_turn(
     // cancel arms can observe it without re-borrowing.
     let tui_cancel_token = state.tui_cancel_token.clone();
 
+    // Incremental state for interruption recovery: written during
+    // streaming, snapped on force-exit.
+    let incremental_state =
+        Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+
     let (result, was_user_cancel) = {
         let stream_fut = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
@@ -1251,6 +1257,7 @@ async fn run_chat_turn(
             plan_subtask_id: state.current_plan_subtask_id.as_deref(),
             delegation_engine: state.delegation_engine.clone(),
             cancel_token: Some(cancel_token),
+            incremental_state: Some(incremental_state.clone()),
             plan_assemble_line_release: None,
             stream_event_tx: state.tui_stream_event_tx.clone(),
             agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
@@ -1318,6 +1325,7 @@ async fn run_chat_turn(
                     &mut stream_fut,
                     drain_timeout,
                     "Ctrl+C",
+                    incremental_state.clone(),
                 ).await;
                 (drained, true)
             }
@@ -1332,6 +1340,7 @@ async fn run_chat_turn(
                     &mut stream_fut,
                     drain_timeout,
                     "TUI cancel",
+                    incremental_state.clone(),
                 ).await;
                 (drained, true)
             }
@@ -3330,21 +3339,37 @@ pub(crate) fn is_llm_provider_auth_error(error: &str) -> bool {
 }
 
 /// Build a `TurnFailure` placeholder when the agentic loop fails to drain
-/// within the post-cancel deadline. Centralised so clippy's
-/// `result_large_err` lint can be allowed once instead of at each call site.
+/// within the post-cancel deadline. Consumes the incremental state so
+/// partial token counts and text are recovered even on force-exit.
 #[allow(clippy::result_large_err)]
-fn fabricate_user_cancel_failure(reason: &str) -> Result<StreamResult, crate::TurnFailure> {
+fn fabricate_user_cancel_failure(
+    reason: &str,
+    incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
+) -> Result<StreamResult, crate::TurnFailure> {
+    let snap = incremental_state.snapshot();
     Err(crate::TurnFailure {
         error: reason.to_string(),
-        partial: crate::PartialTurnData::default(),
+        partial: crate::PartialTurnData {
+            prompt_tokens: snap.prompt_tokens,
+            completion_tokens: snap.completion_tokens,
+            cache_read_tokens: snap.cache_read_tokens,
+            cache_creation_tokens: snap.cache_creation_tokens,
+            tool_calls_count: snap.tool_call_records.len() as u32,
+            tool_call_records: snap.tool_call_records,
+            tools_used: snap.tools_used,
+            partial_text: snap.partial_text,
+            session_id: snap.session_id,
+            run_id: snap.run_id,
+            ..Default::default()
+        },
     })
 }
 
 /// Drain the agentic-loop future after the cancel token has been flipped.
 /// Returns whichever of these wins first:
 ///   - The future completing on its own (preferred — full partial data).
-///   - A second ^C from the user (force-exit — partial data lost).
-///   - The drain timeout (wedged runtime — partial data lost).
+///   - A second ^C from the user (force-exit — partial data recovered from incremental state).
+///   - The drain timeout (wedged runtime — partial data recovered from incremental state).
 ///
 /// Without the second-^C arm, a runtime stuck inside an unresponsive tool
 /// (e.g. a Bash that ignores SIGTERM, an MCP call without cancel
@@ -3356,6 +3381,7 @@ async fn drain_after_cancel<F>(
     stream_fut: &mut std::pin::Pin<&mut F>,
     timeout: std::time::Duration,
     source: &'static str,
+    incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
 ) -> Result<StreamResult, crate::TurnFailure>
 where
     F: std::future::Future<Output = Result<StreamResult, crate::TurnFailure>>,
@@ -3364,34 +3390,35 @@ where
         biased;
         r = stream_fut => r,
         _ = tokio::signal::ctrl_c() => {
-            // User pressed ^C twice — they want OUT now, even at the cost
-            // of partial-data loss. Suggest them, but don't wait further.
+            // User pressed ^C twice — they want OUT now. Snapshot the
+            // incremental state so token counts and partial text survive.
             tracing::warn!(
                 target: "astra::cli::cancel",
                 source,
-                "user force-exited via second Ctrl+C; partial assistant text + tool records discarded"
+                "user force-exited via second Ctrl+C; recovering partial data from incremental state"
             );
-            eprintln!("{}", "  Force-exiting (partial response lost).".dim());
-            fabricate_user_cancel_failure(&format!(
-                "user_interrupted ({source}, force-exit)"
-            ))
+            eprintln!("{}", "  Force-exiting (partial data recovered).".dim());
+            fabricate_user_cancel_failure(
+                &format!("user_interrupted ({source}, force-exit)"),
+                incremental_state,
+            )
         }
         _ = tokio::time::sleep(timeout) => {
             // Wedged runtime — the cancel token was flipped but the loop
-            // didn't unwind in time. Surface a diagnostic line: this is the
-            // only signal a user gets that something is stuck below the
-            // turn boundary (e.g. an unkillable Bash, an MCP call without
-            // cancel propagation).
+            // didn't unwind in time. Recover what we have from incremental state.
             tracing::warn!(
                 target: "astra::cli::cancel",
                 source,
                 drain_secs = timeout.as_secs(),
-                "agentic loop drain timed out after cancel; runtime may be wedged in a tool call"
+                "agentic loop drain timed out after cancel; recovering partial data from incremental state"
             );
-            fabricate_user_cancel_failure(&format!(
-                "user_interrupted ({source}, drain timed out after {}s)",
-                timeout.as_secs()
-            ))
+            fabricate_user_cancel_failure(
+                &format!(
+                    "user_interrupted ({source}, drain timed out after {}s)",
+                    timeout.as_secs()
+                ),
+                incremental_state,
+            )
         }
     }
 }
@@ -3570,6 +3597,8 @@ fn report_turn_failure(
                 "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
                 "partial_tokens_in": failure.partial.prompt_tokens,
                 "partial_tokens_out": failure.partial.completion_tokens,
+                "partial_cache_read_tokens": failure.partial.cache_read_tokens,
+                "partial_cache_creation_tokens": failure.partial.cache_creation_tokens,
                 "partial_tool_calls": failure.partial.tool_calls_count,
             }));
         }
@@ -7668,8 +7697,69 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn diagnosis_criteria_start_at_zero() {
+    #[test]
+    fn incremental_state_survives_force_exit() {
+        // Simulate a turn where streaming produced tokens, text, and tool
+        // calls before the user hit Ctrl+C twice.
+        let inc = Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        inc.add_prompt_tokens(500);
+        inc.add_completion_tokens(200);
+        inc.add_cache_read_tokens(50);
+        inc.add_cache_creation_tokens(10);
+        inc.append_text("Here is the partial response before the user");
+        inc.set_session_id("sess-test-001".into());
+        inc.set_run_id("run-test-abc".into());
+        inc.push_tool_record(astra_services::session_journal::ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            ms: 42,
+            error: None,
+            ..Default::default()
+        });
+        inc.add_tool_used("read_file");
+
+        let result = fabricate_user_cancel_failure("user_interrupted (Ctrl+C, force-exit)", inc);
+
+        match result {
+            Ok(_) => panic!("expected TurnFailure, got Ok"),
+            Err(failure) => {
+                assert_eq!(failure.error, "user_interrupted (Ctrl+C, force-exit)");
+                assert_eq!(failure.partial.prompt_tokens, 500);
+                assert_eq!(failure.partial.completion_tokens, 200);
+                assert_eq!(failure.partial.cache_read_tokens, 50);
+                assert_eq!(failure.partial.cache_creation_tokens, 10);
+                assert_eq!(
+                    failure.partial.partial_text,
+                    "Here is the partial response before the user"
+                );
+                assert_eq!(failure.partial.session_id.as_deref(), Some("sess-test-001"));
+                assert_eq!(failure.partial.run_id.as_deref(), Some("run-test-abc"));
+                assert_eq!(failure.partial.tool_calls_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_incremental_state_produces_zero_tokens() {
+        // If nothing was streamed before force-exit, partial data is zeros.
+        let inc = Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        let result = fabricate_user_cancel_failure("user_interrupted (timeout)", inc);
+
+        match result {
+            Ok(_) => panic!("expected TurnFailure, got Ok"),
+            Err(failure) => {
+                assert_eq!(failure.partial.prompt_tokens, 0);
+                assert_eq!(failure.partial.completion_tokens, 0);
+                assert_eq!(failure.partial.cache_read_tokens, 0);
+                assert_eq!(failure.partial.cache_creation_tokens, 0);
+                assert!(failure.partial.partial_text.is_empty());
+                assert_eq!(failure.partial.tool_calls_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn state_default_values() {
         let state = SessionState::default();
         assert_eq!(state.diagnosis_criteria_met, 0);
         assert_eq!(state.diagnosis_criteria_failed, 0);

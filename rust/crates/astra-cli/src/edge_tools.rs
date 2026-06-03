@@ -56,7 +56,6 @@ pub(crate) use session_state::SessionStateRollbackJournal;
 mod passive_lsp;
 use astra_tools::passive_tsc_check;
 #[path = "edge_tools/shell.rs"]
-#[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
 use astra_tools::schemas::all_tool_schemas as full_tool_schemas;

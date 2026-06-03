@@ -1254,6 +1254,7 @@ pub(crate) async fn handle_info_command(
                 plan_subtask_id: None,
                 delegation_engine: None,
                 cancel_token: None,
+                incremental_state: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
                 agent_live_event_sink: None,

@@ -227,7 +227,6 @@ pub fn strip_benign_fd_redirects(command: &str) -> String {
 
 /// Strip `N> file` and `N>> file` (N ∈ 0..=9) including the following filename
 /// token. Pure string scan — no regex dependency in this hot path.
-#[allow(clippy::if_same_then_else)]
 fn strip_fd_redirect_to_file(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -239,22 +238,19 @@ fn strip_fd_redirect_to_file(input: &str) -> String {
                 bytes[i - 1],
                 b' ' | b'\t' | b'\n' | b'|' | b';' | b'&' | b'('
             );
-        let op_len: Option<usize> =
-            if left_ok && b.is_ascii_digit() && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
-                    Some(3)
-                } else {
-                    Some(2)
-                }
-            } else if left_ok && b == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
-                    Some(3)
-                } else {
-                    Some(2)
-                }
+        let is_redirect = left_ok
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'>'
+            && (b.is_ascii_digit() || b == b'&');
+        let op_len: Option<usize> = if is_redirect {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
+                Some(3)
             } else {
-                None
-            };
+                Some(2)
+            }
+        } else {
+            None
+        };
 
         if let Some(oplen) = op_len {
             let mut j = i + oplen;

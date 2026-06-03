@@ -136,7 +136,11 @@ impl CompactResponse {
 ///
 /// Uses bracket matching (not greedy `rfind`) to correctly extract the JSON object
 /// even when the LLM output contains embedded JSON fragments or prose with braces.
-/// Tries each `{` starting position until a valid CompactResponse is parsed.
+///
+/// When multiple valid `{...}` blocks are present, prefers the **richest** one
+/// (most non-empty summary fields and facts). LLMs frequently emit a stub or
+/// example object before the real answer; selecting by content prevents the
+/// stub from winning and producing an empty `/compact` summary.
 pub fn parse_compact_response(raw: &str) -> Option<CompactResponse> {
     let trimmed = raw.trim();
     let json_str = if trimmed.starts_with("```") {
@@ -149,18 +153,22 @@ pub fn parse_compact_response(raw: &str) -> Option<CompactResponse> {
         trimmed
     };
 
-    // Try direct parse
-    if let Ok(resp) = serde_json::from_str::<CompactResponse>(json_str) {
+    // Try direct parse first; if it has any content, use it.
+    if let Ok(resp) = serde_json::from_str::<CompactResponse>(json_str)
+        && response_score(&resp) > 0
+    {
         return Some(resp);
     }
 
-    // Bracket-matching extraction: try each '{' and find its matching '}'
+    // Bracket-matching extraction: enumerate ALL valid CompactResponse blocks,
+    // then return the one with the highest score (most filled fields).
     let bytes = json_str.as_bytes();
     let mut search_start = 0usize;
+    let mut best: Option<(usize, CompactResponse)> = None;
     while let Some(start) = json_str[search_start..].find('{') {
         let abs_start = search_start + start;
         let mut depth = 0u32;
-        let mut end = abs_start;
+        let mut end = None;
         let mut in_string = false;
         let mut escaped = false;
         for (i, &b) in bytes.iter().enumerate().skip(abs_start) {
@@ -180,23 +188,54 @@ pub fn parse_compact_response(raw: &str) -> Option<CompactResponse> {
                 continue;
             }
             if b == b'{' {
-                depth += 1;
+                depth = depth.saturating_add(1);
             } else if b == b'}' {
+                if depth == 0 {
+                    // Stray closing brace before any open — abort this start.
+                    break;
+                }
                 depth -= 1;
                 if depth == 0 {
-                    end = i;
+                    end = Some(i);
                     break;
                 }
             }
         }
-        let slice = &json_str[abs_start..=end];
-        if let Ok(resp) = serde_json::from_str::<CompactResponse>(slice) {
-            return Some(resp);
+        if let Some(end) = end {
+            let slice = &json_str[abs_start..=end];
+            if let Ok(resp) = serde_json::from_str::<CompactResponse>(slice) {
+                let score = response_score(&resp);
+                // Prefer the richest match. On ties (e.g. both empty),
+                // prefer the LATER one — the LLM almost always emits the
+                // real answer after any stub/example.
+                let take = match &best {
+                    None => true,
+                    Some((best_score, _)) => score >= *best_score,
+                };
+                if take {
+                    best = Some((score, resp));
+                }
+            }
         }
         search_start = abs_start + 1;
     }
 
-    None
+    best.map(|(_, resp)| resp).or_else(|| {
+        // If nothing matched the score-filter, fall back to a direct-parse
+        // result (even if empty) — better an empty summary than nothing.
+        serde_json::from_str::<CompactResponse>(json_str).ok()
+    })
+}
+
+/// Score a parsed CompactResponse by how much real content it carries.
+/// Used to disambiguate when multiple valid JSON blocks are present.
+fn response_score(r: &CompactResponse) -> usize {
+    r.summary.goals.iter().filter(|s| !s.is_empty()).count()
+        + r.summary.decisions.iter().filter(|s| !s.is_empty()).count()
+        + r.summary.actions.iter().filter(|s| !s.is_empty()).count()
+        + r.summary.status.iter().filter(|s| !s.is_empty()).count()
+        + r.summary.key_facts.iter().filter(|s| !s.is_empty()).count()
+        + r.facts.iter().filter(|f| !f.fact.is_empty()).count()
 }
 
 #[cfg(test)]
@@ -267,6 +306,50 @@ mod tests {
     #[test]
     fn parse_compact_response_no_braces() {
         assert!(parse_compact_response("just some text without braces").is_none());
+    }
+
+    #[test]
+    fn parse_compact_response_prefers_richer_match_over_empty_stub() {
+        // Regression: the LLM emits an empty schema-shaped stub before
+        // the real answer. The parser must NOT lock in on the empty stub.
+        let input = r#"Example output: {"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}
+Real answer: {"summary":{"goals":["finish refactor"],"decisions":["use typed pipeline"],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"branch is fix_0602_03","type":"semantic"}]}"#;
+        let resp = parse_compact_response(input).expect("must parse the rich answer");
+        assert_eq!(resp.summary.goals, vec!["finish refactor"]);
+        assert_eq!(resp.summary.decisions, vec!["use typed pipeline"]);
+        assert_eq!(resp.facts.len(), 1);
+        assert_eq!(resp.facts[0].fact, "branch is fix_0602_03");
+    }
+
+    #[test]
+    fn parse_compact_response_prefers_later_when_scores_tie() {
+        // Two equally-rich answers: prefer the later one. LLMs emit
+        // their final answer last; an earlier draft should not win.
+        let input = r#"Draft: {"summary":{"goals":["draft goal"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}
+Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).expect("must parse");
+        assert_eq!(
+            resp.summary.goals,
+            vec!["final goal"],
+            "tie-break must pick the later block"
+        );
+    }
+
+    #[test]
+    fn parse_compact_response_only_stub_returns_stub() {
+        // Single empty stub is still parseable — return it (caller decides).
+        let input = r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).expect("must parse");
+        assert!(resp.summary.goals.is_empty());
+        assert!(resp.facts.is_empty());
+    }
+
+    #[test]
+    fn parse_compact_response_handles_stray_closing_brace_without_panic() {
+        // Stray `}` before any `{` must not panic via depth underflow.
+        let input = r#"} prose then {"summary":{"goals":["ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).expect("should still find the real block");
+        assert_eq!(resp.summary.goals, vec!["ok"]);
     }
 
     #[test]

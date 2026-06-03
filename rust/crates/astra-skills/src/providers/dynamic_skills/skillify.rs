@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: skillify
 description: "Capture this session's repeatable process into a reusable SKILL.md skill file"
 version: "1.0.0"
@@ -143,6 +141,5 @@ After writing, tell the user:
 - Do NOT save without explicit user confirmation
 - Trigger phrases must be specific enough to avoid false activation in normal conversation
 - If a trigger would match >10% of typical developer messages, it's too broad — refine it
-"#,
-    )
+"#.to_string()
 }

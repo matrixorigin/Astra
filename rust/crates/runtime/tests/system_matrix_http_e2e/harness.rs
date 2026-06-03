@@ -387,7 +387,6 @@ pub async fn collect_sse_body_text(
 }
 
 /// Parse SSE `data: {...}` blocks; return the first JSON object whose `type` matches.
-#[allow(dead_code)]
 pub fn sse_first_data_json_with_type(body: &str, want_type: &str) -> Option<Value> {
     for block in body.split("\n\n") {
         let line = block.lines().find(|l| l.starts_with("data: "));

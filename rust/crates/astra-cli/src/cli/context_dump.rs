@@ -483,6 +483,7 @@ mod tests {
         assert_eq!(p, explicit);
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_path_expands_tilde() {
         let _g = crate::tests::HomeGuard::set("/tmp/fake-home");
@@ -490,6 +491,7 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/fake-home/snap.json"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_path_synthesizes_under_home_dir_by_default() {
         let tmp = tempfile::tempdir().unwrap();
@@ -568,6 +570,7 @@ mod tests {
         assert!(nested.exists());
     }
 
+    #[serial_test::serial]
     #[test]
     fn expand_tilde_only_matches_leading_slash_prefix() {
         let _g = crate::tests::HomeGuard::set("/tmp/home");
@@ -576,6 +579,7 @@ mod tests {
         assert_eq!(expand_tilde("~/foo"), PathBuf::from("/tmp/home/foo"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_dump_from_journal_rejects_unknown_session() {
         let err = build_dump_from_journal("nonexistent-session-xyz").unwrap_err();

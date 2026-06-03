@@ -19,6 +19,7 @@ struct CompactCtx<'a> {
     api: &'a astra_thin_client::ThinClient,
     token: &'a str,
     profile: Option<&'a str>,
+    incremental_state: Option<Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
 }
 
 impl<'a> CompactCtx<'a> {
@@ -61,6 +62,7 @@ impl<'a> CompactCtx<'a> {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token,
+            incremental_state: self.incremental_state.clone(),
             plan_assemble_line_release: None,
             stream_event_tx: None,
             agent_live_event_sink: None,
@@ -98,6 +100,62 @@ impl<'a> CompactCtx<'a> {
             #[cfg(feature = "harness")]
             harness_trace: Some(self.state.harness_trace.clone()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactArgs {
+    quick: bool,
+    no_memoria: bool,
+}
+
+fn parse_compact_args(arg: &str) -> CompactArgs {
+    let mut parsed = CompactArgs {
+        quick: false,
+        no_memoria: false,
+    };
+    for word in arg.split_whitespace() {
+        let normalized = word.to_ascii_lowercase();
+        if normalized == "quick" || normalized == "summary-only" {
+            parsed.quick = true;
+        }
+        if normalized == "no-memoria" || normalized == "no_memoria" {
+            parsed.no_memoria = true;
+        }
+    }
+    parsed
+}
+
+fn cap_swap_body(swap_body: String) -> String {
+    const MAX_SWAP_BODY_BYTES: usize = 2000;
+    if swap_body.len() > MAX_SWAP_BODY_BYTES {
+        let boundary = swap_body.floor_char_boundary(MAX_SWAP_BODY_BYTES);
+        format!("{}…", &swap_body[..boundary])
+    } else {
+        swap_body
+    }
+}
+
+fn compact_mem_note(
+    no_memoria: bool,
+    saved_to_memoria: bool,
+    facts_stored: usize,
+    quick: bool,
+) -> String {
+    if no_memoria {
+        " · Memoria side-effects skipped (no-memoria)".to_string()
+    } else if saved_to_memoria {
+        let mut note = if facts_stored > 0 {
+            format!(" · saved to memory ({facts_stored} facts extracted)")
+        } else {
+            " · saved to memory".to_string()
+        };
+        if quick {
+            note.push_str(" · quick (facts not stored to memory)");
+        }
+        note
+    } else {
+        String::new()
     }
 }
 
@@ -384,20 +442,7 @@ pub(crate) async fn handle_state_command(
                 );
                 return Ok(());
             }
-            let (compact_quick, compact_no_memoria) = {
-                let mut q = false;
-                let mut nm = false;
-                for w in arg.split_whitespace() {
-                    let t = w.to_ascii_lowercase();
-                    if t == "quick" || t == "summary-only" {
-                        q = true;
-                    }
-                    if t == "no-memoria" || t == "no_memoria" {
-                        nm = true;
-                    }
-                }
-                (q, nm)
-            };
+            let compact_args = parse_compact_args(arg);
             let Some(tok) = token else {
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
@@ -420,17 +465,24 @@ pub(crate) async fn handle_state_command(
                     max_prompt_tokens: limit,
                     last_measured_tokens: limit.saturating_add(1),
                     current_round_index: None,
+                    now_secs: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
                 };
                 CompactionEngine::micro_pipeline().compress_if_needed(&mut msgs, &budget);
                 Some(msgs)
             };
 
             // ── Single LLM call: unified summary + facts extraction ──
+            let inc_state =
+                Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
             let mut compact_ctx = CompactCtx {
                 state,
                 api,
                 token: tok,
                 profile,
+                incremental_state: Some(inc_state),
             };
             let unified_result = tokio::select! {
                 r = stream_chat_sse(compact_ctx.build_params(
@@ -488,7 +540,7 @@ pub(crate) async fn handle_state_command(
             let mut saved_to_memoria = false;
             let mut facts_stored = 0usize;
             if let Some(tok) = token {
-                if !compact_no_memoria {
+                if !compact_args.no_memoria {
                     let meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
                         state.session_id.as_deref(),
                         state.turn,
@@ -522,7 +574,7 @@ pub(crate) async fn handle_state_command(
                     }
 
                     // Store facts directly from unified response (no second LLM call)
-                    if saved_to_memoria && !compact_quick {
+                    if saved_to_memoria && !compact_args.quick {
                         let fact_meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
                             state.session_id.as_deref(),
                             state.turn,
@@ -554,7 +606,7 @@ pub(crate) async fn handle_state_command(
             if trimmed_count > 0 {
                 // ── Context swap: store trimmed turns to memory for later retrieval ──
                 if let Some(tok) = token {
-                    if !compact_no_memoria {
+                    if !compact_args.no_memoria {
                         // Build a compact representation of the swapped turns
                         let mut swap_lines: Vec<String> = Vec::new();
                         for (user_msg, assistant_msg) in &state.history[..trimmed_count] {
@@ -573,13 +625,7 @@ pub(crate) async fn handle_state_command(
                                 "Turns 1-{trimmed_count} swapped out [{tier_label}]:\n{}",
                                 swap_lines.join("\n")
                             );
-                            // Cap at 2000 bytes with UTF-8 boundary safety
-                            let capped = if swap_body.len() > 2000 {
-                                let boundary = swap_body.floor_char_boundary(2000);
-                                format!("{}…", &swap_body[..boundary])
-                            } else {
-                                swap_body
-                            };
+                            let capped = cap_swap_body(swap_body);
                             let swap_entry = prompts::memory_proto::MemoryEntry::new(
                                 prompts::memory_proto::NS_SWAP,
                                 prompts::memory_proto::ST_ARCHIVED,
@@ -603,7 +649,7 @@ pub(crate) async fn handle_state_command(
                     }
                 }
 
-                let anchor = if compact_no_memoria {
+                let anchor = if compact_args.no_memoria {
                     None
                 } else {
                     crate::cli::chat_turn::fetch_compact_memory_anchor_snippet(
@@ -626,21 +672,12 @@ pub(crate) async fn handle_state_command(
                 state.recent_tools.clear();
             }
 
-            let mem_note = if compact_no_memoria {
-                " · Memoria side-effects skipped (no-memoria)".to_string()
-            } else if saved_to_memoria {
-                let mut s = if facts_stored > 0 {
-                    format!(" · saved to memory ({facts_stored} facts extracted)")
-                } else {
-                    " · saved to memory".to_string()
-                };
-                if compact_quick {
-                    s.push_str(" · quick (facts not stored to memory)");
-                }
-                s
-            } else {
-                String::new()
-            };
+            let mem_note = compact_mem_note(
+                compact_args.no_memoria,
+                saved_to_memoria,
+                facts_stored,
+                compact_args.quick,
+            );
             eprintln!(
                 "  {} {} turns compacted · {} turns in context{}",
                 theme::icon_ok(),
@@ -1416,25 +1453,148 @@ mod tests {
 
 #[cfg(test)]
 mod compact_tests {
+    use super::*;
+    use tempfile::tempdir;
 
     #[test]
-    fn swap_body_truncation_respects_utf8_boundary() {
-        // CJK characters are 3 bytes each, emoji are 4 bytes
-        let long_text = "你好世界".repeat(300); // 3600 bytes
-        let swap_body = format!("Turns 1-5 swapped out:\nU: {}", long_text);
+    fn parse_compact_args_defaults_to_full_memory_mode() {
+        assert_eq!(
+            parse_compact_args(""),
+            CompactArgs {
+                quick: false,
+                no_memoria: false,
+            }
+        );
+    }
 
-        // Apply the same truncation logic as in the /compact handler
-        let capped = if swap_body.len() > 2000 {
-            let boundary = swap_body.floor_char_boundary(2000);
-            format!("{}…", &swap_body[..boundary])
-        } else {
-            swap_body
+    #[test]
+    fn parse_compact_args_accepts_quick_alias_and_no_memoria_alias() {
+        assert_eq!(
+            parse_compact_args("summary-only no_memoria"),
+            CompactArgs {
+                quick: true,
+                no_memoria: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_compact_args_is_case_insensitive_and_ignores_unknown_words() {
+        assert_eq!(
+            parse_compact_args("QUICK later No-Memoria"),
+            CompactArgs {
+                quick: true,
+                no_memoria: true,
+            }
+        );
+    }
+
+    #[test]
+    fn cap_swap_body_truncates_at_utf8_boundary() {
+        let long_text = "你好世界".repeat(300);
+        let swap_body = format!("Turns 1-5 swapped out:\nU: {}", long_text);
+        let capped = cap_swap_body(swap_body);
+
+        assert!(capped.len() <= 2003);
+        assert!(capped.ends_with("…"));
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cap_swap_body_leaves_short_body_unchanged() {
+        let swap_body = "Turns 1-2 swapped out:\nU: short".to_string();
+        let capped = cap_swap_body(swap_body);
+
+        assert_eq!(capped, "Turns 1-2 swapped out:\nU: short");
+    }
+
+    #[test]
+    fn compact_mem_note_reports_saved_facts() {
+        assert_eq!(
+            compact_mem_note(false, true, 5, false),
+            " · saved to memory (5 facts extracted)"
+        );
+    }
+
+    #[test]
+    fn compact_mem_note_reports_quick_without_claiming_facts() {
+        assert_eq!(
+            compact_mem_note(false, true, 0, true),
+            " · saved to memory · quick (facts not stored to memory)"
+        );
+    }
+
+    #[test]
+    fn compact_mem_note_reports_no_memoria_before_any_save_state() {
+        assert_eq!(
+            compact_mem_note(true, true, 5, false),
+            " · Memoria side-effects skipped (no-memoria)"
+        );
+    }
+
+    #[test]
+    fn compact_mem_note_is_empty_when_memory_save_failed_or_skipped_by_auth() {
+        assert_eq!(compact_mem_note(false, false, 0, false), "");
+    }
+
+    #[test]
+    fn compact_ctx_build_params_uses_history_only_without_preloaded_messages() {
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
+        let mut state = SessionState::default();
+        state.session_id = Some("sess-1".to_string());
+        state.model = Some("model-a".to_string());
+        state.history = vec![("u1".to_string(), "a1".to_string())];
+        let temp = tempdir().expect("tempdir");
+        let mut pm = PermissionManager::with_project(false, temp.path());
+        let mut ctx = CompactCtx {
+            state: &mut state,
+            api: &api,
+            token: "tok",
+            profile: Some("prof"),
+            incremental_state: None,
         };
 
-        // Should be truncated and end with ellipsis
-        assert!(capped.len() <= 2003); // 2000 + "…" (3 bytes)
-        assert!(capped.ends_with("…"));
-        // Should be valid UTF-8
-        assert!(capped.is_ascii() || capped.chars().all(|c| c.len_utf8() > 0));
+        let params = ctx.build_params("compact", true, &mut pm, None, None);
+
+        assert_eq!(params.message, "compact");
+        assert_eq!(params.auth_profile, Some("prof"));
+        assert_eq!(params.session_id, Some("sess-1"));
+        assert_eq!(params.model, Some("model-a"));
+        assert_eq!(params.history.len(), 1);
+        assert!(params.pre_loaded_messages.is_none());
+        assert!(params.incremental_state.is_none());
+    }
+
+    #[test]
+    fn compact_ctx_build_params_prefers_preloaded_messages_over_state_history() {
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
+        let mut state = SessionState::default();
+        state.history = vec![("u1".to_string(), "a1".to_string())];
+        let temp = tempdir().expect("tempdir");
+        let mut pm = PermissionManager::with_project(false, temp.path());
+        let incremental_state =
+            Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        let preloaded = vec![serde_json::json!({"role": "user", "content": "micro"})];
+        let mut ctx = CompactCtx {
+            state: &mut state,
+            api: &api,
+            token: "tok",
+            profile: None,
+            incremental_state: Some(incremental_state.clone()),
+        };
+
+        let params = ctx.build_params("compact", true, &mut pm, None, Some(preloaded));
+
+        assert!(params.history.is_empty());
+        assert_eq!(params.pre_loaded_messages.as_ref().map(Vec::len), Some(1));
+        assert!(Arc::ptr_eq(
+            params
+                .incremental_state
+                .as_ref()
+                .expect("incremental state"),
+            &incremental_state
+        ));
     }
 }

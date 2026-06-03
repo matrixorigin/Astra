@@ -1,4 +1,5 @@
 use astra_runtime::pipeline::persistence::ToolHealthEntry;
+use astra_turn_core::turn_event_sink::IncrementalTurnState;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -349,6 +350,9 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Incremental turn state for surviving interruptions.
+    /// Written during streaming; snapped on force-exit to recover partial data.
+    pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
     /// Plan-only: set to `true` after HTTP 200 so the payload-phase stderr line spinner can exit
     /// before SSE (`Waiting for model` / reasoning preview).
     pub(crate) plan_assemble_line_release: Option<Arc<AtomicBool>>,
@@ -550,6 +554,7 @@ impl<'a> ChatTurnParams<'a> {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            incremental_state: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
             agent_live_event_sink: None,

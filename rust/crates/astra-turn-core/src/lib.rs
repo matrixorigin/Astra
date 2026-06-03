@@ -92,6 +92,7 @@ pub mod token_accounting;
 pub mod tool;
 pub mod tool_allowlist;
 pub mod trace_alert;
+pub mod turn_event_sink;
 pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;

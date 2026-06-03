@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: reflect
 description: "Pause and reflect — use runtime metrics (tokens, errors, stalls, tool health) to diagnose problems and course-correct"
 version: "1.0.0"
@@ -83,6 +81,5 @@ Choose one and act immediately:
 4. **Simplify** — strip back to minimal solution
 
 Reflection without action is stalling. Decide and move.
-"#,
-    )
+"#.to_string()
 }

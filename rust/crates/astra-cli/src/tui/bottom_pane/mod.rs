@@ -270,9 +270,8 @@ impl BottomPane {
         !self.view_stack.is_empty()
     }
 
-    #[allow(clippy::borrowed_box)]
-    fn active_view(&self) -> Option<&Box<dyn BottomPaneView>> {
-        self.view_stack.last()
+    fn active_view(&self) -> Option<&dyn BottomPaneView> {
+        self.view_stack.last().map(|v| &**v)
     }
 
     fn active_view_mut(&mut self) -> Option<&mut Box<dyn BottomPaneView>> {

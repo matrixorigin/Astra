@@ -16,9 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::compaction::{
-    CompactBoundary, CompactResult, CompactTrigger, compact_tiered_with_result,
-};
+use super::compaction::{CompactBoundary, CompactResult, CompactTrigger};
+use super::compaction_engine::CompactionEngine;
 use crate::prompts::{CompactConfig, CompactionTier};
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::cloud_summary::SummaryLlmClient;
@@ -1511,8 +1510,9 @@ pub async fn compact_with_memoria(
 
     if !should_retrieve {
         // Fall back to pure truncation
-        return compact_tiered_with_result(
-            messages,
+        let mut msgs = messages.to_vec();
+        return CompactionEngine::compact_tiered(
+            &mut msgs,
             params.budget_chars,
             params.keep_chars,
             params.tier,
@@ -1521,8 +1521,9 @@ pub async fn compact_with_memoria(
     }
 
     let Some(client) = client else {
-        return compact_tiered_with_result(
-            messages,
+        let mut msgs = messages.to_vec();
+        return CompactionEngine::compact_tiered(
+            &mut msgs,
             params.budget_chars,
             params.keep_chars,
             params.tier,
@@ -1530,8 +1531,9 @@ pub async fn compact_with_memoria(
         );
     };
     let Some(sid) = session_id else {
-        return compact_tiered_with_result(
-            messages,
+        let mut msgs = messages.to_vec();
+        return CompactionEngine::compact_tiered(
+            &mut msgs,
             params.budget_chars,
             params.keep_chars,
             params.tier,
@@ -1586,8 +1588,9 @@ pub async fn compact_with_memoria(
     );
 
     // Step 3: Apply truncation against budget that leaves room for injections
-    let mut result = compact_tiered_with_result(
-        messages,
+    let mut msgs = messages.to_vec();
+    let mut result = CompactionEngine::compact_tiered(
+        &mut msgs,
         adjusted_budget_chars,
         params.keep_chars,
         params.tier,

@@ -518,29 +518,6 @@ async fn post_approval_respond(app: &Router, request_id: &str, decision: &str) -
     app.clone().oneshot(req).await.unwrap().status()
 }
 
-#[allow(dead_code)]
-/// POST /approval/respond with session_id and tool_name
-async fn post_approval_respond_full(
-    app: &Router,
-    request_id: &str,
-    decision: &str,
-    tool_name: &str,
-) -> StatusCode {
-    let body = json!({
-        "request_id": request_id,
-        "decision": decision,
-        "tool_name": tool_name,
-    });
-    let req = Request::builder()
-        .method("POST")
-        .uri("/approval/respond")
-        .header("authorization", TOKEN)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap().status()
-}
-
 /// Read SSE events incrementally from a streaming response body.
 async fn read_sse_events_from_body(body: Body) -> Vec<Value> {
     let bytes = body::to_bytes(body, 16 * 1024 * 1024).await.unwrap();
@@ -548,30 +525,6 @@ async fn read_sse_events_from_body(body: Body) -> Vec<Value> {
     parse_sse_events(&body_str)
 }
 
-#[allow(dead_code)]
-/// Read SSE events from a body frame by frame, collecting them incrementally.
-async fn read_sse_events_incremental(body: Body) -> Vec<Value> {
-    let mut collected = Vec::new();
-    let mut buf = String::new();
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        // Parse complete SSE events from buf.
-        while let Some(idx) = buf.find("\n\n") {
-            let event_str = buf[..idx].to_string();
-            buf = buf[idx + 2..].to_string();
-            if let Some(data) = event_str.strip_prefix("data: ") {
-                if let Ok(v) = serde_json::from_str::<Value>(data) {
-                    collected.push(v);
-                }
-            }
-        }
-    }
-    collected
-}
-
-/// DELETE /chat/runs/{run_id} — cancel a run.
 async fn cancel_run(app: &Router, run_id: &str) -> StatusCode {
     let req = Request::builder()
         .method("DELETE")
@@ -582,7 +535,6 @@ async fn cancel_run(app: &Router, run_id: &str) -> StatusCode {
     app.clone().oneshot(req).await.unwrap().status()
 }
 
-#[allow(dead_code)]
 fn find_event<'a>(events: &'a [Value], event_type: &str) -> Option<&'a Value> {
     events
         .iter()
@@ -596,7 +548,6 @@ fn find_events<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn find_event_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
     events
         .iter()

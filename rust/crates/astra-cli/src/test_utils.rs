@@ -137,6 +137,7 @@ mod tests {
 
     // ── HomeGuard ──────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_temp_creates_temp_dir() {
@@ -151,6 +152,7 @@ mod tests {
         drop(guard);
     }
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_set_redirects_home() {
@@ -165,6 +167,7 @@ mod tests {
         drop(guard);
     }
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_drop_restores_previous_home() {
@@ -186,6 +189,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_nested_restores_correctly() {
@@ -217,6 +221,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_path_returns_current() {

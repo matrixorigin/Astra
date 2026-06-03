@@ -1765,8 +1765,8 @@ fn if_body_token_indices(
     let then_idx = ((if_idx + 1)..tokens.len()).find(|idx| tokens[*idx].text.as_str() == "then")?;
     let mut nested_ifs = 0usize;
     let mut else_idx = None;
-    for idx in (then_idx + 1)..tokens.len() {
-        match tokens[idx].text.as_str() {
+    for (idx, token) in tokens.iter().enumerate().skip(then_idx + 1) {
+        match token.text.as_str() {
             "if" => nested_ifs += 1,
             "fi" if nested_ifs == 0 => return Some((then_idx, else_idx, idx)),
             "fi" => nested_ifs -= 1,
@@ -1779,8 +1779,8 @@ fn if_body_token_indices(
 
 fn brace_group_close_token_index(tokens: &[ShellTokenSpan], open_idx: usize) -> Option<usize> {
     let mut nested_groups = 0usize;
-    for idx in (open_idx + 1)..tokens.len() {
-        match tokens[idx].text.as_str() {
+    for (idx, token) in tokens.iter().enumerate().skip(open_idx + 1) {
+        match token.text.as_str() {
             "{" => nested_groups += 1,
             "}" if nested_groups == 0 => return Some(idx),
             "}" => nested_groups -= 1,
@@ -1799,9 +1799,7 @@ fn subshell_group_close_byte_index(command: &str, open_byte_idx: usize) -> Optio
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut escaped = false;
-    for idx in (open_idx + 1)..chars.len() {
-        let (byte_idx, ch) = chars[idx];
-
+    for &(byte_idx, ch) in chars.iter().skip(open_idx + 1) {
         if escaped {
             escaped = false;
             continue;
@@ -1838,8 +1836,8 @@ fn subshell_group_close_byte_index(command: &str, open_byte_idx: usize) -> Optio
 
 fn case_esac_token_index(tokens: &[ShellTokenSpan], case_idx: usize) -> Option<usize> {
     let mut nested_cases = 0usize;
-    for idx in (case_idx + 1)..tokens.len() {
-        match tokens[idx].text.as_str() {
+    for (idx, token) in tokens.iter().enumerate().skip(case_idx + 1) {
+        match token.text.as_str() {
             "case" => nested_cases += 1,
             "esac" if nested_cases == 0 => return Some(idx),
             "esac" => nested_cases -= 1,
@@ -2001,8 +1999,8 @@ fn shell_loop_body_token_indices(
 ) -> Option<(usize, usize)> {
     let do_idx = ((loop_idx + 1)..tokens.len()).find(|idx| tokens[*idx].text.as_str() == "do")?;
     let mut nested_loops = 0usize;
-    for idx in (do_idx + 1)..tokens.len() {
-        match tokens[idx].text.as_str() {
+    for (idx, token) in tokens.iter().enumerate().skip(do_idx + 1) {
+        match token.text.as_str() {
             "while" | "for" => nested_loops += 1,
             "done" if nested_loops == 0 => return Some((do_idx, idx)),
             "done" => nested_loops -= 1,

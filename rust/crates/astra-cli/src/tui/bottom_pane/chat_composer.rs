@@ -574,6 +574,7 @@ mod paste_tests {
         assert_eq!(decode_entry(&encoded), entry);
     }
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn history_persists_and_reloads() {
@@ -594,6 +595,7 @@ mod paste_tests {
         assert_eq!(c2.history[1], "second command\nwith newline");
     }
 
+    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn duplicate_consecutive_submits_are_deduped() {

@@ -1,7 +1,5 @@
-#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
-    format!(
-        r#"---
+    r#"---
 name: review
 description: "Review changed code for reuse, quality, and efficiency via three parallel review agents — then fix issues found"
 version: "1.0.0"
@@ -63,6 +61,5 @@ Wait for all three agents. For each finding:
 Priority for conflicts: (1) correctness, (2) performance, (3) reusability.
 
 Summarize what was fixed or confirm the code was already clean.
-"#,
-    )
+"#.to_string()
 }

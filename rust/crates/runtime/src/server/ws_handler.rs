@@ -277,7 +277,7 @@ pub(super) enum WsServerMessage {
 
     /// Connection is being closed.
     #[serde(rename = "closing")]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // only constructed in tests; variant required for serde enum
     Closing { reason: String },
 }
 
@@ -1892,11 +1892,12 @@ fn should_suppress_initial_bridge_session_info(
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 enum BridgeWsTerminalStatus {
     Completed,
+    #[allow(dead_code)] // reserved for future WS lifecycle tests
     Cancelled,
     Failed(Option<String>),
+    #[allow(dead_code)] // reserved for future WS lifecycle tests
     Disconnected,
 }
 

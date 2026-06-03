@@ -1700,14 +1700,11 @@ pub fn git_file_history(project_root: &Path, args: &Value) -> String {
     };
 
     let mut lines = Vec::new();
-    let mut walked = 0usize;
     const MAX_WALK: usize = 50_000;
-    #[allow(clippy::explicit_counter_loop)]
-    for info in walk {
+    for (walked, info) in walk.enumerate() {
         if lines.len() >= n || walked >= MAX_WALK {
             break;
         }
-        walked += 1;
         let info = match info {
             Ok(i) => i,
             Err(_) => break,
@@ -2009,15 +2006,12 @@ pub fn git_contributors(project_root: &Path, args: &Value) -> String {
     let mut file_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut recent_lines: Vec<String> = Vec::new();
     let mut total_commits = 0u32;
-    let mut walked = 0u32;
     const MAX_WALK: u32 = 50_000;
 
-    #[allow(clippy::explicit_counter_loop)]
-    for info in walk {
-        if walked >= MAX_WALK {
+    for (walked, info) in walk.enumerate() {
+        if walked as u32 >= MAX_WALK {
             break;
         }
-        walked += 1;
         let info = match info {
             Ok(i) => i,
             Err(_) => break,

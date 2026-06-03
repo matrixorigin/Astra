@@ -536,6 +536,7 @@ pub(crate) async fn stream_chat_sse(
         ),
         prefix_store: prefix_store_for_host,
         append_system_prompt: p.append_system_prompt.take(),
+        incremental_state: p.incremental_state.take(),
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
@@ -876,6 +877,8 @@ pub(crate) async fn stream_chat_sse(
                 verdict_events: std::mem::take(&mut state.stall.verdict_events),
                 prompt_tokens: state.total_prompt,
                 completion_tokens: state.total_completion,
+                cache_read_tokens: state.total_cache_read,
+                cache_creation_tokens: state.total_cache_creation,
                 tool_calls_count,
                 tool_health_export: state.turn_guard.health.export_merged(p.tool_health_entries),
                 session_id: state.current_session_id.clone(),
