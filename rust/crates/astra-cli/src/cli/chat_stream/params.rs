@@ -459,6 +459,9 @@ pub(crate) struct ChatTurnParams<'a> {
     #[cfg(feature = "harness")]
     pub(crate) harness_trace:
         Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+    /// Optional benchmark profile for one-shot/headless runs.
+    #[cfg(feature = "harness")]
+    pub(crate) benchmark_profile: Option<astra_harness::HarnessProfile>,
 }
 
 /// Bundle of "basic CLI" fields shared across one-shot CLI chat invocations
@@ -513,6 +516,9 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Shared harness trace for /inspect trace command (non-REPL one-shot paths).
     #[cfg(feature = "harness")]
     pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+    /// Optional benchmark profile for one-shot/headless runs.
+    #[cfg(feature = "harness")]
+    pub benchmark_profile: Option<astra_harness::HarnessProfile>,
 }
 
 impl<'a> ChatTurnParams<'a> {
@@ -591,6 +597,8 @@ impl<'a> ChatTurnParams<'a> {
             harness_sink: ctx.harness_sink.clone(),
             #[cfg(feature = "harness")]
             harness_trace: ctx.harness_trace.clone(),
+            #[cfg(feature = "harness")]
+            benchmark_profile: ctx.benchmark_profile,
         }
     }
 }

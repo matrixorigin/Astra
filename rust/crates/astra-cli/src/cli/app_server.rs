@@ -443,6 +443,8 @@ async fn run_turn(
         harness_sink: None,
         #[cfg(feature = "harness")]
         harness_trace: None,
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
     };
     let append_system_prompt = params
         .get("developerInstructions")

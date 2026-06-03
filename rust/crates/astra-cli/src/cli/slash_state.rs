@@ -99,6 +99,8 @@ impl<'a> CompactCtx<'a> {
             harness_sink: Some(self.state.harness_sink.clone()),
             #[cfg(feature = "harness")]
             harness_trace: Some(self.state.harness_trace.clone()),
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
         }
     }
 }

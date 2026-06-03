@@ -1294,6 +1294,8 @@ async fn run_chat_turn(
             harness_sink: Some(state.harness_sink.clone()),
             #[cfg(feature = "harness")]
             harness_trace: Some(state.harness_trace.clone()),
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
         });
         tokio::pin!(stream_fut);
 

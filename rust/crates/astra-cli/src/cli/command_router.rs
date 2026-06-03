@@ -295,6 +295,8 @@ async fn execute_headless_task_body(
         harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
             astra_harness::SessionTrace::new(None),
         ))),
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
     };
 
     let turn_options = crate::cli::turn_facade::BasicCliTurnOptions::default();
@@ -1664,6 +1666,8 @@ pub(crate) async fn execute_cli_command(
                 harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
                     astra_harness::SessionTrace::new(None),
                 ))),
+                #[cfg(feature = "harness")]
+                benchmark_profile: None,
             };
             let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
@@ -2224,6 +2228,8 @@ pub(crate) async fn execute_cli_command(
                 harness_sink: Some(harness_sink.clone()),
                 #[cfg(feature = "harness")]
                 harness_trace: Some(harness_trace),
+                #[cfg(feature = "harness")]
+                benchmark_profile: args.benchmark_profile,
             };
             let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
@@ -3050,6 +3056,8 @@ pub(crate) async fn run_print_mode(
         harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
             astra_harness::SessionTrace::new(None),
         ))),
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
     };
 
     let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {

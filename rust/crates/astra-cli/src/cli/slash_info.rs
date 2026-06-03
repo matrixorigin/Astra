@@ -1291,6 +1291,8 @@ pub(crate) async fn handle_info_command(
                 harness_sink: Some(state.harness_sink.clone()),
                 #[cfg(feature = "harness")]
                 harness_trace: Some(state.harness_trace.clone()),
+                #[cfg(feature = "harness")]
+                benchmark_profile: None,
             })
             .await
             .map_err(|f| f.error)?;

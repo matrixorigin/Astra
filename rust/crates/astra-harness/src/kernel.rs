@@ -1,6 +1,7 @@
 use crate::{
     DecisionRecord, HarnessKernel, HookVerdict, RuntimeSnapshot, Severity, SnapshotSink, Verifier,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct StandardKernel {
@@ -22,6 +23,11 @@ impl StandardKernel {
         Self::configured(sink, HarnessLimits::default())
     }
 
+    /// Create a kernel with verifiers configured for a named execution profile.
+    pub fn with_profile(sink: Arc<dyn SnapshotSink>, profile: HarnessProfile) -> Self {
+        Self::configured(sink, profile.limits())
+    }
+
     /// Create a kernel with verifiers configured from explicit limits.
     pub fn configured(sink: Arc<dyn SnapshotSink>, limits: HarnessLimits) -> Self {
         let mut verifiers: Vec<Box<dyn Verifier>> = vec![
@@ -33,7 +39,11 @@ impl StandardKernel {
             Box::new(crate::verifiers::TurnGuardVerifierAdapter::default()),
             Box::new(crate::verifiers::DelegationVerifier::default()),
             Box::new(crate::verifiers::ConfidenceVerifier::default()),
-            Box::new(crate::verifiers::ProgressVerifier::default()),
+            Box::new(crate::verifiers::ProgressVerifier {
+                max_read_only_round_streak: limits.max_read_only_round_streak,
+                max_redundant_read_count: limits.max_redundant_read_count,
+                ..Default::default()
+            }),
             Box::new(crate::verifiers::CompletionVerifier),
         ];
         if let Some(max_cost) = limits.max_session_cost_usd {
@@ -55,8 +65,39 @@ impl StandardKernel {
     }
 }
 
+/// Named verifier profiles for different execution modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HarnessProfile {
+    #[default]
+    Default,
+    Swebench,
+}
+
+impl HarnessProfile {
+    pub fn limits(self) -> HarnessLimits {
+        match self {
+            Self::Default => HarnessLimits::default(),
+            Self::Swebench => HarnessLimits::swebench(),
+        }
+    }
+}
+
+impl FromStr for HarnessProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "swebench" | "swe-bench" => Ok(Self::Swebench),
+            other => Err(format!(
+                "invalid benchmark profile `{other}` (expected swebench)"
+            )),
+        }
+    }
+}
+
 /// Production limits for harness verifiers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HarnessLimits {
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u64>,
@@ -68,6 +109,41 @@ pub struct HarnessLimits {
     pub cache_creation_cost_per_mtok: Option<f64>,
     pub max_tool_calls_per_session: Option<u32>,
     pub sensitive_tools: Vec<String>,
+    pub max_read_only_round_streak: u32,
+    pub max_redundant_read_count: u32,
+}
+
+impl Default for HarnessLimits {
+    fn default() -> Self {
+        let progress = crate::verifiers::ProgressVerifier::default();
+        Self {
+            max_turns: None,
+            max_tokens: None,
+            max_duration_millis: None,
+            max_session_cost_usd: None,
+            prompt_cost_per_mtok: None,
+            completion_cost_per_mtok: None,
+            cache_read_cost_per_mtok: None,
+            cache_creation_cost_per_mtok: None,
+            max_tool_calls_per_session: None,
+            sensitive_tools: Vec::new(),
+            max_read_only_round_streak: progress.max_read_only_round_streak,
+            max_redundant_read_count: progress.max_redundant_read_count,
+        }
+    }
+}
+
+impl HarnessLimits {
+    /// SWE-bench runs are offline/headless and should continue until they
+    /// produce a patch, finish, or hit the runner timeout. Disable the
+    /// interactive read-only checkpoint while keeping the other verifiers.
+    pub fn swebench() -> Self {
+        Self {
+            max_read_only_round_streak: 0,
+            max_redundant_read_count: 0,
+            ..Self::default()
+        }
+    }
 }
 
 impl StandardKernel {
@@ -224,6 +300,31 @@ mod tests {
             }
             other => panic!("expected pause verdict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn swebench_profile_disables_progress_pause() {
+        let sink = InMemorySnapshotSink::arc();
+        let kernel = StandardKernel::with_profile(sink.clone(), HarnessProfile::Swebench);
+        let mut record = make_record(HookPoint::PostTurn, 1, 0);
+        record.snapshot.final_state = Some("empty".into());
+        record.snapshot.read_only_round_streak = 100;
+        record.snapshot.redundant_read_count = 100;
+
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+    }
+
+    #[test]
+    fn benchmark_profile_parser_accepts_only_known_profiles() {
+        assert_eq!(
+            "swebench".parse::<HarnessProfile>(),
+            Ok(HarnessProfile::Swebench)
+        );
+        assert_eq!(
+            "swe-bench".parse::<HarnessProfile>(),
+            Ok(HarnessProfile::Swebench)
+        );
+        assert!("unknown".parse::<HarnessProfile>().is_err());
     }
 
     #[test]

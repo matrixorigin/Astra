@@ -37,6 +37,11 @@ fn parse_explain_mode_arg(value: &str) -> Result<crate::ExplainMode, String> {
     }
 }
 
+#[cfg(feature = "harness")]
+fn parse_benchmark_profile_arg(value: &str) -> Result<astra_harness::HarnessProfile, String> {
+    value.parse()
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "astra")]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
@@ -355,6 +360,10 @@ pub(crate) struct ChatArgs {
     /// Model override
     #[arg(long)]
     pub model: Option<String>,
+    /// Benchmark execution profile. Currently supports `swebench`.
+    #[cfg(feature = "harness")]
+    #[arg(long = "benchmark-profile", value_parser = parse_benchmark_profile_arg)]
+    pub benchmark_profile: Option<astra_harness::HarnessProfile>,
     /// Enable explain mode (`--explain` => on, `--explain verbose` => verbose)
     #[arg(
         long,

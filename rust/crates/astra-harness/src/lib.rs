@@ -11,7 +11,7 @@ pub mod verifiers;
 
 pub use adjust::{AdjustCommand, AdjustSender, adjust_channel};
 pub use debug::{Breakpoint, DebugKernel};
-pub use kernel::{HarnessLimits, StandardKernel};
+pub use kernel::{HarnessLimits, HarnessProfile, StandardKernel};
 pub use query::{HarnessQueryReceiver, HarnessQuerySender, query_channel};
 pub use rollback::RollbackAssessment;
 pub use snapshot_diff::SnapshotDiff;
