@@ -5,10 +5,45 @@
 //! ```
 
 use astra_services::session_reaper::{SessionReaperPolicy, reap_sessions};
+use sqlx::Pool;
 use sqlx::Row;
+use sqlx::mysql::MySql;
 use uuid::Uuid;
 
 mod common;
+
+async fn session_status(pool: &Pool<MySql>, session_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM agent_sessions WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("session status")
+}
+
+/// Shared CI DB may contain many stale rows; `reap_sessions` uses `LIMIT batch_limit`
+/// without `ORDER BY`, so loop until *this* session reaches the expected status.
+async fn reap_until(
+    pool: &Pool<MySql>,
+    policy: &SessionReaperPolicy,
+    session_id: &str,
+    want: &str,
+    max_rounds: u32,
+) {
+    for _ in 0..max_rounds {
+        if session_status(pool, session_id).await == want {
+            return;
+        }
+        let result = reap_sessions(pool, policy).await;
+        if result.marked_idle + result.marked_ended + result.deleted == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        session_status(pool, session_id).await,
+        want,
+        "session {session_id} did not reach '{want}' within {max_rounds} reap rounds"
+    );
+}
 
 #[tokio::test]
 #[ignore = "live MatrixOne; ASTRA_TEST_DB_IT=1"]
@@ -44,53 +79,48 @@ async fn reaper_marks_stale_active_session_idle_then_ended() {
     .await
     .expect("backdate session activity");
 
-    let status_before: String =
-        sqlx::query_scalar("SELECT status FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .expect("status before reap");
-    assert_eq!(status_before, "active", "seed session must start active");
+    let stale_secs: i64 = sqlx::query_scalar(
+        "SELECT TIMESTAMPDIFF(SECOND, last_active_at, NOW(6)) FROM agent_sessions WHERE session_id = ?",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stale seconds");
+    assert!(
+        stale_secs >= 7200,
+        "backdate must leave session at least 2h stale, got {stale_secs}s"
+    );
+    assert_eq!(
+        session_status(&pool, &session_id).await,
+        "active",
+        "seed session must start active"
+    );
 
     // Pass 1: mark stale actives as idle (do not end yet).
     let idle_only = SessionReaperPolicy {
         idle_after_secs: 60,
         end_after_idle_secs: 86_400,
         delete_after_ended_days: 365,
-        batch_limit: 100,
+        batch_limit: 500,
     };
-    let idle_result = reap_sessions(&pool, &idle_only).await;
-    let status_idle: String =
-        sqlx::query_scalar("SELECT status FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .expect("status after idle sweep");
-    assert_eq!(
-        status_idle, "idle",
-        "seed session should become idle (reap marked_idle={})",
-        idle_result.marked_idle
-    );
+    reap_until(&pool, &idle_only, &session_id, "idle", 50).await;
 
     // Pass 2: end sessions idle longer than the threshold.
     let end_policy = SessionReaperPolicy {
         idle_after_secs: 86_400,
         end_after_idle_secs: 60,
         delete_after_ended_days: 365,
-        batch_limit: 100,
+        batch_limit: 500,
     };
-    let end_result = reap_sessions(&pool, &end_policy).await;
+    reap_until(&pool, &end_policy, &session_id, "ended", 50).await;
+
     let row = sqlx::query("SELECT status, ended_at FROM agent_sessions WHERE session_id = ?")
         .bind(&session_id)
         .fetch_one(&pool)
         .await
         .expect("final row");
     let status = row.try_get::<String, _>("status").expect("status");
-    assert_eq!(
-        status, "ended",
-        "seed session should end after idle threshold (reap marked_ended={})",
-        end_result.marked_ended
-    );
+    assert_eq!(status, "ended");
     let ended_at_set: Option<i64> = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND ended_at IS NOT NULL",
     )
