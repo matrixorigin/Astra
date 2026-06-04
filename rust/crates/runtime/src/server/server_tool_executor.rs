@@ -1087,6 +1087,25 @@ impl ServerToolExecutor {
         *guard = schemas;
     }
 
+    async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        let Some(mgr) = &self.mcp_manager else {
+            return astra_tools::ToolResult::error(format!(
+                "Error: Tool '{name}' is not available — no MCP manager configured."
+            ));
+        };
+        match mgr
+            .read()
+            .await
+            .call_tool_by_mcp_name(name, args.clone())
+            .await
+        {
+            Ok(content) => astra_tools::ToolResult::text(content),
+            Err(e) => astra_tools::ToolResult::error(super::runtime_mcp::redact_mcp_error_text(
+                &format!("MCP tool '{name}' failed: {e}"),
+            )),
+        }
+    }
+
     fn supports_server_tool_name(&self, tool: &str) -> bool {
         self.server_tool_names.contains(tool)
     }
@@ -1763,6 +1782,12 @@ impl ServerToolExecutor {
 
     /// Execute a tool call and preserve structured metadata for server-side fallback paths.
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        // Runtime MCP tools are request-scoped server-side tools. Execute them
+        // locally so short-lived credentials never route through edge dispatch.
+        if name.starts_with("mcp__") {
+            return self.execute_mcp_tool(name, args).await;
+        }
+
         // ── Try remote edge agent first ──────────────────────────────
         if let Some(pool) = &self.edge_connection_pool {
             if let Some(result) = pool.execute_tool_any_edge(&self.user_id, name, args).await {
@@ -2184,26 +2209,7 @@ impl ServerToolExecutor {
                 }
             }
             // ── MCP tool forwarding ──────────────────────────────────
-            _ if name.starts_with("mcp__") => {
-                let Some(mgr) = &self.mcp_manager else {
-                    return astra_tools::ToolResult::error(format!(
-                        "Error: Tool '{name}' is not available — no MCP manager configured."
-                    ));
-                };
-                match mgr
-                    .read()
-                    .await
-                    .call_tool_by_mcp_name(name, args.clone())
-                    .await
-                {
-                    Ok(content) => astra_tools::ToolResult::text(content),
-                    Err(e) => {
-                        astra_tools::ToolResult::error(super::runtime_mcp::redact_mcp_error_text(
-                            &format!("MCP tool '{name}' failed: {e}"),
-                        ))
-                    }
-                }
-            }
+            _ if name.starts_with("mcp__") => self.execute_mcp_tool(name, args).await,
             // ── Unknown tool fallback ──────────────────────────────────
             _ => {
                 self.record_preview_template_missing(name).await;
@@ -5067,6 +5073,109 @@ esac
             None,
         );
         (exec, dir)
+    }
+
+    struct PanicEdgeDispatch;
+
+    #[async_trait]
+    impl astra_services::multi_agent::EdgeDispatchService for PanicEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<i64, String> {
+            panic!("MCP tools must not be routed through edge dispatch");
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            panic!("MCP tools must not poll edge dispatch");
+        }
+
+        async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
+            panic!("MCP tools must not mark edge dispatch");
+        }
+
+        async fn deliver_result(
+            &self,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            panic!("MCP tools must not deliver edge dispatch results");
+        }
+
+        async fn wait_result(
+            &self,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            panic!("MCP tools must not wait for edge dispatch results");
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            panic!("MCP tools must not clean edge dispatch");
+        }
+    }
+
+    struct PanicEdgeRegistry;
+
+    #[async_trait]
+    impl astra_services::multi_agent::EdgeRegistryService for PanicEdgeRegistry {
+        async fn register_or_update(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+            _hostname: Option<&str>,
+            _worktree_path: Option<&str>,
+            _capabilities: Option<serde_json::Value>,
+        ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+            panic!("MCP tools must not update edge registry");
+        }
+
+        async fn heartbeat(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+        ) -> Result<(), String> {
+            panic!("MCP tools must not heartbeat edge registry");
+        }
+
+        async fn list_by_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            panic!("MCP tools must not list edge registry");
+        }
+
+        async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
+            panic!("MCP tools must not unregister edge registry");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_bypass_edge_dispatch() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_edge_dispatch_service(Arc::new(PanicEdgeDispatch));
+        exec.set_edge_registry_service(Arc::new(PanicEdgeRegistry));
+
+        let result = exec
+            .execute_with_metadata("mcp__demo__search", &json!({ "query": "hello" }))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("no MCP manager configured"),
+            "{}",
+            result.output
+        );
     }
 
     fn cleanup_session_artifacts(session_id: &str) {
