@@ -1,3 +1,4 @@
+pub mod agent_result_wire;
 pub mod builtin_agents;
 pub mod context_cache;
 pub mod progress;

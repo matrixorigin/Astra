@@ -835,8 +835,6 @@ pub(crate) async fn partition_and_execute_delegations(
                     .await
                     {
                         Ok(result) => {
-                            let succeeded =
-                                result.status == "completed" || result.status == "success";
                             delegation_results.push(DelegationExecutionResult {
                                 call_id,
                                 summary: format_delegation_result(&result),
@@ -844,7 +842,7 @@ pub(crate) async fn partition_and_execute_delegations(
                                 outcome: Some(DelegationOutcomeMetadata {
                                     scenario: scenario_name,
                                     pattern: pattern_name,
-                                    succeeded,
+                                    succeeded: result.is_success(),
                                 }),
                             });
                         }
@@ -940,11 +938,19 @@ pub(crate) fn format_delegation_result(
         .iter()
         .filter(|ar| ar.is_success())
         .count();
-    let failed = result.agent_results.len().saturating_sub(succeeded);
+    let unfinished = result
+        .agent_results
+        .iter()
+        .filter(|ar| ar.is_unfinished())
+        .count();
+    let failed = result
+        .agent_results
+        .len()
+        .saturating_sub(succeeded + unfinished);
     let mut parts = Vec::new();
     parts.push(format!(
-        "Delegation {} — status: {} ({} ok / {} failed)",
-        result.delegation_id, result.status, succeeded, failed
+        "Delegation {} — status: {} ({} ok / {} unfinished / {} failed)",
+        result.delegation_id, result.status, succeeded, unfinished, failed
     ));
 
     let final_output = delegation_final_output_preview(result, 1_500);
@@ -958,7 +964,13 @@ pub(crate) fn format_delegation_result(
         Some(DelegationFinalOutputSource::SingleSuccessfulSubRun)
     );
     for ar in &result.agent_results {
-        let status_icon = if ar.is_success() { "✅" } else { "❌" };
+        let status_icon = if ar.is_success() {
+            "✅"
+        } else if ar.is_unfinished() {
+            "⏳"
+        } else {
+            "❌"
+        };
         let output_preview =
             if single_successful_sub_run_fallback && ar.is_success() && ar.output.is_some() {
                 "[same as final result above]".to_string()
@@ -993,17 +1005,27 @@ pub(crate) fn format_delegation_terminal_preview(
         .iter()
         .filter(|ar| ar.is_success())
         .count();
-    let failed = result.agent_results.len().saturating_sub(succeeded);
-    let status_style = if failed == 0 {
+    let unfinished = result
+        .agent_results
+        .iter()
+        .filter(|ar| ar.is_unfinished())
+        .count();
+    let failed = result
+        .agent_results
+        .len()
+        .saturating_sub(succeeded + unfinished);
+    let status_style = if result.is_success() {
         HeadlessStderrStyle::Green
-    } else {
+    } else if result.is_unfinished() || succeeded > 0 {
         HeadlessStderrStyle::Yellow
+    } else {
+        HeadlessStderrStyle::Red
     };
     let mut lines = vec![(
         status_style,
         format!(
-            "🤝 Delegation {} completed [{} ok / {} failed]",
-            result.delegation_id, succeeded, failed
+            "🤝 Delegation {} {} [{} ok / {} unfinished / {} failed]",
+            result.delegation_id, result.status, succeeded, unfinished, failed
         ),
     )];
     if let Some((final_output, _)) = delegation_final_output_preview(result, 200) {
@@ -1562,6 +1584,48 @@ mod tests {
         assert!(formatted.contains("❌"));
         assert!(formatted.contains("timeout"));
         assert!(formatted.contains("partial_failure"));
+    }
+
+    #[test]
+    fn format_delegation_result_surfaces_unfinished_agents_distinctly() {
+        let result = astra_services::coordination::DelegationResult {
+            delegation_id: "del-unfinished".to_string(),
+            status: "unfinished".to_string(),
+            agent_results: vec![
+                astra_services::coordination::AgentResult {
+                    agent_id: "coder".to_string(),
+                    run_id: "run-1".to_string(),
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                astra_services::coordination::AgentResult {
+                    agent_id: "reviewer".to_string(),
+                    run_id: "run-2".to_string(),
+                    status: "waiting".to_string(),
+                    output: Some("waiting for approval".to_string()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+            ],
+            aggregated_output: None,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+        };
+
+        let formatted = format_delegation_result(&result);
+        assert!(formatted.contains("1 ok / 1 unfinished / 0 failed"));
+        assert!(formatted.contains("⏳"));
+
+        let preview = format_delegation_terminal_preview(&result);
+        assert_eq!(preview[0].0, HeadlessStderrStyle::Yellow);
+        assert!(preview[0].1.contains("unfinished"));
     }
 
     #[test]

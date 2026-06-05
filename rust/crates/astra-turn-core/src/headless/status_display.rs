@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 
 use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_str};
 
+use crate::orchestration::agent_result_wire::agent_tool_status_summary;
 use crate::tool::categories::{ToolDisplayCategory, registry};
 
 fn format_path_location(
@@ -918,6 +919,10 @@ pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
                 Some(format!("{changed} files"))
             }
         }
+        "agent" => serde_json::from_str::<Value>(result)
+            .ok()
+            .as_ref()
+            .and_then(agent_tool_status_summary),
         _ => None,
     }
 }
@@ -1157,6 +1162,24 @@ mod tests {
             &json!({"task_id": "render-pass", "status": "in_progress"}),
         );
         assert_eq!(detail.as_deref(), Some("render-pass -> in_progress"));
+    }
+
+    #[test]
+    fn tool_result_summary_agent_uses_shared_child_result_projection() {
+        let launched = tool_result_summary(
+            "agent",
+            r#"{"status":"launched","agent_id":"reviewer@abc"}"#,
+        );
+        assert_eq!(
+            launched.as_deref(),
+            Some("Agent launched; waiting for get_result output.")
+        );
+
+        let interrupted = tool_result_summary(
+            "agent",
+            r#"{"status":"interrupted","agent_id":"reviewer@abc","result":"partial draft","finish_reason":"budget_exhausted"}"#,
+        );
+        assert_eq!(interrupted.as_deref(), Some("partial draft"));
     }
 
     #[test]

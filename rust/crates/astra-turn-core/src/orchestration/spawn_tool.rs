@@ -414,7 +414,7 @@ fn default_agent_type() -> String {
 /// dropped without inspection.
 #[must_use = "spawning an agent without inspecting the result leaks the run \
               (Launched: caller must follow up with get_result; \
-              Completed/Failed/Cancelled: caller must surface the agent's output)"]
+              Completed/Interrupted/Failed/Cancelled: caller must surface the agent's output)"]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SpawnAgentOutput {
@@ -422,6 +422,14 @@ pub enum SpawnAgentOutput {
     Completed {
         agent_id: String,
         result: String,
+        tool_calls: u32,
+        duration_ms: u64,
+    },
+    /// Agent produced partial output but stopped before normal completion.
+    Interrupted {
+        agent_id: String,
+        result: String,
+        finish_reason: String,
         tool_calls: u32,
         duration_ms: u64,
     },
@@ -462,6 +470,7 @@ impl SpawnAgentOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_deserialize_input() {
@@ -716,6 +725,30 @@ mod tests {
                 "type {bad} must be rejected, got parsed result"
             );
         }
+    }
+
+    #[test]
+    fn interrupted_spawn_output_serializes_as_distinct_wire_status() {
+        let value = serde_json::to_value(SpawnAgentOutput::Interrupted {
+            agent_id: "reviewer@abc123".to_string(),
+            result: "partial findings".to_string(),
+            finish_reason: "budget_exhausted".to_string(),
+            tool_calls: 3,
+            duration_ms: 1250,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "status": "interrupted",
+                "agent_id": "reviewer@abc123",
+                "result": "partial findings",
+                "finish_reason": "budget_exhausted",
+                "tool_calls": 3,
+                "duration_ms": 1250
+            })
+        );
     }
 }
 

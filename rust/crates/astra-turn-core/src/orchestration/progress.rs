@@ -36,6 +36,14 @@ pub enum ProgressEventType {
         total_tokens: (u64, u64),
         duration_ms: u64,
     },
+    /// Agent produced partial output but stopped before normal completion.
+    Interrupted {
+        reason: String,
+        partial_summary: String,
+        total_tool_calls: u32,
+        total_tokens: (u64, u64),
+        duration_ms: u64,
+    },
     /// Agent failed.
     Failed { error: String },
     /// Agent cancelled.
@@ -71,6 +79,30 @@ pub enum ProgressEventType {
         agent_type: String,
         description: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProgressTerminalKind {
+    Completed,
+    Interrupted,
+    Failed,
+    Cancelled,
+}
+
+impl ProgressEventType {
+    pub fn terminal_kind(&self) -> Option<AgentProgressTerminalKind> {
+        match self {
+            Self::Completed { .. } => Some(AgentProgressTerminalKind::Completed),
+            Self::Interrupted { .. } => Some(AgentProgressTerminalKind::Interrupted),
+            Self::Failed { .. } => Some(AgentProgressTerminalKind::Failed),
+            Self::Cancelled { .. } => Some(AgentProgressTerminalKind::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.terminal_kind().is_some()
+    }
 }
 
 /// Broadcasts progress events to multiple subscribers.
@@ -155,6 +187,23 @@ impl AgentProgressEmitter {
     ) {
         self.emit(ProgressEventType::Completed {
             result_summary: summary.into(),
+            total_tool_calls: tool_calls,
+            total_tokens: tokens,
+            duration_ms,
+        });
+    }
+
+    pub fn interrupted(
+        &self,
+        reason: impl Into<String>,
+        partial_summary: impl Into<String>,
+        tool_calls: u32,
+        tokens: (u64, u64),
+        duration_ms: u64,
+    ) {
+        self.emit(ProgressEventType::Interrupted {
+            reason: reason.into(),
+            partial_summary: partial_summary.into(),
             total_tool_calls: tool_calls,
             total_tokens: tokens,
             duration_ms,
@@ -318,6 +367,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_kind_distinguishes_interrupted_from_completed() {
+        let completed = ProgressEventType::Completed {
+            result_summary: "done".into(),
+            total_tool_calls: 1,
+            total_tokens: (1, 2),
+            duration_ms: 3,
+        };
+        let interrupted = ProgressEventType::Interrupted {
+            reason: "budget_exhausted".into(),
+            partial_summary: "partial".into(),
+            total_tool_calls: 1,
+            total_tokens: (1, 2),
+            duration_ms: 3,
+        };
+        assert_eq!(
+            completed.terminal_kind(),
+            Some(AgentProgressTerminalKind::Completed)
+        );
+        assert_eq!(
+            interrupted.terminal_kind(),
+            Some(AgentProgressTerminalKind::Interrupted)
+        );
+        assert!(interrupted.is_terminal());
+    }
+
     #[tokio::test]
     async fn test_failed_and_cancelled_events() {
         let broadcaster = Arc::new(ProgressBroadcaster::default());
@@ -338,6 +413,21 @@ mod tests {
         assert!(
             matches!(e2.event_type, ProgressEventType::Cancelled { reason } if reason == "user request")
         );
+
+        let emitter3 = broadcaster.for_agent("agent-4".to_string());
+        emitter3.interrupted("budget_exhausted", "partial output", 4, (10, 11), 1200);
+        let e3 = rx.recv().await.unwrap();
+        assert_eq!(e3.agent_id, "agent-4");
+        assert!(matches!(
+            e3.event_type,
+            ProgressEventType::Interrupted {
+                reason,
+                partial_summary,
+                total_tool_calls: 4,
+                total_tokens: (10, 11),
+                duration_ms: 1200,
+            } if reason == "budget_exhausted" && partial_summary == "partial output"
+        ));
     }
 
     #[tokio::test]

@@ -10,6 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use astra_turn_core::orchestration::agent_result_wire::{
+    render_agent_tool_error, render_unknown_agent_result, render_wait_for_agent_status,
+    render_wait_timeout_outcome,
+};
+
 use super::{
     DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnContext, WaitForAgentOutcome,
 };
@@ -62,26 +67,22 @@ pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> 
     match action {
         "spawn" => handle_agent_spawn_action(args, ctx).await,
         "get_result" => handle_agent_get_result_action(args, ctx).await,
-        "send_message" => json!({
-            "status": "failed",
-            "error": "agent.send_message requires a mailbox-aware executor and is not handled by the shared spawn/get_result runtime handler."
-        })
-        .to_string(),
-        other if other.is_empty() && args.get("spawn").is_some() => json!({
-            "status": "failed",
-            "error": "Invalid agent call shape. Use the top-level `action='spawn'` field, not a `spawn` wrapper key. Example: agent(action='spawn', description='...', prompt='...', run_in_background: true)."
-        })
-        .to_string(),
-        other if other.is_empty() && args.get("agents").is_some() => json!({
-            "status": "failed",
-            "error": "Unsupported `agents` batch payload for `agent`. Each `agent(action='spawn', ...)` call launches exactly one child. To fan out in parallel, emit N separate spawn calls in a single assistant message."
-        })
-        .to_string(),
-        other => json!({
-            "status": "failed",
-            "error": format!("Unknown agent action: '{other}'. Use one of: spawn, get_result, run_chain")
-        })
-        .to_string(),
+        "send_message" => render_agent_tool_error(
+            None,
+            "agent.send_message requires a mailbox-aware executor and is not handled by the shared spawn/get_result runtime handler.",
+        ),
+        other if other.is_empty() && args.get("spawn").is_some() => render_agent_tool_error(
+            None,
+            "Invalid agent call shape. Use the top-level `action='spawn'` field, not a `spawn` wrapper key. Example: agent(action='spawn', description='...', prompt='...', run_in_background: true).",
+        ),
+        other if other.is_empty() && args.get("agents").is_some() => render_agent_tool_error(
+            None,
+            "Unsupported `agents` batch payload for `agent`. Each `agent(action='spawn', ...)` call launches exactly one child. To fan out in parallel, emit N separate spawn calls in a single assistant message.",
+        ),
+        other => render_agent_tool_error(
+            None,
+            &format!("Unknown agent action: '{other}'. Use one of: spawn, get_result, run_chain"),
+        ),
     }
 }
 
@@ -92,22 +93,14 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     {
         Ok(i) => i,
         Err(e) => {
-            return json!({
-                "status": "failed",
-                "error": format!("Invalid input: {e}")
-            })
-            .to_string();
+            return render_agent_tool_error(None, &format!("Invalid input: {e}"));
         }
     };
 
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return json!({
-                "status": "failed",
-                "error": "Agent spawning not available in this context."
-            })
-            .to_string();
+            return render_agent_tool_error(None, "Agent spawning not available in this context.");
         }
     };
 
@@ -134,18 +127,9 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     };
 
     match ctx.spawner.spawn(input, &spawn_ctx).await {
-        Ok(output) => serde_json::to_string(&output).unwrap_or_else(|_| {
-            json!({
-                "status": "failed",
-                "error": "Failed to serialize output"
-            })
-            .to_string()
-        }),
-        Err(e) => json!({
-            "status": "failed",
-            "error": e.to_string()
-        })
-        .to_string(),
+        Ok(output) => serde_json::to_string(&output)
+            .unwrap_or_else(|_| render_agent_tool_error(None, "Failed to serialize output")),
+        Err(e) => render_agent_tool_error(None, &e.to_string()),
     }
 }
 
@@ -237,40 +221,25 @@ pub async fn handle_agent_get_result_action(
     let agent_id = match args.get("agent_id").and_then(Value::as_str).map(str::trim) {
         Some(id) if !id.is_empty() => id,
         None => {
-            return json!({
-                "status": "failed",
-                "error": "Missing required field: agent_id"
-            })
-            .to_string();
+            return render_agent_tool_error(None, "Missing required field: agent_id");
         }
         Some(_) => {
-            return json!({
-                "status": "failed",
-                "error": "Invalid agent_id: must be a non-empty string"
-            })
-            .to_string();
+            return render_agent_tool_error(None, "Invalid agent_id: must be a non-empty string");
         }
     };
 
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return json!({
-                "status": "failed",
-                "error": "Agent spawning not available in this context."
-            })
-            .to_string();
+            return render_agent_tool_error(None, "Agent spawning not available in this context.");
         }
     };
 
-    use astra_turn_core::orchestration_types::AgentStatus;
-
     if agent_id.len() > MAX_AGENT_ID_BYTES {
-        return json!({
-            "status": "failed",
-            "error": format!("Invalid agent_id: exceeds {MAX_AGENT_ID_BYTES} bytes"),
-        })
-        .to_string();
+        return render_agent_tool_error(
+            None,
+            &format!("Invalid agent_id: exceeds {MAX_AGENT_ID_BYTES} bytes"),
+        );
     }
 
     let timeout = Duration::from_secs(120);
@@ -285,31 +254,7 @@ pub async fn handle_agent_get_result_action(
                     &status,
                 )
                 .await;
-            match status {
-                AgentStatus::Completed {
-                    result,
-                    finish_reason,
-                } => render_completed_agent_result(agent_id, &result, finish_reason.as_deref()),
-                AgentStatus::Failed {
-                    error,
-                    finish_reason,
-                } => {
-                    let reason = finish_reason.as_deref().unwrap_or("failed");
-                    json!({
-                        "status": "failed",
-                        "agent_id": agent_id,
-                        "error": error,
-                        "finish_reason": reason,
-                    })
-                    .to_string()
-                }
-                status => json!({
-                    "status": "unknown",
-                    "agent_id": agent_id,
-                    "detail": format!("{status:?}"),
-                })
-                .to_string(),
-            }
+            render_wait_for_agent_status(agent_id, &status)
         }
         WaitForAgentOutcome::TimedOut => {
             let live_status = ctx
@@ -319,66 +264,9 @@ pub async fn handle_agent_get_result_action(
                 .map(|state| state.status);
             render_wait_timeout_outcome(agent_id, live_status.as_ref(), timeout)
         }
-        WaitForAgentOutcome::Unknown => json!({
-            "status": "failed",
-            "agent_id": agent_id,
-            "error": UNKNOWN_AGENT_ID_ERROR,
-        })
-        .to_string(),
-    }
-}
-
-pub fn render_completed_agent_result(
-    agent_id: &str,
-    result: &str,
-    finish_reason: Option<&str>,
-) -> String {
-    let reason = finish_reason.unwrap_or("normal");
-    let interrupted = reason != "normal";
-    let mut body = json!({
-        "status": if interrupted { "interrupted" } else { "completed" },
-        "agent_id": agent_id,
-        "result": result,
-        "finish_reason": reason,
-        "incomplete": interrupted,
-    });
-    if interrupted {
-        body["hint"] = json!(
-            "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly."
-        );
-    }
-    body.to_string()
-}
-
-/// Decide the outcome JSON when `wait_for_agent` returns `None`.
-///
-/// Split out as a pure function so timeout vs still-running remains
-/// regression-tested without standing up a full [`DynamicAgentSpawner`].
-pub fn render_wait_timeout_outcome(
-    agent_id: &str,
-    live_status: Option<&astra_turn_core::orchestration_types::AgentStatus>,
-    timeout: Duration,
-) -> String {
-    match live_status {
-        Some(status) if !status.is_terminal() => json!({
-            "status": "still_running",
-            "agent_id": agent_id,
-            "current_status": format!("{status:?}"),
-            "waited_secs": timeout.as_secs(),
-            "hint": "The child agent is still working. Call `agent(action='get_result', agent_id=...)` again \
-                    to continue waiting. Do NOT treat this as failure or fabricate \
-                    what the child would have returned.",
-        })
-        .to_string(),
-        _ => json!({
-            "status": "timeout",
-            "agent_id": agent_id,
-            "error": format!(
-                "Agent '{agent_id}' did not complete within {}s and has no live state",
-                timeout.as_secs()
-            ),
-        })
-        .to_string(),
+        WaitForAgentOutcome::Unknown => {
+            render_unknown_agent_result(agent_id, UNKNOWN_AGENT_ID_ERROR)
+        }
     }
 }
 
@@ -387,7 +275,6 @@ mod tests {
     use super::*;
     use crate::orchestration::{SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult};
     use crate::server::delegation::engine::DelegationTracker;
-    use astra_turn_core::orchestration_types::AgentStatus;
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -565,6 +452,29 @@ mod tests {
         }
     }
 
+    struct InterruptedSpawnExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for InterruptedSpawnExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "interrupted".into(),
+                finish_reason: "budget_exhausted".into(),
+                output: Some("partial review".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 2,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
     fn test_spawner(executor: Arc<dyn SpawnAgentExecutor>) -> Arc<DynamicAgentSpawner> {
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -648,6 +558,25 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("claude-sonnet-4.6")
         );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_surfaces_interrupted_sync_result() {
+        let spawner = test_spawner(Arc::new(InterruptedSpawnExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Code review",
+            "prompt": "Review the diff and stop if budget runs out",
+            "agent_type": "general-purpose"
+        });
+
+        let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "interrupted");
+        assert_eq!(value["finish_reason"], "budget_exhausted");
+        assert_eq!(value["result"], "partial review");
+        assert_eq!(value["tool_calls"], 2);
     }
 
     #[tokio::test]
@@ -737,87 +666,5 @@ mod tests {
                 .contains("mailbox-aware executor"),
             "{result}"
         );
-    }
-
-    #[test]
-    fn wait_timeout_still_running_when_live_state_non_terminal() {
-        let status = AgentStatus::Running {
-            activity: "reading file".into(),
-        };
-        let out =
-            render_wait_timeout_outcome("reviewer-tests", Some(&status), Duration::from_secs(120));
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            v["status"], "still_running",
-            "a timeout while the child is demonstrably running must NOT look like failure: {out}"
-        );
-        assert!(
-            v["hint"].as_str().unwrap_or("").contains("still working"),
-            "the hint must tell the LLM to call again rather than synthesize a fake result: {out}"
-        );
-        assert_eq!(v["waited_secs"], 120);
-    }
-
-    #[test]
-    fn wait_timeout_timeout_when_no_live_state() {
-        let out = render_wait_timeout_outcome("unknown-agent", None, Duration::from_secs(120));
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            v["status"], "timeout",
-            "when there is no live state the outcome is a genuine timeout: {out}"
-        );
-        assert!(
-            v["error"].as_str().unwrap_or("").contains("no live state"),
-            "error must make the distinction auditable: {out}"
-        );
-    }
-
-    #[test]
-    fn wait_timeout_reports_terminal_states_as_timeout_not_still_running() {
-        for terminal in [
-            AgentStatus::Cancelled,
-            AgentStatus::Failed {
-                error: "x".into(),
-                finish_reason: None,
-            },
-            AgentStatus::Completed {
-                result: "done".into(),
-                finish_reason: None,
-            },
-        ] {
-            let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));
-            let v: Value = serde_json::from_str(&out).unwrap();
-            assert_eq!(
-                v["status"], "timeout",
-                "terminal state must not render as still_running: status={terminal:?} out={out}"
-            );
-        }
-    }
-
-    #[test]
-    fn completed_result_reports_budget_exhaustion_as_interrupted() {
-        let out = render_completed_agent_result(
-            "reviewer-tests",
-            "partial findings",
-            Some("budget_exhausted"),
-        );
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "interrupted");
-        assert_eq!(v["finish_reason"], "budget_exhausted");
-        assert_eq!(v["incomplete"], true);
-        assert!(
-            v["hint"].as_str().unwrap_or("").contains("incomplete"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn completed_result_keeps_normal_completion_completed() {
-        let out = render_completed_agent_result("reviewer-tests", "done", Some("normal"));
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "completed");
-        assert_eq!(v["finish_reason"], "normal");
-        assert_eq!(v["incomplete"], false);
-        assert!(v.get("hint").is_none(), "{out}");
     }
 }

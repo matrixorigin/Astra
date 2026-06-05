@@ -25,8 +25,12 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use astra_services::coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
-    DelegationRequest, DelegationResult, aggregate_results,
+    AGENT_RESULT_STATUS_FAILED, AgentProfile, AgentProfileRegistry, AgentResult,
+    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
+    agent_result_status_to_subrun_state, aggregate_results,
+};
+use astra_services::runs::{
+    DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
 };
 use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServiceConfig};
 
@@ -612,13 +616,16 @@ impl DelegationTracker {
                 delegation_id: delegation_id.clone(),
                 agent_id: rec.agent_id.clone().unwrap_or_default(),
                 depth: 0, // Depth not stored in DB; 0 is safe for recovered records
-                state: SubRunState::from_str(&rec.status).unwrap_or_else(|| {
-                    eprintln!(
-                        "[delegation-tracker] unknown status '{}' for run '{}', defaulting to Failed",
-                        rec.status, rec.run_id
-                    );
-                    SubRunState::Failed
-                }),
+                state: match durable_run_status_kind(&rec.status) {
+                    DurableRunStatusKind::Other => {
+                        eprintln!(
+                            "[delegation-tracker] unknown status '{}' for run '{}', defaulting to Failed",
+                            rec.status, rec.run_id
+                        );
+                        SubRunState::Failed
+                    }
+                    _ => durable_run_status_to_subrun_state(&rec.status),
+                },
                 retry_of: rec.retry_of.clone(),
             };
 
@@ -968,21 +975,50 @@ impl DelegationTracker {
         output_preview: Option<&str>,
     ) {
         debug_assert!(terminal_state.is_terminal());
+        self.set_sub_run_result_state(run_id, terminal_state, error, output_preview, true)
+            .await;
+    }
 
+    pub async fn apply_sub_run_result_state(
+        &self,
+        run_id: &str,
+        result_state: SubRunState,
+        error: Option<&str>,
+        output_preview: Option<&str>,
+    ) {
+        if result_state.is_terminal() {
+            self.complete_sub_run_with_result(run_id, result_state, error, output_preview)
+                .await;
+            return;
+        }
+
+        debug_assert_eq!(result_state, SubRunState::Paused);
+        self.set_sub_run_result_state(run_id, result_state, error, output_preview, false)
+            .await;
+    }
+
+    async fn set_sub_run_result_state(
+        &self,
+        run_id: &str,
+        result_state: SubRunState,
+        error: Option<&str>,
+        output_preview: Option<&str>,
+        emit_completion_event: bool,
+    ) {
         // Transition state in record
         let mut delegation_id = None;
         let mut agent_id = None;
-        let mut final_state = terminal_state;
+        let mut final_state = result_state;
         {
             let mut delegations = self.delegations.write().await;
             for records in delegations.values_mut() {
                 for record in records.iter_mut() {
                     if record.run_id == run_id {
-                        // Best-effort: if transition fails, force the terminal state
+                        // Best-effort: if transition fails, force the requested result state.
                         record.state = record
                             .state
-                            .try_transition(terminal_state)
-                            .unwrap_or(terminal_state);
+                            .try_transition(result_state)
+                            .unwrap_or(result_state);
                         final_state = record.state;
                         delegation_id = Some(record.delegation_id.clone());
                         agent_id = Some(record.agent_id.clone());
@@ -1000,44 +1036,57 @@ impl DelegationTracker {
 
         // Update progress + emit SSE event
         if let (Some(did), Some(aid)) = (delegation_id, agent_id) {
-            self.persist_journal_entry(
-                astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
-                    self.session_id.as_deref(),
-                    &did,
-                    run_id,
-                    &aid,
-                    final_state.as_str(),
-                    error,
-                    output_preview,
-                ),
-            );
+            if emit_completion_event {
+                self.persist_journal_entry(
+                    astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
+                        self.session_id.as_deref(),
+                        &did,
+                        run_id,
+                        &aid,
+                        final_state.as_str(),
+                        error,
+                        output_preview,
+                    ),
+                );
+            }
 
             self.update_progress(&did, &aid, final_state).await;
 
             // Emit completion SSE event for web clients
-            if let Some(ref broadcaster) = self.progress_broadcaster {
-                use crate::orchestration::{AgentProgressEvent, ProgressEventType};
-                let status_str = format!("{:?}", final_state);
-                let event_type = if final_state == SubRunState::Completed {
-                    ProgressEventType::Completed {
-                        result_summary: format!("Sub-run {} finished", run_id),
-                        total_tool_calls: 0,
-                        total_tokens: (0, 0),
-                        duration_ms: 0,
-                    }
-                } else {
-                    ProgressEventType::Failed {
-                        error: format!("Sub-run terminal state: {}", status_str),
-                    }
-                };
-                broadcaster.emit(AgentProgressEvent {
-                    agent_id: aid,
-                    event_type,
-                    timestamp_epoch_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                });
+            if emit_completion_event {
+                if let Some(ref broadcaster) = self.progress_broadcaster {
+                    use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+                    let status_str = format!("{:?}", final_state);
+                    let event_type = match final_state {
+                        SubRunState::Completed => ProgressEventType::Completed {
+                            result_summary: format!("Sub-run {} finished", run_id),
+                            total_tool_calls: 0,
+                            total_tokens: (0, 0),
+                            duration_ms: 0,
+                        },
+                        SubRunState::Paused => ProgressEventType::Interrupted {
+                            reason: "paused".to_string(),
+                            partial_summary: format!("Sub-run {} paused", run_id),
+                            total_tool_calls: 0,
+                            total_tokens: (0, 0),
+                            duration_ms: 0,
+                        },
+                        SubRunState::Cancelled => ProgressEventType::Cancelled {
+                            reason: format!("Sub-run {} cancelled", run_id),
+                        },
+                        _ => ProgressEventType::Failed {
+                            error: format!("Sub-run terminal state: {}", status_str),
+                        },
+                    };
+                    broadcaster.emit(AgentProgressEvent {
+                        agent_id: aid,
+                        event_type,
+                        timestamp_epoch_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    });
+                }
             }
         }
     }
@@ -1645,16 +1694,11 @@ impl DelegationEngine {
                         retry_exec.await
                     } {
                         Ok(r) => {
-                            // Transition retry to Running→Completed/Failed
-                            let terminal_state = if r.is_success() {
-                                SubRunState::Completed
-                            } else {
-                                SubRunState::Failed
-                            };
+                            let result_state = agent_result_status_to_subrun_state(&r.status);
                             self.tracker
-                                .complete_sub_run_with_result(
+                                .apply_sub_run_result_state(
                                     &r.run_id,
-                                    terminal_state,
+                                    result_state,
                                     r.error.as_deref(),
                                     r.output.as_deref(),
                                 )
@@ -2270,7 +2314,7 @@ impl DelegationEngine {
                             &run_id,
                             "status"
                         );
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
+                        agent_result_status_to_subrun_state(&r.status)
                     }
                     Err(e) => {
                         astra_core::log_persist!(
@@ -2289,7 +2333,7 @@ impl DelegationEngine {
                     Err(e) => (Some(e.as_str()), None),
                 };
                 tracker
-                    .complete_sub_run_with_result(&run_id, final_state, error, output_preview)
+                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
                     .await;
                 (result, agent_id, run_id)
             });
@@ -2630,10 +2674,9 @@ impl DelegationEngine {
                         &sub_run_id,
                         "status"
                     );
-                    let final_state =
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    let final_state = agent_result_status_to_subrun_state(&r.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &sub_run_id,
                             final_state,
                             r.error.as_deref(),
@@ -2925,10 +2968,9 @@ impl DelegationEngine {
                         &prod_run_id,
                         "status"
                     );
-                    let final_state =
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    let final_state = agent_result_status_to_subrun_state(&r.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &prod_run_id,
                             final_state,
                             r.error.as_deref(),
@@ -3135,10 +3177,9 @@ impl DelegationEngine {
                         &rev_run_id,
                         "status"
                     );
-                    let final_state =
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    let final_state = agent_result_status_to_subrun_state(&r.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &rev_run_id,
                             final_state,
                             r.error.as_deref(),
@@ -3416,7 +3457,7 @@ impl DelegationEngine {
                                 "Fork: failed to persist final status for {run_id}: {e}"
                             );
                         }
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
+                        agent_result_status_to_subrun_state(&r.status)
                     }
                     Err(e) => {
                         if let Err(pe) = run_engine
@@ -3436,7 +3477,7 @@ impl DelegationEngine {
                     Err(e) => (Some(e.as_str()), None),
                 };
                 tracker
-                    .complete_sub_run_with_result(&run_id, final_state, error, output_preview)
+                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
                     .await;
                 (result, agent_id, run_id)
             });
@@ -4091,6 +4132,27 @@ mod tests {
         }
     }
 
+    struct StatusExecutor {
+        status: &'static str,
+        error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for StatusExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: self.status.to_string(),
+                output: Some(format!("[{}] yielded", self.status)),
+                error: self.error.map(ToString::to_string),
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
     /// Test executor that fails for specific agents.
     struct FailingExecutor {
         fail_agents: Vec<String>,
@@ -4172,6 +4234,29 @@ mod tests {
         // Tracker recorded hierarchy
         let subs = tracker.get_sub_runs("del-1").await;
         assert_eq!(subs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fan_out_paused_result_preserves_nonterminal_tracker_state() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(StatusExecutor {
+            status: STATUS_PAUSED,
+            error: None,
+        }));
+
+        let result = de
+            .execute(fan_out_request(vec!["coder"]), "orch", None)
+            .await
+            .unwrap();
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, STATUS_PAUSED);
+
+        let run_id = &result.agent_results[0].run_id;
+        assert_eq!(
+            tracker.get_sub_run_state(run_id).await,
+            Some(SubRunState::Paused)
+        );
+        let run = engine.load_run(run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, STATUS_PAUSED);
     }
 
     #[tokio::test]
@@ -5530,6 +5615,36 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
+            DurableRunRecord {
+                run_id: "sub-3".into(),
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: Some("parent-1".into()),
+                root_run_id: Some("parent-1".into()),
+                ancestor_path: Some("parent-1/sub-3".into()),
+                depth: 1,
+                delegation_id: Some("del-1".into()),
+                agent_id: Some("approver".into()),
+                retry_of: None,
+                retry_scope: Some("node".into()),
+                status: "waiting".into(),
+                waiting_for: Some("approval".into()),
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: -1,
+                checkpoint_version: None,
+                checkpoint_json: None,
+                error_code: None,
+                error_message: None,
+                retry_count: 0,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
             // Root run — should be skipped
             DurableRunRecord {
                 run_id: "root-run".into(),
@@ -5568,9 +5683,10 @@ mod tests {
 
         // Hierarchy rebuilt
         let subs = tracker.get_sub_runs("del-1").await;
-        assert_eq!(subs.len(), 2);
+        assert_eq!(subs.len(), 3);
         assert!(tracker.is_sub_run("sub-1").await);
         assert!(tracker.is_sub_run("sub-2").await);
+        assert!(tracker.is_sub_run("sub-3").await);
         assert!(!tracker.is_sub_run("root-run").await);
 
         // Parent links rebuilt
@@ -5588,11 +5704,19 @@ mod tests {
                 .and_then(|sub| sub.retry_of.as_deref()),
             Some("sub-1")
         );
+        assert_eq!(
+            tracker.get_sub_run_state("sub-3").await,
+            Some(SubRunState::Paused)
+        );
 
         // Paused sub-run gets pause flag
         let flag = tracker.get_pause_flag("sub-2").await;
         assert!(flag.is_some());
         assert!(flag.unwrap().load(Ordering::SeqCst)); // paused = true
+
+        // Waiting sub-run maps to paused tracker state but does not recreate
+        // a cooperative pause flag.
+        assert!(tracker.get_pause_flag("sub-3").await.is_none());
 
         // Completed sub-run has no pause flag
         assert!(tracker.get_pause_flag("sub-1").await.is_none());
@@ -5975,7 +6099,7 @@ mod tests {
             run_id: "r1".into(),
             status: status.into(),
             output: output.map(|s| s.to_string()),
-            error: if status == "failed" {
+            error: if status == AGENT_RESULT_STATUS_FAILED {
                 Some("err".into())
             } else {
                 None

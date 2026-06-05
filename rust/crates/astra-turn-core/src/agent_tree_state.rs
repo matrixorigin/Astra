@@ -116,6 +116,21 @@ impl AgentTreeState {
                         record.info.metrics.prompt_tokens = total_tokens.0;
                         record.info.metrics.completion_tokens = total_tokens.1;
                     }
+                    ProgressEventType::Interrupted {
+                        reason,
+                        partial_summary,
+                        total_tool_calls,
+                        total_tokens,
+                        ..
+                    } => {
+                        record.info.status = AgentStatus::Completed {
+                            result: partial_summary,
+                            finish_reason: Some(reason),
+                        };
+                        record.info.metrics.tool_calls = total_tool_calls;
+                        record.info.metrics.prompt_tokens = total_tokens.0;
+                        record.info.metrics.completion_tokens = total_tokens.1;
+                    }
                     ProgressEventType::Failed { error } => {
                         record.info.status = AgentStatus::Failed {
                             error,
@@ -339,6 +354,42 @@ mod tests {
         let snap = state.snapshot();
         assert!(matches!(snap.roots[0].status, AgentStatus::Failed { .. }));
         assert_eq!(snap.failed_agents, 1);
+    }
+
+    #[test]
+    fn interrupted_completion_preserves_partial_result_and_finish_reason() {
+        let mut state = AgentTreeState::default();
+        state.apply(event(
+            "agent",
+            ProgressEventType::AgentSpawned {
+                run_id: "run-1".into(),
+                parent_run_id: "root".into(),
+                agent_type: "task".into(),
+                description: "agent".into(),
+            },
+        ));
+        state.apply(event(
+            "agent",
+            ProgressEventType::Interrupted {
+                reason: "budget_exhausted".into(),
+                partial_summary: "partial output".into(),
+                total_tool_calls: 2,
+                total_tokens: (9, 4),
+                duration_ms: 25,
+            },
+        ));
+
+        let snap = state.snapshot();
+        assert!(matches!(
+            &snap.roots[0].status,
+            AgentStatus::Completed {
+                result,
+                finish_reason: Some(reason),
+            } if result == "partial output" && reason == "budget_exhausted"
+        ));
+        assert_eq!(snap.roots[0].metrics.tool_calls, 2);
+        assert_eq!(snap.roots[0].metrics.prompt_tokens, 9);
+        assert_eq!(snap.roots[0].metrics.completion_tokens, 4);
     }
 
     #[test]

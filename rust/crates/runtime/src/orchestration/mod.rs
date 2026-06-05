@@ -3,15 +3,31 @@
 //! This module provides the ability for LLMs to dynamically spawn sub-agents
 //! at runtime without pre-defined team configurations.
 
+mod agent_result_status;
 pub mod agent_tool;
+pub mod agent_trace_status;
 mod fork_cache_probe;
 pub(crate) mod spawner;
 pub mod worktree_registry;
 pub mod worktree_sweep;
 
+pub use agent_result_status::{
+    AgentToolBudgetRecordProjection, AgentToolRecordActionKind, AgentToolRecordProjection,
+    project_agent_tool_budget_record, project_agent_tool_record,
+    render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
+};
 pub use agent_tool::{
     AgentToolContext, handle_agent_get_result_action, handle_agent_spawn_action, handle_agent_tool,
-    normalize_agent_spawn_args, render_completed_agent_result, render_wait_timeout_outcome,
+    normalize_agent_spawn_args,
+};
+pub use agent_trace_status::{
+    AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,
+    AGENT_TRACE_EVENT_INTERRUPTED, AGENT_TRACE_EVENT_SPAWNED, AGENT_TRACE_EVENT_WAITING,
+    AGENT_TRACE_STATUS_CANCELLED, AGENT_TRACE_STATUS_COMPLETED, AGENT_TRACE_STATUS_FAILED,
+    AGENT_TRACE_STATUS_INTERRUPTED, AGENT_TRACE_STATUS_RUNNING, AGENT_TRACE_STATUS_SPAWNED,
+    AGENT_TRACE_STATUS_WAITING, AgentTraceLifecycleStatusKind, agent_trace_lifecycle_kind,
+    agent_trace_requires_result_collection, agent_trace_status_from_event,
+    agent_trace_terminal_event_type, is_agent_trace_settled_event,
 };
 pub use astra_turn_core::orchestration_context_cache::{
     AgentFindings, CacheStats, CachedFile, Finding, FindingCategory, Knowledge, SharedContextCache,
@@ -35,4 +51,5 @@ pub use spawner::{
     AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, InheritedChildPrefix, PermissionSummary,
     SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult, SpawnedAgentInfo,
     SpawnedAgentMetrics, SpawnedAgentState, WaitForAgentOutcome,
+    spawn_completion_status_from_finish_reason,
 };

@@ -673,6 +673,46 @@ pub fn starts_with_chinese_continuation_prefix(trimmed: &str) -> bool {
     .any(|prefix| trimmed.starts_with(prefix))
 }
 
+/// Detect very short continuation prompts such as "continue", "继续", or
+/// colloquial follow-ups like "还有什么？".
+pub fn is_short_continuation_prompt(line: &str) -> bool {
+    let trimmed = trim_trailing_punctuation(line);
+    if trimmed.is_empty() || trimmed.chars().count() > 16 {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "continue"
+            | "go on"
+            | "go ahead"
+            | "resume"
+            | "do it"
+            | "fix it"
+            | "try it"
+            | "run it"
+            | "yes"
+            | "ok"
+            | "okay"
+            | "sure"
+            | "proceed"
+            | "next"
+            | "keep going"
+    ) {
+        return true;
+    }
+
+    if matches!(
+        trimmed,
+        "继续" | "好的" | "好" | "可以" | "是的" | "对" | "行" | "嗯"
+    ) {
+        return true;
+    }
+
+    starts_with_chinese_continuation_prefix(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,5 +1133,37 @@ mod tests {
         assert!(!starts_with_chinese_continuation_prefix("补充说明架构"));
         assert!(!starts_with_chinese_continuation_prefix("修复 bug"));
         assert!(!starts_with_chinese_continuation_prefix("你好"));
+    }
+
+    #[test]
+    fn short_continuation_prompt_is_detected() {
+        assert!(is_short_continuation_prompt("继续"));
+        assert!(is_short_continuation_prompt("continue"));
+        assert!(is_short_continuation_prompt("resume"));
+        assert!(is_short_continuation_prompt("go ahead"));
+        assert!(is_short_continuation_prompt("do it"));
+        assert!(is_short_continuation_prompt("fix it"));
+        assert!(is_short_continuation_prompt("yes"));
+        assert!(is_short_continuation_prompt("ok"));
+        assert!(is_short_continuation_prompt("sure"));
+        assert!(is_short_continuation_prompt("proceed"));
+        assert!(is_short_continuation_prompt("next"));
+        assert!(is_short_continuation_prompt("keep going"));
+        assert!(is_short_continuation_prompt("好的"));
+        assert!(is_short_continuation_prompt("可以"));
+        assert!(is_short_continuation_prompt("是的"));
+        assert!(is_short_continuation_prompt("行"));
+        assert!(!is_short_continuation_prompt(
+            "继续修这个 bug，并顺便看下另一个问题"
+        ));
+        assert!(!is_short_continuation_prompt("fix this bug"));
+    }
+
+    #[test]
+    fn short_continuation_prompt_detects_colloquial_followups() {
+        assert!(is_short_continuation_prompt("继续啊"));
+        assert!(is_short_continuation_prompt("继续完成所有的啊"));
+        assert!(is_short_continuation_prompt("接着啊"));
+        assert!(is_short_continuation_prompt("还有什么？"));
     }
 }
