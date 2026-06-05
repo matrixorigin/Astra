@@ -702,7 +702,7 @@ pub(crate) fn record_loop_completion_feedback(
         .observability_session
         .as_ref()
         .map(|session| {
-            let session = session.read().unwrap_or_else(|e| e.into_inner());
+            let session = astra_core::sync_poison::recover_rwlock_read(&session);
             crate::observability::session_signal_attribution(&session)
         });
     let enrich_signal = |signal: FeedbackSignal| {

@@ -1374,7 +1374,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     ) {
         let session_id = state.current_session_id.as_deref().unwrap_or("");
         let user_id = {
-            let s = session.read().unwrap_or_else(|e| e.into_inner());
+            let s = astra_core::sync_poison::recover_rwlock_read(&session);
             s.user_id.clone()
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
@@ -2575,7 +2575,7 @@ mod tests {
             .expect("turn should prepare");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
     }
 
@@ -2597,7 +2597,7 @@ mod tests {
             .expect("turn should prepare");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
     }
 
@@ -2619,7 +2619,7 @@ mod tests {
             .expect("turn should prepare");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         assert_eq!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
     }
 

@@ -5214,7 +5214,7 @@ mod tests {
         }
 
         fn log(&self) -> BranchOpsLog {
-            let guard = self.log.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = astra_core::sync_poison::recover_mutex_lock(&self.log);
             BranchOpsLog {
                 snapshots_created: guard.snapshots_created.clone(),
                 diffs_requested: guard.diffs_requested.clone(),
@@ -6018,7 +6018,7 @@ mod tests {
     #[async_trait]
     impl LlmJudge for ContextCapturingJudge {
         async fn evaluate(&self, _prompt: &str, context: &str) -> Result<f64, String> {
-            *self.captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(context.to_string());
+            *astra_core::sync_poison::recover_mutex_lock(&self.captured) = Some(context.to_string());
             Ok(0.9)
         }
     }

@@ -125,7 +125,7 @@ impl ToolStdoutLineAnim {
         let handle = std::thread::spawn(move || {
             // Initial frame
             {
-                let mut g = ui.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = astra_core::sync_poison::recover_mutex_lock(&ui);
                 if idx < g.lines.len() {
                     let frame = SPINNER_FRAMES[0];
                     g.lines[idx] = format!(
@@ -144,7 +144,7 @@ impl ToolStdoutLineAnim {
                 if !interruptible_sleep(std::time::Duration::from_millis(50), &stop2) {
                     return;
                 }
-                let mut g = ui.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = astra_core::sync_poison::recover_mutex_lock(&ui);
                 if idx >= g.lines.len() {
                     return;
                 }

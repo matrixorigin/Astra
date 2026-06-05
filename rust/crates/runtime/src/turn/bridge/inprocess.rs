@@ -5312,7 +5312,7 @@ mod tests {
     }
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5354,7 +5354,7 @@ mod tests {
 
     #[test]
     fn annotate_tool_schemas_marks_end_of_pinned_prefix() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5396,7 +5396,7 @@ mod tests {
 
     #[test]
     fn add_message_cache_breakpoint_targets_last_non_system() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let mut messages = vec![
             json!({"role": "system", "content": "sys prompt"}),
             json!({"role": "user", "content": "hello"}),
@@ -5423,7 +5423,7 @@ mod tests {
 
     #[test]
     fn add_message_cache_breakpoint_noop_for_openai() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let mut messages = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hi"}),
@@ -5441,7 +5441,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_anthropic() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5460,7 +5460,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_openai() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5475,7 +5475,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_unknown_provider() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5493,7 +5493,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_env_disabled() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         }
@@ -5515,7 +5515,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_idempotent() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5690,7 +5690,7 @@ mod tests {
 
     #[test]
     fn message_breakpoint_skips_system_only() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5709,7 +5709,7 @@ mod tests {
 
     #[test]
     fn message_breakpoint_empty_messages_noop() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let mut messages: Vec<Value> = vec![];
         add_message_cache_breakpoint(
             &mut messages,
@@ -5720,7 +5720,7 @@ mod tests {
 
     #[test]
     fn message_breakpoint_array_content_appends_to_last_block() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -5752,7 +5752,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_empty_list_noop() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let mut tools: Vec<Value> = vec![];
         annotate_tool_schemas_for_caching(
             &mut tools,

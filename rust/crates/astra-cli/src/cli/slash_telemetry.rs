@@ -63,7 +63,7 @@ fn show_summary(
 ) {
     use astra_runtime::observability::FuzzyMatchOutcome;
 
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
 
     eprintln!(
         "\n{}",
@@ -245,7 +245,7 @@ fn show_summary(
 fn show_turn_timings(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
 
     if session_guard.turn_timings.is_empty() {
         eprintln!("{}", "  No turn timing data yet.".yellow());
@@ -298,7 +298,7 @@ fn show_drift_analysis(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     _state: &SessionState,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
 
     eprintln!(
         "\n{}",
@@ -339,7 +339,7 @@ fn show_drift_analysis(
 fn show_decisions(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
 
     if session_guard.decision_explanations.is_empty() {
         eprintln!("{}", "  No decision data yet.".yellow());
@@ -573,7 +573,7 @@ fn show_context_trace(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
     let traces = &session_guard.context_traces;
 
     if traces.is_empty() {
@@ -833,7 +833,7 @@ fn show_tool_trace(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
     let traces = &session_guard.context_traces;
 
     if traces.is_empty() {
@@ -959,7 +959,7 @@ fn show_compression_trace(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
     let traces = &session_guard.context_traces;
 
     if traces.is_empty() {
@@ -1105,7 +1105,7 @@ fn show_compression_trace(
 fn show_budget_evolution(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
     let traces = &session_guard.context_traces;
 
     if traces.is_empty() {
@@ -1214,7 +1214,7 @@ fn show_context_detail(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
     let traces = &session_guard.context_traces;
 
     if traces.is_empty() {
@@ -1558,7 +1558,7 @@ fn show_session_analysis(
 ) {
     use astra_turn_core::context_assembly_trace::TraceAggregation;
 
-    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
     let traces = &session_guard.context_traces;
 
     if traces.is_empty() {

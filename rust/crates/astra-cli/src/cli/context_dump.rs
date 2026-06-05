@@ -110,7 +110,7 @@ pub(crate) fn write_dump_for_repl(
 
 fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -> ContextDump {
     let trace_json = state.observability_session.as_ref().and_then(|session| {
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         guard
             .context_traces
             .last()
@@ -120,7 +120,7 @@ fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -
         .observability_session
         .as_ref()
         .map(|session| {
-            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            let guard = astra_core::sync_poison::recover_rwlock_read(&session);
             guard.compressed_turns.clone()
         })
         .unwrap_or_default();

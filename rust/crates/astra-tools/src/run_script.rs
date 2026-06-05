@@ -807,7 +807,7 @@ pub(crate) fn clear_python_cache() {
 fn is_usable_python(path: &str) -> bool {
     let fingerprint = PythonFingerprint::for_path(path);
     {
-        let cache = python_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = astra_core::sync_poison::recover_mutex_lock(&python_cache());
         if let Some((_, _, hit)) = cache
             .iter()
             .find(|(k, fp, _)| k == path && *fp == fingerprint)
@@ -827,7 +827,7 @@ fn is_usable_python(path: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    let mut cache = python_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = astra_core::sync_poison::recover_mutex_lock(&python_cache());
     // Remove any stale entry for this path (different fingerprint) — we
     // just learned the up-to-date answer, keep only one entry per path.
     cache.retain(|(k, _, _)| k != path);
@@ -2118,7 +2118,7 @@ mod tests {
         for i in 0..total {
             let _ = is_usable_python(&format!("/nonexistent/recent-{i}"));
         }
-        let cache = python_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = astra_core::sync_poison::recover_mutex_lock(&python_cache());
         // Last inserted path MUST be present.
         let last_path = format!("/nonexistent/recent-{}", total - 1);
         assert!(

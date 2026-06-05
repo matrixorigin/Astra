@@ -1283,14 +1283,11 @@ impl ToolExecutor {
     }
 
     pub(crate) fn set_cloud_token(&self, token: impl Into<String>) {
-        *self.cloud_token.write().unwrap_or_else(|e| e.into_inner()) = Some(token.into());
+        *astra_core::sync_poison::recover_rwlock_write(&self.cloud_token) = Some(token.into());
     }
 
     pub(crate) fn cloud_token(&self) -> Option<String> {
-        self.cloud_token
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        astra_core::sync_poison::recover_rwlock_read(&self.cloud_token).clone()
     }
 
     // ─── Plan-mode write guard (parity with server_tool_executor) ───────────

@@ -23,7 +23,7 @@ pub trait LockRecovery<T> {
 
 impl<T> LockRecovery<T> for Mutex<T> {
     fn lock_recover(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|e| e.into_inner())
+        astra_core::sync_poison::recover_mutex_lock(&self)
     }
 }
 

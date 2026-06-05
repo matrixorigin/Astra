@@ -4670,7 +4670,7 @@ impl StreamRenderState {
         }
         self.stop_tool_stdout_anim();
         let idx = {
-            let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = astra_core::sync_poison::recover_mutex_lock(&self.tool_ui);
             let idx = g.lines.len();
             // Include progress prefix for stdout mode too.
             let prefix = match self.tool_batch_progress {
@@ -5437,7 +5437,7 @@ impl StreamRenderState {
         let description = self.format_tool_description_with_output(tool, args, Some(output));
         let styled_desc = style_tool_description(tool, &description);
         let dur_display = format!("{}", duration_suffix.dim());
-        let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = astra_core::sync_poison::recover_mutex_lock(&self.tool_ui);
         if idx < g.lines.len() {
             g.lines[idx] = format!("  {icon} {styled_desc}{dur_display}");
             if !extra_line.is_empty() {

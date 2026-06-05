@@ -1772,7 +1772,7 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), jh).await;
         assert!(result.is_ok(), "worker should exit after signal");
 
-        let s = stats.lock().unwrap_or_else(|e| e.into_inner());
+        let s = astra_core::sync_poison::recover_mutex_lock(&stats);
         assert_eq!(
             s.events_received, 5,
             "all 5 events should be counted (recv + drain)"

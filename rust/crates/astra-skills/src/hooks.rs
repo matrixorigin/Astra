@@ -434,7 +434,7 @@ impl ToolEventHookRegistry {
         event: ToolEventKind,
         tool_name: &str,
     ) -> Vec<(usize, &ToolEventHook)> {
-        let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
         let mut tripped = self
             .tripped_circuits
             .lock()
@@ -470,7 +470,7 @@ impl ToolEventHookRegistry {
         if !hook.once {
             return;
         }
-        let mut fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
         for (i, h) in self.hooks.iter().enumerate() {
             if std::ptr::eq(h, hook) {
                 fired.insert(i);
@@ -1500,7 +1500,7 @@ impl SessionEventHookRegistry {
 
     /// Return all hooks matching the given event, sorted by priority and filtered by `once`.
     pub fn matching(&self, event: SessionEvent) -> Vec<&SessionEventHook> {
-        let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
         let mut result: Vec<(usize, &SessionEventHook)> = self
             .hooks
             .iter()
@@ -1516,7 +1516,7 @@ impl SessionEventHookRegistry {
         if !hook.once {
             return;
         }
-        let mut fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
         for (i, h) in self.hooks.iter().enumerate() {
             if std::ptr::eq(h, hook) {
                 fired.insert(i);

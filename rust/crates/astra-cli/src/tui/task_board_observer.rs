@@ -1099,7 +1099,7 @@ mod tests {
 
         obs.maybe_refresh();
 
-        let st = obs.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = astra_core::sync_poison::recover_mutex_lock(&obs.inner.state);
         assert!(
             !st.fetch_in_flight,
             "poison recovery must clear stale fetch_in_flight so future refreshes are not frozen"

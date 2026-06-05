@@ -498,7 +498,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
             let breakdown = match ctx.state.observability_session.as_ref() {
                 Some(session) => {
-                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    let guard = astra_core::sync_poison::recover_rwlock_read(&session);
                     // Pull session-level compaction history into the
                     // snapshot so the Compaction section can show all
                     // past events, not just the last-turn trace.
@@ -2884,7 +2884,7 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
 
     // Compaction + drift counters
     if let Some(obs) = ctx.state.observability_session.as_ref() {
-        let guard = obs.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&obs);
         if !guard.compressed_turns.is_empty() {
             pairs.push(("compactions", guard.compressed_turns.len().to_string()));
         }

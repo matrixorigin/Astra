@@ -17,7 +17,7 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-        let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let lock = astra_core::sync_poison::recover_mutex_lock(&env_lock());
         let previous = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);

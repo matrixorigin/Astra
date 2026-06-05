@@ -146,7 +146,7 @@ mod connection_quota_tests {
 
     #[test]
     fn allocate_within_cap_succeeds() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 10;
         assert!(try_allocate_with_cap(5, cap).is_ok());
@@ -155,7 +155,7 @@ mod connection_quota_tests {
 
     #[test]
     fn allocate_at_exact_cap_succeeds() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 10;
         assert!(try_allocate_with_cap(10, cap).is_ok());
@@ -164,7 +164,7 @@ mod connection_quota_tests {
 
     #[test]
     fn allocate_exceeds_cap_fails() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 10;
         GLOBAL_CONNECTION_ALLOCATED.store(8, Ordering::Release);
@@ -185,7 +185,7 @@ mod connection_quota_tests {
 
     #[test]
     fn allocate_zero_always_succeeds() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         GLOBAL_CONNECTION_ALLOCATED.store(10, Ordering::Release);
         assert!(try_allocate_with_cap(0, 10).is_ok());
@@ -194,7 +194,7 @@ mod connection_quota_tests {
 
     #[test]
     fn release_returns_quota_to_pool() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         GLOBAL_CONNECTION_ALLOCATED.store(8, Ordering::Release);
         release_global_connections(3);
@@ -205,7 +205,7 @@ mod connection_quota_tests {
 
     #[test]
     fn release_from_zero_is_safe() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         release_global_connections(5);
         // Saturating: releasing more than allocated leaves counter at 0
@@ -217,7 +217,7 @@ mod connection_quota_tests {
 
     #[test]
     fn multiple_allocations_track_correctly() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 100;
         assert!(try_allocate_with_cap(30, cap).is_ok());
@@ -234,7 +234,7 @@ mod connection_quota_tests {
     /// All threads succeed but CAS retries are expected since contention is real.
     #[test]
     fn concurrent_cas_contention_resolves() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 100u64;
         let allocated = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -257,7 +257,7 @@ mod connection_quota_tests {
 
     #[test]
     fn concurrent_overflow_rejects_excess() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 50u64;
         let succeeded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -283,12 +283,12 @@ mod connection_quota_tests {
     fn poison_recovery_after_panic() {
         // First, simulate a poison by panicking inside a locked scope
         let _ = std::panic::catch_unwind(|| {
-            let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
             panic!("simulated test panic while holding mutex");
         });
 
         // Second, verify the mutex is still usable (poison recovered)
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let cap = 10;
         assert!(try_allocate_with_cap(5, cap).is_ok());
@@ -299,7 +299,7 @@ mod connection_quota_tests {
     /// and delegates to `try_allocate_with_cap` with the correct cap.
     #[test]
     fn global_connections_uses_env_var_cap() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
 
         // Override global cap via env var
@@ -326,7 +326,7 @@ mod connection_quota_tests {
     /// would panic on overflow if `saturating_add` isn't used).
     #[test]
     fn max_value_allocation_is_rejected_not_panicked() {
-        let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
         reset_quota();
         let result = try_allocate_with_cap(u64::MAX, 10);
         assert!(

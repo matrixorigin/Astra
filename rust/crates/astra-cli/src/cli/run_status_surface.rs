@@ -1,3 +1,5 @@
+use tracing::warn;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStatusKind {
     Created,
@@ -27,7 +29,10 @@ pub(crate) fn run_status_kind(status: &str) -> RunStatusKind {
         "cancelled" => RunStatusKind::Cancelled,
         "interrupted" => RunStatusKind::Interrupted,
         "timeout" => RunStatusKind::Timeout,
-        _ => RunStatusKind::Other,
+        other => {
+            warn!(%other, "run_status_kind: unknown status");
+            RunStatusKind::Other
+        }
     }
 }
 

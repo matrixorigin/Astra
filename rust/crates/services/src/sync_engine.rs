@@ -1478,7 +1478,7 @@ mod tests {
         }
 
         fn set_envelope(&self, envelope: SyncEnvelope) {
-            *self.envelope.lock().unwrap_or_else(|e| e.into_inner()) = envelope;
+            *astra_core::sync_poison::recover_mutex_lock(&self.envelope) = envelope;
         }
     }
 
@@ -1505,7 +1505,7 @@ mod tests {
             _payload: &SyncPayload,
             _expected_version: Option<u64>,
         ) -> Result<PushResult, SyncError> {
-            let mut pushes = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pushes = astra_core::sync_poison::recover_mutex_lock(&self.pushes);
             *pushes += 1;
             if *pushes == 1 {
                 Ok(PushResult {

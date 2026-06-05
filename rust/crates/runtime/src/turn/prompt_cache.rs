@@ -954,7 +954,7 @@ mod tests {
         // schemas from a single helper call instead of re-deriving them via
         // `compaction_tier_calibrated` + `tool_schema_prune::prune_tool_schemas`
         // at two downstream sites. Lock that contract in.
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_outcome_routes_memory_entries_through_pipeline() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_outcome_routes_session_memory_through_runtime_volatile() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_outcome_routes_system_override_through_runtime_identity() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -1245,7 +1245,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_routes_low_confidence_warning_to_dynamic_message() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1351,7 +1351,7 @@ mod tests {
 
     #[test]
     fn pipeline_assembly_anthropic_emits_multi_block_with_cache_control() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[test]
     fn pipeline_assembly_openai_splits_stable_and_dynamic() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1443,7 +1443,7 @@ mod tests {
     /// rules flow through `extra_dynamic_sections` into the final system prompt.
     #[test]
     fn pipeline_assembly_carries_extra_dynamic_sections_through() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -1511,7 +1511,7 @@ mod tests {
         // produce identical system message bytes (no HashMap drift, no
         // time-based IDs, no non-determinism). Holds `CACHE_ENV_MUTEX` so
         // a concurrent test can't mutate `$ASTRA_OUTPUT_STYLE` mid-run.
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -1547,7 +1547,7 @@ mod tests {
     /// markers from the anthropic system message. Ports the intent of the
     #[test]
     fn pipeline_assembly_cache_disabled_strips_all_markers() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1595,7 +1595,7 @@ mod tests {
     /// pick up the override and surface `$ASTRA_OUTPUT_STYLE` in the output.
     #[test]
     fn pipeline_assembly_applies_prompt_overrides_and_output_style() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let home = tempfile::tempdir().expect("temp home");
         let prompts_dir = home.path().join(".astra").join("prompts");
         std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
@@ -1647,7 +1647,7 @@ mod tests {
     /// rather than caching stale bytes).
     #[test]
     fn pipeline_assembly_picks_up_override_file_changes() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let home = tempfile::tempdir().expect("temp home");
         let prompts_dir = home.path().join(".astra").join("prompts");
         std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
@@ -1698,7 +1698,7 @@ mod tests {
     /// stable/volatile split it lives in the Session-scoped primary block.
     #[test]
     fn pipeline_assembly_picks_up_output_style_changes() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         let home = tempfile::tempdir().expect("temp home");
         set_test_env("HOME", home.path().to_str().unwrap());
 
@@ -1801,7 +1801,7 @@ mod tests {
 
     #[test]
     fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
         assert!(cfg.cache_enabled);
@@ -1810,7 +1810,7 @@ mod tests {
 
     #[test]
     fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
         assert!(cfg.cache_enabled);

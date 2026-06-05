@@ -34,7 +34,7 @@ pub(crate) fn load_credentials() -> CredentialsFile {
         Err(err) => {
             let msg = err.to_string();
             let last = LAST_ERR.get_or_init(|| Mutex::new(None));
-            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = astra_core::sync_poison::recover_mutex_lock(&last);
             if guard.as_deref() != Some(msg.as_str()) {
                 eprintln!("  ⚠ failed to read credentials: {msg}");
                 *guard = Some(msg);

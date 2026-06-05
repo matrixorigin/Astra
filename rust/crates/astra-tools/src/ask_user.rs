@@ -279,13 +279,24 @@ fn parse_choices(
     };
     let normalized = maybe_parse_embedded_json(value);
     let value = normalized.as_ref();
-    let items = value
-        .as_array()
-        .or_else(|| {
-            // Handle {"item": [...]} wrapper produced by some LLM providers.
-            value.get("item").and_then(|v| v.as_array())
-        })
-        .ok_or_else(|| ask_user_contract_error("'options' must be an array"))?;
+    let items: Vec<&Value> = if let Some(arr) = value.as_array() {
+        arr.iter().collect()
+    } else if let Some(inner) = value.get("item") {
+        // Handle {"item": [...]} wrapper produced by some LLM providers
+        // (XML-to-JSON serialization artifact). Also handle the single-object
+        // variant {"item": {label: ...}} for single-choice lists.
+        if let Some(arr) = inner.as_array() {
+            arr.iter().collect()
+        } else if inner.is_object() {
+            vec![inner]
+        } else {
+            return Err(ask_user_contract_error("'options' must be an array"));
+        }
+    } else if allow_freeform {
+        return Ok(Vec::new());
+    } else {
+        return Err(ask_user_contract_error("'options' must be an array"));
+    };
     if items.is_empty() && allow_freeform {
         return Ok(Vec::new());
     }
@@ -1229,5 +1240,25 @@ mod tests {
         });
         let prompt = parse_ask_user_prompt(&args).unwrap();
         assert_eq!(prompt.questions[0].options.len(), 3);
+    }
+
+    #[test]
+    fn parse_accepts_item_wrapped_single_object_choice() {
+        // Single choice object wrapped in {"item": {label: ...}} —
+        // some LLM providers produce this when the options array has one element.
+        let args = json!({
+            "questions": [{
+                "question": "Pick one",
+                "header": "H",
+                "options": {"item": {"label": "Only option", "description": "the only one"}}
+            }]
+        });
+        let prompt = parse_ask_user_prompt(&args).unwrap();
+        assert_eq!(prompt.questions[0].options.len(), 1);
+        assert_eq!(prompt.questions[0].options[0].label, "Only option");
+        assert_eq!(
+            prompt.questions[0].options[0].description.as_deref(),
+            Some("the only one")
+        );
     }
 }

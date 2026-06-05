@@ -3586,7 +3586,7 @@ mod tests {
             let captured = captured.clone();
             let resp = response_body.clone();
             async move {
-                *captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
+                *astra_core::sync_poison::recover_mutex_lock(&captured) = Some(body);
                 axum::Json(resp)
             }
         };

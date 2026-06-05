@@ -1478,7 +1478,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     tool_execution_ms: tool_exec_ms,
                     total_ms,
                 };
-                let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+                let mut session_guard = astra_core::sync_poison::recover_rwlock_write(&session);
                 crate::observability::on_turn_end(hub, &mut session_guard, timing);
             }
 
@@ -1518,7 +1518,7 @@ fn observe_gate_cancelled(
             tool_execution_ms: 0,
             total_ms,
         };
-        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+        let mut session_guard = astra_core::sync_poison::recover_rwlock_write(&session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
     }
 }

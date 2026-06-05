@@ -122,7 +122,7 @@ fn context_trace_count(state: &crate::SessionState) -> usize {
         .observability_session
         .as_ref()
         .map(|session| {
-            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            let guard = astra_core::sync_poison::recover_rwlock_read(&session);
             guard.context_traces.len()
         })
         .unwrap_or(0)
@@ -149,7 +149,7 @@ fn latest_context_trace_since(
         return Some(trace.clone());
     }
     let session = state.observability_session.as_ref()?;
-    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let guard = astra_core::sync_poison::recover_rwlock_read(&session);
     (guard.context_traces.len() > baseline_count)
         .then(|| guard.context_traces.last().cloned())
         .flatten()

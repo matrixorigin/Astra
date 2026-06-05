@@ -1,5 +1,5 @@
 use super::types::AgentStatus;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,10 @@ pub fn agent_tool_result_status_kind(status: &str) -> AgentToolResultStatusKind 
         AGENT_TOOL_STATUS_INTERRUPTED => AgentToolResultStatusKind::Interrupted,
         AGENT_TOOL_STATUS_STILL_RUNNING => AgentToolResultStatusKind::StillRunning,
         AGENT_TOOL_STATUS_LAUNCHED => AgentToolResultStatusKind::Launched,
-        _ => AgentToolResultStatusKind::Other,
+        other => {
+            tracing::warn!(%other, "agent_tool_result_status_kind: unknown status");
+            AgentToolResultStatusKind::Other
+        }
     }
 }
 

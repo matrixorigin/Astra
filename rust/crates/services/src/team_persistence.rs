@@ -548,7 +548,7 @@ impl InMemoryTeamStore {
         let now = chrono::Utc::now().to_rfc3339();
         let builtins = builtin_teams(user_id, &now);
         {
-            let mut map = store.teams.write().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_rwlock_write(&store.teams);
             for t in builtins {
                 let key = format!("{}:{}", t.user_id, t.name);
                 map.insert(key, t);

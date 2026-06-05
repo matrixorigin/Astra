@@ -847,7 +847,7 @@ mod tests {
             &self,
             record: SessionArtifactJsonRecord,
         ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
-            *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(record.clone());
+            *astra_core::sync_poison::recover_mutex_lock(&self.seen) = Some(record.clone());
             Ok(StoredSessionArtifact {
                 artifact_id: "artifact-1".into(),
                 session_id: record.session_id,

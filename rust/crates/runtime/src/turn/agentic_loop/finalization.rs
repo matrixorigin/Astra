@@ -88,7 +88,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     });
     let trace = collector.finalize();
     if let Some(ref session) = state.telemetry.observability_session {
-        let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
         crate::observability::on_context_assembled(&mut guard, trace.clone());
     }
     if collector.has_data() {
@@ -116,7 +116,7 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
         _ => return,
     };
     let signal = {
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         crate::observability::latest_context_trace_signal(&guard)
     };
     let Some(signal) = signal else {

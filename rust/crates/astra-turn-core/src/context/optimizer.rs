@@ -1407,7 +1407,7 @@ mod tests {
 
         impl crate::spill_backend::SpillBackend for InMemorySpillBackend {
             fn store(&self, key_hint: &str, _bytes: &[u8]) -> std::io::Result<String> {
-                let mut n = self.counter.lock().unwrap_or_else(|e| e.into_inner());
+                let mut n = astra_core::sync_poison::recover_mutex_lock(&self.counter);
                 *n += 1;
                 Ok(format!("memory://{key_hint}-{}", *n))
             }

@@ -19,8 +19,8 @@ struct CapturingClient {
 #[async_trait::async_trait]
 impl WebhookClient for CapturingClient {
     async fn post(&self, _url: &str, payload: &WebhookPayload) -> Result<(), WebhookError> {
-        if *self.fail_next.lock().unwrap_or_else(|e| e.into_inner()) {
-            *self.fail_next.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        if astra_core::sync_poison::recover_mutex_lock(&*self.fail_next) {
+            astra_core::sync_poison::recover_mutex_lock(&*self.fail_next) = false;
             return Err(WebhookError::Transport("simulated".into()));
         }
         self.sent
@@ -51,7 +51,7 @@ async fn dispatcher_sends_error_alerts_when_threshold_is_warning() {
     dispatcher
         .dispatch("sess-1", &[alert("recovery_loop", AlertSeverity::Error)])
         .await;
-    let sent = client.sent.lock().unwrap_or_else(|e| e.into_inner());
+    let sent = astra_core::sync_poison::recover_mutex_lock(&client.sent);
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].rule, "recovery_loop");
     assert_eq!(sent[0].session_id, "sess-1");
@@ -101,7 +101,7 @@ async fn dispatcher_forwards_multiple_alerts_independently() {
             ],
         )
         .await;
-    let sent = client.sent.lock().unwrap_or_else(|e| e.into_inner());
+    let sent = astra_core::sync_poison::recover_mutex_lock(&client.sent);
     assert_eq!(sent.len(), 2);
     let rules: Vec<&str> = sent.iter().map(|p| p.rule.as_str()).collect();
     assert!(rules.contains(&"compaction_cascade"));
@@ -111,7 +111,7 @@ async fn dispatcher_forwards_multiple_alerts_independently() {
 #[tokio::test]
 async fn dispatcher_swallows_transport_errors_without_panic() {
     let client = CapturingClient::default();
-    *client.fail_next.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    astra_core::sync_poison::recover_mutex_lock(&*client.fail_next) = true;
     let cfg = AlertWebhookConfig {
         url: "https://example.invalid/hook".into(),
         min_severity: AlertSeverity::Warning,

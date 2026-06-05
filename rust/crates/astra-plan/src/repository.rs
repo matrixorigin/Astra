@@ -932,7 +932,7 @@ impl PlanRepository for InMemoryPlanRepository {
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
         validate_plan_id(plan_id)?;
-        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         match (
             guard.plans.get(plan_id).map(|s| s.version),
             expected_version,
@@ -985,7 +985,7 @@ impl PlanRepository for InMemoryPlanRepository {
         user_id: &str,
         filter: PlanListFilter<'_>,
     ) -> Result<Vec<SavedPlanInfo>, PlanLoadError> {
-        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&self.inner);
         let mut plans = guard
             .plans
             .iter()
@@ -1016,7 +1016,7 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
         validate_plan_id(plan_id)?;
-        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         guard.plans.remove(plan_id);
         guard.active_plans.retain(|_, active| active != plan_id);
         guard.step_runs.retain(|_, run| run.plan_id != plan_id);
@@ -1028,7 +1028,7 @@ impl PlanRepository for InMemoryPlanRepository {
         session_id: &str,
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
-        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         guard.active_plans.remove(session_id);
         if let Some(plan_id) = plan_id {
             validate_plan_id(plan_id)?;
@@ -1118,7 +1118,7 @@ impl PlanRepository for InMemoryPlanRepository {
         error: Option<&str>,
         artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError> {
-        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         let Some(run) = guard.step_runs.get_mut(run_id) else {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
         };
@@ -1137,7 +1137,7 @@ impl PlanRepository for InMemoryPlanRepository {
         plan_id: &str,
         run_id: &str,
     ) -> Result<PlanStepRun, PlanLoadError> {
-        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&self.inner);
         let Some(run) = guard.step_runs.get(run_id) else {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
         };
@@ -1153,7 +1153,7 @@ impl PlanRepository for InMemoryPlanRepository {
         subtask_id: Option<&str>,
         limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
-        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&self.inner);
         let mut runs = guard
             .step_runs
             .values()
@@ -1175,7 +1175,7 @@ impl PlanRepository for InMemoryPlanRepository {
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
-        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         let now = Utc::now();
         let mut aborted = 0;
         for run in guard.step_runs.values_mut() {

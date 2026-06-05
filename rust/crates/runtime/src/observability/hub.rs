@@ -109,7 +109,7 @@ impl ObservabilityHub {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id)?;
-        let session = session.read().unwrap_or_else(|e| e.into_inner());
+        let session = astra_core::sync_poison::recover_rwlock_read(&session);
 
         Some(SessionSummary {
             user_id: session.user_id.clone(),
@@ -172,7 +172,7 @@ impl ObservabilityHub {
         let Some(session) = self.get_session(session_id) else {
             return fallback;
         };
-        let session = session.read().unwrap_or_else(|e| e.into_inner());
+        let session = astra_core::sync_poison::recover_rwlock_read(&session);
         let attribution = session_signal_attribution(&session);
         with_signal_attribution(fallback, Some(&attribution))
     }
@@ -395,7 +395,7 @@ pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, qu
 
     // Record query in session
     if let Some(session) = hub.get_session(session_id) {
-        let mut session = session.write().unwrap_or_else(|e| e.into_inner());
+        let mut session = astra_core::sync_poison::recover_rwlock_write(&session);
         let latest_profile = hub.profiles().get_profile(user_id);
         session.profile.preferences = latest_profile.preferences;
         session.profile.current_scenario = latest_profile.current_scenario;

@@ -6889,7 +6889,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.recent_tools = vec!["bash".into(), "view".into()];
 
         {
-            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
             for _ in 0..5 {
                 guard.record_query("fix the bug in the parser");
             }
@@ -6897,7 +6897,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         apply_adaptive_execution_profile_with_intent(&mut state, None);
 
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         assert_eq!(
             guard.profile.current_scenario,
             Some(astra_config::user_profile::Scenario::Debugging)
@@ -6935,14 +6935,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let scenario_before;
         {
-            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
             guard.previous_turn_user_cancelled = true;
             scenario_before = guard.profile.current_scenario;
         }
 
         apply_adaptive_execution_profile_with_intent(&mut state, None);
 
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         // Flag must be consumed (one-turn suppression only).
         assert!(
             !guard.previous_turn_user_cancelled,
@@ -6970,7 +6970,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.recent_tools = vec!["bash".into(), "view".into()];
 
         {
-            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
             for _ in 0..5 {
                 guard.record_query("fix the bug in the parser");
             }
@@ -6980,14 +6980,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // First call: suppressed (flag was true) — scenario unchanged.
         apply_adaptive_execution_profile_with_intent(&mut state, None);
         {
-            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            let guard = astra_core::sync_poison::recover_rwlock_read(&session);
             assert!(!guard.previous_turn_user_cancelled);
             assert_eq!(guard.profile.current_scenario, None);
         }
 
         // Second call: normal detection path runs.
         apply_adaptive_execution_profile_with_intent(&mut state, None);
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         assert_eq!(
             guard.profile.current_scenario,
             Some(astra_config::user_profile::Scenario::Debugging),

@@ -471,7 +471,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
 
     async fn get_usage(&self, user_id: &str) -> ResourceUsage {
         let today = chrono::Utc::now().date_naive();
-        let mut map = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = astra_core::sync_poison::recover_mutex_lock(&self.usage);
         Self::evict_stale(&mut map, today);
         match map.get_mut(user_id) {
             Some(entry) => Self::get_or_reset(entry, today).clone(),
@@ -515,7 +515,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
 
     async fn record_session_created(&self, user_id: &str) {
         let today = chrono::Utc::now().date_naive();
-        let mut map = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = astra_core::sync_poison::recover_mutex_lock(&self.usage);
         let entry = map
             .entry(user_id.to_string())
             .or_insert_with(|| DatedUsage {
@@ -528,7 +528,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
 
     async fn record_tool_calls(&self, user_id: &str, count: u64) {
         let today = chrono::Utc::now().date_naive();
-        let mut map = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = astra_core::sync_poison::recover_mutex_lock(&self.usage);
         let entry = map
             .entry(user_id.to_string())
             .or_insert_with(|| DatedUsage {
@@ -540,7 +540,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
 
     async fn record_tokens(&self, user_id: &str, tokens: u64) {
         let today = chrono::Utc::now().date_naive();
-        let mut map = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = astra_core::sync_poison::recover_mutex_lock(&self.usage);
         let entry = map
             .entry(user_id.to_string())
             .or_insert_with(|| DatedUsage {
@@ -567,7 +567,7 @@ mod tests {
     async fn concurrent_sessions_denied() {
         let gov = InMemoryResourceGovernor::new();
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "u1".into(),
                 DatedUsage {
@@ -589,7 +589,7 @@ mod tests {
     async fn daily_session_cap_enforced() {
         let gov = InMemoryResourceGovernor::new();
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "u1".into(),
                 DatedUsage {
@@ -611,7 +611,7 @@ mod tests {
     async fn token_budget_denied_when_exhausted() {
         let gov = InMemoryResourceGovernor::new();
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "u1".into(),
                 DatedUsage {
@@ -633,7 +633,7 @@ mod tests {
     async fn token_budget_allows_within_limit() {
         let gov = InMemoryResourceGovernor::new();
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "u1".into(),
                 DatedUsage {
@@ -660,7 +660,7 @@ mod tests {
         )
         .await;
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "admin".into(),
                 DatedUsage {
@@ -707,7 +707,7 @@ mod tests {
     async fn run_start_does_not_enforce_daily_session_cap() {
         let gov = InMemoryResourceGovernor::new();
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "u1".into(),
                 DatedUsage {
@@ -732,7 +732,7 @@ mod tests {
     async fn run_start_still_enforces_execution_capacity() {
         let gov = InMemoryResourceGovernor::new();
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 "u1".into(),
                 DatedUsage {
@@ -899,7 +899,7 @@ mod tests {
 
         // Simulate yesterday's usage: at the daily cap
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
                 user.into(),
                 DatedUsage {
@@ -940,7 +940,7 @@ mod tests {
         let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
 
         {
-            let mut map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             // Stale user: yesterday, no active sessions → should be evicted
             map.insert(
                 "stale".into(),
@@ -969,7 +969,7 @@ mod tests {
         // Trigger eviction via get_usage
         let _ = gov.get_usage("anyone").await;
 
-        let map = gov.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
         assert!(
             !map.contains_key("stale"),
             "stale entry (yesterday, 0 active) must be evicted"

@@ -2467,7 +2467,7 @@ pub(crate) fn observe_turn_end_without_tools(
             tool_execution_ms: 0,
             total_ms,
         };
-        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+        let mut session_guard = astra_core::sync_poison::recover_rwlock_write(&session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
     }
 }
@@ -2725,7 +2725,7 @@ fn record_tool_selection(
                 alternatives: vec![],
                 confidence: 0.8,
             };
-            let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+            let mut session_guard = astra_core::sync_poison::recover_rwlock_write(&session);
             crate::observability::on_tool_selection(&mut session_guard, explanation);
         }
     }

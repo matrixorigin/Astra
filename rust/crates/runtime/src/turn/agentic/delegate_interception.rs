@@ -177,7 +177,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 .observability_session
                 .as_ref()
                 .map(|session| {
-                    let session = session.read().unwrap_or_else(|e| e.into_inner());
+                    let session = astra_core::sync_poison::recover_rwlock_read(&session);
                     delegation_adaptive_context(
                         &session,
                         state.telemetry.observability_hub.as_deref(),

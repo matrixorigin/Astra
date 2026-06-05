@@ -1535,7 +1535,7 @@ pub(crate) async fn handle_info_command(
             if sub_cmd == "breakdown" || sub_cmd == "trace" {
                 let session = state.observability_session.as_ref();
                 if let Some(session) = session {
-                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    let guard = astra_core::sync_poison::recover_rwlock_read(&session);
                     if guard.context_traces.is_empty() {
                         eprintln!(
                             "{}",
@@ -1562,7 +1562,7 @@ pub(crate) async fn handle_info_command(
             if sub_cmd == "explain" {
                 let session = state.observability_session.as_ref();
                 if let Some(session) = session {
-                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    let guard = astra_core::sync_poison::recover_rwlock_read(&session);
                     if guard.context_traces.is_empty() {
                         eprintln!(
                             "{}",
@@ -1741,7 +1741,7 @@ pub(crate) async fn handle_info_command(
 
             // Inline last turn's actual component breakdown if available
             if let Some(ref obs) = state.observability_session {
-                let guard = obs.read().unwrap_or_else(|e| e.into_inner());
+                let guard = astra_core::sync_poison::recover_rwlock_read(&obs);
                 if let Some(trace) = guard.context_traces.last() {
                     let tb = &trace.token_budget;
                     if tb.total_used > 0 {

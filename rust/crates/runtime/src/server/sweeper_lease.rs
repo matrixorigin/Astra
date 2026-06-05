@@ -172,7 +172,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_is_leader_acquires_and_confirms() {
-        let _guard = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_expiry_takeover() {
-        let _guard = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
@@ -329,7 +329,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_concurrent_cas_single_leader() {
-        let _guard = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
@@ -402,7 +402,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_error_path_returns_unavailable() {
-        let _guard = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),

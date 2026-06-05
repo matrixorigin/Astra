@@ -38,7 +38,7 @@ impl ConfidenceCalibrator {
 
     /// Record a routing decision outcome.
     pub fn record(&self, intent: &str, was_corrected: bool) {
-        let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut history = astra_core::sync_poison::recover_mutex_lock(&self.history);
         let entry = history.entry(intent.to_string()).or_insert((0, 0));
         entry.0 += 1;
         if was_corrected {
@@ -49,7 +49,7 @@ impl ConfidenceCalibrator {
     /// Get calibrated threshold for an intent type.
     /// Intents with high correction rates get LOWER thresholds (more cautious routing).
     pub fn calibrated_threshold(&self, intent: &str) -> f64 {
-        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let history = astra_core::sync_poison::recover_mutex_lock(&self.history);
         let Some(&(total, corrections)) = history.get(intent) else {
             return self.base_threshold;
         };
@@ -64,7 +64,7 @@ impl ConfidenceCalibrator {
 
     /// Get accuracy stats for an intent.
     pub fn intent_stats(&self, intent: &str) -> Option<(u64, u64, ConfidenceInterval)> {
-        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let history = astra_core::sync_poison::recover_mutex_lock(&self.history);
         history.get(intent).map(|&(total, corrections)| {
             let rate = correction_rate_interval(total, corrections);
             (total, corrections, rate)
@@ -73,7 +73,7 @@ impl ConfidenceCalibrator {
 
     /// Get all tracked intents and their stats.
     pub fn all_stats(&self) -> HashMap<String, (u64, u64, ConfidenceInterval)> {
-        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let history = astra_core::sync_poison::recover_mutex_lock(&self.history);
         history
             .iter()
             .map(|(intent, &(total, corrections))| {

@@ -1098,7 +1098,7 @@ mod tests {
         assert!(abort.is_none());
         assert_eq!(result.accum.session_id.as_deref(), Some("sess-hook"));
         assert_eq!(
-            order.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
+            astra_core::sync_poison::recover_mutex_lock(&order).as_slice(),
             &["session:sess-hook".to_string(), "tool:tr-1".to_string()]
         );
     }
@@ -1830,7 +1830,7 @@ mod tests {
         assert!(abort.is_none(), "unexpected abort: {abort:?}");
         assert_eq!(result.tool_results.len(), 3);
         assert_eq!(
-            *batch_sizes.lock().unwrap_or_else(|e| e.into_inner()),
+            astra_core::sync_poison::recover_mutex_lock(&*batch_sizes),
             vec![3],
             "agent spawn requests should execute as one parallel batch"
         );
@@ -1904,7 +1904,7 @@ mod tests {
 
         assert!(abort.is_none());
         assert_eq!(result.tool_results.len(), 2);
-        let exec_order = order.lock().unwrap_or_else(|e| e.into_inner());
+        let exec_order = astra_core::sync_poison::recover_mutex_lock(&order);
         assert_eq!(
             exec_order[0], "skill",
             "skill should execute before bash, got: {:?}",
@@ -2112,7 +2112,7 @@ mod tests {
         assert!(abort.is_none());
 
         // Both approval and tool execution should be recorded.
-        let recorded = ops.lock().unwrap_or_else(|e| e.into_inner());
+        let recorded = astra_core::sync_poison::recover_mutex_lock(&ops);
         assert_eq!(
             recorded.len(),
             2,
@@ -2277,7 +2277,7 @@ mod tests {
         .await;
         assert!(abort.is_none(), "unexpected abort: {abort:?}");
 
-        let recorded = ops.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let recorded = astra_core::sync_poison::recover_mutex_lock(&ops).clone();
         assert_eq!(
             recorded.len(),
             2,

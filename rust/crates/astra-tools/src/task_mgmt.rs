@@ -88,18 +88,21 @@ pub const SESSION_TASK_STATUS_CANCELLED: &str = "cancelled";
 pub const SESSION_TASK_STATUS_ARCHIVED: &str = "archived";
 pub const SESSION_TASK_STATUS_DELETED: &str = "deleted";
 
-pub fn session_task_status_kind(status: &str) -> SessionTaskStatusKind {
-    match status {
-        SESSION_TASK_STATUS_IN_PROGRESS => SessionTaskStatusKind::InProgress,
-        SESSION_TASK_STATUS_PENDING => SessionTaskStatusKind::Pending,
-        SESSION_TASK_STATUS_COMPLETED => SessionTaskStatusKind::Completed,
-        SESSION_TASK_STATUS_FAILED => SessionTaskStatusKind::Failed,
-        SESSION_TASK_STATUS_CANCELLED => SessionTaskStatusKind::Cancelled,
-        SESSION_TASK_STATUS_ARCHIVED => SessionTaskStatusKind::Archived,
-        SESSION_TASK_STATUS_DELETED => SessionTaskStatusKind::Deleted,
-        _ => SessionTaskStatusKind::Other,
+    pub fn session_task_status_kind(status: &str) -> SessionTaskStatusKind {
+        match status {
+            SESSION_TASK_STATUS_IN_PROGRESS => SessionTaskStatusKind::InProgress,
+            SESSION_TASK_STATUS_PENDING => SessionTaskStatusKind::Pending,
+            SESSION_TASK_STATUS_COMPLETED => SessionTaskStatusKind::Completed,
+            SESSION_TASK_STATUS_FAILED => SessionTaskStatusKind::Failed,
+            SESSION_TASK_STATUS_CANCELLED => SessionTaskStatusKind::Cancelled,
+            SESSION_TASK_STATUS_ARCHIVED => SessionTaskStatusKind::Archived,
+            SESSION_TASK_STATUS_DELETED => SessionTaskStatusKind::Deleted,
+            other => {
+                tracing::warn!(%other, "session_task_status_kind: unknown status");
+                SessionTaskStatusKind::Other
+            }
+        }
     }
-}
 
 pub fn session_task_is_active(status: &str) -> bool {
     matches!(

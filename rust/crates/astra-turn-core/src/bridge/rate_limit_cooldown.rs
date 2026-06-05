@@ -173,7 +173,7 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitAction::Proceed,
             STATE_COOLDOWN => {
-                let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+                let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
                 if let Some(ref cooldown) = *info {
                     if Instant::now() >= cooldown.reset_at {
                         // Cooldown expired — exit inline (already holding lock)
@@ -301,7 +301,7 @@ impl RateLimitCooldown {
         self.cooldowns_triggered.fetch_add(1, Ordering::SeqCst);
         let reset_at = Instant::now() + Duration::from_millis(duration_ms);
 
-        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         *info = Some(CooldownInfo {
             reset_at,
             reason,
@@ -317,7 +317,7 @@ impl RateLimitCooldown {
 
         let reset_at = Instant::now() + Duration::from_millis(DEFAULT_COOLDOWN_MS);
 
-        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         *info = Some(CooldownInfo {
             reset_at,
             reason,
@@ -330,7 +330,7 @@ impl RateLimitCooldown {
     /// the exit logic to avoid releasing and re-acquiring the Mutex.
     #[cfg(test)]
     fn exit_cooldown(&self) {
-        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
@@ -342,7 +342,7 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitState::Active,
             STATE_COOLDOWN => {
-                let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+                let info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
                 if let Some(ref cooldown) = *info {
                     // Convert Instant to epoch ms for external use
                     let now = Instant::now();
@@ -395,7 +395,7 @@ impl RateLimitCooldown {
             return 0;
         }
 
-        let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        let info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         if let Some(ref cooldown) = *info {
             cooldown
                 .reset_at
@@ -411,7 +411,7 @@ impl RateLimitCooldown {
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
-        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         *info = None;
     }
 }
@@ -1043,7 +1043,7 @@ mod tests {
 
         // Poison the mutex by panicking while holding the lock.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = rl2.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = astra_core::sync_poison::recover_mutex_lock(&rl2.cooldown_info);
             panic!("intentional poison");
         }));
         assert!(result.is_err(), "should have panicked");
@@ -1092,7 +1092,7 @@ mod tests {
             // Invariant: state and cooldown_info must be consistent.
             // COOLDOWN → info must be Some. ACTIVE → info must be None.
             let state_val = rl.state.load(Ordering::SeqCst);
-            let info = rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+            let info = astra_core::sync_poison::recover_mutex_lock(&rl.cooldown_info);
             match (state_val, info.is_some()) {
                 (STATE_COOLDOWN, true) => {} // consistent: cooldown active
                 (STATE_ACTIVE, false) => {}  // consistent: no cooldown
@@ -1108,7 +1108,7 @@ mod tests {
 
             // Reset
             rl.state.store(STATE_ACTIVE, Ordering::SeqCst);
-            *rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            astra_core::sync_poison::recover_mutex_lock(&*rl.cooldown_info) = None;
         }
     }
 
