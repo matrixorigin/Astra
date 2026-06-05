@@ -98,7 +98,10 @@ fn spinner_frame() -> &'static str {
     }
 }
 
-fn status_icon_and_color(status: &SessionTaskStatusKind, colors: TaskBoardColors) -> (&'static str, Color) {
+fn status_icon_and_color(
+    status: &SessionTaskStatusKind,
+    colors: TaskBoardColors,
+) -> (&'static str, Color) {
     match status {
         SessionTaskStatusKind::Completed => ("✔", colors.success),
         SessionTaskStatusKind::InProgress => (spinner_frame(), colors.accent),
@@ -164,14 +167,8 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
 }
 
 fn counts(tasks: &[SessionTask]) -> (usize, usize, usize) {
-    let completed = tasks
-        .iter()
-        .filter(|t| t.status.is_completed())
-        .count();
-    let pending = tasks
-        .iter()
-        .filter(|t| t.status.is_pending())
-        .count();
+    let completed = tasks.iter().filter(|t| t.status.is_completed()).count();
+    let pending = tasks.iter().filter(|t| t.status.is_pending()).count();
     let in_progress = tasks.len().saturating_sub(completed + pending);
     (completed, in_progress, pending)
 }
@@ -211,16 +208,8 @@ fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
 /// Order `tasks` by the reference TUI's display priority:
 /// in_progress → pending (open blockers last) → completed.
 fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec<&'a SessionTask> {
-    let in_progress = sort_by_id_asc(
-        tasks
-            .iter()
-            .filter(|t| t.status.is_in_progress())
-            .collect(),
-    );
-    let mut pending: Vec<&SessionTask> = tasks
-        .iter()
-        .filter(|t| t.status.is_pending())
-        .collect();
+    let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
+    let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_pending()).collect();
     pending.sort_by(|a, b| {
         let a_blocked = a.blocked_by.iter().any(|id| unresolved.contains(id));
         let b_blocked = b.blocked_by.iter().any(|id| unresolved.contains(id));
@@ -237,12 +226,7 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
             }
         }
     });
-    let completed = sort_by_id_asc(
-        tasks
-            .iter()
-            .filter(|t| t.status.is_completed())
-            .collect(),
-    );
+    let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_completed()).collect());
     let mut out: Vec<&SessionTask> = Vec::with_capacity(tasks.len());
     out.extend(in_progress);
     out.extend(pending);
@@ -407,14 +391,8 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
         return None;
     }
     let (completed, in_progress, pending) = {
-        let c = hidden
-            .iter()
-            .filter(|t| t.status.is_completed())
-            .count();
-        let p = hidden
-            .iter()
-            .filter(|t| t.status.is_pending())
-            .count();
+        let c = hidden.iter().filter(|t| t.status.is_completed()).count();
+        let p = hidden.iter().filter(|t| t.status.is_pending()).count();
         let ip = hidden.len().saturating_sub(c + p);
         (c, ip, p)
     };
@@ -588,10 +566,7 @@ pub fn render_multi_with_colors(
         // across sessions are not actionable and would clutter the
         // cross-session overview. The single-session board still
         // shows its own completed history.
-        let active: Vec<&SessionTask> = tasks
-            .iter()
-            .filter(|t| t.status.is_active())
-            .collect();
+        let active: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_active()).collect();
         if active.is_empty() {
             continue;
         }

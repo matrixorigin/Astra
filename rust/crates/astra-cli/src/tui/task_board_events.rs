@@ -132,8 +132,14 @@ mod tests {
                 task_id, from, to, ..
             } => {
                 assert_eq!(task_id, "task-1");
-                assert_eq!(from, "pending");
-                assert_eq!(to, "in_progress");
+                assert_eq!(
+                    from,
+                    &astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+                );
+                assert_eq!(
+                    to,
+                    &astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+                );
             }
             other => panic!("expected StatusChanged, got {other:?}"),
         }

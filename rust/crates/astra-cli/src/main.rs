@@ -58,12 +58,14 @@ use cli::turn_entry::{TurnContext, handle_chat_input};
 // CLI argument structs moved to cli/cli_args.rs
 
 // SSE streaming types moved to cli/streaming_types.rs
-pub(crate) use crate::cli::stream::streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
+pub(crate) use crate::cli::stream::streaming_types::{
+    PartialTurnData, StreamResult, TurnFailure, VerdictEvent,
+};
 
 // Session state moved to cli/session_state.rs
+pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
 #[cfg(test)]
 use cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
-pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
 pub(crate) use cli::session_state::{ExplainMode, SessionState, SkillDevState};
 
 // ═══════════════════════════════════════════════ Output Styles ═════════════

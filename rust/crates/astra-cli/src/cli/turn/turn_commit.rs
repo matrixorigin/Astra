@@ -1,10 +1,12 @@
 use std::time::Instant;
 
-use crate::cli::session::session_recovery;
-use crate::cli::session::session_side_effects::{build_bridge_pipeline_journal_events, enqueue_ingestion_pub};
 use super::turn_learning::TurnLearningSnapshot;
 use super::*;
 use crate::StreamResult;
+use crate::cli::session::session_recovery;
+use crate::cli::session::session_side_effects::{
+    build_bridge_pipeline_journal_events, enqueue_ingestion_pub,
+};
 
 fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &serde_json::Value) {
     match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(

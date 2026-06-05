@@ -35,7 +35,11 @@ pub(crate) fn record_edge_tool_observability(
             .telemetry
             .observability_session
             .as_ref()
-            .map(|s| astra_core::sync_poison::recover_rwlock_read(&s).user_id.clone())
+            .map(|s| {
+                astra_core::sync_poison::recover_rwlock_read(s)
+                    .user_id
+                    .clone()
+            })
             .unwrap_or_default();
         for edge_result in edge_tool_round {
             crate::observability::on_tool_executed(hub, &user_id, &edge_result.tool);

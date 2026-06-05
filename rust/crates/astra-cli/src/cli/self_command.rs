@@ -13,7 +13,6 @@ use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
 
-#[path = "self_surface.rs"]
 use super::surface::self_surface;
 
 type SessionArtifacts = LoadedSelfSurfaceArtifacts;
@@ -52,10 +51,10 @@ struct EventPreview {
 }
 
 #[derive(Debug, Serialize)]
-struct CheckResult {
-    name: String,
-    ok: bool,
-    detail: String,
+pub(crate) struct CheckResult {
+    pub(crate) name: String,
+    pub(crate) ok: bool,
+    pub(crate) detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -956,7 +955,9 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::cli::cli_config::cli_args::SelfSessionArgs;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
     use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
     use astra_services::session_workspace::ContextTraceSignal;
     use wiremock::matchers::{method, path};

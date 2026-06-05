@@ -1,5 +1,5 @@
-use crate::cli::cli_config::cli_utils::{CredentialStore, Profile, credential_store};
 use super::*;
+use crate::cli::cli_config::cli_utils::{CredentialStore, Profile, credential_store};
 
 /// Session authentication failure that can be repaired by `/login`.
 ///

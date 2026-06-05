@@ -2,7 +2,7 @@ use crate::cli::surface::task_checkpoint_surface::{
     task_checkpoint_surface, task_record_error_detail, task_record_error_kind, task_record_outcome,
     task_record_status_label,
 };
-use crate::cli::task::task_result_artifact::{load_task_result_artifact, TaskResultArtifact};
+use crate::cli::task::task_result_artifact::{TaskResultArtifact, load_task_result_artifact};
 use astra_services::TaskRecord;
 use crossterm::style::{StyledContent, Stylize};
 
@@ -359,10 +359,12 @@ mod tests {
     fn task_result_header_surface_exposes_structured_failure_metadata() {
         let mut task = base_task();
         task.status = TaskStatus::Failed;
-        task.error_message = Some(crate::cli::task_checkpoint_surface::encode_task_failure_message(
-            "persistence_error",
-            "disk full",
-        ));
+        task.error_message = Some(
+            crate::cli::task_checkpoint_surface::encode_task_failure_message(
+                "persistence_error",
+                "disk full",
+            ),
+        );
         task.checkpoint = Some(TaskCheckpoint {
             active_subtask_id: None,
             turn: 0,
@@ -456,10 +458,12 @@ mod tests {
     fn task_result_lookup_exit_code_prefers_structured_row_persistence_error_without_checkpoint() {
         let mut task = base_task();
         task.status = TaskStatus::Failed;
-        task.error_message = Some(crate::cli::task_checkpoint_surface::encode_task_failure_message(
-            "persistence_error",
-            "failed to save background task result: disk full",
-        ));
+        task.error_message = Some(
+            crate::cli::task_checkpoint_surface::encode_task_failure_message(
+                "persistence_error",
+                "failed to save background task result: disk full",
+            ),
+        );
 
         assert_eq!(
             task_result_lookup_exit_code(&task),

@@ -6,7 +6,7 @@
 use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::durable_bridge;
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::plan;
+use crate::cli::plan::plan_executor;
 use crate::cli::slash::slash_team;
 use crate::mcp_client;
 use astra_runtime::plan as runtime_plan;

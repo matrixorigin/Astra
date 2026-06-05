@@ -1,6 +1,6 @@
 use super::types::AgentStatus;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::str::FromStr;
 use std::time::Duration;
 

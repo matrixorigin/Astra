@@ -4,10 +4,6 @@ use std::time::Instant;
 use astra_turn_core::chat_turn_heuristics::looks_like_live_query_with_context;
 use astra_turn_core::conversation_log::manager::CslManager;
 
-#[cfg(test)]
-use crate::cli::session::session_improvement;
-use crate::cli::session::session_projection::build_continuation_anchor;
-use crate::cli::session::session_startup;
 use super::turn_commit::TurnCommitOutcome;
 use super::turn_commit::commit_turn_journal_workspace_and_sidecars;
 use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
@@ -15,6 +11,10 @@ use super::turn_post_commit::{extract_csl_fields_from_result, run_turn_post_comm
 use super::turn_reporting::{build_history_text, print_turn_status_line};
 use super::*;
 use crate::StreamResult;
+#[cfg(test)]
+use crate::cli::session::session_improvement;
+use crate::cli::session::session_projection::build_continuation_anchor;
+use crate::cli::session::session_startup;
 
 /// Test-only sync variant of `apply_turn_success`. Production code paths must
 /// use [`apply_turn_success_async`] so the LLM-driven skill-improvement path

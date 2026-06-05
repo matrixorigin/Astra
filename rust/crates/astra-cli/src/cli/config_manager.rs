@@ -2,12 +2,12 @@
 //!
 //! Extracted from `command_router.rs` as part of the god-module refactor (P0-2).
 
+use super::theme;
 use crate::cli::cli_config::cli_args::{ConfigCmd, ConfigVersionCmd};
 use crate::cli::cli_config::cli_utils::{
     persist_profile_last_session_or_warn, validate_cli_session_id,
     validated_resumable_last_session_id,
 };
-use super::theme;
 use crossterm::style::Stylize;
 
 // ═══════════════════════════════════════════════════════ Config ═══════════
@@ -219,7 +219,9 @@ pub(crate) async fn execute_config_command(cmd: ConfigCmd) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
     use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

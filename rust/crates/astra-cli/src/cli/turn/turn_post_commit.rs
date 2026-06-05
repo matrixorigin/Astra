@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::StreamResult;
 use crate::cli::session::session_improvement;
 use crate::cli::session::session_projection::{
     CslCheckpointFields, build_full_session_state_compact,
@@ -8,7 +9,6 @@ use crate::cli::session::session_projection::{
 use crate::cli::session::session_recovery;
 use crate::cli::session::session_side_effects::close_pending_memory_feedback_at_turn_end;
 use crate::cli::session::session_state::SessionState;
-use crate::StreamResult;
 
 pub(crate) async fn run_turn_post_commit_tasks(
     state: &mut SessionState,

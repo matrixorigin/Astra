@@ -1,4 +1,3 @@
-use crate::cli::session::session_state::SessionState;
 use super::turn_auth_retry::prepare_auth_refresh_retry;
 use super::turn_session_retry::{
     prepare_session_not_found_retry, should_retry_after_session_not_found,
@@ -7,6 +6,7 @@ use super::turn_settlement::{
     TurnDispatch, settle_failed_turn, settle_interrupted_turn, settle_successful_turn,
 };
 use super::turn_stream_runner::TurnAttempt;
+use crate::cli::session::session_state::SessionState;
 
 pub(crate) async fn settle_turn_attempt(
     state: &mut SessionState,

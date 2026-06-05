@@ -88,7 +88,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     });
     let trace = collector.finalize();
     if let Some(ref session) = state.telemetry.observability_session {
-        let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_context_assembled(&mut guard, trace.clone());
     }
     if collector.has_data() {
@@ -1165,7 +1165,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "in_progress".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -1213,7 +1213,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "in_progress".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -1300,7 +1300,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "in_progress".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),

@@ -21,6 +21,9 @@
 //! - **stdout via TerminalRegion**: ThinkingPreviewPane uses diff-based rendering
 //!   to coordinate with StreamingMarkdown and avoid cursor desync
 
+#[allow(unused_imports)]
+pub(crate) use super::*;
+
 mod plan_spinner;
 mod prep_spinner;
 mod spinner;

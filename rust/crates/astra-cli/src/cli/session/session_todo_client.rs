@@ -12,7 +12,7 @@
 //! return as an `Error: ...` ToolResult.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -253,11 +253,11 @@ impl TaskStore for HttpTaskStore {
 mod wiring_e2e {
     use super::*;
     use crate::lock_recovery::LockRecovery;
-    use crate::tui::task_board_observer::{TaskBoardObserver, COMPLETED_TASK_TTL};
+    use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
     use astra_tools::task_mgmt::{SessionTask, TaskStore};
     use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -329,7 +329,8 @@ mod wiring_e2e {
                             .and_then(|v| v.as_str())
                             .unwrap_or("pending");
                         if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
-                            task.status = new_status.to_string();
+                            task.status =
+                                astra_tools::task_mgmt::SessionTaskStatusKind::from(new_status);
                         }
                         format!("Task #{id} updated to {new_status}")
                     }
@@ -357,11 +358,7 @@ mod wiring_e2e {
             pump();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if cond() {
-            Ok(start.elapsed())
-        } else {
-            Err(())
-        }
+        if cond() { Ok(start.elapsed()) } else { Err(()) }
     }
 
     /// REGRESSION: `route_task_action` POSTs to the cloud on a `task.create`,

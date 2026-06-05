@@ -39,7 +39,9 @@ pub(crate) async fn prepare_session_not_found_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
 
     #[test]
     fn should_retry_after_session_not_found_requires_live_session() {

@@ -31,7 +31,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-
 /// Fallback poll cadence when nothing has broadcast a change. Matches
 /// the "only poll while incomplete" gate in the reference TUI — if a
 /// board has no in-flight work, ticks skip the fetch entirely.

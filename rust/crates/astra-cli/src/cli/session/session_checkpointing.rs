@@ -1,6 +1,6 @@
+use super::*;
 use crate::cli::session::session_recovery;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
-use super::*;
 
 /// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,
 /// journal, and workspace — avoids workspace/checkpoint markdown ahead of failed heavy writes.

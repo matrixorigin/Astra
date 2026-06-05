@@ -1,8 +1,8 @@
 //! Diagnose tool: system diagnostics and health information.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{all_tool_schemas, ToolExecutor, AGGREGATE_OUTPUT_BUDGET};
+use super::{AGGREGATE_OUTPUT_BUDGET, ToolExecutor, all_tool_schemas};
 
 impl ToolExecutor {
     // ─── Diagnose tool ────────────────────────────────────────────────────────────
@@ -219,22 +219,10 @@ impl ToolExecutor {
             let mut tasks_info = serde_json::Map::new();
             tasks_info.insert("total".to_string(), json!(tasks.len()));
 
-            let pending = tasks
-                .iter()
-                .filter(|t| t.status.is_pending())
-                .count();
-            let in_progress = tasks
-                .iter()
-                .filter(|t| t.status.is_in_progress())
-                .count();
-            let completed = tasks
-                .iter()
-                .filter(|t| t.status.is_completed())
-                .count();
-            let failed = tasks
-                .iter()
-                .filter(|t| t.status.is_unsuccessful())
-                .count();
+            let pending = tasks.iter().filter(|t| t.status.is_pending()).count();
+            let in_progress = tasks.iter().filter(|t| t.status.is_in_progress()).count();
+            let completed = tasks.iter().filter(|t| t.status.is_completed()).count();
+            let failed = tasks.iter().filter(|t| t.status.is_unsuccessful()).count();
 
             tasks_info.insert("pending".to_string(), json!(pending));
             tasks_info.insert("in_progress".to_string(), json!(in_progress));

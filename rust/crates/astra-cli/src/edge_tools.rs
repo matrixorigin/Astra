@@ -2402,10 +2402,7 @@ impl ToolExecutor {
         // Task status nudge: if there are active tasks, remind the
         // agent to update them (Claude Code parity: proactive nudge).
         let tasks = self.task_manager.snapshot().await;
-        let active_tasks: Vec<_> = tasks
-            .iter()
-            .filter(|t| t.status.is_active())
-            .collect();
+        let active_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_active()).collect();
         if !active_tasks.is_empty() {
             out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
             for t in active_tasks.iter().take(5) {
@@ -5821,7 +5818,6 @@ mod tests {
             InjectionLevel, InjectionRecord, StalenessSignals,
         };
         use std::time::{Duration, SystemTime};
-use astra_services::session_journal;
 
         let (executor, obs) = attach_empty_observatory(test_executor());
         let big = "x".repeat(1000); // > PREVIEW_CHAR_CAP on purpose

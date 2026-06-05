@@ -15,7 +15,7 @@
 //!   `None` so the caller just skips injection instead of padding
 //!   the prompt with "no tasks".
 
-use crate::cli::surface::session_task_surface::{SessionTaskStatusKind};
+use crate::cli::surface::session_task_surface::SessionTaskStatusKind;
 use astra_tools::task_mgmt::SessionTask;
 
 /// Render the summary. `None` means "the model doesn't need to
@@ -39,10 +39,7 @@ pub(crate) fn format_summary(tasks: &[SessionTask]) -> Option<String> {
 
     // Up to 3 concrete entries, in_progress first then pending, so
     // the model sees what it SHOULD still be doing.
-    let mut picks: Vec<&SessionTask> = tasks
-        .iter()
-        .filter(|t| t.status.is_in_progress())
-        .collect();
+    let mut picks: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_in_progress()).collect();
     if picks.len() < 3 {
         picks.extend(tasks.iter().filter(|t| t.status.is_pending()));
     }

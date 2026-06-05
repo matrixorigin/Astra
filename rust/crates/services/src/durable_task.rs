@@ -6018,7 +6018,8 @@ mod tests {
     #[async_trait]
     impl LlmJudge for ContextCapturingJudge {
         async fn evaluate(&self, _prompt: &str, context: &str) -> Result<f64, String> {
-            *astra_core::sync_poison::recover_mutex_lock(&self.captured) = Some(context.to_string());
+            *astra_core::sync_poison::recover_mutex_lock(&self.captured) =
+                Some(context.to_string());
             Ok(0.9)
         }
     }

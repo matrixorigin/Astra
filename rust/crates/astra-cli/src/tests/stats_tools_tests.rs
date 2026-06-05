@@ -184,7 +184,7 @@ fn tools_session_with_no_tool_calls_does_not_panic() {
 fn tools_reads_tool_calls_from_journal() {
     let _creds = isolate_credentials();
     use astra_services::session_analytics;
-use astra_services::session_journal;
+    use astra_services::session_journal;
 
     let sid = format!("test-tools-calls-{}", uuid::Uuid::new_v4());
     let writer = session_journal::JournalWriter::new(&sid).unwrap();

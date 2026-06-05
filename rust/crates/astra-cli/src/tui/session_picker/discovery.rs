@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use nucleo_matcher::{pattern::Atom, Config, Matcher, Utf32Str};
+use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Atom};
 
 use crate::tui::{transcript_jsonl, turn_event::TurnEvent};
 

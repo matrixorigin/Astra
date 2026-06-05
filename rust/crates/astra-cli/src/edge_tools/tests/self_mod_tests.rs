@@ -1,6 +1,5 @@
 use super::*;
 use astra_services::{session_journal::JournalDirGuard, session_workspace};
-use astra_services::session_journal;
 
 /// Parse a task-tool response into JSON, tolerating the human-readable
 /// summary line that `prefix_summary` prepends to success responses.

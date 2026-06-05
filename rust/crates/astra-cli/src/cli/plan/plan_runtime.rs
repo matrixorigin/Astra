@@ -4,8 +4,8 @@
 //! prompt is reached again) may still use [`crate::cli::plan_monitor::flush_plan_updates_between_prompts`]
 //! when applicable.
 
+use super::*;
 use crate::cli::durable_bridge;
-use crate::cli::plan;
 
 use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;

@@ -57,11 +57,13 @@ pub mod tui;
 pub(crate) use cli::*;
 
 // SSE streaming types
-pub(crate) use crate::cli::stream::streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
+pub(crate) use crate::cli::stream::streaming_types::{
+    PartialTurnData, StreamResult, TurnFailure, VerdictEvent,
+};
 
 // Session state
 pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
-pub(crate) use cli::session_state::{ExplainMode, SessionState, SkillDevState};
+pub(crate) use cli::session::session_state::{ExplainMode, SessionState, SkillDevState};
 
 // Cloud sync
 pub(crate) use cli::cloud_sync::post_auth_cloud_resync;

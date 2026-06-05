@@ -75,11 +75,13 @@ async fn dispatcher_filters_below_threshold() {
             ],
         )
         .await;
-    assert!(client
-        .sent
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty());
+    assert!(
+        client
+            .sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -119,11 +121,13 @@ async fn dispatcher_swallows_transport_errors_without_panic() {
     dispatcher
         .dispatch("sess-x", &[alert("x", AlertSeverity::Error)])
         .await;
-    assert!(client
-        .sent
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty());
+    assert!(
+        client
+            .sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
 }
 
 #[test]

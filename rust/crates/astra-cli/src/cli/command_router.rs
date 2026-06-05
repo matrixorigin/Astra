@@ -30,16 +30,16 @@ use crate::cli::slash::slash_info::*;
 use crate::cli::slash::slash_memory::*;
 use crate::cli::slash::slash_messaging::*;
 use crate::cli::stream::streaming_types::*;
+use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
+use crate::cli::surface::task_result_surface::{
+    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
+    task_result_json_payload,
+};
 use crate::cli::task::task_result_artifact::write_task_output;
 use crate::cli::task::task_result_projection::{
     error_kind_for_exit_code, stream_result_completion_outcome, stream_result_exit_code,
     stream_result_failure_reason, task_checkpoint_state_from_result,
 };
-use crate::cli::surface::task_result_surface::{
-    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
-    task_result_json_payload,
-};
-use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
 use crate::cli::{
     agent_loader, cli_utils, delegate_subrun, diff_presenter, journal_diff, journal_digest,
     journal_tree, slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry, theme,
@@ -4353,7 +4353,10 @@ mod task_run_projection_tests {
             "completed"
         );
         assert_eq!(
-            crate::cli::task_checkpoint_surface::task_status_label(astra_services::TaskStatus::Failed, None,),
+            crate::cli::task_checkpoint_surface::task_status_label(
+                astra_services::TaskStatus::Failed,
+                None,
+            ),
             "failed"
         );
     }

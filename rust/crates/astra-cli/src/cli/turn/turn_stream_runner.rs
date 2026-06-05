@@ -70,6 +70,7 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_turn_stream_params<'a>(
     state: &'a mut SessionState,
     api: &'a astra_thin_client::ThinClient,

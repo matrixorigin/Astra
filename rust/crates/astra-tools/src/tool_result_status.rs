@@ -62,7 +62,11 @@ mod tests {
             "passed",
         ] {
             let kind = ToolResultStatusKind::from_status_str(s);
-            assert_eq!(kind, ToolResultStatusKind::Success, "expected {s} to be Success");
+            assert_eq!(
+                kind,
+                ToolResultStatusKind::Success,
+                "expected {s} to be Success"
+            );
             assert!(kind.is_success());
             assert!(!kind.is_failure());
         }
@@ -72,7 +76,11 @@ mod tests {
     fn from_status_str_case_insensitive() {
         for s in ["OK", "Success", "SUCCEEDED", "Completed", "PASSED"] {
             let kind = ToolResultStatusKind::from_status_str(s);
-            assert_eq!(kind, ToolResultStatusKind::Success, "expected {s} to be Success (case-insensitive)");
+            assert_eq!(
+                kind,
+                ToolResultStatusKind::Success,
+                "expected {s} to be Success (case-insensitive)"
+            );
             assert!(kind.is_success());
         }
     }

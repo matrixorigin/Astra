@@ -1374,7 +1374,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     ) {
         let session_id = state.current_session_id.as_deref().unwrap_or("");
         let user_id = {
-            let s = astra_core::sync_poison::recover_rwlock_read(&session);
+            let s = astra_core::sync_poison::recover_rwlock_read(session);
             s.user_id.clone()
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);

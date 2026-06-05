@@ -63,9 +63,7 @@ use astra_config::user_profile::TurnIntent;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
-use astra_tools::task_mgmt::{
-    SessionTask, TaskManager,
-};
+use astra_tools::task_mgmt::{SessionTask, TaskManager};
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
@@ -2678,7 +2676,7 @@ pub(crate) mod tests {
                 id: "task-2".to_string(),
                 title: "add runtime tests".to_string(),
                 description: None,
-                status: "pending".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2692,7 +2690,7 @@ pub(crate) mod tests {
                 id: "task-1".to_string(),
                 title: "wire completion guard".to_string(),
                 description: None,
-                status: "in_progress".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2706,7 +2704,7 @@ pub(crate) mod tests {
                 id: "task-3".to_string(),
                 title: "already done".to_string(),
                 description: None,
-                status: "completed".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::Completed,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2744,7 +2742,7 @@ pub(crate) mod tests {
                 id: "task-1".to_string(),
                 title: "waiting".to_string(),
                 description: None,
-                status: "pending".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2758,7 +2756,7 @@ pub(crate) mod tests {
                 id: "task-2".to_string(),
                 title: "done".to_string(),
                 description: None,
-                status: "completed".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::Completed,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2772,7 +2770,7 @@ pub(crate) mod tests {
                 id: "task-3".to_string(),
                 title: "cancelled".to_string(),
                 description: None,
-                status: "cancelled".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::Cancelled,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2786,7 +2784,7 @@ pub(crate) mod tests {
                 id: "task-4".to_string(),
                 title: "archived".to_string(),
                 description: None,
-                status: "archived".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::Archived,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),

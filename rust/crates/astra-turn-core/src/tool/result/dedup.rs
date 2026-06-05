@@ -195,14 +195,14 @@ where
     Fut: std::future::Future<Output = String>,
 {
     {
-        let mut guard = astra_core::sync_poison::recover_mutex_lock(&cache);
+        let mut guard = astra_core::sync_poison::recover_mutex_lock(cache);
         if let Some(hit) = guard.lookup(sig) {
             return (hit, true);
         }
     }
     let fresh = f().await;
     {
-        let mut guard = astra_core::sync_poison::recover_mutex_lock(&cache);
+        let mut guard = astra_core::sync_poison::recover_mutex_lock(cache);
         guard.record(sig.clone(), fresh.clone());
     }
     (fresh, false)
@@ -219,14 +219,14 @@ where
     F: FnOnce() -> String,
 {
     {
-        let mut guard = astra_core::sync_poison::recover_mutex_lock(&cache);
+        let mut guard = astra_core::sync_poison::recover_mutex_lock(cache);
         if let Some(hit) = guard.lookup(sig) {
             return (hit, true);
         }
     }
     let fresh = f();
     {
-        let mut guard = astra_core::sync_poison::recover_mutex_lock(&cache);
+        let mut guard = astra_core::sync_poison::recover_mutex_lock(cache);
         guard.record(sig.clone(), fresh.clone());
     }
     (fresh, false)

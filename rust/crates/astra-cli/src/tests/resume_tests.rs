@@ -774,8 +774,8 @@ async fn resume_handles_missing_workspace() {
 #[tokio::test]
 async fn resume_lists_checkpoints_for_session() {
     let _creds = isolate_credentials();
+    use astra_services::session_journal;
     use astra_services::session_restore::SessionRestoreService;
-use astra_services::session_journal;
 
     let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 

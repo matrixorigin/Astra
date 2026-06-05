@@ -47,32 +47,31 @@ pub fn detect_runtime_scaffolding(content: &str) -> Option<RuntimeScaffoldingKin
 }
 
 pub fn is_continuation_scaffolding_for_role(role: &str, content: &str) -> bool {
-    match (role, detect_runtime_scaffolding(content)) {
+    matches!(
+        (role, detect_runtime_scaffolding(content)),
         (
             "user",
             Some(
                 RuntimeScaffoldingKind::SystemReminderWrapper
-                | RuntimeScaffoldingKind::AttentionManifest
-                | RuntimeScaffoldingKind::WorkingSetManifest
-                | RuntimeScaffoldingKind::SessionAnchor
-                | RuntimeScaffoldingKind::ActiveTaskAttachment
-                | RuntimeScaffoldingKind::PreviousRoundSummary
-                | RuntimeScaffoldingKind::SequentialToolCallsWarning,
+                    | RuntimeScaffoldingKind::AttentionManifest
+                    | RuntimeScaffoldingKind::WorkingSetManifest
+                    | RuntimeScaffoldingKind::SessionAnchor
+                    | RuntimeScaffoldingKind::ActiveTaskAttachment
+                    | RuntimeScaffoldingKind::PreviousRoundSummary
+                    | RuntimeScaffoldingKind::SequentialToolCallsWarning,
             ),
-        ) => true,
-        (
+        ) | (
             "system",
             Some(
                 RuntimeScaffoldingKind::AttentionManifest
-                | RuntimeScaffoldingKind::WorkingSetManifest
-                | RuntimeScaffoldingKind::SessionAnchor
-                | RuntimeScaffoldingKind::AlreadyFetchedInventory
-                | RuntimeScaffoldingKind::CrossSessionProjectContext
-                | RuntimeScaffoldingKind::PreviousRoundSummary,
+                    | RuntimeScaffoldingKind::WorkingSetManifest
+                    | RuntimeScaffoldingKind::SessionAnchor
+                    | RuntimeScaffoldingKind::AlreadyFetchedInventory
+                    | RuntimeScaffoldingKind::CrossSessionProjectContext
+                    | RuntimeScaffoldingKind::PreviousRoundSummary,
             ),
-        ) => true,
-        _ => false,
-    }
+        )
+    )
 }
 
 pub fn is_trailing_user_runtime_scaffolding(content: &str) -> bool {

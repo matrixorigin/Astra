@@ -14,7 +14,7 @@
 //! live DB.
 
 use crate::cli::surface::task_checkpoint_surface::task_list_item_outcome;
-use astra_services::{session_journal::JournalEvent, TaskListItem, TaskOutcome, TaskStatus};
+use astra_services::{TaskListItem, TaskOutcome, TaskStatus, session_journal::JournalEvent};
 
 /// Rollup of the terminal-state tasks completed while the user was
 /// away. `ok` = completed with success/unknown outcome; `partial` =
@@ -108,7 +108,6 @@ pub(crate) fn last_seen_cutoff(last_turn_event: Option<&JournalEvent>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-use astra_services::session_journal;
 
     fn item(task_id: &str, status: TaskStatus, updated_at: &str) -> TaskListItem {
         TaskListItem {
@@ -133,10 +132,12 @@ use astra_services::session_journal;
     fn summarize_prefers_structured_failure_over_completed_status() {
         let mut task = item("a", TaskStatus::Completed, "2025-05-10T12:00:00Z");
         task.outcome = Some(TaskOutcome::Success);
-        task.error_message = Some(crate::cli::task_checkpoint_surface::encode_task_failure_message(
-            "persistence_error",
-            "failed to append turn event",
-        ));
+        task.error_message = Some(
+            crate::cli::task_checkpoint_surface::encode_task_failure_message(
+                "persistence_error",
+                "failed to append turn event",
+            ),
+        );
         let summary = summarize(&[task], "", "");
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.ok, 0);

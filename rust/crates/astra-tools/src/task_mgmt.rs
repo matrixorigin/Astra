@@ -84,7 +84,8 @@ pub enum SessionTaskStatusKind {
 }
 
 pub const SESSION_TASK_STATUS_PENDING: SessionTaskStatusKind = SessionTaskStatusKind::Pending;
-pub const SESSION_TASK_STATUS_IN_PROGRESS: SessionTaskStatusKind = SessionTaskStatusKind::InProgress;
+pub const SESSION_TASK_STATUS_IN_PROGRESS: SessionTaskStatusKind =
+    SessionTaskStatusKind::InProgress;
 pub const SESSION_TASK_STATUS_COMPLETED: SessionTaskStatusKind = SessionTaskStatusKind::Completed;
 pub const SESSION_TASK_STATUS_FAILED: SessionTaskStatusKind = SessionTaskStatusKind::Failed;
 pub const SESSION_TASK_STATUS_CANCELLED: SessionTaskStatusKind = SessionTaskStatusKind::Cancelled;
@@ -141,10 +142,7 @@ impl SessionTaskStatusKind {
     pub fn status_marker(self) -> &'static str {
         match self {
             Self::InProgress => "▸",
-            Self::Pending
-            | Self::Archived
-            | Self::Deleted
-            | Self::Other => "·",
+            Self::Pending | Self::Archived | Self::Deleted | Self::Other => "·",
             Self::Completed => "✓",
             Self::Failed => "✗",
             Self::Cancelled => "⏹",
@@ -166,10 +164,7 @@ impl SessionTaskStatusKind {
     }
 
     pub fn can_be_archived(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Cancelled
-        )
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 
     pub fn can_be_stopped(&self) -> bool {
@@ -753,10 +748,7 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
         return;
     }
 
-    let all_completed = task
-        .subtasks
-        .iter()
-        .all(|st| st.status.is_completed());
+    let all_completed = task.subtasks.iter().all(|st| st.status.is_completed());
     if all_completed {
         if task.status.is_active() {
             task.status = SessionTaskStatusKind::Completed;
@@ -764,13 +756,8 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
         return;
     }
 
-    let any_started = task
-        .subtasks
-        .iter()
-        .any(|st| st.status.is_started());
-    if (any_started && task.status.is_pending())
-        || task.status.is_completed()
-    {
+    let any_started = task.subtasks.iter().any(|st| st.status.is_started());
+    if (any_started && task.status.is_pending()) || task.status.is_completed() {
         task.status = SessionTaskStatusKind::InProgress;
     }
 }
@@ -1245,7 +1232,7 @@ impl TaskManager {
                         let Some(previous_status) = tasks
                             .iter()
                             .find(|t| t.id == task_id)
-                            .map(|t| t.status.clone())
+                            .map(|t| t.status)
                         else {
                             return Err(format!("task '{}' not found", task_id));
                         };
@@ -1273,7 +1260,7 @@ impl TaskManager {
                     }
 
                     let previous_status = match tasks.iter().find(|t| t.id == task_id) {
-                        Some(t) => t.status.clone(),
+                        Some(t) => t.status,
                         None => return Err(format!("task '{}' not found", task_id)),
                     };
 
@@ -1457,7 +1444,7 @@ impl TaskManager {
 
                     reconcile_subtask_completion(task);
 
-                    let final_status = task.status.clone();
+                    let final_status = task.status;
                     let response = prefix_summary(
                         format!("Task #{task_id}: {previous_status} → {final_status}"),
                         json!({
@@ -1506,7 +1493,7 @@ impl TaskManager {
                     let Some(task_idx) = tasks.iter().position(|t| t.id == task_id) else {
                         return Err(format!("task '{}' not found", task_id));
                     };
-                    let task_status = tasks[task_idx].status.clone();
+                    let task_status = tasks[task_idx].status;
 
                     if !task_status.can_be_stopped() {
                         return Ok(TaskMutationResult {
@@ -1521,7 +1508,7 @@ impl TaskManager {
                     }
 
                     let task = &mut tasks[task_idx];
-                    let previous_status = task.status.clone();
+                    let previous_status = task.status;
                     task.status = SessionTaskStatusKind::Cancelled;
                     task.description = Some(format!(
                         "{}\n\nCancelled: {} (was: {})",
@@ -2041,7 +2028,8 @@ mod tests {
         let after: SessionTask =
             serde_json::from_str(&after).expect("task json after starting subtask");
         assert_eq!(
-            after.status, SessionTaskStatusKind::InProgress,
+            after.status,
+            SessionTaskStatusKind::InProgress,
             "an active subtask should make the parent read as in-progress so the task board doesn't show it as merely open"
         );
     }
@@ -2070,7 +2058,8 @@ mod tests {
         let after_failed: SessionTask =
             serde_json::from_str(&after_failed).expect("task json after failed parent");
         assert_eq!(
-            after_failed.status, SessionTaskStatusKind::Failed,
+            after_failed.status,
+            SessionTaskStatusKind::Failed,
             "subtask auto-complete must not overwrite explicit failed status"
         );
 
@@ -2092,7 +2081,8 @@ mod tests {
         let after_cancelled: SessionTask =
             serde_json::from_str(&after_cancelled).expect("task json after cancelled parent");
         assert_eq!(
-            after_cancelled.status, SessionTaskStatusKind::Cancelled,
+            after_cancelled.status,
+            SessionTaskStatusKind::Cancelled,
             "subtask auto-complete must not overwrite explicit cancelled status"
         );
     }
@@ -2123,7 +2113,8 @@ mod tests {
         let reopened: SessionTask =
             serde_json::from_str(&reopened).expect("task json after reopening subtask");
         assert_eq!(
-            reopened.status, SessionTaskStatusKind::InProgress,
+            reopened.status,
+            SessionTaskStatusKind::InProgress,
             "reopening a subtask should stop showing the parent as completed"
         );
     }
@@ -2148,7 +2139,9 @@ mod tests {
         let task: SessionTask =
             serde_json::from_str(&task).expect("task json after parent completion");
         assert!(
-            task.subtasks.iter().all(|st| st.status == SessionTaskStatusKind::Completed),
+            task.subtasks
+                .iter()
+                .all(|st| st.status == SessionTaskStatusKind::Completed),
             "explicit parent completion should not leave incomplete subtasks: {task:?}"
         );
     }
@@ -2189,22 +2182,26 @@ mod tests {
         let by_id: std::collections::HashMap<_, _> = task
             .subtasks
             .iter()
-            .map(|s| (s.id.clone(), s.status.clone()))
+            .map(|s| (s.id.clone(), s.status))
             .collect();
         assert_eq!(
-            by_id["s1"], SessionTaskStatusKind::Completed,
+            by_id["s1"],
+            SessionTaskStatusKind::Completed,
             "pending subtask should cascade to completed"
         );
         assert_eq!(
-            by_id["s2"], SessionTaskStatusKind::Failed,
+            by_id["s2"],
+            SessionTaskStatusKind::Failed,
             "failed subtask must NOT be overwritten"
         );
         assert_eq!(
-            by_id["s3"], SessionTaskStatusKind::Cancelled,
+            by_id["s3"],
+            SessionTaskStatusKind::Cancelled,
             "cancelled subtask must NOT be overwritten"
         );
         assert_eq!(
-            by_id["s4"], SessionTaskStatusKind::Completed,
+            by_id["s4"],
+            SessionTaskStatusKind::Completed,
             "already-completed stays completed"
         );
     }

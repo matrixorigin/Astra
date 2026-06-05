@@ -245,7 +245,7 @@ impl IncrementalTurnState {
 
 /// Helper: lock a mutex, recovering from poison if the previous holder panicked.
 fn unwrap_lock<T>(mu: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    astra_core::sync_poison::recover_mutex_lock(&mu)
+    astra_core::sync_poison::recover_mutex_lock(mu)
 }
 
 #[cfg(test)]

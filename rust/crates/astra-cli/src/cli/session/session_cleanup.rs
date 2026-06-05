@@ -14,10 +14,10 @@ use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::time::Duration;
 
-use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn;
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
-use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::SessionState;
+use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn;
+use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::edge_tools;
 
 /// Why the interactive session is exiting. Drives two user-visible
@@ -350,7 +350,9 @@ fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
 
     #[test]
     fn resume_hint_is_shown_for_graceful_exit_paths() {

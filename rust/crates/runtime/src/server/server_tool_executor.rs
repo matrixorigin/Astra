@@ -7157,15 +7157,17 @@ esac
             })
             .expect("approved plan must be mirrored into the user-visible task board");
         assert_eq!(plan_task.title, "ship user-visible plan");
-        assert_eq!(plan_task.status, "in_progress");
+        assert_eq!(
+            plan_task.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
         assert_eq!(plan_task.subtasks.len(), 3);
         assert_eq!(plan_task.subtasks[0].id, "step-1");
         assert_eq!(plan_task.subtasks[0].title, "design state model");
         assert!(
-            plan_task
-                .subtasks
-                .iter()
-                .all(|subtask| subtask.status == "pending"),
+            plan_task.subtasks.iter().all(|subtask| {
+                subtask.status == astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+            }),
             "newly approved plan steps should start pending: {plan_task:?}"
         );
         assert_eq!(

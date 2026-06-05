@@ -2467,7 +2467,7 @@ pub(crate) fn observe_turn_end_without_tools(
             tool_execution_ms: 0,
             total_ms,
         };
-        let mut session_guard = astra_core::sync_poison::recover_rwlock_write(&session);
+        let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
     }
 }
@@ -2725,7 +2725,7 @@ fn record_tool_selection(
                 alternatives: vec![],
                 confidence: 0.8,
             };
-            let mut session_guard = astra_core::sync_poison::recover_rwlock_write(&session);
+            let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
             crate::observability::on_tool_selection(&mut session_guard, explanation);
         }
     }
@@ -3451,7 +3451,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "pending".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -3495,7 +3495,7 @@ mod tests {
                 id: "task-1".to_string(),
                 title: "finish validation".to_string(),
                 description: None,
-                status: "in_progress".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -3595,7 +3595,7 @@ mod tests {
                 id: "task-1".to_string(),
                 title: "finish validation".to_string(),
                 description: None,
-                status: "in_progress".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -3706,7 +3706,7 @@ mod tests {
                 id: "task-1".to_string(),
                 title: "very specific changing task title".to_string(),
                 description: None,
-                status: "in_progress".to_string(),
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                 subtasks: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),

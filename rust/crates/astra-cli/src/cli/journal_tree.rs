@@ -35,11 +35,11 @@ use serde::{Deserialize, Serialize};
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 
 use crate::cli::cli_config::cli_args;
+use crate::cli::journal_digest;
 use crate::cli::surface::delegation_event_surface::{
     project_delegation_started, project_delegation_sub_run_completed,
     project_delegation_sub_run_started,
 };
-use crate::cli::journal_digest;
 
 /// One node in the rendered tree. Leaf = no `children`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

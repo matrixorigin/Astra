@@ -1,5 +1,5 @@
-use crate::cli::session::session_input::detect_correction_signal;
 use super::*;
+use crate::cli::session::session_input::detect_correction_signal;
 
 /// Minimal async-capable chat completion abstraction so the skill-improvement
 /// LLM path can be unit-tested without real HTTP.

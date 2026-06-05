@@ -185,12 +185,14 @@ mod tests {
         temp_env::with_var("HOME", Some(temp.path()), || {
             let artifact = load_task_result_artifact(&base_task()).unwrap();
             assert!(artifact.is_none());
-            assert!(!temp
-                .path()
-                .join(".astra")
-                .join("tasks")
-                .join("outputs")
-                .exists());
+            assert!(
+                !temp
+                    .path()
+                    .join(".astra")
+                    .join("tasks")
+                    .join("outputs")
+                    .exists()
+            );
         });
     }
 

@@ -1,11 +1,11 @@
 //! Plan execution progress rendering and blocking monitor loop.
 
+use super::*;
 use crate::cli::chat_stream;
 use crate::cli::cli_config::cli_formatting;
 use crate::cli::cli_config::cli_utils::append_journal_event_or_warn;
 use crate::cli::durable_bridge;
 use crate::cli::effects;
-use crate::cli::plan;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::stream_render;
 use crate::cli::stream::streaming_md;
@@ -1365,13 +1365,19 @@ mod tests {
             .into_iter()
             .find(|task| task.title == "Ship plan UX")
             .expect("plan task should exist");
-        assert_eq!(task.status, "in_progress");
+        assert_eq!(
+            task.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
         let subtask = task
             .subtasks
             .iter()
             .find(|subtask| subtask.id == "s2")
             .expect("subtask should exist");
-        assert_eq!(subtask.status, "in_progress");
+        assert_eq!(
+            subtask.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
     }
 
     #[tokio::test]
@@ -1415,7 +1421,10 @@ mod tests {
                     .any(|subtask| subtask.title == "old step")
             })
             .expect("stale task exists");
-        assert_eq!(stale_task.subtasks[0].status, "pending");
+        assert_eq!(
+            stale_task.subtasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+        );
 
         let current_task = tasks
             .iter()
@@ -1425,7 +1434,10 @@ mod tests {
                     .any(|subtask| subtask.title == "new step")
             })
             .expect("current task exists");
-        assert_eq!(current_task.subtasks[0].status, "in_progress");
+        assert_eq!(
+            current_task.subtasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
     }
 
     #[tokio::test]
