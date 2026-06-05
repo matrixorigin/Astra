@@ -1830,7 +1830,7 @@ mod tests {
         assert!(abort.is_none(), "unexpected abort: {abort:?}");
         assert_eq!(result.tool_results.len(), 3);
         assert_eq!(
-            astra_core::sync_poison::recover_mutex_lock(&*batch_sizes),
+            *astra_core::sync_poison::recover_mutex_lock(&*batch_sizes),
             vec![3],
             "agent spawn requests should execute as one parallel batch"
         );

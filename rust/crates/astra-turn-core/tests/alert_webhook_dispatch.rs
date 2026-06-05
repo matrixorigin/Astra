@@ -19,8 +19,8 @@ struct CapturingClient {
 #[async_trait::async_trait]
 impl WebhookClient for CapturingClient {
     async fn post(&self, _url: &str, payload: &WebhookPayload) -> Result<(), WebhookError> {
-        if astra_core::sync_poison::recover_mutex_lock(&*self.fail_next) {
-            astra_core::sync_poison::recover_mutex_lock(&*self.fail_next) = false;
+        if *astra_core::sync_poison::recover_mutex_lock(&*self.fail_next) {
+            *astra_core::sync_poison::recover_mutex_lock(&*self.fail_next) = false;
             return Err(WebhookError::Transport("simulated".into()));
         }
         self.sent
@@ -75,13 +75,11 @@ async fn dispatcher_filters_below_threshold() {
             ],
         )
         .await;
-    assert!(
-        client
-            .sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    );
+    assert!(client
+        .sent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty());
 }
 
 #[tokio::test]
@@ -111,7 +109,7 @@ async fn dispatcher_forwards_multiple_alerts_independently() {
 #[tokio::test]
 async fn dispatcher_swallows_transport_errors_without_panic() {
     let client = CapturingClient::default();
-    astra_core::sync_poison::recover_mutex_lock(&*client.fail_next) = true;
+    *astra_core::sync_poison::recover_mutex_lock(&*client.fail_next) = true;
     let cfg = AlertWebhookConfig {
         url: "https://example.invalid/hook".into(),
         min_severity: AlertSeverity::Warning,
@@ -121,13 +119,11 @@ async fn dispatcher_swallows_transport_errors_without_panic() {
     dispatcher
         .dispatch("sess-x", &[alert("x", AlertSeverity::Error)])
         .await;
-    assert!(
-        client
-            .sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    );
+    assert!(client
+        .sent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty());
 }
 
 #[test]

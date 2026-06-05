@@ -1108,7 +1108,7 @@ mod tests {
 
             // Reset
             rl.state.store(STATE_ACTIVE, Ordering::SeqCst);
-            astra_core::sync_poison::recover_mutex_lock(&*rl.cooldown_info) = None;
+            *astra_core::sync_poison::recover_mutex_lock(&rl.cooldown_info) = None;
         }
     }
 

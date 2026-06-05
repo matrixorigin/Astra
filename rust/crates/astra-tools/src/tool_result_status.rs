@@ -1,32 +1,50 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+/// Tool result outcome — intentionally coarse. Detail lives in output text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolResultStatusKind {
     Success,
     NonSuccess,
 }
 
-pub fn tool_result_status_kind(status: &str) -> ToolResultStatusKind {
-    // Normalize: uppercase variants like "OK" / "SUCCESS" occasionally arrive
-    // from upstream edge handlers and API responses.
-    let normalized = status.trim().to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "ok" | "success" | "succeeded" | "completed" | "complete" | "passed"
-    ) {
-        ToolResultStatusKind::Success
-    } else {
-        ToolResultStatusKind::NonSuccess
+impl ToolResultStatusKind {
+    /// Parse a status string with normalization: case-insensitive, leading/trailing whitespace stripped.
+    pub fn from_status_str(status: &str) -> Self {
+        let normalized = status.trim().to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "ok" | "success" | "succeeded" | "completed" | "complete" | "passed"
+        ) {
+            Self::Success
+        } else {
+            Self::NonSuccess
+        }
+    }
+
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    #[must_use]
+    pub fn is_failure(self) -> bool {
+        !self.is_success()
     }
 }
 
+// ── Deprecated free functions (preserved for existing callers) ─────────────────
+
+pub fn tool_result_status_kind(status: &str) -> ToolResultStatusKind {
+    ToolResultStatusKind::from_status_str(status)
+}
+
 pub fn tool_result_status_is_success(status: &str) -> bool {
-    matches!(
-        tool_result_status_kind(status),
-        ToolResultStatusKind::Success
-    )
+    ToolResultStatusKind::from_status_str(status).is_success()
 }
 
 pub fn tool_result_status_is_failure(status: &str) -> bool {
-    !tool_result_status_is_success(status)
+    ToolResultStatusKind::from_status_str(status).is_failure()
 }
 
 #[cfg(test)]
@@ -34,7 +52,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn success_statuses_are_recognized_as_success() {
+    fn from_status_str_success_variants() {
         for s in [
             "ok",
             "success",
@@ -43,52 +61,62 @@ mod tests {
             "complete",
             "passed",
         ] {
-            assert_eq!(
-                tool_result_status_kind(s),
-                ToolResultStatusKind::Success,
-                "expected {s} to be Success"
-            );
-            assert!(tool_result_status_is_success(s));
-            assert!(!tool_result_status_is_failure(s));
+            let kind = ToolResultStatusKind::from_status_str(s);
+            assert_eq!(kind, ToolResultStatusKind::Success, "expected {s} to be Success");
+            assert!(kind.is_success());
+            assert!(!kind.is_failure());
         }
     }
 
     #[test]
-    fn success_statuses_are_case_insensitive() {
+    fn from_status_str_case_insensitive() {
         for s in ["OK", "Success", "SUCCEEDED", "Completed", "PASSED"] {
-            assert_eq!(
-                tool_result_status_kind(s),
-                ToolResultStatusKind::Success,
-                "expected {s} to be Success (case-insensitive)"
-            );
-            assert!(tool_result_status_is_success(s));
+            let kind = ToolResultStatusKind::from_status_str(s);
+            assert_eq!(kind, ToolResultStatusKind::Success, "expected {s} to be Success (case-insensitive)");
+            assert!(kind.is_success());
         }
     }
 
     #[test]
-    fn leading_trailing_whitespace_is_ignored() {
+    fn from_status_str_trims_whitespace() {
         assert_eq!(
-            tool_result_status_kind("  ok  "),
+            ToolResultStatusKind::from_status_str("  ok  "),
             ToolResultStatusKind::Success
         );
         assert_eq!(
-            tool_result_status_kind("\tOK\n"),
+            ToolResultStatusKind::from_status_str("\tOK\n"),
             ToolResultStatusKind::Success
         );
     }
 
     #[test]
-    fn non_success_status_is_recognized_as_failure() {
-        assert_eq!(
-            tool_result_status_kind("permission_denied"),
-            ToolResultStatusKind::NonSuccess
-        );
-        assert!(!tool_result_status_is_success("permission_denied"));
-        assert!(tool_result_status_is_failure("permission_denied"));
+    fn non_success_is_failure() {
+        let kind = ToolResultStatusKind::from_status_str("permission_denied");
+        assert_eq!(kind, ToolResultStatusKind::NonSuccess);
+        assert!(!kind.is_success());
+        assert!(kind.is_failure());
         // Even with mixed case, non-success is still NonSuccess
         assert_eq!(
-            tool_result_status_kind("PERMISSION_DENIED"),
+            ToolResultStatusKind::from_status_str("PERMISSION_DENIED"),
             ToolResultStatusKind::NonSuccess
         );
+    }
+
+    // Regression: free functions still work
+    #[test]
+    fn free_functions_match_methods() {
+        assert!(tool_result_status_is_success("ok"));
+        assert!(!tool_result_status_is_success("err"));
+        assert!(tool_result_status_is_failure("err"));
+        assert!(!tool_result_status_is_failure("ok"));
+        assert_eq!(tool_result_status_kind("ok"), ToolResultStatusKind::Success);
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let json = serde_json::to_string(&ToolResultStatusKind::Success).unwrap();
+        assert_eq!(json, "\"success\"");
+        let kind: ToolResultStatusKind = serde_json::from_str("\"non_success\"").unwrap();
+        assert_eq!(kind, ToolResultStatusKind::NonSuccess);
     }
 }
