@@ -68,6 +68,96 @@ pub struct SessionSubtask {
     pub owner: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTaskStatusKind {
+    InProgress,
+    Pending,
+    Completed,
+    Failed,
+    Cancelled,
+    Archived,
+    Deleted,
+    Other,
+}
+
+pub const SESSION_TASK_STATUS_PENDING: &str = "pending";
+pub const SESSION_TASK_STATUS_IN_PROGRESS: &str = "in_progress";
+pub const SESSION_TASK_STATUS_COMPLETED: &str = "completed";
+pub const SESSION_TASK_STATUS_FAILED: &str = "failed";
+pub const SESSION_TASK_STATUS_CANCELLED: &str = "cancelled";
+pub const SESSION_TASK_STATUS_ARCHIVED: &str = "archived";
+pub const SESSION_TASK_STATUS_DELETED: &str = "deleted";
+
+pub fn session_task_status_kind(status: &str) -> SessionTaskStatusKind {
+    match status {
+        SESSION_TASK_STATUS_IN_PROGRESS => SessionTaskStatusKind::InProgress,
+        SESSION_TASK_STATUS_PENDING => SessionTaskStatusKind::Pending,
+        SESSION_TASK_STATUS_COMPLETED => SessionTaskStatusKind::Completed,
+        SESSION_TASK_STATUS_FAILED => SessionTaskStatusKind::Failed,
+        SESSION_TASK_STATUS_CANCELLED => SessionTaskStatusKind::Cancelled,
+        SESSION_TASK_STATUS_ARCHIVED => SessionTaskStatusKind::Archived,
+        SESSION_TASK_STATUS_DELETED => SessionTaskStatusKind::Deleted,
+        _ => SessionTaskStatusKind::Other,
+    }
+}
+
+pub fn session_task_is_active(status: &str) -> bool {
+    matches!(
+        session_task_status_kind(status),
+        SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Pending
+    )
+}
+
+pub fn session_task_is_in_progress(status: &str) -> bool {
+    session_task_status_kind(status) == SessionTaskStatusKind::InProgress
+}
+
+pub fn session_task_is_pending(status: &str) -> bool {
+    session_task_status_kind(status) == SessionTaskStatusKind::Pending
+}
+
+pub fn session_task_is_completed(status: &str) -> bool {
+    session_task_status_kind(status) == SessionTaskStatusKind::Completed
+}
+
+pub fn session_task_is_failed(status: &str) -> bool {
+    session_task_status_kind(status) == SessionTaskStatusKind::Failed
+}
+
+pub fn session_task_is_cancelled(status: &str) -> bool {
+    session_task_status_kind(status) == SessionTaskStatusKind::Cancelled
+}
+
+pub fn session_task_is_unsuccessful(status: &str) -> bool {
+    matches!(
+        session_task_status_kind(status),
+        SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled
+    )
+}
+
+pub fn session_task_is_started(status: &str) -> bool {
+    matches!(
+        session_task_status_kind(status),
+        SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed
+    )
+}
+
+pub fn session_task_can_be_archived(status: &str) -> bool {
+    matches!(
+        session_task_status_kind(status),
+        SessionTaskStatusKind::Completed
+            | SessionTaskStatusKind::Failed
+            | SessionTaskStatusKind::Cancelled
+    )
+}
+
+pub fn session_task_can_be_stopped(status: &str) -> bool {
+    matches!(
+        session_task_status_kind(status),
+        SessionTaskStatusKind::Pending | SessionTaskStatusKind::InProgress
+    )
+}
+
 /// Point-in-time snapshot of a single session's task list plus its id counter.
 /// Used by the session-state rollback journal to undo a turn's task mutations.
 #[derive(Debug, Clone)]
@@ -108,7 +198,7 @@ pub trait TaskStore: Send + Sync {
             .load(session_id)
             .await?
             .into_iter()
-            .filter(|t| matches!(t.status.as_str(), "pending" | "in_progress"))
+            .filter(|t| session_task_is_active(&t.status))
             .collect())
     }
 
@@ -158,7 +248,8 @@ pub trait TaskStore: Send + Sync {
                         });
                     };
                     let previous_status = task.status.clone();
-                    if previous_status == "archived" {
+                    if session_task_status_kind(&previous_status) == SessionTaskStatusKind::Archived
+                    {
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
@@ -174,7 +265,7 @@ pub trait TaskStore: Send + Sync {
                             ),
                         });
                     }
-                    if !matches!(previous_status.as_str(), "completed" | "failed" | "cancelled") {
+                    if !session_task_can_be_archived(&previous_status) {
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
@@ -196,7 +287,7 @@ pub trait TaskStore: Send + Sync {
                         });
                     }
 
-                    task.status = "archived".to_string();
+                    task.status = SESSION_TASK_STATUS_ARCHIVED.to_string();
                     task.updated_at = now_rfc3339.clone();
                     return Ok(TaskMutationResult {
                         tasks,
@@ -207,7 +298,7 @@ pub trait TaskStore: Send + Sync {
                                 "success": true,
                                 "task_id": task_id,
                                 "previous_status": previous_status,
-                                "status": "archived",
+                                "status": SESSION_TASK_STATUS_ARCHIVED,
                                 "message": format!("Task '{}' archived", task_id),
                             })
                             .to_string(),
@@ -217,7 +308,7 @@ pub trait TaskStore: Send + Sync {
 
                 let mut archived = 0u64;
                 for task in &mut tasks {
-                    if task.status != "completed" {
+                    if !session_task_is_completed(&task.status) {
                         continue;
                     }
                     let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
@@ -602,9 +693,12 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
         return;
     }
 
-    let all_completed = task.subtasks.iter().all(|st| st.status == "completed");
+    let all_completed = task
+        .subtasks
+        .iter()
+        .all(|st| session_task_is_completed(&st.status));
     if all_completed {
-        if matches!(task.status.as_str(), "pending" | "in_progress") {
+        if session_task_is_active(&task.status) {
             task.status = "completed".to_string();
         }
         return;
@@ -613,8 +707,10 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
     let any_started = task
         .subtasks
         .iter()
-        .any(|st| matches!(st.status.as_str(), "in_progress" | "completed"));
-    if (any_started && task.status == "pending") || task.status == "completed" {
+        .any(|st| session_task_is_started(&st.status));
+    if (any_started && session_task_is_pending(&task.status))
+        || session_task_is_completed(&task.status)
+    {
         task.status = "in_progress".to_string();
     }
 }
@@ -788,7 +884,7 @@ impl TaskManager {
                     // duplicating.
                     let normalized_new = normalize_title(&mutation_title);
                     if let Some(dup) = tasks.iter().find(|t| {
-                        matches!(t.status.as_str(), "pending" | "in_progress")
+                        session_task_is_active(&t.status)
                             && normalize_title(&t.title) == normalized_new
                     }) {
                         let response = prefix_summary(
@@ -921,7 +1017,7 @@ impl TaskManager {
                     let done = t
                         .subtasks
                         .iter()
-                        .filter(|st| st.status == "completed")
+                        .filter(|st| session_task_is_completed(&st.status))
                         .count();
                     format!(" [{}/{}]", done, t.subtasks.len())
                 };
@@ -942,7 +1038,7 @@ impl TaskManager {
                 // sees "why" without a follow-up `task.get`. Only on
                 // failed rows; other statuses don't have an
                 // error_message so the field would be confusing noise.
-                if t.status == "failed" {
+                if session_task_is_failed(&t.status) {
                     let preview = t
                         .metadata
                         .as_ref()
@@ -1233,14 +1329,14 @@ impl TaskManager {
 
                     if let Some(status) = new_status.as_deref() {
                         task.status = status.to_string();
-                        if status == "completed" {
+                        if session_task_is_completed(status) {
                             // Cascade parent→subtask completion, but preserve any
                             // subtask already in a terminal non-success state.
                             for subtask in &mut task.subtasks {
-                                if !matches!(
-                                    subtask.status.as_str(),
-                                    "failed" | "cancelled" | "completed"
-                                ) {
+                                if !session_task_is_failed(&subtask.status)
+                                    && !session_task_is_cancelled(&subtask.status)
+                                    && !session_task_is_completed(&subtask.status)
+                                {
                                     subtask.status = "completed".to_string();
                                 }
                             }
@@ -1353,7 +1449,7 @@ impl TaskManager {
                     };
                     let task_status = tasks[task_idx].status.clone();
 
-                    if task_status != "pending" && task_status != "in_progress" {
+                    if !session_task_can_be_stopped(&task_status) {
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
@@ -1378,7 +1474,7 @@ impl TaskManager {
 
                     let mut cancelled_subtasks = 0;
                     for subtask in &mut task.subtasks {
-                        if subtask.status == "pending" || subtask.status == "in_progress" {
+                        if session_task_can_be_stopped(&subtask.status) {
                             subtask.status = "cancelled".to_string();
                             cancelled_subtasks += 1;
                         }
@@ -1434,6 +1530,61 @@ mod tests {
 
     fn mgr() -> TaskManager {
         TaskManager::in_memory()
+    }
+
+    #[test]
+    fn session_task_status_helpers_cover_domain_taxonomy() {
+        assert_eq!(
+            session_task_status_kind("pending"),
+            SessionTaskStatusKind::Pending
+        );
+        assert_eq!(
+            session_task_status_kind("in_progress"),
+            SessionTaskStatusKind::InProgress
+        );
+        assert_eq!(
+            session_task_status_kind("completed"),
+            SessionTaskStatusKind::Completed
+        );
+        assert_eq!(
+            session_task_status_kind("failed"),
+            SessionTaskStatusKind::Failed
+        );
+        assert_eq!(
+            session_task_status_kind("cancelled"),
+            SessionTaskStatusKind::Cancelled
+        );
+        assert_eq!(
+            session_task_status_kind("archived"),
+            SessionTaskStatusKind::Archived
+        );
+        assert_eq!(
+            session_task_status_kind("deleted"),
+            SessionTaskStatusKind::Deleted
+        );
+        assert_eq!(
+            session_task_status_kind("paused"),
+            SessionTaskStatusKind::Other
+        );
+    }
+
+    #[test]
+    fn session_task_status_helpers_keep_active_archive_and_stop_semantics_distinct() {
+        assert!(session_task_is_active("pending"));
+        assert!(session_task_is_active("in_progress"));
+        assert!(!session_task_is_active("completed"));
+        assert!(session_task_is_started("completed"));
+        assert!(!session_task_is_started("cancelled"));
+        assert!(session_task_can_be_archived("completed"));
+        assert!(session_task_can_be_archived("failed"));
+        assert!(session_task_can_be_archived("cancelled"));
+        assert!(!session_task_can_be_archived("archived"));
+        assert!(session_task_can_be_stopped("pending"));
+        assert!(session_task_can_be_stopped("in_progress"));
+        assert!(!session_task_can_be_stopped("cancelled"));
+        assert!(session_task_is_unsuccessful("failed"));
+        assert!(session_task_is_unsuccessful("cancelled"));
+        assert!(!session_task_is_unsuccessful("archived"));
     }
 
     #[tokio::test]

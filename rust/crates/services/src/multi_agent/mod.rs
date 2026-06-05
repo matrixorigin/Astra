@@ -24,7 +24,8 @@ pub use edge_registry::{
 pub use hold_cache::TaskLeaseHoldCache;
 pub use metrics::{MetricTarget, MultiAgentMetrics, SharedMultiAgentMetrics, shared_metrics};
 pub use task_lease::{
-    DEFAULT_TASKS_PACK_LIMIT, DatabaseTaskLeaseService, LeaseClaimResult, TaskLeaseService,
-    TaskLeaseView, TasksPackPushResult, UnconfiguredTaskLeaseService, pull_tasks_pack_mysql,
-    pull_tasks_pack_mysql_with_limit, push_tasks_pack_held_mysql,
+    DEFAULT_TASKS_PACK_LIMIT, DatabaseTaskLeaseService, LeaseClaimResult,
+    NextClaimableLeaseClaimResult, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
+    UnconfiguredTaskLeaseService, pull_tasks_pack_mysql, pull_tasks_pack_mysql_with_limit,
+    push_tasks_pack_held_mysql,
 };

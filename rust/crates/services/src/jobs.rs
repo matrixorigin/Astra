@@ -33,6 +33,44 @@ pub struct JobWebhookData {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStatusKind {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Other,
+}
+
+pub const JOB_STATUS_PENDING: &str = "pending";
+pub const JOB_STATUS_RUNNING: &str = "running";
+pub const JOB_STATUS_COMPLETED: &str = "completed";
+pub const JOB_STATUS_FAILED: &str = "failed";
+pub const JOB_STATUS_CANCELLED: &str = "cancelled";
+
+pub fn job_status_kind(status: &str) -> JobStatusKind {
+    match status {
+        JOB_STATUS_PENDING => JobStatusKind::Pending,
+        JOB_STATUS_RUNNING => JobStatusKind::Running,
+        JOB_STATUS_COMPLETED => JobStatusKind::Completed,
+        JOB_STATUS_FAILED => JobStatusKind::Failed,
+        JOB_STATUS_CANCELLED => JobStatusKind::Cancelled,
+        _ => JobStatusKind::Other,
+    }
+}
+
+pub fn job_status_is_terminal(status: &str) -> bool {
+    matches!(
+        job_status_kind(status),
+        JobStatusKind::Completed | JobStatusKind::Failed | JobStatusKind::Cancelled
+    )
+}
+
+pub fn job_status_allows_webhook_transition(current: &str, next: &str) -> bool {
+    !job_status_is_terminal(current) || current == next
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -117,7 +155,7 @@ impl JobService for InMemoryJobService {
         let job_id = Uuid::new_v4().to_string();
         let record = JobRecord {
             job_id: job_id.clone(),
-            status: "pending".into(),
+            status: JOB_STATUS_PENDING.into(),
             result: None,
             error: None,
             progress: 0.0,
@@ -149,14 +187,14 @@ impl JobService for InMemoryJobService {
         let job = jobs
             .get(&job_id)
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Job not found"))?;
-        if matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
+        if job_status_is_terminal(&job.status) {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 format!("Job already {}", job.status),
             ));
         }
         let updated = JobRecord {
-            status: "cancelled".into(),
+            status: JOB_STATUS_CANCELLED.into(),
             ..job.clone()
         };
         jobs.insert(job_id, updated.clone());
@@ -168,10 +206,24 @@ impl JobService for InMemoryJobService {
         payload: JobWebhookData,
     ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
         let mut jobs = self.jobs.lock().expect("jobs mutex");
-        if let Some(job) = jobs.get_mut(&payload.job_id) {
-            job.status = payload.status;
-            job.result = payload.result;
-            job.error = payload.error;
+        let job = jobs
+            .get_mut(&payload.job_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Job not found"))?;
+        if !job_status_allows_webhook_transition(&job.status, &payload.status) {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "Job already {} and cannot transition to {}",
+                    job.status, payload.status
+                ),
+            ));
+        }
+        job.status = payload.status;
+        if let Some(result) = payload.result {
+            job.result = Some(result);
+        }
+        if let Some(error) = payload.error {
+            job.error = Some(error);
         }
         Ok(serde_json::json!({"resumed": true, "job_id": payload.job_id}))
     }
@@ -249,6 +301,29 @@ mod tests {
     }
 
     // ── InMemoryJobService basic flow ──
+
+    #[test]
+    fn job_status_helpers_fail_closed_on_terminal_regressions() {
+        assert!(job_status_is_terminal(JOB_STATUS_COMPLETED));
+        assert!(job_status_is_terminal(JOB_STATUS_FAILED));
+        assert!(job_status_is_terminal(JOB_STATUS_CANCELLED));
+        assert!(!job_status_is_terminal(JOB_STATUS_PENDING));
+        assert!(!job_status_is_terminal(JOB_STATUS_RUNNING));
+        assert!(!job_status_is_terminal("queued"));
+
+        assert!(job_status_allows_webhook_transition(
+            JOB_STATUS_PENDING,
+            JOB_STATUS_RUNNING
+        ));
+        assert!(job_status_allows_webhook_transition(
+            JOB_STATUS_COMPLETED,
+            JOB_STATUS_COMPLETED
+        ));
+        assert!(!job_status_allows_webhook_transition(
+            JOB_STATUS_COMPLETED,
+            JOB_STATUS_RUNNING
+        ));
+    }
 
     #[tokio::test]
     async fn submit_and_get_job() {
@@ -331,7 +406,7 @@ mod tests {
         let result = unwrap_ok(
             svc.job_webhook(JobWebhookData {
                 job_id: job.job_id.clone(),
-                status: "completed".into(),
+                status: JOB_STATUS_COMPLETED.into(),
                 result: Some(serde_json::json!({"accuracy": 0.95})),
                 error: None,
             })
@@ -340,23 +415,108 @@ mod tests {
         assert_eq!(result["resumed"], true);
 
         let updated = unwrap_ok(svc.get_job(job.job_id).await);
-        assert_eq!(updated.status, "completed");
+        assert_eq!(updated.status, JOB_STATUS_COMPLETED);
         assert!(updated.result.is_some());
     }
 
     #[tokio::test]
-    async fn webhook_for_nonexistent_job_still_succeeds() {
+    async fn webhook_for_nonexistent_job_returns_not_found() {
         let svc = InMemoryJobService::new();
-        let result = unwrap_ok(
+        assert_err_status(
             svc.job_webhook(JobWebhookData {
                 job_id: "nonexistent".into(),
-                status: "completed".into(),
+                status: JOB_STATUS_COMPLETED.into(),
+                result: None,
+                error: None,
+            })
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_terminal_regression() {
+        let svc = InMemoryJobService::new();
+        let job = unwrap_ok(
+            svc.submit_job(
+                "u1".into(),
+                JobSubmitRequestData {
+                    job_type: "train".into(),
+                    inputs: serde_json::json!({}),
+                    gpu_required: false,
+                    timeout_seconds: 3600,
+                    conda_env: None,
+                },
+            )
+            .await,
+        );
+
+        unwrap_ok(
+            svc.job_webhook(JobWebhookData {
+                job_id: job.job_id.clone(),
+                status: JOB_STATUS_COMPLETED.into(),
+                result: Some(serde_json::json!({"accuracy": 0.95})),
+                error: None,
+            })
+            .await,
+        );
+
+        assert_err_status(
+            svc.job_webhook(JobWebhookData {
+                job_id: job.job_id.clone(),
+                status: JOB_STATUS_RUNNING.into(),
+                result: None,
+                error: None,
+            })
+            .await,
+            StatusCode::CONFLICT,
+        );
+
+        let updated = unwrap_ok(svc.get_job(job.job_id).await);
+        assert_eq!(updated.status, JOB_STATUS_COMPLETED);
+        assert_eq!(updated.result, Some(serde_json::json!({"accuracy": 0.95})));
+    }
+
+    #[tokio::test]
+    async fn webhook_same_terminal_status_preserves_existing_result_and_error() {
+        let svc = InMemoryJobService::new();
+        let job = unwrap_ok(
+            svc.submit_job(
+                "u1".into(),
+                JobSubmitRequestData {
+                    job_type: "train".into(),
+                    inputs: serde_json::json!({}),
+                    gpu_required: false,
+                    timeout_seconds: 3600,
+                    conda_env: None,
+                },
+            )
+            .await,
+        );
+
+        unwrap_ok(
+            svc.job_webhook(JobWebhookData {
+                job_id: job.job_id.clone(),
+                status: JOB_STATUS_FAILED.into(),
+                result: Some(serde_json::json!({"step": 7})),
+                error: Some("OOM".into()),
+            })
+            .await,
+        );
+        unwrap_ok(
+            svc.job_webhook(JobWebhookData {
+                job_id: job.job_id.clone(),
+                status: JOB_STATUS_FAILED.into(),
                 result: None,
                 error: None,
             })
             .await,
         );
-        assert_eq!(result["resumed"], true);
+
+        let updated = unwrap_ok(svc.get_job(job.job_id).await);
+        assert_eq!(updated.status, JOB_STATUS_FAILED);
+        assert_eq!(updated.result, Some(serde_json::json!({"step": 7})));
+        assert_eq!(updated.error.as_deref(), Some("OOM"));
     }
 
     // ── UnconfiguredJobService ──

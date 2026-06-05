@@ -1767,6 +1767,11 @@ impl LocalFileBranchOps {
     fn snapshot_path(&self, name: &str) -> std::path::PathBuf {
         self.snapshots_dir.join(name)
     }
+
+    fn internal_state_root(&self) -> Option<std::path::PathBuf> {
+        let root = self.snapshots_dir.parent()?;
+        root.starts_with(&self.work_dir).then(|| root.to_path_buf())
+    }
 }
 
 #[async_trait]
@@ -1781,11 +1786,15 @@ impl TaskBranchOps for LocalFileBranchOps {
         let snap_path = self.snapshot_path(&name);
         let work = self.work_dir.clone();
         let snap = snap_path.clone();
+        let excluded_roots = self
+            .internal_state_root()
+            .into_iter()
+            .collect::<Vec<std::path::PathBuf>>();
         tokio::task::spawn_blocking(move || {
             if snap.exists() {
                 std::fs::remove_dir_all(&snap).ok();
             }
-            copy_dir_recursive(&work, &snap)
+            copy_dir_recursive_excluding(&work, &snap, &excluded_roots)
         })
         .await
         .map_err(|e| format!("spawn: {e}"))?
@@ -1796,10 +1805,16 @@ impl TaskBranchOps for LocalFileBranchOps {
     async fn diff_since_snapshot(&self, snapshot: &str) -> Result<DiffSummary, String> {
         let snap_path = self.snapshot_path(snapshot);
         let work = self.work_dir.clone();
-        let changed = tokio::task::spawn_blocking(move || count_changed_files(&snap_path, &work))
-            .await
-            .map_err(|e| format!("spawn: {e}"))?
-            .map_err(|e| format!("diff: {e}"))?;
+        let excluded_roots = self
+            .internal_state_root()
+            .into_iter()
+            .collect::<Vec<std::path::PathBuf>>();
+        let changed = tokio::task::spawn_blocking(move || {
+            count_changed_files_excluding(&snap_path, &work, &excluded_roots)
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))?
+        .map_err(|e| format!("diff: {e}"))?;
         Ok(DiffSummary {
             snapshot: snapshot.to_string(),
             changed_rows: changed,
@@ -1813,12 +1828,15 @@ impl TaskBranchOps for LocalFileBranchOps {
         }
         let work = self.work_dir.clone();
         let snap = snap_path.clone();
+        let preserved_roots = self
+            .internal_state_root()
+            .into_iter()
+            .collect::<Vec<std::path::PathBuf>>();
         tokio::task::spawn_blocking(move || {
-            // Clear work dir and copy snapshot back
             if work.exists() {
-                std::fs::remove_dir_all(&work).map_err(|e| format!("clear work: {e}"))?;
+                clear_dir_contents_except(&work, &preserved_roots)?;
             }
-            copy_dir_recursive(&snap, &work)
+            copy_dir_recursive_excluding(&snap, &work, &[])
         })
         .await
         .map_err(|e| format!("spawn: {e}"))?
@@ -1883,7 +1901,15 @@ fn is_snapshot_excluded(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|n| SNAPSHOT_EXCLUDED_DIRS.contains(&n))
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+fn is_within_excluded_root(path: &std::path::Path, excluded_roots: &[std::path::PathBuf]) -> bool {
+    excluded_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn copy_dir_recursive_excluding(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    excluded_roots: &[std::path::PathBuf],
+) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     if !src.exists() {
         return Ok(());
@@ -1891,12 +1917,15 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     for entry in std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let src_path = entry.path();
+        if is_within_excluded_root(&src_path, excluded_roots) {
+            continue;
+        }
         let dst_path = dst.join(entry.file_name());
         if src_path.is_dir() {
             if is_snapshot_excluded(&entry.file_name()) {
                 continue;
             }
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_excluding(&src_path, &dst_path, excluded_roots)?;
         } else {
             std::fs::copy(&src_path, &dst_path)
                 .map_err(|e| format!("copy {}: {e}", src_path.display()))?;
@@ -1905,7 +1934,35 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn count_changed_files(snap: &std::path::Path, work: &std::path::Path) -> Result<i64, String> {
+fn clear_dir_contents_except(
+    dir: &std::path::Path,
+    preserved_roots: &[std::path::PathBuf],
+) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("readdir {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let path = entry.path();
+        if is_within_excluded_root(&path, preserved_roots) {
+            continue;
+        }
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("clear dir {}: {e}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("clear file {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn count_changed_files_excluding(
+    snap: &std::path::Path,
+    work: &std::path::Path,
+    excluded_roots: &[std::path::PathBuf],
+) -> Result<i64, String> {
     if !snap.exists() || !work.exists() {
         return Ok(0);
     }
@@ -1913,12 +1970,15 @@ fn count_changed_files(snap: &std::path::Path, work: &std::path::Path) -> Result
     for entry in std::fs::read_dir(work).map_err(|e| format!("readdir {}: {e}", work.display()))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let work_path = entry.path();
+        if is_within_excluded_root(&work_path, excluded_roots) {
+            continue;
+        }
         let snap_path = snap.join(entry.file_name());
         if work_path.is_dir() {
             if is_snapshot_excluded(&entry.file_name()) {
                 continue;
             }
-            changed += count_changed_files(&snap_path, &work_path)?;
+            changed += count_changed_files_excluding(&snap_path, &work_path, excluded_roots)?;
         } else if !snap_path.exists() {
             changed += 1; // new file
         } else {
@@ -1988,6 +2048,51 @@ pub struct SubtaskExecutionContext {
     pub files: Vec<String>,
     pub criteria: Vec<VerificationCriterion>,
     pub snapshot_name: Option<String>,
+}
+
+fn snapshot_name_or_err(
+    result: Result<String, String>,
+    subtask_id: &str,
+    error_label: &str,
+) -> Result<Option<String>, String> {
+    match result {
+        Ok(name) if !name.is_empty() => Ok(Some(name)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(format!("{error_label} for {subtask_id}: {error}")),
+    }
+}
+
+fn diff_summary_or_err(
+    result: Result<DiffSummary, String>,
+    subtask_id: &str,
+    error_label: &str,
+) -> Result<DiffSummary, String> {
+    result.map_err(|error| format!("{error_label} for {subtask_id}: {error}"))
+}
+
+async fn warn_if_snapshot_cleanup_fails(
+    branch_ops: &dyn TaskBranchOps,
+    snapshot: &str,
+    subtask_id: &str,
+    warning_label: &str,
+) {
+    if let Err(error) = branch_ops.cleanup_snapshot(snapshot).await {
+        eprintln!("warn: {warning_label} failed for {subtask_id}: {error}");
+    }
+}
+
+async fn rollback_snapshot_or_err(
+    branch_ops: &dyn TaskBranchOps,
+    snapshot: &str,
+    subtask_id: &str,
+    error_label: &str,
+) -> Result<(), String> {
+    branch_ops
+        .rollback_to_snapshot(snapshot)
+        .await
+        .map_err(|error| format!("{error_label} for {subtask_id}: {error}"))?;
+    warn_if_snapshot_cleanup_fails(branch_ops, snapshot, subtask_id, "post-rollback cleanup").await;
+    Ok(())
 }
 
 /// Context for resuming a paused task.
@@ -2583,19 +2688,13 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
 
         // Git4Data: create snapshot before execution for rollback support
         let version = contract.version;
-        let snapshot_name = match self
-            .branch_ops
-            .create_snapshot(task_id, subtask_id, version)
-            .await
-        {
-            Ok(name) if !name.is_empty() => Some(name),
-            Ok(_) => None, // empty = noop branch ops
-            Err(e) => {
-                // Non-fatal: log but continue without snapshot
-                eprintln!("warn: snapshot failed for {subtask_id}: {e}");
-                None
-            }
-        };
+        let snapshot_name = snapshot_name_or_err(
+            self.branch_ops
+                .create_snapshot(task_id, subtask_id, version)
+                .await,
+            subtask_id,
+            "snapshot failed",
+        )?;
 
         // Now mutably update
         let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
@@ -2635,27 +2734,46 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .await?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
 
-        let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
-        if !matches!(subtask.stage, SubtaskStage::Executing) {
-            return Err(format!(
-                "subtask '{}' not executing (stage: {})",
-                subtask_id,
-                subtask.stage.as_str()
-            ));
-        }
+        let snapshot_name = {
+            let subtask = Self::find_subtask(&contract, subtask_id)?;
+            if !matches!(subtask.stage, SubtaskStage::Executing) {
+                return Err(format!(
+                    "subtask '{}' not executing (stage: {})",
+                    subtask_id,
+                    subtask.stage.as_str()
+                ));
+            }
+            subtask.snapshot_name.clone()
+        };
 
-        // Git4Data: capture diff if we have a snapshot
-        if let Some(snap) = &subtask.snapshot_name {
-            match self.branch_ops.diff_since_snapshot(snap).await {
-                Ok(diff) => {
-                    subtask.diff_summary = Some(diff);
-                }
-                Err(e) => {
-                    eprintln!("warn: diff failed for {subtask_id}: {e}");
+        let diff_summary = if let Some(snapshot) = snapshot_name.as_deref() {
+            match diff_summary_or_err(
+                self.branch_ops.diff_since_snapshot(snapshot).await,
+                subtask_id,
+                "diff capture failed",
+            ) {
+                Ok(diff) => Some(diff),
+                Err(error) => {
+                    let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
+                    subtask.stage = SubtaskStage::ExecutionFailed {
+                        error: error.clone(),
+                    };
+                    if let Err(persist_error) = self.persist_contract(&contract, None, None).await {
+                        return Err(format!(
+                            "{error}; failed to persist execution failure: {persist_error}"
+                        ));
+                    }
+                    return Err(error);
                 }
             }
-        }
+        } else {
+            None
+        };
 
+        let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
+        if let Some(diff) = diff_summary {
+            subtask.diff_summary = Some(diff);
+        }
         subtask.stage = if subtask.criteria.is_empty() {
             // No criteria → auto-verify
             SubtaskStage::Verified
@@ -2759,38 +2877,68 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
 
         // Update stage + git4data actions
         let snapshot_name = durable_st.snapshot_name.clone();
-        let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
-        // Store verification results for delivery report
-        subtask.last_verification = Some(report.clone());
-        if report.all_required_passed {
-            subtask.stage = SubtaskStage::Verified;
-            // Git4Data: cleanup snapshot after successful verification
-            if let Some(snap) = &snapshot_name
-                && let Err(e) = self.branch_ops.cleanup_snapshot(snap).await
-            {
-                eprintln!("warn: snapshot cleanup failed for {subtask_id}: {e}");
-            }
-        } else {
-            subtask.retry_count += 1;
-            if subtask.retry_count >= subtask.max_retries {
-                // Git4Data: rollback on max-retry abandonment
-                if let Some(snap) = &snapshot_name {
-                    if let Err(e) = self.branch_ops.rollback_to_snapshot(snap).await {
-                        eprintln!("warn: rollback failed for {subtask_id}: {e}");
-                    }
-                    // Clean up the snapshot after rollback
-                    if let Err(e) = self.branch_ops.cleanup_snapshot(snap).await {
-                        eprintln!("warn: post-rollback cleanup failed for {subtask_id}: {e}");
-                    }
-                }
-                subtask.stage = SubtaskStage::Abandoned {
-                    reason: format!("verification failed after {} attempts", subtask.retry_count),
-                };
+        let mut rollback_error = None;
+        let mut rollback_snapshot = None;
+        let mut abandon_after_verification = false;
+        {
+            let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
+            // Store verification results for delivery report
+            subtask.last_verification = Some(report.clone());
+            if report.all_required_passed {
+                subtask.stage = SubtaskStage::Verified;
             } else {
-                subtask.stage = SubtaskStage::VerificationFailed {
-                    results: report.results.clone(),
-                };
+                subtask.retry_count += 1;
+                if subtask.retry_count >= subtask.max_retries {
+                    if let Some(snapshot) = snapshot_name.clone() {
+                        rollback_snapshot = Some(snapshot);
+                    } else {
+                        abandon_after_verification = true;
+                    }
+                } else {
+                    subtask.stage = SubtaskStage::VerificationFailed {
+                        results: report.results.clone(),
+                    };
+                }
             }
+        }
+
+        if let Some(snapshot) = rollback_snapshot.as_deref() {
+            match rollback_snapshot_or_err(
+                &*self.branch_ops,
+                snapshot,
+                subtask_id,
+                "rollback failed",
+            )
+            .await
+            {
+                Ok(()) => abandon_after_verification = true,
+                Err(error) => {
+                    let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
+                    subtask.stage = SubtaskStage::ExecutionFailed {
+                        error: error.clone(),
+                    };
+                    rollback_error = Some(error);
+                }
+            }
+        }
+
+        if abandon_after_verification {
+            let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
+            subtask.stage = SubtaskStage::Abandoned {
+                reason: format!("verification failed after {} attempts", subtask.retry_count),
+            };
+        }
+
+        if report.all_required_passed
+            && let Some(snapshot) = snapshot_name.as_deref()
+        {
+            warn_if_snapshot_cleanup_fails(
+                &*self.branch_ops,
+                snapshot,
+                subtask_id,
+                "snapshot cleanup",
+            )
+            .await;
         }
 
         // Persist contract update inside the same transaction
@@ -2850,6 +2998,10 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                 "attempt": durable_st.retry_count + 1,
             }),
         );
+
+        if let Some(error) = rollback_error {
+            return Err(error);
+        }
 
         Ok(report)
     }
@@ -3339,18 +3491,13 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         }
 
         // Git4Data: create snapshot before execution
-        let snapshot_name = match self
-            .branch_ops
-            .create_snapshot(task_id, subtask_id, contract.version)
-            .await
-        {
-            Ok(name) if !name.is_empty() => Some(name),
-            Ok(_) => None,
-            Err(e) => {
-                eprintln!("warn: local snapshot failed for {subtask_id}: {e}");
-                None
-            }
-        };
+        let snapshot_name = snapshot_name_or_err(
+            self.branch_ops
+                .create_snapshot(task_id, subtask_id, contract.version)
+                .await,
+            subtask_id,
+            "local snapshot failed",
+        )?;
 
         subtask.snapshot_name = snapshot_name.clone();
         let ctx = SubtaskExecutionContext {
@@ -3382,22 +3529,59 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         let mut contract = self
             .find_by_task(task_id)?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+        let snapshot_name = {
+            let subtask = contract
+                .subtasks
+                .iter()
+                .find(|s| s.id == subtask_id)
+                .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+
+            if !matches!(subtask.stage, SubtaskStage::Executing) {
+                return Err(format!(
+                    "subtask '{}' not executing (stage: {})",
+                    subtask_id,
+                    subtask.stage.as_str()
+                ));
+            }
+
+            subtask.snapshot_name.clone()
+        };
+
+        let diff_summary = if let Some(snapshot) = snapshot_name.as_deref() {
+            match diff_summary_or_err(
+                self.branch_ops.diff_since_snapshot(snapshot).await,
+                subtask_id,
+                "local diff capture failed",
+            ) {
+                Ok(diff) => Some(diff),
+                Err(error) => {
+                    let subtask = contract
+                        .subtasks
+                        .iter_mut()
+                        .find(|s| s.id == subtask_id)
+                        .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+                    subtask.stage = SubtaskStage::ExecutionFailed {
+                        error: error.clone(),
+                    };
+                    if let Err(persist_error) = self.save_local(&contract) {
+                        return Err(format!(
+                            "{error}; failed to persist execution failure: {persist_error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         let subtask = contract
             .subtasks
             .iter_mut()
             .find(|s| s.id == subtask_id)
             .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
-
-        // Git4Data: capture diff if we have a snapshot
-        if let Some(snap) = &subtask.snapshot_name {
-            match self.branch_ops.diff_since_snapshot(snap).await {
-                Ok(diff) => {
-                    subtask.diff_summary = Some(diff);
-                }
-                Err(e) => {
-                    eprintln!("warn: local diff failed for {subtask_id}: {e}");
-                }
-            }
+        if let Some(diff) = diff_summary {
+            subtask.diff_summary = Some(diff);
         }
 
         subtask.stage = if subtask.criteria.is_empty() {
@@ -3488,37 +3672,88 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         );
 
         let snapshot_name = durable_st.snapshot_name.clone();
-        let subtask = contract
-            .subtasks
-            .iter_mut()
-            .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
-        // Store verification results for delivery report
-        subtask.last_verification = Some(report.clone());
-        if report.all_required_passed {
-            subtask.stage = SubtaskStage::Verified;
-            // Git4Data: cleanup snapshot after successful verification
-            if let Some(snap) = &snapshot_name {
-                let _ = self.branch_ops.cleanup_snapshot(snap).await;
-            }
-        } else {
-            subtask.retry_count += 1;
-            if subtask.retry_count >= subtask.max_retries {
-                // Git4Data: rollback on max-retry abandonment
-                if let Some(snap) = &snapshot_name {
-                    let _ = self.branch_ops.rollback_to_snapshot(snap).await;
-                    let _ = self.branch_ops.cleanup_snapshot(snap).await;
-                }
-                subtask.stage = SubtaskStage::Abandoned {
-                    reason: format!("failed after {} attempts", subtask.retry_count),
-                };
+        let mut rollback_error = None;
+        let mut rollback_snapshot = None;
+        let mut abandon_after_verification = false;
+        {
+            let subtask = contract
+                .subtasks
+                .iter_mut()
+                .find(|s| s.id == subtask_id)
+                .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
+            // Store verification results for delivery report
+            subtask.last_verification = Some(report.clone());
+            if report.all_required_passed {
+                subtask.stage = SubtaskStage::Verified;
             } else {
-                subtask.stage = SubtaskStage::VerificationFailed {
-                    results: report.results.clone(),
-                };
+                subtask.retry_count += 1;
+                if subtask.retry_count >= subtask.max_retries {
+                    if let Some(snapshot) = snapshot_name.clone() {
+                        rollback_snapshot = Some(snapshot);
+                    } else {
+                        abandon_after_verification = true;
+                    }
+                } else {
+                    subtask.stage = SubtaskStage::VerificationFailed {
+                        results: report.results.clone(),
+                    };
+                }
             }
         }
+
+        if let Some(snapshot) = rollback_snapshot.as_deref() {
+            match rollback_snapshot_or_err(
+                &*self.branch_ops,
+                snapshot,
+                subtask_id,
+                "rollback failed",
+            )
+            .await
+            {
+                Ok(()) => abandon_after_verification = true,
+                Err(error) => {
+                    let subtask = contract
+                        .subtasks
+                        .iter_mut()
+                        .find(|s| s.id == subtask_id)
+                        .ok_or_else(|| {
+                            format!("subtask '{subtask_id}' disappeared during verification")
+                        })?;
+                    subtask.stage = SubtaskStage::ExecutionFailed {
+                        error: error.clone(),
+                    };
+                    rollback_error = Some(error);
+                }
+            }
+        }
+
+        if abandon_after_verification {
+            let subtask = contract
+                .subtasks
+                .iter_mut()
+                .find(|s| s.id == subtask_id)
+                .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
+            subtask.stage = SubtaskStage::Abandoned {
+                reason: format!("failed after {} attempts", subtask.retry_count),
+            };
+        }
+
+        if report.all_required_passed
+            && let Some(snapshot) = snapshot_name.as_deref()
+        {
+            warn_if_snapshot_cleanup_fails(
+                &*self.branch_ops,
+                snapshot,
+                subtask_id,
+                "snapshot cleanup",
+            )
+            .await;
+        }
         self.save_local(&contract)?;
+
+        if let Some(error) = rollback_error {
+            return Err(error);
+        }
 
         Ok(report)
     }
@@ -3553,7 +3788,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
 
         // Persist global results on contract so deliver_task() can include them
         contract.last_global_results = results.clone();
-        let _ = self.save_local(&contract);
+        self.save_local(&contract)?;
 
         Ok(results)
     }
@@ -4550,6 +4785,45 @@ mod tests {
         assert!(matches!(c.subtasks[0].stage, SubtaskStage::Verified));
     }
 
+    #[test]
+    fn snapshot_name_or_err_preserves_noop_and_surfaces_failures() {
+        assert_eq!(
+            snapshot_name_or_err(Ok(String::new()), "sub-1", "snapshot failed").unwrap(),
+            None
+        );
+        assert_eq!(
+            snapshot_name_or_err(Ok("snap-1".into()), "sub-1", "snapshot failed").unwrap(),
+            Some("snap-1".into())
+        );
+        assert_eq!(
+            snapshot_name_or_err(Err("disk full".into()), "sub-1", "snapshot failed").unwrap_err(),
+            "snapshot failed for sub-1: disk full"
+        );
+    }
+
+    #[test]
+    fn diff_summary_or_err_surfaces_failures() {
+        let diff = DiffSummary {
+            snapshot: "snap-1".into(),
+            changed_rows: 3,
+        };
+        assert_eq!(
+            diff_summary_or_err(Ok(diff.clone()), "sub-1", "diff capture failed")
+                .unwrap()
+                .changed_rows,
+            3
+        );
+        assert_eq!(
+            diff_summary_or_err(
+                Err("git unavailable".into()),
+                "sub-1",
+                "diff capture failed"
+            )
+            .unwrap_err(),
+            "diff capture failed for sub-1: git unavailable"
+        );
+    }
+
     #[tokio::test]
     async fn local_lifecycle_fail_subtask() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4575,6 +4849,57 @@ mod tests {
             c.subtasks[0].stage,
             SubtaskStage::ExecutionFailed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn local_lifecycle_begin_subtask_fails_closed_when_snapshot_creation_fails() {
+        struct FailingSnapshotOps;
+
+        #[async_trait::async_trait]
+        impl TaskBranchOps for FailingSnapshotOps {
+            async fn create_snapshot(&self, _: &str, _: &str, _: u32) -> Result<String, String> {
+                Err("disk full".into())
+            }
+
+            async fn diff_since_snapshot(&self, _: &str) -> Result<DiffSummary, String> {
+                Err("stub".into())
+            }
+
+            async fn rollback_to_snapshot(&self, _: &str) -> Result<(), String> {
+                Err("stub".into())
+            }
+
+            async fn cleanup_snapshot(&self, _: &str) -> Result<(), String> {
+                Err("stub".into())
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalDurableTaskLifecycle::with_branch_ops(
+            tmp.path().join("data"),
+            Arc::new(FailingSnapshotOps),
+            tmp.path().join("work"),
+        );
+
+        let plan = make_test_plan();
+        let contract = svc
+            .create_contract("u", "s", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let err = svc
+            .begin_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap_err();
+        assert!(err.contains("local snapshot failed for sub-1: disk full"));
+
+        let persisted = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(persisted.subtasks[0].stage, SubtaskStage::Pending));
+        assert!(persisted.subtasks[0].snapshot_name.is_none());
     }
 
     #[tokio::test]
@@ -4722,6 +5047,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_lifecycle_verify_global_fails_when_results_cannot_persist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let contracts_dir = data_dir.join("contracts");
+        let work_dir = tmp.path().join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let svc = LocalDurableTaskLifecycle::new(data_dir.clone(), work_dir);
+
+        let plan = make_test_plan();
+        let contract = svc
+            .create_contract("u", "s", "global verify", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+        svc.begin_subtask(&contract.task_id, "sub-2").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-2")
+            .await
+            .unwrap();
+
+        let mut persisted = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        persisted.global_verification = vec![VerificationCriterion {
+            id: "slow-command".into(),
+            description: "sleep briefly".into(),
+            verifier: VerifierKind::Command {
+                cmd: "sleep 0.2".into(),
+                expected_exit: 0,
+            },
+            required: true,
+            timeout_sec: 5,
+            global_only: true,
+        }];
+        svc.amend_contract(
+            &persisted.contract_id,
+            ContractAmendment {
+                reason: "inject global verifier".into(),
+                updated_subtasks: None,
+                updated_global_verification: Some(persisted.global_verification.clone()),
+                updated_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let contracts_backup = tmp.path().join("contracts-backup");
+        let sabotage_dir = contracts_dir.clone();
+        let sabotage_backup = contracts_backup.clone();
+        let sabotage = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            std::fs::rename(&sabotage_dir, &sabotage_backup).unwrap();
+            std::fs::write(&sabotage_dir, "not a directory").unwrap();
+        });
+
+        let err = svc.verify_global(&contract.task_id).await.unwrap_err();
+        sabotage.await.unwrap();
+        assert!(
+            err.contains("mkdir contracts") || err.contains("write:") || err.contains("rename:"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(&contracts_dir).unwrap();
+        std::fs::rename(&contracts_backup, &contracts_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_lifecycle_resume() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
@@ -4791,6 +5188,20 @@ mod tests {
         fn failing_snapshot() -> Self {
             Self {
                 fail_snapshot: true,
+                ..Self::new()
+            }
+        }
+
+        fn failing_diff() -> Self {
+            Self {
+                fail_diff: true,
+                ..Self::new()
+            }
+        }
+
+        fn failing_rollback() -> Self {
+            Self {
+                fail_rollback: true,
                 ..Self::new()
             }
         }
@@ -4923,7 +5334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git4data_snapshot_failure_is_nonfatal() {
+    async fn git4data_snapshot_failure_fails_closed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mock = Arc::new(MockBranchOps::failing_snapshot());
         let svc = make_local_svc_with_mock(&tmp, mock);
@@ -4934,17 +5345,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Should succeed even though snapshot fails
-        let ctx = svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
-        assert!(ctx.snapshot_name.is_none());
+        let err = svc
+            .begin_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap_err();
+        assert!(err.contains("local snapshot failed for sub-1: mock snapshot failure"));
 
-        // subtask still transitions to Executing
+        // subtask must remain restartable; no half-applied Executing state
         let c = svc
             .get_contract(&contract.contract_id)
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(c.subtasks[0].stage, SubtaskStage::Executing));
+        assert!(matches!(c.subtasks[0].stage, SubtaskStage::Pending));
+        assert!(c.subtasks[0].snapshot_name.is_none());
     }
 
     #[tokio::test]
@@ -4976,6 +5390,44 @@ mod tests {
             .unwrap();
         let diff = c.subtasks[0].diff_summary.as_ref().unwrap();
         assert_eq!(diff.changed_rows, 42);
+    }
+
+    #[tokio::test]
+    async fn git4data_complete_fails_closed_when_diff_capture_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockBranchOps::failing_diff());
+        let svc = make_local_svc_with_mock(&tmp, mock.clone());
+
+        let plan = make_test_plan();
+        let contract = svc
+            .create_contract("u", "s", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
+        let err = svc
+            .complete_subtask_execution(&contract.task_id, "sub-1")
+            .await
+            .unwrap_err();
+        assert!(err.contains("local diff capture failed for sub-1: mock diff failure"));
+
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            c.subtasks[0].stage,
+            SubtaskStage::ExecutionFailed { .. }
+        ));
+        assert!(c.subtasks[0].diff_summary.is_none());
+        match &c.subtasks[0].stage {
+            SubtaskStage::ExecutionFailed { error } => {
+                assert!(error.contains("local diff capture failed for sub-1: mock diff failure"));
+            }
+            other => panic!("unexpected stage: {other:?}"),
+        }
+        assert_eq!(mock.log().diffs_requested.len(), 0);
     }
 
     #[tokio::test]
@@ -5142,6 +5594,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git4data_verify_fails_closed_when_rollback_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mock = Arc::new(MockBranchOps::failing_rollback());
+        let svc =
+            LocalDurableTaskLifecycle::with_branch_ops(tmp.path().join("data"), mock.clone(), work);
+
+        let mut plan = make_test_plan();
+        plan.subtasks.truncate(1);
+        let contract = svc
+            .create_contract("u", "s", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let mut c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        c.subtasks[0].criteria = vec![VerificationCriterion {
+            id: "missing".into(),
+            description: "nonexistent file".into(),
+            verifier: VerifierKind::FileExists {
+                paths: vec!["does_not_exist.txt".into()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+        c.subtasks[0].max_retries = 1;
+        svc.amend_contract(
+            &contract.contract_id,
+            ContractAmendment {
+                reason: "add criteria".into(),
+                updated_subtasks: Some(c.subtasks),
+                updated_global_verification: None,
+                updated_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+
+        let err = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap_err();
+        assert!(err.contains("rollback failed for sub-1: mock rollback failure"));
+
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.subtasks[0].retry_count, 1);
+        assert!(c.subtasks[0].last_verification.is_some());
+        match &c.subtasks[0].stage {
+            SubtaskStage::ExecutionFailed { error } => {
+                assert!(error.contains("rollback failed for sub-1: mock rollback failure"));
+            }
+            other => panic!("unexpected stage: {other:?}"),
+        }
+
+        let log = mock.log();
+        assert_eq!(log.rollbacks.len(), 0);
+        assert_eq!(log.cleanups.len(), 0);
+    }
+
+    #[tokio::test]
     async fn git4data_diff_summary_in_subtask_serde() {
         let subtask = DurableSubtask {
             id: "s1".into(),
@@ -5244,6 +5771,58 @@ mod tests {
 
         ops.cleanup_snapshot(&name).await.unwrap();
         assert!(!snaps.join(&name).exists());
+    }
+
+    #[tokio::test]
+    async fn local_file_branch_ops_snapshot_excludes_internal_state_root_inside_workdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        let session = work.join("session");
+        let snaps = session.join("snapshots");
+        let contracts = session.join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::create_dir_all(&snaps).unwrap();
+        std::fs::write(work.join("file1.txt"), "original").unwrap();
+        std::fs::write(contracts.join("contract.json"), "{}").unwrap();
+
+        let ops = LocalFileBranchOps::new(snaps.clone(), work.clone());
+        let name = ops.create_snapshot("t1", "s1", 1).await.unwrap();
+        let snap_root = snaps.join(&name);
+
+        assert!(snap_root.join("file1.txt").exists());
+        assert!(
+            !snap_root.join("session").exists(),
+            "internal session state should be excluded from snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_file_branch_ops_rollback_preserves_internal_state_root_inside_workdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        let session = work.join("session");
+        let snaps = session.join("snapshots");
+        let contracts = session.join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::create_dir_all(&snaps).unwrap();
+        std::fs::write(work.join("file1.txt"), "original").unwrap();
+        std::fs::write(contracts.join("contract.json"), "v1").unwrap();
+
+        let ops = LocalFileBranchOps::new(snaps, work.clone());
+        let name = ops.create_snapshot("t1", "s1", 1).await.unwrap();
+
+        std::fs::write(work.join("file1.txt"), "damaged").unwrap();
+        std::fs::write(contracts.join("contract.json"), "v2").unwrap();
+
+        ops.rollback_to_snapshot(&name).await.unwrap();
+
+        let app_content = std::fs::read_to_string(work.join("file1.txt")).unwrap();
+        assert_eq!(app_content, "original");
+        let contract_content = std::fs::read_to_string(contracts.join("contract.json")).unwrap();
+        assert_eq!(
+            contract_content, "v2",
+            "rollback should preserve internal durable session state"
+        );
     }
 
     #[tokio::test]
@@ -6318,7 +6897,7 @@ Time:        3.456 s
         std::fs::write(src.join("lib/util.py"), "x=1").unwrap();
 
         let dst = tmp.join("snapshot");
-        copy_dir_recursive(&src, &dst).unwrap();
+        copy_dir_recursive_excluding(&src, &dst, &[]).unwrap();
 
         // Source files ARE copied
         assert!(dst.join("main.py").exists());

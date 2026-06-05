@@ -28,7 +28,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::task_mgmt::{
-    InMemoryTaskStore, SessionSubtask, SessionTask, TaskMutation, TaskStore, prefix_summary,
+    InMemoryTaskStore, SESSION_TASK_STATUS_ARCHIVED, SESSION_TASK_STATUS_CANCELLED,
+    SESSION_TASK_STATUS_COMPLETED, SESSION_TASK_STATUS_FAILED, SESSION_TASK_STATUS_IN_PROGRESS,
+    SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
+    TaskStore, prefix_summary, session_task_can_be_archived, session_task_status_kind,
 };
 
 /// Soft cap on the number of rows a single `session_todos` full-replace
@@ -99,8 +102,9 @@ async fn insert_session_tasks(
             tasks[start..end].iter().enumerate(),
             |mut row, (offset, task)| {
                 let encoded = encode_task_json_fields(task);
-                let archived_at =
-                    (task.status == "archived").then(|| to_mo_datetime(&task.updated_at));
+                let archived_at = (session_task_status_kind(&task.status)
+                    == SessionTaskStatusKind::Archived)
+                    .then(|| to_mo_datetime(&task.updated_at));
                 row.push_bind(session_id)
                     .push_bind(&task.id)
                     .push_bind(user_id)
@@ -319,10 +323,12 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
-             WHERE session_id = ? AND status IN ('pending', 'in_progress') \
+             WHERE session_id = ? AND status IN (?, ?) \
              ORDER BY ordinal ASC",
         )
         .bind(session_id)
+        .bind(SESSION_TASK_STATUS_PENDING)
+        .bind(SESSION_TASK_STATUS_IN_PROGRESS)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -373,7 +379,7 @@ impl TaskStore for MatrixOneTaskStore {
                     .to_string(),
                 ));
             };
-            if status == "archived" {
+            if session_task_status_kind(&status) == SessionTaskStatusKind::Archived {
                 return Ok(prefix_summary(
                     format!("Refused: task #{task_id} is already archived"),
                     json!({
@@ -386,7 +392,7 @@ impl TaskStore for MatrixOneTaskStore {
                     .to_string(),
                 ));
             }
-            if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            if !session_task_can_be_archived(&status) {
                 return Ok(prefix_summary(
                     format!(
                         "Refused: task #{task_id} is '{status}' — only completed, failed, or cancelled tasks can be archived"
@@ -408,24 +414,32 @@ impl TaskStore for MatrixOneTaskStore {
             let result = if self.user_id.is_empty() {
                 sqlx::query(
                     "UPDATE session_todos \
-                     SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                     SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
                      WHERE session_id = ? AND todo_id = ? \
-                       AND status IN ('completed', 'failed', 'cancelled')",
+                       AND status IN (?, ?, ?)",
                 )
+                .bind(SESSION_TASK_STATUS_ARCHIVED)
                 .bind(session_id)
                 .bind(task_id)
+                .bind(SESSION_TASK_STATUS_COMPLETED)
+                .bind(SESSION_TASK_STATUS_FAILED)
+                .bind(SESSION_TASK_STATUS_CANCELLED)
                 .execute(&self.pool)
                 .await
             } else {
                 sqlx::query(
                     "UPDATE session_todos \
-                     SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                     SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
                      WHERE user_id = ? AND session_id = ? AND todo_id = ? \
-                       AND status IN ('completed', 'failed', 'cancelled')",
+                       AND status IN (?, ?, ?)",
                 )
+                .bind(SESSION_TASK_STATUS_ARCHIVED)
                 .bind(&self.user_id)
                 .bind(session_id)
                 .bind(task_id)
+                .bind(SESSION_TASK_STATUS_COMPLETED)
+                .bind(SESSION_TASK_STATUS_FAILED)
+                .bind(SESSION_TASK_STATUS_CANCELLED)
                 .execute(&self.pool)
                 .await
             }
@@ -456,7 +470,7 @@ impl TaskStore for MatrixOneTaskStore {
                     "task_id": task_id,
                     "session_id": session_id,
                     "previous_status": status,
-                    "status": "archived",
+                    "status": SESSION_TASK_STATUS_ARCHIVED,
                     "message": format!("Task '{}' archived", task_id),
                 })
                 .to_string(),
@@ -472,22 +486,26 @@ impl TaskStore for MatrixOneTaskStore {
         let result = if self.user_id.is_empty() {
             sqlx::query(
                 "UPDATE session_todos \
-                 SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE session_id = ? AND status = 'completed' \
+                 SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
+                 WHERE session_id = ? AND status = ? \
                    AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
+            .bind(SESSION_TASK_STATUS_ARCHIVED)
             .bind(session_id)
+            .bind(SESSION_TASK_STATUS_COMPLETED)
             .bind(days)
             .execute(&self.pool)
             .await
         } else {
             sqlx::query(
                 "UPDATE session_todos \
-                 SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE user_id = ? AND status = 'completed' \
+                 SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
+                 WHERE user_id = ? AND status = ? \
                    AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
+            .bind(SESSION_TASK_STATUS_ARCHIVED)
             .bind(&self.user_id)
+            .bind(SESSION_TASK_STATUS_COMPLETED)
             .bind(days)
             .execute(&self.pool)
             .await

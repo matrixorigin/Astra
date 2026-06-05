@@ -52,8 +52,10 @@ impl std::fmt::Debug for DurableTaskState {
 
 /// Generate a [`TaskContract`] from a plan and persist it via the lifecycle.
 ///
-/// Returns `None` (with a warning) if generation or persistence fails —
-/// plan execution proceeds without contract-backed verification.
+/// Returns `None` (with a warning) unless the full durable contract activation
+/// succeeds end to end: generation, persistence, and criteria injection.
+/// Plan execution then proceeds without contract-backed verification instead of
+/// pretending a half-persisted contract is usable.
 pub async fn generate_contract(
     lifecycle: &Arc<dyn DurableTaskLifecycle>,
     plan: &astra_services::task_orchestrator::TaskPlan,
@@ -105,8 +107,7 @@ pub async fn generate_contract(
                 }
                 Err(e) => {
                     eprintln!("  {}  Criteria injection failed: {}", theme::icon_warn(), e,);
-                    display_contract_summary(&persisted);
-                    Some(persisted)
+                    None
                 }
             }
         }
@@ -116,9 +117,7 @@ pub async fn generate_contract(
                 theme::icon_warn(),
                 e
             );
-            // Return the in-memory contract anyway so verification still works
-            display_contract_summary(&contract);
-            Some(contract)
+            None
         }
     }
 }
@@ -152,20 +151,49 @@ pub fn subtask_retries_exhausted(durable: &DurableTaskState, subtask_id: &str) -
         .unwrap_or(false)
 }
 
-/// Extract the latest verification results for a subtask as a JSON value
 /// Call when a subtask transitions Pending → Executing (snapshot).
-pub async fn on_subtask_begin(durable: &DurableTaskState, subtask_id: &str) {
-    if let Err(e) = durable
+///
+/// Returns an error if durable execution could not be started. Callers must not
+/// proceed with the subtask turn after this fails, or they would mutate the
+/// workspace without a durable snapshot / execution boundary.
+pub async fn on_subtask_begin(
+    durable: &mut DurableTaskState,
+    subtask_id: &str,
+) -> Result<(), String> {
+    match durable
         .lifecycle
         .begin_subtask(&durable.contract.task_id, subtask_id)
         .await
     {
-        eprintln!(
-            "  {}  Snapshot skipped for {}: {}",
-            theme::icon_warn(),
-            subtask_id,
-            e,
-        );
+        Ok(ctx) => {
+            if let Some(sub) = durable
+                .contract
+                .subtasks
+                .iter_mut()
+                .find(|s| s.id == subtask_id)
+            {
+                sub.stage = SubtaskStage::Executing;
+                sub.snapshot_name = ctx.snapshot_name;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "  {}  Durable start failed for {}: {}",
+                theme::icon_warn(),
+                subtask_id,
+                e,
+            );
+            if let Some(sub) = durable
+                .contract
+                .subtasks
+                .iter_mut()
+                .find(|s| s.id == subtask_id)
+            {
+                sub.stage = SubtaskStage::ExecutionFailed { error: e.clone() };
+            }
+            Err(e)
+        }
     }
 }
 
@@ -191,6 +219,15 @@ pub async fn on_subtask_complete(
             subtask_id,
             e,
         );
+        if let Some(sub) = durable
+            .contract
+            .subtasks
+            .iter_mut()
+            .find(|s| s.id == subtask_id)
+        {
+            sub.stage = SubtaskStage::ExecutionFailed { error: e };
+        }
+        return (false, None);
     }
 
     // 2. Decide whether we must run `lifecycle.verify_subtask`.
@@ -262,6 +299,14 @@ pub async fn on_subtask_complete(
                 subtask_id,
                 e,
             );
+            if let Some(sub) = durable
+                .contract
+                .subtasks
+                .iter_mut()
+                .find(|s| s.id == subtask_id)
+            {
+                sub.stage = SubtaskStage::ExecutionFailed { error: e };
+            }
             (false, None)
         }
     }
@@ -339,8 +384,12 @@ pub fn display_verification_report(report: &SubtaskVerificationReport) {
 // ─── Global verification + delivery ─────────────────────────────────────────
 
 /// Run global verification (build/test/lint) after all subtasks complete.
-/// Returns `true` if all required global checks pass.
-pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
+///
+/// Returns:
+/// - `Ok(true)` when global checks pass and delivery succeeds
+/// - `Ok(false)` when verification ran and at least one required global check failed
+/// - `Err(...)` when durable orchestration itself failed (verification/delivery persistence)
+pub async fn on_plan_complete(durable: &mut DurableTaskState) -> Result<bool, String> {
     let task_id = durable.contract.task_id.clone();
 
     eprintln!(
@@ -424,15 +473,18 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
                         save_delivery_report_json(&report);
                         durable.last_report = Some(report);
                     }
-                    Err(e) => eprintln!("  {}  Delivery report failed: {}", theme::icon_warn(), e,),
+                    Err(e) => {
+                        eprintln!("  {}  Delivery report failed: {}", theme::icon_warn(), e,);
+                        return Err(format!("delivery report failed: {e}"));
+                    }
                 }
             }
 
-            all_passed
+            Ok(all_passed)
         }
         Err(e) => {
             eprintln!("  {}  Global verification error: {}", theme::icon_warn(), e,);
-            false
+            Err(format!("global verification failed: {e}"))
         }
     }
 }
@@ -683,9 +735,9 @@ pub fn create_local_lifecycle_full(
     cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
     server_proxy_judge: Option<Arc<dyn astra_services::LlmJudge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
-    let contracts_dir = session_dir.join("contracts");
-    let _ = std::fs::create_dir_all(&contracts_dir);
-    let mut lifecycle = LocalDurableTaskLifecycle::new(contracts_dir, work_dir.to_path_buf());
+    let _ = std::fs::create_dir_all(session_dir);
+    let mut lifecycle =
+        LocalDurableTaskLifecycle::new(session_dir.to_path_buf(), work_dir.to_path_buf());
 
     // Wire up LLM judge (priority: cloud > server proxy)
     if let Some(judge) = cloud_judge {
@@ -824,9 +876,13 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
 mod tests {
     use super::*;
     use astra_services::durable_task::VerifierKind;
+    use astra_services::durable_task::{
+        ContractStatus, DurableSubtask, SubtaskExecutionContext, SubtaskStage,
+    };
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     use astra_services::{
-        LlmJudge, SubtaskDeliverySummary, TaskScope, VerificationCriterion, VerificationResult,
+        ContractAmendment, LlmJudge, SubtaskDeliverySummary, SubtaskVerificationReport,
+        TaskResumeContext, TaskScope, VerificationCriterion, VerificationResult,
     };
 
     fn make_test_plan() -> TaskPlan {
@@ -862,6 +918,144 @@ mod tests {
         }
     }
 
+    fn persisted_contract_skeleton() -> astra_services::TaskContract {
+        astra_services::TaskContract {
+            contract_id: "contract-1".into(),
+            task_id: "task-1".into(),
+            goal: "Build foo".into(),
+            scope: TaskScope::default(),
+            subtasks: vec![DurableSubtask {
+                id: "s1".into(),
+                title: "Create module".into(),
+                description: Some("Create the foo module".into()),
+                criteria: vec![],
+                ..Default::default()
+            }],
+            global_verification: vec![],
+            version: 1,
+            status: ContractStatus::Draft,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            domain_hint: None,
+            task_type: None,
+            last_global_results: vec![],
+        }
+    }
+
+    struct StubDurableLifecycle {
+        persisted_contract: astra_services::TaskContract,
+        create_error: Option<String>,
+        amend_error: Option<String>,
+        amend_calls: std::sync::Mutex<usize>,
+    }
+
+    impl StubDurableLifecycle {
+        fn new(create_error: Option<&str>, amend_error: Option<&str>) -> Self {
+            Self {
+                persisted_contract: persisted_contract_skeleton(),
+                create_error: create_error.map(str::to_string),
+                amend_error: amend_error.map(str::to_string),
+                amend_calls: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn amend_calls(&self) -> usize {
+            *self.amend_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DurableTaskLifecycle for StubDurableLifecycle {
+        async fn create_contract(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &TaskPlan,
+            _: TaskScope,
+        ) -> Result<astra_services::TaskContract, String> {
+            match &self.create_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.persisted_contract.clone()),
+            }
+        }
+
+        async fn amend_contract(
+            &self,
+            _: &str,
+            amendment: ContractAmendment,
+        ) -> Result<astra_services::TaskContract, String> {
+            *self.amend_calls.lock().unwrap() += 1;
+            if let Some(error) = &self.amend_error {
+                return Err(error.clone());
+            }
+
+            let mut amended = self.persisted_contract.clone();
+            if let Some(subtasks) = amendment.updated_subtasks {
+                amended.subtasks = subtasks;
+            }
+            if let Some(global) = amendment.updated_global_verification {
+                amended.global_verification = global;
+            }
+            if let Some(scope) = amendment.updated_scope {
+                amended.scope = scope;
+            }
+            amended.version += 1;
+            Ok(amended)
+        }
+
+        async fn get_contract(
+            &self,
+            _: &str,
+        ) -> Result<Option<astra_services::TaskContract>, String> {
+            Ok(None)
+        }
+
+        async fn begin_subtask(&self, _: &str, _: &str) -> Result<SubtaskExecutionContext, String> {
+            Err("stub".into())
+        }
+
+        async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("stub".into())
+        }
+
+        async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Err("stub".into())
+        }
+
+        async fn verify_subtask(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<SubtaskVerificationReport, String> {
+            Err("stub".into())
+        }
+
+        async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+            Err("stub".into())
+        }
+
+        async fn pause_task(&self, _: &str) -> Result<(), String> {
+            Err("stub".into())
+        }
+
+        async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+            Err("stub".into())
+        }
+
+        async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+            Err("stub".into())
+        }
+
+        async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+            Err("stub".into())
+        }
+
+        async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("stub".into())
+        }
+    }
+
     #[test]
     fn contract_summary_display_does_not_panic() {
         let plan = make_test_plan();
@@ -871,6 +1065,382 @@ mod tests {
 
         // Just verify it doesn't panic
         display_contract_summary(&contract);
+    }
+
+    #[tokio::test]
+    async fn generate_contract_returns_none_when_create_contract_fails() {
+        let lifecycle = Arc::new(StubDurableLifecycle::new(Some("persist failed"), None));
+        let tmp = tempfile::tempdir().unwrap();
+
+        let contract = generate_contract(
+            &(lifecycle.clone() as Arc<dyn DurableTaskLifecycle>),
+            &make_test_plan(),
+            "Build foo",
+            "user",
+            "session",
+            tmp.path(),
+        )
+        .await;
+
+        assert!(contract.is_none());
+        assert_eq!(lifecycle.amend_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn generate_contract_returns_none_when_criteria_injection_fails() {
+        let lifecycle = Arc::new(StubDurableLifecycle::new(None, Some("amend failed")));
+        let tmp = tempfile::tempdir().unwrap();
+
+        let contract = generate_contract(
+            &(lifecycle.clone() as Arc<dyn DurableTaskLifecycle>),
+            &make_test_plan(),
+            "Build foo",
+            "user",
+            "session",
+            tmp.path(),
+        )
+        .await;
+
+        assert!(contract.is_none());
+        assert_eq!(lifecycle.amend_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn on_subtask_complete_stops_before_verify_when_diff_capture_fails() {
+        struct CountingLifecycle {
+            verify_calls: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl DurableTaskLifecycle for CountingLifecycle {
+            async fn create_contract(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &TaskPlan,
+                _: TaskScope,
+            ) -> Result<astra_services::TaskContract, String> {
+                Err("unused".into())
+            }
+
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: ContractAmendment,
+            ) -> Result<astra_services::TaskContract, String> {
+                Err("unused".into())
+            }
+
+            async fn get_contract(
+                &self,
+                _: &str,
+            ) -> Result<Option<astra_services::TaskContract>, String> {
+                Err("unused".into())
+            }
+
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskExecutionContext, String> {
+                Err("unused".into())
+            }
+
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("diff capture failed".into())
+            }
+
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                *self.verify_calls.lock().unwrap() += 1;
+                Ok(SubtaskVerificationReport {
+                    subtask_id: "s1".into(),
+                    results: vec![],
+                    all_required_passed: true,
+                    timestamp: String::new(),
+                })
+            }
+
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Err("unused".into())
+            }
+
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+                Err("unused".into())
+            }
+
+            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+                Err("unused".into())
+            }
+
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("unused".into())
+            }
+
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+        }
+
+        let lifecycle = Arc::new(CountingLifecycle {
+            verify_calls: std::sync::Mutex::new(0),
+        });
+        let mut contract = persisted_contract_skeleton();
+        contract.subtasks[0].criteria = vec![VerificationCriterion {
+            id: "must-run".into(),
+            description: "verify".into(),
+            verifier: VerifierKind::FileExists {
+                paths: vec!["x".into()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+        contract.subtasks[0].stage = SubtaskStage::Executing;
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle: lifecycle.clone(),
+            last_report: None,
+        };
+
+        let (passed, report) = on_subtask_complete(&mut durable, "s1").await;
+
+        assert!(!passed);
+        assert!(report.is_none());
+        assert_eq!(*lifecycle.verify_calls.lock().unwrap(), 0);
+        assert!(matches!(
+            durable.contract.subtasks[0].stage,
+            SubtaskStage::ExecutionFailed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn on_subtask_begin_returns_err_and_marks_execution_failed() {
+        struct BeginFailLifecycle;
+
+        #[async_trait::async_trait]
+        impl DurableTaskLifecycle for BeginFailLifecycle {
+            async fn create_contract(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &TaskPlan,
+                _: TaskScope,
+            ) -> Result<astra_services::TaskContract, String> {
+                Err("unused".into())
+            }
+
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: ContractAmendment,
+            ) -> Result<astra_services::TaskContract, String> {
+                Err("unused".into())
+            }
+
+            async fn get_contract(
+                &self,
+                _: &str,
+            ) -> Result<Option<astra_services::TaskContract>, String> {
+                Err("unused".into())
+            }
+
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskExecutionContext, String> {
+                Err("snapshot unavailable".into())
+            }
+
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                Err("unused".into())
+            }
+
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Err("unused".into())
+            }
+
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+                Err("unused".into())
+            }
+
+            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+                Err("unused".into())
+            }
+
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("unused".into())
+            }
+
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+        }
+
+        let mut durable = DurableTaskState {
+            contract: persisted_contract_skeleton(),
+            lifecycle: Arc::new(BeginFailLifecycle),
+            last_report: None,
+        };
+
+        let err = on_subtask_begin(&mut durable, "s1").await.unwrap_err();
+        assert_eq!(err, "snapshot unavailable");
+        match &durable.contract.subtasks[0].stage {
+            SubtaskStage::ExecutionFailed { error } => {
+                assert_eq!(error, "snapshot unavailable");
+            }
+            other => panic!("unexpected stage: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_plan_complete_returns_err_when_delivery_fails() {
+        struct DeliveryFailLifecycle;
+
+        #[async_trait::async_trait]
+        impl DurableTaskLifecycle for DeliveryFailLifecycle {
+            async fn create_contract(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &TaskPlan,
+                _: TaskScope,
+            ) -> Result<astra_services::TaskContract, String> {
+                Err("unused".into())
+            }
+
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: ContractAmendment,
+            ) -> Result<astra_services::TaskContract, String> {
+                Err("unused".into())
+            }
+
+            async fn get_contract(
+                &self,
+                _: &str,
+            ) -> Result<Option<astra_services::TaskContract>, String> {
+                Err("unused".into())
+            }
+
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskExecutionContext, String> {
+                Err("unused".into())
+            }
+
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                Err("unused".into())
+            }
+
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Ok(vec![])
+            }
+
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+
+            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+                Err("unused".into())
+            }
+
+            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+                Err("persist failed".into())
+            }
+
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("unused".into())
+            }
+
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+        }
+
+        let mut durable = DurableTaskState {
+            contract: persisted_contract_skeleton(),
+            lifecycle: Arc::new(DeliveryFailLifecycle),
+            last_report: None,
+        };
+
+        let err = on_plan_complete(&mut durable).await.unwrap_err();
+        assert_eq!(err, "delivery report failed: persist failed");
+        assert!(durable.last_report.is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_contract_returns_amended_contract_when_activation_succeeds() {
+        let lifecycle = Arc::new(StubDurableLifecycle::new(None, None));
+        let tmp = tempfile::tempdir().unwrap();
+
+        let contract = generate_contract(
+            &(lifecycle.clone() as Arc<dyn DurableTaskLifecycle>),
+            &make_test_plan(),
+            "Build foo",
+            "user",
+            "session",
+            tmp.path(),
+        )
+        .await
+        .expect("durable contract should activate");
+
+        assert_eq!(lifecycle.amend_calls(), 1);
+        assert_eq!(contract.subtasks.len(), 2);
+        assert!(
+            contract
+                .subtasks
+                .iter()
+                .all(|subtask| !subtask.criteria.is_empty()),
+            "generated acceptance criteria should survive activation"
+        );
     }
 
     #[test]
@@ -931,6 +1501,18 @@ mod tests {
 
         assert!(!contract.contract_id.is_empty());
         assert_eq!(contract.subtasks.len(), 2);
+        assert!(session_dir.join("contracts").exists());
+        assert!(
+            session_dir
+                .join("contracts")
+                .join(format!("{}.json", contract.contract_id))
+                .exists(),
+            "contract should be persisted directly under session/contracts"
+        );
+        assert!(
+            !session_dir.join("contracts").join("contracts").exists(),
+            "local durable data root should not nest contracts/contracts"
+        );
     }
 
     #[test]
@@ -1036,6 +1618,7 @@ mod tests {
             last_report: None,
         };
 
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Verification should pass — calculator.py exists");
         assert!(
@@ -1088,6 +1671,7 @@ mod tests {
         };
 
         // File doesn't exist → verification should fail
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(!passed, "Verification should FAIL — output.py is missing");
         assert_eq!(durable.contract.subtasks[0].retry_count, 1);
@@ -1177,7 +1761,7 @@ mod tests {
             last_report: None,
         };
 
-        on_subtask_begin(&durable, "s1").await;
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "GrepCheck should pass — 'import jwt' is in auth.py");
     }
@@ -1256,7 +1840,7 @@ mod tests {
             last_report: None,
         };
 
-        on_subtask_begin(&durable, "s1").await;
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(
             !passed,
@@ -1329,7 +1913,7 @@ mod tests {
             last_report: None,
         };
 
-        on_subtask_begin(&durable, "s1").await;
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Command 'true' should exit 0 → pass");
     }
@@ -1399,7 +1983,7 @@ mod tests {
             last_report: None,
         };
 
-        on_subtask_begin(&durable, "s1").await;
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(!passed, "Command 'false' exits 1 → should fail");
     }
@@ -1475,7 +2059,7 @@ mod tests {
             last_report: None,
         };
 
-        on_subtask_begin(&durable, "s1").await;
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         // pytest available: should pass and set stage to Verified
         // pytest not available: verification error → treated as pass (non-blocking),
@@ -1558,7 +2142,7 @@ mod tests {
         }
 
         // Run global verification — should pass (files exist)
-        let global_passed = on_plan_complete(&mut durable).await;
+        let global_passed = on_plan_complete(&mut durable).await.unwrap();
         assert!(
             global_passed,
             "Global verification should pass — both files exist"
@@ -1611,12 +2195,13 @@ mod tests {
         };
 
         // First failure
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         if !passed {
             assert_eq!(durable.contract.subtasks[0].retry_count, 1);
 
             // Second failure
-            durable.contract.subtasks[0].stage = SubtaskStage::Executing;
+            on_subtask_begin(&mut durable, "s1").await.unwrap();
             let (passed2, _report2) = on_subtask_complete(&mut durable, "s1").await;
             assert!(!passed2);
             assert_eq!(durable.contract.subtasks[0].retry_count, 2);
@@ -1705,7 +2290,7 @@ mod tests {
         // Without an LLM judge configured, verify_subtask will fail or error,
         // but the key assertion is that it was *called* (stage changes from
         // AwaitingVerification to either Verified or VerificationFailed).
-        on_subtask_begin(&durable, "s1").await;
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (_passed, _report) = on_subtask_complete(&mut durable, "s1").await;
 
         // Stage must NOT be AwaitingVerification — that would mean verify_subtask
@@ -1757,6 +2342,7 @@ mod tests {
             last_report: None,
         };
 
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Zero criteria should return true immediately");
     }
@@ -1971,6 +2557,7 @@ mod tests {
             lifecycle,
             last_report: None,
         };
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _) = on_subtask_complete(&mut durable, "s1").await;
 
         assert!(passed, "Judge score 0.9 > 0.7 threshold → should pass");
@@ -2029,6 +2616,7 @@ mod tests {
             lifecycle,
             last_report: None,
         };
+        on_subtask_begin(&mut durable, "s1").await.unwrap();
         let (passed, _) = on_subtask_complete(&mut durable, "s1").await;
 
         assert!(passed, "Cloud judge 0.95 > 0.7 → should pass");

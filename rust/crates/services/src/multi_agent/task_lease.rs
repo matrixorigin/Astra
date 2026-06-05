@@ -1,8 +1,8 @@
 //! Task lease service: transactional lease-based task claiming.
 //!
-//! Uses MySQL row-locking (`SELECT ... FOR UPDATE SKIP LOCKED`) to atomically
-//! claim tasks across concurrent pods.  Includes the hold cache for
-//! lease-aware pack sync and the task pack import/export helpers.
+//! Uses transactional lease rows to atomically claim tasks across concurrent
+//! pods. Includes the hold cache for lease-aware pack sync and the task pack
+//! import/export helpers.
 //!
 //! Split from the monolithic `multi_agent.rs`.
 
@@ -13,7 +13,7 @@ use sqlx::Row;
 use super::hold_cache::TaskLeaseHoldCache;
 use super::metrics::SharedMultiAgentMetrics;
 use crate::task_orchestrator::{
-    AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskRecord,
+    AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskListItem, TaskRecord, TaskStatus,
 };
 
 /// Default maximum number of tasks to return in a pack pull.
@@ -163,8 +163,145 @@ pub enum LeaseClaimResult {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NextClaimableLeaseClaimResult {
+    Granted {
+        task_id: String,
+        lease_version: i64,
+        expires_at: String,
+    },
+    NoClaimableTasks,
+    AllClaimableTasksLeased,
+}
+
 pub(crate) fn clamp_ttl_sec(ttl_sec: i64) -> i64 {
     ttl_sec.clamp(30, 86_400)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimedTaskLease {
+    task_id: String,
+    lease_version: i64,
+    expires_at: String,
+}
+
+fn task_status_is_claimable(status: &str) -> bool {
+    TaskStatus::parse_status(status).is_claimable()
+}
+
+const CLAIMABLE_TASK_STATUS_SQL: &str = "t.status IN ('pending', 'in_progress')";
+const CLAIMABILITY_SELECT_SQL: &str = "CASE WHEN t.status = 'pending' THEN 'pending' ELSE 'recoverable_in_progress' END AS claimability";
+
+fn classify_empty_claimable_result(has_unfinished_tasks: bool) -> NextClaimableLeaseClaimResult {
+    if has_unfinished_tasks {
+        NextClaimableLeaseClaimResult::AllClaimableTasksLeased
+    } else {
+        NextClaimableLeaseClaimResult::NoClaimableTasks
+    }
+}
+
+pub(crate) async fn list_claimable_tasks_mysql(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    limit: usize,
+) -> Result<Vec<TaskListItem>, String> {
+    let sql_limit = limit.max(1);
+    let rows = sqlx::query(&format!(
+        "SELECT t.task_id, t.user_id, t.session_id, t.parent_task_id, t.title, \
+                NULL AS description, t.status, t.progress_pct, t.items_done, t.items_total, \
+                NULL AS plan_json, NULL AS checkpoint_json, t.error_message, \
+                t.user_rating, t.completion_time_sec, t.replan_count, t.auto_adjustments, \
+                t.outcome, t.project_type, t.goal_pattern, t.agent_id, \
+                {CLAIMABILITY_SELECT_SQL}, \
+                CAST(t.created_at AS CHAR) AS created_at, \
+                CAST(t.updated_at AS CHAR) AS updated_at, \
+                t.completed_at \
+         FROM agent_tasks t \
+         LEFT JOIN task_leases l \
+           ON l.task_id = t.task_id AND l.user_id = t.user_id AND l.expires_at >= NOW(6) \
+         WHERE t.user_id = ? \
+           AND {CLAIMABLE_TASK_STATUS_SQL} \
+           AND l.task_id IS NULL \
+         ORDER BY created_at ASC LIMIT {}",
+        sql_limit
+    ))
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("list_claimable_tasks_for_worker: {e}"))?;
+
+    rows.iter()
+        .map(MatrixOneTaskService::parse_mysql_list_row)
+        .collect()
+}
+
+async fn persist_granted_lease_locked(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    task_id: &str,
+    agent_id: &str,
+    edge_id: &str,
+    ttl_sec: i64,
+    has_existing_lease_row: bool,
+) -> Result<ClaimedTaskLease, String> {
+    if has_existing_lease_row {
+        sqlx::query(
+            "UPDATE task_leases SET \
+             holder_agent_id = ?, holder_edge_id = ?, \
+             expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
+             lease_version = lease_version + 1, updated_at = NOW(6) \
+             WHERE task_id = ? AND user_id = ?",
+        )
+        .bind(agent_id)
+        .bind(edge_id)
+        .bind(ttl_sec)
+        .bind(task_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("lease update: {e}"))?;
+    } else {
+        sqlx::query(
+            "INSERT INTO task_leases \
+             (task_id, user_id, holder_agent_id, holder_edge_id, expires_at, lease_version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), 1, NOW(6), NOW(6))",
+        )
+        .bind(task_id)
+        .bind(user_id)
+        .bind(agent_id)
+        .bind(edge_id)
+        .bind(ttl_sec)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("lease insert: {e}"))?;
+    }
+
+    sqlx::query("UPDATE agent_tasks SET agent_id = ?, updated_at = NOW(6) WHERE task_id = ?")
+        .bind(agent_id)
+        .bind(task_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("agent_tasks agent_id: {e}"))?;
+
+    let ver: i64 = sqlx::query_scalar("SELECT lease_version FROM task_leases WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| format!("lease version read: {e}"))?;
+
+    let exp: String =
+        sqlx::query_scalar("SELECT CAST(expires_at AS CHAR) FROM task_leases WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| format!("lease exp read: {e}"))?;
+
+    Ok(ClaimedTaskLease {
+        task_id: task_id.to_string(),
+        lease_version: ver,
+        expires_at: exp,
+    })
 }
 
 pub struct DatabaseTaskLeaseService {
@@ -204,6 +341,14 @@ impl DatabaseTaskLeaseService {
 
 #[async_trait]
 pub trait TaskLeaseService: Send + Sync {
+    async fn claim_next_claimable_lease(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        edge_id: &str,
+        ttl_sec: i64,
+    ) -> Result<NextClaimableLeaseClaimResult, String>;
+
     async fn try_claim_lease(
         &self,
         user_id: &str,
@@ -238,6 +383,83 @@ pub trait TaskLeaseService: Send + Sync {
 
 #[async_trait]
 impl TaskLeaseService for DatabaseTaskLeaseService {
+    async fn claim_next_claimable_lease(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        edge_id: &str,
+        ttl_sec: i64,
+    ) -> Result<NextClaimableLeaseClaimResult, String> {
+        let start = std::time::Instant::now();
+        let candidate_task_ids = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT t.task_id \
+             FROM agent_tasks t \
+             LEFT JOIN task_leases l \
+               ON l.task_id = t.task_id AND l.user_id = t.user_id \
+             WHERE t.user_id = ? \
+               AND {CLAIMABLE_TASK_STATUS_SQL} \
+               AND (l.task_id IS NULL OR l.expires_at < NOW(6)) \
+             ORDER BY t.created_at ASC, t.task_id ASC"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("claim_next_claimable_lease select candidates: {e}"))?;
+
+        let mut first_candidate_error = None;
+        for task_id in candidate_task_ids {
+            match self
+                .try_claim_lease(user_id, &task_id, agent_id, edge_id, ttl_sec)
+                .await
+            {
+                Ok(LeaseClaimResult::Granted {
+                    lease_version,
+                    expires_at,
+                }) => {
+                    if let Some(ref m) = self.metrics {
+                        m.lease_claim_latency.record(start.elapsed());
+                    }
+                    return Ok(NextClaimableLeaseClaimResult::Granted {
+                        task_id,
+                        lease_version,
+                        expires_at,
+                    });
+                }
+                Ok(LeaseClaimResult::Contested { .. }) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        %task_id,
+                        %error,
+                        "claim_next_claimable_lease candidate claim failed; trying next candidate"
+                    );
+                    if first_candidate_error.is_none() {
+                        first_candidate_error = Some(format!("{task_id}: {error}"));
+                    }
+                    continue;
+                }
+            }
+        }
+        let has_unfinished_tasks: Option<i8> = sqlx::query_scalar(&format!(
+            "SELECT 1 FROM agent_tasks \
+             WHERE user_id = ? AND {CLAIMABLE_TASK_STATUS_SQL} \
+             LIMIT 1"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("claim_next_pending_lease unfinished probe: {e}"))?;
+
+        if let (Some(error), Some(_)) = (first_candidate_error, has_unfinished_tasks) {
+            return Err(format!(
+                "claim_next_claimable_lease all candidates failed; first failure: {error}"
+            ));
+        }
+
+        Ok(classify_empty_claimable_result(
+            has_unfinished_tasks.is_some(),
+        ))
+    }
+
     #[tracing::instrument(skip(self), fields(
         user_id = %user_id,
         task_id = %task_id,
@@ -274,19 +496,29 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         .await
         .map_err(|e| format!("lease select: {e}"))?;
 
-        let owner: Option<String> =
-            sqlx::query_scalar("SELECT user_id FROM agent_tasks WHERE task_id = ? FOR UPDATE")
+        let task_row =
+            sqlx::query("SELECT user_id, status FROM agent_tasks WHERE task_id = ? FOR UPDATE")
                 .bind(task_id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| format!("lease task lock: {e}"))?;
 
-        let Some(owner_uid) = owner else {
+        let Some(task_row) = task_row else {
             return Err("task not found".to_string());
         };
+        let owner_uid: String = task_row
+            .try_get("user_id")
+            .map_err(|e| format!("lease task owner: {e}"))?;
         if owner_uid != user_id {
             return Err("task not owned by user".to_string());
         }
+        let task_status: String = task_row
+            .try_get("status")
+            .map_err(|e| format!("lease task status: {e}"))?;
+        if !task_status_is_claimable(&task_status) {
+            return Err(format!("task is not claimable from status '{task_status}'"));
+        }
+        let has_existing_lease_row = lease_row.is_some();
 
         if let Some(ref r) = lease_row {
             let holder: String = r.try_get("holder_agent_id").map_err(|e| e.to_string())?;
@@ -308,60 +540,16 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             }
         }
 
-        // Insert or update lease (same agent renews; expired or missing → claim)
-        if lease_row.is_some() {
-            sqlx::query(
-                "UPDATE task_leases SET \
-                 holder_agent_id = ?, holder_edge_id = ?, \
-                 expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
-                 lease_version = lease_version + 1, updated_at = NOW(6) \
-                 WHERE task_id = ? AND user_id = ?",
-            )
-            .bind(agent_id)
-            .bind(edge_id)
-            .bind(ttl)
-            .bind(task_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("lease update: {e}"))?;
-        } else {
-            sqlx::query(
-                "INSERT INTO task_leases \
-                 (task_id, user_id, holder_agent_id, holder_edge_id, expires_at, lease_version, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), 1, NOW(6), NOW(6))",
-            )
-            .bind(task_id)
-            .bind(user_id)
-            .bind(agent_id)
-            .bind(edge_id)
-            .bind(ttl)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("lease insert: {e}"))?;
-        }
-
-        sqlx::query("UPDATE agent_tasks SET agent_id = ?, updated_at = NOW(6) WHERE task_id = ?")
-            .bind(agent_id)
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("agent_tasks agent_id: {e}"))?;
-
-        let ver: i64 =
-            sqlx::query_scalar("SELECT lease_version FROM task_leases WHERE task_id = ?")
-                .bind(task_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| format!("lease version read: {e}"))?;
-
-        let exp: String = sqlx::query_scalar(
-            "SELECT CAST(expires_at AS CHAR) FROM task_leases WHERE task_id = ?",
+        let claimed = persist_granted_lease_locked(
+            &mut tx,
+            user_id,
+            task_id,
+            agent_id,
+            edge_id,
+            ttl,
+            has_existing_lease_row,
         )
-        .bind(task_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| format!("lease exp read: {e}"))?;
+        .await?;
 
         tx.commit()
             .await
@@ -374,8 +562,8 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         }
 
         Ok(LeaseClaimResult::Granted {
-            lease_version: ver,
-            expires_at: exp,
+            lease_version: claimed.lease_version,
+            expires_at: claimed.expires_at,
         })
     }
 
@@ -512,6 +700,16 @@ pub struct UnconfiguredTaskLeaseService;
 
 #[async_trait]
 impl TaskLeaseService for UnconfiguredTaskLeaseService {
+    async fn claim_next_claimable_lease(
+        &self,
+        _user_id: &str,
+        _agent_id: &str,
+        _edge_id: &str,
+        _ttl_sec: i64,
+    ) -> Result<NextClaimableLeaseClaimResult, String> {
+        Err("task lease service not configured".to_string())
+    }
+
     async fn try_claim_lease(
         &self,
         _user_id: &str,
@@ -577,6 +775,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classify_empty_claimable_result_distinguishes_empty_queue_from_leased_frontier() {
+        assert_eq!(
+            classify_empty_claimable_result(false),
+            NextClaimableLeaseClaimResult::NoClaimableTasks
+        );
+        assert_eq!(
+            classify_empty_claimable_result(true),
+            NextClaimableLeaseClaimResult::AllClaimableTasksLeased
+        );
+    }
+
+    #[test]
+    fn task_status_is_claimable_accepts_only_unfinished_worker_states() {
+        assert!(task_status_is_claimable("pending"));
+        assert!(task_status_is_claimable("in_progress"));
+        assert!(!task_status_is_claimable("paused"));
+        assert!(!task_status_is_claimable("completed"));
+        assert!(!task_status_is_claimable("failed"));
+        assert!(!task_status_is_claimable("cancelled"));
+    }
+
+    #[tokio::test]
     async fn unconfigured_edge_registry_errors() {
         let s = UnconfiguredEdgeRegistryService;
         let r = s
@@ -590,6 +810,11 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_task_lease_errors() {
         let s = UnconfiguredTaskLeaseService;
+        assert!(
+            s.claim_next_claimable_lease("u", "a", "e", 60)
+                .await
+                .is_err()
+        );
         assert!(s.try_claim_lease("u", "t", "a", "e", 60).await.is_err());
     }
 }

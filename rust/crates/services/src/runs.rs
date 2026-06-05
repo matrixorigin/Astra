@@ -1,4 +1,7 @@
-use astra_core::{ErrorResponse, SharedPool, error_response, error_response_coded};
+use astra_core::{
+    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response, error_response_coded,
+};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -456,6 +459,55 @@ pub struct DurableRunRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableRunStatusKind {
+    Running,
+    Waiting,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+    Other,
+}
+
+pub fn durable_run_status_kind(status: &str) -> DurableRunStatusKind {
+    match status {
+        STATUS_RUNNING => DurableRunStatusKind::Running,
+        STATUS_WAITING => DurableRunStatusKind::Waiting,
+        STATUS_PAUSED => DurableRunStatusKind::Paused,
+        STATUS_COMPLETED => DurableRunStatusKind::Completed,
+        STATUS_FAILED => DurableRunStatusKind::Failed,
+        STATUS_CANCELLED => DurableRunStatusKind::Cancelled,
+        _ => DurableRunStatusKind::Other,
+    }
+}
+
+pub fn durable_run_status_is_terminal(status: &str) -> bool {
+    matches!(
+        durable_run_status_kind(status),
+        DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Failed
+            | DurableRunStatusKind::Cancelled
+    )
+}
+
+pub fn durable_run_status_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
+    matches!(
+        durable_run_status_kind(status),
+        DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
+    ) || (durable_run_status_kind(status) == DurableRunStatusKind::Paused && waiting_for.is_some())
+}
+
+pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
+    match durable_run_status_kind(status) {
+        DurableRunStatusKind::Running => SubRunState::Running,
+        DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
+        DurableRunStatusKind::Completed => SubRunState::Completed,
+        DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
+        DurableRunStatusKind::Cancelled => SubRunState::Cancelled,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableRunCheckpointRecord {
     pub checkpoint_id: String,
@@ -636,10 +688,6 @@ impl Default for InMemoryRunStateStore {
     }
 }
 
-fn run_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
-    matches!(status, "running" | "waiting") || (status == "paused" && waiting_for.is_some())
-}
-
 fn run_requires_session_exclusive_start(record: &DurableRunRecord) -> bool {
     record.parent_run_id.is_none()
         && record.retry_of.is_none()
@@ -789,7 +837,7 @@ impl RunStateStore for InMemoryRunStateStore {
             && runs.values().any(|run| {
                 run.user_id == record.user_id
                     && run.session_id == record.session_id
-                    && run_blocks_session(&run.status, run.waiting_for.as_deref())
+                    && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
             })
         {
             return Err("session already has an active run".to_string());
@@ -803,10 +851,9 @@ impl RunStateStore for InMemoryRunStateStore {
         // Evict oldest completed/failed runs when over capacity
         let mut evicted_ids = Vec::new();
         if runs.len() > Self::MAX_RUNS {
-            let terminal = ["completed", "failed", "cancelled"];
             let mut evictable: Vec<_> = runs
                 .iter()
-                .filter(|(_, r)| terminal.contains(&r.status.as_str()))
+                .filter(|(_, r)| durable_run_status_is_terminal(&r.status))
                 .map(|(id, r)| (id.clone(), r.updated_at.clone()))
                 .collect();
             evictable.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1015,7 +1062,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
-            .filter(|r| r.status == "waiting")
+            .filter(|r| durable_run_status_kind(&r.status) == DurableRunStatusKind::Waiting)
             .cloned()
             .collect())
     }
@@ -1024,7 +1071,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
-            .filter(|r| r.status == "running")
+            .filter(|r| durable_run_status_kind(&r.status) == DurableRunStatusKind::Running)
             .cloned()
             .collect())
     }
@@ -1040,8 +1087,7 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|run| {
                 run.user_id == user_id
                     && run.session_id == session_id
-                    && (matches!(run.status.as_str(), "running" | "waiting")
-                        || (run.status == "paused" && run.waiting_for.is_some()))
+                    && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2215,11 +2261,11 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        self.find_runs_by_status("waiting").await
+        self.find_runs_by_status(STATUS_WAITING).await
     }
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        self.find_runs_by_status("running").await
+        self.find_runs_by_status(STATUS_RUNNING).await
     }
 
     async fn find_blocking_session_run(
@@ -2230,12 +2276,15 @@ impl RunStateStore for DatabaseRunStateStore {
         let row = sqlx::query(
             "SELECT * FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
-               AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)) \
+               AND (status IN (?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
              ORDER BY updated_at DESC \
              LIMIT 1",
         )
         .bind(user_id)
         .bind(session_id)
+        .bind(STATUS_RUNNING)
+        .bind(STATUS_WAITING)
+        .bind(STATUS_PAUSED)
         .fetch_optional(self.pool.get())
         .await
         .map_err(|source| db_error("find_blocking_session_run", session_id, source).to_string())?;
@@ -2528,6 +2577,9 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "agent_spawned",
     "agent_progress",
     "agent_completed",
+    "agent_failed",
+    "agent_cancelled",
+    "agent_interrupted",
 ];
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -2720,26 +2772,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "agent_id": data.get("agent_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "task": data.get("task").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "agent_spawned" => {
-            let mut out = serde_json::json!({ "type": "agent_spawned" });
-            if let Some(obj) = out.as_object_mut() {
-                for (k, v) in &data {
-                    obj.insert(k.clone(), v.clone());
-                }
-            }
-            out
-        }
-        "agent_progress" => {
-            let mut out = serde_json::json!({ "type": "agent_progress" });
-            if let Some(obj) = out.as_object_mut() {
-                for (k, v) in &data {
-                    obj.insert(k.clone(), v.clone());
-                }
-            }
-            out
-        }
-        "agent_completed" => {
-            let mut out = serde_json::json!({ "type": "agent_completed" });
+        "agent_spawned" | "agent_progress" | "agent_completed" | "agent_failed"
+        | "agent_cancelled" | "agent_interrupted" => {
+            let mut out = serde_json::json!({ "type": event_type });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
                     obj.insert(k.clone(), v.clone());
@@ -2900,6 +2935,99 @@ mod tests {
         let mut team_parent = durable_run_record("team-parent");
         team_parent.agent_id = Some("orchestrator".into());
         assert!(!run_requires_session_exclusive_start(&team_parent));
+    }
+
+    #[test]
+    fn durable_run_status_helpers_keep_terminal_and_blocking_semantics_distinct() {
+        assert_eq!(
+            durable_run_status_kind(STATUS_RUNNING),
+            DurableRunStatusKind::Running
+        );
+        assert_eq!(
+            durable_run_status_kind(STATUS_WAITING),
+            DurableRunStatusKind::Waiting
+        );
+        assert_eq!(
+            durable_run_status_kind(STATUS_PAUSED),
+            DurableRunStatusKind::Paused
+        );
+        assert_eq!(
+            durable_run_status_kind(STATUS_COMPLETED),
+            DurableRunStatusKind::Completed
+        );
+        assert_eq!(
+            durable_run_status_kind(STATUS_FAILED),
+            DurableRunStatusKind::Failed
+        );
+        assert_eq!(
+            durable_run_status_kind(STATUS_CANCELLED),
+            DurableRunStatusKind::Cancelled
+        );
+        assert_eq!(
+            durable_run_status_kind("mystery"),
+            DurableRunStatusKind::Other
+        );
+
+        assert!(durable_run_status_is_terminal(STATUS_COMPLETED));
+        assert!(durable_run_status_is_terminal(STATUS_FAILED));
+        assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
+        assert!(!durable_run_status_is_terminal(STATUS_RUNNING));
+        assert!(!durable_run_status_is_terminal(STATUS_WAITING));
+        assert!(!durable_run_status_is_terminal(STATUS_PAUSED));
+
+        assert!(durable_run_status_blocks_session(STATUS_RUNNING, None));
+        assert!(durable_run_status_blocks_session(STATUS_WAITING, None));
+        assert!(durable_run_status_blocks_session(
+            STATUS_PAUSED,
+            Some("tool_approval")
+        ));
+        assert!(!durable_run_status_blocks_session(STATUS_PAUSED, None));
+        assert!(!durable_run_status_blocks_session(STATUS_COMPLETED, None));
+        assert_eq!(
+            durable_run_status_to_subrun_state(STATUS_WAITING),
+            SubRunState::Paused
+        );
+        assert_eq!(
+            durable_run_status_to_subrun_state(STATUS_RUNNING),
+            SubRunState::Running
+        );
+        assert_eq!(
+            durable_run_status_to_subrun_state("mystery"),
+            SubRunState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_allows_new_root_run_when_existing_run_is_paused_without_waiting() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut paused = durable_run_record("paused");
+        paused.status = STATUS_PAUSED.into();
+        paused.waiting_for = None;
+        store.insert_run(paused).await.unwrap();
+
+        let fresh = durable_run_record("fresh");
+        store
+            .insert_run(fresh)
+            .await
+            .expect("resumable paused run should not block a fresh root run in the same session");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_blocks_new_root_run_when_existing_run_waits_for_input() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut paused = durable_run_record("paused");
+        paused.status = STATUS_PAUSED.into();
+        paused.waiting_for = Some("tool_approval".into());
+        store.insert_run(paused).await.unwrap();
+
+        let fresh = durable_run_record("fresh");
+        let error = store
+            .insert_run(fresh)
+            .await
+            .expect_err("approval-waiting paused run must still block the session");
+        assert_eq!(error, "session already has an active run");
     }
 
     #[test]
@@ -3103,6 +3231,21 @@ mod tests {
             json!({"agent_id": "a1", "result": "done"}),
         ));
         assert_eq!(completed["type"], "agent_completed");
+        let failed = transform_run_event_for_client(make_event(
+            "agent_failed",
+            json!({"agent_id": "a1", "error": "boom"}),
+        ));
+        assert_eq!(failed["type"], "agent_failed");
+        let cancelled = transform_run_event_for_client(make_event(
+            "agent_cancelled",
+            json!({"agent_id": "a1", "reason": "user request"}),
+        ));
+        assert_eq!(cancelled["type"], "agent_cancelled");
+        let interrupted = transform_run_event_for_client(make_event(
+            "agent_interrupted",
+            json!({"agent_id": "a1", "reason": "budget_exhausted"}),
+        ));
+        assert_eq!(interrupted["type"], "agent_interrupted");
     }
 
     #[test]

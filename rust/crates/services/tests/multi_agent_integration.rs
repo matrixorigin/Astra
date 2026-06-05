@@ -10,7 +10,8 @@
 use astra_core::SharedPool;
 use astra_services::multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService, LeaseClaimResult,
-    TaskLeaseHoldCache, TaskLeaseService, push_tasks_pack_held_mysql,
+    NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService,
+    push_tasks_pack_held_mysql,
 };
 use astra_services::task_orchestrator::{TaskRecord, TaskStatus};
 use sqlx::Row;
@@ -648,6 +649,182 @@ async fn task_lease_release_then_new_claim_succeeds() {
     assert_eq!(view.holder_agent_id, "agent-b");
 
     cleanup_task(&pool, &task_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_claim_next_skips_same_agent_active_lease_and_claims_next_task() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let first_task = Uuid::new_v4().to_string();
+    let second_task = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &first_task).await;
+    cleanup_task(&pool, &second_task).await;
+
+    for (task_id, title) in [(&first_task, "first"), (&second_task, "second")] {
+        sqlx::query(
+            "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+        )
+        .bind(task_id)
+        .bind(&user)
+        .bind(title)
+        .execute(&pool)
+        .await
+        .expect("insert task");
+    }
+
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+        .bind("2025-01-01 00:00:00.000000")
+        .bind(&first_task)
+        .execute(&pool)
+        .await
+        .expect("order first task");
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+        .bind("2025-01-02 00:00:00.000000")
+        .bind(&second_task)
+        .execute(&pool)
+        .await
+        .expect("order second task");
+
+    let lease =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
+    lease
+        .try_claim_lease(&user, &first_task, "agent-same", "edge-a", 120)
+        .await
+        .expect("claim first task");
+
+    let next = lease
+        .claim_next_claimable_lease(&user, "agent-same", "edge-a", 120)
+        .await
+        .expect("claim next");
+
+    assert_eq!(
+        next,
+        NextClaimableLeaseClaimResult::Granted {
+            task_id: second_task.clone(),
+            lease_version: 1,
+            expires_at: lease
+                .get_lease(&user, &second_task)
+                .await
+                .expect("get second lease")
+                .expect("second lease exists")
+                .expires_at,
+        }
+    );
+
+    let first_view = lease
+        .get_lease(&user, &first_task)
+        .await
+        .expect("get first lease")
+        .expect("first lease exists");
+    assert_eq!(first_view.holder_agent_id, "agent-same");
+
+    cleanup_task(&pool, &first_task).await;
+    cleanup_task(&pool, &second_task).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_claim_next_reclaims_orphaned_in_progress_after_expiry() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let leased_pending = Uuid::new_v4().to_string();
+    let orphaned_in_progress = Uuid::new_v4().to_string();
+    let fresh_pending = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &leased_pending).await;
+    cleanup_task(&pool, &orphaned_in_progress).await;
+    cleanup_task(&pool, &fresh_pending).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&leased_pending)
+    .bind(&user)
+    .bind("leased-pending")
+    .execute(&pool)
+    .await
+    .expect("insert leased pending");
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'in_progress')",
+    )
+    .bind(&orphaned_in_progress)
+    .bind(&user)
+    .bind("orphaned-in-progress")
+    .execute(&pool)
+    .await
+    .expect("insert orphaned in progress");
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&fresh_pending)
+    .bind(&user)
+    .bind("fresh-pending")
+    .execute(&pool)
+    .await
+    .expect("insert fresh pending");
+
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+        .bind("2025-01-01 00:00:00.000000")
+        .bind(&leased_pending)
+        .execute(&pool)
+        .await
+        .expect("order leased pending");
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+        .bind("2025-01-02 00:00:00.000000")
+        .bind(&orphaned_in_progress)
+        .execute(&pool)
+        .await
+        .expect("order orphaned");
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+        .bind("2025-01-03 00:00:00.000000")
+        .bind(&fresh_pending)
+        .execute(&pool)
+        .await
+        .expect("order fresh pending");
+
+    let lease =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
+    lease
+        .try_claim_lease(&user, &leased_pending, "agent-a", "edge-a", 120)
+        .await
+        .expect("claim leased pending");
+    lease
+        .try_claim_lease(&user, &orphaned_in_progress, "agent-b", "edge-b", 120)
+        .await
+        .expect("claim orphaned");
+
+    sqlx::query(
+        "UPDATE task_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE task_id = ?",
+    )
+    .bind(&orphaned_in_progress)
+    .execute(&pool)
+    .await
+    .expect("expire orphaned lease");
+
+    let next = lease
+        .claim_next_claimable_lease(&user, "agent-c", "edge-c", 120)
+        .await
+        .expect("claim next");
+
+    match next {
+        NextClaimableLeaseClaimResult::Granted { task_id, .. } => {
+            assert_eq!(task_id, orphaned_in_progress);
+        }
+        other => panic!("expected granted orphaned in-progress task, got {other:?}"),
+    }
+
+    let orphaned_view = lease
+        .get_lease(&user, &orphaned_in_progress)
+        .await
+        .expect("get orphaned lease")
+        .expect("orphaned lease exists");
+    assert_eq!(orphaned_view.holder_agent_id, "agent-c");
+
+    cleanup_task(&pool, &leased_pending).await;
+    cleanup_task(&pool, &orphaned_in_progress).await;
+    cleanup_task(&pool, &fresh_pending).await;
 }
 
 /// Verify agent_id is cleared BEFORE lease row is deleted during release.

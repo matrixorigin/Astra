@@ -132,6 +132,112 @@ pub struct HarnessSkillDraftRecord {
     pub rules: Vec<HarnessSkillRuleRecord>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessItemStatusKind {
+    Approved,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessSkillRuleStatusKind {
+    Proposed,
+    Conflicted,
+    NeedsRevision,
+    Approved,
+    Edited,
+    Rejected,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessSkillDraftStatusKind {
+    ReadyToPublish,
+    Approved,
+    PendingRuleReview,
+    NeedsRevision,
+    Rejected,
+    Other,
+}
+
+fn harness_item_status_kind(status: &str) -> HarnessItemStatusKind {
+    match status {
+        "approved" => HarnessItemStatusKind::Approved,
+        _ => HarnessItemStatusKind::Other,
+    }
+}
+
+fn harness_skill_rule_status_kind(status: &str) -> HarnessSkillRuleStatusKind {
+    match status {
+        "proposed" => HarnessSkillRuleStatusKind::Proposed,
+        "conflicted" => HarnessSkillRuleStatusKind::Conflicted,
+        "needs_revision" => HarnessSkillRuleStatusKind::NeedsRevision,
+        "approved" => HarnessSkillRuleStatusKind::Approved,
+        "edited" => HarnessSkillRuleStatusKind::Edited,
+        "rejected" => HarnessSkillRuleStatusKind::Rejected,
+        _ => HarnessSkillRuleStatusKind::Other,
+    }
+}
+
+fn harness_skill_draft_status_kind(status: &str) -> HarnessSkillDraftStatusKind {
+    match status {
+        "ready_to_publish" => HarnessSkillDraftStatusKind::ReadyToPublish,
+        "approved" => HarnessSkillDraftStatusKind::Approved,
+        "pending_rule_review" => HarnessSkillDraftStatusKind::PendingRuleReview,
+        "needs_revision" => HarnessSkillDraftStatusKind::NeedsRevision,
+        "rejected" => HarnessSkillDraftStatusKind::Rejected,
+        _ => HarnessSkillDraftStatusKind::Other,
+    }
+}
+
+fn harness_skill_rule_blocks_draft_approval(status: &str) -> bool {
+    matches!(
+        harness_skill_rule_status_kind(status),
+        HarnessSkillRuleStatusKind::Conflicted
+            | HarnessSkillRuleStatusKind::NeedsRevision
+            | HarnessSkillRuleStatusKind::Rejected
+    )
+}
+
+fn harness_skill_rule_is_unresolved(status: &str) -> bool {
+    matches!(
+        harness_skill_rule_status_kind(status),
+        HarnessSkillRuleStatusKind::Proposed
+            | HarnessSkillRuleStatusKind::Conflicted
+            | HarnessSkillRuleStatusKind::NeedsRevision
+    )
+}
+
+fn harness_skill_rule_is_approved(status: &str) -> bool {
+    matches!(
+        harness_skill_rule_status_kind(status),
+        HarnessSkillRuleStatusKind::Approved | HarnessSkillRuleStatusKind::Edited
+    )
+}
+
+fn harness_skill_draft_is_publishable(status: &str) -> bool {
+    matches!(
+        harness_skill_draft_status_kind(status),
+        HarnessSkillDraftStatusKind::ReadyToPublish | HarnessSkillDraftStatusKind::Approved
+    )
+}
+
+fn derive_harness_skill_draft_status(rules: &[HarnessSkillRuleRecord]) -> &'static str {
+    let unresolved = rules
+        .iter()
+        .any(|rule| harness_skill_rule_is_unresolved(&rule.status));
+    let approved = rules
+        .iter()
+        .any(|rule| harness_skill_rule_is_approved(&rule.status));
+
+    if unresolved {
+        "pending_rule_review"
+    } else if approved {
+        "ready_to_publish"
+    } else {
+        "rejected"
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillifySourceFile {
     pub file_name: String,
@@ -1155,11 +1261,11 @@ impl HarnessService for DatabaseHarnessService {
         let decision = request.decision.trim();
         let (status, content_markdown, decision_after_json) = match decision {
             "approve" => {
-                if current.rules.iter().any(|rule| {
-                    rule.status == "conflicted"
-                        || rule.status == "needs_revision"
-                        || rule.status == "rejected"
-                }) {
+                if current
+                    .rules
+                    .iter()
+                    .any(|rule| harness_skill_rule_blocks_draft_approval(&rule.status))
+                {
                     return Err(error_response(
                         StatusCode::CONFLICT,
                         "resolve rejected, conflicted, or revision-needed rules before approving the skill",
@@ -1413,17 +1519,17 @@ impl HarnessService for DatabaseHarnessService {
         let draft = self
             .load_skill_draft(&harness_run_id, &skill_draft_id)
             .await?;
-        if draft.status != "ready_to_publish" && draft.status != "approved" {
+        if !harness_skill_draft_is_publishable(&draft.status) {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 "skill draft must be approved before publishing",
             ));
         }
-        if draft.rules.iter().any(|rule| {
-            rule.status == "proposed"
-                || rule.status == "conflicted"
-                || rule.status == "needs_revision"
-        }) {
+        if draft
+            .rules
+            .iter()
+            .any(|rule| harness_skill_rule_is_unresolved(&rule.status))
+        {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 "resolve all skill rules before publishing",
@@ -1432,7 +1538,7 @@ impl HarnessService for DatabaseHarnessService {
         let approved_rule_count = draft
             .rules
             .iter()
-            .filter(|rule| rule.status == "approved" || rule.status == "edited")
+            .filter(|rule| harness_skill_rule_is_approved(&rule.status))
             .count();
         if approved_rule_count == 0 {
             return Err(error_response(
@@ -1524,7 +1630,9 @@ impl HarnessService for DatabaseHarnessService {
             .await?;
         let approved: Vec<_> = items
             .into_iter()
-            .filter(|item| item.status == "approved")
+            .filter(|item| {
+                harness_item_status_kind(&item.status) == HarnessItemStatusKind::Approved
+            })
             .collect();
         if approved.is_empty() {
             return Err(error_response(
@@ -2227,19 +2335,7 @@ async fn refresh_skill_draft_after_rule_decision(
         .into_iter()
         .map(skill_rule_from_row)
         .collect::<Vec<_>>();
-    let unresolved = rules.iter().any(|rule| {
-        rule.status == "proposed" || rule.status == "conflicted" || rule.status == "needs_revision"
-    });
-    let approved = rules
-        .iter()
-        .any(|rule| rule.status == "approved" || rule.status == "edited");
-    let status = if unresolved {
-        "pending_rule_review"
-    } else if approved {
-        "ready_to_publish"
-    } else {
-        "rejected"
-    };
+    let status = derive_harness_skill_draft_status(&rules);
     let content_markdown = render_skill_markdown_from_rules(&candidate_name, &description, &rules);
     sqlx::query(
         "UPDATE harness_skill_drafts
@@ -2349,10 +2445,12 @@ fn render_skill_markdown_from_rules(
         "## Rules".to_string(),
         String::new(),
     ];
-    for rule in rules
-        .iter()
-        .filter(|rule| rule.status != "rejected" && rule.status != "needs_revision")
-    {
+    for rule in rules.iter().filter(|rule| {
+        !matches!(
+            harness_skill_rule_status_kind(&rule.status),
+            HarnessSkillRuleStatusKind::Rejected | HarnessSkillRuleStatusKind::NeedsRevision
+        )
+    }) {
         let statement = rule.statement.trim();
         if !statement.is_empty() {
             lines.push(format!("- {statement}"));
@@ -2447,5 +2545,61 @@ mod tests {
         ]);
         assert!(decision_history_contains_idempotency(&history, "idem-1"));
         assert!(!decision_history_contains_idempotency(&history, "idem-2"));
+    }
+
+    #[test]
+    fn harness_skill_rule_status_helpers_keep_unresolved_and_approved_sets_distinct() {
+        assert!(harness_skill_rule_blocks_draft_approval("conflicted"));
+        assert!(harness_skill_rule_blocks_draft_approval("needs_revision"));
+        assert!(harness_skill_rule_blocks_draft_approval("rejected"));
+        assert!(!harness_skill_rule_blocks_draft_approval("proposed"));
+        assert!(!harness_skill_rule_blocks_draft_approval("approved"));
+
+        assert!(harness_skill_rule_is_unresolved("proposed"));
+        assert!(harness_skill_rule_is_unresolved("conflicted"));
+        assert!(harness_skill_rule_is_unresolved("needs_revision"));
+        assert!(!harness_skill_rule_is_unresolved("approved"));
+        assert!(!harness_skill_rule_is_unresolved("edited"));
+
+        assert!(harness_skill_rule_is_approved("approved"));
+        assert!(harness_skill_rule_is_approved("edited"));
+        assert!(!harness_skill_rule_is_approved("rejected"));
+    }
+
+    #[test]
+    fn derive_harness_skill_draft_status_prefers_unresolved_then_approved_then_rejected() {
+        let mut rule = HarnessSkillRuleRecord {
+            skill_rule_id: "rule-1".into(),
+            skill_draft_id: "draft-1".into(),
+            harness_run_id: "run-1".into(),
+            rule_type: "preference".into(),
+            statement: "lead with conclusion".into(),
+            rationale: "stable preference".into(),
+            decision_history_json: json!([]),
+            status: "approved".into(),
+            confidence: Some(0.8),
+            source_count: 1,
+            created_by_node_id: None,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            citations: vec![],
+        };
+
+        assert_eq!(
+            derive_harness_skill_draft_status(&[rule.clone()]),
+            "ready_to_publish"
+        );
+
+        rule.status = "conflicted".into();
+        assert_eq!(
+            derive_harness_skill_draft_status(&[rule.clone()]),
+            "pending_rule_review"
+        );
+
+        rule.status = "rejected".into();
+        assert_eq!(derive_harness_skill_draft_status(&[rule]), "rejected");
+        assert!(harness_skill_draft_is_publishable("ready_to_publish"));
+        assert!(harness_skill_draft_is_publishable("approved"));
+        assert!(!harness_skill_draft_is_publishable("pending_rule_review"));
     }
 }

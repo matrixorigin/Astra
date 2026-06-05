@@ -138,6 +138,19 @@ pub fn write_step_checkpoint(
     Ok(path)
 }
 
+/// Delete a step checkpoint by number and tier.
+pub fn delete_step_checkpoint(session_id: &str, number: u32, tier: &str) -> std::io::Result<()> {
+    let dir = checkpoint_dir_for(session_id);
+    let filename = format!("{:06}-{}.json", number, tier);
+    let path = dir.join(&filename);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_parent_dir(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
 /// Read the latest heavy checkpoint for session recovery.
 /// Returns None if no heavy checkpoint exists.
 pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<HeavyCheckpoint>> {
@@ -765,6 +778,57 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn delete_step_checkpoint_removes_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "delete-existing";
+        let checkpoint = StepCheckpoint::Light(make_light("step-delete", 1.0));
+        let path = write_step_checkpoint(session_id, 7, &checkpoint).unwrap();
+        assert!(path.exists());
+
+        delete_step_checkpoint(session_id, 7, "light").unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_step_checkpoint_ignores_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        delete_step_checkpoint("delete-missing", 99, "heavy").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_step_checkpoint_surfaces_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "delete-perms";
+        let checkpoint = StepCheckpoint::Light(make_light("step-delete-perms", 1.0));
+        let path = write_step_checkpoint(session_id, 3, &checkpoint).unwrap();
+        let dir = path.parent().expect("checkpoint dir").to_path_buf();
+
+        let original_permissions = std::fs::metadata(&dir).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_mode(0o555);
+        std::fs::set_permissions(&dir, readonly_permissions).unwrap();
+
+        let result = delete_step_checkpoint(session_id, 3, "light");
+
+        std::fs::set_permissions(&dir, original_permissions).unwrap();
+
+        let error = result.expect_err("readonly checkpoint dir should deny deletion");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            path.exists(),
+            "failed delete must leave checkpoint untouched"
+        );
     }
 
     #[test]

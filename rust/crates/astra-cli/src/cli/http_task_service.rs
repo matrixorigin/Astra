@@ -11,11 +11,14 @@
 //! `cloud_base` is configured. Offline / one-shot CLI falls back
 //! to the in-memory `LocalTaskService`.
 
-use astra_services::multi_agent::{LeaseClaimResult, TaskLeaseService, TaskLeaseView};
+use astra_services::multi_agent::{
+    LeaseClaimResult, NextClaimableLeaseClaimResult, TaskLeaseService, TaskLeaseView,
+};
 use astra_services::task_orchestrator::{
     LearningStats, TaskCheckpoint, TaskCreateRequest, TaskListItem, TaskOutcome, TaskPlan,
     TaskRecord, TaskService, TaskStatus, TemplateRecommendation,
 };
+use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -115,7 +118,7 @@ impl TaskService for HttpTaskService {
         Ok(Some(task))
     }
 
-    async fn list_tasks(
+    async fn list_recent_tasks(
         &self,
         _user_id: &str,
         status_filter: Option<TaskStatus>,
@@ -127,7 +130,59 @@ impl TaskService for HttpTaskService {
         if let Some(s) = status_str {
             args["status_filter"] = json!(s);
         }
-        let result = self.rpc("list_tasks", args).await?;
+        let result = self.rpc("list_recent_tasks", args).await?;
+        let tasks: Vec<TaskListItem> =
+            serde_json::from_value(result).map_err(|e| format!("decode Vec<TaskListItem>: {e}"))?;
+        Ok(tasks)
+    }
+
+    async fn list_recent_tasks_for_session(
+        &self,
+        _user_id: &str,
+        session_id: &str,
+        status_filter: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let status_str = status_filter
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .and_then(|v| v.as_str().map(String::from));
+        let mut args = json!({ "session_id": session_id });
+        if let Some(s) = status_str {
+            args["status_filter"] = json!(s);
+        }
+        let result = self.rpc("list_recent_tasks_for_session", args).await?;
+        let tasks: Vec<TaskListItem> =
+            serde_json::from_value(result).map_err(|e| format!("decode Vec<TaskListItem>: {e}"))?;
+        Ok(tasks)
+    }
+
+    async fn search_tasks(
+        &self,
+        _user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let result = self
+            .rpc(
+                "search_tasks",
+                json!({
+                    "query": query,
+                    "limit": limit,
+                }),
+            )
+            .await?;
+        let tasks: Vec<TaskListItem> =
+            serde_json::from_value(result).map_err(|e| format!("decode Vec<TaskListItem>: {e}"))?;
+        Ok(tasks)
+    }
+
+    async fn list_claimable_tasks_for_worker(
+        &self,
+        _user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let result = self
+            .rpc("list_claimable_tasks_for_worker", json!({ "limit": limit }))
+            .await?;
         let tasks: Vec<TaskListItem> =
             serde_json::from_value(result).map_err(|e| format!("decode Vec<TaskListItem>: {e}"))?;
         Ok(tasks)
@@ -194,6 +249,19 @@ impl TaskService for HttpTaskService {
     async fn complete_task(&self, task_id: &str) -> Result<(), String> {
         self.rpc("complete_task", json!({ "task_id": task_id }))
             .await?;
+        Ok(())
+    }
+
+    async fn complete_task_with_outcome(
+        &self,
+        task_id: &str,
+        outcome: TaskOutcome,
+    ) -> Result<(), String> {
+        self.rpc(
+            "complete_task_with_outcome",
+            json!({ "task_id": task_id, "outcome": outcome }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -328,12 +396,24 @@ impl HttpTaskLeaseService {
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, String> {
+        self.post_with_edge_id(path, body, None).await
+    }
+
+    async fn post_with_edge_id(
+        &self,
+        path: &str,
+        body: Value,
+        edge_id: Option<&str>,
+    ) -> Result<Value, String> {
         let client = reqwest::Client::builder()
             .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
         let mut req = client.post(self.url(path)).json(&body);
+        if let Some(edge_id) = edge_id.filter(|edge_id| !edge_id.trim().is_empty()) {
+            req = req.header(ASTRA_EDGE_ID_HEADER, edge_id);
+        }
         if let Some(tok) = self.token.as_deref() {
             req = req.bearer_auth(tok);
         }
@@ -378,6 +458,28 @@ impl HttpTaskLeaseService {
 
 #[async_trait]
 impl TaskLeaseService for HttpTaskLeaseService {
+    async fn claim_next_claimable_lease(
+        &self,
+        _user_id: &str,
+        agent_id: &str,
+        edge_id: &str,
+        ttl_sec: i64,
+    ) -> Result<NextClaimableLeaseClaimResult, String> {
+        let result = self
+            .post_with_edge_id(
+                "/tasks/lease/claim-next",
+                json!({
+                    "edge_agent_id": agent_id,
+                    "ttl_sec": ttl_sec,
+                    "edge_id": edge_id,
+                }),
+                Some(edge_id),
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| format!("decode NextClaimableLeaseClaimResult: {e}"))
+    }
+
     async fn try_claim_lease(
         &self,
         _user_id: &str,
@@ -388,13 +490,14 @@ impl TaskLeaseService for HttpTaskLeaseService {
     ) -> Result<LeaseClaimResult, String> {
         // user_id resolved server-side from auth header.
         let result = self
-            .post(
+            .post_with_edge_id(
                 &format!("/tasks/{task_id}/lease/claim"),
                 json!({
                     "edge_agent_id": agent_id,
                     "ttl_sec": ttl_sec,
                     "edge_id": edge_id,
                 }),
+                Some(edge_id),
             )
             .await?;
         serde_json::from_value(result).map_err(|e| format!("decode LeaseClaimResult: {e}"))
@@ -441,13 +544,14 @@ impl TaskLeaseService for HttpTaskLeaseService {
         ttl_sec: i64,
     ) -> Result<Option<TaskLeaseView>, String> {
         let result = self
-            .post(
+            .post_with_edge_id(
                 &format!("/tasks/{task_id}/lease/renew"),
                 json!({
                     "edge_agent_id": agent_id,
                     "ttl_sec": ttl_sec,
                     "edge_id": edge_id,
                 }),
+                Some(edge_id),
             )
             .await?;
         if result.is_null() {

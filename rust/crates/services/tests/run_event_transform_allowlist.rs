@@ -91,3 +91,19 @@ fn known_run_finished_still_passes_through() {
     let out = transform_run_event_for_client(ok);
     assert!(!out.is_null(), "run_finished must pass through");
 }
+
+#[test]
+fn known_agent_interrupted_still_passes_through() {
+    let ok = json!({
+        "type": "agent_interrupted",
+        "agent_id": "agent-1",
+        "reason": "budget_exhausted"
+    });
+    let out = transform_run_event_for_client(ok);
+    assert!(!out.is_null(), "agent_interrupted must pass through");
+    let obj = out.as_object().expect("object");
+    assert_eq!(
+        obj.get("type").and_then(Value::as_str),
+        Some("agent_interrupted")
+    );
+}
