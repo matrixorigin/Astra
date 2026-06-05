@@ -14,7 +14,7 @@ use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
 
 #[path = "self_surface.rs"]
-mod self_surface;
+use super::surface::self_surface;
 
 type SessionArtifacts = LoadedSelfSurfaceArtifacts;
 
