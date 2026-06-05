@@ -12,8 +12,8 @@ pub enum RuntimeScaffoldingKind {
 }
 
 pub const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
-pub const ATTENTION_MANIFEST_PREFIX: &str = "[attention:";
-pub const WORKING_SET_MANIFEST_PREFIX: &str = "[working-set:";
+pub const ATTENTION_MANIFEST_PREFIX: &str = "[attention:v1]";
+pub const WORKING_SET_MANIFEST_PREFIX: &str = "[working-set:v1]";
 pub const SESSION_ANCHOR_PREFIX: &str = "[session-anchor]";
 pub const ACTIVE_TASK_ATTACHMENT_PREFIX: &str = "[Active task attachment]";
 pub const ALREADY_FETCHED_PREFIX: &str = "## Already Fetched";
@@ -115,23 +115,19 @@ mod tests {
     }
 
     #[test]
-    fn continuation_scaffolding_is_role_sensitive() {
-        assert!(is_continuation_scaffolding_for_role(
-            "user",
-            "## ⚠ Sequential Tool Calls Detected\nPlease batch reads"
-        ));
-        assert!(is_continuation_scaffolding_for_role(
-            "system",
-            "## Cross-Session Project Context\n..."
-        ));
-        assert!(is_continuation_scaffolding_for_role(
-            "user",
-            "[Active task attachment]\nResume the active task"
-        ));
-        assert!(!is_continuation_scaffolding_for_role(
-            "assistant",
-            "[working-set:v1]\ngoal: stale"
-        ));
+    fn plain_user_message_is_not_scaffolding() {
+        assert_eq!(detect_runtime_scaffolding("plain user message"), None);
+    }
+
+    #[test]
+    fn non_versioned_attention_prefix_is_not_scaffolding() {
+        // "[attention:" alone without "v1]" could appear in user content
+        // about attention mechanisms — require the version marker.
+        assert_eq!(
+            detect_runtime_scaffolding("[attention:span] user query about ML"),
+            None
+        );
+        assert_eq!(detect_runtime_scaffolding("[working-set:foo]"), None);
     }
 
     #[test]
