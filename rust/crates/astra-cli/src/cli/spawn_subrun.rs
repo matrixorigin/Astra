@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use astra_core::SkillSearchSettings;
 use astra_runtime::{
-    orchestration::{PermissionSummary, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult},
+    orchestration::{
+        PermissionSummary, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+        spawn_completion_status_from_finish_reason,
+    },
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
@@ -213,16 +216,6 @@ fn emit_agent_terminated(
             "spawn_subrun",
             "failed to emit terminal live event for {agent_id}: {err:?}"
         );
-    }
-}
-
-fn completion_status_from_finish_reason(finish_reason: Option<&str>) -> &'static str {
-    // `None` is only expected on the clean-completion path before any
-    // interruption record exists; cancelled/failed branches never call this
-    // helper.
-    match finish_reason {
-        None | Some("normal") => "completed",
-        Some(_) => "interrupted",
     }
 }
 
@@ -860,7 +853,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
-                    status: completion_status_from_finish_reason(
+                    status: spawn_completion_status_from_finish_reason(
                         finish_reason_from_state.as_deref(),
                     )
                     .to_string(),
@@ -1208,27 +1201,6 @@ mod tests {
             events[0].kind,
             AgentLiveEventKind::AgentTerminated { .. }
         ));
-    }
-
-    #[test]
-    fn completion_status_tracks_interrupted_finish_reasons() {
-        assert_eq!(completion_status_from_finish_reason(None), "completed");
-        assert_eq!(
-            completion_status_from_finish_reason(Some("normal")),
-            "completed"
-        );
-        assert_eq!(
-            completion_status_from_finish_reason(Some("budget_exhausted")),
-            "interrupted"
-        );
-        assert_eq!(
-            completion_status_from_finish_reason(Some("context_overflow")),
-            "interrupted"
-        );
-        assert_eq!(
-            completion_status_from_finish_reason(Some("empty_completion")),
-            "interrupted"
-        );
     }
 
     /// Bug1 regression: when inherited prefix ends with a user or tool

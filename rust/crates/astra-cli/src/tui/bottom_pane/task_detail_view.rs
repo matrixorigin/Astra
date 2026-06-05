@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use super::view::{BottomPaneView, CancellationEvent};
+use crate::cli::session_task_surface::{SessionTaskStatusKind, session_task_status_kind};
 use crate::tui::history_cell::task::{ChildStatus, TaskCell, TaskStatus};
 use astra_tools::task_mgmt::SessionTask;
 
@@ -77,10 +78,11 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
 
-    let status_color = match task.status.as_str() {
-        "in_progress" => Color::Yellow,
-        "completed" => Color::Green,
-        "failed" => Color::Red,
+    let status_color = match session_task_status_kind(&task.status) {
+        SessionTaskStatusKind::InProgress => Color::Yellow,
+        SessionTaskStatusKind::Completed => Color::Green,
+        SessionTaskStatusKind::Failed => Color::Red,
+        SessionTaskStatusKind::Cancelled => Color::Yellow,
         _ => Color::White,
     };
     out.push(Line::from(vec![
@@ -120,17 +122,15 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
         for (i, sub) in task.subtasks.iter().enumerate() {
             let is_last = i + 1 == task.subtasks.len();
             let connector = if is_last { "└" } else { "├" };
-            let icon = match sub.status.as_str() {
-                "completed" => "✓",
-                "failed" => "✗",
-                "in_progress" => "◦",
-                _ => "·",
-            };
-            let icon_color = match sub.status.as_str() {
-                "completed" => Color::Green,
-                "failed" => Color::Red,
-                "in_progress" => Color::Yellow,
-                _ => Color::DarkGray,
+            let (icon, icon_color) = match session_task_status_kind(&sub.status) {
+                SessionTaskStatusKind::Completed => ("✓", Color::Green),
+                SessionTaskStatusKind::InProgress => ("◦", Color::Yellow),
+                SessionTaskStatusKind::Pending => ("·", Color::DarkGray),
+                SessionTaskStatusKind::Failed => ("✗", Color::Red),
+                SessionTaskStatusKind::Cancelled => ("⏹", Color::Yellow),
+                SessionTaskStatusKind::Archived
+                | SessionTaskStatusKind::Deleted
+                | SessionTaskStatusKind::Other => ("·", Color::DarkGray),
             };
             out.push(Line::from(vec![
                 Span::styled(format!("  {connector}─ "), dim),

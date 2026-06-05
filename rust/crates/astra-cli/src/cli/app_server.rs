@@ -213,13 +213,14 @@ pub(crate) async fn run_stdio_app_server(
                 let task_ctx = ctx.clone();
                 let task_state = state.clone();
                 let task_writer = writer.clone();
+                let task_thread_id = thread_id.clone();
                 tokio::spawn(async move {
                     let result = run_turn(
                         task_ctx,
                         task_writer.clone(),
                         TurnRequest {
                             state: task_state.clone(),
-                            thread_id,
+                            thread_id: task_thread_id.clone(),
                             turn_id: turn_id.clone(),
                             message,
                             params,
@@ -239,7 +240,7 @@ pub(crate) async fn run_stdio_app_server(
                         let _ = write_notification(
                             &task_writer,
                             "turn/completed",
-                            serde_json::json!({"turn": {"id": turn_id}, "status": "failed"}),
+                            turn_completed_params(&turn_id, &task_thread_id, "failed"),
                         )
                         .await;
                     }
@@ -480,7 +481,7 @@ async fn run_turn(
             write_notification(
                 &writer,
                 "turn/completed",
-                serde_json::json!({"turn": {"id": turn_id}, "status": "failed"}),
+                turn_completed_params(&turn_id, &thread_id, "failed"),
             )
             .await?;
             return Ok(());
@@ -489,7 +490,9 @@ async fn run_turn(
     sr.background_agent_results = spawner_for_drain
         .shutdown_and_wait(std::time::Duration::from_secs(30))
         .await;
-    write_turn_result(&writer, &thread_id, &turn_id, &sr).await?;
+    let next_thread_id = next_thread_id_after_turn(&thread_id, sr.session_id.as_deref());
+    state.lock().await.thread_id = Some(next_thread_id.clone());
+    write_turn_result(&writer, &thread_id, &next_thread_id, &turn_id, &sr).await?;
     Ok(())
 }
 
@@ -530,6 +533,13 @@ fn requested_thread_id(params: &Value) -> Result<Option<String>, String> {
         (Some(thread_id), _) => Ok(Some(thread_id.to_string())),
         (None, Some(session_id)) => Ok(Some(session_id.to_string())),
         (None, None) => Ok(None),
+    }
+}
+
+fn next_thread_id_after_turn(thread_id: &str, session_id: Option<&str>) -> String {
+    match session_id.map(str::trim) {
+        Some("") | None => thread_id.to_string(),
+        Some(session_id) => session_id.to_string(),
     }
 }
 
@@ -683,17 +693,16 @@ fn approval_response_from_params(params: &Value) -> Result<ApprovalResponse, Str
 
 async fn write_turn_result(
     writer: &JsonWriter,
-    thread_id: &str,
+    requested_thread_id: &str,
+    current_thread_id: &str,
     turn_id: &str,
     sr: &StreamResult,
 ) -> Result<(), String> {
-    if let Some(session_id) = sr.session_id.as_deref()
-        && session_id != thread_id
-    {
+    if current_thread_id != requested_thread_id {
         write_notification(
             writer,
             "thread/started",
-            serde_json::json!({"thread": {"id": session_id}}),
+            thread_started_params(current_thread_id, Some(requested_thread_id)),
         )
         .await?;
     }
@@ -719,9 +728,27 @@ async fn write_turn_result(
     write_notification(
         writer,
         "turn/completed",
-        serde_json::json!({"turn": {"id": turn_id}, "status": "completed"}),
+        turn_completed_params(turn_id, current_thread_id, "completed"),
     )
     .await
+}
+
+fn thread_started_params(thread_id: &str, previous_thread_id: Option<&str>) -> Value {
+    let mut params = serde_json::json!({
+        "thread": {"id": thread_id},
+    });
+    if let Some(previous_thread_id) = previous_thread_id {
+        params["previousThreadId"] = Value::String(previous_thread_id.to_string());
+    }
+    params
+}
+
+fn turn_completed_params(turn_id: &str, thread_id: &str, status: &str) -> Value {
+    serde_json::json!({
+        "turn": {"id": turn_id},
+        "threadId": thread_id,
+        "status": status,
+    })
 }
 
 async fn write_stream_notification(writer: &JsonWriter, event: StreamEvent) -> Result<(), String> {
@@ -904,6 +931,37 @@ mod tests {
             requested_thread_id(&params).unwrap().as_deref(),
             Some("session-from-client")
         );
+    }
+
+    #[test]
+    fn next_thread_id_after_turn_prefers_server_session_id() {
+        assert_eq!(
+            next_thread_id_after_turn("temp-thread", Some("sess-123")),
+            "sess-123"
+        );
+        assert_eq!(
+            next_thread_id_after_turn("temp-thread", Some("")),
+            "temp-thread"
+        );
+        assert_eq!(
+            next_thread_id_after_turn("temp-thread", None),
+            "temp-thread"
+        );
+    }
+
+    #[test]
+    fn thread_started_params_include_previous_thread_id_for_rebinds() {
+        let params = thread_started_params("sess-123", Some("temp-thread"));
+        assert_eq!(params["thread"]["id"], "sess-123");
+        assert_eq!(params["previousThreadId"], "temp-thread");
+    }
+
+    #[test]
+    fn turn_completed_params_report_canonical_thread_id() {
+        let params = turn_completed_params("turn-1", "sess-123", "completed");
+        assert_eq!(params["turn"]["id"], "turn-1");
+        assert_eq!(params["threadId"], "sess-123");
+        assert_eq!(params["status"], "completed");
     }
 
     #[test]

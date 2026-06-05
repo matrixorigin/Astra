@@ -291,11 +291,16 @@ pub(crate) async fn handle_slash_command(
             );
             eprintln!("{}", format!("  \u{2713}  Set model to {}", arg).green());
             if let Some(ref j) = state.journal {
-                let _ = j.append(&session_journal::JournalEvent::config_change(
+                crate::cli::cli_utils::append_journal_event_or_warn(
+                    j,
                     state.session_id.as_deref(),
-                    "model",
-                    arg,
-                ));
+                    &session_journal::JournalEvent::config_change(
+                        state.session_id.as_deref(),
+                        "model",
+                        arg,
+                    ),
+                    "slash_router:model",
+                );
             }
         }
 
@@ -303,7 +308,7 @@ pub(crate) async fn handle_slash_command(
 
         "/config" => slash_config::handle_config_command(arg),
 
-        "/checkpoint" => match create_manual_checkpoint(state, arg) {
+        "/checkpoint" => match session_checkpointing::create_manual_checkpoint(state, arg) {
             Ok(summary) => {
                 eprintln!("  {} {}", theme::icon_ok(), summary.headline().green());
                 eprintln!(

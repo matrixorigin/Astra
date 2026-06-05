@@ -22,6 +22,7 @@ pub const AGENTS_EDGE: &str = "/agents/edge";
 pub const AGENTS_EDGE_HEARTBEAT: &str = "/agents/edge/heartbeat";
 
 pub const SESSIONS: &str = "/sessions";
+pub const SESSIONS_RESUMABLE: &str = "/sessions/resumable";
 
 /// `GET/PUT/DELETE /sessions/{id}`
 #[inline]
@@ -32,6 +33,11 @@ pub fn session(id: &str) -> String {
 #[inline]
 pub fn session_close(id: &str) -> String {
     format!("/sessions/{id}/close")
+}
+
+#[inline]
+pub fn session_resume(id: &str) -> String {
+    format!("/sessions/{id}/resume")
 }
 
 #[inline]

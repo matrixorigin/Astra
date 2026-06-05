@@ -3,6 +3,7 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
+mod agent_control_status;
 mod app_event;
 pub(crate) mod approval;
 pub(crate) mod background_tasks;

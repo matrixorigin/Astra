@@ -40,19 +40,19 @@ pub(crate) use cli::*;
 #[cfg(test)]
 use cli::cli_utils::save_credentials;
 use cli::cli_utils::{
-    map_thin_err, normalize_model_override_owned, persist_profile_last_session,
-    resumable_last_session_id,
+    local_resumable_last_session_id, map_thin_err, normalize_model_override_owned,
+    persist_profile_last_session,
 };
 use cli::command_router::{ExitCode, execute_cli_command, run_print_mode};
 #[cfg(test)]
 use cli::stream_render::{RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 #[cfg(test)]
-use cli::chat_turn::{TurnContext, handle_chat_input};
-#[cfg(test)]
 use cli::slash_router::handle_slash_command;
 #[cfg(test)]
 use cli::slash_session::resolve_journal_target_session;
+#[cfg(test)]
+use cli::turn_entry::{TurnContext, handle_chat_input};
 
 // CLI argument structs moved to cli/cli_args.rs
 
@@ -395,7 +395,15 @@ async fn main() {
 
         // For -c, resolve the last session ID from credentials
         let resolved_sid = if continue_last && session_id.is_none() {
-            resumable_last_session_id(profile.as_deref())
+            if cli::session_runtime::resolve_cloud_base().is_some()
+                && cli::session_runtime::current_access_token(profile.as_deref()).is_some()
+            {
+                cli::cli_utils::validated_resumable_last_session_id(&api, profile.as_deref())
+                    .await
+                    .or_else(|| local_resumable_last_session_id(profile.as_deref()))
+            } else {
+                local_resumable_last_session_id(profile.as_deref())
+            }
         } else {
             session_id.map(|s| s.to_string())
         };
@@ -758,6 +766,200 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn execute_cli_session_close_clears_matching_pointer_across_profiles() {
+        let _creds_dir = isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("tok-default".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "other".to_string(),
+            Profile {
+                last_session_id: Some("sess-close-1".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let app = Router::new().route(
+            "/sessions/{id}/close",
+            post(|| async { axum::Json(serde_json::json!({ "status": "closed" })) }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+
+        let result = execute_cli_command(
+            Some(Command::Session(SessionCmd::Close(SessionShowArgs {
+                session_id: "sess-close-1".to_string(),
+            }))),
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            0.0,
+            &cli::cli_context::CliContext::default(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["other"].last_session_id.as_deref(),
+            None,
+            "close should clear matching stale pointer even when another profile holds it"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn execute_cli_session_delete_clears_matching_pointer_across_profiles() {
+        let _creds_dir = isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("tok-default".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "other".to_string(),
+            Profile {
+                last_session_id: Some("sess-delete-1".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let app = Router::new().route("/sessions/{id}", axum::routing::delete(|| async { "" }));
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+
+        let result = execute_cli_command(
+            Some(Command::Session(SessionCmd::Delete(SessionShowArgs {
+                session_id: "sess-delete-1".to_string(),
+            }))),
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            0.0,
+            &cli::cli_context::CliContext::default(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["other"].last_session_id.as_deref(),
+            None,
+            "delete should clear matching stale pointer even when another profile holds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_cli_replay_rejects_invalid_session_id_before_auth() {
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let error = execute_cli_command(
+            Some(Command::Replay(ReplayArgs {
+                session_id: "../escape".to_string(),
+                sandbox_name: None,
+                mock_mode: true,
+                compare: false,
+            })),
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            0.0,
+            &cli::cli_context::CliContext::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("invalid session_id"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn execute_cli_session_close_rejects_invalid_session_id_before_auth() {
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let error = execute_cli_command(
+            Some(Command::Session(SessionCmd::Close(SessionShowArgs {
+                session_id: "../escape".to_string(),
+            }))),
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            0.0,
+            &cli::cli_context::CliContext::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("invalid session_id"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn execute_cli_audit_show_rejects_invalid_session_id_before_auth() {
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let error = execute_cli_command(
+            Some(Command::Audit(AuditCmd::Show(AuditShowArgs {
+                session_id: "../escape".to_string(),
+            }))),
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            0.0,
+            &cli::cli_context::CliContext::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("invalid session_id"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn execute_cli_audit_tools_rejects_invalid_optional_session_id_before_auth() {
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let error = execute_cli_command(
+            Some(Command::Audit(AuditCmd::Tools(AuditToolsArgs {
+                session_id: Some("../escape".to_string()),
+                since: None,
+                until: None,
+            }))),
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            0.0,
+            &cli::cli_context::CliContext::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("invalid session_id"), "got: {error}");
+    }
+
     // ── chat_turn pure functions ──────────────────────────────────────────
 
     // The `picker_submission_echo_*` tests verified line-mode-only
@@ -769,7 +971,7 @@ mod tests {
     #[test]
     fn build_effective_line_plain() {
         let state = SessionState::default();
-        let result = chat_turn::build_effective_line(
+        let result = crate::cli::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -784,7 +986,7 @@ mod tests {
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
-        let result = chat_turn::build_effective_line(
+        let result = crate::cli::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -799,7 +1001,7 @@ mod tests {
             ("q1".to_string(), "a1".to_string()),
             ("q2".to_string(), "a2".to_string()),
         ];
-        let msgs = cli::chat_turn::history_as_messages(&history);
+        let msgs = cli::session_projection::history_as_messages(&history);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
@@ -808,7 +1010,7 @@ mod tests {
     #[test]
     fn history_as_messages_compacted_turn() {
         let history = vec![("".to_string(), "summary".to_string())];
-        let msgs = cli::chat_turn::history_as_messages(&history);
+        let msgs = cli::session_projection::history_as_messages(&history);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "assistant");
     }
@@ -904,6 +1106,32 @@ mod tests {
             .await
             .unwrap();
         assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn find_task_by_title_substring_fails_on_ambiguity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+        for title in [
+            "Refactor authentication module",
+            "Refactor authentication tests",
+        ] {
+            svc.create_task(
+                "u1",
+                "s1",
+                astra_services::TaskCreateRequest {
+                    title: title.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let err = slash_task::find_task_by_query(&svc, "u1", "authentication")
+            .await
+            .unwrap_err();
+        assert!(err.contains("task query 'authentication' is ambiguous"));
     }
 
     #[tokio::test]
@@ -1135,6 +1363,14 @@ total_tokens_out: 500
 
     // ── handle_stats_command ─────────────────────────────────────────────────
 
+    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = session_journal::JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
     #[test]
     fn stats_no_active_session_does_not_panic() {
         // state with no session_id → should not panic
@@ -1146,6 +1382,7 @@ total_tokens_out: 500
 
     #[test]
     fn stats_history_no_sessions_does_not_panic() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let state = super::SessionState::default();
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -3470,7 +3707,7 @@ total_tokens_out: 500
     fn build_effective_line_includes_project_instructions() {
         let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = chat_turn::build_effective_line(
+        let result = crate::cli::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -3489,7 +3726,7 @@ total_tokens_out: 500
     #[test]
     fn build_effective_line_no_instructions_when_none() {
         let state = SessionState::default();
-        let result = chat_turn::build_effective_line(
+        let result = crate::cli::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,

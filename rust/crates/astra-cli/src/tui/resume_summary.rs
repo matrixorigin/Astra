@@ -9,27 +9,30 @@
 //!
 //! This module owns the *pure* part of that flow: given a list of
 //! task summaries + a cutoff, produce the banner text. The actual
-//! `TaskService::list_tasks` call + MatrixOne query live in the
+//! `TaskService::list_recent_tasks_for_session` call + MatrixOne query live in the
 //! event loop; here we keep the rendering logic testable without a
 //! live DB.
 
-use astra_services::{TaskListItem, TaskStatus};
+use crate::cli::task_surface::task_list_item_outcome;
+use astra_services::{TaskListItem, TaskOutcome, TaskStatus, session_journal::JournalEvent};
 
 /// Rollup of the terminal-state tasks completed while the user was
-/// away. `ok` = `Completed`; `failed` = `Failed`; `cancelled`
-/// = `Cancelled`. `paused`/`pending`/`in_progress` are deliberately
+/// away. `ok` = completed with success/unknown outcome; `partial` =
+/// completed with partial outcome; `failed` = failed; `cancelled` =
+/// cancelled. `paused`/`pending`/`in_progress` are deliberately
 /// excluded — those are still-running work and surface via the
 /// `task_board`, not the resume banner.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResumeSummary {
     pub ok: usize,
+    pub partial: usize,
     pub failed: usize,
     pub cancelled: usize,
 }
 
 impl ResumeSummary {
     pub(crate) fn total(&self) -> usize {
-        self.ok + self.failed + self.cancelled
+        self.ok + self.partial + self.failed + self.cancelled
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -45,6 +48,9 @@ impl ResumeSummary {
         if self.ok > 0 {
             parts.push(format!("{} ok", self.ok));
         }
+        if self.partial > 0 {
+            parts.push(format!("{} partial", self.partial));
+        }
         if self.failed > 0 {
             parts.push(format!("{} failed", self.failed));
         }
@@ -57,7 +63,7 @@ impl ResumeSummary {
     }
 }
 
-/// Reduce a `list_tasks` result into a `ResumeSummary`.
+/// Reduce a `list_recent_tasks_for_session` result into a `ResumeSummary`.
 ///
 /// - `session_id_filter`: keep only tasks whose `session_id` matches,
 ///   so we never surface other sessions' work on this banner.
@@ -71,25 +77,32 @@ pub(crate) fn summarize(
 ) -> ResumeSummary {
     let mut out = ResumeSummary::default();
     for item in items {
-        // The listing currently omits `session_id` (the MatrixOne
-        // query flattens task records into a projection). Callers
-        // that need per-session filtering should match on the
-        // project_type/title convention or keep the filter string
-        // empty — we enforce the cutoff unconditionally.
-        let _ = session_id_filter;
+        if !session_id_filter.is_empty() && item.session_id.as_deref() != Some(session_id_filter) {
+            continue;
+        }
         if item.updated_at.as_str() <= updated_after {
             continue;
         }
-        match item.status {
-            TaskStatus::Completed => out.ok += 1,
-            TaskStatus::Failed => out.failed += 1,
-            TaskStatus::Cancelled => out.cancelled += 1,
-            // Still running / paused / pending do not belong on the
-            // "what happened while you were gone" summary.
-            TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::Paused => {}
+        match task_list_item_outcome(item) {
+            Some(TaskOutcome::Partial) => out.partial += 1,
+            Some(TaskOutcome::Failed) => out.failed += 1,
+            Some(TaskOutcome::Cancelled) => out.cancelled += 1,
+            Some(TaskOutcome::Success) => out.ok += 1,
+            None => match item.status {
+                TaskStatus::Completed => out.ok += 1,
+                TaskStatus::Failed => out.failed += 1,
+                TaskStatus::Cancelled => out.cancelled += 1,
+                // Still running / paused / pending do not belong on the
+                // "what happened while you were gone" summary.
+                TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::Paused => {}
+            },
         }
     }
     out
+}
+
+pub(crate) fn last_seen_cutoff(last_turn_event: Option<&JournalEvent>) -> Option<&str> {
+    last_turn_event.map(|event| event.ts.as_str())
 }
 
 #[cfg(test)]
@@ -100,6 +113,7 @@ mod tests {
         TaskListItem {
             task_id: task_id.into(),
             title: format!("title-{task_id}"),
+            session_id: Some("sess-1".into()),
             status,
             progress_pct: 100,
             items_done: 1,
@@ -107,13 +121,39 @@ mod tests {
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: updated_at.into(),
             completed_at: None,
+            outcome: None,
+            error_message: None,
             project_type: None,
+            claimability: None,
         }
     }
 
     #[test]
+    fn summarize_prefers_structured_failure_over_completed_status() {
+        let mut task = item("a", TaskStatus::Completed, "2025-05-10T12:00:00Z");
+        task.outcome = Some(TaskOutcome::Success);
+        task.error_message = Some(crate::cli::task_surface::encode_task_failure_message(
+            "persistence_error",
+            "failed to append turn event",
+        ));
+        let summary = summarize(&[task], "", "");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.ok, 0);
+    }
+
+    #[test]
+    fn summarize_filters_foreign_session_items() {
+        let local = item("a", TaskStatus::Completed, "2025-05-10T12:00:00Z");
+        let mut foreign = item("b", TaskStatus::Failed, "2025-05-10T13:00:00Z");
+        foreign.session_id = Some("sess-2".into());
+        let summary = summarize(&[local, foreign], "sess-1", "");
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
     fn empty_list_yields_empty_summary() {
-        let s = summarize(&[], "sess", "");
+        let s = summarize(&[], "sess-1", "");
         assert!(s.is_empty());
         assert_eq!(s.total(), 0);
     }
@@ -126,11 +166,23 @@ mod tests {
             item("c", TaskStatus::Failed, "2025-05-10T13:30:00Z"),
             item("d", TaskStatus::Cancelled, "2025-05-10T14:00:00Z"),
         ];
-        let s = summarize(&tasks, "sess", "");
+        let s = summarize(&tasks, "sess-1", "");
         assert_eq!(s.ok, 2);
+        assert_eq!(s.partial, 0);
         assert_eq!(s.failed, 1);
         assert_eq!(s.cancelled, 1);
         assert_eq!(s.total(), 4);
+    }
+
+    #[test]
+    fn partial_completed_tasks_are_not_counted_as_ok() {
+        let mut task = item("a", TaskStatus::Completed, "2025-05-10T12:00:00Z");
+        task.outcome = Some(TaskOutcome::Partial);
+        let s = summarize(&[task], "sess-1", "");
+        assert_eq!(s.ok, 0);
+        assert_eq!(s.partial, 1);
+        assert_eq!(s.failed, 0);
+        assert_eq!(s.cancelled, 0);
     }
 
     #[test]
@@ -143,7 +195,7 @@ mod tests {
             item("b", TaskStatus::InProgress, "2025-05-10T13:00:00Z"),
             item("c", TaskStatus::Paused, "2025-05-10T14:00:00Z"),
         ];
-        let s = summarize(&tasks, "sess", "");
+        let s = summarize(&tasks, "sess-1", "");
         assert!(s.is_empty(), "non-terminal tasks must not appear: {s:?}");
     }
 
@@ -157,11 +209,28 @@ mod tests {
             item("at", TaskStatus::Completed, "2025-05-10T13:00:00Z"),
             item("after", TaskStatus::Completed, "2025-05-10T14:00:00Z"),
         ];
-        let s = summarize(&tasks, "sess", "2025-05-10T13:00:00Z");
+        let s = summarize(&tasks, "sess-1", "2025-05-10T13:00:00Z");
         assert_eq!(
             s.ok, 1,
             "only the 14:00 completion should appear post-cutoff: {s:?}"
         );
+    }
+
+    #[test]
+    fn last_seen_cutoff_prefers_last_turn_timestamp() {
+        let event = JournalEvent::turn(
+            Some("sess-1"),
+            3,
+            Some("gpt-5"),
+            "hi",
+            "hello",
+            0,
+            10,
+            5,
+            100,
+        );
+        assert_eq!(last_seen_cutoff(Some(&event)), Some(event.ts.as_str()));
+        assert_eq!(last_seen_cutoff(None), None);
     }
 
     #[test]
@@ -182,16 +251,20 @@ mod tests {
     fn render_uses_plural_and_lists_mixed_outcomes() {
         let s = ResumeSummary {
             ok: 2,
+            partial: 1,
             failed: 1,
             cancelled: 1,
         };
         let out = s.render();
         assert!(
-            out.contains("4 background tasks"),
+            out.contains("5 background tasks"),
             "plural copy missing: {out}"
         );
         assert!(
-            out.contains("2 ok") && out.contains("1 failed") && out.contains("1 cancelled"),
+            out.contains("2 ok")
+                && out.contains("1 partial")
+                && out.contains("1 failed")
+                && out.contains("1 cancelled"),
             "mixed breakdown missing parts: {out}"
         );
     }

@@ -107,20 +107,90 @@ pub(crate) fn session_is_resumable(session_id: &str) -> bool {
     }
 }
 
-pub(crate) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<String> {
+fn latest_session_segment_has_explicit_end(session_id: &str) -> bool {
+    let Ok(events) = session_journal::read_journal(session_id) else {
+        return false;
+    };
+
+    for event in events.iter().rev() {
+        match event.event_type {
+            session_journal::JournalEventType::SessionEnd => return true,
+            session_journal::JournalEventType::SessionStart => return false,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+pub(crate) fn local_session_is_resumable(session_id: &str) -> bool {
+    if session_journal::validate_session_id(session_id).is_err() {
+        return false;
+    }
+    let journal_exists = session_journal::journal_file_path(session_id).exists();
+    let has_heavy_checkpoint =
+        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id)
+            .map(|checkpoint| checkpoint.is_some())
+            .unwrap_or(false);
+    let workspace = match astra_services::session_workspace::read_workspace_optional(session_id) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to read workspace metadata while checking local resumability"
+            );
+            if !journal_exists {
+                return true;
+            }
+            None
+        }
+    };
+
+    if !journal_exists {
+        return workspace
+            .as_ref()
+            .is_some_and(|ws| !ws.status.eq_ignore_ascii_case("completed"));
+    }
+
+    match session_journal::classify_session_end_state(session_id) {
+        Ok(session_journal::SessionEndState::Completed) => {
+            has_heavy_checkpoint && !latest_session_segment_has_explicit_end(session_id)
+        }
+        Ok(session_journal::SessionEndState::Interrupted { resumable, .. }) => resumable,
+        Ok(session_journal::SessionEndState::Zombie) => true,
+        Err(_) => has_heavy_checkpoint,
+    }
+}
+
+pub(crate) fn local_resumable_last_session_id(cli_profile: Option<&str>) -> Option<String> {
+    stored_last_session_id(cli_profile).filter(|session_id| local_session_is_resumable(session_id))
+}
+
+fn stored_last_session_id(cli_profile: Option<&str>) -> Option<String> {
     let creds = load_credentials();
     let name = profile_name(cli_profile, &creds);
-    creds
+    let session_id = creds
         .profiles
         .get(&name)
-        .and_then(|profile| profile.last_session_id.clone())
-        .filter(|session_id| session_is_resumable(session_id))
+        .and_then(|profile| profile.last_session_id.clone())?;
+    if session_journal::validate_session_id(&session_id).is_ok() {
+        Some(session_id)
+    } else {
+        clear_profile_last_session_if_matches_or_warn(
+            cli_profile,
+            &session_id,
+            "cli_utils:stored_last_session_id",
+        );
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionResumePreflight {
     Valid,
     Missing,
+    NoAuth,
     Unknown,
 }
 
@@ -151,15 +221,95 @@ pub(crate) fn clear_profile_last_session_if_matches(
     })
 }
 
+pub(crate) fn clear_profile_last_session_if_matches_or_warn(
+    cli_profile: Option<&str>,
+    session_id: &str,
+    context: &'static str,
+) {
+    if let Err(error) = clear_profile_last_session_if_matches(cli_profile, session_id) {
+        tracing::warn!(
+            %error,
+            %session_id,
+            context,
+            "failed to clear matching profile last_session_id"
+        );
+    }
+}
+
 pub(crate) fn persist_profile_last_session(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> Result<(), String> {
+    validate_cli_session_id(session_id)?;
     mutate_credentials(|creds| {
         let name = profile_name(cli_profile, creds);
         let entry = creds.profiles.entry(name).or_default();
         entry.last_session_id = Some(session_id.to_string());
     })
+}
+
+pub(crate) fn persist_profile_last_session_or_warn(
+    cli_profile: Option<&str>,
+    session_id: &str,
+    context: &'static str,
+) {
+    if let Err(error) = persist_profile_last_session(cli_profile, session_id) {
+        tracing::warn!(
+            %error,
+            %session_id,
+            context,
+            "failed to persist profile last_session_id"
+        );
+    }
+}
+
+pub(crate) fn append_journal_event_or_warn(
+    journal: &session_journal::JournalWriter,
+    session_id: Option<&str>,
+    event: &session_journal::JournalEvent,
+    context: &'static str,
+) {
+    if let Err(error) = journal.append(event) {
+        tracing::warn!(
+            %error,
+            session_id,
+            context,
+            "failed to append journal event"
+        );
+    }
+}
+
+pub(crate) fn append_session_journal_event_or_warn(
+    session_id: &str,
+    event: &session_journal::JournalEvent,
+    context: &'static str,
+) {
+    match session_journal::JournalWriter::new(session_id) {
+        Ok(journal) => append_journal_event_or_warn(&journal, Some(session_id), event, context),
+        Err(error) => tracing::warn!(
+            %error,
+            %session_id,
+            context,
+            "failed to open journal for append"
+        ),
+    }
+}
+
+pub(crate) fn append_bulk_journal_events_no_sync_or_warn(
+    journal: &session_journal::JournalWriter,
+    session_id: Option<&str>,
+    events: &[session_journal::JournalEvent],
+    context: &'static str,
+) {
+    if let Err(error) = journal.append_bulk_no_sync(events) {
+        tracing::warn!(
+            %error,
+            session_id,
+            context,
+            count = events.len(),
+            "failed to append journal events"
+        );
+    }
 }
 
 pub(crate) fn persist_profile_memoria_api_key(
@@ -173,22 +323,20 @@ pub(crate) fn persist_profile_memoria_api_key(
     })
 }
 
+pub(crate) fn validate_cli_session_id(session_id: &str) -> Result<(), String> {
+    session_journal::validate_session_id(session_id).map_err(|e| format!("invalid session_id: {e}"))
+}
+
 pub(crate) async fn preflight_remote_resume_session(
     api: &astra_thin_client::ThinClient,
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> SessionResumePreflight {
-    let creds = load_credentials();
-    let name = profile_name(cli_profile, &creds);
-    let Some(token) = creds
-        .profiles
-        .get(&name)
-        .and_then(|profile| profile.access_token.as_deref())
-    else {
-        return SessionResumePreflight::Unknown;
+    let Some(token) = crate::cli::session_runtime::current_access_token(cli_profile) else {
+        return SessionResumePreflight::NoAuth;
     };
 
-    match api.get_session(Some(token), session_id).await {
+    match api.get_session(Some(&token), session_id).await {
         Ok(_) => SessionResumePreflight::Valid,
         Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
             SessionResumePreflight::Missing
@@ -201,11 +349,18 @@ pub(crate) async fn validated_resumable_last_session_id(
     api: &astra_thin_client::ThinClient,
     cli_profile: Option<&str>,
 ) -> Option<String> {
-    let session_id = resumable_last_session_id(cli_profile)?;
+    let session_id = stored_last_session_id(cli_profile)?;
     match preflight_remote_resume_session(api, cli_profile, &session_id).await {
         SessionResumePreflight::Valid | SessionResumePreflight::Unknown => Some(session_id),
+        SessionResumePreflight::NoAuth => {
+            local_resumable_last_session_id(cli_profile).filter(|local| local == &session_id)
+        }
         SessionResumePreflight::Missing => {
-            let _ = clear_profile_last_session_if_matches(cli_profile, &session_id);
+            clear_profile_last_session_if_matches_or_warn(
+                cli_profile,
+                &session_id,
+                "cli_utils:validated_resumable_last_session_id",
+            );
             None
         }
     }
@@ -678,6 +833,34 @@ mod tests {
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
     fn runtime_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -892,25 +1075,34 @@ mod tests {
 
     // ── profile_name ──────────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[test]
     fn profile_name_uses_cli_override() {
-        let creds = CredentialsFile::default();
-        assert_eq!(profile_name(Some("staging"), &creds), "staging");
+        temp_env::with_var("ASTRA_PROFILE", None::<&str>, || {
+            let creds = CredentialsFile::default();
+            assert_eq!(profile_name(Some("staging"), &creds), "staging");
+        });
     }
 
+    #[serial_test::serial]
     #[test]
     fn profile_name_uses_default_from_creds() {
-        let creds = CredentialsFile {
-            current_profile: Some("prod".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(profile_name(None, &creds), "prod");
+        temp_env::with_var("ASTRA_PROFILE", None::<&str>, || {
+            let creds = CredentialsFile {
+                current_profile: Some("prod".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(profile_name(None, &creds), "prod");
+        });
     }
 
+    #[serial_test::serial]
     #[test]
     fn profile_name_falls_back_to_default() {
-        let creds = CredentialsFile::default();
-        assert_eq!(profile_name(None, &creds), "default");
+        temp_env::with_var("ASTRA_PROFILE", None::<&str>, || {
+            let creds = CredentialsFile::default();
+            assert_eq!(profile_name(None, &creds), "default");
+        });
     }
 
     #[test]
@@ -950,6 +1142,30 @@ mod tests {
         assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
         assert_eq!(profile.access_token.as_deref(), Some("tok"));
         assert_eq!(profile.refresh_token.as_deref(), Some("ref"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn persist_profile_last_session_rejects_invalid_session_id_without_mutation() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some("sess-old".to_string()),
+                access_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let err = persist_profile_last_session(None, "../escape").unwrap_err();
+
+        assert!(err.contains("invalid session_id"), "got: {err}");
+        let creds = load_credentials();
+        let profile = &creds.profiles["default"];
+        assert_eq!(profile.last_session_id.as_deref(), Some("sess-old"));
+        assert_eq!(profile.access_token.as_deref(), Some("tok"));
     }
 
     #[serial_test::serial]
@@ -1034,21 +1250,63 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn resumable_last_session_id_filters_ended_sessions() {
+    fn local_resumable_last_session_id_ignores_stale_pointer_without_local_state() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
 
-        let sid = format!("test-profile-ended-{}", uuid::Uuid::new_v4());
-        let writer = session_journal::JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                Some("gpt-5"),
-            ))
-            .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_end(Some(&sid), 0))
-            .unwrap();
+        let sid = format!("test-stale-local-{}", uuid::Uuid::new_v4());
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(local_resumable_last_session_id(None), None);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn local_resumable_last_session_id_keeps_workspace_only_active_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+
+        let sid = format!("test-workspace-only-{}", uuid::Uuid::new_v4());
+        let ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(
+            local_resumable_last_session_id(None).as_deref(),
+            Some(sid.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn local_resumable_last_session_id_ignores_workspace_only_completed_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+
+        let sid = format!("test-workspace-completed-{}", uuid::Uuid::new_v4());
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.status = "completed".to_string();
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
 
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
@@ -1060,7 +1318,134 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        assert_eq!(resumable_last_session_id(None), None);
+        assert_eq!(local_resumable_last_session_id(None), None);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn local_resumable_last_session_id_keeps_workspace_only_corrupt_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+
+        let sid = format!("test-workspace-corrupt-{}", uuid::Uuid::new_v4());
+        let path = astra_services::session_workspace::workspace_file_path(&sid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, ":\nnot-valid-yaml").unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(
+            local_resumable_last_session_id(None).as_deref(),
+            Some(sid.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn local_resumable_last_session_id_keeps_checkpoint_backed_session_without_terminal_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+
+        let sid = uuid::Uuid::new_v4().to_string();
+        let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::session_start(
+                    Some(&sid),
+                    Some("gpt-5"),
+                ),
+            )
+            .unwrap();
+        drop(writer);
+
+        let heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
+            light: astra_pipeline::step_protocol::LightCheckpoint {
+                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
+                cursor: Default::default(),
+                step_id: "step-1".to_string(),
+                task_id: "task-1".to_string(),
+                agent_id: sid.clone(),
+                progress: 1.0,
+                total_tokens: 42,
+                created_at: astra_pipeline::step_protocol::epoch_ms(),
+            },
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "previous question"}),
+                serde_json::json!({"role": "assistant", "content": "previous answer"}),
+            ],
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
+            blocked_tools: Vec::new(),
+            recent_tools: Vec::new(),
+            memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
+            pipeline_state: None,
+            compaction_state: None,
+            config_version_id: None,
+        };
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &sid,
+            1,
+            &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(
+            local_resumable_last_session_id(None).as_deref(),
+            Some(sid.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn local_resumable_last_session_id_clears_invalid_pointer_without_panicking() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some("../escape".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(local_resumable_last_session_id(None), None);
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            None
+        );
     }
 
     #[serial_test::serial]
@@ -1154,6 +1539,103 @@ mod tests {
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
             Some(session_id.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn validated_resumable_last_session_id_uses_env_token_when_credentials_token_missing() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("env-token-session-{}", uuid::Uuid::new_v4());
+        write_resumable_session(&session_id);
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(session_id.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "env-token-xyz");
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = validated_resumable_last_session_id(&api, None).await;
+        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn validated_resumable_last_session_id_keeps_live_remote_session_without_local_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("remote-only-session-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = validated_resumable_last_session_id(&api, None).await;
+
+        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(session_id.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn validated_resumable_last_session_id_ignores_remote_pointer_without_auth_or_local_state()
+     {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
+        let session_id = format!("unauthed-remote-only-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&session_id);
+        mutate_credentials(|creds| {
+            if let Some(entry) = creds.profiles.get_mut("default") {
+                entry.access_token = None;
+            }
+        })
+        .unwrap();
+
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = validated_resumable_last_session_id(&api, None).await;
+
+        assert_eq!(resolved, None);
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(session_id.as_str()),
+            "missing auth must not clear the stored pointer; it is only unusable in this process"
         );
     }
 

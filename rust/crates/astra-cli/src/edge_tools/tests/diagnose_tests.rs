@@ -93,6 +93,26 @@ async fn diagnose_tasks_with_items() {
 }
 
 #[tokio::test]
+async fn diagnose_tasks_counts_cancelled_as_unsuccessful() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    exe.task_create(&json!({"title": "Task 1"})).await;
+    exe.task_create(&json!({"title": "Task 2"})).await;
+    exe.task_update(&json!({"task_id": "task-1", "status": "in_progress"}))
+        .await;
+    exe.task_stop(&json!({"task_id": "task-1", "reason": "user cancelled"}))
+        .await;
+
+    let result = exe.diagnose(&json!({"category": "tasks"})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["tasks"]["failed_or_cancelled"], 1);
+    assert_eq!(parsed["tasks"]["completed"], 0);
+    assert_eq!(parsed["tasks"]["pending"], 1);
+}
+
+#[tokio::test]
 async fn diagnose_session_info() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());

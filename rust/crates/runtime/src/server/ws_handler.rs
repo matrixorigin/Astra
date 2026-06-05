@@ -44,6 +44,7 @@ use super::*;
 use crate::server::run::handlers::transform_stream_run_events_for_client_with_pending;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
+use astra_services::runs::durable_run_status_is_terminal;
 use astra_tools::{AskUserAnswers, AskUserPrompt};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -1117,16 +1118,12 @@ fn ws_text_frame_exceeds_limit(text: &str) -> bool {
     text.len() > MAX_MESSAGE_SIZE
 }
 
-fn run_status_is_terminal(status: &str) -> bool {
-    matches!(status, STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED)
-}
-
 fn cancel_run_outcome_message(record: &astra_services::runs::CancelRunRecord) -> WsServerMessage {
     match record.status.as_str() {
         STATUS_CANCELLED => WsServerMessage::RunCancelled {
             run_id: record.run_id.clone(),
         },
-        status if run_status_is_terminal(status) => WsServerMessage::RunFinished {
+        status if durable_run_status_is_terminal(status) => WsServerMessage::RunFinished {
             run_id: record.run_id.clone(),
             status: status.to_string(),
             error: None,
@@ -1708,7 +1705,7 @@ async fn stream_run_over_websocket(
                     }
                 };
 
-                if run_status_is_terminal(&status.status) {
+                if durable_run_status_is_terminal(&status.status) {
                     send_msg(
                         socket,
                         &WsServerMessage::RunFinished {
@@ -2597,12 +2594,12 @@ mod tests {
     }
 
     #[test]
-    fn run_status_is_terminal_detects_expected_statuses() {
-        assert!(run_status_is_terminal(STATUS_COMPLETED));
-        assert!(run_status_is_terminal(STATUS_FAILED));
-        assert!(run_status_is_terminal(STATUS_CANCELLED));
-        assert!(!run_status_is_terminal("running"));
-        assert!(!run_status_is_terminal("paused"));
+    fn durable_run_status_is_terminal_detects_expected_statuses() {
+        assert!(durable_run_status_is_terminal(STATUS_COMPLETED));
+        assert!(durable_run_status_is_terminal(STATUS_FAILED));
+        assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
+        assert!(!durable_run_status_is_terminal("running"));
+        assert!(!durable_run_status_is_terminal("paused"));
     }
 
     #[test]

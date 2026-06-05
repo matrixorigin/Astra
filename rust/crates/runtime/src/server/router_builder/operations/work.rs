@@ -25,6 +25,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(task_handlers::post_task_lease_claim_handler),
         )
         .route(
+            "/tasks/lease/claim-next",
+            post(task_handlers::post_task_lease_claim_next_handler),
+        )
+        .route(
             "/tasks/{task_id}/lease/release",
             post(task_handlers::post_task_lease_release_handler),
         )

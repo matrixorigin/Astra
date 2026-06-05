@@ -35,6 +35,10 @@ use serde::{Deserialize, Serialize};
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 
 use crate::cli::cli_args;
+use crate::cli::delegation_event_surface::{
+    project_delegation_started, project_delegation_sub_run_completed,
+    project_delegation_sub_run_started,
+};
 use crate::cli::journal_digest;
 
 /// One node in the rendered tree. Leaf = no `children`.
@@ -151,25 +155,29 @@ pub(crate) fn fold_events_into_tree(
             }
             JournalEventType::DelegationSubRunStarted | JournalEventType::DelegationStarted => {
                 seq = seq.saturating_add(1);
-                let run_id = ev
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("run_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("delegate-{seq}"));
-                let agent_type = ev
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("agent_type"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let task = ev
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("task"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| truncate(s, 120));
+                let (run_id, agent_type, task) = match ev.event_type {
+                    JournalEventType::DelegationStarted => {
+                        let projection = project_delegation_started(ev.metadata.as_ref());
+                        (
+                            projection
+                                .run_id
+                                .unwrap_or_else(|| format!("delegate-{seq}")),
+                            projection.agent_type,
+                            projection.task.map(|s| truncate(&s, 120)),
+                        )
+                    }
+                    JournalEventType::DelegationSubRunStarted => {
+                        let projection = project_delegation_sub_run_started(ev.metadata.as_ref());
+                        (
+                            projection
+                                .run_id
+                                .unwrap_or_else(|| format!("delegate-{seq}")),
+                            projection.agent_type,
+                            projection.task.map(|s| truncate(&s, 120)),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
                 let label = agent_type
                     .clone()
                     .unwrap_or_else(|| format!("delegate#{seq}"));
@@ -199,12 +207,7 @@ pub(crate) fn fold_events_into_tree(
                 }
             }
             JournalEventType::DelegationSubRunCompleted => {
-                let run_id = ev
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("run_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
+                let run_id = project_delegation_sub_run_completed(ev.metadata.as_ref()).run_id;
                 let Some(rid) = run_id else {
                     // Completed event without a run_id — we can't
                     // attach to any specific child. Count and move on.

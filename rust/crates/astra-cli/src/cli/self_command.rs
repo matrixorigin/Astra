@@ -4,26 +4,19 @@ use serde::Serialize;
 use crate::cli::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
 };
-use crate::cli::cli_utils::resumable_last_session_id;
+use crate::cli::cli_utils::local_resumable_last_session_id;
+use crate::cli::session_continuation::extract_text_content;
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
+use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
-use astra_services::session_restore::{
-    HybridRestoreService, RestoredSession, SessionRestoreService,
-};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
 
 #[path = "self_surface.rs"]
 mod self_surface;
 
-#[derive(Debug, Clone)]
-struct SessionArtifacts {
-    session_id: String,
-    workspace: Option<WorkspaceMetadata>,
-    restored: Option<RestoredSession>,
-    journal_events: Vec<JournalEvent>,
-}
+type SessionArtifacts = LoadedSelfSurfaceArtifacts;
 
 #[derive(Debug, Serialize)]
 struct IdentityView {
@@ -37,6 +30,7 @@ struct ReflectResponse {
     session_id: String,
     focus: String,
     question: Option<String>,
+    persistence_warning: Option<String>,
     /// Placeholder: the old liquid-reflection subsystem was removed. The CLI now
     /// returns a minimal reflection surface so callers can still inspect the
     /// recent journal turns under the chosen focus.
@@ -82,10 +76,11 @@ pub(crate) async fn execute_self_command(
 ) -> Result<String, String> {
     match cmd {
         SelfCmd::Snapshot(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "snapshot",
                 20,
+                profile,
             )
             .await
         }
@@ -95,84 +90,93 @@ pub(crate) async fn execute_self_command(
             question,
             last_n,
         }) => {
-            render_reflect_surface_for_session(
-                &resolve_session_id(session_id.as_deref(), profile)?,
+            render_reflect_surface_for_session_with_profile(
+                &resolve_target_session_id(session_id.as_deref(), profile).await?,
                 *last_n,
                 Some(focus.as_str()),
                 question.as_deref(),
+                profile,
             )
             .await
         }
         SelfCmd::Profile(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "profile",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Goal(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "goal",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Trace(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "trace",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Budget(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "budget",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Signals(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "signals",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Health(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "health",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Journal(SelfJournalArgs { session_id, limit }) => {
-            render_surface_for_session(
-                &resolve_session_id(session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(session_id.as_deref(), profile).await?,
                 "journal",
                 *limit,
+                profile,
             )
             .await
         }
         SelfCmd::Verify(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
+            render_surface_for_session_with_profile(
+                &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "verify",
                 20,
+                profile,
             )
             .await
         }
         SelfCmd::Mutate(SelfMutateCmd::Preview(args)) => {
-            let session_id = resolve_session_id(args.session_id.as_deref(), profile)?;
+            let session_id = resolve_target_session_id(args.session_id.as_deref(), profile).await?;
             to_json(&preview_config_mutation(&session_id, args)?)
         }
         SelfCmd::Mutate(SelfMutateCmd::Apply(args)) => {
-            let session_id = resolve_session_id(args.session_id.as_deref(), profile)?;
+            let session_id = resolve_target_session_id(args.session_id.as_deref(), profile).await?;
             let preview = preview_config_mutation(&session_id, args)?;
             persist_config_mutation(&session_id, args, &preview)?;
             to_json(&preview)
@@ -185,7 +189,22 @@ pub(crate) async fn render_surface_for_session(
     surface: &str,
     journal_limit: usize,
 ) -> Result<String, String> {
-    self_surface::render_surface_for_session(session_id, surface, journal_limit).await
+    render_surface_for_session_with_profile(session_id, surface, journal_limit, None).await
+}
+
+pub(crate) async fn render_surface_for_session_with_profile(
+    session_id: &str,
+    surface: &str,
+    journal_limit: usize,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    self_surface::render_surface_for_session_with_profile(
+        session_id,
+        surface,
+        journal_limit,
+        profile,
+    )
+    .await
 }
 
 pub(crate) async fn render_reflect_surface_for_session(
@@ -194,7 +213,51 @@ pub(crate) async fn render_reflect_surface_for_session(
     focus: Option<&str>,
     question: Option<&str>,
 ) -> Result<String, String> {
-    let artifacts = load_artifacts(session_id.to_string()).await?;
+    render_reflect_surface_for_session_with_profile(
+        session_id,
+        journal_limit,
+        focus,
+        question,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
+    session_id: &str,
+    journal_limit: usize,
+    focus: Option<&str>,
+    question: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Option<String>, String> {
+    match render_reflect_surface_for_session_with_profile(
+        session_id,
+        journal_limit,
+        focus,
+        question,
+        profile,
+    )
+    .await
+    {
+        Ok(body) => Ok(Some(body)),
+        Err(error) if reflect_surface_missing_state(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn reflect_surface_missing_state(error: &str) -> bool {
+    error.starts_with("no persistent local or cloud state found for session ")
+        || error.starts_with("no persistent local state found for session ")
+}
+
+pub(crate) async fn render_reflect_surface_for_session_with_profile(
+    session_id: &str,
+    journal_limit: usize,
+    focus: Option<&str>,
+    question: Option<&str>,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    let artifacts = self_surface::load_artifacts(session_id, profile).await?;
     to_json(
         &build_reflect_response(
             &artifacts,
@@ -245,8 +308,17 @@ fn resolve_session_id(query: Option<&str>, profile: Option<&str>) -> Result<Stri
     match query.map(str::trim).filter(|s| !s.is_empty()) {
         Some(q) => session_journal::resolve_session_id(q)
             .or_else(|_| {
-                let ws_path = session_workspace::workspace_dir_for(q).join("workspace.yaml");
-                if ws_path.exists() {
+                session_journal::validate_session_id(q).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no session journal or workspace matches '{q}'"),
+                    )
+                })?;
+                let ws_path = session_workspace::workspace_file_path(q)?;
+                if ws_path.exists()
+                    || (crate::cli::session_runtime::resolve_cloud_base().is_some()
+                        && crate::cli::session_runtime::current_access_token(profile).is_some())
+                {
                     Ok(q.to_string())
                 } else {
                     Err(std::io::Error::new(
@@ -256,27 +328,45 @@ fn resolve_session_id(query: Option<&str>, profile: Option<&str>) -> Result<Stri
                 }
             })
             .map_err(|e| e.to_string()),
-        None => resumable_last_session_id(profile)
-            .ok_or_else(|| "no resumable session found; pass a session id explicitly".to_string()),
+        None => Err("no resumable session found; pass a session id explicitly".to_string()),
     }
 }
 
-async fn load_artifacts(session_id: String) -> Result<SessionArtifacts, String> {
-    let workspace = session_workspace::read_workspace(&session_id).ok();
-    let journal_events = session_journal::read_journal(&session_id).unwrap_or_default();
-    let restore_service = HybridRestoreService::local_only();
-    let restored = restore_service.restore_session(&session_id).await?;
-    if workspace.is_none() && restored.is_none() && journal_events.is_empty() {
-        return Err(format!(
-            "no persistent local state found for session {session_id}"
-        ));
+async fn resolve_target_session_id(
+    query: Option<&str>,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    if query.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return resolve_session_id(query, profile);
     }
-    Ok(SessionArtifacts {
-        session_id,
-        workspace,
-        restored,
-        journal_events,
-    })
+    resolve_default_session_id(profile).await
+}
+
+async fn resolve_default_session_id(profile: Option<&str>) -> Result<String, String> {
+    if let Some(api) = crate::cli::session_restore_client::cloud_resume_client()?
+        && crate::cli::session_runtime::current_access_token(profile).is_some()
+    {
+        if let Some(session_id) =
+            crate::cli::cli_utils::validated_resumable_last_session_id(&api, profile).await
+        {
+            return Ok(session_id);
+        }
+
+        let sessions =
+            crate::cli::session_restore_client::list_cloud_resumable_sessions(profile, &api)
+                .await?;
+        if let Some(session) = sessions.into_iter().find(|session| session.turn_count > 0) {
+            crate::cli::cli_utils::persist_profile_last_session_or_warn(
+                profile,
+                &session.session_id,
+                "self_command:resolve_default_session_id",
+            );
+            return Ok(session.session_id);
+        }
+    }
+
+    local_resumable_last_session_id(profile)
+        .ok_or_else(|| "no resumable session found; pass a session id explicitly".to_string())
 }
 
 async fn build_reflect_response(
@@ -294,12 +384,26 @@ async fn build_reflect_response(
         .iter()
         .filter_map(|event| event.turn)
         .max()
+        .or_else(|| {
+            artifacts
+                .restored
+                .as_ref()
+                .map(|restored| restored.turn_count)
+        })
         .unwrap_or_default();
+    let persistence_warning = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.last_persistence_error.as_deref())
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .map(|error| format!("session persistence degraded: {error}"));
     let reflection_context = serde_json::json!({
         "session_id": artifacts.session_id,
         "turns_completed": turns_completed,
         "focus": focus,
         "question": question,
+        "persistence_warning": persistence_warning.clone(),
         "note": "liquid-reflection subsystem removed; see recent_turns for journal signals",
     });
     let prompt_preview = match question {
@@ -310,13 +414,14 @@ async fn build_reflect_response(
         session_id: artifacts.session_id.clone(),
         focus: focus.to_string(),
         question: question.map(str::to_string),
+        persistence_warning,
         reflection_context,
         prompt_preview,
-        recent_turns: focused_recent_event_previews(
-            &artifacts.journal_events,
-            journal_limit,
-            focus,
-        ),
+        recent_turns: if artifacts.journal_events.is_empty() {
+            restored_recent_turn_previews(artifacts, journal_limit)
+        } else {
+            focused_recent_event_previews(&artifacts.journal_events, journal_limit, focus)
+        },
     }
 }
 
@@ -571,6 +676,85 @@ fn focused_recent_event_previews(
     recent_event_previews(events, journal_limit.clamp(1, 12), event_types)
 }
 
+fn restored_recent_turn_previews(
+    artifacts: &SessionArtifacts,
+    journal_limit: usize,
+) -> Vec<EventPreview> {
+    let Some(restored) = artifacts.restored.as_ref() else {
+        return Vec::new();
+    };
+
+    let ts = artifacts
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.updated_at.clone())
+        .unwrap_or_default();
+    let mut previews = Vec::new();
+    let mut pending_user: Option<String> = None;
+    let mut turn = 0u32;
+
+    for message in &restored.conversation_messages {
+        let role = message.get("role").and_then(serde_json::Value::as_str);
+        match role {
+            Some("user") => {
+                pending_user = extract_text_content(message);
+            }
+            Some("assistant") => {
+                turn += 1;
+                previews.push(EventPreview {
+                    event_type: "turn".to_string(),
+                    ts: ts.clone(),
+                    turn: Some(turn),
+                    error: None,
+                    tools_used: None,
+                    metadata: Some(serde_json::json!({ "source": "cloud_resume" })),
+                    user_input_preview: pending_user.take().map(|text| truncate(&text, 160)),
+                    assistant_output_preview: extract_text_content(message)
+                        .map(|text| truncate(&text, 160)),
+                });
+            }
+            Some("tool") => {
+                if let Some(last) = previews.last_mut() {
+                    let tool_name = message
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            message
+                                .get("tool_name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    if let Some(tool_name) = tool_name {
+                        last.tools_used.get_or_insert_with(Vec::new).push(tool_name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if pending_user.is_some() {
+        turn += 1;
+        previews.push(EventPreview {
+            event_type: "turn".to_string(),
+            ts,
+            turn: Some(turn),
+            error: None,
+            tools_used: None,
+            metadata: Some(serde_json::json!({ "source": "cloud_resume" })),
+            user_input_preview: pending_user.map(|text| truncate(&text, 160)),
+            assistant_output_preview: None,
+        });
+    }
+
+    previews
+        .into_iter()
+        .rev()
+        .take(journal_limit.clamp(1, 12))
+        .collect()
+}
+
 fn effective_runtime_config(
     workspace: Option<&WorkspaceMetadata>,
 ) -> Result<RuntimeConfig, String> {
@@ -772,8 +956,67 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::cli::cli_args::SelfSessionArgs;
+    use crate::cli::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
     use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
     use astra_services::session_workspace::ContextTraceSignal;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    async fn mock_cloud_resume(
+        server: &MockServer,
+        session_id: &str,
+        restored: &astra_services::session_restore::RestoredSession,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(restored))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_cloud_resumable_list(
+        server: &MockServer,
+        sessions: &[astra_services::session_restore::RestoredSession],
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/sessions/resumable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                astra_services::session_restore::ResumableSessionsResponse {
+                    sessions: sessions.to_vec(),
+                    limit: 20,
+                },
+            ))
+            .mount(server)
+            .await;
+    }
 
     #[test]
     fn replace_json_path_updates_existing_leaf() {
@@ -805,6 +1048,12 @@ mod tests {
                 .iter()
                 .any(|check| { check.name == "verification_bounds" && !check.ok })
         );
+    }
+
+    #[test]
+    fn resolve_session_id_rejects_invalid_input_without_panicking() {
+        let error = resolve_session_id(Some("../bad"), None).unwrap_err();
+        assert!(error.contains("no session journal or workspace matches"));
     }
 
     #[tokio::test]
@@ -921,6 +1170,84 @@ mod tests {
                 .contains("turn-7")
         );
         assert_eq!(value["acceptance"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_persistence_error_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-snapshot-persistence";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.last_persistence_error = Some("failed to append turn event".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&JournalEvent {
+                event_type: JournalEventType::Turn,
+                ts: Utc::now().to_rfc3339(),
+                session_id: Some(session_id.to_string()),
+                turn: Some(1),
+                agentic_step: None,
+                model: Some("gpt-5.4".to_string()),
+                user_input: Some("continue".to_string()),
+                assistant_output: Some("implemented".to_string()),
+                tool_count: Some(0),
+                tokens_in: Some(10),
+                tokens_out: Some(20),
+                duration_ms: Some(50),
+                error: None,
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: None,
+                selected_skills: None,
+                tools_used: None,
+                tool_calls: None,
+                budget_used: None,
+                budget_pressure: None,
+                stall_type: None,
+                metadata: None,
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: None,
+                routing_domain_hint: Some("code".to_string()),
+                entity_learn_skipped_no_domain: false,
+                round: None,
+                tool_calls_returned: None,
+                offset_ms: None,
+                llm_rounds: None,
+                total_llm_ms: None,
+                total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
+            })
+            .unwrap();
+
+        let body = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            value["run"]["persistence_error"].as_str(),
+            Some("failed to append turn event")
+        );
     }
 
     #[tokio::test]
@@ -1060,5 +1387,356 @@ mod tests {
         assert!(checks.iter().any(|check| {
             check["name"] == "steps_present_when_journal_present" && check["ok"] == true
         }));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn snapshot_uses_cloud_restore_when_local_state_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+        let session_id = "11111111-1111-1111-1111-111111111111";
+
+        let mut workspace =
+            WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
+        workspace.plan_goal = Some("ship cloud restore".to_string());
+        workspace.pinned_tools = vec!["bash".to_string()];
+        workspace.discovered_skills = vec!["session-recovery".to_string()];
+        let restored = astra_services::session_restore::RestoredSession {
+            session_id: session_id.to_string(),
+            turn_count: 3,
+            total_tokens_in: 120,
+            total_tokens_out: 45,
+            last_status: "active".to_string(),
+            restored_from_cloud: true,
+            workspace: Some(workspace),
+            conversation_messages: vec![
+                serde_json::json!({"role":"user","content":"continue"}),
+                serde_json::json!({"role":"assistant","content":"restored from cloud"}),
+            ],
+            ..Default::default()
+        };
+        mock_cloud_resume(&server, session_id, &restored).await;
+
+        let body = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["run"]["session_id"], session_id);
+        assert_eq!(value["run"]["turn_count"], 3);
+        assert_eq!(value["run"]["goal"], "ship cloud restore");
+        assert_eq!(value["environment"]["cwd"], "/srv/cloud-repo");
+        assert_eq!(value["environment"]["model"], "gpt-5.4");
+        assert_eq!(
+            value["environment"]["discovered_skills"][0],
+            "session-recovery"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn snapshot_merges_local_and_restored_persistence_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+        let session_id = "66666666-6666-6666-6666-666666666666";
+
+        let mut local_workspace =
+            WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        local_workspace.last_persistence_error = Some("failed to append turn event".to_string());
+        session_workspace::write_workspace(&local_workspace).unwrap();
+
+        let mut restored_workspace =
+            WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
+        restored_workspace.last_persistence_error =
+            Some("failed to write workspace metadata".to_string());
+        let restored = astra_services::session_restore::RestoredSession {
+            session_id: session_id.to_string(),
+            turn_count: 3,
+            total_tokens_in: 120,
+            total_tokens_out: 45,
+            last_status: "active".to_string(),
+            restored_from_cloud: true,
+            workspace: Some(restored_workspace),
+            conversation_messages: vec![
+                serde_json::json!({"role":"user","content":"continue"}),
+                serde_json::json!({"role":"assistant","content":"restored from cloud"}),
+            ],
+            ..Default::default()
+        };
+        mock_cloud_resume(&server, session_id, &restored).await;
+
+        let body = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let persistence_error = value["run"]["persistence_error"]
+            .as_str()
+            .expect("snapshot should surface merged persistence error");
+        assert!(persistence_error.contains("failed to append turn event"));
+        assert!(
+            persistence_error.contains("restored snapshot: failed to write workspace metadata")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reflect_uses_cloud_conversation_when_local_journal_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+        let session_id = "22222222-2222-2222-2222-222222222222";
+
+        let restored = astra_services::session_restore::RestoredSession {
+            session_id: session_id.to_string(),
+            turn_count: 2,
+            total_tokens_in: 88,
+            total_tokens_out: 34,
+            last_status: "active".to_string(),
+            restored_from_cloud: true,
+            conversation_messages: vec![
+                serde_json::json!({"role":"user","content":"check history"}),
+                serde_json::json!({"role":"assistant","content":"history restored"}),
+            ],
+            ..Default::default()
+        };
+        mock_cloud_resume(&server, session_id, &restored).await;
+
+        let body = execute_self_command(
+            &SelfCmd::Reflect(SelfReflectArgs {
+                session_id: Some(session_id.to_string()),
+                focus: "history".to_string(),
+                question: None,
+                last_n: 4,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["session_id"], session_id);
+        assert_eq!(value["reflection_context"]["turns_completed"], 2);
+        let recent_turns = value["recent_turns"].as_array().unwrap();
+        assert_eq!(recent_turns.len(), 1);
+        assert_eq!(recent_turns[0]["metadata"]["source"], "cloud_resume");
+        assert_eq!(recent_turns[0]["user_input_preview"], "check history");
+        assert_eq!(
+            recent_turns[0]["assistant_output_preview"],
+            "history restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn reflect_response_includes_persistence_warning_from_workspace() {
+        let session_id = "reflect-persistence-session";
+        let mut workspace =
+            WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        workspace.last_persistence_error = Some("failed to append turn event".to_string());
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: Some(workspace),
+            restored: None,
+            journal_events: Vec::new(),
+            latest_full_context_trace: None,
+        };
+
+        let response = build_reflect_response(&artifacts, 4, "history", None).await;
+
+        assert_eq!(
+            response.persistence_warning.as_deref(),
+            Some("session persistence degraded: failed to append turn event")
+        );
+        assert_eq!(
+            response.reflection_context["persistence_warning"].as_str(),
+            Some("session persistence degraded: failed to append turn event")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn snapshot_without_session_id_replaces_stale_pointer_with_cloud_resumable_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let stale_session_id = "33333333-3333-3333-3333-333333333333";
+        let live_session_id = "44444444-4444-4444-4444-444444444444";
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                last_session_id: Some(stale_session_id.to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{stale_session_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "missing"
+            })))
+            .mount(&server)
+            .await;
+
+        let workspace = WorkspaceMetadata::with_context(
+            live_session_id,
+            "gpt-5.4",
+            "/srv/cloud-picked",
+            Some("main"),
+        );
+        let listed = astra_services::session_restore::RestoredSession {
+            session_id: live_session_id.to_string(),
+            turn_count: 6,
+            total_tokens_in: 210,
+            total_tokens_out: 90,
+            last_status: "active".to_string(),
+            restored_from_cloud: true,
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        };
+        mock_cloud_resumable_list(&server, std::slice::from_ref(&listed)).await;
+
+        let restored = astra_services::session_restore::RestoredSession {
+            conversation_messages: vec![
+                serde_json::json!({"role":"user","content":"status"}),
+                serde_json::json!({"role":"assistant","content":"picked from cloud list"}),
+            ],
+            ..listed.clone()
+        };
+        mock_cloud_resume(&server, live_session_id, &restored).await;
+
+        let body = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs { session_id: None }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["run"]["session_id"], live_session_id);
+        assert_eq!(value["run"]["turn_count"], 6);
+        assert_eq!(value["environment"]["cwd"], "/srv/cloud-picked");
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(live_session_id)
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn snapshot_without_session_id_ignores_stale_local_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
+        let stale_session_id = "77777777-7777-7777-7777-777777777777";
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(stale_session_id.to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let error = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs { session_id: None }),
+            None,
+        )
+        .await
+        .expect_err("stale local pointer should not resolve to a resumable session");
+
+        assert!(error.contains("no resumable session found"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn snapshot_without_session_id_ignores_stale_remote_pointer_when_cloud_is_configured_but_unauthenticated()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
+        let stale_session_id = "88888888-8888-8888-8888-888888888888";
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(stale_session_id.to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let error = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs { session_id: None }),
+            None,
+        )
+        .await
+        .expect_err("unauthenticated cloud pointer should not resolve to a resumable session");
+
+        assert!(error.contains("no resumable session found"), "{error}");
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(stale_session_id),
+            "missing auth should not clear the stored pointer"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_session_journal_io_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "55555555-5555-5555-5555-555555555555";
+        std::fs::create_dir_all(temp.path().join(format!("{session_id}.jsonl"))).unwrap();
+
+        let error = execute_self_command(
+            &SelfCmd::Snapshot(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .expect_err("journal io error should surface");
+
+        assert!(error.contains("failed to read session journal"));
     }
 }

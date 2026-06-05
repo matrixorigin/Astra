@@ -14,6 +14,7 @@
 //! pins the output shape so the view layer and the storage layer
 //! can land in parallel.
 
+use crate::cli::session_task_surface::session_task_is_active;
 use astra_tools::task_mgmt::SessionTask;
 
 /// A flat row in the cross-session task view. Mirrors the
@@ -43,7 +44,7 @@ where
     for (sid, tasks) in per_session {
         let short = sid.chars().take(8).collect::<String>();
         for t in tasks {
-            if !matches!(t.status.as_str(), "pending" | "in_progress") {
+            if !session_task_is_active(&t.status) {
                 continue;
             }
             rows.push(MultiSessionRow {

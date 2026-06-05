@@ -2,6 +2,14 @@ use super::*;
 
 // ── slash_stats::handle_stats_command ─────────────────────────────────────────────────
 
+fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let guard = session_journal::JournalDirGuard::new(&sessions);
+    (tmp, guard)
+}
+
 #[test]
 fn stats_no_active_session_does_not_panic() {
     // state with no session_id → should not panic
@@ -13,6 +21,7 @@ fn stats_no_active_session_does_not_panic() {
 
 #[test]
 fn stats_history_no_sessions_does_not_panic() {
+    let (_tmp, _guard) = isolated_sessions_dir();
     let state = super::SessionState::default();
     tokio::runtime::Runtime::new()
         .unwrap()
@@ -119,6 +128,21 @@ fn stats_history_aggregates_multiple_sessions() {
     assert_eq!(agg.total_turns, 2);
     assert_eq!(agg.total_tokens_in, 1000);
     assert_eq!(agg.total_tokens_out, 500);
+}
+
+#[test]
+fn stats_current_session_with_unreadable_journal_does_not_panic() {
+    let (_tmp, _guard) = isolated_sessions_dir();
+    let sid = format!("test-stats-unreadable-{}", uuid::Uuid::new_v4());
+    std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
+    let state = super::SessionState {
+        session_id: Some(sid),
+        ..Default::default()
+    };
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(slash_stats::handle_stats_command("", &state));
 }
 
 // ── slash_tools::handle_tools_command ─────────────────────────────────────────────────
@@ -243,6 +267,19 @@ fn tools_reads_tool_calls_from_journal() {
     assert_eq!(profiles[1].error_rate, 0.0);
 
     // Verify slash_tools::handle_tools_command doesn't panic with this data
+    let state = super::SessionState {
+        session_id: Some(sid),
+        ..Default::default()
+    };
+    slash_tools::handle_tools_command(&state);
+}
+
+#[test]
+fn tools_unreadable_journal_does_not_panic() {
+    let (_tmp, _guard) = isolated_sessions_dir();
+    let sid = format!("test-tools-unreadable-{}", uuid::Uuid::new_v4());
+    std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
     let state = super::SessionState {
         session_id: Some(sid),
         ..Default::default()

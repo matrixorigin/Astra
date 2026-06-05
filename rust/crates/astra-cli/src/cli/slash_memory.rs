@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::health_status_surface::health_status_icon;
 use astra_services::session_artifact_store::SessionArtifactStore;
 
 pub(crate) const MEMORY_BROWSE_QUERY: &str = "memory knowledge fact preference plan task note";
@@ -1962,11 +1963,7 @@ pub(crate) fn memory_health_lines(body: &str) -> Vec<String> {
                 format!("  {}", "─".repeat(50)),
             ];
             let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
-            let icon = if status == "ok" || status == "healthy" {
-                "✓"
-            } else {
-                "⚠"
-            };
+            let icon = health_status_icon(status);
             lines.push(format!("  {icon} {status}"));
             if let Some(total) = v
                 .get("total_memories")
@@ -2065,6 +2062,17 @@ mod tests {
             .unwrap()
             .replace_all(input, "")
             .into_owned()
+    }
+
+    #[test]
+    fn memory_health_lines_uses_shared_health_icon_semantics() {
+        let lines = memory_health_lines(r#"{"status":"healthy","total_memories":3}"#);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("✓ healthy"), "{rendered}");
+
+        let degraded = memory_health_lines(r#"{"status":"degraded","total_memories":3}"#);
+        let rendered = degraded.join("\n");
+        assert!(rendered.contains("⚠ degraded"), "{rendered}");
     }
 
     // ── /memory session display ──────────────────────────────────────────

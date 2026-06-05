@@ -1,5 +1,112 @@
-#![allow(unused_imports)]
 use super::*;
+use crate::cli::task_result_surface::{
+    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
+};
+use crate::cli::task_surface::{
+    encode_task_failure_message, task_list_item_claimability_icon,
+    task_list_item_claimability_label, task_list_item_outcome, task_list_item_status_icon,
+    task_list_item_status_label,
+};
+#[cfg(test)]
+use crate::cli::task_surface::{task_checkpoint_surface, task_status_icon, task_status_label};
+
+async fn mark_background_task_failed(
+    svc: &dyn astra_services::TaskService,
+    task_id: &str,
+    error_kind: &str,
+    error: String,
+) -> String {
+    let stored_error = encode_task_failure_message(error_kind, &error);
+    match svc.fail_task(task_id, &stored_error).await {
+        Ok(()) => error,
+        Err(fail_err) => {
+            format!("{error}; additionally failed to persist failed status: {fail_err}")
+        }
+    }
+}
+
+async fn persist_background_task_result(
+    svc: &dyn astra_services::TaskService,
+    task_id: &str,
+    session_id: Option<String>,
+    sr: &crate::StreamResult,
+) -> Result<astra_services::TaskOutcome, String> {
+    let exit_code = crate::cli::task_result_projection::stream_result_exit_code(sr);
+    if let Err(error) = svc
+        .save_checkpoint(
+            task_id,
+            &astra_services::task_orchestrator::TaskCheckpoint {
+                active_subtask_id: None,
+                turn: 0,
+                session_id,
+                state: crate::cli::task_result_projection::task_checkpoint_state_from_result(
+                    sr, None, exit_code,
+                ),
+            },
+        )
+        .await
+    {
+        return Err(mark_background_task_failed(
+            svc,
+            task_id,
+            "persistence_error",
+            format!("failed to save background task result: {error}"),
+        )
+        .await);
+    }
+
+    match exit_code {
+        crate::cli::command_router::ExitCode::Success => {
+            if let Err(error) = svc.complete_task(task_id).await {
+                return Err(mark_background_task_failed(
+                    svc,
+                    task_id,
+                    "persistence_error",
+                    format!("failed to mark background task finalized: {error}"),
+                )
+                .await);
+            }
+            Ok(astra_services::TaskOutcome::Success)
+        }
+        crate::cli::command_router::ExitCode::Partial => {
+            let outcome = crate::cli::task_result_projection::stream_result_completion_outcome(sr);
+            if let Err(error) = svc.complete_task_with_outcome(task_id, outcome).await {
+                return Err(mark_background_task_failed(
+                    svc,
+                    task_id,
+                    "persistence_error",
+                    format!("failed to mark background task finalized: {error}"),
+                )
+                .await);
+            }
+            Ok(outcome)
+        }
+        _ => Err(mark_background_task_failed(
+            svc,
+            task_id,
+            crate::cli::task_result_projection::error_kind_for_exit_code(exit_code)
+                .unwrap_or("tool_failure"),
+            crate::cli::task_result_projection::stream_result_failure_reason(exit_code, sr),
+        )
+        .await),
+    }
+}
+
+const TASK_QUERY_MATCH_LIMIT: usize = 8;
+const TASK_PENDING_DISPLAY_LIMIT: usize = 50;
+
+fn format_task_query_ambiguity(query: &str, matches: &[astra_services::TaskListItem]) -> String {
+    let mut lines = Vec::with_capacity(matches.len() + 2);
+    lines.push(format!(
+        "task query '{query}' is ambiguous; refine the id or title"
+    ));
+    for task in matches {
+        let short = &task.task_id[..8.min(task.task_id.len())];
+        let status = task_list_item_status_label(task);
+        lines.push(format!("  {short}  {}  [{status}]", task.title));
+    }
+    lines.join("\n")
+}
 
 pub(crate) async fn handle_task_command(
     arg: &str,
@@ -29,52 +136,78 @@ pub(crate) async fn handle_task_command(
     let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
 
     match subcmd {
-        "list" | "" => match svc.list_tasks(user_id, None).await {
+        "list" | "" => match svc.list_recent_tasks(user_id, None).await {
             Ok(tasks) if tasks.is_empty() => {
                 eprintln!(
                     "  {}",
-                    "No tasks. Use /task add <title> to create one.".dim()
+                    "No recent tasks. Use /task add <title> to create one.".dim()
                 );
             }
             Ok(tasks) => {
                 eprintln!(
                     "\n{}",
-                    "─── Tasks ───────────────────────────────────────".bold()
+                    "─── Recent Tasks ────────────────────────────────".bold()
                 );
                 for t in &tasks {
-                    let icon = match t.status {
-                        TaskStatus::Completed
-                            if t.items_total > 0 && t.items_done < t.items_total =>
-                        {
-                            "△"
-                        }
-                        TaskStatus::Completed => "✓",
-                        TaskStatus::Failed => "✗",
-                        TaskStatus::InProgress => "▶",
-                        TaskStatus::Paused => "⏸",
-                        _ => "○",
-                    };
+                    let icon = task_list_item_status_icon(t);
                     let short_id = &t.task_id[..8.min(t.task_id.len())];
-                    let status_label = match t.status {
-                        TaskStatus::Completed
-                            if t.items_total > 0 && t.items_done < t.items_total =>
-                        {
-                            "partial".to_string()
-                        }
-                        _ => t.status.as_str().to_string(),
-                    };
+                    let status_label = task_list_item_status_label(t).to_string();
                     let progress = if t.items_total > 0 {
                         format!(" ({}/{})", t.items_done, t.items_total)
                     } else {
                         String::new()
                     };
+                    let outcome_suffix = task_list_item_outcome(t)
+                        .filter(|outcome| *outcome != astra_services::TaskOutcome::Success)
+                        .map(|outcome| format!(" [{}]", outcome.as_str().magenta()))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "  {} {} {} [{}]{}{}",
+                        short_id.dim(),
+                        icon,
+                        t.title,
+                        status_label.magenta(),
+                        outcome_suffix,
+                        progress,
+                    );
+                }
+                eprintln!(
+                    "  {}",
+                    "Use /task pending for the oldest-first claimable queue.".dim()
+                );
+                eprintln!();
+            }
+            Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
+        },
+        "pending" => match svc
+            .list_claimable_tasks_for_worker(user_id, TASK_PENDING_DISPLAY_LIMIT)
+            .await
+        {
+            Ok(tasks) if tasks.is_empty() => {
+                eprintln!("  {}", "No claimable tasks in the queue.".dim());
+            }
+            Ok(tasks) => {
+                eprintln!(
+                    "\n{}",
+                    "─── Claimable Queue (oldest first) ─────────────".bold()
+                );
+                for t in &tasks {
+                    let short_id = &t.task_id[..8.min(t.task_id.len())];
+                    let progress = if t.items_total > 0 {
+                        format!(" ({}/{})", t.items_done, t.items_total)
+                    } else {
+                        String::new()
+                    };
+                    let status = task_list_item_claimability_label(t)
+                        .unwrap_or_else(|| task_list_item_status_label(t));
+                    let icon = task_list_item_claimability_icon(t).unwrap_or("◻");
                     eprintln!(
                         "  {} {} {} [{}]{}",
                         short_id.dim(),
                         icon,
                         t.title,
-                        status_label.magenta(),
-                        progress,
+                        status.magenta(),
+                        progress
                     );
                 }
                 eprintln!();
@@ -127,25 +260,20 @@ pub(crate) async fn handle_task_command(
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.get_task(&tid).await {
                     Ok(Some(t)) => {
+                        let read = load_task_result_read_surface(&t);
                         eprintln!(
                             "\n{}",
                             "─── Task Detail ─────────────────────────────────".bold()
                         );
-                        eprintln!("  {:<12} {}", "id:".dim(), t.task_id.magenta());
+                        eprintln!("  {:<12} {}", "id:".dim(), t.task_id.as_str().magenta());
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
-                        let detail_status_label = match t.status {
-                            TaskStatus::Completed
-                                if t.items_total > 0 && t.items_done < t.items_total =>
-                            {
-                                "partial"
-                            }
-                            _ => t.status.as_str(),
-                        };
-                        eprintln!(
-                            "  {:<12} {}",
-                            "status:".dim(),
-                            detail_status_label.magenta()
-                        );
+                        for field in task_result_header_fields(&read) {
+                            eprintln!(
+                                "  {:<12} {}",
+                                field.label.dim(),
+                                render_task_result_header_value(&field)
+                            );
+                        }
                         eprintln!("  {:<12} {}%", "progress:".dim(), t.progress_pct);
                         if let Some(ref desc) = t.description {
                             eprintln!("  {:<12} {}", "desc:".dim(), desc);
@@ -165,9 +293,6 @@ pub(crate) async fn handle_task_command(
                                 };
                                 eprintln!("    {} {}", icon, st.title);
                             }
-                        }
-                        if let Some(ref err) = t.error_message {
-                            eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
                         }
                         eprintln!();
                     }
@@ -355,50 +480,56 @@ pub(crate) async fn handle_task_command(
                 let short = &bg_task_id[..8.min(bg_task_id.len())];
                 match result {
                     Ok(sr) => {
-                        // Store result in checkpoint state map
-                        let mut state_map = serde_json::Map::new();
-                        state_map.insert(
-                            "full_text".to_string(),
-                            serde_json::Value::String(sr.full_text.clone()),
-                        );
-                        state_map.insert(
-                            "prompt_tokens".to_string(),
-                            serde_json::json!(sr.prompt_tokens),
-                        );
-                        state_map.insert(
-                            "completion_tokens".to_string(),
-                            serde_json::json!(sr.completion_tokens),
-                        );
-                        state_map.insert(
-                            "tool_calls_count".to_string(),
-                            serde_json::json!(sr.tool_calls_count),
-                        );
-                        let _ = svc_clone
-                            .save_checkpoint(
-                                &bg_task_id,
-                                &astra_services::task_orchestrator::TaskCheckpoint {
-                                    active_subtask_id: None,
-                                    turn: 0,
-                                    session_id: bg_session_id.clone(),
-                                    state: state_map,
-                                },
-                            )
-                            .await;
-                        let _ = svc_clone.complete_task(&bg_task_id).await;
-                        eprintln!(
-                            "\n  {} Background task {} completed. Use /task result {} to view.",
-                            theme::icon_ok(),
-                            short.magenta(),
-                            short.magenta()
-                        );
+                        match persist_background_task_result(
+                            &*svc_clone,
+                            &bg_task_id,
+                            bg_session_id.clone(),
+                            &sr,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => {
+                                let icon = if outcome == astra_services::TaskOutcome::Partial {
+                                    theme::icon_warn()
+                                } else {
+                                    theme::icon_ok()
+                                };
+                                let terminal = if outcome == astra_services::TaskOutcome::Partial {
+                                    "completed partially"
+                                } else {
+                                    "completed"
+                                };
+                                eprintln!(
+                                    "\n  {} Background task {} {}. Use /task result {} to view.",
+                                    icon,
+                                    short.magenta(),
+                                    terminal,
+                                    short.magenta()
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "\n  {} Background task {} failed: {}",
+                                    theme::icon_err(),
+                                    short.magenta(),
+                                    error.red()
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
-                        let _ = svc_clone.fail_task(&bg_task_id, &e.error).await;
+                        let error = mark_background_task_failed(
+                            &*svc_clone,
+                            &bg_task_id,
+                            "turn_error",
+                            e.error,
+                        )
+                        .await;
                         eprintln!(
                             "\n  {} Background task {} failed: {}",
                             theme::icon_err(),
                             short.magenta(),
-                            e.error.red()
+                            error.red()
                         );
                     }
                 }
@@ -409,53 +540,45 @@ pub(crate) async fn handle_task_command(
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.get_task(&tid).await {
                     Ok(Some(t)) => {
+                        let read = load_task_result_read_surface(&t);
                         let short = &t.task_id[..8.min(t.task_id.len())];
                         eprintln!(
                             "\n{}",
                             format!("─── Task Result ({short}) ─────────────────────────").bold()
                         );
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
-                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().magenta());
-                        if let Some(ref err) = t.error_message {
-                            eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
+                        for field in task_result_header_fields(&read) {
+                            eprintln!(
+                                "  {:<12} {}",
+                                field.label.dim(),
+                                render_task_result_header_value(&field)
+                            );
                         }
-                        // Print checkpoint data (the full_text from the agent)
-                        let mut found_result = false;
-                        if let Some(ref cp) = t.checkpoint {
-                            if let Some(full_text) =
-                                cp.state.get("full_text").and_then(|v| v.as_str())
-                            {
-                                found_result = true;
+                        match read.load_artifact() {
+                            Ok(Some(artifact)) => {
                                 eprintln!();
-                                eprintln!("{full_text}");
-                                if let Some(tokens) =
-                                    cp.state.get("prompt_tokens").and_then(|v| v.as_u64())
-                                {
-                                    let comp = cp
-                                        .state
-                                        .get("completion_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let tools = cp
-                                        .state
-                                        .get("tool_calls_count")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
+                                eprintln!("{}", artifact.full_text);
+                                if let Some(tokens) = artifact.prompt_tokens {
+                                    let comp = artifact.completion_tokens;
+                                    let tools = artifact.tool_calls_count;
                                     eprintln!(
                                         "\n  {}",
                                         format!("tokens: {tokens}→/{comp}← | tools: {tools}").dim()
                                     );
                                 }
+                                if let Some(output_file) = artifact.output_file {
+                                    eprintln!("  {}", format!("output: {output_file}").dim());
+                                }
                             }
-                        }
-                        if !found_result {
-                            match t.status {
-                                TaskStatus::InProgress | TaskStatus::Pending => {
-                                    eprintln!("  {}", "Task is still running…".yellow());
+                            Ok(None) => {
+                                if read.header.is_unfinished {
+                                    eprintln!("  {}", read.missing_text.yellow());
+                                } else {
+                                    eprintln!("  {}", read.missing_text.dim());
                                 }
-                                _ => {
-                                    eprintln!("  {}", "No result data available.".dim());
-                                }
+                            }
+                            Err(e) => {
+                                eprintln!("{}", format!("  {} {e}", theme::icon_err()).red());
                             }
                         }
                         eprintln!();
@@ -474,33 +597,647 @@ pub(crate) async fn handle_task_command(
         }
         _ => {
             eprintln!(
-                "  Usage: /task [list | add <title> | done <id> | status <id> | run <prompt> | result <id>]"
+                "  Usage: /task [list | pending | add <title> | done <id> | status <id> | run <prompt> | result <id>]"
             );
         }
     }
 }
 
-/// Find a task by prefix match on task_id or substring match on title.
+/// Resolve a user task query using the shared service-side matching semantics.
+///
+/// Returns `Ok(None)` when nothing matches, `Ok(Some(task_id))` when the best
+/// match tier is unique, and `Err(...)` when the query is ambiguous.
 pub(crate) async fn find_task_by_query(
     svc: &dyn astra_services::TaskService,
     user_id: &str,
     query: &str,
 ) -> Result<Option<String>, String> {
-    let tasks = svc.list_tasks(user_id, None).await?;
-    // Exact or prefix match on task_id
-    if let Some(t) = tasks
-        .iter()
-        .find(|t| t.task_id == query || t.task_id.starts_with(query))
-    {
-        return Ok(Some(t.task_id.clone()));
+    let query = query.trim();
+    let matches = svc
+        .search_tasks(user_id, query, TASK_QUERY_MATCH_LIMIT)
+        .await?;
+    match matches.as_slice() {
+        [] => Ok(None),
+        [task] => Ok(Some(task.task_id.clone())),
+        _ => Err(format_task_query_ambiguity(query, &matches)),
     }
-    // Substring match on title (case-insensitive)
-    let q_lower = query.to_lowercase();
-    if let Some(t) = tasks
-        .iter()
-        .find(|t| t.title.to_lowercase().contains(&q_lower))
-    {
-        return Ok(Some(t.task_id.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct MockTaskState {
+        saved_checkpoint: bool,
+        completed: bool,
+        completed_outcome: Option<astra_services::TaskOutcome>,
+        failed_error: Option<String>,
+        checkpoint: Option<astra_services::TaskCheckpoint>,
     }
-    Ok(None)
+
+    struct MockTaskService {
+        save_checkpoint_error: Option<String>,
+        complete_task_error: Option<String>,
+        fail_task_error: Option<String>,
+        state: Arc<Mutex<MockTaskState>>,
+    }
+
+    #[async_trait]
+    impl astra_services::TaskService for MockTaskService {
+        async fn create_task(
+            &self,
+            _: &str,
+            _: &str,
+            _: astra_services::TaskCreateRequest,
+        ) -> Result<String, String> {
+            unimplemented!()
+        }
+
+        async fn get_task(&self, _: &str) -> Result<Option<astra_services::TaskRecord>, String> {
+            unimplemented!()
+        }
+
+        async fn list_recent_tasks(
+            &self,
+            _: &str,
+            _: Option<astra_services::TaskStatus>,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            unimplemented!()
+        }
+
+        async fn list_recent_tasks_for_session(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<astra_services::TaskStatus>,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            unimplemented!()
+        }
+
+        async fn search_tasks(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            unimplemented!()
+        }
+
+        async fn list_claimable_tasks_for_worker(
+            &self,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            unimplemented!()
+        }
+
+        async fn update_status(
+            &self,
+            _: &str,
+            _: astra_services::TaskStatus,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn update_progress(&self, _: &str, _: u32, _: u32, _: u32) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn save_checkpoint(
+            &self,
+            _: &str,
+            checkpoint: &astra_services::TaskCheckpoint,
+        ) -> Result<(), String> {
+            if let Some(error) = &self.save_checkpoint_error {
+                return Err(error.clone());
+            }
+            let mut state = self.state.lock().unwrap();
+            state.saved_checkpoint = true;
+            state.checkpoint = Some(checkpoint.clone());
+            Ok(())
+        }
+
+        async fn update_plan(&self, _: &str, _: &astra_services::TaskPlan) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn fail_task(&self, _: &str, error: &str) -> Result<(), String> {
+            if let Some(fail_error) = &self.fail_task_error {
+                return Err(fail_error.clone());
+            }
+            self.state.lock().unwrap().failed_error = Some(error.to_string());
+            Ok(())
+        }
+
+        async fn complete_task(&self, _: &str) -> Result<(), String> {
+            if let Some(error) = &self.complete_task_error {
+                return Err(error.clone());
+            }
+            self.state.lock().unwrap().completed = true;
+            Ok(())
+        }
+
+        async fn complete_plan_run(
+            &self,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+            outcome: astra_services::TaskOutcome,
+        ) -> Result<(), String> {
+            self.state.lock().unwrap().completed_outcome = Some(outcome);
+            Ok(())
+        }
+
+        async fn complete_task_with_outcome(
+            &self,
+            _: &str,
+            outcome: astra_services::TaskOutcome,
+        ) -> Result<(), String> {
+            self.state.lock().unwrap().completed_outcome = Some(outcome);
+            Ok(())
+        }
+
+        async fn record_feedback(
+            &self,
+            _: &str,
+            _: u8,
+            _: astra_services::TaskOutcome,
+            _: Option<i32>,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+            unimplemented!()
+        }
+
+        async fn recommend_templates(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<Vec<astra_services::task_orchestrator::TemplateRecommendation>, String>
+        {
+            unimplemented!()
+        }
+
+        async fn record_template_usage(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn get_learning_stats(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<astra_services::task_orchestrator::LearningStats, String> {
+            unimplemented!()
+        }
+    }
+
+    struct SearchOnlyTaskService {
+        results: Vec<astra_services::TaskListItem>,
+        users: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl astra_services::TaskService for SearchOnlyTaskService {
+        async fn create_task(
+            &self,
+            _: &str,
+            _: &str,
+            _: astra_services::TaskCreateRequest,
+        ) -> Result<String, String> {
+            unimplemented!()
+        }
+
+        async fn get_task(&self, _: &str) -> Result<Option<astra_services::TaskRecord>, String> {
+            unimplemented!()
+        }
+
+        async fn list_recent_tasks(
+            &self,
+            _: &str,
+            _: Option<astra_services::TaskStatus>,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            panic!("find_task_by_query should not call list_recent_tasks")
+        }
+
+        async fn list_recent_tasks_for_session(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<astra_services::TaskStatus>,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            unimplemented!()
+        }
+
+        async fn search_tasks(
+            &self,
+            user_id: &str,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            self.users.lock().unwrap().push(user_id.to_string());
+            Ok(self.results.clone())
+        }
+
+        async fn list_claimable_tasks_for_worker(
+            &self,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<astra_services::TaskListItem>, String> {
+            unimplemented!()
+        }
+
+        async fn update_status(
+            &self,
+            _: &str,
+            _: astra_services::TaskStatus,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn update_progress(&self, _: &str, _: u32, _: u32, _: u32) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn save_checkpoint(
+            &self,
+            _: &str,
+            _: &astra_services::TaskCheckpoint,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn update_plan(&self, _: &str, _: &astra_services::TaskPlan) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn fail_task(&self, _: &str, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn complete_task(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn complete_plan_run(
+            &self,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: astra_services::TaskOutcome,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn complete_task_with_outcome(
+            &self,
+            _: &str,
+            _: astra_services::TaskOutcome,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn record_feedback(
+            &self,
+            _: &str,
+            _: u8,
+            _: astra_services::TaskOutcome,
+            _: Option<i32>,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+            unimplemented!()
+        }
+
+        async fn recommend_templates(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<Vec<astra_services::task_orchestrator::TemplateRecommendation>, String>
+        {
+            unimplemented!()
+        }
+
+        async fn record_template_usage(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+
+        async fn get_learning_stats(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<astra_services::task_orchestrator::LearningStats, String> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn task_status_label_prefers_partial_outcome_over_completed_status() {
+        assert_eq!(
+            task_status_label(
+                astra_services::TaskStatus::Completed,
+                Some(astra_services::TaskOutcome::Partial),
+            ),
+            "partial"
+        );
+        assert_eq!(
+            task_status_label(
+                astra_services::TaskStatus::Completed,
+                Some(astra_services::TaskOutcome::Success),
+            ),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn task_status_icon_marks_partial_completed_tasks() {
+        assert_eq!(
+            task_status_icon(
+                astra_services::TaskStatus::Completed,
+                Some(astra_services::TaskOutcome::Partial),
+                3,
+                3,
+            ),
+            "△"
+        );
+        assert_eq!(
+            task_status_icon(
+                astra_services::TaskStatus::Completed,
+                Some(astra_services::TaskOutcome::Success),
+                3,
+                3,
+            ),
+            "✓"
+        );
+    }
+
+    #[test]
+    fn task_checkpoint_surface_reads_machine_readable_task_metadata() {
+        let checkpoint = astra_services::TaskCheckpoint {
+            active_subtask_id: None,
+            turn: 0,
+            session_id: Some("sess-1".into()),
+            state: serde_json::Map::from_iter([
+                ("error_kind".to_string(), serde_json::json!("partial")),
+                ("final_state".to_string(), serde_json::json!("interrupted")),
+                (
+                    "interruption_kind".to_string(),
+                    serde_json::json!("budget_exhausted"),
+                ),
+                (
+                    "persistence_error".to_string(),
+                    serde_json::json!("write task output: permission denied"),
+                ),
+            ]),
+        };
+        let checkpoint = task_checkpoint_surface(&checkpoint);
+
+        assert_eq!(checkpoint.error_kind, Some("partial"));
+        assert_eq!(checkpoint.final_state, Some("interrupted"));
+        assert_eq!(checkpoint.interruption_kind, Some("budget_exhausted"));
+        assert_eq!(
+            checkpoint.persistence_error,
+            Some("write task output: permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_background_task_result_fails_closed_when_checkpoint_save_fails() {
+        let state = Arc::new(Mutex::new(MockTaskState::default()));
+        let svc = MockTaskService {
+            save_checkpoint_error: Some("disk full".into()),
+            complete_task_error: None,
+            fail_task_error: None,
+            state: state.clone(),
+        };
+        let sr = crate::StreamResult {
+            full_text: "answer".into(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            tool_calls_count: 0,
+            ..Default::default()
+        };
+
+        let err = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
+            .await
+            .unwrap_err();
+
+        let snapshot = state.lock().unwrap();
+        assert!(snapshot.failed_error.is_some());
+        assert!(!snapshot.completed);
+        assert_eq!(
+            crate::cli::task_surface::parse_task_failure_message(
+                snapshot.failed_error.as_deref().unwrap()
+            ),
+            (
+                Some("persistence_error"),
+                "failed to save background task result: disk full"
+            )
+        );
+        assert!(err.contains("failed to save background task result"));
+    }
+
+    #[tokio::test]
+    async fn persist_background_task_result_marks_complete_after_checkpoint_save() {
+        let state = Arc::new(Mutex::new(MockTaskState::default()));
+        let svc = MockTaskService {
+            save_checkpoint_error: None,
+            complete_task_error: None,
+            fail_task_error: None,
+            state: state.clone(),
+        };
+        let sr = crate::StreamResult {
+            full_text: "answer".into(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            tool_calls_count: 1,
+            ..Default::default()
+        };
+
+        let outcome = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
+            .await
+            .unwrap();
+
+        let snapshot = state.lock().unwrap();
+        assert_eq!(outcome, astra_services::TaskOutcome::Success);
+        assert!(snapshot.saved_checkpoint);
+        assert!(snapshot.completed);
+        assert!(snapshot.failed_error.is_none());
+        let checkpoint = snapshot.checkpoint.as_ref().expect("checkpoint saved");
+        assert_eq!(checkpoint.state["final_state"], "completed");
+        assert!(checkpoint.state.get("output_file").is_none());
+    }
+
+    #[tokio::test]
+    async fn persist_background_task_result_marks_partial_outcome_for_interrupted_turn() {
+        let state = Arc::new(Mutex::new(MockTaskState::default()));
+        let svc = MockTaskService {
+            save_checkpoint_error: None,
+            complete_task_error: None,
+            fail_task_error: None,
+            state: state.clone(),
+        };
+        let sr = crate::StreamResult {
+            full_text: "partial answer".into(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            tool_calls_count: 1,
+            final_state: "interrupted".into(),
+            interruption_kind: Some("budget_exhausted".into()),
+            ..Default::default()
+        };
+
+        let outcome = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
+            .await
+            .unwrap();
+
+        let snapshot = state.lock().unwrap();
+        assert_eq!(outcome, astra_services::TaskOutcome::Partial);
+        assert!(snapshot.saved_checkpoint);
+        assert!(!snapshot.completed);
+        assert_eq!(
+            snapshot.completed_outcome,
+            Some(astra_services::TaskOutcome::Partial)
+        );
+        let checkpoint = snapshot.checkpoint.as_ref().expect("checkpoint saved");
+        assert_eq!(checkpoint.state["final_state"], "interrupted");
+        assert_eq!(checkpoint.state["interruption_kind"], "budget_exhausted");
+    }
+
+    #[tokio::test]
+    async fn persist_background_task_result_fails_on_persistence_degradation() {
+        let state = Arc::new(Mutex::new(MockTaskState::default()));
+        let svc = MockTaskService {
+            save_checkpoint_error: None,
+            complete_task_error: None,
+            fail_task_error: None,
+            state: state.clone(),
+        };
+        let sr = crate::StreamResult {
+            full_text: "answer".into(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            tool_calls_count: 1,
+            session_persistence_error: Some("failed to append turn event".into()),
+            ..Default::default()
+        };
+
+        let err = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
+            .await
+            .unwrap_err();
+
+        let snapshot = state.lock().unwrap();
+        assert!(snapshot.saved_checkpoint);
+        assert!(!snapshot.completed);
+        assert!(snapshot.completed_outcome.is_none());
+        assert_eq!(
+            crate::cli::task_surface::parse_task_failure_message(
+                snapshot.failed_error.as_deref().unwrap()
+            ),
+            (Some("persistence_error"), "failed to append turn event")
+        );
+        let checkpoint = snapshot.checkpoint.as_ref().expect("checkpoint saved");
+        assert_eq!(checkpoint.state["error_kind"], "persistence_error");
+        assert_eq!(
+            checkpoint.state["persistence_error"],
+            "failed to append turn event"
+        );
+        assert_eq!(err, "failed to append turn event");
+    }
+
+    #[tokio::test]
+    async fn find_task_by_query_uses_service_search_and_records_user_scope() {
+        let users = Arc::new(Mutex::new(Vec::new()));
+        let svc = SearchOnlyTaskService {
+            results: vec![astra_services::TaskListItem {
+                task_id: "task-123".into(),
+                title: "Build auth".into(),
+                session_id: Some("sess-1".into()),
+                status: astra_services::TaskStatus::Completed,
+                progress_pct: 100,
+                items_done: 1,
+                items_total: 1,
+                created_at: "2025-01-01T00:00:00Z".into(),
+                updated_at: "2025-01-01T00:00:00Z".into(),
+                completed_at: Some("2025-01-01T00:00:00Z".into()),
+                outcome: Some(astra_services::TaskOutcome::Success),
+                error_message: None,
+                project_type: None,
+                claimability: None,
+            }],
+            users: users.clone(),
+        };
+
+        let found = find_task_by_query(&svc, "user-123", "Build").await.unwrap();
+        assert_eq!(found.as_deref(), Some("task-123"));
+        assert_eq!(users.lock().unwrap().as_slice(), ["user-123"]);
+    }
+
+    #[tokio::test]
+    async fn find_task_by_query_fails_closed_on_ambiguous_matches() {
+        let svc = SearchOnlyTaskService {
+            results: vec![
+                astra_services::TaskListItem {
+                    task_id: "task-111".into(),
+                    title: "Refactor auth module".into(),
+                    session_id: Some("sess-1".into()),
+                    status: astra_services::TaskStatus::Completed,
+                    progress_pct: 100,
+                    items_done: 1,
+                    items_total: 1,
+                    created_at: "2025-01-01T00:00:00Z".into(),
+                    updated_at: "2025-01-02T00:00:00Z".into(),
+                    completed_at: Some("2025-01-02T00:00:00Z".into()),
+                    outcome: Some(astra_services::TaskOutcome::Success),
+                    error_message: None,
+                    project_type: None,
+                    claimability: None,
+                },
+                astra_services::TaskListItem {
+                    task_id: "task-222".into(),
+                    title: "Refactor auth tests".into(),
+                    session_id: Some("sess-2".into()),
+                    status: astra_services::TaskStatus::InProgress,
+                    progress_pct: 50,
+                    items_done: 1,
+                    items_total: 2,
+                    created_at: "2025-01-01T00:00:00Z".into(),
+                    updated_at: "2025-01-03T00:00:00Z".into(),
+                    completed_at: None,
+                    outcome: None,
+                    error_message: None,
+                    project_type: None,
+                    claimability: None,
+                },
+            ],
+            users: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let err = find_task_by_query(&svc, "user-123", "auth")
+            .await
+            .unwrap_err();
+        assert!(err.contains("task query 'auth' is ambiguous"));
+        assert!(err.contains("task-111"));
+        assert!(err.contains("task-222"));
+    }
 }

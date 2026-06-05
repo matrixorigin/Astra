@@ -73,6 +73,7 @@ pub(crate) fn render_team_args(args: &TeamArgs) -> String {
 pub(crate) fn render_task_args(args: &TaskArgs) -> String {
     match &args.command {
         None | Some(TaskSubcommand::List) => String::new(),
+        Some(TaskSubcommand::Pending) => "pending".to_string(),
         Some(TaskSubcommand::Add(cmd)) => format!("add {}", join_words(&cmd.text)),
         Some(TaskSubcommand::Done(cmd)) => format!("done {}", join_words(&cmd.query)),
         Some(TaskSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
@@ -229,7 +230,7 @@ pub(crate) fn render_bug_args(args: &BugArgs) -> String {
 #[cfg(test)]
 mod arg_render_tests {
     use super::*;
-    use crate::cli::cli_args::PermissionsTraceArgs;
+    use crate::cli::cli_args::{PermissionsTraceArgs, TaskArgs, TaskSubcommand};
 
     #[test]
     fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {
@@ -268,5 +269,13 @@ mod arg_render_tests {
             })),
         };
         assert_eq!(render_permissions_args(&args), "trace --export trace.jsonl");
+    }
+
+    #[test]
+    fn task_pending_renders_explicit_queue_view() {
+        let args = TaskArgs {
+            command: Some(TaskSubcommand::Pending),
+        };
+        assert_eq!(render_task_args(&args), "pending");
     }
 }

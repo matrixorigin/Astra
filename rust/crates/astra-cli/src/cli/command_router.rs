@@ -1,11 +1,9 @@
-use super::session_continuation::*;
 use crate::cli::arg_render::{
     apply_system_prompt, join_words, render_agent_args, render_bug_args, render_debug_args,
     render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
     render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
 use crate::cli::auth_flow::*;
-use crate::cli::chat_turn::is_auth_error;
 use crate::cli::cli_args::*;
 use crate::cli::cli_utils::*;
 use crate::cli::config_manager::{
@@ -14,6 +12,9 @@ use crate::cli::config_manager::{
 };
 use crate::cli::interactive_chat::run_interactive_chat;
 use crate::cli::mcp_config::execute_mcp_command;
+use crate::cli::one_shot_session_routing::{
+    OneShotSessionRouting, resolve_one_shot_session_routing,
+};
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::project_instructions::*;
 use crate::cli::session_runtime;
@@ -29,6 +30,16 @@ use crate::cli::slash_info::*;
 use crate::cli::slash_memory::*;
 use crate::cli::slash_messaging::*;
 use crate::cli::streaming_types::*;
+use crate::cli::task_result_artifact::write_task_output;
+use crate::cli::task_result_projection::{
+    error_kind_for_exit_code, stream_result_completion_outcome, stream_result_exit_code,
+    stream_result_failure_reason, task_checkpoint_state_from_result,
+};
+use crate::cli::task_result_surface::{
+    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
+    task_result_json_payload,
+};
+use crate::cli::task_surface::encode_task_failure_message;
 use crate::cli::{
     agent_loader, cli_utils, delegate_subrun, diff_presenter, journal_diff, journal_digest,
     journal_tree, slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry, theme,
@@ -36,10 +47,7 @@ use crate::cli::{
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
-use std::{
-    fs,
-    io::{Read, Write},
-};
+use std::{fs, io::Read};
 
 /// Exit codes for CLI commands (for scripting integration)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +60,12 @@ pub(crate) enum ExitCode {
     ForceStop = 2,
     /// API/network error (3) - failed to communicate with server
     ApiError = 3,
+    /// Local session durability failure after the turn itself succeeded (4)
+    PersistenceError = 4,
+    /// Turn produced a partial/interrupted result without a harder failure (5)
+    Partial = 5,
+    /// Task result was requested before the task had finished (6)
+    Unfinished = 6,
 }
 
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
@@ -77,6 +91,11 @@ impl From<ExitCode> for i32 {
 
 fn maybe_load_project_instructions(state: &mut SessionState) {
     state.project_instructions = discover_project_instructions();
+}
+
+fn validated_cli_session_arg(session_id: &str) -> Result<&str, String> {
+    validate_cli_session_id(session_id)?;
+    Ok(session_id)
 }
 
 fn maybe_wire_delegation_engine(
@@ -118,52 +137,6 @@ fn task_run_title(prompt: &str) -> String {
     format!("run: {summary}")
 }
 
-fn task_output_path(task_id: &str) -> Result<std::path::PathBuf, String> {
-    if !task_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!("unsafe task id for output path: {task_id}"));
-    }
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".astra")
-        .join("tasks")
-        .join("outputs");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create task output dir: {e}"))?;
-    Ok(dir.join(format!("{task_id}.output")))
-}
-
-fn write_task_output(task_id: &str, text: &str) -> Result<std::path::PathBuf, String> {
-    let path = task_output_path(task_id)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| format!("open task output: {e}"))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| format!("write task output: {e}"))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| format!("open task output: {e}"))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| format!("write task output: {e}"))?;
-    }
-    Ok(path)
-}
-
 fn emit_task_event(enabled: bool, value: serde_json::Value) {
     if enabled {
         if let Ok(line) = serde_json::to_string(&value) {
@@ -172,11 +145,265 @@ fn emit_task_event(enabled: bool, value: serde_json::Value) {
     }
 }
 
+pub(crate) fn exit_code_for_error_kind(error_kind: &str) -> Option<ExitCode> {
+    match error_kind {
+        "tool_failure" => Some(ExitCode::ToolFailure),
+        "force_stop" => Some(ExitCode::ForceStop),
+        "api_error" => Some(ExitCode::ApiError),
+        "persistence_error" => Some(ExitCode::PersistenceError),
+        "partial" => Some(ExitCode::Partial),
+        "unfinished" => Some(ExitCode::Unfinished),
+        _ => None,
+    }
+}
+
+fn task_status_for_exit_code(exit_code: ExitCode) -> &'static str {
+    match exit_code {
+        ExitCode::Success => "completed",
+        ExitCode::Partial => "partial",
+        ExitCode::Unfinished => "unfinished",
+        ExitCode::PersistenceError => "persistence_error",
+        ExitCode::ToolFailure | ExitCode::ForceStop | ExitCode::ApiError => "failed",
+    }
+}
+
+fn task_notification_payload(
+    task_id: &str,
+    sr: &StreamResult,
+    output_path: Option<&str>,
+    exit_code: ExitCode,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".to_string(), serde_json::json!("task_notification"));
+    payload.insert("task_id".to_string(), serde_json::json!(task_id));
+    payload.insert(
+        "status".to_string(),
+        serde_json::json!(task_status_for_exit_code(exit_code)),
+    );
+    payload.insert(
+        "success".to_string(),
+        serde_json::json!(exit_code == ExitCode::Success),
+    );
+    payload.insert(
+        "exit_code".to_string(),
+        serde_json::json!(i32::from(exit_code)),
+    );
+    if let Some(output_path) = output_path {
+        payload.insert("output_file".to_string(), serde_json::json!(output_path));
+    }
+    payload.insert(
+        "summary".to_string(),
+        serde_json::json!(sr.full_text.chars().take(200).collect::<String>()),
+    );
+    payload.insert("final_state".to_string(), serde_json::json!(sr.final_state));
+    payload.insert(
+        "interruption_kind".to_string(),
+        serde_json::json!(sr.interruption_kind),
+    );
+    if let Some(error_kind) = error_kind_for_exit_code(exit_code) {
+        payload.insert("error_kind".to_string(), serde_json::json!(error_kind));
+    }
+    if let Some(error) = sr.session_persistence_error.as_deref() {
+        payload.insert("persistence_error".to_string(), serde_json::json!(error));
+    }
+    serde_json::Value::Object(payload)
+}
+
+fn failed_task_notification_payload(
+    task_id: &str,
+    summary: &str,
+    error_kind: &str,
+    output_path: Option<&str>,
+    persistence_error: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".to_string(), serde_json::json!("task_notification"));
+    payload.insert("task_id".to_string(), serde_json::json!(task_id));
+    let status = if error_kind == "persistence_error" {
+        "persistence_error"
+    } else {
+        "failed"
+    };
+    payload.insert("status".to_string(), serde_json::json!(status));
+    payload.insert("success".to_string(), serde_json::json!(false));
+    payload.insert("summary".to_string(), serde_json::json!(summary));
+    payload.insert("error_kind".to_string(), serde_json::json!(error_kind));
+    if let Some(path) = output_path {
+        payload.insert("output_file".to_string(), serde_json::json!(path));
+    }
+    if let Some(error) = persistence_error {
+        payload.insert("persistence_error".to_string(), serde_json::json!(error));
+    }
+    serde_json::Value::Object(payload)
+}
+
+fn task_terminal_summary_line(
+    task_id: &str,
+    output_path: Option<&str>,
+    exit_code: ExitCode,
+) -> String {
+    let (icon, outcome) = match exit_code {
+        ExitCode::Success => (theme::icon_ok(), "finished"),
+        ExitCode::Partial => (theme::icon_warn(), "finished partially"),
+        ExitCode::Unfinished => (theme::icon_warn(), "unfinished"),
+        ExitCode::PersistenceError => (theme::icon_warn(), "finished with persistence degradation"),
+        ExitCode::ForceStop => (theme::icon_warn(), "stopped"),
+        ExitCode::ToolFailure | ExitCode::ApiError => (theme::icon_err(), "failed"),
+    };
+    match output_path {
+        Some(output_path) => format!(
+            "\n  {} Task {} {}; output saved to {}",
+            icon,
+            prefix_chars(task_id, 8).cyan(),
+            outcome,
+            output_path.dim(),
+        ),
+        None => format!(
+            "\n  {} Task {} {}; output file unavailable",
+            icon,
+            prefix_chars(task_id, 8).cyan(),
+            outcome,
+        ),
+    }
+}
+
+async fn finalize_headless_task_result<T: astra_services::TaskService + ?Sized>(
+    svc: &T,
+    task_id: &str,
+    sr: &StreamResult,
+    task_session_id: Option<&str>,
+    output_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    use astra_services::TaskCheckpoint;
+
+    let exit_code = compute_exit_code(sr);
+    let state = task_checkpoint_state_from_result(sr, output_path, exit_code);
+    svc.save_checkpoint(
+        task_id,
+        &TaskCheckpoint {
+            active_subtask_id: None,
+            turn: 0,
+            session_id: task_session_id
+                .map(str::to_string)
+                .or_else(|| sr.session_id.clone()),
+            state,
+        },
+    )
+    .await?;
+    match exit_code {
+        ExitCode::Success => {
+            svc.complete_task(task_id).await?;
+        }
+        ExitCode::Partial => {
+            svc.complete_task_with_outcome(task_id, stream_result_completion_outcome(sr))
+                .await?;
+        }
+        ExitCode::Unfinished => {
+            unreachable!("unfinished exit code is only valid for task result lookup")
+        }
+        ExitCode::ToolFailure
+        | ExitCode::ForceStop
+        | ExitCode::ApiError
+        | ExitCode::PersistenceError => {
+            let failure_reason = stream_result_failure_reason(exit_code, sr);
+            svc.fail_task(task_id, &failure_reason).await?;
+        }
+    }
+
+    Ok(exit_code)
+}
+
+async fn resolve_task_result_task_id(
+    svc: &dyn astra_services::TaskService,
+    query: &str,
+) -> Result<String, String> {
+    let user_id = cli_user_id();
+    super::slash_task::find_task_by_query(svc, &user_id, query)
+        .await?
+        .ok_or_else(|| format!("no task matching '{query}'"))
+}
+
+fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<String>) {
+    let detail = detail.into();
+    match sr.session_persistence_error.as_deref() {
+        Some(existing) if existing == detail => {}
+        Some(existing) => {
+            sr.session_persistence_error = Some(format!("{existing}; {detail}"));
+        }
+        None => sr.session_persistence_error = Some(detail),
+    }
+}
+
+fn persist_one_shot_session_state(
+    profile: Option<&str>,
+    model: Option<&str>,
+    line: &str,
+    sr: &mut StreamResult,
+    turn_start: std::time::Instant,
+) {
+    if let Err(error) = super::session_side_effects::append_one_shot_journal_events(
+        sr.session_id.as_deref(),
+        model,
+        line,
+        sr,
+        turn_start,
+    ) {
+        record_stream_persistence_error(sr, error);
+    }
+
+    if sr.session_persistence_error.is_none()
+        && let Some(sid) = sr.session_id.as_deref()
+        && let Err(error) = persist_profile_last_session(profile, sid)
+    {
+        record_stream_persistence_error(
+            sr,
+            format!("failed to persist last session pointer: {error}"),
+        );
+    }
+}
+
+fn finalize_one_shot_stream_result(
+    profile: Option<&str>,
+    model: Option<&str>,
+    line: &str,
+    sr: &mut StreamResult,
+    turn_start: std::time::Instant,
+) -> ExitCode {
+    persist_one_shot_session_state(profile, model, line, sr, turn_start);
+    compute_exit_code(sr)
+}
+
+fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option<String> {
+    if let Some(error) = sr.session_persistence_error.as_deref() {
+        Some(format!("Session persistence degraded: {error}"))
+    } else if exit_code == ExitCode::Partial {
+        Some(match sr.interruption_kind.as_deref() {
+            Some(kind) => format!(
+                "Turn finished partially ({kind}). Inspect partial output before continuing."
+            ),
+            None => {
+                "Turn finished partially. Inspect partial output before continuing.".to_string()
+            }
+        })
+    } else {
+        None
+    }
+}
+
+fn print_one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode, json_output: bool) {
+    if let Some(message) = one_shot_completion_warning(sr, exit_code)
+        && !json_output
+    {
+        eprintln!("  {}", message.yellow());
+    }
+}
+
 struct HeadlessTaskInput {
     task_id: String,
+    task_session_id: String,
     prompt: String,
     svc: std::sync::Arc<dyn astra_services::TaskService>,
-    session_id: Option<String>,
+    session_routing: OneShotSessionRouting,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +412,29 @@ struct HeadlessTaskOptions {
     quiet: bool,
     stream_events: bool,
     print_started: bool,
+}
+
+const NON_CANONICAL_TASK_SCOPE: &str = "no-session";
+
+async fn build_one_shot_task_manager(
+    profile: Option<&str>,
+    api_origin: &str,
+    session_id: Option<&str>,
+) -> std::sync::Arc<crate::edge_tools::TaskManager> {
+    if let Some(session_id) = session_id {
+        let task_store = crate::cli::session_runtime::resolve_task_store(profile, Some(api_origin))
+            .await
+            .0;
+        std::sync::Arc::new(crate::edge_tools::TaskManager::new(
+            session_id.to_string(),
+            task_store,
+        ))
+    } else {
+        std::sync::Arc::new(crate::edge_tools::TaskManager::new(
+            NON_CANONICAL_TASK_SCOPE.to_string(),
+            std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
+        ))
+    }
 }
 
 async fn execute_headless_task_body(
@@ -197,12 +447,15 @@ async fn execute_headless_task_body(
 ) -> Result<ExitCode, String> {
     let HeadlessTaskInput {
         task_id,
+        task_session_id,
         prompt,
         svc,
-        session_id,
+        session_routing,
     } = input;
-    use astra_services::{TaskCheckpoint, TaskStatus};
+    use astra_services::TaskStatus;
     let (_creds, profile_name, _, token) = get_profile_and_token(profile)?;
+    let session_id = session_routing.server_session_id.clone();
+    let mut continuation_messages = session_routing.continuation_messages();
 
     emit_task_event(
         options.stream_events,
@@ -258,16 +511,12 @@ async fn execute_headless_task_body(
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
-    let task_store =
-        crate::cli::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
-            .await
-            .0;
-    let task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-        session_id
-            .clone()
-            .unwrap_or_else(|| "no-session".to_string()),
-        task_store,
-    ));
+    let task_manager = build_one_shot_task_manager(
+        profile,
+        &api.api_origin(),
+        session_routing.task_scope_session_id(),
+    )
+    .await;
 
     let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
         api,
@@ -299,7 +548,11 @@ async fn execute_headless_task_body(
         benchmark_profile: None,
     };
 
-    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions::default();
+    let turn_start = std::time::Instant::now();
+    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+        pre_loaded_messages: continuation_messages.take(),
+        ..Default::default()
+    };
     let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
         &chat_ctx,
         &token,
@@ -316,12 +569,7 @@ async fn execute_headless_task_body(
             let _ = svc.fail_task(&task_id, &e.error).await;
             emit_task_event(
                 options.stream_events,
-                serde_json::json!({
-                    "type": "task_notification",
-                    "task_id": task_id,
-                    "status": "failed",
-                    "summary": e.error,
-                }),
+                failed_task_notification_payload(&task_id, &e.error, "turn_error", None, None),
             );
             return Err(e.error);
         }
@@ -336,84 +584,56 @@ async fn execute_headless_task_body(
         let _ = handle.await;
     }
 
-    let output_path = match write_task_output(&task_id, &sr.full_text) {
-        Ok(path) => path,
+    persist_one_shot_session_state(
+        Some(&profile_name),
+        global_model,
+        &prompt,
+        &mut sr,
+        turn_start,
+    );
+
+    let output_path_result = write_task_output(&task_id, &sr.full_text);
+    let output_path_string = match output_path_result.as_ref() {
+        Ok(path) => Some(path.to_string_lossy().to_string()),
+        Err(error) => {
+            record_stream_persistence_error(&mut sr, error.clone());
+            None
+        }
+    };
+    let exit_code = match finalize_headless_task_result(
+        svc.as_ref(),
+        &task_id,
+        &sr,
+        Some(&task_session_id),
+        output_path_string.as_deref(),
+    )
+    .await
+    {
+        Ok(code) => code,
         Err(e) => {
-            let _ = svc.fail_task(&task_id, &e).await;
+            let _ = svc
+                .fail_task(
+                    &task_id,
+                    &encode_task_failure_message("persistence_error", &e),
+                )
+                .await;
+            emit_task_event(
+                options.stream_events,
+                failed_task_notification_payload(
+                    &task_id,
+                    &e,
+                    "task_record_error",
+                    output_path_string.as_deref(),
+                    sr.session_persistence_error.as_deref(),
+                ),
+            );
             return Err(e);
         }
     };
-    let output_path_string = output_path.to_string_lossy().to_string();
-    let mut state_map = serde_json::Map::new();
-    state_map.insert(
-        "full_text".to_string(),
-        serde_json::Value::String(sr.full_text.clone()),
-    );
-    state_map.insert(
-        "output_file".to_string(),
-        serde_json::Value::String(output_path_string.clone()),
-    );
-    state_map.insert(
-        "prompt_tokens".to_string(),
-        serde_json::json!(sr.prompt_tokens),
-    );
-    state_map.insert(
-        "completion_tokens".to_string(),
-        serde_json::json!(sr.completion_tokens),
-    );
-    state_map.insert(
-        "tool_calls_count".to_string(),
-        serde_json::json!(sr.tool_calls_count),
-    );
-    state_map.insert(
-        "background_agent_results".to_string(),
-        serde_json::json!(
-            sr.background_agent_results
-                .iter()
-                .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                .collect::<Vec<_>>()
-        ),
-    );
-    if let Err(e) = svc
-        .save_checkpoint(
-            &task_id,
-            &TaskCheckpoint {
-                active_subtask_id: None,
-                turn: 0,
-                session_id: sr.session_id.clone().or(session_id.clone()),
-                state: state_map,
-            },
-        )
-        .await
-    {
-        let _ = svc.fail_task(&task_id, &e).await;
-        return Err(e);
-    }
-
-    let exit_code = compute_exit_code(&sr);
-    if exit_code == ExitCode::Success {
-        svc.complete_task(&task_id).await?;
-    } else {
-        svc.fail_task(
-            &task_id,
-            error_kind_for_exit_code(exit_code).unwrap_or("task failed"),
-        )
-        .await?;
-    }
-
-    if let Some(ref sid) = sr.session_id {
-        persist_profile_last_session(Some(&profile_name), sid)?;
-    }
 
     emit_task_event(
         options.stream_events,
-        serde_json::json!({
-            "type": "task_notification",
-            "task_id": task_id,
-            "status": if exit_code == ExitCode::Success { "completed" } else { "failed" },
-            "output_file": output_path_string,
-            "summary": sr.full_text.chars().take(200).collect::<String>(),
-        }),
+        task_notification_payload(&task_id, &sr, output_path_string.as_deref(), exit_code),
     );
 
     if options.json {
@@ -422,11 +642,7 @@ async fn execute_headless_task_body(
             obj.insert("task_id".to_string(), serde_json::json!(task_id));
             obj.insert(
                 "task_status".to_string(),
-                serde_json::json!(if exit_code == ExitCode::Success {
-                    "completed"
-                } else {
-                    "failed"
-                }),
+                serde_json::json!(task_status_for_exit_code(exit_code)),
             );
             obj.insert(
                 "output_file".to_string(),
@@ -450,12 +666,12 @@ async fn execute_headless_task_body(
         println!("{}", sr.full_text);
     } else {
         eprintln!(
-            "\n  {} Task {} finished; output saved to {}",
-            theme::icon_ok(),
-            prefix_chars(&task_id, 8).cyan(),
-            output_path.display().to_string().dim()
+            "{}",
+            task_terminal_summary_line(&task_id, output_path_string.as_deref(), exit_code)
         );
     }
+
+    print_one_shot_completion_warning(&sr, exit_code, options.json);
 
     Ok(exit_code)
 }
@@ -474,17 +690,19 @@ async fn execute_headless_task_run(
         return Err("task prompt cannot be empty".to_string());
     }
 
-    let session_id = match cli_context.session_id.clone() {
-        Some(session_id) => Some(session_id),
-        None => validated_resumable_last_session_id(api, profile).await,
-    };
+    let session_routing =
+        resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
+            .await?;
     let user_id = cli_user_id();
-    let task_session_id = session_id.as_deref().unwrap_or("no-session");
+    let task_session_id = session_routing
+        .task_scope_session_id()
+        .unwrap_or(NON_CANONICAL_TASK_SCOPE)
+        .to_string();
     let svc = session_runtime::resolve_task_service(profile).await;
     let task_id = svc
         .create_task(
             &user_id,
-            task_session_id,
+            &task_session_id,
             TaskCreateRequest {
                 title: task_run_title(&prompt),
                 description: Some(prompt.clone()),
@@ -499,9 +717,10 @@ async fn execute_headless_task_run(
     execute_headless_task_body(
         HeadlessTaskInput {
             task_id,
+            task_session_id,
             prompt,
             svc,
-            session_id,
+            session_routing,
         },
         HeadlessTaskOptions {
             json: args.json,
@@ -583,6 +802,18 @@ fn default_task_agent_id() -> String {
         .unwrap_or_else(|_| format!("astra-worker-{}", std::process::id()))
 }
 
+async fn claim_next_claimable_task_for_worker(
+    lease_svc: &dyn astra_services::TaskLeaseService,
+    user_id: &str,
+    agent_id: &str,
+    edge_id: &str,
+    ttl_sec: i64,
+) -> Result<astra_services::NextClaimableLeaseClaimResult, String> {
+    lease_svc
+        .claim_next_claimable_lease(user_id, agent_id, edge_id, ttl_sec)
+        .await
+}
+
 /// Outcome of a single worker poll. `Interrupted` lets the outer
 /// `--loop` driver tell a user-initiated Ctrl+C apart from a normal
 /// "task done" cycle, so the loop exits promptly instead of requiring
@@ -599,111 +830,70 @@ async fn execute_task_worker_once(
     api: &astra_thin_client::ThinClient,
     cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<WorkerOutcome, String> {
-    use astra_services::{LeaseClaimResult, TaskStatus};
-
     let (svc, lease_svc) = session_runtime::resolve_cloud_task_runtime(profile).await?;
     let user_id = cli_user_id();
     let agent_id = args.agent_id.clone().unwrap_or_else(default_task_agent_id);
     let edge_id = std::env::var("ASTRA_EDGE_ID").unwrap_or_else(|_| agent_id.clone());
-    let pending_tasks = svc.list_tasks(&user_id, Some(TaskStatus::Pending)).await?;
-    if pending_tasks.is_empty() {
-        if args.json {
-            println!(
-                "{}",
-                serde_json::json!({"claimed": false, "reason": "no_pending_tasks"})
-            );
-        } else if !args.quiet {
-            eprintln!("  {}", "No pending cloud tasks.".dim());
-        }
-        return Ok(WorkerOutcome::Completed(ExitCode::Success));
-    }
-
-    let mut claimed_task_id = None;
-    for candidate in pending_tasks {
-        // A transient lease-claim failure (pool hiccup, replica lag,
-        // brief MO unavailability) on ONE candidate must not abort
-        // the whole poll — in loop mode that would kill the worker
-        // on the first flaky query. Log and try the next candidate.
-        let claim = match lease_svc
-            .try_claim_lease(
-                &user_id,
-                &candidate.task_id,
-                &agent_id,
-                &edge_id,
-                args.ttl_seconds,
-            )
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                if !args.quiet && !args.json {
-                    eprintln!(
-                        "  {} claim failed for {}: {} — skipping",
-                        "⚠".yellow(),
-                        prefix_chars(&candidate.task_id, 8).dim(),
-                        e
-                    );
-                }
-                tracing::warn!(task_id = %candidate.task_id, error = %e, "try_claim_lease transient failure");
-                continue;
+    let claimed_task_id = match claim_next_claimable_task_for_worker(
+        &*lease_svc,
+        &user_id,
+        &agent_id,
+        &edge_id,
+        args.ttl_seconds,
+    )
+    .await?
+    {
+        astra_services::NextClaimableLeaseClaimResult::Granted {
+            task_id,
+            lease_version,
+            expires_at,
+        } => {
+            if args.json {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "claimed": true,
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "lease_version": lease_version,
+                        "expires_at": expires_at,
+                    })
+                );
+            } else if !args.quiet {
+                eprintln!(
+                    "  {} Claimed cloud task {} as {}",
+                    "▶".cyan(),
+                    prefix_chars(&task_id, 8).dim(),
+                    agent_id.as_str().cyan()
+                );
             }
-        };
-        match claim {
-            LeaseClaimResult::Granted {
-                lease_version,
-                expires_at,
-            } => {
-                if args.json {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "claimed": true,
-                            "task_id": candidate.task_id,
-                            "agent_id": agent_id,
-                            "lease_version": lease_version,
-                            "expires_at": expires_at,
-                        })
-                    );
-                } else if !args.quiet {
-                    eprintln!(
-                        "  {} Claimed cloud task {} as {}",
-                        "▶".cyan(),
-                        prefix_chars(&candidate.task_id, 8).dim(),
-                        agent_id.as_str().cyan()
-                    );
-                }
-                claimed_task_id = Some(candidate.task_id);
-                break;
-            }
-            LeaseClaimResult::Contested {
-                holder_agent_id,
-                expires_at,
-            } => {
-                if !args.quiet && !args.json {
-                    eprintln!(
-                        "  {} Skipping leased task {} held by {} until {}",
-                        "⚠".yellow(),
-                        prefix_chars(&candidate.task_id, 8).dim(),
-                        holder_agent_id,
-                        expires_at
-                    );
-                }
-            }
+            task_id
         }
-    }
-    let Some(claimed_task_id) = claimed_task_id else {
-        if args.json {
-            println!(
-                "{}",
-                serde_json::json!({"claimed": false, "reason": "all_pending_tasks_leased"})
-            );
-        } else if !args.quiet {
-            eprintln!(
-                "  {}",
-                "All pending cloud tasks are currently leased.".dim()
-            );
+        astra_services::NextClaimableLeaseClaimResult::NoClaimableTasks => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"claimed": false, "reason": "no_claimable_tasks"})
+                );
+            } else if !args.quiet {
+                eprintln!("  {}", "No claimable cloud tasks.".dim());
+            }
+            return Ok(WorkerOutcome::Completed(ExitCode::Success));
         }
-        return Ok(WorkerOutcome::Completed(ExitCode::Success));
+        astra_services::NextClaimableLeaseClaimResult::AllClaimableTasksLeased => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"claimed": false, "reason": "all_claimable_tasks_leased"})
+                );
+            } else if !args.quiet {
+                eprintln!(
+                    "  {}",
+                    "All claimable cloud tasks are currently leased.".dim()
+                );
+            }
+            return Ok(WorkerOutcome::Completed(ExitCode::Success));
+        }
     };
 
     // `get_task` runs AFTER a successful claim — any failure here would
@@ -814,24 +1004,36 @@ async fn execute_task_worker_once(
     // `interrupted` lets the outer --loop driver exit cleanly instead
     // of requiring a second Ctrl+C during the poll-interval sleep.
     let (body_result, interrupted): (Result<ExitCode, String>, bool) = tokio::select! {
-        res = execute_headless_task_body(
-            HeadlessTaskInput {
-                task_id: task.task_id.clone(),
-                prompt,
-                svc: svc.clone(),
-                session_id: task.session_id.clone(),
-            },
-            HeadlessTaskOptions {
-                json: args.json,
-                quiet: args.quiet,
-                stream_events: args.stream_events,
-                print_started: false,
-            },
-            profile,
-            global_model,
-            api,
-            cli_context,
-        ) => (res, false),
+        res = async {
+            let session_routing = resolve_one_shot_session_routing(
+                api,
+                profile,
+                task.session_id.clone(),
+                true,
+            ).await?;
+            execute_headless_task_body(
+                HeadlessTaskInput {
+                    task_id: task.task_id.clone(),
+                    task_session_id: task
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| NON_CANONICAL_TASK_SCOPE.to_string()),
+                    prompt,
+                    svc: svc.clone(),
+                    session_routing,
+                },
+                HeadlessTaskOptions {
+                    json: args.json,
+                    quiet: args.quiet,
+                    stream_events: args.stream_events,
+                    print_started: false,
+                },
+                profile,
+                global_model,
+                api,
+                cli_context,
+            ).await
+        } => (res, false),
         _ = tokio::signal::ctrl_c() => {
             if !args.quiet && !args.json {
                 eprintln!("  {}", "Task interrupted — releasing lease.".dim());
@@ -857,12 +1059,12 @@ async fn execute_task_worker_once(
     }
 
     // On Ctrl+C the body was dropped while the task row was already
-    // `InProgress` (execute_headless_task_body sets that early). Without
-    // a revert, `list_tasks(Pending)` wouldn't re-surface the task and
-    // no other worker could claim it — the task would sit stranded
-    // until the lease TTL expired. Revert to `Pending` BEFORE releasing
-    // the lease so a concurrent worker polling post-release sees the
-    // right status.
+    // `InProgress` (execute_headless_task_body sets that early). The
+    // task will still become claimable again after lease release/expiry,
+    // but leaving it `InProgress` is misleading in user-facing task
+    // surfaces. Revert to `Pending` before releasing the lease when we
+    // still own it so the next worker and the user both see an honest
+    // queue state.
     //
     // Guards:
     // - **Lease ownership** — if another worker stole the lease while
@@ -878,7 +1080,7 @@ async fn execute_task_worker_once(
     // - **Timeout** — Ctrl+C is a prompt-exit signal; we MUST NOT
     //   block indefinitely here if MO is unavailable. 5 s is a
     //   generous budget for a single UPDATE; timeout degrades to
-    //   "stranded until TTL" which matches pre-fix behaviour.
+    //   "still claimable, but visually stuck as in_progress".
     if interrupted {
         use std::time::Duration;
         let revert_timeout = Duration::from_secs(5);
@@ -929,13 +1131,13 @@ async fn execute_task_worker_once(
                     tracing::warn!(
                         task_id = %task.task_id,
                         error = %e,
-                        "failed to revert interrupted task to Pending (task may appear stranded until lease TTL)"
+                        "failed to revert interrupted task to Pending (task remains claimable but may still look in_progress)"
                     );
                 }
                 Err(_) => {
                     tracing::warn!(
                         task_id = %task.task_id,
-                        "update_status revert timed out (task may appear stranded until lease TTL)"
+                        "update_status revert timed out (task remains claimable but may still look in_progress)"
                     );
                 }
             }
@@ -1206,8 +1408,6 @@ async fn execute_task_worker(
 }
 
 async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode, String> {
-    use astra_services::TaskStatus;
-
     let query = join_words(&args.query);
     if query.trim().is_empty() {
         return Err("provide a task id or title fragment".to_string());
@@ -1217,13 +1417,12 @@ async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode, String> {
     // falls back to env-only token resolution which is fine for
     // one-shot `astra task result <query>` invocations.
     let svc = session_runtime::resolve_task_service(None).await;
-    let task_id = super::slash_task::find_task_by_query(&*svc, "local", &query)
-        .await?
-        .ok_or_else(|| format!("no task matching '{query}'"))?;
+    let task_id = resolve_task_result_task_id(&*svc, &query).await?;
     let task = svc
         .get_task(&task_id)
         .await?
         .ok_or_else(|| format!("task disappeared: {task_id}"))?;
+    let read = load_task_result_read_surface(&task);
 
     let short = &task.task_id[..8.min(task.task_id.len())];
     eprintln!(
@@ -1231,129 +1430,53 @@ async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode, String> {
         format!("─── Task Result ({short}) ─────────────────────────").bold()
     );
     eprintln!("  {:<12} {}", "title:".dim(), task.title);
-    eprintln!("  {:<12} {}", "status:".dim(), task.status.as_str().cyan());
-    if let Some(ref err) = task.error_message {
-        eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
+    for field in task_result_header_fields(&read) {
+        eprintln!(
+            "  {:<12} {}",
+            field.label.dim(),
+            render_task_result_header_value(&field)
+        );
     }
 
-    // 1. Try checkpoint (set by `task run` and worker)
-    if let Some(ref cp) = task.checkpoint {
-        if let Some(full_text) = cp.state.get("full_text").and_then(|v| v.as_str()) {
-            eprintln!();
-            if args.json {
-                let tokens = cp
-                    .state
-                    .get("prompt_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let comp = cp
-                    .state
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let tools = cp
-                    .state
-                    .get("tool_calls_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let output_file = cp
-                    .state
-                    .get("output_file")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "task_id": task.task_id,
-                        "title": task.title,
-                        "status": task.status.as_str(),
-                        "full_text": full_text,
-                        "prompt_tokens": tokens,
-                        "completion_tokens": comp,
-                        "tool_calls_count": tools,
-                        "output_file": output_file,
-                    }))
-                    .unwrap_or_default()
-                );
-            } else {
-                println!("{full_text}");
-                if let Some(tokens) = cp.state.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                    let comp = cp
-                        .state
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let tools = cp
-                        .state
-                        .get("tool_calls_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    eprintln!(
-                        "\n  {}",
-                        format!("tokens: {tokens}→/{comp}← | tools: {tools}").dim()
-                    );
-                }
-                if let Some(output_file) = cp.state.get("output_file").and_then(|v| v.as_str()) {
-                    eprintln!("  {}", format!("output: {output_file}").dim());
-                }
-            }
-            eprintln!();
-            return Ok(ExitCode::Success);
-        }
+    let artifact = read.load_artifact()?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&task_result_json_payload(&read, artifact.as_ref()))
+                .unwrap_or_default()
+        );
+        eprintln!();
+        return Ok(read.exit_code);
     }
 
-    // 2. Fallback: read output file at the canonical path for this task_id
-    if let Ok(output_path) = task_output_path(&task.task_id) {
-        if let Ok(text) = std::fs::read_to_string(&output_path) {
-            if !text.trim().is_empty() {
-                eprintln!();
-                if args.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "task_id": task.task_id,
-                            "title": task.title,
-                            "status": task.status.as_str(),
-                            "full_text": text,
-                            "output_file": output_path.display().to_string(),
-                        }))
-                        .unwrap_or_default()
-                    );
-                } else {
-                    println!("{text}");
-                    eprintln!("  {}", format!("output: {}", output_path.display()).dim());
-                }
-                eprintln!();
-                return Ok(ExitCode::Success);
-            }
+    if let Some(artifact) = artifact {
+        eprintln!();
+        println!("{}", artifact.full_text);
+        if let Some(tokens) = artifact.prompt_tokens {
+            let comp = artifact.completion_tokens;
+            let tools = artifact.tool_calls_count;
+            eprintln!(
+                "\n  {}",
+                format!("tokens: {tokens}→/{comp}← | tools: {tools}").dim()
+            );
         }
+        if let Some(output_file) = artifact.output_file {
+            eprintln!("  {}", format!("output: {output_file}").dim());
+        }
+        eprintln!();
+        return Ok(read.exit_code);
     }
 
-    // 3. Still running / no data yet
-    match task.status {
-        TaskStatus::InProgress | TaskStatus::Pending => {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"task_id": task.task_id, "status": "running"})
-                );
-            } else {
-                eprintln!("  {}", "Task is still running…".yellow());
-            }
-        }
-        _ => {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"task_id": task.task_id, "status": task.status.as_str(), "result": null})
-                );
-            } else {
-                eprintln!("  {}", "No result available.".dim());
-            }
-        }
+    // Unfinished / no data yet
+    if read.header.is_unfinished {
+        eprintln!("  {}", read.missing_text.yellow());
+    } else {
+        eprintln!("  {}", read.missing_text.dim());
+        eprintln!();
+        return Ok(read.exit_code);
     }
     eprintln!();
-    Ok(ExitCode::Success)
+    Ok(read.exit_code)
 }
 
 async fn execute_repl_bridge_command(
@@ -1616,13 +1739,15 @@ pub(crate) async fn execute_cli_command(
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id = match cli_context.session_id.clone() {
-                Some(session_id) => Some(session_id),
-                None => validated_resumable_last_session_id(api, profile.as_deref()).await,
-            };
-            let mut continuation_messages = session_id
-                .as_deref()
-                .and_then(load_session_messages_for_continuation);
+            let session_routing = resolve_one_shot_session_routing(
+                api,
+                profile.as_deref(),
+                cli_context.session_id.clone(),
+                true,
+            )
+            .await?;
+            let session_id = session_routing.server_session_id.clone();
+            let mut continuation_messages = session_routing.continuation_messages();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mode = if auto_approve {
                 PermissionMode::Auto
@@ -1673,7 +1798,8 @@ pub(crate) async fn execute_cli_command(
                 pre_loaded_messages: continuation_messages.take(),
                 ..Default::default()
             };
-            let sr = match crate::cli::turn_facade::execute_basic_cli_turn(
+            let turn_start = std::time::Instant::now();
+            let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
@@ -1714,10 +1840,15 @@ pub(crate) async fn execute_cli_command(
                 }
                 Err(e) => return Err(e.error),
             };
-            if let Some(ref sid) = sr.session_id {
-                persist_profile_last_session(profile.as_deref(), sid)?;
-            }
-            Ok(compute_exit_code(&sr))
+            let exit_code = finalize_one_shot_stream_result(
+                profile.as_deref(),
+                global_model.as_deref(),
+                &message,
+                &mut sr,
+                turn_start,
+            );
+            print_one_shot_completion_warning(&sr, exit_code, false);
+            Ok(exit_code)
         }
 
         Some(Command::Register(args)) => {
@@ -1814,14 +1945,7 @@ pub(crate) async fn execute_cli_command(
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            mutate_credentials(|creds| {
-                let name = profile_name(profile.as_deref(), creds);
-                if let Some(entry) = creds.profiles.get_mut(&name) {
-                    entry.access_token = None;
-                    entry.refresh_token = None;
-                    entry.last_session_id = None;
-                }
-            })?;
+            clear_profile_auth(profile.as_deref())?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -2089,18 +2213,18 @@ pub(crate) async fn execute_cli_command(
 
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let explicit_session_id = args.session_id.clone();
-            let session_id = match explicit_session_id {
-                Some(session_id) => Some(session_id),
-                None if args.no_resume => None,
-                None => match cli_context.session_id.clone() {
+            let session_routing = resolve_one_shot_session_routing(
+                api,
+                profile.as_deref(),
+                match explicit_session_id {
                     Some(session_id) => Some(session_id),
-                    None => validated_resumable_last_session_id(api, profile.as_deref()).await,
+                    None => cli_context.session_id.clone(),
                 },
-            };
-            // Load previous conversation for multi-turn continuity.
-            let mut continuation_messages = session_id
-                .as_deref()
-                .and_then(load_session_messages_for_continuation);
+                !args.no_resume,
+            )
+            .await?;
+            let session_id = session_routing.server_session_id.clone();
+            let mut continuation_messages = session_routing.continuation_messages();
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
@@ -2192,18 +2316,12 @@ pub(crate) async fn execute_cli_command(
             // to `session_todos`. Without this the tool runs against a
             // throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
-            let (chat_task_store, _chat_task_notify_tx) =
-                super::session_runtime::resolve_task_store(
-                    profile.as_deref(),
-                    Some(&api.api_origin()),
-                )
-                .await;
-            let chat_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-                session_id
-                    .clone()
-                    .unwrap_or_else(|| "no-session".to_string()),
-                chat_task_store,
-            ));
+            let chat_task_manager = build_one_shot_task_manager(
+                profile.as_deref(),
+                &api.api_origin(),
+                session_id.as_deref(),
+            )
+            .await;
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -2253,15 +2371,11 @@ pub(crate) async fn execute_cli_command(
                 Err(e) => return Err(e.error),
             };
 
-            // Save session for resumption
-            if let Some(sid) = &sr.session_id {
-                persist_profile_last_session(profile.as_deref(), sid)?;
-            }
-            super::chat_turn::append_one_shot_journal_events(
-                sr.session_id.as_deref(),
+            let exit_code = finalize_one_shot_stream_result(
+                profile.as_deref(),
                 args.model.as_deref().or(global_model.as_deref()),
                 &message,
-                &sr,
+                &mut sr,
                 turn_start,
             );
 
@@ -2293,8 +2407,6 @@ pub(crate) async fn execute_cli_command(
 
             // Output result
             if args.json {
-                // Compute exit code for JSON output
-                let exit_code = compute_exit_code(&sr);
                 // Pure JSON output for scripting
                 let mut json_output = final_json_output(&sr, exit_code);
                 if let Some(obj) = json_output.as_object_mut() {
@@ -2323,15 +2435,18 @@ pub(crate) async fn execute_cli_command(
             }
             // Normal mode output is already handled by stream_chat_sse
 
-            Ok(compute_exit_code(&sr))
+            print_one_shot_completion_warning(&sr, exit_code, args.json);
+
+            Ok(exit_code)
         }
 
         Some(Command::Replay(args)) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let replay_body = api
                 .post_session_replay_json(
                     &token,
-                    &args.session_id,
+                    session_id,
                     &serde_json::json!({
                         "sandbox_name": args.sandbox_name,
                         "mock_mode": args.mock_mode
@@ -2342,7 +2457,7 @@ pub(crate) async fn execute_cli_command(
             print_json_or_raw(&replay_body);
             if args.compare {
                 let compare_body = api
-                    .get_session_replay_compare_text(&token, &args.session_id)
+                    .get_session_replay_compare_text(&token, session_id)
                     .await
                     .map_err(map_thin_err)?;
                 print_json_or_raw(&compare_body);
@@ -2371,9 +2486,10 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Session(SessionCmd::Show(args))) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
-                .get_session_text(&token, &args.session_id)
+                .get_session_text(&token, session_id)
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);
@@ -2381,37 +2497,33 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Session(SessionCmd::Close(args))) => {
-            let (creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id = validated_cli_session_arg(&args.session_id)?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
-                .post_session_close_text(&token, &args.session_id)
+                .post_session_close_text(&token, session_id)
                 .await
                 .map_err(map_thin_err)?;
-            if creds
-                .profiles
-                .get(&name)
-                .and_then(|profile| profile.last_session_id.as_deref())
-                == Some(args.session_id.as_str())
-            {
-                let _ = clear_profile_last_session(profile.as_deref());
-            }
+            clear_profile_last_session_if_matches_or_warn(
+                profile.as_deref(),
+                session_id,
+                "command_router:session_close",
+            );
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::Delete(args))) => {
-            let (creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id = validated_cli_session_arg(&args.session_id)?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
-                .delete_session_text(&token, &args.session_id)
+                .delete_session_text(&token, session_id)
                 .await
                 .map_err(map_thin_err)?;
-            if creds
-                .profiles
-                .get(&name)
-                .and_then(|profile| profile.last_session_id.as_deref())
-                == Some(args.session_id.as_str())
-            {
-                let _ = clear_profile_last_session(profile.as_deref());
-            }
+            clear_profile_last_session_if_matches_or_warn(
+                profile.as_deref(),
+                session_id,
+                "command_router:session_delete",
+            );
             if body.is_empty() {
                 println!("  {} {}", theme::icon_ok(), "Deleted".green());
             } else {
@@ -2608,13 +2720,10 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Audit(AuditCmd::Show(args))) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
-                .get_bearer_path_query_text(
-                    &token,
-                    &paths::session_audit_summary(&args.session_id),
-                    &[],
-                )
+                .get_bearer_path_query_text(&token, &paths::session_audit_summary(session_id), &[])
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);
@@ -2622,11 +2731,12 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Audit(AuditCmd::Turns(args))) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = if let Some(turn) = args.turn {
                 api.get_bearer_path_query_text(
                     &token,
-                    &paths::session_audit_turn_detail(&args.session_id, turn),
+                    &paths::session_audit_turn_detail(session_id, turn),
                     &[],
                 )
                 .await
@@ -2635,12 +2745,8 @@ pub(crate) async fn execute_cli_command(
                     ("page", args.page.to_string()),
                     ("per_page", args.per_page.to_string()),
                 ];
-                api.get_bearer_path_query_text(
-                    &token,
-                    &paths::session_audit_turns(&args.session_id),
-                    &q,
-                )
-                .await
+                api.get_bearer_path_query_text(&token, &paths::session_audit_turns(session_id), &q)
+                    .await
             }
             .map_err(map_thin_err)?;
             print_json_or_raw(&body);
@@ -2648,8 +2754,13 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Audit(AuditCmd::Tools(args))) => {
+            let session_id = args
+                .session_id
+                .as_deref()
+                .map(validated_cli_session_arg)
+                .transpose()?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = if let Some(ref sid) = args.session_id {
+            let body = if let Some(sid) = session_id {
                 api.get_bearer_path_query_text(&token, &paths::session_audit_tools(sid), &[])
                     .await
             } else {
@@ -2720,77 +2831,7 @@ pub(crate) async fn execute_cli_command(
 /// finds nothing or a diff that reports differences is a successful tool
 /// execution, not an error the agent needs to recover from.
 fn compute_exit_code(sr: &StreamResult) -> ExitCode {
-    // ── Force stop (highest priority) ──────────────────────────────────
-    for ve in &sr.verdict_events {
-        if ve.force_stop {
-            return ExitCode::ForceStop;
-        }
-    }
-
-    // ── Semantic classification of each tool call ──────────────────────
-    let is_error = |r: &astra_services::session_journal::ToolCallRecord| -> bool {
-        match r
-            .exit_semantics
-            .as_deref()
-            .and_then(parse_exit_semantics_tag)
-        {
-            // ExecutionError is a genuine tool failure (command crashed,
-            // permission denied, signal kill, unknown command, etc.)
-            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError) => true,
-            // Success, InformationalFailure (grep no-match), and
-            // DomainNegative (diff differences, test failures) are all
-            // intentional domain outcomes — the tool worked correctly.
-            Some(
-                astra_tools::exit_semantics::ExitSemantics::Success
-                | astra_tools::exit_semantics::ExitSemantics::InformationalFailure
-                | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
-            ) => false,
-            // Unknown or missing semantics fall back to the legacy ok flag.
-            // That keeps malformed records from silently downgrading a real
-            // tool failure into success.
-            None => !r.ok,
-        }
-    };
-
-    // Check for unrecovered tool failures. Agents self-correct by
-    // retrying with the same or different tools (write_file fails →
-    // bash echo succeeds). Only fail if the agent never recovered —
-    // i.e. the last error was not followed by a successful call.
-    let has_any_failure = sr.tool_call_records.iter().any(&is_error);
-    if has_any_failure {
-        let last_ok = sr
-            .tool_call_records
-            .iter()
-            .rev()
-            .find(|r| !is_error(r))
-            .is_some();
-        let last_ok_explicit = sr
-            .tool_call_records
-            .last()
-            .map(|r| !is_error(r))
-            .unwrap_or(true);
-        if !last_ok || !last_ok_explicit {
-            return ExitCode::ToolFailure;
-        }
-    }
-
-    ExitCode::Success
-}
-
-fn parse_exit_semantics_tag(tag: &str) -> Option<astra_tools::exit_semantics::ExitSemantics> {
-    serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(serde_json::Value::String(
-        tag.to_string(),
-    ))
-    .ok()
-}
-
-fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
-    match exit_code {
-        ExitCode::Success => None,
-        ExitCode::ToolFailure => Some("tool_failure"),
-        ExitCode::ForceStop => Some("force_stop"),
-        ExitCode::ApiError => Some("api_error"),
-    }
+    stream_result_exit_code(sr)
 }
 
 fn gateway_env_context() -> (Option<String>, Option<String>) {
@@ -2936,6 +2977,7 @@ fn final_json_output_with_context(
         "completion_tokens": sr.completion_tokens,
         "tool_calls_count": sr.tool_calls_count,
         "tools_used": sr.tools_used,
+        "persistence_error": sr.session_persistence_error,
         "exit_code": i32::from(exit_code),
         "success": exit_code == ExitCode::Success,
         "error_kind": error_kind_for_exit_code(exit_code),
@@ -2975,13 +3017,11 @@ pub(crate) async fn run_print_mode(
     let message = apply_system_prompt(&raw_message, system_prompt);
 
     let (_, _, _, token) = get_profile_and_token(profile)?;
-    let session_id = match cli_context.session_id.clone() {
-        Some(session_id) => Some(session_id),
-        None => validated_resumable_last_session_id(api, profile).await,
-    };
-    let mut continuation_messages = session_id
-        .as_deref()
-        .and_then(load_session_messages_for_continuation);
+    let session_routing =
+        resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
+            .await?;
+    let session_id = session_routing.server_session_id.clone();
+    let mut continuation_messages = session_routing.continuation_messages();
     let _pipeline = create_pipeline_modules(api, profile);
     // Issue #326 P0 / R1 Major 2: print mode (headless `astra -p`) is
     // non-interactive — there is no TUI to ask for approvals. We force
@@ -3019,16 +3059,12 @@ pub(crate) async fn run_print_mode(
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
-    let task_store =
-        crate::cli::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
-            .await
-            .0;
-    let print_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-        session_id
-            .clone()
-            .unwrap_or_else(|| "no-session".to_string()),
-        task_store,
-    ));
+    let print_task_manager = build_one_shot_task_manager(
+        profile,
+        &api.api_origin(),
+        session_routing.task_scope_session_id(),
+    )
+    .await;
 
     let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
         api,
@@ -3064,7 +3100,8 @@ pub(crate) async fn run_print_mode(
         pre_loaded_messages: continuation_messages.take(),
         ..Default::default()
     };
-    let sr = match crate::cli::turn_facade::execute_basic_cli_turn(
+    let turn_start = std::time::Instant::now();
+    let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         session_id.as_deref(),
@@ -3079,12 +3116,7 @@ pub(crate) async fn run_print_mode(
         Err(e) => return Err(e.error),
     };
 
-    // Save session for resumption
-    if let Some(sid) = &sr.session_id {
-        persist_profile_last_session(profile, sid)?;
-    }
-
-    let exit_code = compute_exit_code(&sr);
+    let exit_code = finalize_one_shot_stream_result(profile, model, &message, &mut sr, turn_start);
 
     match output_format {
         "json" | "stream-json" => {
@@ -3099,6 +3131,12 @@ pub(crate) async fn run_print_mode(
             print!("{}", sr.full_text);
         }
     }
+
+    print_one_shot_completion_warning(
+        &sr,
+        exit_code,
+        matches!(output_format, "json" | "stream-json"),
+    );
 
     Ok(exit_code)
 }
@@ -3310,6 +3348,7 @@ mod exit_code_tests {
         StreamResult {
             session_id: None,
             run_id: None,
+            session_persistence_error: None,
             full_text: String::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -3347,6 +3386,45 @@ mod exit_code_tests {
     fn exit_code_success_on_empty_result() {
         let sr = empty_stream_result();
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_persistence_error_on_successful_turn_with_durability_failure() {
+        let mut sr = empty_stream_result();
+        sr.session_persistence_error = Some("failed to append one-shot journal events".into());
+        assert_eq!(compute_exit_code(&sr), ExitCode::PersistenceError);
+    }
+
+    #[test]
+    fn exit_code_partial_on_interrupted_turn_without_harder_failure() {
+        let mut sr = empty_stream_result();
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
+    }
+
+    #[test]
+    fn exit_code_persistence_error_overrides_partial_turn() {
+        let mut sr = empty_stream_result();
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
+        sr.session_persistence_error = Some("journal append failed".into());
+        assert_eq!(compute_exit_code(&sr), ExitCode::PersistenceError);
+    }
+
+    #[test]
+    fn exit_code_tool_failure_takes_precedence_over_persistence_error() {
+        let mut sr = empty_stream_result();
+        sr.session_persistence_error = Some("failed to append one-shot journal events".into());
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: Some("exit code 1".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
 
     #[cfg(feature = "harness")]
@@ -3685,6 +3763,7 @@ mod final_json_output_tests {
         StreamResult {
             session_id: Some("session-1".to_string()),
             run_id: Some("run-1".to_string()),
+            session_persistence_error: None,
             full_text: "hello".to_string(),
             prompt_tokens: 10,
             completion_tokens: 3,
@@ -3789,6 +3868,857 @@ mod final_json_output_tests {
         assert_eq!(output["exit_code"], 1);
         assert_eq!(output["success"], false);
         assert_eq!(output["error_kind"], "tool_failure");
+    }
+
+    #[test]
+    fn final_json_output_includes_persistence_error() {
+        let mut sr = stream_result_for_json();
+        sr.session_persistence_error = Some("failed to append one-shot journal events".into());
+        let output = final_json_output_with_context(&sr, ExitCode::PersistenceError, None, None);
+
+        assert_eq!(output["exit_code"], 4);
+        assert_eq!(output["success"], false);
+        assert_eq!(output["error_kind"], "persistence_error");
+        assert_eq!(
+            output["persistence_error"],
+            "failed to append one-shot journal events"
+        );
+    }
+}
+
+#[cfg(test)]
+mod one_shot_persistence_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn persist_one_shot_session_state_marks_stream_result_and_skips_pointer_update_on_append_failure()
+     {
+        let _home = crate::tests::HomeGuard::temp();
+        let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+
+        let sid = format!("one-shot-persist-{}", uuid::Uuid::new_v4());
+        let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(&sid),
+                    1,
+                    0,
+                    serde_json::json!({
+                        "request": {
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "tools": []
+                        },
+                        "model": "test-model",
+                        "provider": "openai"
+                    }),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(&sid),
+                    1,
+                    0,
+                    serde_json::json!({
+                        "response": {
+                            "response": {
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 1
+                                }
+                            }
+                        },
+                        "provider": "openai"
+                    }),
+                ),
+            )
+            .unwrap();
+
+        let journal_path = astra_services::session_journal::journal_file_path(&sid);
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut sr = StreamResult {
+            session_id: Some(sid.clone()),
+            run_id: None,
+            session_persistence_error: None,
+            full_text: "answer".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_count: 0,
+            tools_selected: Vec::new(),
+            selected_skills: Vec::new(),
+            tools_used: Vec::new(),
+            tool_call_records: Vec::new(),
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: Vec::new(),
+            verdict_events: Vec::new(),
+            step_recorder_summary: None,
+            tool_health_export: Vec::new(),
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            memoria_ms: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
+            final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
+        };
+
+        persist_one_shot_session_state(
+            Some("default"),
+            Some("test-model"),
+            "continue",
+            &mut sr,
+            std::time::Instant::now(),
+        );
+
+        assert!(
+            sr.session_persistence_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to append one-shot journal events")
+        );
+        let creds = crate::cli::cli_utils::load_credentials();
+        assert_eq!(
+            creds
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.clone()),
+            None
+        );
+
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn finalize_one_shot_stream_result_returns_persistence_error_on_append_failure() {
+        let _home = crate::tests::HomeGuard::temp();
+        let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+
+        let sid = format!("one-shot-exit-{}", uuid::Uuid::new_v4());
+        let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(&sid),
+                    1,
+                    0,
+                    serde_json::json!({
+                        "request": {
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "tools": []
+                        },
+                        "model": "test-model",
+                        "provider": "openai"
+                    }),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(&sid),
+                    1,
+                    0,
+                    serde_json::json!({
+                        "response": {
+                            "response": {
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 1
+                                }
+                            }
+                        },
+                        "provider": "openai"
+                    }),
+                ),
+            )
+            .unwrap();
+        let journal_path = astra_services::session_journal::journal_file_path(&sid);
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut sr = StreamResult {
+            session_id: Some(sid.clone()),
+            run_id: None,
+            session_persistence_error: None,
+            full_text: "answer".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_count: 0,
+            tools_selected: Vec::new(),
+            selected_skills: Vec::new(),
+            tools_used: Vec::new(),
+            tool_call_records: Vec::new(),
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: Vec::new(),
+            verdict_events: Vec::new(),
+            step_recorder_summary: None,
+            tool_health_export: Vec::new(),
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            memoria_ms: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
+            final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
+        };
+
+        let exit_code = finalize_one_shot_stream_result(
+            Some("default"),
+            Some("test-model"),
+            "continue",
+            &mut sr,
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(exit_code, ExitCode::PersistenceError);
+        assert!(
+            sr.session_persistence_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to append one-shot journal events")
+        );
+
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod task_lookup_tests {
+    use super::*;
+    use astra_services::TaskService as _;
+
+    struct CliUserIdGuard {
+        previous: Option<String>,
+    }
+
+    impl CliUserIdGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var("ASTRA_CLI_USER_ID").ok();
+            unsafe {
+                std::env::set_var("ASTRA_CLI_USER_ID", value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for CliUserIdGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = self.previous.as_deref() {
+                    std::env::set_var("ASTRA_CLI_USER_ID", previous);
+                } else {
+                    std::env::remove_var("ASTRA_CLI_USER_ID");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_task_result_task_id_uses_cli_user_id_scope() {
+        let _user = CliUserIdGuard::set("task-user");
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let expected = svc
+            .create_task(
+                "task-user",
+                "sess-1",
+                astra_services::TaskCreateRequest {
+                    title: "Build auth".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.create_task(
+            "other-user",
+            "sess-2",
+            astra_services::TaskCreateRequest {
+                title: "Build auth".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let found = resolve_task_result_task_id(&svc, "Build auth")
+            .await
+            .unwrap();
+        assert_eq!(found, expected);
+    }
+
+    struct StubTaskLeaseService {
+        next_result: astra_services::NextClaimableLeaseClaimResult,
+    }
+
+    #[async_trait::async_trait]
+    impl astra_services::TaskLeaseService for StubTaskLeaseService {
+        async fn claim_next_claimable_lease(
+            &self,
+            _user_id: &str,
+            _agent_id: &str,
+            _edge_id: &str,
+            _ttl_sec: i64,
+        ) -> Result<astra_services::NextClaimableLeaseClaimResult, String> {
+            Ok(self.next_result.clone())
+        }
+
+        async fn try_claim_lease(
+            &self,
+            _user_id: &str,
+            _task_id: &str,
+            _agent_id: &str,
+            _edge_id: &str,
+            _ttl_sec: i64,
+        ) -> Result<astra_services::LeaseClaimResult, String> {
+            unreachable!("worker claim path should not fall back to per-task try_claim_lease");
+        }
+
+        async fn release_lease(
+            &self,
+            _user_id: &str,
+            _task_id: &str,
+            _agent_id: &str,
+        ) -> Result<bool, String> {
+            unreachable!("not used in this test");
+        }
+
+        async fn get_lease(
+            &self,
+            _user_id: &str,
+            _task_id: &str,
+        ) -> Result<Option<astra_services::TaskLeaseView>, String> {
+            unreachable!("not used in this test");
+        }
+
+        async fn renew_lease(
+            &self,
+            _user_id: &str,
+            _task_id: &str,
+            _agent_id: &str,
+            _edge_id: &str,
+            _ttl_sec: i64,
+        ) -> Result<Option<astra_services::TaskLeaseView>, String> {
+            unreachable!("not used in this test");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_next_claimable_task_for_worker_uses_lease_owner_result() {
+        let lease_svc = StubTaskLeaseService {
+            next_result: astra_services::NextClaimableLeaseClaimResult::Granted {
+                task_id: "task-201".into(),
+                lease_version: 9,
+                expires_at: "2025-01-03T00:00:00Z".into(),
+            },
+        };
+
+        let result =
+            claim_next_claimable_task_for_worker(&lease_svc, "task-user", "agent-1", "edge-1", 300)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result,
+            astra_services::NextClaimableLeaseClaimResult::Granted {
+                task_id: "task-201".into(),
+                lease_version: 9,
+                expires_at: "2025-01-03T00:00:00Z".into(),
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_run_projection_tests {
+    use super::*;
+    use astra_services::TaskService;
+
+    fn stream_result_for_task_checkpoint() -> StreamResult {
+        StreamResult {
+            session_id: Some("session-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            session_persistence_error: Some("failed to append one-shot journal events".into()),
+            full_text: "hello".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 3,
+            cache_read_tokens: 2,
+            cache_creation_tokens: 1,
+            tool_calls_count: 2,
+            tools_selected: vec![],
+            selected_skills: vec![],
+            tools_used: vec!["bash".to_string()],
+            tool_call_records: vec![],
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: vec![],
+            verdict_events: vec![],
+            step_recorder_summary: None,
+            tool_health_export: vec![],
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            memoria_ms: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
+            final_messages: Vec::new(),
+            background_agent_results: vec![("agent-1".into(), "done".into())],
+        }
+    }
+
+    #[test]
+    fn task_checkpoint_state_includes_persistence_error() {
+        let sr = stream_result_for_task_checkpoint();
+        let state = task_checkpoint_state_from_result(
+            &sr,
+            Some("/tmp/out.txt"),
+            ExitCode::PersistenceError,
+        );
+
+        assert_eq!(
+            state.get("full_text").and_then(|v| v.as_str()),
+            Some("hello")
+        );
+        assert_eq!(
+            state.get("output_file").and_then(|v| v.as_str()),
+            Some("/tmp/out.txt")
+        );
+        assert_eq!(
+            state.get("persistence_error").and_then(|v| v.as_str()),
+            Some("failed to append one-shot journal events")
+        );
+        assert_eq!(
+            state["background_agent_results"],
+            serde_json::json!([{"agent_id":"agent-1","result":"done"}])
+        );
+        assert_eq!(state["exit_code"], 4);
+        assert_eq!(state["error_kind"], "persistence_error");
+        assert_eq!(state["final_state"], "completed");
+        assert!(state["interruption_kind"].is_null());
+    }
+
+    #[test]
+    fn task_status_label_marks_partial_completed_tasks() {
+        assert_eq!(
+            crate::cli::task_surface::task_status_label(
+                astra_services::TaskStatus::Completed,
+                Some(astra_services::TaskOutcome::Partial),
+            ),
+            "partial"
+        );
+        assert_eq!(
+            crate::cli::task_surface::task_status_label(
+                astra_services::TaskStatus::Completed,
+                Some(astra_services::TaskOutcome::Success),
+            ),
+            "completed"
+        );
+        assert_eq!(
+            crate::cli::task_surface::task_status_label(astra_services::TaskStatus::Failed, None,),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn stream_result_failure_reason_prefers_persistence_detail() {
+        let sr = stream_result_for_task_checkpoint();
+        assert_eq!(
+            stream_result_failure_reason(ExitCode::PersistenceError, &sr),
+            "failed to append one-shot journal events"
+        );
+        assert_eq!(
+            stream_result_failure_reason(ExitCode::ToolFailure, &sr),
+            "tool_failure"
+        );
+    }
+
+    #[test]
+    fn task_notification_payload_includes_exit_semantics_for_persistence_error() {
+        let sr = stream_result_for_task_checkpoint();
+        let payload = task_notification_payload(
+            "task-12345678",
+            &sr,
+            Some("/tmp/out.txt"),
+            ExitCode::PersistenceError,
+        );
+
+        assert_eq!(payload["type"], "task_notification");
+        assert_eq!(payload["task_id"], "task-12345678");
+        assert_eq!(payload["status"], "persistence_error");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["exit_code"], 4);
+        assert_eq!(payload["error_kind"], "persistence_error");
+        assert_eq!(payload["output_file"], "/tmp/out.txt");
+        assert_eq!(payload["final_state"], "completed");
+        assert!(payload["interruption_kind"].is_null());
+        assert_eq!(
+            payload["persistence_error"],
+            "failed to append one-shot journal events"
+        );
+        assert_eq!(payload["summary"], "hello");
+    }
+
+    #[test]
+    fn task_notification_payload_marks_partial_outcome() {
+        let mut sr = stream_result_for_task_checkpoint();
+        sr.session_persistence_error = None;
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
+
+        let payload = task_notification_payload(
+            "task-12345678",
+            &sr,
+            Some("/tmp/out.txt"),
+            ExitCode::Partial,
+        );
+
+        assert_eq!(payload["status"], "partial");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["exit_code"], 5);
+        assert_eq!(payload["error_kind"], "partial");
+        assert_eq!(payload["final_state"], "interrupted");
+        assert_eq!(payload["interruption_kind"], "budget_exhausted");
+    }
+
+    #[test]
+    fn failed_task_notification_payload_carries_failure_detail() {
+        let payload = failed_task_notification_payload(
+            "task-12345678",
+            "write task output: permission denied",
+            "persistence_error",
+            None,
+            Some("write task output: permission denied"),
+        );
+
+        assert_eq!(payload["type"], "task_notification");
+        assert_eq!(payload["task_id"], "task-12345678");
+        assert_eq!(payload["status"], "persistence_error");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["error_kind"], "persistence_error");
+        assert_eq!(payload["summary"], "write task output: permission denied");
+        assert_eq!(
+            payload["persistence_error"],
+            "write task output: permission denied"
+        );
+        assert!(payload.get("output_file").is_none());
+    }
+
+    #[test]
+    fn task_terminal_summary_line_distinguishes_success_and_persistence_failure() {
+        let success =
+            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Success);
+        assert!(success.contains("finished; output saved to"));
+        assert!(!success.contains("persistence degradation"));
+
+        let partial =
+            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Partial);
+        assert!(partial.contains("finished partially; output saved to"));
+
+        let degraded = task_terminal_summary_line(
+            "task-12345678",
+            Some("/tmp/out.txt"),
+            ExitCode::PersistenceError,
+        );
+        assert!(degraded.contains("finished with persistence degradation; output saved to"));
+
+        let tool_failure = task_terminal_summary_line(
+            "task-12345678",
+            Some("/tmp/out.txt"),
+            ExitCode::ToolFailure,
+        );
+        assert!(tool_failure.contains("failed; output saved to"));
+
+        let unfinished =
+            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Unfinished);
+        assert!(unfinished.contains("unfinished; output saved to"));
+    }
+
+    #[test]
+    fn task_terminal_summary_line_handles_missing_output_file() {
+        let degraded =
+            task_terminal_summary_line("task-12345678", None, ExitCode::PersistenceError);
+        assert!(degraded.contains("output file unavailable"));
+    }
+
+    #[test]
+    fn one_shot_completion_warning_prefers_persistence_error_over_partial() {
+        let mut sr = stream_result_for_task_checkpoint();
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
+
+        assert_eq!(
+            one_shot_completion_warning(&sr, ExitCode::PersistenceError).as_deref(),
+            Some("Session persistence degraded: failed to append one-shot journal events")
+        );
+    }
+
+    #[test]
+    fn one_shot_completion_warning_surfaces_partial_reason() {
+        let mut sr = stream_result_for_task_checkpoint();
+        sr.session_persistence_error = None;
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
+
+        assert_eq!(
+            one_shot_completion_warning(&sr, ExitCode::Partial).as_deref(),
+            Some(
+                "Turn finished partially (budget_exhausted). Inspect partial output before continuing."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_headless_task_result_marks_task_failed_and_persists_checkpoint_on_persistence_error()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "test-user",
+                "fallback-session",
+                astra_services::TaskCreateRequest {
+                    title: "run: test".to_string(),
+                    description: Some("test".to_string()),
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let sr = stream_result_for_task_checkpoint();
+        let exit_code = finalize_headless_task_result(
+            &svc,
+            &tid,
+            &sr,
+            Some("fallback-session"),
+            Some("/tmp/out.txt"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, ExitCode::PersistenceError);
+
+        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(record.status, astra_services::TaskStatus::Failed);
+        assert_eq!(
+            record.error_message.as_deref(),
+            Some("failed to append one-shot journal events")
+        );
+        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
+        assert_eq!(checkpoint.session_id.as_deref(), Some("fallback-session"));
+        assert_eq!(
+            checkpoint
+                .state
+                .get("persistence_error")
+                .and_then(|v| v.as_str()),
+            Some("failed to append one-shot journal events")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_headless_task_result_marks_task_completed_on_clean_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "test-user",
+                "fallback-session",
+                astra_services::TaskCreateRequest {
+                    title: "run: test".to_string(),
+                    description: Some("test".to_string()),
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mut sr = stream_result_for_task_checkpoint();
+        sr.session_id = None;
+        sr.session_persistence_error = None;
+
+        let exit_code = finalize_headless_task_result(
+            &svc,
+            &tid,
+            &sr,
+            Some("fallback-session"),
+            Some("/tmp/out.txt"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, ExitCode::Success);
+
+        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(record.status, astra_services::TaskStatus::Completed);
+        assert_eq!(record.outcome, Some(astra_services::TaskOutcome::Success));
+        assert_eq!(record.error_message, None);
+        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
+        assert_eq!(checkpoint.session_id.as_deref(), Some("fallback-session"));
+        assert!(checkpoint.state["persistence_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn finalize_headless_task_result_marks_task_completed_with_partial_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "test-user",
+                "fallback-session",
+                astra_services::TaskCreateRequest {
+                    title: "run: test".to_string(),
+                    description: Some("test".to_string()),
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mut sr = stream_result_for_task_checkpoint();
+        sr.session_persistence_error = None;
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
+
+        let exit_code = finalize_headless_task_result(
+            &svc,
+            &tid,
+            &sr,
+            Some("fallback-session"),
+            Some("/tmp/out.txt"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, ExitCode::Partial);
+
+        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(record.status, astra_services::TaskStatus::Completed);
+        assert_eq!(record.outcome, Some(astra_services::TaskOutcome::Partial));
+        assert_eq!(record.error_message, None);
+        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
+        assert_eq!(checkpoint.state["final_state"], "interrupted");
+        assert_eq!(checkpoint.state["interruption_kind"], "budget_exhausted");
+    }
+
+    #[tokio::test]
+    async fn finalize_headless_task_result_persists_checkpoint_without_output_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "test-user",
+                "fallback-session",
+                astra_services::TaskCreateRequest {
+                    title: "run: test".to_string(),
+                    description: Some("test".to_string()),
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mut sr = stream_result_for_task_checkpoint();
+        sr.session_persistence_error = Some("write task output: permission denied".into());
+
+        let exit_code =
+            finalize_headless_task_result(&svc, &tid, &sr, Some("fallback-session"), None)
+                .await
+                .unwrap();
+
+        assert_eq!(exit_code, ExitCode::PersistenceError);
+
+        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(record.status, astra_services::TaskStatus::Failed);
+        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
+        assert!(checkpoint.state.get("output_file").is_none());
+        assert_eq!(
+            checkpoint.state["persistence_error"],
+            "write task output: permission denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_one_shot_task_manager_without_canonical_session_uses_ephemeral_store() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+
+        let first = build_one_shot_task_manager(None, &api.api_origin(), None).await;
+        let second = build_one_shot_task_manager(None, &api.api_origin(), None).await;
+
+        assert_eq!(first.session_id(), NON_CANONICAL_TASK_SCOPE);
+        assert_eq!(second.session_id(), NON_CANONICAL_TASK_SCOPE);
+
+        let created = first
+            .create(&serde_json::json!({ "title": "ephemeral" }))
+            .await;
+        assert!(created.contains("ephemeral"));
+        assert_eq!(first.snapshot().await.len(), 1);
+        assert!(
+            second.snapshot().await.is_empty(),
+            "non-canonical one-shot managers must not share a durable session store"
+        );
     }
 }
 

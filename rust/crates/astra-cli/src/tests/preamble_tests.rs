@@ -262,14 +262,18 @@ fn compacted_history_skips_empty_user_messages() {
 
 #[test]
 fn compact_assistant_message_optional_session_memory_anchor() {
-    let with_anchor =
-        chat_turn::compact_assistant_message(3, "Summary body", Some("- [fact] one\n- [fact] two"));
+    let with_anchor = crate::cli::session_compaction::compact_assistant_message(
+        3,
+        "Summary body",
+        Some("- [fact] one\n- [fact] two"),
+    );
     assert!(with_anchor.contains("[Session memory anchor]"));
     assert!(with_anchor.contains("[fact] one"));
     assert!(with_anchor.contains("[Prior context — 3 turns compacted]"));
     assert!(with_anchor.contains("Summary body"));
 
-    let no_anchor = chat_turn::compact_assistant_message(2, "Only summary", None);
+    let no_anchor =
+        crate::cli::session_compaction::compact_assistant_message(2, "Only summary", None);
     assert!(!no_anchor.contains("[Session memory anchor]"));
     assert!(no_anchor.contains("[Prior context — 2 turns compacted]"));
     assert!(no_anchor.contains("Only summary"));

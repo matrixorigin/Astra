@@ -14,7 +14,13 @@ pub(crate) fn handle_tools_command(state: &SessionState) {
             return;
         }
     };
-    let events = session_journal::read_journal(&sid).unwrap_or_default();
+    let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid) {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!("  {}", error.red());
+            return;
+        }
+    };
     let profiles = session_analytics::compute_tool_profiles(&events);
 
     if profiles.is_empty() {

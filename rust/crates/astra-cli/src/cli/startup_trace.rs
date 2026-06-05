@@ -45,9 +45,11 @@ impl StartupTracer {
             &self.phases,
             total_us,
         );
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
-            let _ = writer.append(&event);
-        }
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            session_id,
+            &event,
+            "startup_trace:finish",
+        );
     }
 }
 

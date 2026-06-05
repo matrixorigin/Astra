@@ -9,6 +9,8 @@ use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 pub(super) struct TaskListQuery {
     /// Optional status filter: pending, in_progress, paused, completed, failed, cancelled
     pub status: Option<String>,
+    /// Optional session filter.
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,12 +56,21 @@ pub(super) async fn list_tasks_handler(
 
     let status_filter = query.status.and_then(|s| parse_task_status(&s));
 
-    let tasks = state
-        .execution
-        .task_service
-        .list_tasks(&user.user_id, status_filter)
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let tasks = if let Some(session_id) = query.session_id.as_deref() {
+        state
+            .execution
+            .task_service
+            .list_recent_tasks_for_session(&user.user_id, session_id, status_filter)
+            .await
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    } else {
+        state
+            .execution
+            .task_service
+            .list_recent_tasks(&user.user_id, status_filter)
+            .await
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    };
 
     let total = tasks.len();
     Ok(Json(TaskListResponse { tasks, total }))
@@ -284,6 +295,33 @@ pub(super) async fn post_task_lease_claim_handler(
         .execution
         .task_lease_service
         .try_claim_lease(&user.user_id, &task_id, &body.edge_agent_id, &edge_id, ttl)
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(Json(
+        serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+    ))
+}
+
+/// `POST /tasks/lease/claim-next`
+pub(super) async fn post_task_lease_claim_next_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LeaseClaimRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if body.edge_agent_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_agent_id required",
+        ));
+    }
+
+    let edge_id = edge_id_header(&headers);
+    let ttl = body.ttl_sec.unwrap_or(300);
+    let result = state
+        .execution
+        .task_lease_service
+        .claim_next_claimable_lease(&user.user_id, &body.edge_agent_id, &edge_id, ttl)
         .await
         .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
     Ok(Json(
@@ -525,7 +563,7 @@ pub(super) async fn task_rpc_handler(
                 _ => serde_json::Value::Null,
             }
         }
-        "list_tasks" => {
+        "list_recent_tasks" => {
             let status_filter = req
                 .args
                 .get("status_filter")
@@ -534,7 +572,55 @@ pub(super) async fn task_rpc_handler(
             let tasks = state
                 .execution
                 .task_service
-                .list_tasks(&user.user_id, status_filter)
+                .list_recent_tasks(&user.user_id, status_filter)
+                .await
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            serde_json::to_value(&tasks).unwrap_or(serde_json::Value::Null)
+        }
+        "list_recent_tasks_for_session" => {
+            let session_id = req
+                .args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'session_id'"))?;
+            let status_filter = req
+                .args
+                .get("status_filter")
+                .and_then(|v| v.as_str())
+                .and_then(parse_task_status);
+            let tasks = state
+                .execution
+                .task_service
+                .list_recent_tasks_for_session(&user.user_id, session_id, status_filter)
+                .await
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            serde_json::to_value(&tasks).unwrap_or(serde_json::Value::Null)
+        }
+        "search_tasks" => {
+            let query = req
+                .args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'query'"))?;
+            let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            let tasks = state
+                .execution
+                .task_service
+                .search_tasks(&user.user_id, query, limit)
+                .await
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            serde_json::to_value(&tasks).unwrap_or(serde_json::Value::Null)
+        }
+        "list_claimable_tasks_for_worker" => {
+            let limit = req
+                .args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200) as usize;
+            let tasks = state
+                .execution
+                .task_service
+                .list_claimable_tasks_for_worker(&user.user_id, limit)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::to_value(&tasks).unwrap_or(serde_json::Value::Null)
@@ -635,6 +721,21 @@ pub(super) async fn task_rpc_handler(
                 .execution
                 .task_service
                 .complete_task(&task_id)
+                .await
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            serde_json::json!({ "ok": true })
+        }
+        "complete_task_with_outcome" => {
+            let task_id = require_owned_task(&state, &user.user_id, &req.args).await?;
+            let outcome: TaskOutcome =
+                serde_json::from_value(req.args.get("outcome").cloned().unwrap_or_default())
+                    .map_err(|e| {
+                        error_response(StatusCode::BAD_REQUEST, format!("decode outcome: {e}"))
+                    })?;
+            state
+                .execution
+                .task_service
+                .complete_task_with_outcome(&task_id, outcome)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })

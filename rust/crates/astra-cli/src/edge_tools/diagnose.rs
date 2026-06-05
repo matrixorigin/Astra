@@ -1,5 +1,9 @@
 //! Diagnose tool: system diagnostics and health information.
 
+use crate::cli::session_task_surface::{
+    session_task_is_completed, session_task_is_in_progress, session_task_is_pending,
+    session_task_is_unsuccessful,
+};
 use serde_json::{Value, json};
 
 use super::{AGGREGATE_OUTPUT_BUDGET, ToolExecutor, all_tool_schemas};
@@ -219,12 +223,21 @@ impl ToolExecutor {
             let mut tasks_info = serde_json::Map::new();
             tasks_info.insert("total".to_string(), json!(tasks.len()));
 
-            let pending = tasks.iter().filter(|t| t.status == "pending").count();
-            let in_progress = tasks.iter().filter(|t| t.status == "in_progress").count();
-            let completed = tasks.iter().filter(|t| t.status == "completed").count();
+            let pending = tasks
+                .iter()
+                .filter(|t| session_task_is_pending(&t.status))
+                .count();
+            let in_progress = tasks
+                .iter()
+                .filter(|t| session_task_is_in_progress(&t.status))
+                .count();
+            let completed = tasks
+                .iter()
+                .filter(|t| session_task_is_completed(&t.status))
+                .count();
             let failed = tasks
                 .iter()
-                .filter(|t| t.status == "failed" || t.status == "cancelled")
+                .filter(|t| session_task_is_unsuccessful(&t.status))
                 .count();
 
             tasks_info.insert("pending".to_string(), json!(pending));

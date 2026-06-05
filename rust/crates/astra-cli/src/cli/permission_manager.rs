@@ -1413,6 +1413,13 @@ impl PermissionManager {
             astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
     }
 
+    /// Start a new session binding: session approvals from the previous
+    /// conversation must not leak into the next session.
+    pub(crate) fn clear_session_overrides(&mut self) {
+        self.session_overrides =
+            astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
+    }
+
     fn check_overrides(
         &self,
         fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,

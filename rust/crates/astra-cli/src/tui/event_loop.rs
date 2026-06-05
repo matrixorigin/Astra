@@ -766,7 +766,7 @@ pub(crate) async fn run_tui_session(
     // — it comes AFTER the replay so the banner is the last thing
     // the user sees before the prompt lands. Silent when the summary
     // is empty (either no resume, no task_service, or nothing
-    // finished since last_seen_at).
+    // finished since the last recorded turn).
     if let (Some(svc), Some(sid)) = (state.task_service.clone(), state.session_id.clone())
         && !sid.is_empty()
     {
@@ -774,17 +774,14 @@ pub(crate) async fn run_tui_session(
             .ingestion_user_id
             .clone()
             .unwrap_or_else(|| "local".into());
-        match svc.list_tasks(&user_id, None).await {
+        match svc
+            .list_recent_tasks_for_session(&user_id, &sid, None)
+            .await
+        {
             Ok(items) => {
-                // `last_seen_at` cutoff: we don't have a dedicated
-                // per-session cursor, so use "1 day ago" as a
-                // conservative window. Anything newer surfaces; anything
-                // older is assumed to have already been seen.
-                let cutoff = chrono::Utc::now()
-                    .checked_sub_signed(chrono::Duration::hours(24))
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_default();
-                let summary = resume_summary::summarize(&items, &sid, &cutoff);
+                let cutoff =
+                    resume_summary::last_seen_cutoff(state.last_turn_event.as_ref()).unwrap_or("");
+                let summary = resume_summary::summarize(&items, &sid, cutoff);
                 if !summary.is_empty() {
                     chat_widget.commit_resume_summary(summary.render());
                 }
@@ -792,7 +789,7 @@ pub(crate) async fn run_tui_session(
             Err(e) => tracing::debug!(
                 target: "astra_cli::tui",
                 error = %e,
-                "resume summary: list_tasks failed; skipping banner"
+                "resume summary: list_recent_tasks failed; skipping banner"
             ),
         }
     }
@@ -1701,10 +1698,10 @@ pub(crate) async fn run_tui_session(
                                         // us from reaching through `state` inside the
                                         // inner select.
                                         let task_service_for_cancel = state.task_service.clone();
-                                        let ctx = crate::cli::chat_turn::TurnContext { api, profile };
+                                        let ctx = crate::cli::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::cli::chat_turn::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::cli::turn_entry::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {

@@ -38,7 +38,13 @@ pub(crate) fn handle_cache_command(arg: &str, state: &SessionState) {
         return;
     }
 
-    let events = session_journal::read_journal(session_id).unwrap_or_default();
+    let events = match load_cache_events(session_id) {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!("  {}", error.red());
+            return;
+        }
+    };
     let turns = summarize_cache_turns(&events);
     eprintln!(
         "{}",
@@ -65,6 +71,11 @@ pub(crate) fn render_cache_diagnosis(session_id: &str, rounds: &[RoundSnapshot])
 pub(crate) fn load_cache_rounds(session_id: &str) -> Vec<RoundSnapshot> {
     let session_dir = session_journal::local_sessions_dir().join(session_id);
     cache_diagnosis::load_session_captures(&session_dir).unwrap_or_default()
+}
+
+fn load_cache_events(session_id: &str) -> Result<Vec<JournalEvent>, String> {
+    session_journal::read_journal(session_id)
+        .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))
 }
 
 fn summarize_cache_turns(events: &[JournalEvent]) -> Vec<CacheTurnSummary> {
@@ -263,6 +274,15 @@ fn render_cache_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalDirGuard;
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
 
     fn round(turn: u32, round: u32, cache_read_tokens: u64) -> RoundSnapshot {
         RoundSnapshot {
@@ -391,5 +411,18 @@ mod tests {
         assert!(text.contains(
             "mismatch:           observed intra_turn_rounds < declared conversation_turns"
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_cache_events_surfaces_unreadable_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("cache-unreadable-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
+
+        let error = load_cache_events(&session_id)
+            .expect_err("directory journal path should surface an error");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
     }
 }

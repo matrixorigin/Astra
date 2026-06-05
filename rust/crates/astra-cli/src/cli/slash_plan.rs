@@ -96,11 +96,11 @@ pub(crate) async fn handle_plan_command(
         theme::icon_ok(),
         plan_request
     );
-    crate::cli::chat_turn::handle_chat_input(
+    crate::cli::turn_entry::handle_chat_input(
         plan_request.to_string(),
         Some(&token),
         state,
-        crate::cli::chat_turn::TurnContext { api, profile },
+        crate::cli::turn_entry::TurnContext { api, profile },
     )
     .await?;
     Ok(())

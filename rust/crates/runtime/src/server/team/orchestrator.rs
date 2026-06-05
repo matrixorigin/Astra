@@ -24,7 +24,7 @@ use astra_server_types::team_orchestrator_traits::{
 };
 pub use astra_server_types::team_orchestrator_types::{
     ExecutionPhase, OrchestratorConfig, ProgressCallback, TeamExecutionStatus,
-    append_merge_conflict_summary, derive_team_status, sum_usage, summarize_failed_agents,
+    append_merge_conflict_summary, derive_team_status, sum_usage, summarize_unsuccessful_agents,
 };
 use astra_server_types::warn_persist;
 
@@ -681,7 +681,7 @@ impl TeamExecutionOrchestrator {
     }
 }
 
-// Helper functions (sum_usage, summarize_failed_agents, derive_team_status, etc.)
+// Helper functions (sum_usage, summarize_unsuccessful_agents, derive_team_status, etc.)
 // are re-exported from astra_server_types::team_orchestrator_types via `pub use` above.
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -697,6 +697,27 @@ mod tests {
     use astra_services::runs::InMemoryRunStateStore;
     use astra_services::team_persistence::InMemoryTeamStore;
     use async_trait::async_trait;
+
+    struct StatusExecutor {
+        status: &'static str,
+        error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for StatusExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: self.status.to_string(),
+                output: Some(format!("[{}] yielded", self.status)),
+                error: self.error.map(ToString::to_string),
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
 
     async fn setup_orchestrator(team_store: Arc<InMemoryTeamStore>) -> TeamExecutionOrchestrator {
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
@@ -776,6 +797,7 @@ mod tests {
     #[test]
     fn execution_status_display() {
         assert_eq!(TeamExecutionStatus::Completed.to_string(), "completed");
+        assert_eq!(TeamExecutionStatus::Unfinished.to_string(), "unfinished");
         assert_eq!(TeamExecutionStatus::Partial.to_string(), "partial");
         assert_eq!(
             TeamExecutionStatus::CompletedWithConflicts.to_string(),
@@ -786,6 +808,57 @@ mod tests {
             "completed_over_budget"
         );
         assert_eq!(TeamExecutionStatus::Failed.to_string(), "failed");
+    }
+
+    #[tokio::test]
+    async fn execute_team_paused_subrun_reports_unfinished() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+
+        {
+            let mut reg = registry.write().await;
+            let orch = AgentProfile::new("orchestrator", "orchestrator", AgentTier::Orchestrator);
+            let _ = reg.register(orch);
+        }
+
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(StatusExecutor {
+                status: "paused",
+                error: None,
+            }),
+        ));
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine,
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: None,
+            },
+        );
+
+        let report = orch
+            .execute_team("research", "analyze codebase", None)
+            .await;
+        assert_eq!(report.status, TeamExecutionStatus::Unfinished);
+        let dr = report.delegation_result.expect("delegation result");
+        assert_eq!(dr.status, "unfinished");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|value| value.contains("unfinished"))
+        );
     }
 
     // ─── T-6: Enhanced orchestrator tests ──────────────────────────────

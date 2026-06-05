@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::run_status_surface::run_status_icon;
 use astra_runtime::server::team::orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
@@ -438,7 +439,11 @@ async fn ensure_team_run_session(
                 if !is_session_not_found_error(&err) {
                     return Ok(session_id);
                 }
-                let _ = crate::cli::auth_flow::clear_profile_last_session(profile);
+                crate::cli::cli_utils::clear_profile_last_session_if_matches_or_warn(
+                    profile,
+                    &session_id,
+                    "slash_team:ensure_team_run_session",
+                );
                 state.clear_session_id();
                 state.unregister_root_mailbox().await;
                 state.run_id = None;
@@ -460,8 +465,12 @@ async fn ensure_team_run_session(
         .ok_or_else(|| "session create response missing session_id".to_string())?
         .to_string();
 
-    crate::cli::chat_turn::initialize_journal_pub(state, &session_id);
-    crate::cli::chat_turn::persist_last_session_id(profile, &session_id);
+    crate::cli::session_startup::initialize_journal_pub(state, &session_id);
+    crate::cli::cli_utils::persist_profile_last_session_or_warn(
+        profile,
+        &session_id,
+        "slash_team:ensure_team_run_session",
+    );
     state.set_session_id(session_id.clone());
     Ok(session_id)
 }
@@ -1165,7 +1174,9 @@ pub(crate) async fn handle_team_command(
                 .map(|c| format!("{c:?}"))
                 .unwrap_or_else(|| "auto".to_string());
             if let Some(ref j) = state.journal {
-                let _ = j.append(
+                crate::cli::cli_utils::append_journal_event_or_warn(
+                    j,
+                    state.session_id.as_deref(),
                     &astra_services::session_journal::JournalEvent::delegation_started(
                         state.session_id.as_deref(),
                         team_name, // delegation_id not yet known — use team name
@@ -1173,6 +1184,7 @@ pub(crate) async fn handle_team_command(
                         &coordination_label,
                         &agent_roles,
                     ),
+                    "slash_team:delegation_started",
                 );
             }
 
@@ -1188,7 +1200,9 @@ pub(crate) async fn handle_team_command(
                     progress_renderer.abort();
                     // Journal: record interrupted execution
                     if let Some(ref j) = state.journal {
-                        let _ = j.append(
+                        crate::cli::cli_utils::append_journal_event_or_warn(
+                            j,
+                            state.session_id.as_deref(),
                             &astra_services::session_journal::JournalEvent::delegation_completed(
                                 state.session_id.as_deref(),
                                 team_name,
@@ -1199,6 +1213,7 @@ pub(crate) async fn handle_team_command(
                                 "interrupted",
                                 None,
                             ),
+                            "slash_team:delegation_interrupted",
                         );
                     }
                     return;
@@ -1217,6 +1232,16 @@ pub(crate) async fn handle_team_command(
                         team_name.green().bold(),
                         format!("({})", format_duration(elapsed)).dim()
                     );
+                }
+                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Unfinished => {
+                    eprintln!(
+                        "  ⏳ Team '{}' returned unfinished {}",
+                        team_name.yellow().bold(),
+                        format!("({})", format_duration(elapsed)).dim()
+                    );
+                    if let Some(ref err) = report.error {
+                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
+                    }
                 }
                 astra_runtime::server::team::orchestrator::TeamExecutionStatus::Partial => {
                     eprintln!(
@@ -1273,11 +1298,14 @@ pub(crate) async fn handle_team_command(
                     dr.delegation_id.get(..8).unwrap_or(&dr.delegation_id).dim(),
                 );
                 for ar in &dr.agent_results {
-                    let is_success = ar.status == "completed" && ar.error.is_none();
+                    let is_success = ar.is_success();
+                    let is_unfinished = ar.is_unfinished();
                     let (status_icon, status_color) = if is_success {
-                        ("✓", "green")
+                        ("✅", "green")
+                    } else if is_unfinished {
+                        ("⏳", "yellow")
                     } else {
-                        ("✗", "red")
+                        ("❌", "red")
                     };
                     let first_line = ar
                         .output
@@ -1298,6 +1326,13 @@ pub(crate) async fn handle_team_command(
                         "green" => eprintln!(
                             "    {} {} {} — {}",
                             status_icon.green(),
+                            ar.agent_id.as_str().magenta(),
+                            status_label.dim(),
+                            truncate_str(first_line, 72),
+                        ),
+                        "yellow" => eprintln!(
+                            "    {} {} {} — {}",
+                            status_icon.yellow(),
                             ar.agent_id.as_str().magenta(),
                             status_label.dim(),
                             truncate_str(first_line, 72),
@@ -1373,15 +1408,13 @@ pub(crate) async fn handle_team_command(
                     .delegation_result
                     .as_ref()
                     .map(|dr| {
-                        let s = dr
-                            .agent_results
-                            .iter()
-                            .filter(|r| r.status == "completed" && r.error.is_none())
-                            .count();
+                        let s = dr.agent_results.iter().filter(|r| r.is_success()).count();
                         (s, dr.agent_results.len() - s)
                     })
                     .unwrap_or((0, 0));
-                let _ = j.append(
+                crate::cli::cli_utils::append_journal_event_or_warn(
+                    j,
+                    state.session_id.as_deref(),
                     &astra_services::session_journal::JournalEvent::delegation_completed(
                         state.session_id.as_deref(),
                         &report.delegation_id,
@@ -1395,6 +1428,7 @@ pub(crate) async fn handle_team_command(
                             .as_ref()
                             .and_then(|result| result.aggregated_output.as_deref()),
                     ),
+                    "slash_team:delegation_completed",
                 );
             }
         }
@@ -1458,12 +1492,7 @@ pub(crate) async fn handle_team_command(
                 .bold()
             );
             for (i, e) in entries.iter().enumerate().rev() {
-                let status_icon = match e.status.as_str() {
-                    "completed" => "✅",
-                    "partial" => "⚠️ ",
-                    "completed_with_conflicts" => "⚠️ ",
-                    _ => "❌",
-                };
+                let status_icon = run_status_icon(&e.status);
                 eprintln!(
                     "\n  {} #{} {} {}",
                     status_icon,
@@ -1761,11 +1790,7 @@ pub(crate) async fn handle_team_command(
             }
             eprintln!("\n{}", "─── Recent Team Runs ───".bold().magenta());
             for e in &entries {
-                let icon = match e.status.as_str() {
-                    "completed" => "✅",
-                    "partial" | "completed_with_conflicts" => "⚠️ ",
-                    _ => "❌",
-                };
+                let icon = run_status_icon(&e.status);
                 eprintln!(
                     "  {} {} {} — {} ({} agents, {}tok)",
                     icon,
@@ -2253,6 +2278,68 @@ mod tests {
         assert_eq!(
             creds.profiles["default"].last_session_id.as_deref(),
             Some("team-sess-2")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_team_run_session_clears_matching_pointer_across_profiles() {
+        let _creds_guard = crate::tests::isolate_credentials();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("team-token".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "other".to_string(),
+            Profile {
+                last_session_id: Some("stale-sess".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let app = Router::new()
+            .route(
+                "/sessions/{id}",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::json!({ "detail": "Session not found" })),
+                    )
+                }),
+            )
+            .route(
+                "/sessions",
+                post(|| async { axum::Json(serde_json::json!({ "session_id": "team-sess-3" })) }),
+            );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut state = SessionState {
+            session_id: Some("stale-sess".to_string()),
+            journal: session_journal::JournalWriter::new("stale-sess").ok(),
+            ..Default::default()
+        };
+
+        let session_id = ensure_team_run_session(&api, None, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "team-sess-3");
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["other"].last_session_id.as_deref(),
+            None,
+            "team run should clear matching stale pointer even when another profile holds it"
+        );
+        assert_eq!(
+            creds.profiles["default"].last_session_id.as_deref(),
+            Some("team-sess-3")
         );
     }
 

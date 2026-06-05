@@ -967,9 +967,17 @@ impl ToolExecutor {
         let session_id = session_id.into();
         let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
         let (pinned_tools, deprioritized_tools) =
-            match astra_services::session_workspace::read_workspace(&session_id) {
-                Ok(ws) => (ws.pinned_tools, ws.deprioritized_tools),
-                Err(_) => (Vec::new(), Vec::new()),
+            match astra_services::session_workspace::read_workspace_optional(&session_id) {
+                Ok(Some(ws)) => (ws.pinned_tools, ws.deprioritized_tools),
+                Ok(None) => (Vec::new(), Vec::new()),
+                Err(error) => {
+                    tracing::warn!(
+                        "active session {} has unreadable workspace metadata; clearing self-mod tool preferences: {}",
+                        session_id,
+                        error
+                    );
+                    (Vec::new(), Vec::new())
+                }
             };
         if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
             *pinned = pinned_tools;
@@ -1498,16 +1506,16 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Acquire);
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::task_lifecycle(
-                    Some(&session_id),
-                    turn,
-                    Self::task_lifecycle_summary(action, &payload),
-                    Some(Self::task_lifecycle_detail(action, args, &payload)),
-                ),
-            );
-        }
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &astra_services::session_journal::JournalEvent::task_lifecycle(
+                Some(&session_id),
+                turn,
+                Self::task_lifecycle_summary(action, &payload),
+                Some(Self::task_lifecycle_detail(action, args, &payload)),
+            ),
+            "edge_tools:record_task_lifecycle_event",
+        );
     }
 
     /// Route a `task` action either to the cloud (production) or the
@@ -2398,12 +2406,12 @@ impl ToolExecutor {
         let tasks = self.task_manager.snapshot().await;
         let active_tasks: Vec<_> = tasks
             .iter()
-            .filter(|t| t.status == "pending" || t.status == "in_progress")
+            .filter(|t| task_mgmt::session_task_is_active(&t.status))
             .collect();
         if !active_tasks.is_empty() {
             out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
             for t in active_tasks.iter().take(5) {
-                let status_icon = if t.status == "in_progress" {
+                let status_icon = if task_mgmt::session_task_is_in_progress(&t.status) {
                     "▶"
                 } else {
                     "○"
@@ -2544,16 +2552,16 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::memory_suppressed(
-                    Some(&session_id),
-                    turn,
-                    memory_id,
-                    reason,
-                ),
-            );
-        }
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &astra_services::session_journal::JournalEvent::memory_suppressed(
+                Some(&session_id),
+                turn,
+                memory_id,
+                reason,
+            ),
+            "edge_tools:suppress_memory",
+        );
         format!(
             "Memory `{mid}` suppressed for this session. It will not be injected in future turns.",
             mid = memory_id
@@ -2629,16 +2637,16 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
-            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::context_released(
-                    Some(&session_id),
-                    turn,
-                    &id_refs,
-                ),
-            );
-        }
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &astra_services::session_journal::JournalEvent::context_released(
+                Some(&session_id),
+                turn,
+                &id_refs,
+            ),
+            "edge_tools:release_context",
+        );
         format!(
             "Released {} tool result(s). They will be stubbed on the next LLM call.",
             ids.len()
@@ -2777,12 +2785,16 @@ impl ToolExecutor {
             .as_ref()
             .map(crate::cli::slash_memory::render_session_memory_surface_status)
             .filter(|block| !block.trim().is_empty());
-        let journal_fallback = self.render_session_memory_journal_fallback();
-        let journal_pipeline = self
-            .active_session_id()
-            .filter(|sid| !sid.is_empty())
-            .and_then(|sid| astra_services::session_journal::read_journal(&sid).ok())
-            .and_then(|events| Self::render_session_memory_pipeline_traces(&events));
+        let (journal_fallback, journal_pipeline, journal_notice) =
+            match self.load_active_session_memory_journal() {
+                Ok(Some((session_id, events))) => (
+                    Self::render_session_memory_journal_fallback(&session_id, &events),
+                    Self::render_session_memory_pipeline_traces(&events),
+                    None,
+                ),
+                Ok(None) => (None, None, None),
+                Err(error) => (None, None, Some(format!("journal unavailable: {error}"))),
+            };
         let Some(obs) = self.session_memory_observatory.as_ref() else {
             let body = journal_fallback.unwrap_or_else(|| {
                 "# session-memory observatory\n\n\
@@ -2791,6 +2803,10 @@ impl ToolExecutor {
                      attach one so extractions + injections are traceable here."
                     .to_string()
             });
+            let body = journal_notice
+                .as_deref()
+                .map(|notice| Self::inject_session_memory_notice(&body, notice))
+                .unwrap_or(body);
             return Self::prepend_session_memory_surface_status(surface_block.as_deref(), &body);
         };
 
@@ -2808,6 +2824,9 @@ impl ToolExecutor {
         let mut out = String::from("# session-memory observatory\n\n");
         if let Some(block) = surface_block.as_deref() {
             writeln!(out, "{block}\n").ok();
+        }
+        if let Some(notice) = journal_notice.as_deref() {
+            writeln!(out, "{notice}\n").ok();
         }
 
         writeln!(
@@ -2915,11 +2934,23 @@ impl ToolExecutor {
         out
     }
 
-    fn render_session_memory_journal_fallback(&self) -> Option<String> {
+    fn load_active_session_memory_journal(
+        &self,
+    ) -> Result<Option<(String, Vec<astra_services::session_journal::JournalEvent>)>, String> {
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return Ok(None);
+        };
+        let events = astra_services::session_journal::read_journal(&session_id)
+            .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
+        Ok(Some((session_id, events)))
+    }
+
+    fn render_session_memory_journal_fallback(
+        session_id: &str,
+        events: &[astra_services::session_journal::JournalEvent],
+    ) -> Option<String> {
         use std::fmt::Write as _;
 
-        let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
-        let events = astra_services::session_journal::read_journal(&session_id).ok()?;
         if events.is_empty() {
             return None;
         }
@@ -3161,6 +3192,15 @@ impl ToolExecutor {
         match surface_block.filter(|block| !block.trim().is_empty()) {
             Some(block) => format!("{block}\n\n{body}"),
             None => body.to_string(),
+        }
+    }
+
+    fn inject_session_memory_notice(body: &str, notice: &str) -> String {
+        const HEADER: &str = "# session-memory observatory\n\n";
+        if let Some(rest) = body.strip_prefix(HEADER) {
+            format!("{HEADER}{notice}\n\n{rest}")
+        } else {
+            format!("{notice}\n\n{body}")
         }
     }
 
@@ -5658,6 +5698,26 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn introspect_session_memory_unreadable_journal_surfaces_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-unreadable";
+        std::fs::create_dir_all(astra_services::session_journal::journal_file_path(
+            session_id,
+        ))
+        .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("journal unavailable:"), "{out}");
+        assert!(
+            out.contains("failed to read session journal for sess-introspect-unreadable"),
+            "{out}"
+        );
+        assert!(out.contains("No observatory attached"), "{out}");
     }
 
     #[test]

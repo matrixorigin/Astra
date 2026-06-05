@@ -56,6 +56,7 @@ pub struct ContextDump {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
+    pub persistence_error: Option<String>,
     /// Only `Some` when the caller could reach the latest trace
     /// (either via the live ObservabilitySession or a persisted
     /// journal).  Missing traces land here as `None` so the dump
@@ -132,6 +133,7 @@ fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -
         model: state.model.clone(),
         cwd: std::env::current_dir().ok().map(display_path),
         git_branch: detect_git_branch(),
+        persistence_error: state.session_persistence_error.clone(),
         trace: trace_json,
         chat_history,
         totals: Totals {
@@ -231,6 +233,15 @@ pub fn print_summary(session_id: &str) -> Result<(), String> {
     if let Some(m) = &dump.model {
         println!("  model: {m}");
     }
+    if let Some(cwd) = &dump.cwd {
+        println!("  cwd: {cwd}");
+    }
+    if let Some(git_branch) = &dump.git_branch {
+        println!("  git: {git_branch}");
+    }
+    if let Some(error) = &dump.persistence_error {
+        println!("  persistence: degraded · {error}");
+    }
     println!(
         "  tokens: in {} · out {} · cache-read {} · cache-create {}",
         fmt_tokens_u64(dump.totals.prompt_tokens),
@@ -321,6 +332,9 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
     let mut last_turn: u32 = 0;
     let mut trace_json: Option<serde_json::Value> = None;
     let mut model: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut git_branch: Option<String> = None;
+    let mut persistence_error: Option<String> = None;
     let mut compressed_turns: Vec<u32> = Vec::new();
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
@@ -330,6 +344,24 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
     // dumps report 0 here. Live dumps (the `/context dump` slash)
     // still carry the accumulated cost from SessionState.
     let cost_usd: f64 = 0.0;
+
+    match astra_services::session_workspace::read_workspace_optional(session_id) {
+        Ok(Some(workspace)) => {
+            model = model.or(workspace.model.clone());
+            cwd = Some(workspace.cwd);
+            git_branch = workspace.git_branch;
+            persistence_error = workspace
+                .last_persistence_error
+                .as_deref()
+                .map(str::trim)
+                .filter(|error| !error.is_empty())
+                .map(str::to_string);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            persistence_error = Some(format!("workspace metadata unreadable: {error}"));
+        }
+    }
 
     for ev in &events {
         if let Some(t) = ev.turn {
@@ -389,8 +421,9 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
         session_id: Some(session_id.to_string()),
         turn: last_turn,
         model,
-        cwd: None, // Forensic dumps can't infer the original cwd.
-        git_branch: None,
+        cwd,
+        git_branch,
+        persistence_error,
         trace: trace_json,
         chat_history: chat,
         totals: Totals {
@@ -517,6 +550,7 @@ mod tests {
             model: Some("m".into()),
             cwd: None,
             git_branch: None,
+            persistence_error: None,
             trace: None,
             chat_history: vec![ChatTurnDump {
                 role: "user".into(),
@@ -553,6 +587,7 @@ mod tests {
             model: None,
             cwd: None,
             git_branch: None,
+            persistence_error: None,
             trace: None,
             chat_history: Vec::new(),
             totals: Totals {
@@ -618,6 +653,7 @@ mod tests {
         (g, tmp)
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_returns_most_recent_when_arg_none() {
         let (_g, _tmp) = seed_sessions_tmp(&[
@@ -630,6 +666,7 @@ mod tests {
         assert_eq!(id, "02020202-aaaa-bbbb-cccc-dddddddddddd");
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_matches_unique_prefix() {
         let (_g, _tmp) = seed_sessions_tmp(&[
@@ -640,6 +677,7 @@ mod tests {
         assert_eq!(id, "01010101-aaaa-bbbb-cccc-dddddddddddd");
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_errors_on_ambiguous_prefix() {
         let (_g, _tmp) = seed_sessions_tmp(&[
@@ -655,6 +693,7 @@ mod tests {
         assert!(err.contains("ab111111"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_errors_on_unknown_prefix() {
         let (_g, _tmp) = seed_sessions_tmp(&["01010101-aaaa-bbbb-cccc-dddddddddddd"]);
@@ -662,6 +701,7 @@ mod tests {
         assert!(err.contains("no session matches prefix"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_errors_when_sessions_dir_is_empty() {
         let (_g, _tmp) = seed_sessions_tmp(&[]);
@@ -669,6 +709,7 @@ mod tests {
         assert!(err.contains("no sessions found"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_accepts_full_uuid_even_if_overlapping_prefixes_exist() {
         // If a full UUID is typed it should never trigger the
@@ -677,5 +718,85 @@ mod tests {
         let (_g, _tmp) = seed_sessions_tmp(&[full, "01010101-extra-overlap-prefix"]);
         let id = resolve_session_id(Some(full)).unwrap();
         assert_eq!(id, full);
+    }
+
+    #[test]
+    fn build_dump_from_journal_surfaces_workspace_persistence_and_metadata() {
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalEvent, JournalEventType, JournalWriter,
+        };
+        use astra_services::session_workspace::WorkspaceMetadata;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "context-dump-persistence";
+
+        let mut workspace =
+            WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        workspace.last_persistence_error = Some("failed to append turn event".to_string());
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let writer = JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&JournalEvent {
+                event_type: JournalEventType::Turn,
+                ts: "2026-01-15T10:31:00Z".to_string(),
+                session_id: Some(session_id.to_string()),
+                turn: Some(3),
+                agentic_step: None,
+                model: Some("gpt-5.4".to_string()),
+                user_input: Some("hello".to_string()),
+                assistant_output: Some("world".to_string()),
+                tool_count: Some(0),
+                tokens_in: Some(12),
+                tokens_out: Some(7),
+                duration_ms: Some(50),
+                error: None,
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: None,
+                selected_skills: None,
+                tools_used: None,
+                tool_calls: None,
+                budget_used: None,
+                budget_pressure: None,
+                stall_type: None,
+                metadata: None,
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: None,
+                routing_domain_hint: None,
+                entity_learn_skipped_no_domain: false,
+                round: None,
+                tool_calls_returned: None,
+                offset_ms: None,
+                llm_rounds: None,
+                total_llm_ms: None,
+                total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
+            })
+            .unwrap();
+
+        let dump = build_dump_from_journal(session_id).unwrap();
+
+        assert_eq!(dump.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(dump.cwd.as_deref(), Some("/repo"));
+        assert_eq!(dump.git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            dump.persistence_error.as_deref(),
+            Some("failed to append turn event")
+        );
     }
 }

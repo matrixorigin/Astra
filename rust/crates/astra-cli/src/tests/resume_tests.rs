@@ -109,6 +109,32 @@ async fn find_task_by_title_substring() {
 }
 
 #[tokio::test]
+async fn find_task_by_title_substring_fails_on_ambiguity() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+    for title in [
+        "Refactor authentication module",
+        "Refactor authentication tests",
+    ] {
+        svc.create_task(
+            "u1",
+            "s1",
+            astra_services::TaskCreateRequest {
+                title: title.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let err = slash_task::find_task_by_query(&svc, "u1", "authentication")
+        .await
+        .unwrap_err();
+    assert!(err.contains("task query 'authentication' is ambiguous"));
+}
+
+#[tokio::test]
 async fn find_task_not_found() {
     let tmp = tempfile::TempDir::new().unwrap();
     let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());

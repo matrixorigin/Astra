@@ -63,26 +63,91 @@ impl SessionSource for FsSessionSource {
         };
         ids.into_iter()
             .filter_map(|sid| {
-                let ws = session_workspace::read_workspace(&sid).ok()?;
+                let peek = session_journal::peek_session_meta(&sid);
+                let workspace = match session_workspace::read_workspace_optional(&sid) {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        tracing::warn!(
+                            "session picker failed to read workspace for {}: {}",
+                            sid,
+                            error
+                        );
+                        None
+                    }
+                };
                 let cost_usd = transcript_cost_usd(&sid);
-                Some(SessionEntry {
-                    id: sid,
-                    cwd: ws.cwd,
-                    git_branch: ws.git_branch,
-                    git_head: ws.git_head,
-                    turn_count: ws.turn_count,
-                    tokens_in: ws.total_tokens_in,
-                    tokens_out: ws.total_tokens_out,
-                    cost_usd,
-                    summary: ws.summary,
-                    status: ws.status,
-                    model: ws.model.unwrap_or_else(|| "default".to_string()),
-                    updated_at: ws.updated_at,
-                    checkpoints: ws.checkpoints.len() as u32,
-                    plan_goal: ws.plan_goal,
-                })
+                workspace
+                    .map(|ws| SessionEntry {
+                        id: sid.clone(),
+                        cwd: ws.cwd,
+                        git_branch: ws.git_branch,
+                        git_head: ws.git_head,
+                        turn_count: ws.turn_count,
+                        tokens_in: ws.total_tokens_in,
+                        tokens_out: ws.total_tokens_out,
+                        cost_usd,
+                        summary: decorate_picker_summary(
+                            ws.summary,
+                            ws.last_persistence_error.as_deref(),
+                        ),
+                        status: ws.status,
+                        model: ws.model.unwrap_or_else(|| "default".to_string()),
+                        updated_at: ws.updated_at,
+                        checkpoints: ws.checkpoints.len() as u32,
+                        plan_goal: ws.plan_goal,
+                    })
+                    .or_else(|| {
+                        peek.map(|peek| SessionEntry {
+                            id: sid.clone(),
+                            cwd: "(workspace unavailable)".to_string(),
+                            git_branch: None,
+                            git_head: None,
+                            turn_count: session_journal::count_turns(&sid),
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            cost_usd,
+                            summary: peek.first_prompt,
+                            status: "journal_only".to_string(),
+                            model: peek.model.unwrap_or_else(|| "default".to_string()),
+                            updated_at: peek.created_at.unwrap_or_default(),
+                            checkpoints: 0,
+                            plan_goal: None,
+                        })
+                    })
             })
             .collect()
+    }
+}
+
+fn decorate_picker_summary(
+    summary: Option<String>,
+    persistence_error: Option<&str>,
+) -> Option<String> {
+    let persistence_error = persistence_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty());
+    match (summary, persistence_error) {
+        (Some(summary), Some(error)) => Some(format!(
+            "persistence degraded: {} · {}",
+            summarize_picker_error(error),
+            summary
+        )),
+        (None, Some(error)) => Some(format!(
+            "persistence degraded: {}",
+            summarize_picker_error(error)
+        )),
+        (summary, None) => summary,
+    }
+}
+
+fn summarize_picker_error(error: &str) -> String {
+    const LIMIT: usize = 56;
+    let mut chars = error.chars();
+    let preview: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
     }
 }
 
@@ -280,7 +345,10 @@ fn haystack(e: &SessionEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::{session_journal::JournalDirGuard, session_workspace};
+    use astra_services::{
+        session_journal::{JournalDirGuard, JournalEvent, JournalWriter},
+        session_workspace,
+    };
 
     fn with_tmp_sessions_dir<F: FnOnce(&std::path::Path)>(f: F) {
         let cwd = std::env::current_dir().expect("current dir");
@@ -383,6 +451,67 @@ mod tests {
                 .find(|entry| entry.id == sid)
                 .expect("session listed");
             assert_eq!(entry.cost_usd, Some(0.42));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fs_source_keeps_session_when_workspace_is_corrupt() {
+        with_tmp_sessions_dir(|sessions_dir| {
+            let _guard = JournalDirGuard::new(sessions_dir);
+            let sid = "sessmeta789";
+            JournalWriter::new(sid)
+                .unwrap()
+                .append(&JournalEvent::session_start(Some(sid), Some("gpt-5")))
+                .unwrap();
+            JournalWriter::new(sid)
+                .unwrap()
+                .append(&JournalEvent::turn(
+                    Some(sid),
+                    1,
+                    Some("gpt-5"),
+                    "resume me",
+                    "done",
+                    0,
+                    10,
+                    20,
+                    30,
+                ))
+                .unwrap();
+            let workspace_path = session_workspace::workspace_file_path(sid).unwrap();
+            std::fs::create_dir_all(workspace_path.parent().unwrap()).unwrap();
+            std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
+
+            let entries = FsSessionSource::new().list(10);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == sid)
+                .expect("corrupt-workspace session still listed");
+            assert_eq!(entry.status, "journal_only");
+            assert_eq!(entry.summary.as_deref(), Some("resume me"));
+            assert_eq!(entry.turn_count, 1);
+            assert_eq!(entry.cwd, "(workspace unavailable)");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fs_source_surfaces_persistence_degradation_in_summary() {
+        with_tmp_sessions_dir(|sessions_dir| {
+            let _guard = JournalDirGuard::new(sessions_dir);
+            let sid = "sessmeta-degraded";
+            let mut ws = write_picker_session(sessions_dir, sid);
+            ws.last_persistence_error = Some("failed to append turn event".into());
+            session_workspace::write_workspace(&ws).expect("rewrite workspace yaml");
+
+            let entries = FsSessionSource::new().list(10);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == sid)
+                .expect("session listed");
+            let summary = entry.summary.as_deref().expect("summary should be present");
+            assert!(summary.contains("persistence degraded"), "{summary}");
+            assert!(summary.contains("rich metadata"), "{summary}");
         });
     }
 }

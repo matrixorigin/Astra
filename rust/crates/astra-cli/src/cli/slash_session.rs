@@ -1,15 +1,21 @@
 use std::io::Write;
 
 use astra_core::{DriftCause, EvidenceType};
-use astra_services::session_restore::{
-    HybridRestoreService, RestoredSession, SessionRestoreService,
-};
+use astra_services::session_restore::RestoredSession;
 use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
 use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
 use super::*;
+use crate::cli::agent_journal_event_surface::{project_agent_spawned, project_agent_terminated};
+use crate::cli::delegation_event_surface::{
+    project_delegation_completed, project_delegation_retry, project_delegation_started,
+    project_delegation_sub_run_completed, project_delegation_sub_run_started,
+};
+use crate::cli::session_restore_client;
 use crate::cli::session_runtime;
+use crate::cli::session_source_surface::session_source_surface;
+use crate::cli::session_workspace_status_surface::session_workspace_status_surface;
 use crate::cli::tool_call_groups;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
@@ -61,6 +67,14 @@ fn format_u64_grouped(n: u64) -> String {
     out.chars().rev().collect()
 }
 
+fn turn_count_label(turns: u32) -> String {
+    if turns == 1 {
+        "1 turn".to_string()
+    } else {
+        format!("{turns} turns")
+    }
+}
+
 fn permission_audit_summary(metadata: Option<&serde_json::Value>) -> String {
     let Some(meta) = metadata else {
         return "unknown".to_string();
@@ -109,32 +123,337 @@ fn permission_audit_summary(metadata: Option<&serde_json::Value>) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SessionWorkspaceState {
+    Present(Box<session_workspace::WorkspaceMetadata>),
+    Missing { journal_turns: u32 },
+    Invalid { error: String, journal_turns: u32 },
+}
+
+impl SessionWorkspaceState {
+    fn load(session_id: &str) -> Self {
+        match session_workspace::read_workspace_optional(session_id) {
+            Ok(Some(workspace)) => Self::Present(Box::new(workspace)),
+            Ok(None) => Self::Missing {
+                journal_turns: session_journal::count_turns(session_id),
+            },
+            Err(error) => Self::Invalid {
+                error: error.to_string(),
+                journal_turns: session_journal::count_turns(session_id),
+            },
+        }
+    }
+
+    fn metadata(&self) -> Option<&session_workspace::WorkspaceMetadata> {
+        match self {
+            Self::Present(workspace) => Some(workspace.as_ref()),
+            Self::Missing { .. } | Self::Invalid { .. } => None,
+        }
+    }
+
+    fn summary_hint(&self) -> String {
+        match self {
+            Self::Present(ws) => {
+                let mut parts: Vec<String> = Vec::new();
+                let cwd = tilde_path(ws.cwd.as_str());
+                parts.push(ellipsize(&cwd, 56));
+                match (&ws.git_branch, &ws.git_head) {
+                    (Some(b), Some(h)) => parts.push(format!("{b} @ {h}")),
+                    (Some(b), None) => parts.push(b.clone()),
+                    (None, Some(h)) => parts.push(format!("@ {h}")),
+                    (None, None) => {}
+                }
+                if ws.turn_count > 0 {
+                    parts.push(turn_count_label(ws.turn_count));
+                }
+                let status = session_workspace_status_surface(ws.status.as_str());
+                if !status.is_active() {
+                    parts.push(status.label().to_string());
+                }
+                if ws
+                    .last_persistence_error
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|error| !error.is_empty())
+                    .is_some()
+                {
+                    parts.push("persistence degraded".to_string());
+                }
+                if let Some(lbl) = rel_updated_label(ws.updated_at.as_str()) {
+                    parts.push(lbl);
+                }
+                parts.join(" · ")
+            }
+            Self::Missing { journal_turns } => {
+                if *journal_turns > 0 {
+                    format!(
+                        "workspace metadata missing · journal has {}",
+                        turn_count_label(*journal_turns)
+                    )
+                } else {
+                    "workspace metadata missing".to_string()
+                }
+            }
+            Self::Invalid {
+                error: _,
+                journal_turns,
+            } => {
+                if *journal_turns > 0 {
+                    format!(
+                        "workspace metadata unreadable · journal has {}",
+                        turn_count_label(*journal_turns)
+                    )
+                } else {
+                    "workspace metadata unreadable".to_string()
+                }
+            }
+        }
+    }
+}
+
 /// One-line hint for session lists: cwd, git, turns (from `workspace.yaml` if present).
 fn workspace_summary_line(sid: &str) -> String {
-    match session_workspace::read_workspace(sid) {
-        Ok(ws) => {
-            let mut parts: Vec<String> = Vec::new();
-            let cwd = tilde_path(ws.cwd.as_str());
-            parts.push(ellipsize(&cwd, 56));
-            match (&ws.git_branch, &ws.git_head) {
-                (Some(b), Some(h)) => parts.push(format!("{b} @ {h}")),
-                (Some(b), None) => parts.push(b.clone()),
-                (None, Some(h)) => parts.push(format!("@ {h}")),
-                (None, None) => {}
-            }
-            if ws.turn_count > 0 {
-                parts.push(format!("{} turns", ws.turn_count));
-            }
-            if ws.status != "active" {
-                parts.push(ws.status.clone());
-            }
-            if let Some(lbl) = rel_updated_label(ws.updated_at.as_str()) {
-                parts.push(lbl);
-            }
-            parts.join(" · ")
+    SessionWorkspaceState::load(sid).summary_hint()
+}
+
+fn resume_persistence_warning(error: Option<&str>) -> Option<String> {
+    error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .map(|error| format!("Session persistence degraded: {}", ellipsize(error, 96)))
+}
+
+fn list_local_sessions_by_time(limit: usize) -> Result<Vec<String>, String> {
+    session_journal::list_sessions_by_time(limit)
+        .map_err(|error| format!("failed to scan local sessions: {error}"))
+}
+
+fn list_local_sessions() -> Result<Vec<String>, String> {
+    session_journal::list_sessions()
+        .map_err(|error| format!("failed to scan local sessions: {error}"))
+}
+
+#[derive(Debug)]
+struct ResumableSessionCandidates {
+    sessions: Vec<astra_services::session_restore::RestoredSession>,
+    local_scan_error: Option<String>,
+    cloud_scan_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionListEntry {
+    sid: String,
+    workspace: SessionWorkspaceState,
+    hint: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SessionListFilterOptions {
+    filter_active: bool,
+    filter_completed: bool,
+    filter_here: bool,
+    filter_project: bool,
+    search_term: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SessionListFilterOutcome {
+    skipped_missing_workspace: usize,
+    skipped_invalid_workspace: usize,
+    project_filter_ignored: bool,
+}
+
+impl SessionListFilterOutcome {
+    fn record_workspace_skip(&mut self, workspace: &SessionWorkspaceState) {
+        match workspace {
+            SessionWorkspaceState::Present(_) => {}
+            SessionWorkspaceState::Missing { .. } => self.skipped_missing_workspace += 1,
+            SessionWorkspaceState::Invalid { .. } => self.skipped_invalid_workspace += 1,
         }
-        Err(_) => "journal only (no workspace.yaml)".to_string(),
     }
+
+    fn workspace_filter_warning(&self) -> Option<String> {
+        let total = self.skipped_missing_workspace + self.skipped_invalid_workspace;
+        if total == 0 {
+            return None;
+        }
+
+        let mut reasons = Vec::new();
+        if self.skipped_missing_workspace > 0 {
+            reasons.push(format!(
+                "{} missing workspace metadata",
+                self.skipped_missing_workspace
+            ));
+        }
+        if self.skipped_invalid_workspace > 0 {
+            reasons.push(format!(
+                "{} unreadable workspace metadata",
+                self.skipped_invalid_workspace
+            ));
+        }
+
+        Some(format!(
+            "Skipped {total} session(s) that could not be evaluated for workspace-based filters ({})",
+            reasons.join(", ")
+        ))
+    }
+}
+
+fn build_session_list_entries(session_ids: &[String]) -> Vec<SessionListEntry> {
+    session_ids
+        .iter()
+        .map(|sid| {
+            let workspace = SessionWorkspaceState::load(sid);
+            let hint = workspace.summary_hint();
+            SessionListEntry {
+                sid: sid.clone(),
+                workspace,
+                hint,
+            }
+        })
+        .collect()
+}
+
+fn retain_entries_with_workspace_filter<F>(
+    entries: &mut Vec<SessionListEntry>,
+    outcome: &mut SessionListFilterOutcome,
+    predicate: F,
+) where
+    F: Fn(&session_workspace::WorkspaceMetadata) -> bool,
+{
+    entries.retain(|entry| match entry.workspace.metadata() {
+        Some(workspace) => predicate(workspace),
+        None => {
+            outcome.record_workspace_skip(&entry.workspace);
+            false
+        }
+    });
+}
+
+fn filter_session_list_entries(
+    entries: &mut Vec<SessionListEntry>,
+    options: &SessionListFilterOptions,
+    current_cwd: &str,
+    current_git_root: Option<&str>,
+) -> SessionListFilterOutcome {
+    let mut outcome = SessionListFilterOutcome::default();
+
+    if options.filter_active {
+        retain_entries_with_workspace_filter(entries, &mut outcome, |workspace| {
+            session_workspace_status_surface(workspace.status.as_str()).is_active()
+        });
+    }
+    if options.filter_completed {
+        retain_entries_with_workspace_filter(entries, &mut outcome, |workspace| {
+            session_workspace_status_surface(workspace.status.as_str()).is_completed()
+        });
+    }
+    if options.filter_here {
+        retain_entries_with_workspace_filter(entries, &mut outcome, |workspace| {
+            workspace.cwd == current_cwd
+        });
+    }
+    if options.filter_project {
+        if let Some(root) = current_git_root {
+            retain_entries_with_workspace_filter(entries, &mut outcome, |workspace| {
+                workspace.git_root.as_deref() == Some(root)
+            });
+        } else {
+            outcome.project_filter_ignored = true;
+        }
+    }
+
+    if let Some(term) = options.search_term.as_ref() {
+        entries.retain(|entry| {
+            if entry.sid.to_lowercase().starts_with(term) {
+                return true;
+            }
+            if entry.hint.to_lowercase().contains(term) {
+                return true;
+            }
+            if let Some(workspace) = entry.workspace.metadata() {
+                if workspace.cwd.to_lowercase().contains(term) {
+                    return true;
+                }
+                if let Some(branch) = workspace.git_branch.as_ref()
+                    && branch.to_lowercase().contains(term)
+                {
+                    return true;
+                }
+                if let Some(summary) = workspace.summary.as_ref()
+                    && summary.to_lowercase().contains(term)
+                {
+                    return true;
+                }
+            }
+            false
+        });
+    }
+
+    outcome
+}
+
+async fn load_resumable_session_candidates(
+    profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    local_limit: usize,
+) -> Result<ResumableSessionCandidates, String> {
+    let (cloud_sessions, cloud_scan_error) =
+        match session_restore_client::list_cloud_resumable_sessions(profile, api).await {
+            Ok(sessions) => (sessions, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("failed to load cloud resumable sessions: {error}")),
+            ),
+        };
+    let (local_ids, local_scan_error) = match list_local_sessions_by_time(local_limit) {
+        Ok(ids) => (ids, None),
+        Err(error) if !cloud_sessions.is_empty() => (Vec::new(), Some(error)),
+        Err(error) => {
+            let mut failures = vec![error];
+            if let Some(cloud_error) = cloud_scan_error.clone() {
+                failures.push(cloud_error);
+            }
+            return Err(failures.join(" | "));
+        }
+    };
+
+    let mut merged: std::collections::HashMap<
+        String,
+        astra_services::session_restore::RestoredSession,
+    > = std::collections::HashMap::new();
+
+    for sid in &local_ids {
+        merged.entry(sid.clone()).or_insert_with(|| {
+            astra_services::session_restore::RestoredSession {
+                session_id: sid.clone(),
+                turn_count: session_journal::count_turns(sid),
+                last_status: "local".to_string(),
+                ..Default::default()
+            }
+        });
+    }
+
+    for session in cloud_sessions {
+        merged.insert(session.session_id.clone(), session);
+    }
+
+    let mut sessions: Vec<_> = Vec::new();
+    for sid in &local_ids {
+        if let Some(session) = merged.remove(sid) {
+            sessions.push(session);
+        }
+    }
+    let mut cloud_only: Vec<_> = merged.into_values().collect();
+    cloud_only.sort_by_key(|session| std::cmp::Reverse(session.turn_count));
+    sessions.splice(0..0, cloud_only);
+    sessions.retain(|session| session.turn_count > 0);
+
+    Ok(ResumableSessionCandidates {
+        sessions,
+        local_scan_error,
+        cloud_scan_error,
+    })
 }
 
 /// Resolve parent session id and optional label for `/session fork`.
@@ -236,7 +555,25 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         saved.magenta(),
         ago.dim()
     );
-    eprintln!("  {:<16} {}", "status:".dim(), ws.status.as_str().magenta());
+    let status = session_workspace_status_surface(ws.status.as_str());
+    eprintln!(
+        "  {:<16} {} {}",
+        "status:".dim(),
+        status.icon(),
+        status.label().magenta()
+    );
+    if let Some(error) = ws
+        .last_persistence_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        eprintln!(
+            "  {:<16} {}",
+            "persistence:".dim(),
+            ellipsize(error, 96).yellow()
+        );
+    }
     if let Some(ref sum) = ws.summary {
         eprintln!("  {:<16} {}", "summary:".dim(), ellipsize(sum, 80).dim());
     }
@@ -290,13 +627,14 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
             tail.dim()
         );
     }
-    let ws_path = session_workspace::workspace_dir_for(sid).join("workspace.yaml");
-    let ws_disp = ws_path.display().to_string();
-    eprintln!(
-        "  {:<16} {}",
-        "workspace.yaml:".dim(),
-        tilde_path(&ws_disp).as_str().dim()
-    );
+    if let Ok(ws_path) = session_workspace::workspace_file_path(sid) {
+        let ws_disp = ws_path.display().to_string();
+        eprintln!(
+            "  {:<16} {}",
+            "workspace.yaml:".dim(),
+            tilde_path(&ws_disp).as_str().dim()
+        );
+    }
     eprintln!();
 }
 
@@ -317,20 +655,16 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
 fn handle_session_list(sub_arg: &str, state: &SessionState) {
     // Parse options
     let mut show_all = false;
-    let mut filter_active = false;
-    let mut filter_completed = false;
-    let mut filter_here = false;
-    let mut filter_project = false;
-    let mut search_term: Option<String> = None;
+    let mut options = SessionListFilterOptions::default();
 
     for part in sub_arg.split_whitespace() {
         match part {
             "--all" | "-a" => show_all = true,
-            "--active" => filter_active = true,
-            "--completed" | "--done" => filter_completed = true,
-            "--here" | "--cwd" => filter_here = true,
-            "--project" | "--repo" => filter_project = true,
-            _ if !part.starts_with('-') => search_term = Some(part.to_lowercase()),
+            "--active" => options.filter_active = true,
+            "--completed" | "--done" => options.filter_completed = true,
+            "--here" | "--cwd" => options.filter_here = true,
+            "--project" | "--repo" => options.filter_project = true,
+            _ if !part.starts_with('-') => options.search_term = Some(part.to_lowercase()),
             other => {
                 eprintln!("{}", format!("  Unknown option: {other}").red());
                 eprintln!(
@@ -356,7 +690,7 @@ fn handle_session_list(sub_arg: &str, state: &SessionState) {
 
     // Load sessions by recency
     let limit = if show_all { 500 } else { 50 }; // scan more than display for filtering
-    let sessions = match session_journal::list_sessions_by_time(limit) {
+    let sessions = match list_local_sessions_by_time(limit) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}", format!("  ✗ {e}").red());
@@ -373,81 +707,18 @@ fn handle_session_list(sub_arg: &str, state: &SessionState) {
         return;
     }
 
-    // Build session list with metadata for filtering/searching
-    struct SessionEntry {
-        sid: String,
-        ws: Option<session_workspace::WorkspaceMetadata>,
-        hint: String,
-    }
-
-    let mut entries: Vec<SessionEntry> = sessions
-        .iter()
-        .map(|sid| {
-            let ws = session_workspace::read_workspace(sid).ok();
-            let hint = workspace_summary_line(sid);
-            SessionEntry {
-                sid: sid.clone(),
-                ws,
-                hint,
-            }
-        })
-        .collect();
-
-    // Apply filters
-    if filter_active {
-        entries.retain(|e| e.ws.as_ref().map(|w| w.status == "active").unwrap_or(false));
-    }
-    if filter_completed {
-        entries.retain(|e| {
-            e.ws.as_ref()
-                .map(|w| w.status == "completed")
-                .unwrap_or(false)
-        });
-    }
-    if filter_here {
-        entries.retain(|e| e.ws.as_ref().map(|w| w.cwd == current_cwd).unwrap_or(false));
-    }
-    if filter_project {
-        if let Some(ref root) = current_git_root {
-            entries.retain(|e| {
-                e.ws.as_ref()
-                    .and_then(|w| w.git_root.as_ref())
-                    .map(|r| r == root)
-                    .unwrap_or(false)
-            });
-        } else {
-            eprintln!(
-                "  {}",
-                "Not in a git repository — --project filter ignored.".yellow()
-            );
-        }
-    }
-
-    // Apply search
-    if let Some(ref term) = search_term {
-        entries.retain(|e| {
-            // Match session ID prefix
-            if e.sid.to_lowercase().starts_with(term) {
-                return true;
-            }
-            // Match cwd, git branch, or summary
-            if let Some(ref ws) = e.ws {
-                if ws.cwd.to_lowercase().contains(term) {
-                    return true;
-                }
-                if let Some(ref b) = ws.git_branch {
-                    if b.to_lowercase().contains(term) {
-                        return true;
-                    }
-                }
-                if let Some(ref s) = ws.summary {
-                    if s.to_lowercase().contains(term) {
-                        return true;
-                    }
-                }
-            }
-            false
-        });
+    let mut entries = build_session_list_entries(&sessions);
+    let filter_outcome = filter_session_list_entries(
+        &mut entries,
+        &options,
+        &current_cwd,
+        current_git_root.as_deref(),
+    );
+    if filter_outcome.project_filter_ignored {
+        eprintln!(
+            "  {}",
+            "Not in a git repository — --project filter ignored.".yellow()
+        );
     }
 
     // Limit display
@@ -457,16 +728,16 @@ fn handle_session_list(sub_arg: &str, state: &SessionState) {
 
     if entries.is_empty() {
         let mut filter_desc = Vec::new();
-        if filter_active {
+        if options.filter_active {
             filter_desc.push("active");
         }
-        if filter_completed {
+        if options.filter_completed {
             filter_desc.push("completed");
         }
-        if filter_here {
+        if options.filter_here {
             filter_desc.push("this directory");
         }
-        if filter_project {
+        if options.filter_project {
             filter_desc.push("this project");
         }
         let desc = if filter_desc.is_empty() {
@@ -475,6 +746,9 @@ fn handle_session_list(sub_arg: &str, state: &SessionState) {
             format!(" ({})", filter_desc.join(", "))
         };
         eprintln!("  {}", format!("No sessions match{desc}.").dim());
+        if let Some(warning) = filter_outcome.workspace_filter_warning() {
+            eprintln!("  {}", warning.yellow());
+        }
         return;
     }
 
@@ -488,19 +762,19 @@ fn handle_session_list(sub_arg: &str, state: &SessionState) {
     let sort_info = "sorted by recent";
     let filter_info = {
         let mut parts = Vec::new();
-        if filter_active {
+        if options.filter_active {
             parts.push("active only");
         }
-        if filter_completed {
+        if options.filter_completed {
             parts.push("completed only");
         }
-        if filter_here {
+        if options.filter_here {
             parts.push("this dir");
         }
-        if filter_project {
+        if options.filter_project {
             parts.push("this project");
         }
-        if let Some(ref t) = search_term {
+        if let Some(ref t) = options.search_term {
             parts.push(t);
         }
         if parts.is_empty() {
@@ -510,6 +784,9 @@ fn handle_session_list(sub_arg: &str, state: &SessionState) {
         }
     };
     eprintln!("  {}", format!("{sort_info}{filter_info}").dim());
+    if let Some(warning) = filter_outcome.workspace_filter_warning() {
+        eprintln!("  {}", warning.yellow());
+    }
 
     // Display entries with numbered shortcuts
     let current = state.session_id.as_deref().unwrap_or("");
@@ -577,8 +854,33 @@ fn get_session_shortcut(num: usize) -> Option<String> {
     LAST_SESSION_LIST.with(|cell| cell.borrow().get(num.saturating_sub(1)).cloned())
 }
 
+fn resume_restore_hint(error: &str) -> &'static str {
+    if error.contains("not found")
+        || error.contains("no resumable workspace/checkpoint state")
+        || error.contains("no longer exists on the server")
+    {
+        "Use /resume to see available sessions."
+    } else {
+        "Check connection with /diagnostics, or try a different session."
+    }
+}
+
+async fn switch_session_into_state(
+    session_id: &str,
+    profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    state: &mut SessionState,
+) -> Result<(), String> {
+    restore_session_into_state(session_id, profile, api, state).await
+}
+
 /// Handle `/session switch <N>` - quick switch to session by number from last list
-fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
+async fn handle_session_switch(
+    sub_arg: &str,
+    profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    state: &mut SessionState,
+) {
     let arg = sub_arg.trim();
 
     if arg.is_empty() {
@@ -611,7 +913,10 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
     };
 
     // Show preview and confirm
-    let ws = session_workspace::read_workspace(&session_id).ok();
+    let (ws, workspace_error) = match session_workspace::read_workspace_optional(&session_id) {
+        Ok(workspace) => (workspace, None),
+        Err(error) => (None, Some(error)),
+    };
 
     let short_id = &session_id[..8.min(session_id.len())];
     let summary = ws
@@ -639,6 +944,12 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
         summary.dim(),
         turns
     );
+    if let Some(error) = workspace_error.as_ref() {
+        eprintln!(
+            "  {}",
+            format!("workspace.yaml is invalid: {error}").yellow()
+        );
+    }
 
     // Quick confirm
     eprint!("  {} ", "Switch to this session? [Y/n]:".bold());
@@ -654,19 +965,12 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
         return;
     }
 
-    // Restore session state
-    let st = crate::cli::session_runtime::session_state_from_journal(&session_id);
-    state.set_session_id(session_id.clone());
-    state.journal = session_journal::JournalWriter::new(&session_id).ok();
-    state.history = st.history;
-    state.turn = st.turn;
-    state.total_prompt_tokens = st.total_prompt_tokens;
-    state.total_completion_tokens = st.total_completion_tokens;
-    state.total_cache_read_tokens = st.total_cache_read_tokens;
-    state.total_cache_creation_tokens = st.total_cache_creation_tokens;
-    state.recent_tools = st.recent_tools;
-    state.last_turn_event = None;
-    state.run_id = None;
+    if let Err(error) = switch_session_into_state(&session_id, profile, api, state).await {
+        let hint = resume_restore_hint(&error);
+        eprintln!("  {} {}", theme::icon_err(), error.red());
+        eprintln!("{}", format!("  {hint}").dim());
+        return;
+    }
 
     eprintln!(
         "  {} Switched to session {} ({} turns loaded)",
@@ -690,7 +994,7 @@ pub(crate) fn resolve_journal_target_session(
         Ok((sid.clone(), false))
     } else {
         // No active session — list local journals and let user pick
-        let sessions = session_journal::list_sessions_by_time(10).unwrap_or_default();
+        let sessions = list_local_sessions_by_time(10).map_err(|error| format!("  ✗ {error}"))?;
         if sessions.is_empty() {
             return Err("  No sessions found. Start a conversation to create one.".to_string());
         }
@@ -731,8 +1035,8 @@ pub(crate) fn resolve_journal_target_session(
 
 pub(crate) async fn handle_session_command(
     arg: &str,
-    _api: &astra_thin_client::ThinClient,
-    _profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
     state: &mut SessionState,
     _token: Option<&str>,
 ) {
@@ -752,9 +1056,14 @@ pub(crate) async fn handle_session_command(
                     .magenta()
             );
             eprintln!("  {:<16} {}", "session_id:".dim(), sid.magenta());
-            let persisted_ws = (sid != "none")
-                .then(|| session_workspace::read_workspace(sid).ok())
-                .flatten();
+            let (persisted_ws, persisted_ws_error) = if sid != "none" {
+                match session_workspace::read_workspace_optional(sid) {
+                    Ok(workspace) => (workspace, None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
             if sid != "none" {
                 if let Some(ref ws) = persisted_ws {
                     print_workspace_metadata(ws, sid);
@@ -769,6 +1078,12 @@ pub(crate) async fn handle_session_command(
                         "— no workspace.yaml yet (cwd/git after journal init) —".dim()
                     );
                     eprintln!();
+                }
+                if let Some(error) = persisted_ws_error.as_ref() {
+                    eprintln!(
+                        "  {}",
+                        format!("workspace.yaml is invalid: {error}").yellow()
+                    );
                 }
             } else {
                 eprintln!();
@@ -807,6 +1122,24 @@ pub(crate) async fn handle_session_command(
                 "run_id:".dim(),
                 state.run_id.as_deref().unwrap_or("none").magenta()
             );
+            if let Some(error) = state
+                .session_persistence_error
+                .as_deref()
+                .map(str::trim)
+                .filter(|error| !error.is_empty())
+            {
+                let persisted_error = persisted_ws
+                    .as_ref()
+                    .and_then(|ws| ws.last_persistence_error.as_deref())
+                    .map(str::trim);
+                if persisted_error != Some(error) {
+                    eprintln!(
+                        "  {:<16} {}",
+                        "persistence:".dim(),
+                        ellipsize(error, 96).yellow()
+                    );
+                }
+            }
             if let Some(ref j) = state.journal {
                 let jp = j.path().display().to_string();
                 eprintln!(
@@ -856,55 +1189,50 @@ pub(crate) async fn handle_session_command(
                         )
                         .dim()
                     );
-                    // Fork CSL: materialize parent → write child Snapshot(seq=1)
-                    let base_dir = session_journal::local_sessions_dir();
-                    let store = std::sync::Arc::new(
-                        astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
-                    );
-                    // Fork CSL and restore child state.
-                    // Journal provides turn/token counters (not in CSL).
-                    let st = session_runtime::session_state_from_journal(&new_sid);
-                    state.set_session_id(new_sid.clone());
-                    state.journal = session_journal::JournalWriter::new(&new_sid).ok();
-                    state.turn = st.turn;
-                    state.total_prompt_tokens = st.total_prompt_tokens;
-                    state.total_completion_tokens = st.total_completion_tokens;
-                    state.total_cache_read_tokens = st.total_cache_read_tokens;
-                    state.total_cache_creation_tokens = st.total_cache_creation_tokens;
-                    state.last_turn_event = None;
-                    state.run_id = None;
+                    let restored_child = match load_prepared_fork_restore(
+                        &parent_id,
+                        &new_sid,
+                        res.forked_at_turn,
+                    )
+                    .await
+                    {
+                        Ok(restored_child) => restored_child,
+                        Err(error) => {
+                            eprintln!(
+                                    "{}",
+                                    format!(
+                                        "  ✗ Forked child session could not restore local history: {error}"
+                                    )
+                                    .red()
+                                );
+                            return;
+                        }
+                    };
 
-                    // Write child CSL: materialize parent → Snapshot(seq=1).
-                    // On success, reuse the child CslManager (already loaded) to
-                    // restore history — avoids double I/O from restore_journal_history.
-                    let parent_mgr = astra_turn_core::conversation_log::manager::CslManager::new(
-                        store,
-                        parent_id.clone(),
-                        Default::default(),
-                    );
-                    match parent_mgr {
-                        Ok(parent_mgr) => {
-                            match parent_mgr.fork(&new_sid, res.forked_at_turn).await {
-                                Ok((child_mgr, child_mat)) => {
-                                    apply_csl_fork_to_state(state, child_mgr, child_mat);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "CSL fork failed, child will use journal fallback"
-                                    );
-                                    restore_journal_history_if_available(state, &new_sid).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "CSL manager creation failed, child will use journal fallback"
-                            );
-                            restore_journal_history_if_available(state, &new_sid).await;
-                        }
+                    let mut fork_guard = ForkStateGuard::new(state);
+                    apply_prepared_fork_restore(fork_guard.state(), &new_sid, restored_child);
+
+                    if let Err(error) =
+                        crate::cli::session_recovery::sync_recovery_snapshot_after_history_edit(
+                            fork_guard.state(),
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "  ✗ Forked child session could not persist resume/fork state: {error}"
+                            )
+                            .red()
+                        );
+                        return;
                     }
+                    persist_profile_last_session_or_warn(
+                        profile,
+                        &new_sid,
+                        "slash_session:fork_new_session_id",
+                    );
+                    fork_guard.commit();
                     eprintln!(
                         "  {}",
                         "REPL context is now the forked session (same history; new cloud lineage)."
@@ -1529,111 +1857,71 @@ pub(crate) async fn handle_session_command(
                                 );
                             }
                             session_journal::JournalEventType::DelegationStarted => {
-                                let pattern = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("pattern"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let count = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("agent_count"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
+                                let projection = project_delegation_started(evt.metadata.as_ref());
                                 eprintln!(
                                     "  {} {} delegation started ({}, {} agents)",
                                     ts_short.dim(),
                                     "⑂".magenta(),
-                                    pattern,
-                                    count,
+                                    projection.pattern,
+                                    projection.agent_count,
                                 );
                             }
                             session_journal::JournalEventType::DelegationSubRunStarted => {
-                                let meta = evt.metadata.as_ref();
-                                let agent = meta
-                                    .and_then(|m| m.get("agent_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let run = meta
-                                    .and_then(|m| m.get("sub_run_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let retry_of = meta
-                                    .and_then(|m| m.get("retry_of"))
-                                    .and_then(|v| v.as_str())
+                                let projection =
+                                    project_delegation_sub_run_started(evt.metadata.as_ref());
+                                let retry_of = projection
+                                    .retry_of
+                                    .as_deref()
                                     .map(|run_id| format!(" (retry of {run_id})"))
                                     .unwrap_or_default();
                                 eprintln!(
                                     "  {} {} sub-run {} started {}{}",
                                     ts_short.dim(),
                                     "↳".magenta(),
-                                    agent,
-                                    run.dim(),
+                                    projection.agent_id,
+                                    projection.sub_run_id.dim(),
                                     retry_of.dim(),
                                 );
                             }
                             session_journal::JournalEventType::DelegationSubRunCompleted => {
-                                let meta = evt.metadata.as_ref();
-                                let agent = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("agent_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let status = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("status"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let icon = if status == "completed" { "✓" } else { "✗" };
+                                let projection =
+                                    project_delegation_sub_run_completed(evt.metadata.as_ref());
+                                let icon = crate::cli::run_status_surface::run_status_icon(
+                                    &projection.status,
+                                );
                                 eprintln!(
                                     "  {} {} sub-run {} → {}",
                                     ts_short.dim(),
                                     icon.magenta(),
-                                    agent,
-                                    status,
+                                    projection.agent_id,
+                                    projection.status,
                                 );
-                                if let Some(preview) = meta
-                                    .and_then(|m| m.get("output_preview"))
-                                    .and_then(|v| v.as_str())
+                                if let Some(preview) = projection
+                                    .output_preview
+                                    .as_deref()
                                     .filter(|s| !s.is_empty())
                                 {
                                     eprintln!("      {}", ellipsize(preview, 120).dim());
                                 }
-                                if let Some(error) = meta
-                                    .and_then(|m| m.get("error"))
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
+                                if let Some(error) =
+                                    projection.error.as_deref().filter(|s| !s.is_empty())
                                 {
                                     eprintln!("      {}", ellipsize(error, 120).red());
                                 }
                             }
                             session_journal::JournalEventType::DelegationCompleted => {
-                                let meta = evt.metadata.as_ref();
-                                let succeeded = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("succeeded"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let failed = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("failed"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
+                                let projection =
+                                    project_delegation_completed(evt.metadata.as_ref());
                                 eprintln!(
                                     "  {} {} delegation done ({} ok, {} failed)",
                                     ts_short.dim(),
                                     "⑂".green(),
-                                    succeeded,
-                                    failed,
+                                    projection.succeeded,
+                                    projection.failed,
                                 );
-                                if let Some(preview) = meta
-                                    .and_then(|m| m.get("aggregated_output_preview"))
-                                    .and_then(|v| v.as_str())
+                                if let Some(preview) = projection
+                                    .aggregated_output_preview
+                                    .as_deref()
                                     .filter(|s| !s.is_empty())
                                 {
                                     eprintln!("      {}", ellipsize(preview, 120).magenta());
@@ -1668,49 +1956,25 @@ pub(crate) async fn handle_session_command(
                                 );
                             }
                             session_journal::JournalEventType::AgentSpawned => {
-                                let m = evt.metadata.as_ref();
-                                let agent = m
-                                    .and_then(|x| x.get("agent_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let desc = m
-                                    .and_then(|x| x.get("description"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let projection = project_agent_spawned(evt.metadata.as_ref());
                                 eprintln!(
                                     "  {} {} agent spawned: {} ({})",
                                     ts_short.dim(),
                                     "┌".magenta(),
-                                    agent.magenta(),
-                                    desc,
+                                    projection.agent_id.magenta(),
+                                    projection.description,
                                 );
                             }
                             session_journal::JournalEventType::AgentTerminated => {
-                                let m = evt.metadata.as_ref();
-                                let agent = m
-                                    .and_then(|x| x.get("agent_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let run = m
-                                    .and_then(|x| x.get("run_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let status = m
-                                    .and_then(|x| x.get("status"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let turns = m
-                                    .and_then(|x| x.get("turns_completed"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
+                                let projection = project_agent_terminated(evt.metadata.as_ref());
                                 eprintln!(
                                     "  {} {} agent {} run {} → {} ({} turns)",
                                     ts_short.dim(),
                                     "⌁".dim(),
-                                    agent.dim(),
-                                    run.dim(),
-                                    status.magenta(),
-                                    turns,
+                                    projection.agent_id.dim(),
+                                    projection.run_id.dim(),
+                                    projection.status.magenta(),
+                                    projection.turns_completed,
                                 );
                             }
                             session_journal::JournalEventType::VerificationCompleted => {
@@ -1757,31 +2021,15 @@ pub(crate) async fn handle_session_command(
                                 );
                             }
                             session_journal::JournalEventType::DelegationRetry => {
-                                let m = evt.metadata.as_ref();
-                                let original = m
-                                    .and_then(|x| x.get("original_run_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let retry = m
-                                    .and_then(|x| x.get("retry_run_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let attempt = m
-                                    .and_then(|x| x.get("attempt"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let reason = m
-                                    .and_then(|x| x.get("reason"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let projection = project_delegation_retry(evt.metadata.as_ref());
                                 eprintln!(
                                     "  {} {} retry #{} {} → {} {}",
                                     ts_short.dim(),
                                     "↻".yellow(),
-                                    attempt,
-                                    original.dim(),
-                                    retry.dim(),
-                                    reason.dim(),
+                                    projection.attempt,
+                                    projection.original_run_id.dim(),
+                                    projection.retry_run_id.dim(),
+                                    projection.reason.dim(),
                                 );
                             }
                             session_journal::JournalEventType::DriftDetected => {
@@ -2340,7 +2588,7 @@ pub(crate) async fn handle_session_command(
             handle_session_cleanup(sub_arg, state);
         }
         "switch" | "sw" => {
-            handle_session_switch(sub_arg, state);
+            handle_session_switch(sub_arg, profile, api, state).await;
         }
         "verify" | "sync" | "status" => {
             handle_session_verify(state);
@@ -2679,9 +2927,19 @@ fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
 /// Build a markdown export from journal events.
 pub(crate) fn build_export_markdown(
     session_id: &str,
+    workspace: Option<&session_workspace::WorkspaceMetadata>,
     events: &[session_journal::JournalEvent],
 ) -> String {
     let mut md = format!("# Session: {session_id}\n\n");
+    if let Some(error) = workspace
+        .and_then(|workspace| workspace.last_persistence_error.as_deref())
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        md.push_str(&format!(
+            "> Warning: Session persistence degraded: {error}\n\n"
+        ));
+    }
     for evt in events {
         let ts_short = evt.ts.get(..19).unwrap_or(&evt.ts);
         match evt.event_type {
@@ -2891,7 +3149,20 @@ fn export_session_markdown(session_id: &str) {
             eprintln!("{}", "  No journal entries to export.".dim());
         }
         Ok(events) => {
-            let md = build_export_markdown(session_id, &events);
+            let workspace = match session_workspace::read_workspace_optional(session_id) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    eprintln!(
+                        "  {}",
+                        format!(
+                            "warning: workspace.yaml is invalid; export omits workspace health metadata: {error}"
+                        )
+                        .yellow()
+                    );
+                    None
+                }
+            };
+            let md = build_export_markdown(session_id, workspace.as_ref(), &events);
             let now = chrono::Local::now();
             let export_path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
             match std::fs::write(&export_path, &md) {
@@ -3635,7 +3906,10 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
             return;
         }
     };
-    let ws = session_workspace::read_workspace(&target_sid).ok();
+    let (ws, workspace_error) = match session_workspace::read_workspace_optional(&target_sid) {
+        Ok(workspace) => (workspace, None),
+        Err(error) => (None, Some(error)),
+    };
 
     // ── Collect turn events ─────────────────────────────────────────────────
     let turns: Vec<&session_journal::JournalEvent> = events
@@ -3683,6 +3957,13 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
     let total_cache_create: u64 = turns.iter().filter_map(|t| t.cache_creation_tokens).sum();
 
     eprintln!("  {:<16} {}", "model:".dim(), model.magenta());
+    if let Some(error) = workspace_error.as_ref() {
+        eprintln!(
+            "  {:<16} {}",
+            "workspace:".dim(),
+            format!("invalid ({error})").yellow()
+        );
+    }
     eprintln!(
         "  {:<16} {} ({} prompt + {} completion)",
         "tokens:".dim(),
@@ -4102,37 +4383,63 @@ fn handle_session_verify(state: &SessionState) {
     // Session disk usage summary
     if sid != "none" {
         let sessions_dir = session_journal::local_sessions_dir();
-        let all_sessions = session_journal::list_sessions().unwrap_or_default();
-        let total_journals: u64 = all_sessions
-            .iter()
-            .filter_map(|s| {
-                std::fs::metadata(sessions_dir.join(format!("{s}.jsonl")))
-                    .ok()
-                    .map(|m| m.len())
-            })
-            .sum();
-        let compressed: usize = std::fs::read_dir(&sessions_dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl.gz"))
-                    .count()
-            })
-            .unwrap_or(0);
-
         eprintln!();
         eprintln!("  {}", "Disk".dim());
-        eprintln!(
-            "    {:<20} {} active, {} archived",
-            "sessions:".dim(),
-            all_sessions.len().to_string().magenta(),
-            compressed.to_string().magenta()
-        );
-        eprintln!(
-            "    {:<20} {}",
-            "journal total:".dim(),
-            human_bytes(total_journals).magenta()
-        );
+        match list_local_sessions() {
+            Ok(all_sessions) => {
+                let total_journals: u64 = all_sessions
+                    .iter()
+                    .filter_map(|s| {
+                        std::fs::metadata(sessions_dir.join(format!("{s}.jsonl")))
+                            .ok()
+                            .map(|m| m.len())
+                    })
+                    .sum();
+                match std::fs::read_dir(&sessions_dir) {
+                    Ok(entries) => {
+                        let compressed = entries
+                            .flatten()
+                            .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl.gz"))
+                            .count();
+                        eprintln!(
+                            "    {:<20} {} active, {} archived",
+                            "sessions:".dim(),
+                            all_sessions.len().to_string().magenta(),
+                            compressed.to_string().magenta()
+                        );
+                        eprintln!(
+                            "    {:<20} {}",
+                            "journal total:".dim(),
+                            human_bytes(total_journals).magenta()
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "    {:<20} {}",
+                            "sessions:".dim(),
+                            format!("unavailable ({error})").yellow()
+                        );
+                        eprintln!(
+                            "    {:<20} {}",
+                            "journal total:".dim(),
+                            format!("unavailable ({error})").yellow()
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "    {:<20} {}",
+                    "sessions:".dim(),
+                    format!("unavailable ({error})").yellow()
+                );
+                eprintln!(
+                    "    {:<20} {}",
+                    "journal total:".dim(),
+                    format!("unavailable ({error})").yellow()
+                );
+            }
+        }
     }
 
     eprintln!();
@@ -4168,7 +4475,7 @@ mod export_tests {
             "ts": "2025-01-15T10:30:00Z",
             "model": "gpt-4o",
         }));
-        let md = build_export_markdown("abc123", &[evt]);
+        let md = build_export_markdown("abc123", None, &[evt]);
         assert!(md.contains("# Session: abc123"));
         assert!(md.contains("## Session Start"));
         assert!(md.contains("gpt-4o"));
@@ -4204,7 +4511,7 @@ mod export_tests {
             ],
         }));
 
-        let md = build_export_markdown("test-sid", &[evt]);
+        let md = build_export_markdown("test-sid", None, &[evt]);
         assert!(md.contains("### Turn 1"));
         assert!(md.contains("**User:**"));
         assert!(md.contains("Hello"));
@@ -4226,7 +4533,7 @@ mod export_tests {
             "assistant_output": "hello",
         }));
 
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(!md.contains("<details>"));
         assert!(md.contains("hello"));
     }
@@ -4289,7 +4596,7 @@ mod export_tests {
 
     #[test]
     fn build_export_empty_events_only_header() {
-        let md = build_export_markdown("empty-sid", &[]);
+        let md = build_export_markdown("empty-sid", None, &[]);
         assert!(md.contains("# Session: empty-sid"));
         // Should not contain any section headers
         assert!(!md.contains("## Session Start"));
@@ -4304,7 +4611,7 @@ mod export_tests {
             "turn": 3,
             "error": "rate limit exceeded",
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("Turn 3 ❌ Error"));
         assert!(md.contains("rate limit exceeded"));
     }
@@ -4317,7 +4624,7 @@ mod export_tests {
             "turns_compacted": 8,
             "facts_stored": 2,
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("### Compact"));
         assert!(md.contains("Turns compacted:** 8"));
         assert!(md.contains("Facts stored:** 2"));
@@ -4331,7 +4638,7 @@ mod export_tests {
             "config_key": "model",
             "config_value": "gpt-4o-mini",
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("⚙️"));
         assert!(md.contains("model → gpt-4o-mini"));
     }
@@ -4343,7 +4650,7 @@ mod export_tests {
             "ts": "2025-01-15T11:00:00Z",
             "turn": 15,
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("## Session End"));
         assert!(md.contains("Total turns:** 15"));
     }
@@ -4355,7 +4662,7 @@ mod export_tests {
             "ts": "2025-01-15T10:40:00Z",
             "user_input": "manual checkpoint",
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("### Sync marker"));
         assert!(md.contains("manual checkpoint"));
     }
@@ -4369,7 +4676,7 @@ mod export_tests {
             "user_input": "请帮我修改代码 🔧",
             "assistant_output": "好的，我已经修改了。",
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("请帮我修改代码 🔧"));
         assert!(md.contains("好的，我已经修改了。"));
     }
@@ -4407,7 +4714,7 @@ mod export_tests {
                 "turn": 10,
             })),
         ];
-        let md = build_export_markdown("multi", &events);
+        let md = build_export_markdown("multi", None, &events);
         // Check order: session_start before turns before session_end
         let start_pos = md.find("## Session Start").unwrap();
         let turn_pos = md.find("### Turn 1").unwrap();
@@ -4429,7 +4736,7 @@ mod export_tests {
             "user_input": "",
             "assistant_output": "some output",
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(!md.contains("**User:**"));
         assert!(md.contains("**Assistant:**"));
     }
@@ -4442,111 +4749,151 @@ mod export_tests {
             "ts": "2025-01-15T10:30:00.123456789Z",
             "model": "test",
         }));
-        let md = build_export_markdown("sid", &[evt]);
+        let md = build_export_markdown("sid", None, &[evt]);
         assert!(md.contains("2025-01-15T10:30:00"));
         // Should not include the fractional seconds
         assert!(!md.contains(".123456789Z"));
+    }
+
+    #[test]
+    fn build_export_header_surfaces_persistence_degradation() {
+        let mut workspace = session_workspace::WorkspaceMetadata::new("sid", "gpt-5");
+        workspace.last_persistence_error = Some("failed to append turn event".to_string());
+
+        let md = build_export_markdown("sid", Some(&workspace), &[]);
+
+        assert!(md.contains("Warning: Session persistence degraded"));
+        assert!(md.contains("failed to append turn event"));
     }
 }
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
-fn resume_restore_service(state: &SessionState) -> HybridRestoreService {
-    let _ = state;
-    HybridRestoreService::local_only()
+#[derive(Clone, Default)]
+struct PreparedWorkspaceRestore {
+    workspace: Option<session_workspace::WorkspaceMetadata>,
+    session_persistence_error: Option<String>,
+    pinned_skills: std::collections::HashSet<String>,
+    discovered_skills: std::collections::HashSet<String>,
+    pending_adaptive_state: Option<super::session_state::PersistedAdaptiveState>,
 }
 
-fn reset_state_for_session_restore(state: &mut SessionState) {
-    state.clear_session_id();
-    state.pending_recovery = None;
-    state.run_id = None;
-    state.turn = 0;
-    state.last_response = None;
-    state.continuation_anchor = None;
-    state.pending_followup_suggestion = None;
-    state.history.clear();
-    state.total_prompt_tokens = 0;
-    state.total_completion_tokens = 0;
-    state.total_cache_read_tokens = 0;
-    state.total_cache_creation_tokens = 0;
-    state.cloud_plan_mirror = None;
-    state.executing_plan = None;
-    state.plan_execution_config = None;
-    state.executing_plan_goal = None;
-    state.plan_execution_rounds = 0;
-    state.current_plan_subtask_id = None;
-    state.last_turn_interrupted = false;
-    state.last_turn_event = None;
-    state.plan_execution_corrections.clear();
-    state.pending_approval = None;
-    state.plan_in_token_stream = false;
-    state.plan_md_renderer = None;
-    state.plan_thinking_pane = None;
-    state.durable_task_state = None;
-    state.last_delivery_report = None;
-    state.redo_stack.clear();
-    state.resume_guidance = None;
-    state.pending_adaptive_state = None;
-    state.pinned_skills.clear();
-    state.discovered_skills.clear();
-}
-
-fn apply_restored_workspace_state(state: &mut SessionState, session_id: &str) {
-    match session_workspace::read_workspace(session_id) {
-        Ok(ws) => {
-            state.pinned_skills = ws.pinned_skills.into_iter().collect();
-            state.discovered_skills = ws.discovered_skills.into_iter().collect();
-
-            if ws.last_scenario_change_turn.is_some()
-                || ws.last_token_budget_direction != 0
-                || ws.active_experiment_id.is_some()
-                || ws.tuned_config_json.is_some()
-            {
-                state.pending_adaptive_state = Some(super::session_state::PersistedAdaptiveState {
-                    last_scenario_change_turn: ws.last_scenario_change_turn,
-                    last_token_budget_direction: ws.last_token_budget_direction,
-                    last_token_budget_change_turn: ws.last_token_budget_change_turn,
-                    active_experiment_id: ws.active_experiment_id,
-                    active_variant: ws.active_variant,
-                    tuned_config_json: ws.tuned_config_json,
-                });
-            }
-        }
-        Err(e) => {
-            eprintln!("  ⚠ Failed to restore workspace state for session {session_id}: {e}");
-        }
+fn prepared_workspace_restore_from_workspace(
+    ws: session_workspace::WorkspaceMetadata,
+) -> PreparedWorkspaceRestore {
+    let pending_adaptive_state = (ws.last_scenario_change_turn.is_some()
+        || ws.last_token_budget_direction != 0
+        || ws.active_experiment_id.is_some()
+        || ws.tuned_config_json.is_some())
+    .then(|| super::session_state::PersistedAdaptiveState {
+        last_scenario_change_turn: ws.last_scenario_change_turn,
+        last_token_budget_direction: ws.last_token_budget_direction,
+        last_token_budget_change_turn: ws.last_token_budget_change_turn,
+        active_experiment_id: ws.active_experiment_id.clone(),
+        active_variant: ws.active_variant.clone(),
+        tuned_config_json: ws.tuned_config_json.clone(),
+    });
+    PreparedWorkspaceRestore {
+        session_persistence_error: ws.last_persistence_error.clone(),
+        pinned_skills: ws.pinned_skills.iter().cloned().collect(),
+        discovered_skills: ws.discovered_skills.iter().cloned().collect(),
+        pending_adaptive_state,
+        workspace: Some(ws),
     }
+}
 
-    chat_turn::apply_pending_adaptive_state(state);
+fn load_prepared_workspace_restore(
+    restored: &RestoredSession,
+) -> Result<PreparedWorkspaceRestore, String> {
+    if let Some(workspace) = restored.workspace.clone() {
+        return Ok(prepared_workspace_restore_from_workspace(workspace));
+    }
+    match session_workspace::read_workspace(&restored.session_id) {
+        Ok(ws) => Ok(prepared_workspace_restore_from_workspace(ws)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PreparedWorkspaceRestore::default())
+        }
+        Err(e) => Err(format!(
+            "read workspace state for session {}: {e}",
+            restored.session_id
+        )),
+    }
+}
+
+fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
+    state.session_persistence_error = prepared.session_persistence_error.clone();
+    state.pinned_skills = prepared.pinned_skills.clone();
+    state.discovered_skills = prepared.discovered_skills.clone();
+    state.pending_adaptive_state = prepared.pending_adaptive_state.clone();
+    session_startup::apply_pending_adaptive_state(state);
+}
+
+fn persist_resumed_workspace_metadata(
+    restored: &RestoredSession,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    existing_workspace: Option<&session_workspace::WorkspaceMetadata>,
+) -> Result<(), String> {
+    let model_for_new = restored.model.as_deref().unwrap_or("default");
+    let mut ws = existing_workspace
+        .cloned()
+        .or_else(|| restored.workspace.clone())
+        .unwrap_or_else(|| {
+            session_workspace::WorkspaceMetadata::new(&restored.session_id, model_for_new)
+        });
+    ws.turn_count = restored.turn_count;
+    ws.total_tokens_in = restored.total_tokens_in;
+    ws.total_tokens_out = restored.total_tokens_out;
+    ws.total_cache_read_tokens = total_cache_read_tokens;
+    ws.total_cache_creation_tokens = total_cache_creation_tokens;
+    ws.status = restored.last_status.clone();
+    if let Some(ref branch) = restored.git_branch {
+        ws.git_branch = Some(branch.clone());
+    }
+    ws.model = astra_core::model_override::normalize_model_override_owned(restored.model.clone());
+    ws.executing_plan_json = restored.executing_plan_json.clone();
+    ws.plan_goal = restored.plan_goal.clone();
+    ws.plan_config_json = restored.plan_config_json.clone();
+    ws.plan_execution_rounds = restored.plan_execution_rounds;
+    ws.contract_json = restored.contract_json.clone();
+    ws.plan_corrections = restored.plan_corrections.clone();
+    ws.last_context_trace = restored.last_context_trace.clone();
+    astra_services::session_workspace::write_workspace(&ws)
+        .map_err(|e| format!("write workspace during resume: {e}"))
 }
 
 fn build_step_resume_guidance(
     interruption: Option<&serde_json::Value>,
     compaction_state: Option<&serde_json::Value>,
 ) -> Option<String> {
-    let compaction_ctx =
-        compaction_state.map(
-            |cs| astra_turn_core::interruption::CompactionResumeContext {
-                compaction_attempts: cs
-                    .get("attempt_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-                total_tokens_freed: cs
-                    .get("cumulative_tokens_freed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                last_was_insufficient: cs
-                    .get("last_was_insufficient")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            },
-        );
+    let compaction_ctx = compaction_resume_context_from_checkpoint_state(compaction_state);
     interruption.and_then(|irj| {
         astra_turn_core::interruption::build_resume_guidance_with_context(
             irj,
             compaction_ctx.as_ref(),
         )
     })
+}
+
+fn compaction_resume_context_from_checkpoint_state(
+    compaction_state: Option<&serde_json::Value>,
+) -> Option<astra_turn_core::interruption::CompactionResumeContext> {
+    compaction_state.map(
+        |cs| astra_turn_core::interruption::CompactionResumeContext {
+            compaction_attempts: cs
+                .get("attempt_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            total_tokens_freed: cs
+                .get("cumulative_tokens_freed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            last_was_insufficient: cs
+                .get("last_was_insufficient")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
+    )
 }
 
 fn apply_resume_recovery_state(
@@ -4559,24 +4906,6 @@ fn apply_resume_recovery_state(
     state.resume_restricted_tools = interruption
         .map(astra_turn_core::interruption::resume_restricted_tools_from_interruption_json)
         .unwrap_or_default();
-}
-
-fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    let mut last_user = String::new();
-    for msg in messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        match role {
-            "user" => last_user = content.to_string(),
-            "assistant" if !last_user.is_empty() => {
-                pairs.push((last_user.clone(), content.to_string()));
-                last_user.clear();
-            }
-            _ => {}
-        }
-    }
-    pairs
 }
 
 /// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
@@ -4615,13 +4944,14 @@ fn apply_heavy_state_fallback(
         state.recent_tools = recent_tools.to_vec();
     }
     if state.history.is_empty() {
-        let pairs = history_pairs_from_messages(messages);
+        let pairs = super::session_continuation::history_pairs_from_messages(messages);
         if !pairs.is_empty() {
             state.history = pairs;
         }
     }
 }
 
+#[cfg(test)]
 fn apply_heavy_checkpoint_fallback(
     state: &mut SessionState,
     heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
@@ -4645,92 +4975,260 @@ fn apply_restored_cloud_heavy_state(state: &mut SessionState, restored: &Restore
     );
 }
 
-/// Apply the child CslManager and its materialized state from `fork()` to REPL
-/// state. No additional I/O — the fork already loaded the child.
-fn apply_csl_fork_to_state(
-    state: &mut SessionState,
-    mgr: astra_turn_core::conversation_log::manager::CslManager,
-    mat: Option<astra_turn_core::conversation_log::MaterializedState>,
-) {
-    if let Some(mat) = mat {
-        state.history = derive_history_pairs_from_messages(&mat.messages);
-        if !mat.session_state.recent_tools.is_empty() {
-            state.recent_tools = mat.session_state.recent_tools;
-        }
-    }
-    state.csl_manager = Some(mgr);
+struct PreparedForkRestore {
+    history: Vec<(String, String)>,
+    recent_tools: Vec<String>,
+    csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
+    journal_state: session_runtime::RestoredSessionState,
+    last_turn_event: Option<session_journal::JournalEvent>,
 }
 
-async fn restore_journal_history_if_available(state: &mut SessionState, session_id: &str) {
-    // Try CSL first — full-fidelity message history via CslManager
+struct ForkStateSnapshot {
+    session_id: Option<String>,
+    root_mailbox: Option<astra_messaging::router::AgentMailbox>,
+    turn: u32,
+    total_prompt_tokens: u64,
+    total_completion_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    last_turn_event: Option<session_journal::JournalEvent>,
+    run_id: Option<String>,
+    history: Vec<(String, String)>,
+    recent_tools: Vec<String>,
+    csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
+    last_response: Option<String>,
+    continuation_anchor: Option<String>,
+}
+
+impl ForkStateSnapshot {
+    fn capture(state: &mut SessionState) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            root_mailbox: state.root_mailbox.take(),
+            turn: state.turn,
+            total_prompt_tokens: state.total_prompt_tokens,
+            total_completion_tokens: state.total_completion_tokens,
+            total_cache_read_tokens: state.total_cache_read_tokens,
+            total_cache_creation_tokens: state.total_cache_creation_tokens,
+            last_turn_event: state.last_turn_event.clone(),
+            run_id: state.run_id.clone(),
+            history: state.history.clone(),
+            recent_tools: state.recent_tools.clone(),
+            csl_manager: state.csl_manager.take(),
+            last_response: state.last_response.clone(),
+            continuation_anchor: state.continuation_anchor.clone(),
+        }
+    }
+
+    fn restore(self, state: &mut SessionState) {
+        match self.session_id {
+            Some(session_id) => {
+                state.set_session_id(session_id.clone());
+                session_startup::initialize_journal_pub(state, &session_id);
+            }
+            None => {
+                state.clear_session_id();
+                state.journal = None;
+            }
+        }
+        state.turn = self.turn;
+        state.total_prompt_tokens = self.total_prompt_tokens;
+        state.total_completion_tokens = self.total_completion_tokens;
+        state.total_cache_read_tokens = self.total_cache_read_tokens;
+        state.total_cache_creation_tokens = self.total_cache_creation_tokens;
+        state.last_turn_event = self.last_turn_event;
+        state.run_id = self.run_id;
+        state.history = self.history;
+        state.recent_tools = self.recent_tools;
+        state.csl_manager = self.csl_manager;
+        state.root_mailbox = self.root_mailbox;
+        state.last_response = self.last_response;
+        state.continuation_anchor = self.continuation_anchor;
+    }
+}
+
+struct ForkStateGuard<'a> {
+    state: &'a mut SessionState,
+    snapshot: Option<ForkStateSnapshot>,
+}
+
+impl<'a> ForkStateGuard<'a> {
+    fn new(state: &'a mut SessionState) -> Self {
+        Self {
+            snapshot: Some(ForkStateSnapshot::capture(state)),
+            state,
+        }
+    }
+
+    fn state(&mut self) -> &mut SessionState {
+        self.state
+    }
+
+    fn commit(mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for ForkStateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            snapshot.restore(self.state);
+        }
+    }
+}
+
+fn materialize_prepared_fork_restore(
+    mgr: astra_turn_core::conversation_log::manager::CslManager,
+    mat: Option<astra_turn_core::conversation_log::MaterializedState>,
+    restored_journal: session_runtime::RestoredJournalState,
+) -> PreparedForkRestore {
+    let mut history = restored_journal.session.history.clone();
+    let mut recent_tools = restored_journal.session.recent_tools.clone();
+    if let Some(ref materialized) = mat {
+        history = super::session_continuation::history_pairs_from_messages(&materialized.messages);
+        if !materialized.session_state.recent_tools.is_empty() {
+            recent_tools = materialized.session_state.recent_tools.clone();
+        }
+    }
+    PreparedForkRestore {
+        history,
+        recent_tools,
+        csl_manager: Some(mgr),
+        journal_state: restored_journal.session,
+        last_turn_event: restored_journal.last_turn_event,
+    }
+}
+
+fn prepared_fork_restore_from_restored_journal(
+    restored_journal: session_runtime::RestoredJournalState,
+) -> PreparedForkRestore {
+    PreparedForkRestore {
+        history: restored_journal.session.history.clone(),
+        recent_tools: restored_journal.session.recent_tools.clone(),
+        csl_manager: None,
+        journal_state: restored_journal.session,
+        last_turn_event: restored_journal.last_turn_event,
+    }
+}
+
+async fn prepared_fork_restore_from_journal(
+    session_id: &str,
+) -> Result<PreparedForkRestore, String> {
+    let restored_journal = session_runtime::restored_journal_state(session_id)?;
+    // Try CSL first — full-fidelity message history via CslManager.
     let base_dir = session_journal::local_sessions_dir();
     let store = std::sync::Arc::new(
         astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
     );
-    if let Ok(mut mgr) = astra_turn_core::conversation_log::manager::CslManager::new(
+    let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
         store,
         session_id.to_string(),
         Default::default(),
-    ) {
-        match mgr.load().await {
-            Ok(Some(mat)) => {
-                state.history = derive_history_pairs_from_messages(&mat.messages);
-                if !mat.session_state.recent_tools.is_empty() {
-                    state.recent_tools = mat.session_state.recent_tools;
-                }
-                state.csl_manager = Some(mgr);
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(session_id, error = %e, "CSL load failed during session resume");
-            }
+    )
+    .map_err(|e| format!("initialize CSL state for session {session_id}: {e}"))?;
+    match mgr.load().await {
+        Ok(Some(mat)) => {
+            return Ok(materialize_prepared_fork_restore(
+                mgr,
+                Some(mat),
+                restored_journal,
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(format!("load CSL state for session {session_id}: {e}"));
         }
     }
 
-    // Fall back to journal-based history (pre-CSL sessions)
-    let history = session_runtime::restore_history_from_journal(session_id);
-    if history.len() > state.history.len() || state.history.is_empty() {
-        state.history = history;
+    // Fall back to journal-based history for pre-CSL sessions.
+    Ok(prepared_fork_restore_from_restored_journal(
+        restored_journal,
+    ))
+}
+
+async fn load_prepared_fork_restore(
+    parent_id: &str,
+    new_sid: &str,
+    forked_at_turn: u32,
+) -> Result<PreparedForkRestore, String> {
+    let restored_journal = session_runtime::restored_journal_state(new_sid)?;
+    if !restored_journal.exists {
+        return Err(format!(
+            "missing session journal for forked child {new_sid}"
+        ));
+    }
+    let base_dir = session_journal::local_sessions_dir();
+    let store = std::sync::Arc::new(
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
+    );
+    match astra_turn_core::conversation_log::manager::CslManager::new(
+        store,
+        parent_id.to_string(),
+        Default::default(),
+    ) {
+        Ok(parent_mgr) => match parent_mgr.fork(new_sid, forked_at_turn).await {
+            Ok((child_mgr, child_mat)) => Ok(materialize_prepared_fork_restore(
+                child_mgr,
+                child_mat,
+                restored_journal,
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CSL fork failed, child will use journal fallback"
+                );
+                Ok(prepared_fork_restore_from_restored_journal(
+                    restored_journal,
+                ))
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "CSL manager creation failed, child will use journal fallback"
+            );
+            Ok(prepared_fork_restore_from_restored_journal(
+                restored_journal,
+            ))
+        }
     }
 }
 
-fn derive_history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    let mut current_user = String::new();
-    let mut current_assistant = String::new();
+fn apply_prepared_fork_restore(
+    state: &mut SessionState,
+    new_sid: &str,
+    restored_child: PreparedForkRestore,
+) {
+    state.set_session_id(new_sid.to_string());
+    session_startup::initialize_journal_pub(state, new_sid);
+    state.turn = restored_child.journal_state.turn;
+    state.total_prompt_tokens = restored_child.journal_state.total_prompt_tokens;
+    state.total_completion_tokens = restored_child.journal_state.total_completion_tokens;
+    state.total_cache_read_tokens = restored_child.journal_state.total_cache_read_tokens;
+    state.total_cache_creation_tokens = restored_child.journal_state.total_cache_creation_tokens;
+    state.last_turn_event = restored_child.last_turn_event;
+    state.run_id = None;
+    state.history = restored_child.history;
+    state.recent_tools = restored_child.recent_tools;
+    state.csl_manager = restored_child.csl_manager;
+    state.last_response = state.history.last().map(|(_, resp)| resp.clone());
+    state.continuation_anchor = None;
+}
 
-    for msg in messages {
-        let role = msg
-            .get("role")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let content = msg
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        match role {
-            "user" => {
-                if !current_user.is_empty() || !current_assistant.is_empty() {
-                    pairs.push((
-                        std::mem::take(&mut current_user),
-                        std::mem::take(&mut current_assistant),
-                    ));
-                }
-                current_user = content;
-            }
-            "assistant" => {
-                current_assistant = content;
-            }
-            _ => {}
-        }
+async fn restore_journal_history_if_available(
+    state: &mut SessionState,
+    session_id: &str,
+) -> Result<(), String> {
+    let restored = prepared_fork_restore_from_journal(session_id).await?;
+    if restored.history.len() > state.history.len() || state.history.is_empty() {
+        state.history = restored.history;
     }
-    if !current_user.is_empty() || !current_assistant.is_empty() {
-        pairs.push((current_user, current_assistant));
+    if !restored.recent_tools.is_empty() {
+        state.recent_tools = restored.recent_tools;
     }
-    pairs
+    state.csl_manager = restored.csl_manager;
+    state.last_response = state.history.last().map(|(_, resp)| resp.clone());
+    Ok(())
 }
 
 async fn apply_restored_session(
@@ -4739,31 +5237,26 @@ async fn apply_restored_session(
     state: &mut SessionState,
     restored: RestoredSession,
 ) -> Result<(), String> {
-    if !restored.restored_from_cloud && session_journal::read_journal(&restored.session_id).is_err()
-    {
+    let local_journal = session_runtime::restored_journal_state(&restored.session_id)?;
+    if !restored.restored_from_cloud && !local_journal.exists {
         return Err(format!(
             "Session {} not found or not owned by user",
             restored.session_id
         ));
     }
 
-    reset_state_for_session_restore(state);
-
-    let local_state = session_runtime::session_state_from_journal(&restored.session_id);
-    state.set_session_id(restored.session_id.clone());
-    state.turn = restored.turn_count;
-    state.total_prompt_tokens = restored.total_tokens_in;
-    state.total_completion_tokens = restored.total_tokens_out;
-    state.total_cache_read_tokens = restored
+    let local_state = local_journal.session;
+    let total_cache_read_tokens = restored
         .total_cache_read_tokens
         .max(local_state.total_cache_read_tokens);
-    state.total_cache_creation_tokens = restored
+    let total_cache_creation_tokens = restored
         .total_cache_creation_tokens
         .max(local_state.total_cache_creation_tokens);
-    state.recent_tools = restored.recent_tools.clone();
+    let prepared_workspace = load_prepared_workspace_restore(&restored)?;
+    let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
+    let last_turn_event = local_journal.last_turn_event;
 
-    apply_restored_workspace_state(state, &restored.session_id);
-
+    let mut step_restore_error = None;
     let step_restored = match astra_pipeline::step_restore::restore_session(&restored.session_id) {
         Ok(restored) => restored,
         Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
@@ -4773,13 +5266,54 @@ async fn apply_restored_session(
             ));
         }
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "skipping invalid local step checkpoint during resume"
-            );
+            step_restore_error = Some(error.to_string());
             None
         }
     };
+    let has_cloud_heavy_fallback = !restored.conversation_messages.is_empty()
+        || !restored.blocked_tools.is_empty()
+        || restored.approval_overrides.is_some()
+        || restored.interruption.is_some()
+        || restored.compaction_state.is_some();
+    if step_restore_error.is_some()
+        && !has_cloud_heavy_fallback
+        && let Some(error) = step_restore_error.as_ref()
+    {
+        return Err(format!(
+            "Failed to restore local step checkpoint for {}: {}",
+            restored.session_id, error
+        ));
+    }
+    if let Some(error) = step_restore_error.as_ref() {
+        tracing::warn!(
+            error = %error,
+            "local step checkpoint restore failed; continuing with fallback state"
+        );
+    }
+    let session_memory = super::slash_memory::load_current_session_memory_body_with_profile(
+        api,
+        profile,
+        &restored.session_id,
+    )
+    .await;
+    persist_resumed_workspace_metadata(
+        &restored,
+        total_cache_read_tokens,
+        total_cache_creation_tokens,
+        prepared_workspace.workspace.as_ref(),
+    )?;
+
+    state.prepare_for_session_rebind().await;
+    state.reset_for_session_restore();
+    state.set_session_id(restored.session_id.clone());
+    state.turn = restored.turn_count;
+    state.total_prompt_tokens = restored.total_tokens_in;
+    state.total_completion_tokens = restored.total_tokens_out;
+    state.total_cache_read_tokens = total_cache_read_tokens;
+    state.total_cache_creation_tokens = total_cache_creation_tokens;
+    state.recent_tools = restored.recent_tools.clone();
+    apply_prepared_workspace_restore(state, &prepared_workspace);
+
     if let Some(step_restored) = step_restored {
         let summary = astra_pipeline::step_restore::restore_summary(&step_restored);
         for tool in &step_restored.blocked_tools {
@@ -4801,21 +5335,7 @@ async fn apply_restored_session(
             state.perm_manager.merge_restored_overrides(ao_json);
         }
         eprintln!("  {} {}", "↻".magenta(), summary.dim());
-    } else if let Ok(Some(heavy)) =
-        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
-    {
-        apply_heavy_checkpoint_fallback(state, &heavy);
-        apply_resume_recovery_state(
-            state,
-            heavy.interruption.as_ref(),
-            heavy.compaction_state.as_ref(),
-        );
-    } else if !restored.conversation_messages.is_empty()
-        || !restored.blocked_tools.is_empty()
-        || restored.approval_overrides.is_some()
-        || restored.interruption.is_some()
-        || restored.compaction_state.is_some()
-    {
+    } else if has_cloud_heavy_fallback {
         apply_restored_cloud_heavy_state(state, &restored);
         apply_resume_recovery_state(
             state,
@@ -4840,23 +5360,17 @@ async fn apply_restored_session(
         }
     }
 
-    restore_journal_history_if_available(state, &restored.session_id).await;
-
-    if let Ok(events) = session_journal::read_journal(&restored.session_id) {
-        state.last_turn_event = events
-            .iter()
-            .rev()
-            .find(|e| e.event_type == session_journal::JournalEventType::Turn)
-            .cloned();
+    if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
+        state.history = prepared_history.history;
     }
-    chat_turn::rebuild_continuation_anchor_from_live_state(state).await;
-    let session_memory = super::slash_memory::load_current_session_memory_body_with_profile(
-        api,
-        profile,
-        &restored.session_id,
-    )
-    .await;
-    state.continuation_anchor = chat_turn::merge_continuation_anchor_with_session_memory(
+    if !prepared_history.recent_tools.is_empty() {
+        state.recent_tools = prepared_history.recent_tools;
+    }
+    state.csl_manager = prepared_history.csl_manager;
+    state.last_response = state.history.last().map(|(_, resp)| resp.clone());
+    state.last_turn_event = last_turn_event;
+    session_projection::rebuild_continuation_anchor_from_live_state(state).await;
+    state.continuation_anchor = session_projection::merge_continuation_anchor_with_session_memory(
         state.continuation_anchor.take(),
         session_memory.as_deref(),
     );
@@ -4866,7 +5380,7 @@ async fn apply_restored_session(
     }
     if let Some(ref goal) = restored.plan_goal {
         state.executing_plan_goal = Some(goal.clone());
-        chat_turn::steer_observability_goal(state, goal);
+        session_startup::steer_observability_goal(state, goal);
     }
     if let Some(ref json) = restored.plan_config_json {
         state.plan_execution_config = serde_json::from_str(json).ok();
@@ -4908,45 +5422,25 @@ async fn apply_restored_session(
         });
     }
 
-    chat_turn::initialize_journal_pub(state, &restored.session_id);
-    chat_turn::persist_last_session_id(profile, &restored.session_id);
-    if let Ok(mut ws) = astra_services::session_workspace::read_workspace(&restored.session_id) {
-        ws.turn_count = restored.turn_count;
-        ws.total_tokens_in = restored.total_tokens_in;
-        ws.total_tokens_out = restored.total_tokens_out;
-        ws.total_cache_read_tokens = state.total_cache_read_tokens;
-        ws.total_cache_creation_tokens = state.total_cache_creation_tokens;
-        ws.status = restored.last_status.clone();
-        if let Some(ref branch) = restored.git_branch {
-            ws.git_branch = Some(branch.clone());
-        }
-        ws.model =
-            astra_core::model_override::normalize_model_override_owned(restored.model.clone());
-        ws.executing_plan_json = restored.executing_plan_json.clone();
-        ws.plan_goal = restored.plan_goal.clone();
-        ws.plan_config_json = restored.plan_config_json.clone();
-        ws.plan_execution_rounds = restored.plan_execution_rounds;
-        ws.contract_json = restored.contract_json.clone();
-        ws.plan_corrections = restored.plan_corrections.clone();
-        ws.last_context_trace = restored.last_context_trace.clone();
-        if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
-            eprintln!("  ⚠ workspace write failed during resume: {e}");
-        }
-    }
+    session_startup::initialize_journal_pub(state, &restored.session_id);
+    persist_profile_last_session_or_warn(
+        profile,
+        &restored.session_id,
+        "slash_session:restore_session_into_state",
+    );
 
-    let source = if restored.restored_from_cloud {
-        "cloud"
-    } else {
-        "local"
-    };
+    let source = session_source_surface(&restored.last_status, restored.restored_from_cloud, false);
     eprintln!(
         "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
         theme::icon_ok(),
         restored.session_id[..8.min(restored.session_id.len())].magenta(),
-        source,
+        source.label(),
         restored.turn_count,
         restored.checkpoint_count,
     );
+    if let Some(warning) = resume_persistence_warning(state.session_persistence_error.as_deref()) {
+        eprintln!("  {}", warning.yellow());
+    }
     if let Some(ref trace) = restored.last_context_trace {
         let preview = trace.preview();
         if !preview.is_empty() {
@@ -4988,17 +5482,19 @@ pub(crate) async fn restore_session_into_state(
         preflight_remote_resume_session(api, profile, session_id).await,
         SessionResumePreflight::Missing
     ) {
-        let _ = clear_profile_last_session_if_matches(profile, session_id);
+        clear_profile_last_session_if_matches_or_warn(
+            profile,
+            session_id,
+            "slash_session:restore_session_snapshot",
+        );
         return Err(format!(
             "Session {session_id} no longer exists on the server and cannot be resumed for new chat turns."
         ));
     }
 
-    let svc = resume_restore_service(state);
-    let restored = svc
-        .restore_session(session_id)
-        .await
-        .map_err(|e| format!("Resume failed: {e}"))?
+    let restored =
+        session_restore_client::restore_session_snapshot_with_client(profile, api, session_id)
+        .await?
         .ok_or_else(|| {
             format!(
                 "Session {session_id} has no resumable workspace/checkpoint state. Use /resume to inspect available sessions."
@@ -5015,60 +5511,25 @@ pub(crate) async fn handle_resume_command(
     api: &astra_thin_client::ThinClient,
     state: &mut SessionState,
 ) {
-    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-    let svc = resume_restore_service(state);
-
     // If no session_id given, list and let user pick
     let effective_arg;
     if arg.is_empty() {
-        // Merge cloud + local sessions, deduplicate, sort by recency
-        let cloud_sessions = svc
-            .list_resumable_sessions(user_id)
-            .await
-            .unwrap_or_default();
-        let local_ids = session_journal::list_sessions_by_time(20).unwrap_or_default();
-
-        // Build merged map: session_id → RestoredSession (cloud wins on metadata)
-        let mut merged: std::collections::HashMap<
-            String,
-            astra_services::session_restore::RestoredSession,
-        > = std::collections::HashMap::new();
-
-        // Insert local sessions first (lower priority)
-        for sid in &local_ids {
-            merged.entry(sid.clone()).or_insert_with(|| {
-                astra_services::session_restore::RestoredSession {
-                    session_id: sid.clone(),
-                    turn_count: session_journal::count_turns(sid),
-                    last_status: "local".to_string(),
-                    ..Default::default()
-                }
-            });
-        }
-
-        // Cloud sessions override local (richer metadata: title, turn_count, status)
-        for s in cloud_sessions {
-            merged.insert(s.session_id.clone(), s);
-        }
-
-        // Sort by local file order (newest first), cloud-only sessions appended at front
-        let mut result: Vec<_> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        // Local order first (already sorted by mtime)
-        for sid in &local_ids {
-            if let Some(s) = merged.remove(sid) {
-                seen.insert(sid.clone());
-                result.push(s);
+        let candidates = match load_resumable_session_candidates(profile, api, 20).await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                eprintln!("  {} {}", theme::icon_err(), error.red());
+                return;
             }
-        }
-        // Remaining cloud-only sessions at the front (they're newer if not local)
-        let mut cloud_only: Vec<_> = merged.into_values().collect();
-        cloud_only.sort_by_key(|x| std::cmp::Reverse(x.turn_count));
-        result.splice(0..0, cloud_only);
+        };
 
-        // Filter out empty sessions (0 turns = nothing to resume)
-        result.retain(|s| s.turn_count > 0);
+        if let Some(error) = candidates.cloud_scan_error.as_ref() {
+            eprintln!("  {}", error.as_str().yellow());
+        }
+        if let Some(error) = candidates.local_scan_error.as_ref() {
+            eprintln!("  {}", error.as_str().yellow());
+        }
+
+        let result = candidates.sessions;
 
         if result.is_empty() {
             eprintln!("{}", "  No resumable sessions found.".dim());
@@ -5088,6 +5549,8 @@ pub(crate) async fn handle_resume_command(
             cwd_short: Option<String>,
             git_branch: Option<String>,
             source: String,
+            workspace_error: bool,
+            persistence_error: Option<String>,
             has_plan: bool,
             age: String,
         }
@@ -5095,7 +5558,18 @@ pub(crate) async fn handle_resume_command(
         let mut items: Vec<SessionDisplay> = Vec::new();
         for (i, s) in sessions.iter().enumerate() {
             let peek = session_journal::peek_session_meta(&s.session_id);
-            let ws = astra_services::session_workspace::read_workspace(&s.session_id).ok();
+            let (ws, workspace_error) =
+                match astra_services::session_workspace::read_workspace_optional(&s.session_id) {
+                    Ok(workspace) => (workspace, false),
+                    Err(error) => {
+                        tracing::warn!(
+                            "resume picker failed to read workspace for {}: {}",
+                            s.session_id,
+                            error
+                        );
+                        (None, true)
+                    }
+                };
 
             // Title: cloud title > workspace summary > first prompt preview
             let title = s
@@ -5127,14 +5601,15 @@ pub(crate) async fn handle_resume_command(
                 .git_branch
                 .clone()
                 .or_else(|| ws.as_ref().and_then(|w| w.git_branch.clone()));
+            let persistence_error = ws
+                .as_ref()
+                .and_then(|w| w.last_persistence_error.clone())
+                .filter(|error| !error.trim().is_empty());
 
-            let source = if s.restored_from_cloud {
-                "☁".to_string()
-            } else if s.last_status == "local" {
-                "⊙".to_string()
-            } else {
-                s.last_status.clone()
-            };
+            let source =
+                session_source_surface(&s.last_status, s.restored_from_cloud, workspace_error)
+                    .badge()
+                    .to_string();
 
             let has_plan = ws.as_ref().is_some_and(|w| w.executing_plan_json.is_some());
 
@@ -5166,6 +5641,8 @@ pub(crate) async fn handle_resume_command(
                 cwd_short,
                 git_branch,
                 source,
+                workspace_error,
+                persistence_error,
                 has_plan,
                 age,
             });
@@ -5209,6 +5686,17 @@ pub(crate) async fn handle_resume_command(
                 branch_str.dim(),
                 cwd_str.dim(),
             );
+            if s.workspace_error {
+                eprintln!(
+                    "      {}",
+                    "workspace.yaml invalid; using journal/cloud metadata".yellow()
+                );
+            }
+            if let Some(error) = s.persistence_error.as_deref() {
+                if let Some(warning) = resume_persistence_warning(Some(error)) {
+                    eprintln!("      {}", warning.yellow());
+                }
+            }
         }
         eprintln!();
         eprint!("  {} ", "Select (number or Enter to cancel):".bold());
@@ -5253,7 +5741,10 @@ pub(crate) async fn handle_resume_command(
     // Show preview if user explicitly typed a session ID (not from picker)
     if !arg.is_empty() {
         // Show session preview
-        let ws = session_workspace::read_workspace(&session_id).ok();
+        let (ws, workspace_error) = match session_workspace::read_workspace_optional(&session_id) {
+            Ok(workspace) => (workspace, None),
+            Err(error) => (None, Some(error)),
+        };
         let peek = session_journal::peek_session_meta(&session_id);
 
         eprintln!(
@@ -5294,6 +5785,9 @@ pub(crate) async fn handle_resume_command(
                 "progress:".dim(),
                 w.turn_count.to_string().magenta()
             );
+            if let Some(warning) = resume_persistence_warning(w.last_persistence_error.as_deref()) {
+                eprintln!("  {:<14} {}", "warning:".dim(), warning.yellow());
+            }
         } else if peek.is_some() {
             let turns = session_journal::count_turns(&session_id);
             eprintln!(
@@ -5335,17 +5829,12 @@ pub(crate) async fn handle_resume_command(
 
         // Status
         if let Some(ref w) = ws {
-            let status_icon = match w.status.as_str() {
-                "active" => "🔄",
-                "completed" => "✅",
-                "error" => "❌",
-                _ => "•",
-            };
+            let status = session_workspace_status_surface(w.status.as_str());
             eprintln!(
                 "  {:<14} {} {}",
                 "status:".dim(),
-                status_icon,
-                w.status.as_str().magenta()
+                status.icon(),
+                status.label().magenta()
             );
         }
 
@@ -5367,6 +5856,14 @@ pub(crate) async fn handle_resume_command(
             });
         if let Some(age) = age {
             eprintln!("  {:<14} {}", "last active:".dim(), age.dim());
+        }
+
+        if let Some(error) = workspace_error.as_ref() {
+            eprintln!(
+                "  {:<14} {}",
+                "workspace:".dim(),
+                format!("invalid ({error})").yellow()
+            );
         }
 
         // Plan status
@@ -5396,15 +5893,7 @@ pub(crate) async fn handle_resume_command(
     }
 
     if let Err(e) = restore_session_into_state(&session_id, profile, api, state).await {
-        let hint = if e.to_string().contains("not found")
-            || e.to_string()
-                .contains("no resumable workspace/checkpoint state")
-            || e.to_string().contains("no longer exists on the server")
-        {
-            "Use /resume to see available sessions."
-        } else {
-            "Check connection with /diagnostics, or try a different session."
-        };
+        let hint = resume_restore_hint(&e);
         eprintln!("  {} {}", theme::icon_err(), e.red());
         eprintln!("{}", format!("  {hint}").dim());
     }
@@ -5416,6 +5905,34 @@ mod resume_tests {
     use astra_services::session_journal::{self, JournalDirGuard};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -5508,6 +6025,33 @@ mod resume_tests {
         .unwrap();
     }
 
+    fn write_local_step_checkpoint_with_approval_overrides(
+        session_id: &str,
+        turn_count: u32,
+        approval_overrides: serde_json::Value,
+    ) {
+        let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
+            format!("step-{turn_count}"),
+            format!("task-{turn_count}"),
+            session_id.to_string(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        ) {
+            astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
+            _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
+        };
+        heavy.messages = vec![
+            serde_json::json!({"role": "user", "content": "continue"}),
+            serde_json::json!({"role": "assistant", "content": "restoring session approvals"}),
+        ];
+        heavy.approval_overrides = Some(approval_overrides);
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            session_id,
+            turn_count,
+            &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
+    }
+
     fn write_workspace_lifecycle_state(session_id: &str) {
         let mut ws = astra_services::session_workspace::read_workspace(session_id).unwrap();
         let executing_plan = astra_services::task_orchestrator::TaskPlan {
@@ -5582,6 +6126,61 @@ mod resume_tests {
         crate::cli::cli_utils::save_credentials(&creds).unwrap();
     }
 
+    fn write_local_step_checkpoint_with_compaction_state(session_id: &str, turn_count: u32) {
+        let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
+            format!("step-{turn_count}"),
+            format!("task-{turn_count}"),
+            session_id.to_string(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        ) {
+            astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
+            _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
+        };
+        heavy.messages = vec![
+            serde_json::json!({"role": "user", "content": "continue"}),
+            serde_json::json!({"role": "assistant", "content": "context was compacted"}),
+        ];
+        heavy.interruption = Some(serde_json::json!({
+            "kind": "context_overflow",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 2,
+            "turns_completed": turn_count,
+            "remaining_turns": 1,
+        }));
+        heavy.compaction_state = Some(serde_json::json!({
+            "attempt_count": 3,
+            "cumulative_tokens_freed": 15000,
+            "last_tokens_freed": 4000,
+            "last_was_insufficient": true,
+        }));
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            session_id,
+            turn_count,
+            &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
+    }
+
+    fn write_invalid_local_step_checkpoint(session_id: &str, turn_count: u32) {
+        let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
+            format!("step-{turn_count}"),
+            format!("task-{turn_count}"),
+            session_id.to_string(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        ) {
+            astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
+            _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
+        };
+        heavy.light.protocol_version = 0;
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            session_id,
+            turn_count,
+            &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn apply_heavy_checkpoint_fallback_restores_history_and_approval_overrides() {
         use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
@@ -5639,7 +6238,9 @@ mod resume_tests {
         let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "still-here".to_string())];
 
-        restore_journal_history_if_available(&mut state, "missing-session").await;
+        restore_journal_history_if_available(&mut state, "missing-session")
+            .await
+            .unwrap();
 
         assert_eq!(
             state.history,
@@ -5664,6 +6265,432 @@ mod resume_tests {
         assert_eq!(state.resume_restricted_tools, vec!["read_file", "view"]);
     }
 
+    #[test]
+    fn build_step_resume_guidance_decodes_compaction_state_schema() {
+        let guidance = build_step_resume_guidance(
+            Some(&serde_json::json!({
+                "kind": "context_overflow",
+                "resumable": true,
+                "has_checkpoint": true,
+                "tool_calls_completed": 1,
+                "turns_completed": 2,
+                "remaining_turns": 1,
+            })),
+            Some(&serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_was_insufficient": true,
+            })),
+        )
+        .expect("guidance");
+
+        assert!(guidance.contains("3 attempt(s)"), "{guidance}");
+        assert!(guidance.contains("15000 tokens freed"), "{guidance}");
+        assert!(guidance.contains("insufficient"), "{guidance}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn apply_restored_session_uses_checkpoint_compaction_state_for_resume_guidance() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-compact-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 2);
+        write_local_step_checkpoint_with_compaction_state(&session_id, 2);
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("apply restored session");
+
+        let guidance = state.resume_guidance.expect("resume guidance");
+        assert!(guidance.contains("3 attempt(s)"), "{guidance}");
+        assert!(guidance.contains("15000 tokens freed"), "{guidance}");
+        assert!(guidance.contains("insufficient"), "{guidance}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn apply_restored_session_rebinds_root_mailbox_and_replaces_live_session_overrides() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-overrides-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 2);
+
+        let mut restored_overrides =
+            astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
+        restored_overrides.insert(
+            astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare("read_file"),
+            true,
+        );
+        write_local_step_checkpoint_with_approval_overrides(
+            &session_id,
+            2,
+            restored_overrides
+                .to_json()
+                .expect("restored overrides should serialize"),
+        );
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            ..Default::default()
+        };
+        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = std::sync::Arc::new(
+            astra_runtime::server::delegation::engine::DelegationTracker::new(),
+        );
+        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            tracker,
+        ));
+        let live_root_addr = astra_messaging::AgentAddress::new("live-session", "main");
+
+        let mut state = SessionState::default();
+        state.set_session_id("live-session");
+        state.root_mailbox = Some(router.register(live_root_addr.clone(), None).await.unwrap());
+        state.perm_manager.record_approval("bash", None, false);
+
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("apply restored session");
+
+        let restored_session_overrides = state
+            .perm_manager
+            .export_session_overrides()
+            .expect("checkpoint overrides should be restored");
+        let old_bash = astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare("bash");
+        let restored_read_file =
+            astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare("read_file");
+        assert_eq!(restored_session_overrides.check(&old_bash), None);
+        assert_eq!(
+            restored_session_overrides.check(&restored_read_file),
+            Some(true)
+        );
+        assert!(state.root_mailbox.is_none());
+        router
+            .register(live_root_addr, None)
+            .await
+            .expect("resume should unregister the prior root mailbox");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn apply_restored_session_rejects_corrupt_workspace_without_mutating_live_state() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-bad-workspace-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 2);
+
+        let workspace_path = astra_services::session_workspace::workspace_dir_for(&session_id)
+            .join("workspace.yaml");
+        std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            ..Default::default()
+        };
+        let mut state = SessionState {
+            session_id: Some("existing-session".into()),
+            turn: 7,
+            history: vec![("old".into(), "state".into())],
+            pinned_skills: ["keep-me".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let error = apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect_err("corrupt workspace should abort restore");
+
+        assert!(error.contains("read workspace state"), "{error}");
+        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
+        assert_eq!(state.turn, 7);
+        assert_eq!(
+            state.history,
+            vec![("old".to_string(), "state".to_string())]
+        );
+        assert!(state.pinned_skills.contains("keep-me"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_summary_line_marks_invalid_workspace() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-bad-summary-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 1);
+        let workspace_path =
+            astra_services::session_workspace::workspace_file_path(&session_id).unwrap();
+        std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
+
+        let summary = workspace_summary_line(&session_id);
+        assert!(
+            summary.contains("workspace metadata unreadable"),
+            "{summary}"
+        );
+        assert!(!summary.contains("not-valid-yaml"), "{summary}");
+        assert!(summary.contains("1 turn"), "{summary}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_summary_line_journal_only_includes_turn_count() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-journal-only-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let workspace_path =
+            astra_services::session_workspace::workspace_file_path(&session_id).unwrap();
+        std::fs::remove_file(&workspace_path).unwrap();
+
+        let summary = workspace_summary_line(&session_id);
+        assert!(summary.contains("workspace metadata missing"), "{summary}");
+        assert!(summary.contains("1 turn"), "{summary}");
+    }
+
+    #[test]
+    fn resume_persistence_warning_formats_user_visible_notice() {
+        let warning =
+            resume_persistence_warning(Some("failed to append turn event: Is a directory"))
+                .expect("warning");
+        assert!(
+            warning.contains("Session persistence degraded"),
+            "{warning}"
+        );
+        assert!(warning.contains("failed to append turn event"), "{warning}");
+        assert!(resume_persistence_warning(None).is_none());
+        assert!(resume_persistence_warning(Some("   ")).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_summary_line_marks_persistence_degraded() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-degraded-summary-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let mut workspace = session_workspace::read_workspace(&session_id).unwrap();
+        workspace.last_persistence_error = Some("failed to append turn event".to_string());
+        session_workspace::write_workspace(&workspace).unwrap();
+
+        let summary = workspace_summary_line(&session_id);
+        assert!(summary.contains("persistence degraded"), "{summary}");
+        assert!(summary.contains("2 turns"), "{summary}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn filter_session_list_entries_tracks_missing_and_invalid_workspace_skips() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let valid_session = format!("session-list-valid-{}", uuid::Uuid::new_v4());
+        let invalid_session = format!("session-list-invalid-{}", uuid::Uuid::new_v4());
+        let missing_session = format!("session-list-missing-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&valid_session, 2);
+        write_local_resumable_session(&invalid_session, 1);
+        write_local_resumable_session(&missing_session, 1);
+
+        let invalid_workspace =
+            astra_services::session_workspace::workspace_file_path(&invalid_session).unwrap();
+        std::fs::write(&invalid_workspace, ":\nnot-valid-yaml").unwrap();
+        let missing_workspace =
+            astra_services::session_workspace::workspace_file_path(&missing_session).unwrap();
+        std::fs::remove_file(&missing_workspace).unwrap();
+
+        let session_ids = vec![
+            valid_session.clone(),
+            invalid_session.clone(),
+            missing_session.clone(),
+        ];
+        let mut entries = build_session_list_entries(&session_ids);
+        let outcome = filter_session_list_entries(
+            &mut entries,
+            &SessionListFilterOptions {
+                filter_active: true,
+                ..Default::default()
+            },
+            &std::env::current_dir().unwrap().display().to_string(),
+            None,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sid, valid_session);
+        assert_eq!(
+            outcome,
+            SessionListFilterOutcome {
+                skipped_missing_workspace: 1,
+                skipped_invalid_workspace: 1,
+                project_filter_ignored: false,
+            }
+        );
+        let warning = outcome
+            .workspace_filter_warning()
+            .expect("warning should describe skipped sessions");
+        assert!(
+            warning.contains("1 missing workspace metadata"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("1 unreadable workspace metadata"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn filter_session_list_entries_searches_invalid_workspace_hint() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let invalid_session = format!("session-list-search-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&invalid_session, 1);
+        let workspace_path =
+            astra_services::session_workspace::workspace_file_path(&invalid_session).unwrap();
+        std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
+
+        let mut entries = build_session_list_entries(std::slice::from_ref(&invalid_session));
+        let outcome = filter_session_list_entries(
+            &mut entries,
+            &SessionListFilterOptions {
+                search_term: Some("metadata unreadable".to_string()),
+                ..Default::default()
+            },
+            "",
+            None,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sid, invalid_session);
+        assert_eq!(outcome, SessionListFilterOutcome::default());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn apply_restored_session_fails_when_local_step_checkpoint_is_invalid_without_fallback() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-bad-step-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 2);
+        write_invalid_local_step_checkpoint(&session_id, 2);
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            ..Default::default()
+        };
+        let mut state = SessionState {
+            session_id: Some("existing-session".into()),
+            turn: 7,
+            history: vec![("old".into(), "state".into())],
+            ..Default::default()
+        };
+
+        let error = apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect_err("invalid checkpoint without fallback should fail restore");
+
+        assert!(
+            error.contains("Failed to restore local step checkpoint"),
+            "{error}"
+        );
+        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
+        assert_eq!(state.turn, 7);
+        assert_eq!(
+            state.history,
+            vec![("old".to_string(), "state".to_string())]
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn apply_restored_session_surfaces_unreadable_local_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-bad-journal-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            restored_from_cloud: false,
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+        let error = apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect_err("unreadable local journal should abort restore");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
+        assert!(!error.contains("not found or not owned"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn load_prepared_fork_restore_requires_existing_child_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+
+        let error =
+            match load_prepared_fork_restore("parent-session", "missing-child-session", 1).await {
+                Ok(_) => panic!("missing child journal should abort fork restore"),
+                Err(error) => error,
+            };
+
+        assert!(error.contains("missing session journal"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn apply_restored_session_uses_cloud_fallback_when_local_step_checkpoint_is_invalid() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-cloud-fallback-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 2);
+        write_invalid_local_step_checkpoint(&session_id, 2);
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            conversation_messages: vec![
+                serde_json::json!({"role": "user", "content": "continue"}),
+                serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
+            ],
+            interruption: Some(serde_json::json!({
+                "kind": "context_overflow",
+                "resumable": true,
+                "has_checkpoint": true,
+                "tool_calls_completed": 2,
+                "turns_completed": 2,
+                "remaining_turns": 1,
+            })),
+            compaction_state: Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_was_insufficient": true,
+            })),
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("cloud fallback should keep resume working");
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        let guidance = state.resume_guidance.expect("resume guidance");
+        assert!(guidance.contains("3 attempt(s)"), "{guidance}");
+    }
+
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
@@ -5674,7 +6701,9 @@ mod resume_tests {
         let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-data".to_string())];
 
-        restore_journal_history_if_available(&mut state, &session_id).await;
+        restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .unwrap();
 
         // Cloud-restored history is preserved when non-empty; local journal is not used
         // to overwrite fresher cloud state.
@@ -5716,7 +6745,9 @@ mod resume_tests {
         let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-1".to_string())];
 
-        restore_journal_history_if_available(&mut state, &session_id).await;
+        restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .unwrap();
 
         // Local journal wins when it has more entries (3 local vs 1 cloud).
         assert_eq!(
@@ -5770,7 +6801,9 @@ mod resume_tests {
             .unwrap();
 
         let mut state = SessionState::default();
-        restore_journal_history_if_available(&mut state, &session_id).await;
+        restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .unwrap();
 
         assert_eq!(state.history.len(), 2, "should have 2 user/assistant pairs");
         assert_eq!(state.history[0].0, "hello");
@@ -5793,7 +6826,9 @@ mod resume_tests {
         write_local_resumable_session(&session_id, 3);
 
         let mut state = SessionState::default();
-        restore_journal_history_if_available(&mut state, &session_id).await;
+        restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .unwrap();
 
         assert!(
             !state.history.is_empty(),
@@ -5802,6 +6837,77 @@ mod resume_tests {
         assert!(
             state.csl_manager.is_none(),
             "CSL manager should remain None"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_without_csl_restores_recent_tools_from_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("no-csl-tools-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&session_id),
+                    1,
+                    Some("gpt-5"),
+                    "continue",
+                    "restored",
+                    0,
+                    10,
+                    5,
+                    5,
+                )
+                .with_tool_selection(
+                    vec![],
+                    vec![],
+                    vec!["bash".into(), "grep".into()],
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let mut state = SessionState::default();
+        restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.recent_tools,
+            vec!["bash".to_string(), "grep".to_string()]
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_from_corrupt_csl_returns_error_instead_of_falling_back() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("corrupt-csl-{}", uuid::Uuid::new_v4());
+        let session_dir = session_journal::local_sessions_dir().join(&session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        write_local_resumable_session(&session_id, 2);
+        std::fs::write(
+            session_dir.join("conversation_log.jsonl"),
+            "{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[]\n{\"type\":\"snapshot\",\"seq\":2,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
+        )
+        .unwrap();
+
+        let mut state = SessionState::default();
+        let error = restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .expect_err("corrupt csl should fail");
+
+        assert!(error.contains("load CSL state"), "{error}");
+        assert!(
+            state.history.is_empty(),
+            "lossy journal fallback should not run"
         );
     }
 
@@ -5815,7 +6921,7 @@ mod resume_tests {
             serde_json::json!({"role": "user", "content": "q2"}),
             serde_json::json!({"role": "assistant", "content": "a2"}),
         ];
-        let pairs = derive_history_pairs_from_messages(&messages);
+        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("q1".into(), "a1".into()));
         assert_eq!(pairs[1], ("q2".into(), "a2".into()));
@@ -5831,38 +6937,38 @@ mod resume_tests {
             serde_json::json!({"role": "user", "content": "thanks"}),
             serde_json::json!({"role": "assistant", "content": "you're welcome"}),
         ];
-        let pairs = derive_history_pairs_from_messages(&messages);
+        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "fix the bug");
-        assert_eq!(pairs[0].1, "done, fixed it");
+        assert_eq!(pairs[0].1, "I'll read the file\n\ndone, fixed it");
         assert_eq!(pairs[1].0, "thanks");
         assert_eq!(pairs[1].1, "you're welcome");
     }
 
     #[test]
     fn derive_history_pairs_empty_messages() {
-        let pairs = derive_history_pairs_from_messages(&[]);
+        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&[]);
         assert!(pairs.is_empty());
     }
 
     #[test]
     fn derive_history_pairs_user_only_no_assistant() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let pairs = derive_history_pairs_from_messages(&messages);
+        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0], ("hello".into(), String::new()));
     }
 
     #[test]
-    fn derive_history_pairs_structured_content_becomes_empty() {
+    fn derive_history_pairs_structured_content_preserves_text() {
         let messages = vec![
             serde_json::json!({"role": "user", "content": "question"}),
             serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "answer"}]}),
         ];
-        let pairs = derive_history_pairs_from_messages(&messages);
+        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "question");
-        assert_eq!(pairs[0].1, "", "non-string content becomes empty string");
+        assert_eq!(pairs[0].1, "answer");
     }
 
     #[serial_test::serial]
@@ -5899,6 +7005,273 @@ mod resume_tests {
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
             None
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn list_cloud_resumable_sessions_uses_server_restore_payload() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _token_guard = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+
+        let session_id = format!("cloud-list-{}", uuid::Uuid::new_v4());
+        let workspace = session_workspace::WorkspaceMetadata::with_context(
+            &session_id,
+            "gpt-5",
+            "/srv/cloud-project",
+            Some("feature/cloud"),
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/resumable"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessions": [{
+                    "session_id": session_id,
+                    "turn_count": 5,
+                    "total_tokens_in": 120,
+                    "total_tokens_out": 45,
+                    "total_cache_read_tokens": 22,
+                    "total_cache_creation_tokens": 7,
+                    "recent_tools": ["bash", "grep"],
+                    "checkpoint_count": 2,
+                    "last_status": "active",
+                    "git_branch": "feature/cloud",
+                    "model": "gpt-5",
+                    "title": "Cloud only session",
+                    "restored_from_cloud": true,
+                    "workspace": workspace,
+                }],
+                "limit": 20
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let sessions = session_restore_client::list_cloud_resumable_sessions(None, &api)
+            .await
+            .expect("cloud resumable list");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, session_id);
+        assert_eq!(sessions[0].turn_count, 5);
+        assert!(sessions[0].restored_from_cloud);
+        assert_eq!(
+            sessions[0]
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.cwd.as_str()),
+            Some("/srv/cloud-project")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn load_resumable_session_candidates_keeps_cloud_results_when_local_scan_fails() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let tmp = tempfile::tempdir().unwrap();
+        let broken_root = tmp.path().join("broken-sessions-root");
+        std::fs::write(&broken_root, "not-a-directory").unwrap();
+        let _guard = JournalDirGuard::new(&broken_root);
+        write_profile_with_token("placeholder-session");
+
+        let session_id = format!("cloud-only-{}", uuid::Uuid::new_v4());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/resumable"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessions": [{
+                    "session_id": session_id,
+                    "turn_count": 4,
+                    "total_tokens_in": 0,
+                    "total_tokens_out": 0,
+                    "last_status": "active",
+                    "recent_tools": [],
+                    "checkpoint_count": 0,
+                    "restored_from_cloud": true
+                }],
+                "limit": 20
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let candidates = load_resumable_session_candidates(None, &api, 20)
+            .await
+            .expect("cloud sessions should still load");
+
+        assert_eq!(candidates.sessions.len(), 1);
+        assert_eq!(candidates.sessions[0].session_id, session_id);
+        assert!(candidates.local_scan_error.is_some());
+        assert!(candidates.cloud_scan_error.is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn load_resumable_session_candidates_errors_when_local_scan_fails_without_cloud() {
+        let tmp = tempfile::tempdir().unwrap();
+        let broken_root = tmp.path().join("broken-sessions-root");
+        std::fs::write(&broken_root, "not-a-directory").unwrap();
+        let _guard = JournalDirGuard::new(&broken_root);
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+
+        let error = load_resumable_session_candidates(None, &api, 20)
+            .await
+            .expect_err("local scan failure should surface when cloud is unavailable");
+
+        assert!(error.contains("failed to scan local sessions"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn switch_session_into_state_restores_workspace_scoped_state() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+
+        let mut ws = session_workspace::read_workspace(&session_id).unwrap();
+        ws.pinned_skills = vec!["rust-review".to_string()];
+        ws.discovered_skills = vec!["session-recovery".to_string()];
+        ws.last_scenario_change_turn = Some(2);
+        ws.last_token_budget_direction = 1;
+        ws.last_persistence_error = Some("failed to append turn event".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState {
+            session_id: Some("current-session".into()),
+            history: vec![("old".into(), "state".into())],
+            pinned_skills: ["stale".to_string()].into_iter().collect(),
+            discovered_skills: ["obsolete".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        switch_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .expect("switch should reuse strict resume restore");
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 2);
+        assert_eq!(
+            state.history,
+            vec![("continue".to_string(), "restored".to_string())]
+        );
+        assert!(state.pinned_skills.contains("rust-review"));
+        assert!(state.discovered_skills.contains("session-recovery"));
+        assert_eq!(
+            state.session_persistence_error.as_deref(),
+            Some("failed to append turn event")
+        );
+        assert!(state.pending_adaptive_state.is_none());
+        assert!(
+            state.journal.is_some(),
+            "switch should initialize a journal"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_session_into_state_restores_cloud_only_session_and_workspace_metadata() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-cloud-only-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&session_id);
+
+        let mut workspace = session_workspace::WorkspaceMetadata::with_context(
+            &session_id,
+            "gpt-5",
+            "/srv/cloud-project",
+            Some("feature/cloud"),
+        );
+        workspace.git_root = Some("/srv/cloud-project".to_string());
+        workspace.git_head = Some("abc1234".to_string());
+        workspace.turn_count = 3;
+        workspace.total_tokens_in = 120;
+        workspace.total_tokens_out = 45;
+        workspace.total_cache_read_tokens = 22;
+        workspace.total_cache_creation_tokens = 7;
+        workspace.status = "active".to_string();
+        workspace.pinned_skills = vec!["rust-review".to_string()];
+        workspace.discovered_skills = vec!["cloud-recovery".to_string()];
+        workspace.last_scenario_change_turn = Some(3);
+        workspace.last_token_budget_direction = 1;
+        workspace.last_persistence_error = Some("failed to write workspace metadata".to_string());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "turn_count": 3,
+                "total_tokens_in": 120,
+                "total_tokens_out": 45,
+                "total_cache_read_tokens": 22,
+                "total_cache_creation_tokens": 7,
+                "recent_tools": ["bash", "grep"],
+                "checkpoint_count": 0,
+                "last_status": "active",
+                "git_branch": "feature/cloud",
+                "model": "gpt-5",
+                "restored_from_cloud": true,
+                "workspace": workspace,
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .expect("cloud-only restore should succeed");
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 3);
+        assert_eq!(state.total_prompt_tokens, 120);
+        assert_eq!(state.total_completion_tokens, 45);
+        assert_eq!(state.total_cache_read_tokens, 22);
+        assert_eq!(state.total_cache_creation_tokens, 7);
+        assert_eq!(
+            state.pinned_skills,
+            ["rust-review".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            state.discovered_skills,
+            ["cloud-recovery".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            state.session_persistence_error.as_deref(),
+            Some("failed to write workspace metadata")
+        );
+        assert!(state.journal.is_some());
+
+        let persisted = session_workspace::read_workspace(&session_id)
+            .expect("cloud resume should persist workspace metadata");
+        assert_eq!(persisted.cwd, "/srv/cloud-project");
+        assert_eq!(persisted.git_root.as_deref(), Some("/srv/cloud-project"));
+        assert_eq!(persisted.git_branch.as_deref(), Some("feature/cloud"));
+        assert_eq!(persisted.git_head.as_deref(), Some("abc1234"));
+        assert_eq!(persisted.turn_count, 3);
+        assert_eq!(persisted.total_cache_read_tokens, 22);
+        assert_eq!(persisted.pinned_skills, vec!["rust-review".to_string()]);
+        assert_eq!(
+            persisted.discovered_skills,
+            vec!["cloud-recovery".to_string()]
+        );
+        assert_eq!(
+            persisted.last_persistence_error.as_deref(),
+            Some("failed to write workspace metadata")
         );
     }
 
@@ -5965,6 +7338,12 @@ mod resume_tests {
         assert_eq!(state.total_completion_tokens, 30);
         assert_eq!(state.total_cache_read_tokens, 44);
         assert_eq!(state.total_cache_creation_tokens, 11);
+
+        let workspace = astra_services::session_workspace::read_workspace(&session_id)
+            .expect("resume should recreate workspace metadata");
+        assert_eq!(workspace.turn_count, 4);
+        assert_eq!(workspace.total_cache_read_tokens, 44);
+        assert_eq!(workspace.total_cache_creation_tokens, 11);
     }
 
     #[serial_test::serial]
@@ -6222,7 +7601,9 @@ mod resume_tests {
         // Simulate resume: restore_journal_history_if_available should pick up
         // the child's CSL data (not fall back to journal).
         let mut state = SessionState::default();
-        restore_journal_history_if_available(&mut state, &child_id).await;
+        restore_journal_history_if_available(&mut state, &child_id)
+            .await
+            .unwrap();
 
         assert!(state.csl_manager.is_some(), "should use CSL path");
         assert_eq!(state.history.len(), 1, "should have 1 user/assistant pair");
@@ -6253,7 +7634,9 @@ mod resume_tests {
         // Child has no CSL file, so resume falls back to journal (which is also
         // empty). No error should occur.
         let mut state = SessionState::default();
-        restore_journal_history_if_available(&mut state, &child_id).await;
+        restore_journal_history_if_available(&mut state, &child_id)
+            .await
+            .unwrap();
 
         assert!(
             state.csl_manager.is_none(),
@@ -6263,5 +7646,194 @@ mod resume_tests {
             state.history.is_empty(),
             "no history from either CSL or journal"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn fork_state_snapshot_capture_restore_roundtrip_preserves_fields() {
+        use astra_turn_core::conversation_log::{
+            SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+        };
+
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = format!("fork-snapshot-{}", uuid::Uuid::new_v4());
+        let store = std::sync::Arc::new(FileCslStore::new(session_journal::local_sessions_dir()));
+        let mut mgr = CslManager::new(store, sid.clone(), Default::default()).unwrap();
+        mgr.persist_turn(
+            1,
+            &[serde_json::json!({"role": "user", "content": "hi"})],
+            &SessionStateCompact {
+                recent_tools: vec!["bash".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut source = SessionState::default();
+        source.set_session_id(sid.clone());
+        session_startup::initialize_journal_pub(&mut source, &sid);
+        source.turn = 4;
+        source.total_prompt_tokens = 11;
+        source.total_completion_tokens = 22;
+        source.total_cache_read_tokens = 33;
+        source.total_cache_creation_tokens = 44;
+        source.last_turn_event = Some(session_journal::JournalEvent::turn(
+            Some(&sid),
+            4,
+            Some("gpt-5"),
+            "question",
+            "answer",
+            0,
+            66,
+            40,
+            26,
+        ));
+        source.run_id = Some("run-1".into());
+        source.history = vec![("q1".into(), "a1".into())];
+        source.recent_tools = vec!["bash".into(), "read_file".into()];
+        source.last_response = Some("a1".into());
+        source.continuation_anchor = Some("anchor".into());
+        source.csl_manager = Some(mgr);
+
+        let snapshot = ForkStateSnapshot::capture(&mut source);
+
+        let mut restored = SessionState::default();
+        snapshot.restore(&mut restored);
+
+        assert_eq!(restored.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(restored.turn, 4);
+        assert_eq!(restored.total_prompt_tokens, 11);
+        assert_eq!(restored.total_completion_tokens, 22);
+        assert_eq!(restored.total_cache_read_tokens, 33);
+        assert_eq!(restored.total_cache_creation_tokens, 44);
+        assert_eq!(restored.run_id.as_deref(), Some("run-1"));
+        assert_eq!(restored.history, vec![("q1".to_string(), "a1".to_string())]);
+        assert_eq!(
+            restored.recent_tools,
+            vec!["bash".to_string(), "read_file".to_string()]
+        );
+        assert_eq!(restored.last_response.as_deref(), Some("a1"));
+        assert_eq!(restored.continuation_anchor.as_deref(), Some("anchor"));
+        assert!(
+            restored.journal.is_some(),
+            "restore should reinitialize journal"
+        );
+        assert_eq!(
+            restored
+                .csl_manager
+                .as_ref()
+                .expect("csl manager restored")
+                .last_seq(),
+            1
+        );
+    }
+
+    #[test]
+    fn fork_state_snapshot_restore_without_session_id_clears_identity() {
+        let mut source = SessionState {
+            turn: 2,
+            history: vec![("q".into(), "a".into())],
+            recent_tools: vec!["bash".into()],
+            last_response: Some("a".into()),
+            continuation_anchor: Some("anchor".into()),
+            ..Default::default()
+        };
+        let snapshot = ForkStateSnapshot::capture(&mut source);
+
+        let mut state = SessionState::default();
+        state.set_session_id("existing-session");
+        session_startup::initialize_journal_pub(&mut state, "existing-session");
+        state.turn = 9;
+        state.history = vec![("stale".into(), "state".into())];
+        state.recent_tools = vec!["stale-tool".into()];
+        state.last_response = Some("stale".into());
+        state.continuation_anchor = Some("stale-anchor".into());
+
+        snapshot.restore(&mut state);
+
+        assert!(state.session_id.is_none());
+        assert!(state.journal.is_none());
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.history, vec![("q".to_string(), "a".to_string())]);
+        assert_eq!(state.recent_tools, vec!["bash".to_string()]);
+        assert_eq!(state.last_response.as_deref(), Some("a"));
+        assert_eq!(state.continuation_anchor.as_deref(), Some("anchor"));
+    }
+
+    #[test]
+    fn fork_state_guard_restores_original_state_on_drop_without_commit() {
+        let mut state = SessionState::default();
+        state.set_session_id("parent-session");
+        session_startup::initialize_journal_pub(&mut state, "parent-session");
+        state.turn = 3;
+        state.history = vec![("q1".into(), "a1".into())];
+        state.recent_tools = vec!["bash".into()];
+        state.last_response = Some("a1".into());
+        state.continuation_anchor = Some("anchor".into());
+
+        {
+            let mut guard = ForkStateGuard::new(&mut state);
+            let child_state = session_runtime::RestoredSessionState {
+                history: vec![("child-q".into(), "child-a".into())],
+                turn: 1,
+                recent_tools: vec!["read_file".into()],
+                total_prompt_tokens: 10,
+                total_completion_tokens: 20,
+                total_cache_read_tokens: 30,
+                total_cache_creation_tokens: 40,
+            };
+            let restored_child = PreparedForkRestore {
+                history: child_state.history.clone(),
+                recent_tools: child_state.recent_tools.clone(),
+                csl_manager: None,
+                journal_state: child_state,
+                last_turn_event: None,
+            };
+            apply_prepared_fork_restore(guard.state(), "child-session", restored_child);
+        }
+
+        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
+        assert_eq!(state.turn, 3);
+        assert_eq!(state.history, vec![("q1".to_string(), "a1".to_string())]);
+        assert_eq!(state.recent_tools, vec!["bash".to_string()]);
+        assert_eq!(state.last_response.as_deref(), Some("a1"));
+        assert_eq!(state.continuation_anchor.as_deref(), Some("anchor"));
+    }
+
+    #[tokio::test]
+    async fn fork_state_guard_restores_root_mailbox_on_drop_without_commit() {
+        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = std::sync::Arc::new(
+            astra_runtime::server::delegation::engine::DelegationTracker::new(),
+        );
+        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            tracker,
+        ));
+        let root_addr = astra_messaging::AgentAddress::new("parent-session", "main");
+
+        let mut state = SessionState::default();
+        state.set_session_id("parent-session");
+        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
+
+        {
+            let mut guard = ForkStateGuard::new(&mut state);
+            guard.state().set_session_id("child-session");
+        }
+
+        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
+        assert_eq!(
+            state.root_mailbox.as_ref().map(|mailbox| &mailbox.address),
+            Some(&root_addr)
+        );
+        assert_eq!(transport.agent_count().await, 1);
+
+        state.unregister_root_mailbox().await;
+        assert_eq!(transport.agent_count().await, 0);
+        router
+            .register(root_addr, None)
+            .await
+            .expect("explicit unregister should release restored root mailbox route");
     }
 }

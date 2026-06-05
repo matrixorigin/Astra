@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::skill_install_status_surface::skill_install_status_surface;
 
 pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category
@@ -496,12 +497,15 @@ pub(crate) async fn handle_skill_command(
             let (message, changed) = apply_skill_surfacing(state, command);
             eprintln!("  {}", message.green());
             if changed && let Some(ref j) = state.journal {
-                let _ = j.append(
+                crate::cli::cli_utils::append_journal_event_or_warn(
+                    j,
+                    state.session_id.as_deref(),
                     &astra_services::session_journal::JournalEvent::config_change(
                         state.session_id.as_deref(),
                         "skill_search",
                         &format_skill_surfacing_line(&state.skill_search),
                     ),
+                    "slash_skill:surfacing",
                 );
             }
         }
@@ -4141,17 +4145,11 @@ async fn list_installed_marketplace(api: &astra_thin_client::ThinClient, token: 
                             "Installed".bold()
                         );
                         for inst in &resp.installations {
-                            let status_colored = match inst.status.as_str() {
-                                "installed" => inst.status.as_str().green().to_string(),
-                                "upgraded" => inst.status.as_str().magenta().to_string(),
-                                "rolled_back" => inst.status.as_str().yellow().to_string(),
-                                _ => inst.status.clone(),
-                            };
                             eprintln!(
                                 "  {:<24}  {:<10}  {:<12}  {}",
                                 inst.skill_name.as_str().magenta(),
                                 inst.skill_version.as_str().dim(),
-                                status_colored,
+                                skill_install_status_surface(inst.status.as_str()).styled_label(),
                                 inst.installed_at.as_str().dim()
                             );
                         }

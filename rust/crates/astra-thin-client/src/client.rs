@@ -9,6 +9,7 @@ use reqwest::{
     Client, Response, Url,
     header::{self, HeaderMap, HeaderValue},
 };
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::edge::ASTRA_EDGE_ID_HEADER;
@@ -150,6 +151,13 @@ impl ThinClient {
         Ok(serde_json::from_str(&text)?)
     }
 
+    async fn typed_json_or_error<T: DeserializeOwned>(
+        resp: Response,
+    ) -> Result<T, ThinClientError> {
+        let value = Self::json_or_error(resp).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     // ── Bearer-authenticated CRUD (admin routes, any path under API origin) ─
 
     /// `GET` with `Authorization: Bearer` and optional query pairs.
@@ -166,6 +174,22 @@ impl ThinClient {
         }
         let resp = req.send().await?;
         Self::text_or_api(resp).await
+    }
+
+    /// `GET` with `Authorization: Bearer` and optional query pairs, decoding JSON.
+    pub async fn get_bearer_path_query_json<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T, ThinClientError> {
+        let url = self.url(path)?;
+        let mut req = self.http.get(url).headers(Self::bearer_headers(token)?);
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+        let resp = req.send().await?;
+        Self::typed_json_or_error(resp).await
     }
 
     /// `POST` JSON with bearer.
@@ -220,6 +244,22 @@ impl ThinClient {
             .send()
             .await?;
         Self::text_or_api(resp).await
+    }
+
+    /// `POST` with bearer, empty body, decoding JSON.
+    pub async fn post_bearer_path_empty_json<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        path: &str,
+    ) -> Result<T, ThinClientError> {
+        let url = self.url(path)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
     }
 
     /// `DELETE` with bearer.

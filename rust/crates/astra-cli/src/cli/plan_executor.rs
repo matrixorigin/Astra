@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use astra_services::task_orchestrator::TaskOutcome;
 use crossterm::style::Stylize;
 
 use crate::cli::theme;
@@ -61,11 +62,11 @@ pub enum PlanUpdate {
         /// dependency deadlock.
         blocked_ids: Vec<String>,
     },
-    PlanCompleted {
+    PlanFinished {
         pct: u32,
         elapsed: Duration,
+        outcome: TaskOutcome,
     },
-    GlobalVerificationFailed,
     ParallelGroupInfo {
         ready: usize,
         parallel_safe: usize,
@@ -83,9 +84,7 @@ pub enum PlanUpdate {
         session_id: Option<String>,
     },
     /// Fatal error in the background executor.
-    PlanError {
-        error: String,
-    },
+    PlanError { error: String },
     /// Journal event to be written on the main CLI thread (JournalWriter is !Send).
     JournalEvent(Box<session_journal::JournalEvent>),
     /// History entry from a completed subtask turn — the monitor should append it.
@@ -93,7 +92,7 @@ pub enum PlanUpdate {
         user_msg: String,
         assistant_msg: String,
     },
-    /// Delivery report from global verification, sent before PlanCompleted.
+    /// Delivery report from global verification, sent before the terminal PlanFinished event.
     DeliveryReport(astra_services::durable_task::TaskDeliveryReport),
     /// Real-time streaming event from within an LLM turn (tokens, tool calls, model status).
     StreamingEvent {
@@ -159,14 +158,11 @@ pub trait PlanOutputSink {
         failure_hint: Option<String>,
     );
 
-    /// Plan completed at 100%.
-    fn plan_completed(&self, summary: &str, elapsed: Duration);
+    /// Plan finished with a terminal verification outcome.
+    fn plan_finished(&self, summary: &str, elapsed: Duration, outcome: TaskOutcome);
 
     /// Plan paused (blocked or Ctrl+C).
     fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, blocked_ids: &str);
-
-    /// Global verification failed.
-    fn global_verification_failed(&self);
 
     /// Parallel group info line.
     fn parallel_info(&self, parts: &[String]);
@@ -247,20 +243,23 @@ impl PlanOutputSink for StderrSink {
         }
     }
 
-    fn plan_completed(&self, summary: &str, elapsed: Duration) {
+    fn plan_finished(&self, summary: &str, elapsed: Duration, outcome: TaskOutcome) {
         eprintln!();
         eprint!("{summary}");
         eprintln!(
             "{}",
             format!("  Total elapsed: {}", crate::format_duration_short(elapsed)).dim()
         );
-    }
-
-    fn global_verification_failed(&self) {
-        eprintln!(
-            "\n{}  Global verification failed. Plan remains active for fixes.",
-            theme::icon_warn()
-        );
+        if outcome == TaskOutcome::Partial {
+            eprintln!(
+                "{}",
+                format!(
+                    "\n{}  Verification failed. Plan finished without passing all required checks.",
+                    theme::icon_warn()
+                )
+                .yellow()
+            );
+        }
     }
 
     fn plan_paused(&self, pct: u32, _remaining: usize, elapsed: Duration, blocked_ids: &str) {
@@ -364,8 +363,12 @@ impl PlanOutputSink for ChannelSink {
         });
     }
 
-    fn plan_completed(&self, _summary: &str, elapsed: Duration) {
-        self.send(PlanUpdate::PlanCompleted { pct: 100, elapsed });
+    fn plan_finished(&self, _summary: &str, elapsed: Duration, outcome: TaskOutcome) {
+        self.send(PlanUpdate::PlanFinished {
+            pct: 100,
+            elapsed,
+            outcome,
+        });
     }
 
     fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, blocked_ids: &str) {
@@ -384,10 +387,6 @@ impl PlanOutputSink for ChannelSink {
             elapsed,
             blocked_ids,
         });
-    }
-
-    fn global_verification_failed(&self) {
-        self.send(PlanUpdate::GlobalVerificationFailed);
     }
 
     fn parallel_info(&self, parts: &[String]) {
@@ -1116,7 +1115,7 @@ pub(crate) struct BackgroundPlanContext {
 ///
 /// Returns a [`PlanExecutorHandle`] for the plan monitor to poll for updates and
 /// send commands. The `TaskPlan` is moved into the spawned task and will
-/// be returned via `PlanUpdate::PlanCompleted` when execution finishes.
+/// be returned via `PlanUpdate::PlanFinished` when execution finishes.
 pub(crate) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
     let (handle, update_tx, cmd_rx) = create_plan_channels();
 
@@ -1152,7 +1151,7 @@ async fn cleanup_plan_root_mailbox(ctx: &mut BackgroundPlanContext) {
 /// 5. Checks command channel for Pause/Cancel between subtasks
 ///
 /// Emits journal events for each subtask transition.
-/// On completion, sends `PlanUpdate::PlanCompleted`. On error, sends
+/// On clean finish, sends `PlanUpdate::PlanFinished`. On error, sends
 /// `PlanUpdate::PlanError`.
 async fn plan_executor_task(
     ctx: &mut BackgroundPlanContext,
@@ -1230,14 +1229,22 @@ async fn plan_executor_task(
             if pct == 100 {
                 // Durable task: run global verification
                 let global_passed = if let Some(ref mut durable) = ctx.durable_task_state {
-                    durable_bridge::on_plan_complete(durable).await
+                    match durable_bridge::on_plan_complete(durable).await {
+                        Ok(passed) => passed,
+                        Err(error) => {
+                            if let Some(durable) = ctx.durable_task_state.take() {
+                                let _ = update_tx
+                                    .send(PlanUpdate::DurableStateReturn(Box::new(durable)));
+                            }
+                            let _ = update_tx.send(PlanUpdate::PlanError {
+                                error: format!("Durable plan completion failed: {error}"),
+                            });
+                            return;
+                        }
+                    }
                 } else {
                     true
                 };
-
-                if !global_passed {
-                    let _ = update_tx.send(PlanUpdate::GlobalVerificationFailed);
-                }
 
                 // Send delivery report if available
                 if let Some(ref durable) = ctx.durable_task_state
@@ -1280,9 +1287,15 @@ async fn plan_executor_task(
                     let _ = update_tx.send(PlanUpdate::DurableStateReturn(Box::new(durable)));
                 }
 
-                let _ = update_tx.send(PlanUpdate::PlanCompleted {
+                let outcome = if global_passed {
+                    TaskOutcome::Success
+                } else {
+                    TaskOutcome::Partial
+                };
+                let _ = update_tx.send(PlanUpdate::PlanFinished {
                     pct: 100,
                     elapsed: plan_start.elapsed(),
+                    outcome,
                 });
                 return; // Plan is done — exit the execution loop
             } else {
@@ -1410,8 +1423,28 @@ async fn plan_executor_task(
             };
 
             // Durable task: snapshot before execution
-            if let Some(ref durable) = ctx.durable_task_state {
-                durable_bridge::on_subtask_begin(durable, next_id).await;
+            let durable_begin_error = if let Some(ref mut durable) = ctx.durable_task_state {
+                durable_bridge::on_subtask_begin(durable, next_id)
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            if let Some(error) = durable_begin_error {
+                if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                    st.status = TaskStatus::Failed;
+                }
+                let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                    id: next_id.clone(),
+                    status: TaskStatus::Failed,
+                });
+                if let Some(durable) = ctx.durable_task_state.take() {
+                    let _ = update_tx.send(PlanUpdate::DurableStateReturn(Box::new(durable)));
+                }
+                let _ = update_tx.send(PlanUpdate::PlanError {
+                    error: format!("Subtask '{}' durable start failed: {error}", next_id),
+                });
+                return;
             }
 
             let done_so_far = ctx.plan.items_done() + 1;
@@ -1620,13 +1653,9 @@ async fn plan_executor_task(
                             turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
                         }
                         // Attach per-turn git snapshot.
-                        let git_root = ctx
-                            .session_id
-                            .as_deref()
-                            .and_then(|sid| {
-                                astra_services::session_workspace::read_workspace(sid).ok()
-                            })
-                            .and_then(|ws| ws.git_root);
+                        let git_root = super::session_recovery::session_workspace_git_root(
+                            ctx.session_id.as_deref(),
+                        );
                         let (git_head, git_branch) =
                             super::cli_utils::git_snapshot(git_root.as_deref());
                         turn_event = turn_event.with_git_snapshot(git_head, git_branch);
@@ -2112,9 +2141,10 @@ mod tests {
             index: 1,
             total: 5,
         };
-        let _ = PlanUpdate::PlanCompleted {
+        let _ = PlanUpdate::PlanFinished {
             pct: 100,
             elapsed: Duration::from_secs(60),
+            outcome: TaskOutcome::Success,
         };
     }
 
@@ -2138,8 +2168,8 @@ mod tests {
         let sink = ChannelSink::new(tx);
 
         sink.subtask_started("progress", 1, 5, "", "Add tests", "s1");
-        sink.plan_completed("summary", Duration::from_secs(30));
-        sink.global_verification_failed();
+        sink.plan_finished("summary", Duration::from_secs(30), TaskOutcome::Success);
+        sink.plan_finished("summary", Duration::from_secs(30), TaskOutcome::Partial);
 
         // Verify we got 3 updates
         let u1 = rx.try_recv().unwrap();
@@ -2152,9 +2182,23 @@ mod tests {
             }
         ));
         let u2 = rx.try_recv().unwrap();
-        assert!(matches!(u2, PlanUpdate::PlanCompleted { pct: 100, .. }));
+        assert!(matches!(
+            u2,
+            PlanUpdate::PlanFinished {
+                pct: 100,
+                outcome: TaskOutcome::Success,
+                ..
+            }
+        ));
         let u3 = rx.try_recv().unwrap();
-        assert!(matches!(u3, PlanUpdate::GlobalVerificationFailed));
+        assert!(matches!(
+            u3,
+            PlanUpdate::PlanFinished {
+                pct: 100,
+                outcome: TaskOutcome::Partial,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2163,13 +2207,21 @@ mod tests {
 
         // Executor → monitor
         update_tx
-            .send(PlanUpdate::PlanCompleted {
+            .send(PlanUpdate::PlanFinished {
                 pct: 100,
                 elapsed: Duration::from_secs(10),
+                outcome: TaskOutcome::Success,
             })
             .unwrap();
         let update = handle.try_recv().unwrap();
-        assert!(matches!(update, PlanUpdate::PlanCompleted { pct: 100, .. }));
+        assert!(matches!(
+            update,
+            PlanUpdate::PlanFinished {
+                pct: 100,
+                outcome: TaskOutcome::Success,
+                ..
+            }
+        ));
 
         // Monitor → executor
         handle.send_command(PlanCommand::Pause).unwrap();
@@ -2402,6 +2454,7 @@ mod tests {
         StreamResult {
             session_id: None,
             run_id: None,
+            session_persistence_error: None,
             full_text: full_text.to_string(),
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -2761,6 +2814,42 @@ All acceptance checks pass:
         }
     }
 
+    fn durable_task_state_with_lifecycle(
+        subtask_id: &str,
+        stage: astra_services::durable_task::SubtaskStage,
+        global_verification: Vec<astra_services::VerificationCriterion>,
+        lifecycle: Arc<dyn astra_services::DurableTaskLifecycle>,
+    ) -> durable_bridge::DurableTaskState {
+        use astra_services::durable_task::{
+            ContractStatus, DurableSubtask, TaskContract, TaskScope,
+        };
+
+        durable_bridge::DurableTaskState {
+            contract: TaskContract {
+                contract_id: "contract-1".into(),
+                task_id: "task-1".into(),
+                goal: "goal".into(),
+                scope: TaskScope::default(),
+                subtasks: vec![DurableSubtask {
+                    id: subtask_id.into(),
+                    title: "durable task".into(),
+                    stage,
+                    ..Default::default()
+                }],
+                global_verification,
+                version: 1,
+                status: ContractStatus::Active,
+                created_at: String::new(),
+                updated_at: String::new(),
+                domain_hint: None,
+                task_type: None,
+                last_global_results: vec![],
+            },
+            lifecycle,
+            last_report: None,
+        }
+    }
+
     #[test]
     fn failed_verification_status_fails_browser_gap_without_durable() {
         let (status, retries_exhausted, retry_pending) =
@@ -2879,6 +2968,277 @@ All acceptance checks pass:
             !saw_completed_status,
             "browser-only verification gap must not surface as completed"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_plan_executor_aborts_when_durable_subtask_begin_fails() {
+        use astra_services::durable_task::{
+            DurableTaskLifecycle, SubtaskExecutionContext, SubtaskStage, TaskContract,
+            TaskDeliveryReport, TaskResumeContext, TaskScope,
+        };
+        use astra_services::{ContractAmendment, SubtaskVerificationReport, VerificationResult};
+        use tokio::time::{Duration, Instant, sleep};
+
+        struct BeginFailLifecycle;
+
+        #[async_trait::async_trait]
+        impl DurableTaskLifecycle for BeginFailLifecycle {
+            async fn create_contract(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &TaskPlan,
+                _: TaskScope,
+            ) -> Result<TaskContract, String> {
+                Err("unused".into())
+            }
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: ContractAmendment,
+            ) -> Result<TaskContract, String> {
+                Err("unused".into())
+            }
+            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+                Ok(None)
+            }
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskExecutionContext, String> {
+                Err("snapshot unavailable".into())
+            }
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                Err("unused".into())
+            }
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Err("unused".into())
+            }
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+                Err("unused".into())
+            }
+            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+                Err("unused".into())
+            }
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("unused".into())
+            }
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+        }
+
+        let mut ctx = test_background_plan_context();
+        ctx.plan = TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "s1".into(),
+                title: "Fail durable begin".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        ctx.durable_task_state = Some(durable_task_state_with_lifecycle(
+            "s1",
+            SubtaskStage::Pending,
+            vec![],
+            Arc::new(BeginFailLifecycle),
+        ));
+
+        let mut handle = spawn_plan_executor(ctx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut plan_error = None;
+        let mut saw_failed_status = false;
+        let mut saw_plan_finished = false;
+        let mut returned_stage = None;
+
+        while Instant::now() < deadline {
+            let mut drained_any = false;
+            while let Some(update) = handle.try_recv() {
+                drained_any = true;
+                match update {
+                    PlanUpdate::PlanError { error } => {
+                        plan_error = Some(error);
+                    }
+                    PlanUpdate::SubtaskStatusSync { id, status }
+                        if id == "s1" && status == TaskStatus::Failed =>
+                    {
+                        saw_failed_status = true;
+                    }
+                    PlanUpdate::DurableStateReturn(durable) => {
+                        returned_stage = Some(durable.contract.subtasks[0].stage.clone());
+                    }
+                    PlanUpdate::PlanFinished { .. } => {
+                        saw_plan_finished = true;
+                    }
+                    _ => {}
+                }
+            }
+            if plan_error.is_some() && handle.is_finished() {
+                break;
+            }
+            if !drained_any {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        let error = plan_error.expect("plan should surface durable begin failure");
+        assert!(error.contains("Subtask 's1' durable start failed: snapshot unavailable"));
+        assert!(saw_failed_status);
+        assert!(!saw_plan_finished);
+        match returned_stage.expect("durable state should be returned") {
+            SubtaskStage::ExecutionFailed { error } => {
+                assert_eq!(error, "snapshot unavailable");
+            }
+            other => panic!("unexpected durable stage: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_plan_executor_aborts_when_durable_delivery_fails() {
+        use astra_services::durable_task::{
+            DurableTaskLifecycle, SubtaskExecutionContext, SubtaskStage, TaskContract,
+            TaskDeliveryReport, TaskResumeContext, TaskScope,
+        };
+        use astra_services::{
+            ContractAmendment, SubtaskVerificationReport, VerificationCriterion, VerificationResult,
+        };
+        use tokio::time::{Duration, Instant, sleep};
+
+        struct DeliveryFailLifecycle;
+
+        #[async_trait::async_trait]
+        impl DurableTaskLifecycle for DeliveryFailLifecycle {
+            async fn create_contract(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &TaskPlan,
+                _: TaskScope,
+            ) -> Result<TaskContract, String> {
+                Err("unused".into())
+            }
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: ContractAmendment,
+            ) -> Result<TaskContract, String> {
+                Err("unused".into())
+            }
+            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+                Ok(None)
+            }
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskExecutionContext, String> {
+                Err("unused".into())
+            }
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                Err("unused".into())
+            }
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Ok(vec![])
+            }
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+                Err("unused".into())
+            }
+            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+                Err("persist failed".into())
+            }
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("unused".into())
+            }
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".into())
+            }
+        }
+
+        let mut ctx = test_background_plan_context();
+        ctx.plan = TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "s1".into(),
+                title: "Already done".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        ctx.durable_task_state = Some(durable_task_state_with_lifecycle(
+            "s1",
+            SubtaskStage::Verified,
+            Vec::<VerificationCriterion>::new(),
+            Arc::new(DeliveryFailLifecycle),
+        ));
+
+        let mut handle = spawn_plan_executor(ctx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut plan_error = None;
+        let mut saw_plan_finished = None;
+        let mut saw_durable_return = false;
+
+        while Instant::now() < deadline {
+            let mut drained_any = false;
+            while let Some(update) = handle.try_recv() {
+                drained_any = true;
+                match update {
+                    PlanUpdate::PlanError { error } => {
+                        plan_error = Some(error);
+                    }
+                    PlanUpdate::PlanFinished { outcome, .. } => {
+                        saw_plan_finished = Some(outcome);
+                    }
+                    PlanUpdate::DurableStateReturn(_) => {
+                        saw_durable_return = true;
+                    }
+                    _ => {}
+                }
+            }
+            if plan_error.is_some() && handle.is_finished() {
+                break;
+            }
+            if !drained_any {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        let error = plan_error.expect("plan should surface durable delivery failure");
+        assert!(
+            error
+                .contains("Durable plan completion failed: delivery report failed: persist failed")
+        );
+        assert!(saw_durable_return);
+        assert!(saw_plan_finished.is_none());
     }
 
     #[tokio::test]
@@ -3405,6 +3765,7 @@ All acceptance checks pass:
         let result = StreamResult {
             session_id: None,
             run_id: None,
+            session_persistence_error: None,
             full_text: "done".into(),
             prompt_tokens: 123,
             completion_tokens: 45,

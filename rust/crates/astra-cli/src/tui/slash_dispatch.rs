@@ -659,6 +659,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             };
             let timeline = Timeline::new(JournalTurnSource::new(), &sid);
+            if let Some(error) = timeline.load_error() {
+                ctx.show_info(error.to_string());
+                return SlashResult::Handled;
+            }
             if timeline.is_empty() {
                 ctx.show_info(format!("No turns recorded yet for session {sid}."));
                 return SlashResult::Handled;
@@ -1492,7 +1496,7 @@ pub(crate) fn handle_view_result(
 
 fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane) {
     use crate::tui::bottom_pane::info_view::InfoView;
-    use astra_services::{session_analytics, session_journal};
+    use astra_services::session_analytics;
 
     match sub {
         "" | "overview" => {
@@ -1515,37 +1519,43 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ("cost", format!("${:.4}", state.total_session_cost)),
             ];
             if !sid.is_empty() {
-                if let Ok(events) = session_journal::read_journal(&sid) {
-                    let stats = session_analytics::compute_session_stats(&sid, &events);
-                    pairs.push((
-                        "duration",
-                        format!(
-                            "{:.1}s ({:.0}ms/turn)",
-                            stats.total_duration_ms as f64 / 1000.0,
-                            stats.avg_duration_ms as f64
-                        ),
-                    ));
-                    pairs.push((
-                        "tool calls",
-                        format!(
-                            "{} ({} failed, {:.0}% err)",
-                            stats.total_tool_calls,
-                            stats.failed_tool_calls,
-                            stats.tool_error_rate * 100.0
-                        ),
-                    ));
-                    if !stats.unique_tools.is_empty() {
-                        pairs.push(("tools used", stats.unique_tools.join(", ")));
-                    }
-                    if stats.error_count > 0 || stats.stall_count > 0 {
+                match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid) {
+                    Ok(events) => {
+                        let stats = session_analytics::compute_session_stats(&sid, &events);
                         pairs.push((
-                            "issues",
-                            format!("{} errors, {} stalls", stats.error_count, stats.stall_count),
+                            "duration",
+                            format!(
+                                "{:.1}s ({:.0}ms/turn)",
+                                stats.total_duration_ms as f64 / 1000.0,
+                                stats.avg_duration_ms as f64
+                            ),
                         ));
+                        pairs.push((
+                            "tool calls",
+                            format!(
+                                "{} ({} failed, {:.0}% err)",
+                                stats.total_tool_calls,
+                                stats.failed_tool_calls,
+                                stats.tool_error_rate * 100.0
+                            ),
+                        ));
+                        if !stats.unique_tools.is_empty() {
+                            pairs.push(("tools used", stats.unique_tools.join(", ")));
+                        }
+                        if stats.error_count > 0 || stats.stall_count > 0 {
+                            pairs.push((
+                                "issues",
+                                format!(
+                                    "{} errors, {} stalls",
+                                    stats.error_count, stats.stall_count
+                                ),
+                            ));
+                        }
+                        if stats.checkpoint_count > 0 {
+                            pairs.push(("checkpoints", stats.checkpoint_count.to_string()));
+                        }
                     }
-                    if stats.checkpoint_count > 0 {
-                        pairs.push(("checkpoints", stats.checkpoint_count.to_string()));
-                    }
+                    Err(error) => pairs.push(("journal", format!("unavailable ({error})"))),
                 }
             }
             bottom_pane.push_view(Box::new(
@@ -1554,41 +1564,10 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
         }
 
         "history" => {
-            let sessions = session_journal::list_sessions().unwrap_or_default();
-            if sessions.is_empty() {
-                bottom_pane.push_view(Box::new(
-                    InfoView::from_plain("Session History", vec!["  No sessions found.".into()])
-                        .with_reopen("/stats"),
-                ));
-                return;
-            }
-            let mut lines = Vec::new();
-            let recent: Vec<_> = sessions.into_iter().take(10).collect();
-            for sid in &recent {
-                if let Ok(events) = session_journal::read_journal(sid) {
-                    let s = session_analytics::compute_session_stats(sid, &events);
-                    let short = &sid[..8.min(sid.len())];
-                    let model = s.model.as_deref().unwrap_or("?");
-                    lines.push(format!(
-                        "  {short}  {:>3} turns  {:>6}+{:<6} tok  {:>3} tools  {model}",
-                        s.turn_count, s.total_tokens_in, s.total_tokens_out, s.total_tool_calls,
-                    ));
-                }
-            }
-            let agg = {
-                let mut all = Vec::new();
-                for sid in &recent {
-                    if let Ok(events) = session_journal::read_journal(sid) {
-                        all.push(session_analytics::compute_session_stats(sid, &events));
-                    }
-                }
-                session_analytics::aggregate_stats(&all)
+            let lines = match build_recent_session_history_lines(10) {
+                Ok(lines) => lines,
+                Err(error) => vec![format!("  {error}")],
             };
-            lines.push(String::new());
-            lines.push(format!(
-                "  Summary: {} sessions, {} turns, {}+{} tokens",
-                agg.session_count, agg.total_turns, agg.total_tokens_in, agg.total_tokens_out,
-            ));
             bottom_pane.push_view(Box::new(
                 InfoView::from_plain("Recent Sessions", lines).with_reopen("/stats"),
             ));
@@ -1603,7 +1582,17 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ));
                 return;
             }
-            let events = session_journal::read_journal(&sid).unwrap_or_default();
+            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    bottom_pane.push_view(Box::new(
+                        InfoView::from_plain("Tool Performance", vec![format!("  {error}")])
+                            .with_reopen("/stats"),
+                    ));
+                    return;
+                }
+            };
             let profiles = session_analytics::compute_tool_profiles(&events);
             if profiles.is_empty() {
                 bottom_pane.push_view(Box::new(
@@ -1756,7 +1745,17 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ));
                 return;
             }
-            let events = session_journal::read_journal(&sid).unwrap_or_default();
+            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    bottom_pane.push_view(Box::new(
+                        InfoView::from_plain("Tool Health", vec![format!("  {error}")])
+                            .with_reopen("/stats"),
+                    ));
+                    return;
+                }
+            };
             let profiles = session_analytics::compute_tool_profiles(&events);
             let mut lines = Vec::new();
             for p in &profiles {
@@ -1784,6 +1783,59 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
 
         _ => {}
     }
+}
+
+fn build_recent_session_history_lines(limit: usize) -> Result<Vec<String>, String> {
+    use astra_services::session_analytics;
+
+    let scan = crate::cli::session_stats_scan::collect_recent_session_stats(limit)?;
+    if scan.stats.is_empty() && scan.unreadable.is_empty() {
+        return Ok(vec!["  No sessions found.".into()]);
+    }
+
+    let mut lines = Vec::new();
+    for stats in &scan.stats {
+        let short = &stats.session_id[..8.min(stats.session_id.len())];
+        let model = stats.model.as_deref().unwrap_or("?");
+        lines.push(format!(
+            "  {short}  {:>3} turns  {:>6}+{:<6} tok  {:>3} tools  {model}",
+            stats.turn_count, stats.total_tokens_in, stats.total_tokens_out, stats.total_tool_calls,
+        ));
+    }
+    for unreadable in &scan.unreadable {
+        let short = &unreadable.session_id[..8.min(unreadable.session_id.len())];
+        let preview: String = unreadable.error.chars().take(96).collect();
+        lines.push(format!("  {short}  journal unreadable ({preview})"));
+    }
+
+    if scan.stats.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("  Summary: no readable session data".into());
+        lines.push(format!(
+            "  Skipped {} unreadable journal(s).",
+            scan.unreadable.len()
+        ));
+        return Ok(lines);
+    }
+
+    let agg = session_analytics::aggregate_stats(&scan.stats);
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(format!(
+        "  Summary: {} sessions, {} turns, {}+{} tokens",
+        agg.session_count, agg.total_turns, agg.total_tokens_in, agg.total_tokens_out,
+    ));
+    if !scan.unreadable.is_empty() {
+        lines.push(format!(
+            "  Skipped {} unreadable journal(s).",
+            scan.unreadable.len()
+        ));
+    }
+
+    Ok(lines)
 }
 
 /// Split `"sub rest of args"` → `("sub", "rest of args")`.  Trims
@@ -2756,9 +2808,14 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ];
 
     // Workspace info (cwd, git, timestamps)
-    let ws = (!sid.is_empty())
-        .then(|| session_workspace::read_workspace(&sid).ok())
-        .flatten();
+    let (ws, workspace_error) = if sid.is_empty() {
+        (None, None)
+    } else {
+        match session_workspace::read_workspace_optional(&sid) {
+            Ok(workspace) => (workspace, None),
+            Err(error) => (None, Some(error)),
+        }
+    };
     if let Some(ref ws) = ws {
         pairs.push(("cwd", tilde_session_path(&ws.cwd)));
         let git_line = match (&ws.git_branch, &ws.git_head) {
@@ -2775,11 +2832,19 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
         if ws.status != "active" {
             pairs.push(("status", ws.status.clone()));
         }
+    } else if workspace_error.is_some() {
+        pairs.push((
+            "workspace",
+            "metadata unreadable; using live/journal state".into(),
+        ));
     } else {
         let cwd = std::env::current_dir()
             .map(|p| tilde_session_path(&p.to_string_lossy()))
             .unwrap_or_else(|_| "?".into());
         pairs.push(("cwd", cwd));
+    }
+    if let Some(error) = session_hub_persistence_error(ctx.state, ws.as_ref()) {
+        pairs.push(("persistence", error));
     }
 
     // Live state
@@ -2850,6 +2915,23 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
     SlashResult::Handled
 }
 
+fn session_hub_persistence_error(
+    state: &crate::cli::session_state::SessionState,
+    workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
+) -> Option<String> {
+    state
+        .session_persistence_error
+        .as_deref()
+        .or_else(|| workspace.and_then(|ws| ws.last_persistence_error.as_deref()))
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .map(|error| {
+            format!(
+                "degraded: {error} · live session can continue; resume/fork metadata may be stale until the next successful save"
+            )
+        })
+}
+
 fn tilde_session_path(abs: &str) -> String {
     let Some(home) = dirs::home_dir() else {
         return abs.to_string();
@@ -2887,7 +2969,13 @@ fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
     let Some(sid) = sid else {
         return SlashResult::Handled;
     };
-    let events = astra_services::session_journal::read_journal(&sid).unwrap_or_default();
+    let events = match astra_services::session_journal::read_journal(&sid) {
+        Ok(events) => events,
+        Err(error) => {
+            ctx.show_error(format!("Failed to read journal: {error}"));
+            return SlashResult::Handled;
+        }
+    };
     if events.is_empty() {
         ctx.show_info(format!("No journal events for session {sid}."));
         return SlashResult::Handled;
@@ -3051,7 +3139,16 @@ fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slash
         ctx.show_info(format!("Session {sid} has no journal events to export."));
         return SlashResult::Handled;
     }
-    let md = crate::cli::slash_session::build_export_markdown(&sid, &events);
+    let workspace = match astra_services::session_workspace::read_workspace_optional(&sid) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            ctx.show_info(format!(
+                "workspace.yaml is invalid; export omits workspace health metadata: {error}"
+            ));
+            None
+        }
+    };
+    let md = crate::cli::slash_session::build_export_markdown(&sid, workspace.as_ref(), &events);
     let now = chrono::Local::now();
     // Default path mirrors the legacy line-mode exporter so users
     // with scripts expecting that filename shape keep working.
@@ -3800,6 +3897,113 @@ mod split_sub_tests {
 }
 
 #[cfg(test)]
+mod stats_view_tests {
+    use super::build_recent_session_history_lines;
+    use astra_services::session_journal::{self, JournalDirGuard};
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
+    fn write_stats_session(session_id: &str) {
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(session_id),
+                1,
+                Some("gpt-5"),
+                "continue",
+                "restored",
+                0,
+                15,
+                7,
+                8,
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_recent_session_history_lines_surfaces_scan_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let broken_root = tmp.path().join("broken-sessions-root");
+        std::fs::write(&broken_root, "not-a-directory").unwrap();
+        let _guard = JournalDirGuard::new(&broken_root);
+
+        let error = build_recent_session_history_lines(10)
+            .expect_err("session scan failure should surface");
+
+        assert!(error.contains("failed to scan local sessions"), "{error}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_recent_session_history_lines_marks_unreadable_journals() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let good_session = format!("stats-good-{}", uuid::Uuid::new_v4());
+        let bad_session = format!("stats-bad-{}", uuid::Uuid::new_v4());
+        write_stats_session(&good_session);
+        std::fs::create_dir_all(session_journal::journal_file_path(&bad_session)).unwrap();
+
+        let rendered = build_recent_session_history_lines(10)
+            .expect("history lines should still render")
+            .join("\n");
+
+        assert!(rendered.contains("journal unreadable"), "{rendered}");
+        assert!(
+            rendered.contains("Skipped 1 unreadable journal"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Summary: 1 sessions"), "{rendered}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_recent_session_history_lines_surfaces_no_readable_sessions() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let bad_session = format!("stats-bad-only-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&bad_session)).unwrap();
+
+        let rendered = build_recent_session_history_lines(10)
+            .expect("history lines should still render")
+            .join("\n");
+
+        assert!(rendered.contains("journal unreadable"), "{rendered}");
+        assert!(
+            rendered.contains("Summary: no readable session data"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Skipped 1 unreadable journal"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_session_journal_for_stats_surfaces_directory_error() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("stats-dir-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
+
+        let error = crate::cli::session_stats_scan::read_session_journal_for_stats(&session_id)
+            .expect_err("directory journal path should fail to read");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod fmt_tokens_tests {
     use super::fmt_tokens;
 
@@ -3810,6 +4014,44 @@ mod fmt_tokens_tests {
         assert_eq!(fmt_tokens(1_200), "1.2k");
         assert_eq!(fmt_tokens(999_999), "1.0M");
         assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+}
+
+#[cfg(test)]
+mod session_hub_tests {
+    use super::session_hub_persistence_error;
+    use crate::cli::session_state::SessionState;
+    use astra_services::session_workspace::WorkspaceMetadata;
+
+    #[test]
+    fn session_hub_persistence_error_prefers_live_state() {
+        let state = SessionState {
+            session_persistence_error: Some("live commit failed".into()),
+            ..SessionState::default()
+        };
+        let mut ws = WorkspaceMetadata::new("sess-hub", "gpt-5");
+        ws.last_persistence_error = Some("stale workspace error".into());
+
+        assert_eq!(
+            session_hub_persistence_error(&state, Some(&ws)).as_deref(),
+            Some(
+                "degraded: live commit failed · live session can continue; resume/fork metadata may be stale until the next successful save"
+            )
+        );
+    }
+
+    #[test]
+    fn session_hub_persistence_error_falls_back_to_workspace_state() {
+        let state = SessionState::default();
+        let mut ws = WorkspaceMetadata::new("sess-hub", "gpt-5");
+        ws.last_persistence_error = Some("workspace write failed".into());
+
+        assert_eq!(
+            session_hub_persistence_error(&state, Some(&ws)).as_deref(),
+            Some(
+                "degraded: workspace write failed · live session can continue; resume/fork metadata may be stale until the next successful save"
+            )
+        );
     }
 }
 

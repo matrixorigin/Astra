@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::health_status_surface::api_probe_is_healthy;
 use crate::edge_tools;
 use astra_services::session_journal;
 
@@ -617,6 +618,16 @@ fn seq_for_event(
         .enumerate()
         .rfind(|(_, e)| (e.turn, e.ts.as_str()) == key)
         .map(|(i, _)| i as u32 + 1)
+}
+
+fn journal_seq_for_last_turn(
+    session_id: &str,
+    ev: &session_journal::JournalEvent,
+) -> Result<Option<u32>, String> {
+    let events = session_journal::read_journal(session_id)
+        .map_err(|error| format!("Failed to read session journal: {error}"))?;
+    let turns = collect_journal_turns(events);
+    Ok(seq_for_event(&turns, ev))
 }
 
 fn resolve_turn_pick(
@@ -1297,7 +1308,7 @@ pub(crate) async fn handle_info_command(
             .await
             .map_err(|f| f.error)?;
             if let Some(session_id) = sr.session_id.as_deref() {
-                crate::cli::chat_turn::initialize_journal_pub(state, session_id);
+                crate::cli::session_startup::initialize_journal_pub(state, session_id);
                 state.set_session_id(session_id.to_string());
             }
             state.last_response = Some(sr.full_text.clone());
@@ -1349,7 +1360,12 @@ pub(crate) async fn handle_info_command(
                     turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
                 }
                 state.last_turn_event = Some(turn_event.clone());
-                let _ = journal.append(&turn_event);
+                crate::cli::cli_utils::append_journal_event_or_warn(
+                    journal,
+                    state.session_id.as_deref(),
+                    &turn_event,
+                    "slash_info:inject_turn_event",
+                );
             }
         }
 
@@ -1408,7 +1424,7 @@ pub(crate) async fn handle_info_command(
                         .get("database")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
-                    let health_ok = status == "healthy" && database == "connected";
+                    let health_ok = api_probe_is_healthy(status, database);
                     rows.push((
                         health_ok,
                         "api health",
@@ -1813,16 +1829,16 @@ pub(crate) async fn handle_info_command(
 
             if pick == TurnPick::Last {
                 if let Some(ev) = state.last_turn_event.as_ref() {
-                    let seq = state
-                        .session_id
-                        .as_deref()
-                        .and_then(|sid| {
-                            session_journal::read_journal(sid).ok().map(|events| {
-                                let turns = collect_journal_turns(events);
-                                seq_for_event(&turns, ev)
-                            })
-                        })
-                        .flatten();
+                    let seq = match state.session_id.as_deref() {
+                        Some(sid) => match journal_seq_for_last_turn(sid, ev) {
+                            Ok(seq) => seq,
+                            Err(error) => {
+                                eprintln!("{}", format!("  {error}").yellow());
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     print_turn_trace(ev, seq);
                 } else if let Some(sid) = state.session_id.as_deref() {
                     match session_journal::read_journal(sid) {
@@ -1936,11 +1952,16 @@ pub(crate) async fn handle_info_command(
                     state.turn = 0;
                     state.last_response = None;
                     if let Some(ref j) = state.journal {
-                        let _ = j.append(&session_journal::JournalEvent::config_change(
+                        crate::cli::cli_utils::append_journal_event_or_warn(
+                            j,
                             state.session_id.as_deref(),
-                            "rewind",
-                            &format!("rewound to start, removed {old_len} turn(s)"),
-                        ));
+                            &session_journal::JournalEvent::config_change(
+                                state.session_id.as_deref(),
+                                "rewind",
+                                &format!("rewound to start, removed {old_len} turn(s)"),
+                            ),
+                            "slash_info:rewind_to_start",
+                        );
                     }
                     eprintln!(
                         "{}",
@@ -1962,13 +1983,18 @@ pub(crate) async fn handle_info_command(
                     state.turn = target as u32;
                     state.last_response = state.history.last().map(|(_, a)| a.clone());
                     if let Some(ref j) = state.journal {
-                        let _ = j.append(&session_journal::JournalEvent::config_change(
+                        crate::cli::cli_utils::append_journal_event_or_warn(
+                            j,
                             state.session_id.as_deref(),
-                            "rewind",
-                            &format!(
-                                "rewound from turn {old_len} to {target}, removed {removed} turn(s)"
+                            &session_journal::JournalEvent::config_change(
+                                state.session_id.as_deref(),
+                                "rewind",
+                                &format!(
+                                    "rewound from turn {old_len} to {target}, removed {removed} turn(s)"
+                                ),
                             ),
-                        ));
+                            "slash_info:rewind",
+                        );
                     }
                     eprintln!(
                         "{}",
@@ -2445,6 +2471,15 @@ fn print_cognition_view(state: &SessionState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalDirGuard;
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
 
     #[test]
     fn parse_grep_request_defaults_to_content_search() {
@@ -2697,5 +2732,29 @@ mod tests {
         );
         assert!(out.contains("pending_proposal : <none>"), "got: {out}");
         assert!(out.contains("skills_registered"), "got: {out}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn journal_seq_for_last_turn_surfaces_read_error() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("turn-seq-unreadable-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
+        let event = session_journal::JournalEvent::turn(
+            Some(&session_id),
+            1,
+            Some("gpt-5"),
+            "hello",
+            "world",
+            0,
+            10,
+            5,
+            5,
+        );
+
+        let error = journal_seq_for_last_turn(&session_id, &event)
+            .expect_err("directory journal path should surface an error");
+
+        assert!(error.contains("Failed to read session journal"), "{error}");
     }
 }

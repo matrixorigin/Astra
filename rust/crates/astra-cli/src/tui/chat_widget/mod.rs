@@ -25,11 +25,13 @@
 //! this module just provides the target API. Wire-up comes in
 //! step 3d.
 
+mod agent_control_surface;
 mod bridge;
 mod resume;
 #[cfg(test)]
 mod turn_driver;
 
+use self::agent_control_surface::{AgentControlOutcome, AgentControlSurface, CancelledStateUpdate};
 pub(crate) use bridge::{TurnContext, translate};
 pub(crate) use resume::load as load_resume;
 
@@ -1167,13 +1169,8 @@ impl ChatWidget {
         event_agent_id: Option<String>,
     ) {
         let parsed = output.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-        let agent_id = event_agent_id.or_else(|| {
-            parsed
-                .as_ref()
-                .and_then(|value| value.get("agent_id"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        });
+        let surface = AgentControlSurface::from_wire(&action, &status, parsed.as_ref());
+        let agent_id = event_agent_id.or_else(|| surface.agent_id().map(str::to_string));
         let provisional = provisional_agent_key(&tool_use_id);
         let fallback_key = if action == "agent" {
             tool_use_id.clone()
@@ -1204,28 +1201,17 @@ impl ChatWidget {
             self.agent_runs.ensure_running(key.clone(), label.clone());
         }
 
-        let parsed_status = parsed
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(|value| value.as_str());
-        let has_result = parsed
-            .as_ref()
-            .and_then(|value| value.get("result"))
-            .and_then(|value| value.as_str())
-            .is_some();
-        let legacy_terminal_result = parsed_status.is_none()
-            && (status != "success" || has_result || action == "get_result" || action == "agent");
-        if matches!(
-            parsed_status,
-            Some("completed" | "failed" | "timeout" | "cancelled")
-        ) || legacy_terminal_result
-        {
+        if surface.is_terminal() {
             self.cancelling_task_ids.remove(&key);
         }
-        if parsed_status == Some("cancelled") {
-            self.cancelled_task_ids.insert(key.clone());
-        } else if matches!(parsed_status, Some("completed" | "failed" | "timeout")) {
-            self.cancelled_task_ids.remove(&key);
+        match surface.cancelled_state_update() {
+            CancelledStateUpdate::Set => {
+                self.cancelled_task_ids.insert(key.clone());
+            }
+            CancelledStateUpdate::Clear => {
+                self.cancelled_task_ids.remove(&key);
+            }
+            CancelledStateUpdate::Preserve => {}
         }
 
         let Some(cell) = self.agent_runs.get_mut(&key) else {
@@ -1233,36 +1219,25 @@ impl ChatWidget {
         };
         cell.description = agent_id
             .as_deref()
-            .map(|id| {
-                agent_display_name(
-                    id,
-                    parsed.as_ref().and_then(|value| {
-                        value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| value.get("description").and_then(|v| v.as_str()))
-                    }),
-                )
-            })
+            .map(|id| agent_display_name(id, surface.display_name_hint()))
             .unwrap_or(label);
 
-        match parsed_status {
-            Some("completed") => {
-                complete_agent_cell(cell, duration_ms, parsed.as_ref(), None);
+        match surface.outcome() {
+            AgentControlOutcome::Completed => {
+                complete_agent_cell(cell, duration_ms, parsed.as_ref(), output);
             }
-            Some("failed") | Some("timeout") => {
-                let fallback = if parsed_status == Some("timeout") {
-                    "agent result timed out"
-                } else {
-                    "agent failed"
-                };
-                fail_agent_cell(cell, duration_ms, parsed.as_ref(), fallback);
+            AgentControlOutcome::Failed(_) => {
+                let failure_message = surface.failure_message();
+                fail_agent_cell(
+                    cell,
+                    duration_ms,
+                    parsed.as_ref(),
+                    failure_message.as_deref().unwrap_or("agent failed"),
+                );
             }
-            Some("cancelled") => {
-                let fallback = parsed
-                    .as_ref()
-                    .and_then(|value| value.get("reason"))
-                    .and_then(|value| value.as_str())
+            AgentControlOutcome::Cancelled => {
+                let fallback = surface
+                    .cancelled_reason()
                     .unwrap_or("agent cancelled")
                     .to_string();
                 cell.complete(
@@ -1272,10 +1247,10 @@ impl ChatWidget {
                     Some(fallback),
                 );
             }
-            Some("still_running") | Some("launched") => {
+            AgentControlOutcome::Running => {
                 cell.status = crate::tui::history_cell::task::TaskStatus::Running;
                 cell.duration_ms = None;
-                if let Some(preview) = agent_running_preview(parsed.as_ref()) {
+                if let Some(preview) = surface.running_preview() {
                     if cell
                         .output_summary
                         .as_deref()
@@ -1287,20 +1262,7 @@ impl ChatWidget {
                     }
                 }
             }
-            _ if status == "success"
-                && (has_result || action == "get_result" || action == "agent") =>
-            {
-                complete_agent_cell(cell, duration_ms, parsed.as_ref(), output);
-            }
-            _ if status != "success" => {
-                fail_agent_cell(
-                    cell,
-                    duration_ms,
-                    parsed.as_ref(),
-                    "agent control tool failed",
-                );
-            }
-            _ => {}
+            AgentControlOutcome::NoChange => {}
         }
     }
 
@@ -1821,40 +1783,10 @@ fn complete_agent_cell(
     parsed: Option<&serde_json::Value>,
     raw_output: Option<&str>,
 ) {
-    let result = parsed
-        .and_then(|value| value.get("result"))
-        .and_then(|value| value.as_str())
-        .or(raw_output)
-        .map(agent_result_preview);
+    let result =
+        crate::tui::agent_control_status::agent_control_result_output_summary(parsed, raw_output);
     let elapsed = cell.started_at.elapsed().as_millis() as u64;
     cell.complete("success", elapsed.max(duration_ms), result, None);
-}
-
-fn agent_running_preview(parsed: Option<&serde_json::Value>) -> Option<String> {
-    let value = parsed?;
-    match value.get("status").and_then(|v| v.as_str()) {
-        Some("still_running") => {
-            let current_status = value
-                .get("current_status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("running");
-            let waited = value
-                .get("waited_secs")
-                .and_then(|v| v.as_u64())
-                .map(|secs| format!(" after {secs}s"))
-                .unwrap_or_default();
-            let hint = value
-                .get("hint")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            Some(match hint {
-                Some(hint) => format!("Agent is {current_status}{waited}. {hint}"),
-                None => format!("Agent is {current_status}{waited}."),
-            })
-        }
-        Some("launched") => Some("Agent launched; waiting for get_result output.".to_string()),
-        _ => None,
-    }
 }
 
 const MAX_AGENT_LIVE_OUTPUT_CHARS: usize = 100_000;
@@ -1897,39 +1829,16 @@ fn fail_agent_cell(
     parsed: Option<&serde_json::Value>,
     fallback: &str,
 ) {
-    let error = parsed
-        .and_then(|value| value.get("error"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(fallback)
-        .to_string();
+    let output_summary =
+        crate::tui::agent_control_status::agent_control_result_output_summary(parsed, None);
+    let error = crate::tui::agent_control_status::agent_control_error_message(parsed, fallback);
     let elapsed = cell.started_at.elapsed().as_millis() as u64;
     cell.complete(
         "failed",
         elapsed.max(duration_ms),
-        Some(error.clone()),
+        output_summary.or_else(|| Some(error.clone())),
         Some(error),
     );
-}
-
-fn agent_result_preview(result: &str) -> String {
-    const MAX_LINES: usize = 80;
-    const MAX_CHARS: usize = 8_000;
-    let mut out = String::new();
-    for (idx, line) in result.lines().enumerate() {
-        if idx >= MAX_LINES || out.len() > MAX_CHARS {
-            out.push_str("\n…");
-            break;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    if out.is_empty() {
-        result.chars().take(MAX_CHARS).collect()
-    } else {
-        out
-    }
 }
 
 fn cell_kind(c: &dyn HistoryCell) -> CellKind {
@@ -2442,6 +2351,41 @@ mod tests {
             "turn complete must clear prior-turn cancelled ids: {:?}",
             w.cancelled_task_ids
         );
+    }
+
+    #[test]
+    fn legacy_completed_agent_result_clears_cancelled_tracking() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 10,
+            output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@abc"}"#.into()),
+            tool_use_id: "spawn-tu-legacy".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        assert!(w.cancelled_task_ids.contains("reviewer-A@abc"));
+
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "get_result".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 42,
+            output: Some(r#"{"agent_id":"reviewer-A@abc","result":"done"}"#.into()),
+            tool_use_id: "result-tu-legacy".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+
+        assert!(
+            !w.cancelled_task_ids.contains("reviewer-A@abc"),
+            "non-cancelled terminal result must clear stale cancelled tracking"
+        );
+        let detail = w.task_cell_anywhere("reviewer-A@abc").unwrap();
+        assert!(matches!(
+            detail.status,
+            crate::tui::history_cell::task::TaskStatus::Completed
+        ));
     }
 
     #[test]
@@ -3690,6 +3634,68 @@ mod tests {
         let output = detail.output_summary.as_deref().unwrap_or("");
         assert!(output.contains("live token"));
         assert!(output.contains("Agent is running after 120s. call again"));
+    }
+
+    #[test]
+    fn interrupted_get_result_marks_agent_failed_instead_of_completed() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+            name: "agent".into(),
+            description: "Get agent result: reviewer@abc12345".into(),
+            status: "success".into(),
+            duration_ms: 77,
+            output_summary: None,
+            output: Some(
+                r#"{"status":"interrupted","agent_id":"reviewer@abc12345","finish_reason":"budget_exhausted"}"#
+                    .into(),
+            ),
+            tool_use_id: "result-reviewer".into(),
+            parent_tool_use_id: None,
+        }));
+
+        let rows = w.agents_drilldown_rows(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "reviewer@abc12345");
+        assert_eq!(rows[0].status, AgentRowStatus::Failed);
+
+        let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
+        assert!(matches!(
+            detail.status,
+            crate::tui::history_cell::task::TaskStatus::Failed
+        ));
+        assert_eq!(
+            detail.error.as_deref(),
+            Some(crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR)
+        );
+    }
+
+    #[test]
+    fn interrupted_get_result_preserves_partial_result_text() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+            name: "agent".into(),
+            description: "Get agent result: reviewer@abc12345".into(),
+            status: "success".into(),
+            duration_ms: 77,
+            output_summary: None,
+            output: Some(
+                r#"{"status":"interrupted","agent_id":"reviewer@abc12345","result":"partial draft","finish_reason":"budget_exhausted"}"#
+                    .into(),
+            ),
+            tool_use_id: "result-reviewer".into(),
+            parent_tool_use_id: None,
+        }));
+
+        let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
+        assert!(matches!(
+            detail.status,
+            crate::tui::history_cell::task::TaskStatus::Failed
+        ));
+        assert_eq!(detail.output_summary.as_deref(), Some("partial draft"));
+        assert_eq!(
+            detail.error.as_deref(),
+            Some(crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR)
+        );
     }
 
     #[test]

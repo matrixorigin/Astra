@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;
+use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
 
@@ -104,7 +105,7 @@ impl ToolCell {
         output_summary: Option<String>,
         output: Option<String>,
     ) {
-        self.status = if status_str == "success" {
+        self.status = if tool_result_status_is_success(status_str) {
             ToolStatus::Success
         } else {
             ToolStatus::Failed
@@ -498,6 +499,13 @@ mod tests {
         assert_eq!(t.status, ToolStatus::Success);
         assert_eq!(t.duration_ms, Some(42));
         assert_eq!(t.output_summary.as_deref(), Some("3 entries"));
+    }
+
+    #[test]
+    fn complete_treats_ok_as_success() {
+        let mut t = ToolCell::new_running("bash", "ls");
+        t.complete("ok", 42, String::new(), Some("3 entries".into()), None);
+        assert_eq!(t.status, ToolStatus::Success);
     }
 
     #[test]

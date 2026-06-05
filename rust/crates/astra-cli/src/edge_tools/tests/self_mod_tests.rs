@@ -191,6 +191,64 @@ fn switching_to_session_without_workspace_clears_self_mod_preferences() {
     );
 }
 
+#[test]
+fn switching_to_session_with_corrupt_workspace_clears_self_mod_preferences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(tmp.path());
+    let source_session_id = "prefs-source-session".to_string();
+    let target_session_id = "prefs-corrupt-session".to_string();
+
+    let mut ws = session_workspace::WorkspaceMetadata::with_context(
+        &source_session_id,
+        "gpt-5.4",
+        "/repo",
+        Some("main"),
+    );
+    ws.pinned_tools = vec!["bash".to_string()];
+    ws.deprioritized_tools = vec!["web_fetch".to_string()];
+    session_workspace::write_workspace(&ws).unwrap();
+
+    let corrupt_workspace_dir = session_workspace::workspace_dir_for(&target_session_id);
+    std::fs::create_dir_all(&corrupt_workspace_dir).unwrap();
+    std::fs::write(
+        corrupt_workspace_dir.join("workspace.yaml"),
+        ":\nnot-valid-yaml",
+    )
+    .unwrap();
+
+    let session = std::sync::Arc::new(std::sync::RwLock::new(
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
+    ));
+    let exe = ToolExecutor::new(tmp.path())
+        .with_active_session_id(source_session_id)
+        .with_observability_session(session);
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(
+        model
+            .capabilities
+            .pinned_tools
+            .contains(&"bash".to_string())
+    );
+    assert!(
+        model
+            .capabilities
+            .deprioritized_tools
+            .contains(&"web_fetch".to_string())
+    );
+
+    exe.set_active_session_id(target_session_id);
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(
+        model.capabilities.pinned_tools.is_empty(),
+        "corrupt target workspace must not leak pinned tools from prior session"
+    );
+    assert!(
+        model.capabilities.deprioritized_tools.is_empty(),
+        "corrupt target workspace must not leak deprioritized tools from prior session"
+    );
+}
+
 #[tokio::test]
 async fn switching_sessions_clears_session_scoped_self_model_context() {
     let tmp = tempfile::tempdir().unwrap();

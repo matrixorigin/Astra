@@ -27,6 +27,8 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;
+use crate::cli::tool_result_status::tool_result_status_is_success;
+use crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskStatus {
@@ -54,8 +56,6 @@ pub(crate) enum ChildStatus {
     Success,
     Failed,
 }
-
-const GET_AGENT_RESULT_INTERRUPTED_ERROR: &str = "Parent turn budget was exhausted and cancelled the child agent before it returned a final result.";
 
 #[derive(Debug, Clone)]
 pub(crate) struct TaskCell {
@@ -115,7 +115,7 @@ impl TaskCell {
             .iter_mut()
             .find(|c| c.tool_use_id == tool_use_id)
         {
-            c.status = if status_str == "success" {
+            c.status = if tool_result_status_is_success(status_str) {
                 ChildStatus::Success
             } else {
                 ChildStatus::Failed
@@ -125,8 +125,8 @@ impl TaskCell {
     }
 
     /// Terminal transition for the parent task. `status_str` follows
-    /// the same wire convention as ToolCell: `"success"` = green,
-    /// anything else = failed.
+    /// the same shared tool-result convention as ToolCell:
+    /// `"ok"` / `"success"` = green, anything else = failed.
     pub fn complete(
         &mut self,
         status_str: &str,
@@ -134,7 +134,7 @@ impl TaskCell {
         output_summary: Option<String>,
         error: Option<String>,
     ) {
-        self.status = if status_str == "success" {
+        self.status = if tool_result_status_is_success(status_str) {
             TaskStatus::Completed
         } else {
             TaskStatus::Failed
@@ -152,7 +152,7 @@ impl TaskCell {
     pub(crate) fn is_interrupted_wait(&self) -> bool {
         self.status == TaskStatus::Failed
             && self.is_agent_result_wait()
-            && self.error.as_deref() == Some(GET_AGENT_RESULT_INTERRUPTED_ERROR)
+            && self.error.as_deref() == Some(AGENT_RESULT_INTERRUPTED_ERROR)
     }
 
     fn arrow(&self) -> Span<'static> {
@@ -361,7 +361,7 @@ impl HistoryCell for TaskCell {
             }
             if self.error.is_none() {
                 self.error = Some(if self.is_agent_result_wait() {
-                    GET_AGENT_RESULT_INTERRUPTED_ERROR.into()
+                    AGENT_RESULT_INTERRUPTED_ERROR.into()
                 } else {
                     "Task did not complete before the turn ended.".into()
                 });
@@ -460,12 +460,7 @@ mod tests {
         let normalized = out.replace('\n', " ");
         assert!(out.contains("Task interrupted"), "{out}");
         assert!(!out.contains("Task failed"), "{out}");
-        assert!(
-            normalized.contains(
-                "Parent turn budget was exhausted and cancelled the child agent before it returned a final result"
-            ),
-            "{out}"
-        );
+        assert!(normalized.contains(AGENT_RESULT_INTERRUPTED_ERROR), "{out}");
     }
 
     // ── Children ───────────────────────────────────────────────────
@@ -485,6 +480,14 @@ mod tests {
         t.push_child_completed("tu_a", "success", 55);
         assert_eq!(t.children[0].status, ChildStatus::Success);
         assert_eq!(t.children[0].duration_ms, Some(55));
+    }
+
+    #[test]
+    fn push_child_completed_treats_ok_as_success() {
+        let mut t = TaskCell::new_running("tu_parent", "wrap");
+        t.push_child_started("tu_a", "bash", "ls");
+        t.push_child_completed("tu_a", "ok", 55);
+        assert_eq!(t.children[0].status, ChildStatus::Success);
     }
 
     #[test]
@@ -519,6 +522,13 @@ mod tests {
         assert!(out.contains("Task done"), "missing completed label: {out}");
         assert!(out.contains("2.5s"), "missing duration: {out}");
         assert!(out.contains("3 files changed"), "missing summary: {out}");
+    }
+
+    #[test]
+    fn complete_treats_ok_as_completed() {
+        let mut t = TaskCell::new_running("tu_parent", "do work");
+        t.complete("ok", 2500, Some("3 files changed".into()), None);
+        assert_eq!(t.status, TaskStatus::Completed);
     }
 
     #[test]

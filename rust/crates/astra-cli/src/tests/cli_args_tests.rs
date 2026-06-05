@@ -1362,7 +1362,7 @@ fn format_project_instructions_wraps_in_tags() {
 fn build_effective_line_includes_project_instructions() {
     let mut state = SessionState::default();
     state.project_instructions = Some("Always use Rust.".to_string());
-    let result = chat_turn::build_effective_line(
+    let result = crate::cli::session_input::build_effective_line(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -1381,7 +1381,7 @@ fn build_effective_line_includes_project_instructions() {
 #[test]
 fn build_effective_line_no_instructions_when_none() {
     let state = SessionState::default();
-    let result = chat_turn::build_effective_line(
+    let result = crate::cli::session_input::build_effective_line(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,

@@ -11,6 +11,15 @@
 //! - `/agent help`: Show help
 
 use super::*;
+use crate::cli::delegation_event_surface::{
+    delegation_event_id, delegation_sub_run_detail, project_delegation_completed,
+    project_delegation_retry, project_delegation_started, project_delegation_sub_run_completed,
+    project_delegation_sub_run_started,
+};
+use crate::cli::run_status_surface::{
+    RunStatusKind, run_status_icon, run_status_is_active, run_status_is_done, run_status_is_failed,
+    run_status_kind,
+};
 use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
 use astra_services::session_journal::{self, JournalEventType};
 use astra_turn_core::delegation_tree::{AgentTreeNode, render_agent_forest};
@@ -114,7 +123,13 @@ pub async fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
 }
 
 fn show_history(ctx: &AgentCommandContext) {
-    let delegations = load_recent_delegations(ctx.session_id.as_deref());
+    let delegations = match load_recent_delegations(ctx.session_id.as_deref()) {
+        Ok(delegations) => delegations,
+        Err(error) => {
+            eprintln!("  {}", error.yellow());
+            return;
+        }
+    };
     if delegations.is_empty() {
         eprintln!(
             "\n  {}",
@@ -128,7 +143,7 @@ fn show_history(ctx: &AgentCommandContext) {
     for entry in &delegations {
         eprintln!(
             "  {} {} {} [{} ok / {} failed]",
-            sub_run_status_icon(&entry.status),
+            run_status_icon(&entry.status),
             entry.delegation_id.as_str().white().bold(),
             format!("[{}]", entry.pattern).dim(),
             entry.succeeded.to_string().green(),
@@ -146,7 +161,7 @@ fn show_history(ctx: &AgentCommandContext) {
         for sub_run in &entry.sub_runs {
             eprintln!(
                 "    {} {} {}",
-                sub_run_status_icon(&sub_run.status),
+                run_status_icon(&sub_run.status),
                 sub_run.agent_id.as_str().white().bold(),
                 format!("[{}]", sub_run.status).dim()
             );
@@ -171,9 +186,16 @@ async fn show_list(ctx: &AgentCommandContext) {
     let (active_agents, completed_agents): (Vec<_>, Vec<_>) = recent_agents
         .into_iter()
         .partition(|agent| !is_terminal_agent_status(&agent.status));
-    let delegations = load_recent_delegations(ctx.session_id.as_deref());
+    let (delegations, delegation_error) = match load_recent_delegations(ctx.session_id.as_deref()) {
+        Ok(delegations) => (delegations, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
-    if active_agents.is_empty() && completed_agents.is_empty() && delegations.is_empty() {
+    if active_agents.is_empty()
+        && completed_agents.is_empty()
+        && delegations.is_empty()
+        && delegation_error.is_none()
+    {
         eprintln!(
             "\n  {}",
             "🤖 No recent agents or delegations".magenta().bold()
@@ -195,6 +217,9 @@ async fn show_list(ctx: &AgentCommandContext) {
     if !delegations.is_empty() {
         print_delegation_section(&delegations);
     }
+    if let Some(error) = delegation_error {
+        eprintln!("\n  {}", error.yellow());
+    }
     eprintln!();
 }
 
@@ -204,9 +229,12 @@ async fn show_tree(ctx: &AgentCommandContext) {
     } else {
         Vec::new()
     };
-    let delegations = load_recent_delegations(ctx.session_id.as_deref());
+    let (delegations, delegation_error) = match load_recent_delegations(ctx.session_id.as_deref()) {
+        Ok(delegations) => (delegations, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
-    if agents.is_empty() && delegations.is_empty() {
+    if agents.is_empty() && delegations.is_empty() && delegation_error.is_none() {
         eprintln!(
             "\n  {}",
             "🌲 No agent or delegation tree available".magenta().bold()
@@ -235,6 +263,10 @@ async fn show_tree(ctx: &AgentCommandContext) {
         for line in render_delegation_tree(&delegations) {
             eprintln!("  {}", line);
         }
+    }
+    if let Some(error) = delegation_error {
+        eprintln!();
+        eprintln!("  {}", error.yellow());
     }
     eprintln!();
 }
@@ -324,10 +356,14 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
         return;
     }
 
-    if let Some(entry) = find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
-        let events = load_delegation_events(ctx.session_id.as_deref(), agent_id)
-            .map(|(_, events)| events)
-            .unwrap_or_default();
+    let delegation = match load_delegation_entry_with_events(ctx.session_id.as_deref(), agent_id) {
+        Ok(delegation) => delegation,
+        Err(error) => {
+            eprintln!("  {}", error.yellow());
+            return;
+        }
+    };
+    if let Some((entry, events)) = delegation {
         eprintln!(
             "\n  {} {}",
             "🤝 Delegation".magenta().bold(),
@@ -397,23 +433,27 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
 
             eprintln!();
         }
-        None => {
-            if let Some(entry) = find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
+        None => match find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
+            Ok(Some(entry)) => {
                 eprintln!(
-                    "  {}",
-                    format!(
-                        "Permissions are only tracked for spawned agents. Delegation '{}' is journal-backed; use /agent status or /agent logs.",
-                        entry.delegation_id
-                    )
-                    .yellow()
-                );
-            } else {
+                        "  {}",
+                        format!(
+                            "Permissions are only tracked for spawned agents. Delegation '{}' is journal-backed; use /agent status or /agent logs.",
+                            entry.delegation_id
+                        )
+                        .yellow()
+                    );
+            }
+            Ok(None) => {
                 eprintln!(
                     "  {}",
                     format!("Agent or delegation not found: {agent_id}").yellow()
                 );
             }
-        }
+            Err(error) => {
+                eprintln!("  {}", error.yellow());
+            }
+        },
     }
 }
 
@@ -461,20 +501,26 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
     // First check if agent exists
     let agent = spawner.get_agent_state_any(agent_id).await;
     if agent.is_none() {
-        if let Some(entry) = find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
-            eprintln!(
-                "  {}",
-                format!(
-                    "Delegation '{}' runs synchronously under its parent agent and cannot be stopped via /agent stop. Cancel the parent run while it is active instead.",
-                    entry.delegation_id
-                )
-                .yellow()
-            );
-        } else {
-            eprintln!(
-                "  {}",
-                format!("Agent or delegation not found: {agent_id}").yellow()
-            );
+        match find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
+            Ok(Some(entry)) => {
+                eprintln!(
+                    "  {}",
+                    format!(
+                        "Delegation '{}' runs synchronously under its parent agent and cannot be stopped via /agent stop. Cancel the parent run while it is active instead.",
+                        entry.delegation_id
+                    )
+                    .yellow()
+                );
+            }
+            Ok(None) => {
+                eprintln!(
+                    "  {}",
+                    format!("Agent or delegation not found: {agent_id}").yellow()
+                );
+            }
+            Err(error) => {
+                eprintln!("  {}", error.yellow());
+            }
         }
         return;
     }
@@ -512,9 +558,9 @@ async fn show_watch(ctx: &AgentCommandContext) {
         .as_ref()
         .map(|spawner| spawner.subscribe_progress());
     let throttle_interval = Duration::from_millis(500);
-    let mut last_snapshot = build_watch_snapshot(
+    let mut last_snapshot = build_watch_snapshot_for_session(
         &load_watch_agents(spawner_clone.as_ref()).await,
-        &load_recent_delegations(ctx.session_id.as_deref()),
+        ctx.session_id.as_deref(),
     );
     print_watch_snapshot(&last_snapshot);
 
@@ -534,8 +580,13 @@ async fn show_watch(ctx: &AgentCommandContext) {
 
 async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
     let Some(ref spawner) = ctx.spawner else {
-        if show_delegation_logs(ctx.session_id.as_deref(), agent_id) {
-            return;
+        match show_delegation_logs(ctx.session_id.as_deref(), agent_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("  {}", error.yellow());
+                return;
+            }
         }
         eprintln!("  {}", "No agent spawner available.".dim());
         return;
@@ -546,8 +597,13 @@ async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
         None
     };
     if agent.is_none() {
-        if show_delegation_logs(ctx.session_id.as_deref(), agent_id) {
-            return;
+        match show_delegation_logs(ctx.session_id.as_deref(), agent_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("  {}", error.yellow());
+                return;
+            }
         }
         eprintln!(
             "  {}",
@@ -572,12 +628,7 @@ async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
                 if event.agent_id == target_agent_id {
                     print_progress_event(&event);
 
-                    if matches!(
-                        event.event_type,
-                        astra_runtime::orchestration::ProgressEventType::Completed { .. }
-                            | astra_runtime::orchestration::ProgressEventType::Failed { .. }
-                            | astra_runtime::orchestration::ProgressEventType::Cancelled { .. }
-                    ) {
+                    if progress_event_ends_log_stream(&event.event_type) {
                         break;
                     }
                 }
@@ -595,9 +646,26 @@ async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
     eprintln!();
 }
 
-fn show_delegation_logs(session_id: Option<&str>, query: &str) -> bool {
-    let Some((delegation_id, events)) = load_delegation_events(session_id, query) else {
-        return false;
+fn progress_event_ends_log_stream(
+    event_type: &astra_runtime::orchestration::ProgressEventType,
+) -> bool {
+    event_type.is_terminal()
+}
+
+fn progress_event_should_refresh_watch_snapshot(
+    event_type: &astra_runtime::orchestration::ProgressEventType,
+) -> bool {
+    event_type.is_terminal()
+        || matches!(
+            event_type,
+            astra_runtime::orchestration::ProgressEventType::AgentSpawned { .. }
+                | astra_runtime::orchestration::ProgressEventType::PermissionDenied { .. }
+        )
+}
+
+fn show_delegation_logs(session_id: Option<&str>, query: &str) -> Result<bool, String> {
+    let Some((delegation_id, events)) = load_delegation_events(session_id, query)? else {
+        return Ok(false);
     };
     eprintln!(
         "\n  {} {}\n",
@@ -607,105 +675,53 @@ fn show_delegation_logs(session_id: Option<&str>, query: &str) -> bool {
     for event in events {
         match event.event_type {
             JournalEventType::DelegationStarted => {
-                let pattern = event
-                    .metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get("pattern"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?");
-                let count = event
-                    .metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get("agent_count"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
+                let projection = project_delegation_started(event.metadata.as_ref());
                 eprintln!(
                     "  [{}] {} started {} ({} agents)",
                     event.ts.dim(),
                     "▶".green(),
-                    pattern,
-                    count
+                    projection.pattern,
+                    projection.agent_count
                 );
             }
             JournalEventType::DelegationRetry => {
-                let metadata = event.metadata.as_ref();
-                let agent_id = metadata
-                    .and_then(|meta| meta.get("agent_id"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?");
-                let attempt = metadata
-                    .and_then(|meta| meta.get("attempt"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                let reason = metadata
-                    .and_then(|meta| meta.get("reason"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
+                let projection = project_delegation_retry(event.metadata.as_ref());
                 eprintln!(
                     "  [{}] {} {} retry #{} — {}",
                     event.ts.dim(),
                     "↻".yellow(),
-                    agent_id,
-                    attempt,
-                    reason
+                    projection.agent_id,
+                    projection.attempt,
+                    projection.reason
                 );
             }
             JournalEventType::DelegationSubRunCompleted => {
-                let metadata = event.metadata.as_ref();
-                let agent_id = metadata
-                    .and_then(|meta| meta.get("agent_id"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?");
-                let status = metadata
-                    .and_then(|meta| meta.get("status"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?");
-                let output_preview = metadata
-                    .and_then(|meta| meta.get("output_preview"))
-                    .and_then(|value| value.as_str());
-                let error = metadata
-                    .and_then(|meta| meta.get("error"))
-                    .and_then(|value| value.as_str());
+                let projection = project_delegation_sub_run_completed(event.metadata.as_ref());
                 eprintln!(
                     "  [{}] {} {} [{}]",
                     event.ts.dim(),
-                    sub_run_status_icon(status),
-                    agent_id,
-                    status
+                    run_status_icon(&projection.status),
+                    projection.agent_id,
+                    projection.status
                 );
-                if let Some(preview) = output_preview {
+                if let Some(preview) = projection.output_preview.as_deref() {
                     eprintln!("      {}", preview.magenta());
                 }
-                if let Some(error) = error {
+                if let Some(error) = projection.error.as_deref() {
                     eprintln!("      {}", error.red());
                 }
             }
             JournalEventType::DelegationCompleted => {
-                let metadata = event.metadata.as_ref();
-                let status = metadata
-                    .and_then(|meta| meta.get("aggregated_status"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?");
-                let succeeded = metadata
-                    .and_then(|meta| meta.get("succeeded"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                let failed = metadata
-                    .and_then(|meta| meta.get("failed"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                let preview = metadata
-                    .and_then(|meta| meta.get("aggregated_output_preview"))
-                    .and_then(|value| value.as_str());
+                let projection = project_delegation_completed(event.metadata.as_ref());
                 eprintln!(
                     "  [{}] {} completed [{} ok / {} failed, status={}]",
                     event.ts.dim(),
-                    sub_run_status_icon(status),
-                    succeeded,
-                    failed,
-                    status
+                    run_status_icon(&projection.aggregated_status),
+                    projection.succeeded,
+                    projection.failed,
+                    projection.aggregated_status
                 );
-                if let Some(preview) = preview {
+                if let Some(preview) = projection.aggregated_output_preview.as_deref() {
                     eprintln!("      {}", preview.magenta());
                 }
             }
@@ -713,7 +729,7 @@ fn show_delegation_logs(session_id: Option<&str>, query: &str) -> bool {
         }
     }
     eprintln!();
-    true
+    Ok(true)
 }
 
 fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent) {
@@ -763,6 +779,22 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
                 total_tool_calls,
                 duration_ms,
                 result_summary
+            )
+        }
+        ProgressEventType::Interrupted {
+            reason,
+            partial_summary,
+            total_tool_calls,
+            duration_ms,
+            ..
+        } => {
+            format!(
+                "{} ({} tools, {}ms): {} [{}]",
+                "⏸ Interrupted".yellow(),
+                total_tool_calls,
+                duration_ms,
+                partial_summary,
+                reason
             )
         }
         ProgressEventType::Failed { error } => format!("{} {}", "✗ Failed:".red(), error),
@@ -991,7 +1023,7 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
     for entry in entries {
         eprintln!(
             "  {} {} {} [{} ok / {} failed]",
-            sub_run_status_icon(&entry.status),
+            run_status_icon(&entry.status),
             entry.delegation_id.as_str().white().bold(),
             format!("[{}]", entry.pattern).dim(),
             entry.succeeded.to_string().green(),
@@ -1025,12 +1057,12 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
         let done_count = entry
             .sub_runs
             .iter()
-            .filter(|s| s.status == "completed" || s.status == "partial")
+            .filter(|s| run_status_is_done(&s.status))
             .count();
         let failed_count = entry
             .sub_runs
             .iter()
-            .filter(|s| s.status == "failed" || s.status == "cancelled")
+            .filter(|s| run_status_is_failed(&s.status))
             .count();
         let total = entry.total_sub_runs.max(entry.sub_runs.len());
         let progress = if total > 0 {
@@ -1045,7 +1077,7 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
 
         lines.push(format!(
             "{} {} [{}{}]{}{}",
-            sub_run_status_icon(&entry.status),
+            run_status_icon(&entry.status),
             entry.delegation_id,
             entry.pattern,
             if entry.retry_count > 0 {
@@ -1073,7 +1105,7 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
             lines.push(format!(
                 "{} {} {} [{}]",
                 branch,
-                sub_run_status_icon(&sub_run.status),
+                run_status_icon(&sub_run.status),
                 sub_run.agent_id,
                 sub_run_tree_label(sub_run)
             ));
@@ -1122,7 +1154,6 @@ async fn wait_for_watch_snapshot_change(
     last_snapshot: &str,
     poll_interval: std::time::Duration,
 ) -> String {
-    use astra_runtime::orchestration::ProgressEventType;
     use tokio::sync::broadcast::error::RecvError;
 
     let mut interval = tokio::time::interval(poll_interval);
@@ -1131,14 +1162,7 @@ async fn wait_for_watch_snapshot_change(
             _ = interval.tick() => true,
             event = recv_watch_event(rx) => {
                 match event {
-                    Ok(event) => matches!(
-                        event.event_type,
-                        ProgressEventType::AgentSpawned { .. }
-                            | ProgressEventType::Completed { .. }
-                            | ProgressEventType::Failed { .. }
-                            | ProgressEventType::Cancelled { .. }
-                            | ProgressEventType::PermissionDenied { .. }
-                    ),
+                    Ok(event) => progress_event_should_refresh_watch_snapshot(&event.event_type),
                     Err(RecvError::Lagged(_)) => true,
                     Err(RecvError::Closed) => {
                         *rx = None;
@@ -1150,10 +1174,8 @@ async fn wait_for_watch_snapshot_change(
         if !should_refresh {
             continue;
         }
-        let snapshot = build_watch_snapshot(
-            &load_watch_agents(spawner).await,
-            &load_recent_delegations(session_id),
-        );
+        let snapshot =
+            build_watch_snapshot_for_session(&load_watch_agents(spawner).await, session_id);
         if snapshot != last_snapshot {
             return snapshot;
         }
@@ -1175,17 +1197,17 @@ fn build_watch_snapshot(
         let done_subruns: usize = delegations
             .iter()
             .flat_map(|d| &d.sub_runs)
-            .filter(|s| s.status == "completed" || s.status == "partial")
+            .filter(|s| run_status_is_done(&s.status))
             .count();
         let failed_subruns: usize = delegations
             .iter()
             .flat_map(|d| &d.sub_runs)
-            .filter(|s| s.status == "failed" || s.status == "cancelled")
+            .filter(|s| run_status_is_failed(&s.status))
             .count();
         let running_subruns: usize = delegations
             .iter()
             .flat_map(|d| &d.sub_runs)
-            .filter(|s| s.status == "running" || s.status == "created")
+            .filter(|s| run_status_is_active(&s.status))
             .count();
 
         let mut summary_parts = vec![format!("{} delegations", delegations.len())];
@@ -1228,6 +1250,21 @@ fn build_watch_snapshot(
     lines.join("\n")
 }
 
+fn build_watch_snapshot_for_session(
+    agents: &[astra_runtime::orchestration::SpawnedAgentInfo],
+    session_id: Option<&str>,
+) -> String {
+    match load_recent_delegations(session_id) {
+        Ok(delegations) => build_watch_snapshot(agents, &delegations),
+        Err(error) => {
+            let mut snapshot = build_watch_snapshot(agents, &[]);
+            snapshot.push_str("\n\n");
+            snapshot.push_str(&format!("  warning: {error}"));
+            snapshot
+        }
+    }
+}
+
 fn print_watch_snapshot(snapshot: &str) {
     eprint!("\x1b[2J\x1b[H");
     eprintln!("  {}", "🌲 Agent Delegation Tree".magenta().bold());
@@ -1239,18 +1276,6 @@ fn print_watch_snapshot(snapshot: &str) {
     eprintln!();
     for line in snapshot.lines() {
         eprintln!("  {}", line);
-    }
-}
-
-fn sub_run_status_icon(status: &str) -> &'static str {
-    match status {
-        "created" => "⏳",
-        "running" => "🔄",
-        "completed" => "✅",
-        "partial" => "🟡",
-        "failed" => "❌",
-        "cancelled" => "🛑",
-        _ => "⑂",
     }
 }
 
@@ -1294,23 +1319,22 @@ fn sub_run_tree_label(sub_run: &DelegationSubRunSummary) -> String {
     label
 }
 
-fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEntry> {
-    let Some(session_id) = session_id else {
-        return Vec::new();
-    };
-    let Ok(events) = session_journal::read_journal(session_id) else {
-        return Vec::new();
-    };
+fn read_session_journal_events(
+    session_id: &str,
+) -> Result<Vec<session_journal::JournalEvent>, String> {
+    session_journal::read_journal(session_id)
+        .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))
+}
+
+fn collect_recent_delegations(
+    events: &[session_journal::JournalEvent],
+) -> Vec<DelegationHistoryEntry> {
     let mut delegations: HashMap<String, DelegationHistoryEntry> = HashMap::new();
-    for (idx, event) in events.into_iter().enumerate() {
-        let Some(metadata) = event.metadata else {
+    for (idx, event) in events.iter().enumerate() {
+        let Some(metadata) = event.metadata.as_ref() else {
             continue;
         };
-        let Some(delegation_id) = metadata
-            .get("delegation_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-        else {
+        let Some(delegation_id) = delegation_event_id(Some(metadata)) else {
             continue;
         };
         let entry =
@@ -1324,54 +1348,23 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
         entry.last_seen_index = idx;
         match event.event_type {
             JournalEventType::DelegationStarted => {
-                entry.parent_run_id = metadata
-                    .get("parent_run_id")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string);
-                entry.pattern = metadata
-                    .get("pattern")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                entry.agent_ids = metadata
-                    .get("agent_ids")
-                    .and_then(|value| value.as_array())
-                    .map(|ids| {
-                        ids.iter()
-                            .filter_map(|value| value.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                entry.total_sub_runs = metadata
-                    .get("agent_count")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
+                let projection = project_delegation_started(Some(metadata));
+                entry.parent_run_id = projection.parent_run_id;
+                entry.pattern = projection.pattern;
+                entry.agent_ids = projection.agent_ids;
+                entry.total_sub_runs = projection.agent_count;
                 if entry.status.is_empty() {
                     entry.status = "running".to_string();
                 }
             }
             JournalEventType::DelegationSubRunStarted => {
-                let sub_run_id = metadata
-                    .get("sub_run_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let started = project_delegation_sub_run_started(Some(metadata));
+                let sub_run_id = started.sub_run_id.clone();
                 let started = DelegationSubRunSummary {
                     sub_run_id: sub_run_id.clone(),
-                    agent_id: metadata
-                        .get("agent_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    status: metadata
-                        .get("status")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("running")
-                        .to_string(),
-                    retry_of: metadata
-                        .get("retry_of")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string),
+                    agent_id: started.agent_id,
+                    status: started.status,
+                    retry_of: started.retry_of,
                     attempt: 1,
                     retry_reason: None,
                     error: None,
@@ -1393,34 +1386,17 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
                 }
             }
             JournalEventType::DelegationSubRunCompleted => {
-                let sub_run_id = metadata
-                    .get("sub_run_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let projection = project_delegation_sub_run_completed(Some(metadata));
+                let sub_run_id = projection.sub_run_id.clone();
                 let sub_run = DelegationSubRunSummary {
                     sub_run_id: sub_run_id.clone(),
-                    agent_id: metadata
-                        .get("agent_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    status: metadata
-                        .get("status")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
+                    agent_id: projection.agent_id,
+                    status: projection.status,
                     retry_of: None,
                     attempt: 1,
                     retry_reason: None,
-                    error: metadata
-                        .get("error")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string),
-                    output_preview: metadata
-                        .get("output_preview")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string),
+                    error: projection.error,
+                    output_preview: projection.output_preview,
                 };
                 if let Some(existing) = entry
                     .sub_runs
@@ -1434,31 +1410,13 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
             }
             JournalEventType::DelegationRetry => {
                 entry.retry_count = entry.retry_count.saturating_add(1);
+                let projection = project_delegation_retry(Some(metadata));
                 let retry = DelegationRetrySummary {
-                    original_run_id: metadata
-                        .get("original_run_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    retry_run_id: metadata
-                        .get("retry_run_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    agent_id: metadata
-                        .get("agent_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    attempt: metadata
-                        .get("attempt")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(2) as u32,
-                    reason: metadata
-                        .get("reason")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    original_run_id: projection.original_run_id,
+                    retry_run_id: projection.retry_run_id,
+                    agent_id: projection.agent_id,
+                    attempt: projection.attempt,
+                    reason: projection.reason,
                 };
                 if let Some(existing) = entry
                     .retries
@@ -1474,33 +1432,17 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
                 }
             }
             JournalEventType::DelegationCompleted => {
-                entry.pattern = metadata
-                    .get("pattern")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                entry.total_sub_runs = metadata
-                    .get("total_sub_runs")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(entry.total_sub_runs as u64)
-                    as usize;
-                entry.succeeded = metadata
-                    .get("succeeded")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
-                entry.failed = metadata
-                    .get("failed")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
-                entry.status = metadata
-                    .get("aggregated_status")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                entry.aggregated_output_preview = metadata
-                    .get("aggregated_output_preview")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string);
+                let projection = project_delegation_completed(Some(metadata));
+                entry.pattern = projection.pattern;
+                entry.total_sub_runs = if projection.total_sub_runs == 0 {
+                    entry.total_sub_runs
+                } else {
+                    projection.total_sub_runs
+                };
+                entry.succeeded = projection.succeeded;
+                entry.failed = projection.failed;
+                entry.status = projection.aggregated_status;
+                entry.aggregated_output_preview = projection.aggregated_output_preview;
             }
             _ => {}
         }
@@ -1513,50 +1455,77 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
     entries
 }
 
-fn find_delegation_entry(session_id: Option<&str>, query: &str) -> Option<DelegationHistoryEntry> {
-    load_recent_delegations(session_id)
+fn load_recent_delegations(
+    session_id: Option<&str>,
+) -> Result<Vec<DelegationHistoryEntry>, String> {
+    let Some(session_id) = session_id else {
+        return Ok(Vec::new());
+    };
+    let events = read_session_journal_events(session_id)?;
+    Ok(collect_recent_delegations(&events))
+}
+
+fn load_delegation_entry_with_events(
+    session_id: Option<&str>,
+    query: &str,
+) -> Result<Option<(DelegationHistoryEntry, Vec<session_journal::JournalEvent>)>, String> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let events = read_session_journal_events(session_id)?;
+    let Some(entry) = collect_recent_delegations(&events)
         .into_iter()
         .find(|entry| entry.delegation_id == query || entry.delegation_id.starts_with(query))
+    else {
+        return Ok(None);
+    };
+    let delegation_id = entry.delegation_id.clone();
+    let filtered = events
+        .into_iter()
+        .filter(|event| {
+            delegation_event_id(event.metadata.as_ref()).as_deref() == Some(delegation_id.as_str())
+        })
+        .collect();
+    Ok(Some((entry, filtered)))
+}
+
+fn find_delegation_entry(
+    session_id: Option<&str>,
+    query: &str,
+) -> Result<Option<DelegationHistoryEntry>, String> {
+    Ok(load_recent_delegations(session_id)?
+        .into_iter()
+        .find(|entry| entry.delegation_id == query || entry.delegation_id.starts_with(query)))
 }
 
 fn load_delegation_events(
     session_id: Option<&str>,
     query: &str,
-) -> Option<(String, Vec<session_journal::JournalEvent>)> {
-    let session_id = session_id?;
-    let delegation_id = find_delegation_entry(Some(session_id), query)?.delegation_id;
-    let Ok(events) = session_journal::read_journal(session_id) else {
-        return None;
-    };
-    let filtered: Vec<_> = events
-        .into_iter()
-        .filter(|event| {
-            event.metadata.as_ref().is_some_and(|metadata| {
-                metadata
-                    .get("delegation_id")
-                    .and_then(|value| value.as_str())
-                    == Some(delegation_id.as_str())
-            })
-        })
-        .collect();
-    Some((delegation_id, filtered))
+) -> Result<Option<(String, Vec<session_journal::JournalEvent>)>, String> {
+    Ok(load_delegation_entry_with_events(session_id, query)?
+        .map(|(entry, events)| (entry.delegation_id, events)))
 }
 
 fn delegation_parent_lifecycle_note(status: &str) -> &'static str {
-    match status {
-        "running" => {
+    match run_status_kind(status) {
+        RunStatusKind::Running => {
             "Parent agent is paused while delegated sub-runs execute and wait for aggregation."
         }
-        "completed" => {
+        RunStatusKind::Completed => {
             "Delegated sub-runs finished and the parent agent can continue from the aggregated result below."
         }
-        "partial" | "partial_failure" => {
+        RunStatusKind::Unfinished => {
+            "Delegated sub-runs yielded unfinished results (waiting/paused); no final aggregate was produced."
+        }
+        RunStatusKind::Partial
+        | RunStatusKind::CompletedWithConflicts
+        | RunStatusKind::CompletedOverBudget => {
             "Delegated sub-runs finished with failures; the parent agent can continue, but review the failed sub-runs below."
         }
-        "failed" => {
+        RunStatusKind::Failed | RunStatusKind::Timeout => {
             "Delegation failed before a clean aggregate was produced; review the lifecycle and failures below."
         }
-        "cancelled" => {
+        RunStatusKind::Cancelled | RunStatusKind::Interrupted => {
             "Delegation was cancelled before aggregation completed; the parent agent cannot use a final delegated result."
         }
         _ => {
@@ -1574,91 +1543,51 @@ fn truncate_display(text: &str, limit: usize) -> String {
 }
 
 fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Option<String> {
-    let metadata = event.metadata.as_ref()?;
     match event.event_type {
         JournalEventType::DelegationStarted => {
-            let pattern = metadata
-                .get("pattern")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let count = metadata
-                .get("agent_count")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
+            let projection = project_delegation_started(event.metadata.as_ref());
             Some(format!(
                 "[{}] ▶ started {} ({} agents)",
-                event.ts, pattern, count
+                event.ts, projection.pattern, projection.agent_count
             ))
         }
         JournalEventType::DelegationSubRunStarted => {
-            let agent_id = metadata
-                .get("agent_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let sub_run_id = metadata
-                .get("sub_run_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let retry_suffix = metadata
-                .get("retry_of")
-                .and_then(|value| value.as_str())
+            let projection = project_delegation_sub_run_started(event.metadata.as_ref());
+            let retry_suffix = projection
+                .retry_of
+                .as_deref()
                 .map(|retry_of| format!(" (retry of {})", retry_of))
                 .unwrap_or_default();
             Some(format!(
                 "[{}] ↳ {} running {}{}",
-                event.ts, agent_id, sub_run_id, retry_suffix
+                event.ts, projection.agent_id, projection.sub_run_id, retry_suffix
             ))
         }
         JournalEventType::DelegationRetry => {
-            let agent_id = metadata
-                .get("agent_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let attempt = metadata
-                .get("attempt")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let reason = metadata
-                .get("reason")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
+            let projection = project_delegation_retry(event.metadata.as_ref());
             Some(format!(
                 "[{}] ↻ {} retry #{}{}",
                 event.ts,
-                agent_id,
-                attempt,
-                if reason.is_empty() {
+                projection.agent_id,
+                projection.attempt,
+                if projection.reason.is_empty() {
                     String::new()
                 } else {
-                    format!(" — {reason}")
+                    format!(" — {}", projection.reason)
                 }
             ))
         }
         JournalEventType::DelegationSubRunCompleted => {
-            let agent_id = metadata
-                .get("agent_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let status = metadata
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let detail = metadata
-                .get("error")
-                .and_then(|value| value.as_str())
-                .or_else(|| {
-                    metadata
-                        .get("output_preview")
-                        .and_then(|value| value.as_str())
-                })
+            let projection = project_delegation_sub_run_completed(event.metadata.as_ref());
+            let detail = delegation_sub_run_detail(&projection)
                 .map(|msg| truncate_display(msg, 120))
                 .unwrap_or_default();
             Some(format!(
                 "[{}] {} {} [{}]{}",
                 event.ts,
-                sub_run_status_icon(status),
-                agent_id,
-                status,
+                run_status_icon(&projection.status),
+                projection.agent_id,
+                projection.status,
                 if detail.is_empty() {
                     String::new()
                 } else {
@@ -1667,30 +1596,19 @@ fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Optio
             ))
         }
         JournalEventType::DelegationCompleted => {
-            let status = metadata
-                .get("aggregated_status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let succeeded = metadata
-                .get("succeeded")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let failed = metadata
-                .get("failed")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let preview = metadata
-                .get("aggregated_output_preview")
-                .and_then(|value| value.as_str())
+            let projection = project_delegation_completed(event.metadata.as_ref());
+            let preview = projection
+                .aggregated_output_preview
+                .as_deref()
                 .map(|msg| truncate_display(msg, 120))
                 .unwrap_or_default();
             Some(format!(
                 "[{}] {} completed [{} ok / {} failed, status={}]{}",
                 event.ts,
-                sub_run_status_icon(status),
-                succeeded,
-                failed,
-                status,
+                run_status_icon(&projection.aggregated_status),
+                projection.succeeded,
+                projection.failed,
+                projection.aggregated_status,
                 if preview.is_empty() {
                     String::new()
                 } else {
@@ -1744,7 +1662,7 @@ fn render_delegation_status_lines(
         for line in preview.lines() {
             lines.push(format!("  {}", line));
         }
-    } else if entry.status == "running" {
+    } else if run_status_is_active(&entry.status) {
         lines
             .push("  Waiting for aggregated output; the parent agent is still paused.".to_string());
     } else {
@@ -1757,9 +1675,7 @@ fn render_delegation_status_lines(
     let failed_sub_runs: Vec<_> = entry
         .sub_runs
         .iter()
-        .filter(|sub_run| {
-            sub_run.status == "failed" || sub_run.status == "cancelled" || sub_run.error.is_some()
-        })
+        .filter(|sub_run| run_status_is_failed(&sub_run.status) || sub_run.error.is_some())
         .collect();
     if !failed_sub_runs.is_empty() {
         lines.push(String::new());
@@ -1767,7 +1683,7 @@ fn render_delegation_status_lines(
         for sub_run in failed_sub_runs {
             lines.push(format!(
                 "  {} {} [{}]",
-                sub_run_status_icon(&sub_run.status),
+                run_status_icon(&sub_run.status),
                 sub_run.agent_id,
                 sub_run.status
             ));
@@ -1825,7 +1741,7 @@ fn render_delegation_status_lines(
         for sub_run in &entry.sub_runs {
             let mut header = format!(
                 "  {} {} [{}]",
-                sub_run_status_icon(&sub_run.status),
+                run_status_icon(&sub_run.status),
                 sub_run.agent_id,
                 sub_run.status
             );
@@ -1862,7 +1778,7 @@ fn delegation_final_preview(entry: &DelegationHistoryEntry) -> Option<String> {
     let successful_outputs: Vec<_> = entry
         .sub_runs
         .iter()
-        .filter(|sub_run| sub_run.status == "completed")
+        .filter(|sub_run| run_status_surface::run_status_is_completed(&sub_run.status))
         .filter_map(|sub_run| sub_run.output_preview.as_ref())
         .collect();
     if successful_outputs.len() == 1 {
@@ -1880,10 +1796,18 @@ mod tests {
         SpawnAgentInput, SpawnContext, SpawnedAgentInfo, SpawnedAgentMetrics,
     };
     use astra_runtime::server::delegation::engine::DelegationTracker;
-    use astra_services::session_journal::JournalEvent;
+    use astra_services::session_journal::{JournalDirGuard, JournalEvent};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::SystemTime;
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
 
     fn make_agent(agent_id: &str, run_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
         SpawnedAgentInfo {
@@ -1994,7 +1918,7 @@ mod tests {
             ))
             .unwrap();
 
-        let delegations = load_recent_delegations(Some(&sid));
+        let delegations = load_recent_delegations(Some(&sid)).unwrap();
         assert_eq!(delegations.len(), 1);
         assert_eq!(delegations[0].delegation_id, "del-1");
         assert_eq!(delegations[0].parent_run_id.as_deref(), Some("run-parent"));
@@ -2058,7 +1982,9 @@ mod tests {
             ))
             .unwrap();
 
-        let (delegation_id, events) = load_delegation_events(Some(&sid), "del-log").unwrap();
+        let (delegation_id, events) = load_delegation_events(Some(&sid), "del-log")
+            .unwrap()
+            .unwrap();
         assert_eq!(delegation_id, "del-logs");
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].event_type, JournalEventType::DelegationRetry);
@@ -2090,12 +2016,36 @@ mod tests {
             ))
             .unwrap();
 
-        let delegations = load_recent_delegations(Some(&sid));
+        let delegations = load_recent_delegations(Some(&sid)).unwrap();
         assert_eq!(delegations.len(), 1);
         assert_eq!(delegations[0].status, "running");
         assert_eq!(delegations[0].sub_runs.len(), 1);
         assert_eq!(delegations[0].sub_runs[0].sub_run_id, "run-1");
         assert_eq!(delegations[0].sub_runs[0].status, "running");
+    }
+
+    #[test]
+    fn load_recent_delegations_surfaces_unreadable_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = format!("slash-agent-unreadable-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
+        let error = load_recent_delegations(Some(&sid))
+            .expect_err("directory journal path should surface an error");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
+    }
+
+    #[test]
+    fn load_delegation_events_surfaces_unreadable_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = format!("slash-agent-events-unreadable-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
+        let error = load_delegation_events(Some(&sid), "del-1")
+            .expect_err("directory journal path should surface an error");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
     }
 
     #[test]
@@ -2201,6 +2151,20 @@ mod tests {
     }
 
     #[test]
+    fn build_watch_snapshot_for_session_surfaces_unreadable_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = format!("slash-agent-watch-unreadable-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
+        let snapshot = build_watch_snapshot_for_session(&[], Some(&sid));
+
+        assert!(
+            snapshot.contains("warning: failed to read session journal"),
+            "{snapshot}"
+        );
+    }
+
+    #[test]
     fn render_delegation_status_lines_highlights_parent_wait_and_failures() {
         let entry = DelegationHistoryEntry {
             delegation_id: "del-1".to_string(),
@@ -2295,6 +2259,83 @@ mod tests {
         assert!(rendered.contains("single-agent final answer"));
     }
 
+    #[test]
+    fn delegation_parent_lifecycle_note_uses_shared_run_status_taxonomy() {
+        assert!(
+            delegation_parent_lifecycle_note("unfinished").contains("yielded unfinished results")
+        );
+        assert!(
+            delegation_parent_lifecycle_note("partial_failure").contains("finished with failures")
+        );
+        assert!(
+            delegation_parent_lifecycle_note("completed_over_budget")
+                .contains("finished with failures")
+        );
+        assert!(
+            delegation_parent_lifecycle_note("interrupted")
+                .contains("cancelled before aggregation completed")
+        );
+    }
+
+    #[test]
+    fn render_delegation_status_lines_handles_legacy_and_interrupted_statuses() {
+        let entry = DelegationHistoryEntry {
+            delegation_id: "del-legacy".to_string(),
+            parent_run_id: Some("run-parent".to_string()),
+            pattern: "fan_out".to_string(),
+            agent_ids: vec!["coder".to_string(), "reviewer".to_string()],
+            total_sub_runs: 2,
+            succeeded: 1,
+            failed: 1,
+            retry_count: 0,
+            status: "partial_failure".to_string(),
+            aggregated_output_preview: Some("partial aggregate".to_string()),
+            retries: vec![],
+            sub_runs: vec![
+                DelegationSubRunSummary {
+                    sub_run_id: "run-1".to_string(),
+                    agent_id: "coder".to_string(),
+                    status: "completed".to_string(),
+                    retry_of: None,
+                    attempt: 1,
+                    retry_reason: None,
+                    error: None,
+                    output_preview: Some("ok".to_string()),
+                },
+                DelegationSubRunSummary {
+                    sub_run_id: "run-2".to_string(),
+                    agent_id: "reviewer".to_string(),
+                    status: "interrupted".to_string(),
+                    retry_of: None,
+                    attempt: 1,
+                    retry_reason: None,
+                    error: Some("cancelled by parent".to_string()),
+                    output_preview: None,
+                },
+            ],
+            last_seen_index: 0,
+        };
+        let events = vec![JournalEvent::delegation_completed(
+            Some("sid"),
+            "del-legacy",
+            "fan_out",
+            2,
+            1,
+            1,
+            "interrupted",
+            None,
+        )];
+
+        let rendered = render_delegation_status_lines(&entry, &events).join("\n");
+
+        assert!(rendered.contains("Status: partial_failure"));
+        assert!(rendered.contains("finished with failures"));
+        assert!(rendered.contains("partial aggregate"));
+        assert!(rendered.contains("reviewer [interrupted]"));
+        assert!(rendered.contains("cancelled by parent"));
+        assert!(rendered.contains("status=interrupted"));
+    }
+
     #[tokio::test]
     async fn wait_for_watch_snapshot_change_detects_spawned_agent_events() {
         let transport = Arc::new(InProcessTransport::new());
@@ -2380,5 +2421,21 @@ mod tests {
 
         assert!(snapshot.contains("Journal-backed delegations (1)"));
         assert!(snapshot.contains("del-watch"));
+    }
+
+    #[test]
+    fn progress_event_helpers_treat_interrupted_as_terminal_refresh() {
+        use astra_runtime::orchestration::ProgressEventType;
+
+        let interrupted = ProgressEventType::Interrupted {
+            reason: "budget_exhausted".to_string(),
+            partial_summary: "partial".to_string(),
+            total_tool_calls: 1,
+            total_tokens: (2, 3),
+            duration_ms: 4,
+        };
+
+        assert!(progress_event_ends_log_stream(&interrupted));
+        assert!(progress_event_should_refresh_watch_snapshot(&interrupted));
     }
 }

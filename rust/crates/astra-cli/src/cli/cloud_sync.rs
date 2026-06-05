@@ -15,7 +15,7 @@ use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
-use super::chat_turn::enqueue_ingestion_pub;
+use super::session_side_effects::enqueue_ingestion_pub;
 use crate::{ExplainMode, SessionState};
 
 /// Result from cloud pull attempt at session start.
@@ -259,9 +259,21 @@ pub(crate) fn append_cloud_pull_sync_journal(
         reachable_empty_ack,
     );
     let Ok(writer) = session_journal::JournalWriter::new(sid) else {
+        tracing::warn!(
+            session_id = sid,
+            context = "cloud_sync:cloud_pull_sync_marker",
+            "failed to open session journal for cloud pull sync marker"
+        );
         return;
     };
-    if writer.append(&evt).is_ok() {
+    if let Err(error) = writer.append(&evt) {
+        tracing::warn!(
+            session_id = sid,
+            context = "cloud_sync:cloud_pull_sync_marker",
+            ?error,
+            "failed to append session journal event"
+        );
+    } else {
         enqueue_ingestion_pub(state, &evt);
     }
 }

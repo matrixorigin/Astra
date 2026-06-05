@@ -3,7 +3,10 @@
 //! Extracted from `command_router.rs` as part of the god-module refactor (P0-2).
 
 use super::cli_args::{ConfigCmd, ConfigVersionCmd};
-use super::cli_utils::validated_resumable_last_session_id;
+use super::cli_utils::{
+    persist_profile_last_session_or_warn, validate_cli_session_id,
+    validated_resumable_last_session_id,
+};
 use super::theme;
 use crossterm::style::Stylize;
 
@@ -98,13 +101,42 @@ pub(crate) async fn resolve_remote_session_id(
     profile: Option<&str>,
     requested: Option<&str>,
 ) -> Result<String, String> {
+    resolve_optional_remote_session_id(api, profile, requested)
+        .await?
+        .ok_or_else(|| {
+            "No session id provided and no recent resumable session is available".to_string()
+        })
+}
+
+pub(crate) async fn resolve_optional_remote_session_id(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    requested: Option<&str>,
+) -> Result<Option<String>, String> {
     match requested.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(session_id) => Ok(session_id.to_string()),
-        None => validated_resumable_last_session_id(api, profile)
-            .await
-            .ok_or_else(|| {
-                "No session id provided and no recent resumable session is available".to_string()
-            }),
+        Some(session_id) => {
+            validate_cli_session_id(session_id)?;
+            Ok(Some(session_id.to_string()))
+        }
+        None => {
+            if let Some(session_id) = validated_resumable_last_session_id(api, profile).await {
+                return Ok(Some(session_id));
+            }
+
+            let sessions =
+                crate::cli::session_restore_client::list_cloud_resumable_sessions(profile, api)
+                    .await?;
+            if let Some(session) = sessions.into_iter().find(|session| session.turn_count > 0) {
+                persist_profile_last_session_or_warn(
+                    profile,
+                    &session.session_id,
+                    "config_manager:resolve_optional_remote_session_id",
+                );
+                return Ok(Some(session.session_id));
+            }
+
+            Ok(None)
+        }
     }
 }
 
@@ -181,6 +213,217 @@ pub(crate) async fn execute_config_command(cmd: ConfigCmd) -> Result<(), String>
         ConfigCmd::Set(args) => config_set(&args.key, &args.value),
         ConfigCmd::ShowPolicy(args) => config_show_policy(args.model.as_deref(), args.json),
         ConfigCmd::Version(sub) => config_version_dispatch(sub).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
+    use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    async fn mock_cloud_resumable_list(
+        server: &MockServer,
+        sessions: &[astra_services::session_restore::RestoredSession],
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/sessions/resumable"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                astra_services::session_restore::ResumableSessionsResponse {
+                    sessions: sessions.to_vec(),
+                    limit: 20,
+                },
+            ))
+            .mount(server)
+            .await;
+    }
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_remote_session_id_falls_back_to_cloud_resumable_list() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let session_id = "88888888-8888-8888-8888-888888888888";
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        mock_cloud_resumable_list(
+            &server,
+            &[astra_services::session_restore::RestoredSession {
+                session_id: session_id.to_string(),
+                turn_count: 3,
+                last_status: "active".to_string(),
+                restored_from_cloud: true,
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = resolve_remote_session_id(&api, None, None)
+            .await
+            .expect("cloud resumable session");
+
+        assert_eq!(resolved, session_id);
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(session_id)
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_remote_session_id_prefers_validated_last_session_pointer() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let session_id = format!("cfg-live-{}", uuid::Uuid::new_v4());
+
+        let writer = JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some(&session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(&session_id),
+                1,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 1,
+                    "turns_completed": 1,
+                    "remaining_turns": 4,
+                }),
+            ))
+            .unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                last_session_id: Some(session_id.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = resolve_remote_session_id(&api, None, None)
+            .await
+            .expect("validated session pointer");
+
+        assert_eq!(resolved, session_id);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_remote_session_id_errors_when_no_remote_session_available() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+
+        mock_cloud_resumable_list(&server, &[]).await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = resolve_remote_session_id(&api, None, None)
+            .await
+            .expect_err("no remote session should error");
+
+        assert!(error.contains("No session id provided"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_optional_remote_session_id_returns_none_when_no_remote_session_available() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+
+        mock_cloud_resumable_list(&server, &[]).await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = resolve_optional_remote_session_id(&api, None, None)
+            .await
+            .expect("optional resolver should not error");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_remote_session_id_rejects_invalid_requested_session_id() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = resolve_remote_session_id(&api, None, Some("../escape"))
+            .await
+            .expect_err("invalid session id must fail before any remote call");
+
+        assert!(error.contains("invalid session_id"), "{error}");
     }
 }
 

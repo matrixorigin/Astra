@@ -11,7 +11,7 @@ pub(crate) fn suggest_followup(
     let trimmed = line.trim();
     if trimmed.is_empty()
         || trimmed.starts_with('/')
-        || super::chat_turn::is_short_continuation_prompt(trimmed)
+        || astra_turn_core::chat_turn_heuristics::is_short_continuation_prompt(trimmed)
         || state.plan_mode_active()
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
@@ -40,6 +40,7 @@ mod tests {
         StreamResult {
             session_id: None,
             run_id: None,
+            session_persistence_error: None,
             full_text: full_text.to_string(),
             prompt_tokens: 0,
             completion_tokens: 0,

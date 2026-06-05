@@ -206,7 +206,7 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_res, StatusCode::OK, "resume session: {resm}");
     assert_eq!(
-        resm["status"].as_str(),
+        resm["last_status"].as_str(),
         Some("active"),
         "resume response: {resm}"
     );

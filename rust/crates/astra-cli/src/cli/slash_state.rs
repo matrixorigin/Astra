@@ -9,6 +9,24 @@ pub(crate) struct StateCommandContext<'a> {
     pub(crate) token: Option<&'a str>,
 }
 
+fn append_state_journal_event_or_warn(
+    state: &SessionState,
+    event: &session_journal::JournalEvent,
+    context: &'static str,
+) {
+    let Some(journal) = state.journal.as_ref() else {
+        return;
+    };
+    if let Err(error) = journal.append(event) {
+        tracing::warn!(
+            %error,
+            session_id = ?state.session_id,
+            context,
+            "failed to append slash-state journal event"
+        );
+    }
+}
+
 /// Bundled context for building compact-related `ChatTurnParams`.
 ///
 /// Eliminates the 9-parameter sponge that `compact_turn_params` previously required.
@@ -111,6 +129,22 @@ struct CompactArgs {
     no_memoria: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualCompactPlan {
+    PrefixTurns { trimmed_count: usize },
+    SingleTurnInPlace,
+}
+
+#[derive(Clone)]
+struct HistoryEditSnapshot {
+    history: Vec<(String, String)>,
+    redo_stack: Vec<(String, String, u32)>,
+    turn: u32,
+    last_response: Option<String>,
+    continuation_anchor: Option<String>,
+    recent_tools: Vec<String>,
+}
+
 fn parse_compact_args(arg: &str) -> CompactArgs {
     let mut parsed = CompactArgs {
         quick: false,
@@ -138,6 +172,32 @@ fn cap_swap_body(swap_body: String) -> String {
     }
 }
 
+fn build_swap_memory_body(
+    swapped_turns: &[(String, String)],
+    trimmed_count: usize,
+) -> Option<String> {
+    let mut swap_lines: Vec<String> = Vec::new();
+    for (user_msg, assistant_msg) in swapped_turns {
+        if !user_msg.is_empty() {
+            let preview: String = user_msg.chars().take(100).collect();
+            swap_lines.push(format!("U: {preview}"));
+        }
+        if !assistant_msg.is_empty() {
+            let preview: String = assistant_msg.chars().take(150).collect();
+            swap_lines.push(format!("A: {preview}"));
+        }
+    }
+    if swap_lines.is_empty() {
+        return None;
+    }
+
+    let tier_label = "compact_history";
+    Some(cap_swap_body(format!(
+        "Turns 1-{trimmed_count} swapped out [{tier_label}]:\n{}",
+        swap_lines.join("\n")
+    )))
+}
+
 fn compact_mem_note(
     no_memoria: bool,
     saved_to_memoria: bool,
@@ -159,6 +219,170 @@ fn compact_mem_note(
     } else {
         String::new()
     }
+}
+
+impl HistoryEditSnapshot {
+    fn capture(state: &SessionState) -> Self {
+        Self {
+            history: state.history.clone(),
+            redo_stack: state.redo_stack.clone(),
+            turn: state.turn,
+            last_response: state.last_response.clone(),
+            continuation_anchor: state.continuation_anchor.clone(),
+            recent_tools: state.recent_tools.clone(),
+        }
+    }
+
+    fn restore(self, state: &mut SessionState) {
+        state.history = self.history;
+        state.redo_stack = self.redo_stack;
+        state.turn = self.turn;
+        state.last_response = self.last_response;
+        state.continuation_anchor = self.continuation_anchor;
+        state.recent_tools = self.recent_tools;
+    }
+}
+
+fn plan_manual_compaction(
+    total_turns: usize,
+    keep_recent_turns: usize,
+) -> Option<ManualCompactPlan> {
+    let keep_recent_turns = keep_recent_turns.max(1);
+    match total_turns {
+        0 => None,
+        1 => Some(ManualCompactPlan::SingleTurnInPlace),
+        total if total > keep_recent_turns => Some(ManualCompactPlan::PrefixTurns {
+            trimmed_count: total.saturating_sub(keep_recent_turns),
+        }),
+        total => Some(ManualCompactPlan::PrefixTurns {
+            trimmed_count: total.saturating_sub(1),
+        }),
+    }
+}
+
+async fn persist_history_edit_state(state: &mut SessionState, action: &str) -> Result<(), String> {
+    crate::cli::session_recovery::sync_recovery_snapshot_after_history_edit(state)
+        .await
+        .map_err(|error| {
+            format!(
+                "{action} updated live context but failed to refresh resume/fork state: {error}"
+            )
+        })
+}
+
+fn append_history_edit_rollback_error(
+    message: &mut String,
+    label: &str,
+    result: Result<(), String>,
+) {
+    if let Err(error) = result {
+        message.push_str(&format!("; {label}: {error}"));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UndoFileRevertError {
+    message: String,
+    rollback_failed: bool,
+}
+
+fn apply_undo_file_reverts(
+    state: &SessionState,
+    undone_turns: &[u32],
+) -> Result<Vec<String>, UndoFileRevertError> {
+    let journal = state
+        .file_journal
+        .lock()
+        .map_err(|error| UndoFileRevertError {
+            message: format!("lock file journal: {error}"),
+            rollback_failed: false,
+        })?;
+    let mut reverted_paths = Vec::new();
+    let mut reverted_turns = Vec::new();
+
+    for &turn_index in undone_turns {
+        match journal.undo_turn_transactional(turn_index) {
+            Ok(paths) => {
+                reverted_paths.extend(paths.into_iter().map(|path| path.display().to_string()));
+                reverted_turns.push(turn_index);
+            }
+            Err(error) => {
+                let mut error_message =
+                    format!("revert workspace files for turn {turn_index}: {error}");
+                let mut rollback_failed = error.contains("; rollback file ");
+                for reverted_turn in reverted_turns.iter().rev() {
+                    let rollback_result = journal
+                        .restore_turn_transactional(*reverted_turn)
+                        .map(|_| ());
+                    if rollback_result.is_err() {
+                        rollback_failed = true;
+                    }
+                    append_history_edit_rollback_error(
+                        &mut error_message,
+                        &format!("restore workspace files for turn {reverted_turn}"),
+                        rollback_result,
+                    );
+                }
+                return Err(UndoFileRevertError {
+                    message: error_message,
+                    rollback_failed,
+                });
+            }
+        }
+    }
+
+    Ok(reverted_paths)
+}
+
+fn rollback_undo_file_reverts(state: &SessionState, undone_turns: &[u32]) -> Result<(), String> {
+    let journal = state
+        .file_journal
+        .lock()
+        .map_err(|error| format!("lock file journal for rollback: {error}"))?;
+    let mut rollback_error = String::new();
+
+    for turn_index in undone_turns.iter().rev() {
+        append_history_edit_rollback_error(
+            &mut rollback_error,
+            &format!("restore workspace files for turn {turn_index}"),
+            journal.restore_turn_transactional(*turn_index).map(|_| ()),
+        );
+    }
+
+    if rollback_error.is_empty() {
+        Ok(())
+    } else {
+        Err(rollback_error.trim_start_matches("; ").to_string())
+    }
+}
+
+fn handle_undo_persist_failure(
+    state: &mut SessionState,
+    snapshot: HistoryEditSnapshot,
+    undone_turns: &[u32],
+    error_message: String,
+) -> String {
+    let mut error_message = error_message;
+    let persist_rollback_failed = error_message.contains("rollback failed");
+    let rollback_result = rollback_undo_file_reverts(state, undone_turns);
+    let file_rollback_failed = rollback_result.is_err();
+    append_history_edit_rollback_error(
+        &mut error_message,
+        "restore workspace files after failed /undo persist",
+        rollback_result,
+    );
+    if file_rollback_failed {
+        error_message.push_str(
+            "; kept /undo in live memory because workspace files did not fully roll back",
+        );
+        state.session_persistence_error = Some(error_message.clone());
+    } else {
+        snapshot.restore(state);
+        if persist_rollback_failed {
+            state.session_persistence_error = Some(error_message.clone());
+        }
+    }
+    error_message
 }
 
 pub(crate) async fn handle_state_command(
@@ -189,23 +413,21 @@ pub(crate) async fn handle_state_command(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             if let Some(sid) = &new_sid {
-                let _ = persist_profile_last_session(profile, sid);
+                persist_profile_last_session_or_warn(
+                    profile,
+                    sid,
+                    "slash_state:clear_starts_fresh_session",
+                );
             }
-            state.session_id = new_sid.clone();
-            state.turn = 0;
-            state.run_id = None;
-            state.csl_manager = None;
-            state.history.clear();
-            state.total_prompt_tokens = 0;
-            state.total_completion_tokens = 0;
+            state.prepare_for_session_rebind().await;
+            state.reset_for_new_session();
             if let Some(ref sid) = new_sid {
-                state.journal = session_journal::JournalWriter::new(sid).ok();
-                if let Some(ref j) = state.journal {
-                    let _ = j.append(&session_journal::JournalEvent::session_start(
-                        Some(sid),
-                        state.model.as_deref(),
-                    ));
-                }
+                state.set_session_id(sid.clone());
+            } else {
+                state.clear_session_id();
+            }
+            if let Some(ref sid) = new_sid {
+                crate::cli::session_startup::initialize_journal_pub(state, sid);
             }
             let display = new_sid.as_deref().unwrap_or("(none)");
             eprintln!(
@@ -264,9 +486,10 @@ pub(crate) async fn handle_state_command(
                     }
                 }
             };
+            let snapshot = HistoryEditSnapshot::capture(state);
             let actual = count.min(state.history.len());
             let mut undone_previews = Vec::new();
-            let mut file_reverts: Vec<String> = Vec::new();
+            let mut undone_turns = Vec::new();
             for _ in 0..actual {
                 if let Some((user_msg, assistant_msg)) = state.history.pop() {
                     let preview: String = user_msg.chars().take(50).collect();
@@ -276,14 +499,8 @@ pub(crate) async fn handle_state_command(
                         preview
                     };
                     undone_previews.push(preview);
-                    // Revert file changes for this turn
                     let turn_index = state.turn;
-                    if let Ok(journal) = state.file_journal.lock() {
-                        let result = journal.undo_turn(turn_index);
-                        for path in &result.reverted {
-                            file_reverts.push(path.display().to_string());
-                        }
-                    }
+                    undone_turns.push(turn_index);
                     // Save to redo stack
                     state.redo_stack.push((user_msg, assistant_msg, state.turn));
                     state.turn = state.turn.saturating_sub(1);
@@ -291,9 +508,35 @@ pub(crate) async fn handle_state_command(
             }
             state.last_response = state.history.last().map(|(_, resp)| resp.clone());
             state.continuation_anchor = None;
-            if let Some(ref mut mgr) = state.csl_manager {
-                let _ = mgr.reset().await;
+            let file_reverts = match apply_undo_file_reverts(state, &undone_turns) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    let message = format!("/undo failed: {}", error.message);
+                    if error.rollback_failed {
+                        state.session_persistence_error = Some(message.clone());
+                    } else {
+                        snapshot.restore(state);
+                    }
+                    return Err(message);
+                }
+            };
+            if let Err(error) = persist_history_edit_state(state, "/undo").await {
+                return Err(handle_undo_persist_failure(
+                    state,
+                    snapshot,
+                    &undone_turns,
+                    error,
+                ));
             }
+            append_state_journal_event_or_warn(
+                state,
+                &session_journal::JournalEvent::config_change(
+                    state.session_id.as_deref(),
+                    "undo",
+                    &actual.to_string(),
+                ),
+                "slash_state:undo",
+            );
             if actual == 1 {
                 eprintln!(
                     "  {} Undid 1 turn: {}",
@@ -324,13 +567,6 @@ pub(crate) async fn handle_state_command(
                     if state.redo_stack.len() == 1 { "" } else { "s" }
                 );
             }
-            if let Some(ref j) = state.journal {
-                let _ = j.append(&session_journal::JournalEvent::config_change(
-                    state.session_id.as_deref(),
-                    "undo",
-                    &actual.to_string(),
-                ));
-            }
         }
 
         "/redo" => {
@@ -356,6 +592,7 @@ pub(crate) async fn handle_state_command(
                     }
                 }
             };
+            let snapshot = HistoryEditSnapshot::capture(state);
             let actual = count.min(state.redo_stack.len());
             let mut redone_previews = Vec::new();
             for _ in 0..actual {
@@ -374,6 +611,19 @@ pub(crate) async fn handle_state_command(
                 }
             }
             state.continuation_anchor = None;
+            if let Err(error) = persist_history_edit_state(state, "/redo").await {
+                snapshot.restore(state);
+                return Err(error);
+            }
+            append_state_journal_event_or_warn(
+                state,
+                &session_journal::JournalEvent::config_change(
+                    state.session_id.as_deref(),
+                    "redo",
+                    &actual.to_string(),
+                ),
+                "slash_state:redo",
+            );
             if actual == 1 {
                 eprintln!(
                     "  {} Redid 1 turn: {}",
@@ -394,13 +644,6 @@ pub(crate) async fn handle_state_command(
                     if state.redo_stack.len() == 1 { "" } else { "s" }
                 );
             }
-            if let Some(ref j) = state.journal {
-                let _ = j.append(&session_journal::JournalEvent::config_change(
-                    state.session_id.as_deref(),
-                    "redo",
-                    &actual.to_string(),
-                ));
-            }
         }
 
         "/explain" => {
@@ -418,18 +661,20 @@ pub(crate) async fn handle_state_command(
             if matches!(state.explain, ExplainMode::On) {
                 eprintln!("{}", "  (verbose: selector + skill lines on stderr)".dim());
             }
-            if let Some(ref j) = state.journal {
-                let explain_val = match state.explain {
-                    ExplainMode::Off => "off",
-                    ExplainMode::On => "on",
-                    ExplainMode::Verbose => "verbose",
-                };
-                let _ = j.append(&session_journal::JournalEvent::config_change(
+            let explain_val = match state.explain {
+                ExplainMode::Off => "off",
+                ExplainMode::On => "on",
+                ExplainMode::Verbose => "verbose",
+            };
+            append_state_journal_event_or_warn(
+                state,
+                &session_journal::JournalEvent::config_change(
                     state.session_id.as_deref(),
                     "explain",
                     explain_val,
-                ));
-            }
+                ),
+                "slash_state:explain",
+            );
         }
 
         "/verbose" => {
@@ -440,10 +685,18 @@ pub(crate) async fn handle_state_command(
             if state.history.is_empty() {
                 eprintln!(
                     "  {}",
-                    "Nothing to compact — no conversation history yet.".dim()
+                    "Nothing to compact: this session has no conversation turns yet.".yellow()
                 );
                 return Ok(());
             }
+            let keep_recent = state.context_budget.keep_recent_turns;
+            let total = state.history.len();
+            let compact_plan = plan_manual_compaction(total, keep_recent)
+                .expect("non-empty history should produce a compaction plan");
+            let trimmed_count = match compact_plan {
+                ManualCompactPlan::PrefixTurns { trimmed_count } => trimmed_count,
+                ManualCompactPlan::SingleTurnInPlace => 1,
+            };
             let compact_args = parse_compact_args(arg);
             let Some(tok) = token else {
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
@@ -460,7 +713,7 @@ pub(crate) async fn handle_state_command(
 
             // ── Micro-compact: reduce input tokens before LLM summary call ──
             let pre_messages = {
-                let mut msgs = crate::cli::chat_turn::history_as_messages(&state.history);
+                let mut msgs = crate::cli::session_projection::history_as_messages(&state.history);
                 let limit = astra_runtime::prompts::budget_for_model(state.model.as_deref())
                     .effective_input_limit() as u64;
                 let budget = TokenBudget {
@@ -601,78 +854,74 @@ pub(crate) async fn handle_state_command(
                 }
             }
 
-            // Truncate history: align with ContextBudget (same as auto-compact)
-            let keep_recent = state.context_budget.keep_recent_turns;
-            let total = state.history.len();
-            let trimmed_count = total.saturating_sub(keep_recent);
-            if trimmed_count > 0 {
-                // ── Context swap: store trimmed turns to memory for later retrieval ──
-                if let Some(tok) = token {
-                    if !compact_args.no_memoria {
-                        // Build a compact representation of the swapped turns
-                        let mut swap_lines: Vec<String> = Vec::new();
-                        for (user_msg, assistant_msg) in &state.history[..trimmed_count] {
-                            if !user_msg.is_empty() {
-                                let preview: String = user_msg.chars().take(100).collect();
-                                swap_lines.push(format!("U: {preview}"));
-                            }
-                            if !assistant_msg.is_empty() {
-                                let preview: String = assistant_msg.chars().take(150).collect();
-                                swap_lines.push(format!("A: {preview}"));
-                            }
-                        }
-                        if !swap_lines.is_empty() {
-                            let tier_label = "compact_history";
-                            let swap_body = format!(
-                                "Turns 1-{trimmed_count} swapped out [{tier_label}]:\n{}",
-                                swap_lines.join("\n")
-                            );
-                            let capped = cap_swap_body(swap_body);
-                            let swap_entry = prompts::memory_proto::MemoryEntry::new(
-                                prompts::memory_proto::NS_SWAP,
-                                prompts::memory_proto::ST_ARCHIVED,
-                                &capped,
-                            );
-                            // Use same compact metadata for consistent traceability
-                            let swap_meta =
-                                prompts::memory_proto::EntryMeta::from_session_with_tier(
-                                    state.session_id.as_deref(),
-                                    state.turn,
-                                    prompts::memory_proto::SRC_COMPACT,
-                                    prompts::memory_proto::TIER_UNVERIFIED,
-                                );
-                            let _ = api
-                                .post_memory_store_json(
-                                    tok,
-                                    &swap_entry.to_store_payload_with_meta(&swap_meta),
-                                )
-                                .await;
-                        }
+            let snapshot = HistoryEditSnapshot::capture(state);
+            // Rewrite history to reflect the compacted conversation.
+            // Manual `/compact` is explicit user intent, so it must do useful work even when
+            // the session is still inside `keep_recent_turns` (for example a single giant turn).
+            // We preserve the latest raw turn when possible; for a single-turn session we keep
+            // the user request and replace only the assistant side with a summary.
+            // ── Context swap: store compacted turns to memory for later retrieval ──
+            if let Some(tok) = token {
+                if !compact_args.no_memoria {
+                    if let Some(capped) = build_swap_memory_body(
+                        &state.history[..trimmed_count.min(total)],
+                        trimmed_count,
+                    ) {
+                        let swap_entry = prompts::memory_proto::MemoryEntry::new(
+                            prompts::memory_proto::NS_SWAP,
+                            prompts::memory_proto::ST_ARCHIVED,
+                            &capped,
+                        );
+                        // Use same compact metadata for consistent traceability
+                        let swap_meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
+                            state.session_id.as_deref(),
+                            state.turn,
+                            prompts::memory_proto::SRC_COMPACT,
+                            prompts::memory_proto::TIER_UNVERIFIED,
+                        );
+                        let _ = api
+                            .post_memory_store_json(
+                                tok,
+                                &swap_entry.to_store_payload_with_meta(&swap_meta),
+                            )
+                            .await;
                     }
                 }
-
-                let anchor = if compact_args.no_memoria {
-                    None
-                } else {
-                    crate::cli::chat_turn::fetch_compact_memory_anchor_snippet(
-                        api,
-                        tok,
-                        state.session_id.as_deref(),
-                        &summary,
-                    )
-                    .await
-                };
-                let assistant_text = crate::cli::chat_turn::compact_assistant_message(
-                    trimmed_count,
-                    &summary,
-                    anchor.as_deref(),
-                );
-                let context_entry = (String::new(), assistant_text);
-                let mut new_hist = vec![context_entry];
-                new_hist.extend_from_slice(&state.history[trimmed_count..]);
-                state.history = new_hist;
-                state.recent_tools.clear();
             }
+
+            let anchor = if compact_args.no_memoria {
+                None
+            } else {
+                crate::cli::session_compaction::fetch_compact_memory_anchor_snippet(
+                    api,
+                    tok,
+                    state.session_id.as_deref(),
+                    &summary,
+                )
+                .await
+            };
+            let assistant_text = crate::cli::session_compaction::compact_assistant_message(
+                trimmed_count,
+                &summary,
+                anchor.as_deref(),
+            );
+            match compact_plan {
+                ManualCompactPlan::PrefixTurns { trimmed_count } => {
+                    let context_entry = (String::new(), assistant_text);
+                    let mut new_hist = vec![context_entry];
+                    new_hist.extend_from_slice(&state.history[trimmed_count..]);
+                    state.history = new_hist;
+                }
+                ManualCompactPlan::SingleTurnInPlace => {
+                    let original_user = state
+                        .history
+                        .first()
+                        .map(|(user, _)| user.clone())
+                        .unwrap_or_default();
+                    state.history = vec![(original_user, assistant_text)];
+                }
+            }
+            state.recent_tools.clear();
 
             let mem_note = compact_mem_note(
                 compact_args.no_memoria,
@@ -680,29 +929,57 @@ pub(crate) async fn handle_state_command(
                 facts_stored,
                 compact_args.quick,
             );
-            eprintln!(
-                "  {} {} turns compacted · {} turns in context{}",
-                theme::icon_ok(),
-                trimmed_count,
-                state.history.len(),
-                mem_note,
+            if let Err(error) = persist_history_edit_state(state, "/compact").await {
+                snapshot.restore(state);
+                return Err(error);
+            }
+            // Journal: log compact event (include summary for knowledge backflow)
+            append_state_journal_event_or_warn(
+                state,
+                &session_journal::JournalEvent::compact_with_summary(
+                    state.session_id.as_deref(),
+                    state.turn,
+                    trimmed_count,
+                    facts_stored,
+                    Some(&summary),
+                ),
+                "slash_state:compact",
             );
+            match compact_plan {
+                ManualCompactPlan::PrefixTurns { .. } => {
+                    eprintln!(
+                        "  {} {} turns compacted · {} turns in context{}",
+                        theme::icon_ok(),
+                        trimmed_count,
+                        state.history.len(),
+                        mem_note,
+                    );
+                }
+                ManualCompactPlan::SingleTurnInPlace => {
+                    eprintln!(
+                        "  {} Compacted the current turn in place · {} turn in context{}",
+                        theme::icon_ok(),
+                        state.history.len(),
+                        mem_note,
+                    );
+                }
+            }
+            if total <= keep_recent {
+                eprintln!(
+                    "  {}",
+                    format!(
+                        "Manual compaction overrode keep_recent_turns={} so this session could actually shrink.",
+                        keep_recent
+                    )
+                    .dim()
+                );
+            }
             if state.plan_mode_active() || state.executing_plan.is_some() {
                 eprintln!(
                     "{}",
                     "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan` or your plan view."
                         .dim()
                 );
-            }
-            // Journal: log compact event (include summary for knowledge backflow)
-            if let Some(ref j) = state.journal {
-                let _ = j.append(&session_journal::JournalEvent::compact_with_summary(
-                    state.session_id.as_deref(),
-                    state.turn,
-                    trimmed_count,
-                    facts_stored,
-                    Some(&summary),
-                ));
             }
         }
 
@@ -724,13 +1001,15 @@ pub(crate) async fn handle_state_command(
                 eprint!("{out}");
                 return Ok(());
             }
-            if let Ok(body) = crate::cli::self_command::render_reflect_surface_for_session(
-                &sid,
-                20,
-                requested_focus.as_deref(),
-                requested_question.as_deref(),
-            )
-            .await
+            if let Some(body) =
+                crate::cli::self_command::try_render_reflect_surface_for_session_with_profile(
+                    &sid,
+                    20,
+                    requested_focus.as_deref(),
+                    requested_question.as_deref(),
+                    profile,
+                )
+                .await?
             {
                 render_reflect_report(
                     &body,
@@ -1210,6 +1489,462 @@ fn render_local_reflect_report(
 }
 
 #[cfg(test)]
+mod state_command_tests {
+    use super::*;
+    use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn clear_command_starts_fresh_session_and_resets_state() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let old_sid = uuid::Uuid::new_v4().to_string();
+        let new_sid = uuid::Uuid::new_v4().to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": new_sid
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(old_sid.clone());
+        state.model = Some("gpt-5".to_string());
+        crate::cli::session_startup::initialize_journal_pub(&mut state, &old_sid);
+        state.pending_recovery = Some("stale".into());
+        state.run_id = Some("run-1".into());
+        state.turn = 4;
+        state.history = vec![("q".into(), "a".into())];
+        state.total_prompt_tokens = 11;
+        state.total_completion_tokens = 22;
+        state.total_cache_read_tokens = 33;
+        state.total_cache_creation_tokens = 44;
+        state.total_session_cost = 1.5;
+        state.recent_tools = vec!["bash".into()];
+        state.redo_stack = vec![("q".into(), "a".into(), 1)];
+        state.last_response = Some("a".into());
+        state.continuation_anchor = Some("anchor".into());
+        state.diagnostics_context = Some("diag".into());
+        state.queued_message = Some("queued".into());
+        state.resume_guidance = Some("resume".into());
+        state.resume_restricted_tools = vec!["read_file".into()];
+        state.executing_plan_goal = Some("goal".into());
+        state.executing_plan_id = Some("plan-1".into());
+        state.plan_execution_rounds = 3;
+        state.last_turn_interrupted = true;
+        state.plan_mode_sync_error = Some("sync failed".into());
+        state.pending_bg_notifications = vec!["background".into()];
+        state.turns_since_task_use = 5;
+        state.turns_since_task_reminder = 4;
+        state.session_lessons_loaded = true;
+        state.perm_manager.record_approval("bash", None, false);
+        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = std::sync::Arc::new(
+            astra_runtime::server::delegation::engine::DelegationTracker::new(),
+        );
+        let router =
+            std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let root_addr = astra_messaging::AgentAddress::new(old_sid.clone(), "main");
+        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
+
+        handle_state_command(
+            "/clear",
+            "",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: Some("test-token"),
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.session_id.as_deref(), Some(new_sid.as_str()));
+        assert_eq!(state.turn, 0);
+        assert!(state.history.is_empty());
+        assert_eq!(state.total_prompt_tokens, 0);
+        assert_eq!(state.total_completion_tokens, 0);
+        assert_eq!(state.total_cache_read_tokens, 0);
+        assert_eq!(state.total_cache_creation_tokens, 0);
+        assert_eq!(state.total_session_cost, 0.0);
+        assert!(state.recent_tools.is_empty());
+        assert!(state.redo_stack.is_empty());
+        assert!(state.last_response.is_none());
+        assert!(state.continuation_anchor.is_none());
+        assert!(state.diagnostics_context.is_none());
+        assert!(state.queued_message.is_none());
+        assert!(state.resume_guidance.is_none());
+        assert!(state.resume_restricted_tools.is_empty());
+        assert!(state.executing_plan_goal.is_none());
+        assert!(state.executing_plan_id.is_none());
+        assert_eq!(state.plan_execution_rounds, 0);
+        assert!(!state.last_turn_interrupted);
+        assert!(state.plan_mode_sync_error.is_none());
+        assert!(state.pending_bg_notifications.is_empty());
+        assert_eq!(state.turns_since_task_use, 0);
+        assert_eq!(state.turns_since_task_reminder, 0);
+        assert!(!state.session_lessons_loaded);
+        assert!(state.journal.is_some());
+        assert!(state.root_mailbox.is_none());
+        assert!(state.perm_manager.export_session_overrides().is_none());
+        router
+            .register(root_addr, None)
+            .await
+            .expect("clear should unregister the prior root mailbox");
+
+        let events = session_journal::read_journal(&new_sid).unwrap();
+        let session_start_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::SessionStart)
+            .count();
+        assert_eq!(
+            session_start_count, 1,
+            "new session journal should contain exactly one session_start event"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn undo_rolls_back_live_state_when_recovery_persist_fails() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
+        ws.turn_count = 2;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+        let session_dir = session_journal::local_sessions_dir().join(&sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+        let journal = session_journal::JournalWriter::new(&sid).unwrap();
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id(sid);
+        state.journal = Some(journal);
+        state.turn = 2;
+        state.history = vec![("q1".into(), "a1".into()), ("q2".into(), "a2".into())];
+        state.last_response = Some("a2".into());
+
+        let error = handle_state_command(
+            "/undo",
+            "",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: None,
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("invalid checkpoint path should fail undo persistence");
+
+        assert!(error.contains("/undo updated live context"), "{error}");
+        assert_eq!(
+            state.history,
+            vec![
+                ("q1".to_string(), "a1".to_string()),
+                ("q2".to_string(), "a2".to_string())
+            ]
+        );
+        assert!(state.redo_stack.is_empty());
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.last_response.as_deref(), Some("a2"));
+        assert!(state.session_persistence_error.is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn undo_restores_workspace_files_when_recovery_persist_fails() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("edited.txt");
+        std::fs::write(&file_path, b"after").unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
+        ws.turn_count = 1;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+        let session_dir = session_journal::local_sessions_dir().join(&sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(sid);
+        state.turn = 1;
+        state.history = vec![("q1".into(), "a1".into())];
+        state.last_response = Some("a1".into());
+        {
+            let mut journal = state.file_journal.lock().unwrap();
+            std::fs::write(&file_path, b"before").unwrap();
+            journal.record_before(&file_path, "tool-1", 1);
+            std::fs::write(&file_path, b"after").unwrap();
+            journal.record_after(&file_path, "tool-1", b"after");
+        }
+
+        let error = handle_state_command(
+            "/undo",
+            "",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: None,
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("invalid checkpoint path should fail undo persistence");
+
+        assert!(error.contains("/undo updated live context"), "{error}");
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"after");
+        assert_eq!(state.history, vec![("q1".to_string(), "a1".to_string())]);
+        assert!(state.redo_stack.is_empty());
+        assert_eq!(state.turn, 1);
+        assert!(state.session_persistence_error.is_none());
+    }
+
+    #[test]
+    fn undo_persist_failure_marks_session_persistence_error_when_recovery_rollback_failed() {
+        let snapshot_source = SessionState {
+            turn: 1,
+            history: vec![("q1".into(), "a1".into())],
+            last_response: Some("a1".into()),
+            ..Default::default()
+        };
+        let snapshot = HistoryEditSnapshot::capture(&snapshot_source);
+
+        let mut state = SessionState {
+            redo_stack: vec![("q1".into(), "a1".into(), 1)],
+            ..Default::default()
+        };
+
+        let error = handle_undo_persist_failure(
+            &mut state,
+            snapshot,
+            &[],
+            "/undo updated live context but failed to refresh resume/fork state: recovery checkpoint rollback failed: stale heavy checkpoint".into(),
+        );
+
+        assert!(error.contains("rollback failed"), "{error}");
+        assert_eq!(state.history, vec![("q1".to_string(), "a1".to_string())]);
+        assert!(state.redo_stack.is_empty());
+        assert_eq!(state.turn, 1);
+        assert_eq!(state.last_response.as_deref(), Some("a1"));
+        assert_eq!(
+            state.session_persistence_error.as_deref(),
+            Some(error.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn compact_single_turn_rewrites_current_turn_in_place() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.turn_count = 1;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(sid.clone());
+        state.model = Some("gpt-5".into());
+        state.turn = 1;
+        state.history = vec![("hi".into(), "hello".into())];
+        state.recent_tools = vec!["bash".into()];
+        crate::cli::session_startup::initialize_journal_pub(&mut state, &sid);
+
+        handle_state_command(
+            "/compact",
+            "quick no-memoria",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: Some("test-token"),
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].0, "hi");
+        assert!(
+            state.history[0]
+                .1
+                .contains("[Prior context — 1 turns compacted]"),
+            "{}",
+            state.history[0].1
+        );
+        assert!(
+            state.history[0]
+                .1
+                .contains("answering directly without tools on turn"),
+            "{}",
+            state.history[0].1
+        );
+        assert!(state.recent_tools.is_empty());
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == JournalEventType::Compact),
+            "compact should be durably recorded"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn compact_rolls_back_live_state_when_recovery_persist_fails() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.turn_count = 1;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+        let session_dir = session_journal::local_sessions_dir().join(&sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(sid.clone());
+        state.model = Some("gpt-5".into());
+        state.turn = 1;
+        state.history = vec![("hi".into(), "hello".into())];
+        state.recent_tools = vec!["bash".into()];
+        crate::cli::session_startup::initialize_journal_pub(&mut state, &sid);
+
+        let error = handle_state_command(
+            "/compact",
+            "quick no-memoria",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: Some("test-token"),
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("invalid checkpoint path should fail compact persistence");
+
+        assert!(error.contains("/compact updated live context"), "{error}");
+        assert_eq!(state.history, vec![("hi".to_string(), "hello".to_string())]);
+        assert_eq!(state.recent_tools, vec!["bash".to_string()]);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == JournalEventType::Compact),
+            "failed compact must not be journaled as durable state"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reflect_falls_back_to_remote_when_local_state_missing() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/chat/session/{sid}/reflect")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": sid,
+                "overview": {
+                    "summary": "remote reflect"
+                },
+                "recent_turns": []
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(sid);
+
+        handle_state_command(
+            "/reflect",
+            "",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: Some("test-token"),
+            },
+            &mut state,
+        )
+        .await
+        .expect("missing local state should fall back to remote reflect");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reflect_surfaces_local_artifact_error_without_remote_fallback() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/chat/session/{sid}/reflect")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": sid,
+                "overview": {
+                    "summary": "remote reflect should not mask local corruption"
+                },
+                "recent_turns": []
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        std::fs::create_dir_all(session_journal::local_sessions_dir().join(format!("{sid}.jsonl")))
+            .unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(sid);
+
+        let error = handle_state_command(
+            "/reflect",
+            "",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: Some("test-token"),
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("local artifact errors must surface instead of falling back");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1511,6 +2246,35 @@ mod compact_tests {
     }
 
     #[test]
+    fn build_swap_memory_body_formats_compacted_turn_previews() {
+        let user = "u".repeat(120);
+        let assistant = "a".repeat(170);
+        let body = build_swap_memory_body(
+            &[
+                (user.clone(), assistant.clone()),
+                (String::new(), "done".into()),
+            ],
+            2,
+        )
+        .expect("swap body");
+
+        assert!(body.starts_with("Turns 1-2 swapped out [compact_history]:"));
+        assert!(body.contains(&format!("U: {}", "u".repeat(100))));
+        assert!(!body.contains(&format!("U: {}", "u".repeat(101))));
+        assert!(body.contains(&format!("A: {}", "a".repeat(150))));
+        assert!(!body.contains(&format!("A: {}", "a".repeat(151))));
+        assert!(body.contains("A: done"));
+    }
+
+    #[test]
+    fn build_swap_memory_body_skips_empty_turns() {
+        assert_eq!(
+            build_swap_memory_body(&[(String::new(), String::new())], 1),
+            None
+        );
+    }
+
+    #[test]
     fn compact_mem_note_reports_saved_facts() {
         assert_eq!(
             compact_mem_note(false, true, 5, false),
@@ -1537,6 +2301,43 @@ mod compact_tests {
     #[test]
     fn compact_mem_note_is_empty_when_memory_save_failed_or_skipped_by_auth() {
         assert_eq!(compact_mem_note(false, false, 0, false), "");
+    }
+
+    #[test]
+    fn plan_manual_compaction_returns_none_for_empty_history() {
+        assert_eq!(plan_manual_compaction(0, 3), None);
+    }
+
+    #[test]
+    fn plan_manual_compaction_compacts_single_turn_in_place() {
+        assert_eq!(
+            plan_manual_compaction(1, 3),
+            Some(ManualCompactPlan::SingleTurnInPlace)
+        );
+    }
+
+    #[test]
+    fn plan_manual_compaction_compacts_all_but_latest_turn_inside_keep_recent_window() {
+        assert_eq!(
+            plan_manual_compaction(3, 3),
+            Some(ManualCompactPlan::PrefixTurns { trimmed_count: 2 })
+        );
+    }
+
+    #[test]
+    fn plan_manual_compaction_respects_keep_recent_window_when_history_exceeds_it() {
+        assert_eq!(
+            plan_manual_compaction(5, 3),
+            Some(ManualCompactPlan::PrefixTurns { trimmed_count: 2 })
+        );
+    }
+
+    #[test]
+    fn plan_manual_compaction_keeps_latest_turn_when_keep_recent_is_zero() {
+        assert_eq!(
+            plan_manual_compaction(3, 0),
+            Some(ManualCompactPlan::PrefixTurns { trimmed_count: 2 })
+        );
     }
 
     #[test]

@@ -58,7 +58,7 @@ impl TimelineTurn {
 /// IO abstraction — tests inject [`StaticTurnSource`], production
 /// uses `JournalTurnSource` (see `impl` below).
 pub(crate) trait TurnSource: std::fmt::Debug + Send + Sync {
-    fn load(&self, session_id: &str) -> Vec<TimelineTurn>;
+    fn load(&self, session_id: &str) -> Result<Vec<TimelineTurn>, String>;
 }
 
 // ── Journal-backed source (production) ────────────────────────────
@@ -83,12 +83,11 @@ impl JournalTurnSource {
 }
 
 impl TurnSource for JournalTurnSource {
-    fn load(&self, session_id: &str) -> Vec<TimelineTurn> {
+    fn load(&self, session_id: &str) -> Result<Vec<TimelineTurn>, String> {
         use astra_services::session_journal::{JournalEventType, read_journal};
-        let Ok(events) = read_journal(session_id) else {
-            return Vec::new();
-        };
-        events
+        let events = read_journal(session_id)
+            .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
+        Ok(events
             .into_iter()
             .filter(|e| {
                 matches!(
@@ -143,7 +142,7 @@ impl TurnSource for JournalTurnSource {
                     assistant_output: e.assistant_output.clone(),
                 })
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -161,8 +160,8 @@ impl StaticTurnSource {
 }
 
 impl TurnSource for StaticTurnSource {
-    fn load(&self, _session_id: &str) -> Vec<TimelineTurn> {
-        self.turns.clone()
+    fn load(&self, _session_id: &str) -> Result<Vec<TimelineTurn>, String> {
+        Ok(self.turns.clone())
     }
 }
 
@@ -205,9 +204,26 @@ mod tests {
             )
             .expect("append turn");
 
-        let turns = JournalTurnSource::new().load("sess-timeline");
+        let turns = JournalTurnSource::new().load("sess-timeline").unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].context_ms, Some(91));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn journal_source_surfaces_unreadable_journal() {
+        let dir = tempdir().expect("tempdir");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        std::fs::create_dir_all(sessions_dir.join("sess-timeline.jsonl"))
+            .expect("bad journal path");
+
+        let error = JournalTurnSource::new()
+            .load("sess-timeline")
+            .expect_err("directory journal path should surface an error");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
     }
 }
 
@@ -216,6 +232,7 @@ mod tests {
 pub(crate) struct Timeline {
     source: Arc<dyn TurnSource>,
     turns: Vec<TimelineTurn>,
+    load_error: Option<String>,
     selected: usize,
     drilled: bool,
 }
@@ -224,6 +241,7 @@ impl std::fmt::Debug for Timeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Timeline")
             .field("turns_len", &self.turns.len())
+            .field("load_error", &self.load_error)
             .field("selected", &self.selected)
             .finish()
     }
@@ -235,7 +253,10 @@ impl Timeline {
     }
 
     pub fn from_arc(source: Arc<dyn TurnSource>, session_id: &str) -> Self {
-        let mut turns = source.load(session_id);
+        let (mut turns, load_error) = match source.load(session_id) {
+            Ok(turns) => (turns, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         // Running totals for cumulative views.
         let mut cum_in = 0u64;
         let mut cum_out = 0u64;
@@ -248,6 +269,7 @@ impl Timeline {
         Self {
             source,
             turns,
+            load_error,
             selected: 0,
             drilled: false,
         }
@@ -259,6 +281,10 @@ impl Timeline {
 
     pub fn is_empty(&self) -> bool {
         self.turns.is_empty()
+    }
+
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
     }
 
     pub fn turns(&self) -> &[TimelineTurn] {

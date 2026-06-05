@@ -245,6 +245,36 @@ impl FileEditJournal {
         self.undo_turn_since(turn_index, 0)
     }
 
+    /// Revert all file edits from a specific turn transactionally.
+    ///
+    /// If reverting any entry fails, previously reverted entries are
+    /// re-applied in chronological order so disk state returns to the
+    /// original post-turn contents.
+    pub fn undo_turn_transactional(&self, turn_index: u32) -> Result<Vec<PathBuf>, String> {
+        self.undo_turn_since_transactional(turn_index, 0)
+    }
+
+    /// Revert file edits from a specific turn recorded at or after a
+    /// checkpoint transactionally.
+    pub fn undo_turn_since_transactional(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Result<Vec<PathBuf>, String> {
+        let turn_entries: Vec<&FileEditEntry> = self
+            .entries
+            .iter()
+            .rev()
+            .filter(|e| e.turn_index == turn_index && e.sequence >= checkpoint)
+            .collect();
+        Self::apply_entries_transactionally(
+            turn_entries,
+            Self::apply_revert,
+            Self::apply_forward,
+            "undo",
+        )
+    }
+
     /// Revert file edits from a specific turn recorded at or after a checkpoint.
     pub fn undo_turn_since(&self, turn_index: u32, checkpoint: u64) -> UndoResult {
         let mut result = UndoResult {
@@ -266,6 +296,35 @@ impl FileEditJournal {
             }
         }
         result
+    }
+
+    /// Re-apply all file edits from a specific turn transactionally.
+    ///
+    /// This is the inverse of [`Self::undo_turn_transactional`]. It is
+    /// used by higher-level session rollback code when a later persistence
+    /// step fails after files were already reverted on disk.
+    pub fn restore_turn_transactional(&self, turn_index: u32) -> Result<Vec<PathBuf>, String> {
+        self.restore_turn_since_transactional(turn_index, 0)
+    }
+
+    /// Re-apply file edits from a specific turn recorded at or after a
+    /// checkpoint transactionally.
+    pub fn restore_turn_since_transactional(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Result<Vec<PathBuf>, String> {
+        let turn_entries: Vec<&FileEditEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.turn_index == turn_index && e.sequence >= checkpoint)
+            .collect();
+        Self::apply_entries_transactionally(
+            turn_entries,
+            Self::apply_forward,
+            Self::apply_revert,
+            "restore",
+        )
     }
 
     /// Return a checkpoint token for future turn-scoped rollback filtering.
@@ -633,6 +692,54 @@ impl FileEditJournal {
         }
         Ok(())
     }
+
+    fn apply_forward(entry: &FileEditEntry) -> io::Result<()> {
+        match entry.edit_type {
+            EditType::Delete => {
+                if entry.path.exists() {
+                    std::fs::remove_file(&entry.path)?;
+                }
+            }
+            _ => {
+                std::fs::write(&entry.path, &entry.after_content)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_entries_transactionally(
+        entries: Vec<&FileEditEntry>,
+        apply: fn(&FileEditEntry) -> io::Result<()>,
+        rollback: fn(&FileEditEntry) -> io::Result<()>,
+        action: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut applied: Vec<&FileEditEntry> = Vec::new();
+        let mut paths = Vec::new();
+
+        for entry in entries {
+            match apply(entry) {
+                Ok(()) => {
+                    paths.push(entry.path.clone());
+                    applied.push(entry);
+                }
+                Err(error) => {
+                    let mut error_message =
+                        format!("{action} file {}: {error}", entry.path.display());
+                    for reverted in applied.iter().rev() {
+                        if let Err(rollback_error) = rollback(reverted) {
+                            error_message.push_str(&format!(
+                                "; rollback file {}: {rollback_error}",
+                                reverted.path.display()
+                            ));
+                        }
+                    }
+                    return Err(error_message);
+                }
+            }
+        }
+
+        Ok(paths)
+    }
 }
 
 impl Default for FileEditJournal {
@@ -712,6 +819,33 @@ mod tests {
             new_seq > max_existing,
             "next_sequence must advance past max"
         );
+    }
+
+    #[test]
+    fn undo_turn_transactional_roundtrips_existing_and_created_files() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.txt");
+        let created = tmp.path().join("created.txt");
+        std::fs::write(&existing, b"before").unwrap();
+
+        let mut journal = FileEditJournal::new(100);
+        journal.record_before(&existing, "overwrite", 7);
+        std::fs::write(&existing, b"after").unwrap();
+        journal.record_after(&existing, "overwrite", b"after");
+
+        journal.record_before(&created, "create", 7);
+        std::fs::write(&created, b"brand-new").unwrap();
+        journal.record_after(&created, "create", b"brand-new");
+
+        let reverted = journal.undo_turn_transactional(7).unwrap();
+        assert_eq!(reverted.len(), 2);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"before");
+        assert!(!created.exists(), "undo should remove newly created files");
+
+        let restored = journal.restore_turn_transactional(7).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"after");
+        assert_eq!(std::fs::read(&created).unwrap(), b"brand-new");
     }
 
     /// When combined length exceeds max_entries, oldest entries are evicted

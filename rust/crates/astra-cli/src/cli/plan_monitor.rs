@@ -2,6 +2,7 @@
 
 use crate::cli::chat_stream;
 use crate::cli::cli_formatting;
+use crate::cli::cli_utils::append_journal_event_or_warn;
 use crate::cli::durable_bridge;
 use crate::cli::effects;
 use crate::cli::plan_executor;
@@ -9,6 +10,7 @@ use crate::cli::session_state::SessionState;
 use crate::cli::stream_render;
 use crate::cli::streaming_md;
 use crate::cli::theme;
+use crate::cli::tool_result_status::tool_result_status_icon;
 use crossterm::style::Stylize;
 
 /// Shown after Ctrl+C pauses plan auto-execution (interrupt is not sent to the model).
@@ -122,7 +124,7 @@ fn emit_plan_lifecycle_event(
             description,
             Some(serde_json::Value::Object(extra)),
         );
-        let _ = journal.append(&event);
+        append_journal_event_or_warn(journal, session_id, &event, "plan_monitor:emit_plan_event");
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +133,7 @@ enum PlanMonitorOutcome {
     Continue,
     /// `PlanPaused` received — return control to the caller with the current plan intact.
     Paused,
-    /// `PlanCompleted` or `PlanError` received — executor has exited.
+    /// `PlanFinished` or `PlanError` received — executor has exited.
     Finished,
 }
 
@@ -324,9 +326,28 @@ fn display_plan_updates_live(
                 let _ = (elapsed, eta);
                 continue;
             }
-            PlanUpdate::PlanCompleted { pct, elapsed } => {
+            PlanUpdate::PlanFinished {
+                pct,
+                elapsed,
+                outcome,
+            } => {
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
+                }
+                if state.plan_run_task_id.is_some() {
+                    let progress = state
+                        .executing_plan
+                        .as_ref()
+                        .map(|plan| (plan.items_done(), plan.subtasks.len() as u32))
+                        .or_else(|| {
+                            state
+                                .plan_run_task_last_progress
+                                .map(|(_, done, total)| (done, total))
+                        });
+                    if let Some((done, total)) = progress {
+                        state.plan_run_task_last_progress = Some((pct, done, total));
+                    }
+                    state.plan_run_task_last_outcome = Some(outcome);
                 }
                 if let Some(mut h) = state.plan_handle.take() {
                     while let Some(trailing) = h.try_recv() {
@@ -340,17 +361,59 @@ fn display_plan_updates_live(
                     serde_json::json!(elapsed.as_millis() as u64),
                 );
                 extra.insert("pct".to_string(), serde_json::json!(pct));
+                extra.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
+                let (description, stage, msg, completion_hint) = match outcome {
+                    astra_services::task_orchestrator::TaskOutcome::Success => (
+                        "Plan execution completed",
+                        "completed",
+                        format!(
+                            "\n🏁  Plan complete — {pct}% verified in {}",
+                            format_duration_short(elapsed),
+                        ),
+                        "  ✓ Plan completed! Type exit for normal chat, or describe next goal."
+                            .to_string(),
+                    ),
+                    astra_services::task_orchestrator::TaskOutcome::Partial => (
+                        "Plan execution finished with verification failures",
+                        "partial",
+                        format!(
+                            "\n{}  Plan finished with verification failures — {pct}% verified in {}",
+                            theme::icon_warn(),
+                            format_duration_short(elapsed),
+                        ),
+                        "  ⚠ Plan finished with verification failures. Inspect /report, type exit, or describe next goal."
+                            .to_string(),
+                    ),
+                    astra_services::task_orchestrator::TaskOutcome::Failed => (
+                        "Plan execution finished as failed",
+                        "failed",
+                        format!(
+                            "\n{}  Plan finished as failed after {}",
+                            theme::icon_err(),
+                            format_duration_short(elapsed),
+                        ),
+                        "  ✗ Plan finished as failed. Inspect /report, adjust the plan, or exit plan mode."
+                            .to_string(),
+                    ),
+                    astra_services::task_orchestrator::TaskOutcome::Cancelled => (
+                        "Plan execution finished as cancelled",
+                        "cancelled",
+                        format!(
+                            "\n{}  Plan cancelled after {}",
+                            theme::icon_warn(),
+                            format_duration_short(elapsed),
+                        ),
+                        "  ⏹ Plan cancelled. Type exit for normal chat, or describe next goal."
+                            .to_string(),
+                    ),
+                };
                 emit_plan_lifecycle_event(
                     state.journal.as_ref(),
                     state.session_id.as_deref(),
                     state.executing_plan.as_ref(),
-                    "Plan execution completed",
-                    "completed",
+                    description,
+                    stage,
                     extra,
-                );
-                let msg = format!(
-                    "\n🏁  Plan complete — {pct}% verified in {}",
-                    format_duration_short(elapsed),
                 );
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
@@ -370,16 +433,13 @@ fn display_plan_updates_live(
                 }
                 if state.plan_mode_active() {
                     eprintln!();
-                    eprintln!(
-                        "{}",
-                        "  ✓ Plan completed! Type exit for normal chat, or describe next goal."
-                            .dim()
-                    );
+                    eprintln!("{}", completion_hint.dim());
                 }
                 return PlanMonitorOutcome::Finished;
             }
             PlanUpdate::PlanError { error } => {
                 state.plan_run_task_last_error = Some(error.clone());
+                state.plan_run_task_last_outcome = None;
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
                 }
@@ -476,13 +536,14 @@ fn display_plan_updates_live(
                 );
                 (msg, PostSpinner::None)
             }
-            PlanUpdate::GlobalVerificationFailed => (
-                "  ⚠ Global verification failed".to_string(),
-                PostSpinner::None,
-            ),
             PlanUpdate::JournalEvent(event) => {
                 if let Some(ref journal) = state.journal {
-                    let _ = journal.append(&event);
+                    append_journal_event_or_warn(
+                        journal,
+                        state.session_id.as_deref(),
+                        &event,
+                        "plan_monitor:update_journal_event",
+                    );
                 }
                 continue;
             }
@@ -565,11 +626,7 @@ fn display_plan_updates_live(
                         ..
                     } => {
                         let dur = cli_formatting::format_duration_suffix(duration_ms);
-                        let icon = if status == "error" {
-                            theme::icon_err()
-                        } else {
-                            theme::icon_ok()
-                        };
+                        let icon = tool_result_status_icon(&status);
                         let styled = stream_render::style_tool_description(&name, &description);
                         let summary = output_summary
                             .map(|s| format!("\n    {}", s.dim()))
@@ -611,11 +668,7 @@ fn display_plan_updates_live(
                         ..
                     } => {
                         let dur = cli_formatting::format_duration_suffix(duration_ms);
-                        let icon = if status == "error" {
-                            theme::icon_err()
-                        } else {
-                            theme::icon_ok()
-                        };
+                        let icon = tool_result_status_icon(&status);
                         (
                             format!("  {icon} Agent {label}{}", dur.dim()),
                             PostSpinner::None,
@@ -839,7 +892,6 @@ pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut SessionSta
     let Some(ref svc) = state.task_service else {
         return;
     };
-    use astra_services::task_orchestrator::TaskOutcome;
     if let Some(ref err) = state.plan_run_task_last_error {
         let err = err.clone();
         let _ = svc.fail_task(&tid, &err).await;
@@ -847,19 +899,31 @@ pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut SessionSta
         let (outcome, pct, done, total) =
             durable_bridge::plan_run_finish_from_delivery_report(report);
         let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
-    } else if let Some((pct, done, total)) = state.plan_run_task_last_progress {
+    } else if let Some(outcome) = state.plan_run_task_last_outcome {
+        if let Some((pct, done, total)) = state.plan_run_task_last_progress {
+            let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
+        } else {
+            let _ = svc
+                .fail_task(
+                    &tid,
+                    "Plan executor exited without terminal progress state.",
+                )
+                .await;
+        }
+    } else if state.plan_run_task_last_progress.is_some() {
         let _ = svc
-            .complete_plan_run(&tid, pct, done, total, TaskOutcome::Success)
+            .fail_task(&tid, "Plan executor exited without terminal outcome.")
             .await;
     } else {
         let _ = svc.complete_task(&tid).await;
     }
     state.plan_run_task_id = None;
     state.plan_run_task_last_progress = None;
+    state.plan_run_task_last_outcome = None;
     state.plan_run_task_last_error = None;
 }
 
-/// Returns `true` when the executor sent a terminal event (`PlanCompleted` / `PlanError`).
+/// Returns `true` when the executor sent a terminal event (`PlanFinished` / `PlanError`).
 pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bool {
     if state.plan_handle.is_none() {
         return false;
@@ -874,7 +938,7 @@ pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bo
     outcome == PlanMonitorOutcome::Finished
 }
 
-/// Clear plan-monitor state when the update channel closed without `PlanCompleted` / `PlanError`.
+/// Clear plan-monitor state when the update channel closed without `PlanFinished` / `PlanError`.
 /// Emits structured journal events so the failure is observable in telemetry.
 fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Option<PlanSpinner>) {
     if let Some(s) = plan_spinner.take() {
@@ -911,8 +975,13 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
                 total,
                 done,
             );
-            let _ = journal.append(&event);
-            super::chat_turn::enqueue_ingestion_pub(state, &event);
+            append_journal_event_or_warn(
+                journal,
+                state.session_id.as_deref(),
+                &event,
+                "plan_monitor:plan_failed_event",
+            );
+            super::session_side_effects::enqueue_ingestion_pub(state, &event);
         }
         // 2. interruption_recorded for the crash
         let interruption = astra_services::session_journal::JournalEvent::interruption_recorded(
@@ -924,8 +993,13 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
                 "resumable": false,
             }),
         );
-        let _ = journal.append(&interruption);
-        super::chat_turn::enqueue_ingestion_pub(state, &interruption);
+        append_journal_event_or_warn(
+            journal,
+            state.session_id.as_deref(),
+            &interruption,
+            "plan_monitor:plan_crash_interruption",
+        );
+        super::session_side_effects::enqueue_ingestion_pub(state, &interruption);
     }
 
     state.executing_plan = None;
@@ -977,8 +1051,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
             sync_plan_run_task_progress(state).await;
             if state.plan_run_task_id.is_some() {
                 state.plan_run_task_last_error.get_or_insert(
-                    "Plan executor stopped without PlanCompleted/PlanError (channel closed)."
-                        .into(),
+                    "Plan executor stopped without PlanFinished/PlanError (channel closed).".into(),
                 );
                 finalize_plan_run_task_after_executor(state).await;
             }
@@ -1059,7 +1132,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
 }
 
 /// Apply a single trailing update from the plan executor channel.
-/// Called when draining remaining messages after PlanCompleted/PlanError.
+/// Called when draining remaining messages after PlanFinished/PlanError.
 fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionState) {
     use plan_executor::PlanUpdate;
     match update {
@@ -1071,7 +1144,12 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionS
         }
         PlanUpdate::JournalEvent(event) => {
             if let Some(ref journal) = state.journal {
-                let _ = journal.append(&event);
+                append_journal_event_or_warn(
+                    journal,
+                    state.session_id.as_deref(),
+                    &event,
+                    "plan_monitor:trailing_journal_event",
+                );
             }
         }
         PlanUpdate::DeliveryReport(report) => {
@@ -1203,7 +1281,9 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+    use astra_services::task_orchestrator::{
+        LocalTaskService, SubtaskPlan, TaskCreateRequest, TaskOutcome, TaskPlan, TaskStatus,
+    };
 
     #[test]
     fn flush_plan_updates_syncs_status_into_executing_plan() {
@@ -1348,18 +1428,110 @@ mod tests {
         assert_eq!(current_task.subtasks[0].status, "in_progress");
     }
 
+    #[tokio::test]
+    async fn finalize_plan_run_task_after_executor_uses_partial_terminal_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc: std::sync::Arc<dyn astra_services::TaskService> =
+            std::sync::Arc::new(LocalTaskService::new(tmp.path().join("tasks")));
+        let task_id = svc
+            .create_task(
+                "user-1",
+                "session-1",
+                TaskCreateRequest {
+                    title: "Run plan".into(),
+                    description: None,
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = SessionState {
+            task_service: Some(svc.clone()),
+            plan_run_task_id: Some(task_id.clone()),
+            plan_run_task_last_progress: Some((67, 2, 3)),
+            plan_run_task_last_outcome: Some(TaskOutcome::Partial),
+            ..Default::default()
+        };
+
+        finalize_plan_run_task_after_executor(&mut state).await;
+
+        let task = svc
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .expect("task should exist");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.progress_pct, 67);
+        assert_eq!(task.items_done, 2);
+        assert_eq!(task.items_total, 3);
+        assert_eq!(task.outcome, Some(TaskOutcome::Partial));
+        assert!(state.plan_run_task_id.is_none());
+        assert!(state.plan_run_task_last_progress.is_none());
+        assert!(state.plan_run_task_last_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn finalize_plan_run_task_after_executor_fails_without_terminal_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc: std::sync::Arc<dyn astra_services::TaskService> =
+            std::sync::Arc::new(LocalTaskService::new(tmp.path().join("tasks")));
+        let task_id = svc
+            .create_task(
+                "user-1",
+                "session-1",
+                TaskCreateRequest {
+                    title: "Run plan".into(),
+                    description: None,
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = SessionState {
+            task_service: Some(svc.clone()),
+            plan_run_task_id: Some(task_id.clone()),
+            plan_run_task_last_progress: Some((100, 3, 3)),
+            ..Default::default()
+        };
+
+        finalize_plan_run_task_after_executor(&mut state).await;
+
+        let task = svc
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .expect("task should exist");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.error_message.as_deref(),
+            Some("Plan executor exited without terminal outcome.")
+        );
+    }
+
     // ── R3: journal metadata assertion tests ──────────────────────────────────
 
-    /// Create a JournalWriter for a unique test session and return (writer, path).
+    /// Create a JournalWriter in an isolated sessions dir and keep the guard alive.
     fn make_test_journal(
         session_id: &str,
     ) -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
         astra_services::session_journal::JournalWriter,
         std::path::PathBuf,
     ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
         let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
         let path = writer.path().clone();
-        (writer, path)
+        (tmp, guard, writer, path)
     }
 
     /// Read all journal events from a jsonl file.
@@ -1373,9 +1545,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_completed_journal_has_stage_and_elapsed_ms() {
-        let sid = format!("test-plan-completed-{}", std::process::id());
-        let (writer, path) = make_test_journal(&sid);
+    fn plan_finished_success_journal_has_stage_elapsed_ms_and_outcome() {
+        let sid = format!("test-plan-finished-success-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
         let mut state = SessionState::default();
         state.journal = Some(writer);
         state.executing_plan = Some(TaskPlan {
@@ -1390,9 +1562,10 @@ mod tests {
 
         let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
         state.plan_handle = Some(handle);
-        let _ = update_tx.send(plan_executor::PlanUpdate::PlanCompleted {
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanFinished {
             pct: 100,
             elapsed: std::time::Duration::from_millis(1234),
+            outcome: TaskOutcome::Success,
         });
 
         flush_plan_updates_between_prompts(&mut state);
@@ -1405,15 +1578,54 @@ mod tests {
         let detail = &lifecycle["metadata"]["detail"];
         assert_eq!(detail["stage"], "completed", "stage field present");
         assert_eq!(detail["elapsed_ms"], 1234u64, "elapsed_ms matches");
+        assert_eq!(detail["outcome"], "success", "outcome field present");
         assert_eq!(detail["items_done"], 1u32, "items_done correct");
         assert_eq!(detail["items_total"], 1u32, "items_total correct");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
+    fn plan_finished_partial_journal_has_partial_stage_and_outcome() {
+        let sid = format!("test-plan-finished-partial-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
+        let mut state = SessionState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanFinished {
+            pct: 67,
+            elapsed: std::time::Duration::from_millis(987),
+            outcome: TaskOutcome::Partial,
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "partial", "stage field present");
+        assert_eq!(detail["outcome"], "partial", "outcome field present");
+        assert_eq!(detail["elapsed_ms"], 987u64, "elapsed_ms matches");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn plan_error_journal_has_stage_and_error_field() {
         let sid = format!("test-plan-error-{}", std::process::id());
-        let (writer, path) = make_test_journal(&sid);
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
         let mut state = SessionState::default();
         state.journal = Some(writer);
         state.executing_plan = Some(TaskPlan {
@@ -1449,7 +1661,7 @@ mod tests {
     #[test]
     fn plan_paused_journal_has_stage_elapsed_ms_and_items() {
         let sid = format!("test-plan-paused-{}", std::process::id());
-        let (writer, path) = make_test_journal(&sid);
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
         let mut state = SessionState::default();
         state.journal = Some(writer);
         state.executing_plan = Some(TaskPlan {
@@ -1498,7 +1710,7 @@ mod tests {
     fn cancel_journal_has_stage_cancelled() {
         use astra_services::session_journal;
         let sid = format!("test-plan-cancel-{}", std::process::id());
-        let (writer, path) = make_test_journal(&sid);
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
 
         // Replicate what the Cancel branch does.
         let event = session_journal::JournalEvent::plan_lifecycle(

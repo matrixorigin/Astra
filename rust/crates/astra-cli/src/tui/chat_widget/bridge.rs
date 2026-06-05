@@ -194,14 +194,14 @@ mod tests {
             },
             TurnContext::default(),
         );
-        assert!(matches!(
-            &completed,
+        match &completed {
             Some(AppEvent::Wire(WireEvent::ToolCompleted {
                 status,
                 duration_ms: 42,
                 ..
-            })) if status == "success"
-        ));
+            })) => assert_eq!(status, "success"),
+            other => panic!("unexpected tool completed event: {other:?}"),
+        }
     }
 
     #[test]

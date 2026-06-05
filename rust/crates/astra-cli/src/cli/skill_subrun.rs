@@ -429,7 +429,12 @@ impl AgenticLoopHost for SubRunHost {
                     ..Default::default()
                 });
                 let events = buf.drain();
-                let _ = journal.append_bulk_no_sync(&events);
+                crate::cli::cli_utils::append_bulk_journal_events_no_sync_or_warn(
+                    journal,
+                    state.current_session_id.as_deref(),
+                    &events,
+                    "skill_subrun:flush_round_events",
+                );
             }
         }
     }

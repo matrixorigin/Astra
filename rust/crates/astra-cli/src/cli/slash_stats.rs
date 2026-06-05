@@ -23,36 +23,33 @@ pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
         }
         "history" => {
             // Show stats across recent sessions
-            let sessions = match session_journal::list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("  ⚠ Could not read session history: {e}").yellow()
-                    );
+            let scan = match crate::cli::session_stats_scan::collect_recent_session_stats(10) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    eprintln!("  {}", error.red());
                     return;
                 }
             };
-            if sessions.is_empty() {
+            if scan.stats.is_empty() && scan.unreadable.is_empty() {
                 eprintln!("{}", "  No sessions found.".dim());
                 return;
             }
-            let recent: Vec<_> = sessions.into_iter().take(10).collect();
-            let mut all_stats = Vec::new();
-            for sid in &recent {
-                if let Ok(events) = session_journal::read_journal(sid) {
-                    all_stats.push(session_analytics::compute_session_stats(sid, &events));
+            if scan.stats.is_empty() {
+                eprintln!("{}", "  No readable session data.".dim());
+                if !scan.unreadable.is_empty() {
+                    eprintln!(
+                        "  {}",
+                        format!("Skipped {} unreadable journal(s).", scan.unreadable.len())
+                            .yellow()
+                    );
                 }
-            }
-            if all_stats.is_empty() {
-                eprintln!("{}", "  No session data.".dim());
                 return;
             }
             eprintln!(
                 "\n{}",
                 "─── Recent Sessions ─────────────────────────────".bold()
             );
-            for s in &all_stats {
+            for s in &scan.stats {
                 let short = &s.session_id[..8.min(s.session_id.len())];
                 let model = s.model.as_deref().unwrap_or("?");
                 eprintln!(
@@ -66,7 +63,7 @@ pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
                     model.dim(),
                 );
             }
-            let agg = session_analytics::aggregate_stats(&all_stats);
+            let agg = session_analytics::aggregate_stats(&scan.stats);
             eprintln!(
                 "\n  {} {} sessions, {} turns, {}+{} tokens, {:.1}% tool errors",
                 "Summary:".bold(),
@@ -100,6 +97,12 @@ pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
                     agg.total_execution_boundaries_aborted
                 );
             }
+            if !scan.unreadable.is_empty() {
+                eprintln!(
+                    "  {}",
+                    format!("Skipped {} unreadable journal(s).", scan.unreadable.len()).yellow()
+                );
+            }
             eprintln!();
         }
         _ => {
@@ -111,7 +114,14 @@ pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
                     return;
                 }
             };
-            let events = session_journal::read_journal(&sid).unwrap_or_default();
+            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    eprintln!("  {}", error.red());
+                    return;
+                }
+            };
             let stats = session_analytics::compute_session_stats(&sid, &events);
 
             eprintln!(
@@ -225,7 +235,14 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     return;
                 }
             };
-            let events = session_journal::read_journal(&sid).unwrap_or_default();
+            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    eprintln!("  {}", error.red());
+                    return;
+                }
+            };
             let pricing = &state.cached_pricing;
 
             eprintln!(
@@ -293,18 +310,26 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
 
         "history" => {
             // Across recent sessions
-            let sessions = match session_journal::list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("  ⚠ Could not read session history: {e}").yellow()
-                    );
+            let scan = match crate::cli::session_stats_scan::collect_recent_session_stats(10) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    eprintln!("  {}", error.red());
                     return;
                 }
             };
-            if sessions.is_empty() {
+            if scan.stats.is_empty() && scan.unreadable.is_empty() {
                 eprintln!("{}", "  No sessions found.".dim());
+                return;
+            }
+            if scan.stats.is_empty() {
+                eprintln!("{}", "  No readable session data.".dim());
+                if !scan.unreadable.is_empty() {
+                    eprintln!(
+                        "  {}",
+                        format!("Skipped {} unreadable journal(s).", scan.unreadable.len())
+                            .yellow()
+                    );
+                }
                 return;
             }
 
@@ -322,40 +347,42 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
             );
             eprintln!();
 
-            let recent: Vec<_> = sessions.into_iter().take(10).collect();
             let mut grand_total = 0.0f64;
 
-            for sid in &recent {
-                if let Ok(events) = session_journal::read_journal(sid) {
-                    let stats = session_analytics::compute_session_stats(sid, &events);
-                    let cost = cost_for_tokens(
-                        stats.total_tokens_in,
-                        stats.total_tokens_out,
-                        stats.total_cache_read,
-                        stats.total_cache_creation,
-                        pricing,
-                    );
-                    grand_total += cost;
+            for stats in &scan.stats {
+                let cost = cost_for_tokens(
+                    stats.total_tokens_in,
+                    stats.total_tokens_out,
+                    stats.total_cache_read,
+                    stats.total_cache_creation,
+                    pricing,
+                );
+                grand_total += cost;
 
-                    let short = &sid[..8.min(sid.len())];
-                    let model = stats.model.as_deref().unwrap_or("?");
-                    eprintln!(
-                        "  {} {:>3} turns  {:>6}+{:<6} tok  {}  {}",
-                        short.magenta(),
-                        stats.turn_count,
-                        stats.total_tokens_in,
-                        stats.total_tokens_out,
-                        format_cost(cost),
-                        model.dim(),
-                    );
-                }
+                let short = &stats.session_id[..8.min(stats.session_id.len())];
+                let model = stats.model.as_deref().unwrap_or("?");
+                eprintln!(
+                    "  {} {:>3} turns  {:>6}+{:<6} tok  {}  {}",
+                    short.magenta(),
+                    stats.turn_count,
+                    stats.total_tokens_in,
+                    stats.total_tokens_out,
+                    format_cost(cost),
+                    model.dim(),
+                );
             }
 
             eprintln!(
                 "\n  {} across {} sessions",
                 format_cost(grand_total).bold(),
-                recent.len(),
+                scan.stats.len(),
             );
+            if !scan.unreadable.is_empty() {
+                eprintln!(
+                    "  {}",
+                    format!("Skipped {} unreadable journal(s).", scan.unreadable.len()).yellow()
+                );
+            }
             eprintln!();
         }
 
