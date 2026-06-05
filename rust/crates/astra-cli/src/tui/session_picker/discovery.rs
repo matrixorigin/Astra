@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Atom};
+use nucleo_matcher::{pattern::Atom, Config, Matcher, Utf32Str};
 
 use crate::tui::{transcript_jsonl, turn_event::TurnEvent};
 
@@ -346,7 +346,6 @@ fn haystack(e: &SessionEntry) -> String {
 mod tests {
     use super::*;
     use astra_services::{
-use astra_services::session_journal;
         session_journal::{JournalDirGuard, JournalEvent, JournalWriter},
         session_workspace,
     };

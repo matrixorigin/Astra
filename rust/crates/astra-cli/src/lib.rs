@@ -1,4 +1,3 @@
-use astra_services::session_journal;
 //! `astra-cli` library crate.
 //!
 //! Provides the CLI application logic shared between the main `astra` binary
