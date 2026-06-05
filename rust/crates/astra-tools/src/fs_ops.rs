@@ -168,7 +168,8 @@ pub fn resolve_path_sandboxed(
     relative: &str,
     allowed_paths: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let path = if Path::new(relative).is_absolute() {
+    let input_is_absolute = Path::new(relative).is_absolute();
+    let path = if input_is_absolute {
         PathBuf::from(relative)
     } else {
         workspace_root.join(relative)
@@ -189,10 +190,17 @@ pub fn resolve_path_sandboxed(
         return Ok(final_path);
     }
 
-    // Check allowed_paths (e.g., /tmp).
-    for allowed in allowed_paths {
-        if is_within_workspace_root(&final_path, allowed) {
-            return Ok(final_path);
+    // The allowlist (e.g. `/tmp`) only applies to inputs the caller
+    // explicitly typed as absolute. A relative input that escapes the
+    // workspace via `..` and happens to land inside an allowed prefix is
+    // still a sandbox escape — the caller did not opt into the allowed
+    // root, the path traversal did. Without this guard, a workspace
+    // located under $TMPDIR can be escaped via `read_file("../foo")`.
+    if input_is_absolute {
+        for allowed in allowed_paths {
+            if is_within_workspace_root(&final_path, allowed) {
+                return Ok(final_path);
+            }
         }
     }
 
@@ -3100,6 +3108,28 @@ mod tests {
             result
         );
         assert!(result.unwrap().starts_with("/tmp"));
+    }
+
+    /// Regression: a workspace under $TMPDIR (e.g. /tmp/.../tmpXXX) plus a
+    /// relative input that climbs out via `..` MUST NOT be rescued by the
+    /// allowlist. Relative paths express intent "stay inside workspace";
+    /// the /tmp allowlist is for absolute paths the user explicitly named.
+    /// Conflating the two lets `read_file("../../foo")` from a workspace
+    /// inside /tmp escape the sandbox.
+    #[test]
+    fn resolve_path_relative_dot_dot_escape_is_denied_even_when_landing_in_tmp() {
+        let tmp_root = std::env::temp_dir();
+        let workspace = tempfile::tempdir_in(&tmp_root).unwrap();
+        // Climb above the workspace, land in /tmp (which is in default
+        // allowed_paths). Must still be denied because the request was
+        // a relative path that resolved out of workspace_root.
+        let result = resolve_path(workspace.path(), "../escape.txt");
+        assert!(
+            result.is_err(),
+            "relative ../ that escapes workspace must be denied even when result is under /tmp: {:?}",
+            result
+        );
+        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
     }
 
     #[test]
