@@ -38,8 +38,8 @@ use std::collections::HashSet;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli::session_task_surface::{
-    SessionTaskStatusKind, session_task_is_active, session_task_is_completed,
-    session_task_is_in_progress, session_task_is_pending,
+    session_task_is_active, session_task_is_completed, session_task_is_in_progress,
+    session_task_is_pending, SessionTaskStatusKind,
 };
 
 /// Colour triple the widget reads for all status rendering. Built from

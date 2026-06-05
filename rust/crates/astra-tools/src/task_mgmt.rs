@@ -104,6 +104,38 @@ impl SessionTaskStatusKind {
             SessionTaskStatusKind::Other => "other",
         }
     }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::InProgress | Self::Pending)
+    }
+
+    pub fn is_in_progress(&self) -> bool {
+        *self == Self::InProgress
+    }
+
+    pub fn is_pending(&self) -> bool {
+        *self == Self::Pending
+    }
+
+    pub fn is_completed(&self) -> bool {
+        *self == Self::Completed
+    }
+
+    pub fn is_failed(&self) -> bool {
+        *self == Self::Failed
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self == Self::Cancelled
+    }
+
+    pub fn is_unsuccessful(&self) -> bool {
+        matches!(self, Self::Failed | Self::Cancelled)
+    }
+
+    pub fn is_started(&self) -> bool {
+        matches!(self, Self::InProgress | Self::Completed)
+    }
 }
 
 impl SessionTaskStatusKind {
@@ -154,44 +186,35 @@ pub fn session_task_status_kind(status: &str) -> SessionTaskStatusKind {
 }
 
 pub fn session_task_is_active(status: &SessionTaskStatusKind) -> bool {
-    matches!(
-        status,
-        SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Pending
-    )
+    status.is_active()
 }
 
 pub fn session_task_is_in_progress(status: &SessionTaskStatusKind) -> bool {
-    *status == SessionTaskStatusKind::InProgress
+    status.is_in_progress()
 }
 
 pub fn session_task_is_pending(status: &SessionTaskStatusKind) -> bool {
-    *status == SessionTaskStatusKind::Pending
+    status.is_pending()
 }
 
 pub fn session_task_is_completed(status: &SessionTaskStatusKind) -> bool {
-    *status == SessionTaskStatusKind::Completed
+    status.is_completed()
 }
 
 pub fn session_task_is_failed(status: &SessionTaskStatusKind) -> bool {
-    *status == SessionTaskStatusKind::Failed
+    status.is_failed()
 }
 
 pub fn session_task_is_cancelled(status: &SessionTaskStatusKind) -> bool {
-    *status == SessionTaskStatusKind::Cancelled
+    status.is_cancelled()
 }
 
 pub fn session_task_is_unsuccessful(status: &SessionTaskStatusKind) -> bool {
-    matches!(
-        status,
-        SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled
-    )
+    status.is_unsuccessful()
 }
 
 pub fn session_task_is_started(status: &SessionTaskStatusKind) -> bool {
-    matches!(
-        status,
-        SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed
-    )
+    status.is_started()
 }
 
 pub fn session_task_can_be_archived(status: &SessionTaskStatusKind) -> bool {

@@ -16,8 +16,8 @@
 //!   the prompt with "no tasks".
 
 use crate::cli::session_task_surface::{
-    SessionTaskStatusKind, session_task_is_completed, session_task_is_in_progress,
-    session_task_is_pending, session_task_status_marker,
+    session_task_is_completed, session_task_is_in_progress, session_task_is_pending,
+    session_task_status_marker, SessionTaskStatusKind,
 };
 use astra_tools::task_mgmt::SessionTask;
 
