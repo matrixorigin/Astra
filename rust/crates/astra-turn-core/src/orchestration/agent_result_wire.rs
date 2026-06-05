@@ -38,14 +38,38 @@ impl AgentToolResultStatusKind {
             Self::Other => "other",
         }
     }
+
+    /// Wire-tolerant parser: any unrecognized status maps to `Other`.
+    ///
+    /// Use this from JSON-deserialization paths where dropping an unknown
+    /// status would silently lose information from a peer running a different
+    /// version. For typed call sites where you want to learn about a typo,
+    /// use `FromStr::from_str` instead — it returns `Err` for unknowns.
+    pub fn parse_wire(s: &str) -> Self {
+        Self::from_str(s).unwrap_or(Self::Other)
+    }
 }
 
 impl FromStr for AgentToolResultStatusKind {
     type Err = String;
 
+    /// Parse a wire status string. Trims and lower-cases the input for
+    /// resilience to upstream casing/whitespace variants. Truly unknown
+    /// statuses produce an `Err` rather than silently mapping to `Other`,
+    /// so callers must explicitly opt into the catch-all.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        serde_json::from_value(serde_json::Value::String(s.to_owned()))
-            .map_err(|e| format!("unknown agent tool status: '{s}': {e}"))
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "timeout" => Ok(Self::TimedOut),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            "still_running" => Ok(Self::StillRunning),
+            "launched" => Ok(Self::Launched),
+            "other" => Ok(Self::Other),
+            _ => Err(format!("unknown agent tool status: '{s}'")),
+        }
     }
 }
 
@@ -81,7 +105,7 @@ pub fn project_agent_tool_wire<'a>(
     let status_kind = parsed
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
-        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok());
+        .map(AgentToolResultStatusKind::parse_wire);
     let finish_reason = parsed
         .and_then(|value| value.get("finish_reason"))
         .and_then(Value::as_str);
@@ -138,7 +162,7 @@ pub fn agent_tool_completed_result_text(parsed: &Value) -> Option<String> {
     match parsed
         .get("status")
         .and_then(Value::as_str)
-        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok())
+        .map(AgentToolResultStatusKind::parse_wire)
     {
         Some(AgentToolResultStatusKind::Completed | AgentToolResultStatusKind::Interrupted) => {
             parsed
@@ -174,7 +198,7 @@ pub fn agent_tool_incomplete_reason(parsed: &Value) -> Option<String> {
     match parsed
         .get("status")
         .and_then(Value::as_str)
-        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok())
+        .map(AgentToolResultStatusKind::parse_wire)
     {
         Some(AgentToolResultStatusKind::StillRunning) => {
             let detail = parsed
@@ -224,7 +248,7 @@ pub fn agent_tool_running_preview(parsed: &Value) -> Option<String> {
     match parsed
         .get("status")
         .and_then(Value::as_str)
-        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok())
+        .map(AgentToolResultStatusKind::parse_wire)
     {
         Some(AgentToolResultStatusKind::StillRunning) => {
             let current_status = parsed
@@ -472,10 +496,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_status_deserializes_to_other() {
+    fn unknown_status_via_from_str_is_error_but_via_serde_is_other() {
+        // First-principles split: `from_str` is the typed call path — caller
+        // is supposed to know what statuses exist, so unknown is a bug and
+        // surfaces as `Err`. Serde wire deserialization (e.g. JSON arriving
+        // from an out-of-version peer) routes unknowns to `Other` to keep
+        // the wire backwards-tolerant rather than dropping the message.
+        assert!(AgentToolResultStatusKind::from_str("mystery").is_err());
+        let kind: AgentToolResultStatusKind =
+            serde_json::from_value(serde_json::Value::String("mystery".into())).unwrap();
+        assert_eq!(kind, AgentToolResultStatusKind::Other);
+    }
+
+    #[test]
+    fn from_str_normalizes_case_and_whitespace() {
         assert_eq!(
-            AgentToolResultStatusKind::from_str("mystery").unwrap(),
-            AgentToolResultStatusKind::Other
+            AgentToolResultStatusKind::from_str("Completed").unwrap(),
+            AgentToolResultStatusKind::Completed
+        );
+        assert_eq!(
+            AgentToolResultStatusKind::from_str("  STILL_RUNNING  ").unwrap(),
+            AgentToolResultStatusKind::StillRunning
+        );
+        assert_eq!(
+            AgentToolResultStatusKind::from_str("TIMEOUT").unwrap(),
+            AgentToolResultStatusKind::TimedOut
         );
     }
 

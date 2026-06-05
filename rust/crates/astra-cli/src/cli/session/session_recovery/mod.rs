@@ -25,12 +25,11 @@ mod tests {
         load_previous_recovery_state, persist_recovery_checkpoint, rollback_recovery_checkpoint,
     };
     use super::csl::{
-        csl_log_path_for, ensure_loaded_csl_state, rebuild_csl_from_history,
-        write_full_csl_snapshot_atomic,
+        ensure_loaded_csl_state, rebuild_csl_from_history, write_full_csl_snapshot_atomic,
     };
     use super::io::{
-        composite_index_path_for, read_optional_file_bytes, restore_optional_file_bytes,
-        with_workspace_lock, write_bytes_atomic,
+        composite_index_path_for, csl_log_path_for, read_optional_file_bytes,
+        restore_optional_file_bytes, with_workspace_lock, write_bytes_atomic,
     };
     use super::*;
     use crate::cli::session::session_state::SessionState;
@@ -590,6 +589,69 @@ mod tests {
                 assert_eq!(restored_state.recent_tools, vec!["bash".to_string()]);
             }
             other => panic!("expected snapshot entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_full_csl_snapshot_atomic_increments_seq_past_existing_log() {
+        // Regression: the recovery snapshot used to hardcode `seq: 1`. If a
+        // session already had snapshots/deltas at seq>=1, writing a new
+        // recovery snapshot at seq=1 broke the strictly-increasing seq
+        // invariant required by `materialize_session_state` and rendered any
+        // out-of-band consumer relying on seq monotonicity inconsistent.
+        // The snapshot sequence MUST exceed the highest seq present in the
+        // existing log.
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("csl-seq-{}", uuid::Uuid::new_v4());
+        let messages_pre = vec![serde_json::json!({"role":"user","content":"prior"})];
+        let state = astra_turn_core::conversation_log::SessionStateCompact::default();
+
+        // Simulate an established log: snapshot(seq=1) + a couple of deltas.
+        let csl_path = csl_log_path_for(&sid);
+        std::fs::create_dir_all(csl_path.parent().unwrap()).unwrap();
+        let mut log_text = String::new();
+        let snap1 = astra_turn_core::conversation_log::CslEntry::Snapshot {
+            seq: 1,
+            turn: 0,
+            messages: messages_pre.clone(),
+            session_state: state.clone(),
+        };
+        log_text.push_str(&serde_json::to_string(&snap1).unwrap());
+        log_text.push('\n');
+        let delta_a = astra_turn_core::conversation_log::CslEntry::TurnDelta {
+            seq: 2,
+            turn: 1,
+            appended: vec![serde_json::json!({"role":"assistant","content":"a"})],
+            state_patch: None,
+        };
+        let delta_b = astra_turn_core::conversation_log::CslEntry::TurnDelta {
+            seq: 3,
+            turn: 2,
+            appended: vec![serde_json::json!({"role":"user","content":"b"})],
+            state_patch: None,
+        };
+        log_text.push_str(&serde_json::to_string(&delta_a).unwrap());
+        log_text.push('\n');
+        log_text.push_str(&serde_json::to_string(&delta_b).unwrap());
+        log_text.push('\n');
+        std::fs::write(&csl_path, log_text).unwrap();
+
+        let messages_now = vec![serde_json::json!({"role":"user","content":"after-recovery"})];
+        write_full_csl_snapshot_atomic(&sid, 3, &messages_now, &state).unwrap();
+
+        let read = std::fs::read_to_string(&csl_path).unwrap();
+        let line = read.lines().next().expect("at least one line");
+        let entry: astra_turn_core::conversation_log::CslEntry =
+            serde_json::from_str(line).unwrap();
+        match entry {
+            astra_turn_core::conversation_log::CslEntry::Snapshot { seq, turn, .. } => {
+                assert!(
+                    seq > 3,
+                    "snapshot seq must exceed prior log's max seq (3), got {seq}"
+                );
+                assert_eq!(turn, 3);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
         }
     }
 

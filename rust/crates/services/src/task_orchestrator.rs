@@ -644,6 +644,44 @@ impl MatrixOneTaskService {
         })
     }
 
+    /// Convert a 0-rows-affected outcome from a guarded UPDATE into a structured
+    /// error: distinguish "not found" from "terminal-state immutability" by
+    /// reading the row's current status.
+    async fn report_terminal_guard_violation(
+        &self,
+        task_id: &str,
+        attempted: &str,
+    ) -> Result<(), String> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT status FROM agent_tasks WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("terminal_guard check: {e}"))?;
+        match row {
+            None => Err(format!("task not found: {task_id}")),
+            Some(r) => {
+                let cur: String = r.try_get("status").unwrap_or_default();
+                let cur_status = TaskStatus::parse_status(&cur);
+                if cur_status.is_terminal() {
+                    Err(format!(
+                        "invalid task status transition: {} → {} (terminal states are immutable)",
+                        cur_status.as_str(),
+                        attempted
+                    ))
+                } else {
+                    // The guard rejected the update for a non-status reason
+                    // (should not happen given current SQL); surface a generic
+                    // structured error rather than a silent success.
+                    Err(format!(
+                        "task {task_id} update rejected (status={}, attempted={attempted})",
+                        cur_status.as_str()
+                    ))
+                }
+            }
+        }
+    }
+
     pub fn parse_mysql_list_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskListItem, String> {
         use sqlx::Row;
 
@@ -939,8 +977,9 @@ impl TaskService for MatrixOneTaskService {
         items_done: u32,
         items_total: u32,
     ) -> Result<(), String> {
-        sqlx::query(
-            "UPDATE agent_tasks SET progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(progress_pct as i32)
         .bind(items_done as i32)
@@ -949,6 +988,9 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("update_progress: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self.report_terminal_guard_violation(task_id, "progress").await;
+        }
         Ok(())
     }
 
@@ -991,15 +1033,19 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn fail_task(&self, task_id: &str, error: &str) -> Result<(), String> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_tasks SET status = 'failed', outcome = 'failed', error_message = ?, \
-             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+             updated_at = NOW(), completed_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(error)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("fail_task: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self.report_terminal_guard_violation(task_id, "failed").await;
+        }
         let preview: String = error.chars().take(200).collect();
         tracing::warn!(
             target: "astra_services::task_orchestrator",
@@ -1020,16 +1066,20 @@ impl TaskService for MatrixOneTaskService {
         task_id: &str,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_tasks SET status = 'completed', progress_pct = 100, \
              outcome = ?, error_message = NULL, \
-             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+             updated_at = NOW(), completed_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(outcome.as_str())
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_task_with_outcome: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self.report_terminal_guard_violation(task_id, "completed").await;
+        }
         tracing::info!(
             target: "astra_services::task_orchestrator",
             task_id,
@@ -1047,10 +1097,11 @@ impl TaskService for MatrixOneTaskService {
         items_total: u32,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_tasks SET status = 'completed', progress_pct = ?, items_done = ?, \
              items_total = ?, outcome = ?, error_message = NULL, \
-             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+             updated_at = NOW(), completed_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(progress_pct as i32)
         .bind(items_done as i32)
@@ -1060,6 +1111,9 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_plan_run: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self.report_terminal_guard_violation(task_id, "completed").await;
+        }
         tracing::info!(
             target: "astra_services::task_orchestrator",
             task_id,
@@ -1620,6 +1674,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "cannot update progress on terminal task {task_id} (status={})",
+                record.status.as_str()
+            ));
+        }
         record.progress_pct = progress_pct;
         record.items_done = items_done;
         record.items_total = items_total;
@@ -1656,6 +1716,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "invalid task status transition: {} → failed (terminal states are immutable)",
+                record.status.as_str()
+            ));
+        }
         record.status = TaskStatus::Failed;
         record.outcome = Some(TaskOutcome::Failed);
         record.error_message = Some(error.to_string());
@@ -1678,6 +1744,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "invalid task status transition: {} → completed (terminal states are immutable)",
+                record.status.as_str()
+            ));
+        }
         record.status = TaskStatus::Completed;
         record.progress_pct = 100;
         record.outcome = Some(outcome);
@@ -1699,6 +1771,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "invalid task status transition: {} → completed (terminal states are immutable)",
+                record.status.as_str()
+            ));
+        }
         record.status = TaskStatus::Completed;
         record.progress_pct = progress_pct;
         record.items_done = items_done;
@@ -2481,6 +2559,126 @@ mod tests {
         assert_eq!(t.items_total, 0);
         assert_eq!(t.outcome, Some(TaskOutcome::Partial));
         assert!(t.completed_at.is_some());
+    }
+
+    // ── Terminal-state guards ──
+    //
+    // Once a task reaches Completed/Failed/Cancelled, all mutations to its
+    // status, outcome, error_message, or progress must be rejected. The
+    // historical behavior was: the SQL UPDATE would fire unconditionally,
+    // letting a late `fail_task` overwrite a successful completion (and erase
+    // the success record), or letting `update_progress` bump progress on a
+    // task that already finished (post-mortem mutation).
+
+    #[tokio::test]
+    async fn local_task_completed_cannot_be_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_task(&tid).await.unwrap();
+        let before = svc.get_task(&tid).await.unwrap().unwrap();
+
+        let err = svc.fail_task(&tid, "should be rejected").await;
+        assert!(err.is_err(), "fail_task on completed must error");
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.status, TaskStatus::Completed);
+        assert_eq!(after.outcome, Some(TaskOutcome::Success));
+        assert_eq!(after.error_message, None);
+        assert_eq!(after.completed_at, before.completed_at);
+    }
+
+    #[tokio::test]
+    async fn local_task_failed_cannot_be_completed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.fail_task(&tid, "boom").await.unwrap();
+
+        let err = svc.complete_task(&tid).await;
+        assert!(err.is_err(), "complete_task on failed must error");
+        let err = svc
+            .complete_task_with_outcome(&tid, TaskOutcome::Success)
+            .await;
+        assert!(err.is_err(), "complete_task_with_outcome on failed must error");
+        let err = svc
+            .complete_plan_run(&tid, 100, 1, 1, TaskOutcome::Success)
+            .await;
+        assert!(err.is_err(), "complete_plan_run on failed must error");
+
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.status, TaskStatus::Failed);
+        assert_eq!(after.outcome, Some(TaskOutcome::Failed));
+        assert_eq!(after.error_message.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn local_task_progress_rejected_on_terminal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_task(&tid).await.unwrap();
+        let before = svc.get_task(&tid).await.unwrap().unwrap();
+
+        let err = svc.update_progress(&tid, 50, 5, 10).await;
+        assert!(err.is_err(), "update_progress on completed must error");
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.progress_pct, before.progress_pct);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    #[tokio::test]
+    async fn local_task_cancel_terminal_then_no_overwrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.update_status(&tid, TaskStatus::Cancelled).await.unwrap();
+
+        assert!(svc.fail_task(&tid, "late").await.is_err());
+        assert!(svc.complete_task(&tid).await.is_err());
+        assert!(svc.update_progress(&tid, 1, 1, 1).await.is_err());
+
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.status, TaskStatus::Cancelled);
     }
 
     #[tokio::test]

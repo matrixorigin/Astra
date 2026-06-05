@@ -185,8 +185,10 @@ mod tests {
                 .unwrap(),
             AgentToolResultStatusKind::Launched
         );
+        // Strict typed parse: unknown is Err. Wire-tolerant parse: Other.
+        assert!(AgentToolResultStatusKind::from_str("weird").is_err());
         assert_eq!(
-            AgentToolResultStatusKind::from_str("weird").unwrap(),
+            AgentToolResultStatusKind::parse_wire("weird"),
             AgentToolResultStatusKind::Other
         );
     }

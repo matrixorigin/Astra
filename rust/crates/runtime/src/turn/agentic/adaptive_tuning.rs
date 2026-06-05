@@ -683,6 +683,27 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     (tool_calls, unique_tools.len() as u32)
 }
 
+/// Decide whether the current user message implicitly accepts the previous
+/// assistant turn. Acceptance fires when:
+///
+/// - the message is non-empty (whitespace stripped), AND
+/// - it does not match the shared correction-signal classifier in
+///   `astra_turn_core::input_classifier::is_correction_signal`.
+///
+/// Routing through that shared classifier is mandatory: prior to this
+/// extraction adaptive_tuning carried its own inlined keyword list that drifted
+/// from the canonical one (false positives on bare "not " and "wrong",
+/// missing matches for "i meant", "actually i", "wait,", etc.). Two parallel
+/// lists is the anti-pattern this consolidates away.
+#[must_use]
+pub(crate) fn should_emit_acceptance(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !astra_turn_core::input_classifier::is_correction_signal(trimmed)
+}
+
 /// Record feedback signals based on the loop's outcome and accumulated state.
 ///
 /// Called once after the loop finishes (or errors) to feed the auto-tuning engine.
@@ -868,27 +889,10 @@ pub(crate) fn record_loop_completion_feedback(
             .iter()
             .rev()
             .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-        if has_prior_assistant && !state.message.is_empty() {
-            let lower = state.message.to_lowercase();
-            const CORRECTION_KEYWORDS: &[&str] = &[
-                "no, ",
-                "not ",
-                "wrong",
-                "incorrect",
-                "actually,",
-                "instead",
-                "try again",
-                "不对",
-                "错了",
-                "不是",
-                "重新",
-            ];
-            let is_correction = CORRECTION_KEYWORDS.iter().any(|kw| lower.contains(kw));
-            if !is_correction {
-                hub.record_feedback(enrich_signal(
-                    FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),
-                ));
-            }
+        if has_prior_assistant && should_emit_acceptance(&state.message) {
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),
+            ));
         }
     }
 
@@ -1055,7 +1059,59 @@ fn write_session_journal_event(
 
 #[cfg(test)]
 mod tests {
+    use super::should_emit_acceptance;
     use super::{fallback_scenario_from_task, resolve_scenario_from_routing};
+
+    // ── Acceptance signal routes through shared correction classifier ──
+
+    #[test]
+    fn acceptance_skipped_for_explicit_corrections() {
+        for s in [
+            "no, that's not what i meant",
+            "actually, i wanted X",
+            "wait, hold on",
+            "i meant the other one",
+            "to clarify, i need Y",
+            "不对，我的意思是改这里",
+            "等等，先停一下",
+        ] {
+            assert!(
+                !should_emit_acceptance(s),
+                "{s:?} is a correction; acceptance must not fire"
+            );
+        }
+    }
+
+    #[test]
+    fn acceptance_fires_for_neutral_or_accepting_messages() {
+        for s in [
+            "please continue",
+            "thanks, looks good",
+            "next step",
+            "继续",
+            "ok run it",
+        ] {
+            assert!(should_emit_acceptance(s), "{s:?} must emit acceptance");
+        }
+    }
+
+    #[test]
+    fn acceptance_skipped_for_empty_or_whitespace_message() {
+        assert!(!should_emit_acceptance(""));
+        assert!(!should_emit_acceptance("   \n\t"));
+    }
+
+    #[test]
+    fn acceptance_does_not_fire_on_drifted_inline_keyword_set() {
+        // Regression: the deleted inline list reported "not " as a correction
+        // (false positive on "the answer is not 5"); the shared classifier
+        // requires "not that" / "i meant" / "wrong," etc. — which is the
+        // calibrated form. Verify the false-positive cases now correctly
+        // emit acceptance (they are NOT corrections).
+        assert!(should_emit_acceptance("the answer is not 5"));
+        assert!(should_emit_acceptance("this looks wrong-shaped, fix the layout"));
+    }
+
     use crate::pipeline::routing::TaskType;
     use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;

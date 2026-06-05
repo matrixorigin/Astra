@@ -62,7 +62,8 @@ pub enum AgentResultStatusKind {
 }
 
 pub fn agent_result_status_kind(status: &str) -> AgentResultStatusKind {
-    match status {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         AGENT_RESULT_STATUS_COMPLETED => AgentResultStatusKind::Completed,
         AGENT_RESULT_STATUS_FAILED => AgentResultStatusKind::Failed,
         AGENT_RESULT_STATUS_TIMEOUT => AgentResultStatusKind::Timeout,
@@ -119,7 +120,8 @@ pub enum DelegationResultStatusKind {
 }
 
 pub fn delegation_result_status_kind(status: &str) -> DelegationResultStatusKind {
-    match status {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         DELEGATION_RESULT_STATUS_COMPLETED => DelegationResultStatusKind::Completed,
         DELEGATION_RESULT_STATUS_UNFINISHED => DelegationResultStatusKind::Unfinished,
         DELEGATION_RESULT_STATUS_PARTIAL => DelegationResultStatusKind::Partial,
@@ -1297,6 +1299,50 @@ mod tests {
         assert_eq!(
             agent_result_status_to_subrun_state("mystery"),
             SubRunState::Failed
+        );
+    }
+
+    #[test]
+    fn agent_result_status_kind_normalizes_case_and_whitespace() {
+        // Asymmetry-bug regression: ToolResultStatusKind::from_status_str
+        // already lowercases + trims, but agent_result_status_kind used to be
+        // exact-match. A producer that emitted "Completed" (capital C) or
+        // "FAILED" silently fell into AgentResultStatusKind::Other and was
+        // then projected to SubRunState::Failed — a successful sub-run was
+        // reported as failed.
+        for s in ["Completed", "COMPLETED", "  completed  ", "\tcompleted\n"] {
+            assert_eq!(
+                agent_result_status_kind(s),
+                AgentResultStatusKind::Completed,
+                "{s:?} must normalize to Completed",
+            );
+            assert!(agent_result_status_is_success(s), "{s:?} must be success");
+            assert_eq!(
+                agent_result_status_to_subrun_state(s),
+                SubRunState::Completed,
+                "{s:?} must project to Completed sub-run",
+            );
+        }
+        for s in ["FAILED", "Failed"] {
+            assert_eq!(agent_result_status_kind(s), AgentResultStatusKind::Failed);
+            assert!(agent_result_status_is_failure(s));
+        }
+        for s in ["Verification_Failed", "VERIFICATION_FAILED"] {
+            assert_eq!(
+                agent_result_status_kind(s),
+                AgentResultStatusKind::VerificationFailed
+            );
+        }
+        for s in ["Paused", "WAITING"] {
+            assert!(
+                agent_result_status_is_unfinished(s),
+                "{s:?} must be unfinished"
+            );
+        }
+        // Truly unknown still falls through to Other.
+        assert_eq!(
+            agent_result_status_kind("mystery"),
+            AgentResultStatusKind::Other
         );
     }
 

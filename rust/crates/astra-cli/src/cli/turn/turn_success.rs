@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(state.task_manager.session_id(), "");
         assert!(state.pending_adaptive_state.is_some());
         assert!(
-            !crate::cli::session_recovery::csl::csl_log_path_for(&sid).exists(),
+            !crate::cli::session_recovery::io::csl_log_path_for(&sid).exists(),
             "post-commit CSL persistence must be skipped when the primary turn commit fails"
         );
         assert!(

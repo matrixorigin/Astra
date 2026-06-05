@@ -98,11 +98,29 @@ pub(crate) async fn rebuild_csl_from_history(
     Ok(())
 }
 
-pub(crate) fn csl_log_path_for(session_id: &str) -> std::path::PathBuf {
-    session_journal::local_sessions_dir()
-        .join(session_id)
-        .join("conversation_log.jsonl")
+/// Read the highest `seq` present in the on-disk CSL log, if any.
+///
+/// Used to compute the seq for a recovery-time full snapshot so the new
+/// snapshot strictly dominates anything previously persisted. Lines that fail
+/// to parse (corruption, partial writes) are skipped — they cannot constrain
+/// the new high-water mark anyway since they are unreadable.
+fn read_max_seq_from_log(path: &std::path::Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let mut max_seq = 0u64;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<astra_turn_core::conversation_log::CslEntry>(line)
+        {
+            max_seq = max_seq.max(entry.seq());
+        }
+    }
+    max_seq
 }
+
 pub(crate) fn write_full_csl_snapshot_atomic(
     sid: &str,
     turn: u32,
@@ -118,8 +136,15 @@ pub(crate) fn write_full_csl_snapshot_atomic(
         }
     }
 
+    // The recovery snapshot replaces the file in its entirety, but the new
+    // snapshot's seq must still strictly dominate anything previously written
+    // so any out-of-band reader that observed older seqs (e.g. a cached
+    // `last_seq` in a still-running CSL manager) does not regress and reject
+    // subsequent appends as out-of-order.
+    let next_seq = read_max_seq_from_log(&path).saturating_add(1);
+
     let snapshot = astra_turn_core::conversation_log::CslEntry::Snapshot {
-        seq: 1,
+        seq: next_seq,
         turn,
         messages: messages.to_vec(),
         session_state: session_state.clone(),
