@@ -14,6 +14,19 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # ubuntu-latest has ~14GB free; parallel shards each restore a multi-GB
+    # rust-cache target/ dir. Only the build job used to run this cleanup.
+    - name: Free disk space
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune -af 2>/dev/null || true
+        df -h /
+
     - uses: dtolnay/rust-toolchain@stable
 
     - uses: taiki-e/install-action@nextest
