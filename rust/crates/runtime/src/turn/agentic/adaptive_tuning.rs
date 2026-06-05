@@ -285,7 +285,6 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
         &state.recent_tools,
         &[],
         Vec::new(),
-        None,
     );
     let user_id = session_guard.user_id.clone();
     let _ = hub;

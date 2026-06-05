@@ -615,30 +615,34 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
             use crate::tui::worktrees::{WorktreeList, parse};
 
-            // `git worktree list --porcelain` on a blocking thread.
-            let porcelain = tokio::task::spawn_blocking(|| {
+            // Both the `git worktree list --porcelain` invocation AND the
+            // per-entry session-count enrichment do blocking filesystem IO
+            // (process exec, journal scans, workspace YAML reads). Run the
+            // whole bundle on a blocking thread — keeping any portion of
+            // it on the runtime thread freezes the TUI on filesystems
+            // with tens of sessions per worktree.
+            let entries = tokio::task::spawn_blocking(|| {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let out = std::process::Command::new("git")
                     .args(["worktree", "list", "--porcelain"])
                     .current_dir(&cwd)
                     .output();
-                match out {
+                let porcelain = match out {
                     Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
                     _ => String::new(),
+                };
+                let mut entries = parse(&porcelain);
+                for e in entries.iter_mut() {
+                    let sessions = astra_services::session_workspace::list_sessions_by_git_root(
+                        &e.path, None, 50,
+                    );
+                    e.session_count = sessions.len();
+                    e.last_session_at = sessions.first().map(|s| s.updated_at.clone());
                 }
+                entries
             })
             .await
             .unwrap_or_default();
-
-            let mut entries = parse(&porcelain);
-            // Enrich each entry with session count (best-effort; any
-            // errors collapse to zero).
-            for e in entries.iter_mut() {
-                let sessions =
-                    astra_services::session_workspace::list_sessions_by_git_root(&e.path, None, 50);
-                e.session_count = sessions.len();
-                e.last_session_at = sessions.first().map(|s| s.updated_at.clone());
-            }
 
             if entries.is_empty() {
                 ctx.show_info("No worktrees found (or `git worktree list` failed).".into());
@@ -658,7 +662,21 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.show_info("No active session — /timeline needs a session id.".into());
                 return SlashResult::Handled;
             };
-            let timeline = Timeline::new(JournalTurnSource::new(), &sid);
+            // Timeline construction synchronously reads the entire JSONL
+            // session journal from disk; on long sessions this freezes
+            // the TUI for hundreds of ms. Run on a blocking thread.
+            let sid_owned = sid.clone();
+            let timeline = match tokio::task::spawn_blocking(move || {
+                Timeline::new(JournalTurnSource::new(), &sid_owned)
+            })
+            .await
+            {
+                Ok(t) => t,
+                Err(error) => {
+                    ctx.show_info(format!("/timeline failed: {error}"));
+                    return SlashResult::Handled;
+                }
+            };
             if let Some(error) = timeline.load_error() {
                 ctx.show_info(error.to_string());
                 return SlashResult::Handled;
@@ -691,7 +709,21 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
             use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-            let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+            // SessionDiscovery::new walks the on-disk journal index and
+            // reads up to `limit` workspace YAML files (~3 fs ops per
+            // session). On a runtime thread that's a TUI freeze; do it
+            // on a blocking thread instead.
+            let disco = match tokio::task::spawn_blocking(|| {
+                SessionDiscovery::new(FsSessionSource::new(), 50)
+            })
+            .await
+            {
+                Ok(d) => d,
+                Err(error) => {
+                    ctx.show_info(format!("session discovery failed: {error}"));
+                    return SlashResult::Handled;
+                }
+            };
             if disco.total() == 0 {
                 ctx.show_info("No previous sessions found.".into());
                 return SlashResult::Handled;
@@ -725,9 +757,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             let (sub, rest) = split_sub(trimmed);
             match sub {
-                "list" => handle_session_list_view(ctx),
+                "list" => handle_session_list_view(ctx).await,
                 "history" => handle_session_history_view(ctx, rest),
-                "fork" => handle_session_fork_view(ctx),
+                "fork" => handle_session_fork_view(ctx).await,
                 "analyze" | "diag" => handle_session_analyze_view(ctx, rest),
                 "export" => handle_session_export_view(ctx, rest),
                 _ => SlashResult::Fallback,
@@ -2951,10 +2983,20 @@ fn tilde_session_path(abs: &str) -> String {
 /// `/session list` — same picker as `/resume`, but reached via
 /// the session namespace so the registry reads naturally.  Empty
 /// store → info message instead of a blank picker.
-fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
+async fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
     use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-    let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+    let disco = match tokio::task::spawn_blocking(|| {
+        SessionDiscovery::new(FsSessionSource::new(), 50)
+    })
+    .await
+    {
+        Ok(d) => d,
+        Err(error) => {
+            ctx.show_info(format!("session discovery failed: {error}"));
+            return SlashResult::Handled;
+        }
+    };
     if disco.total() == 0 {
         ctx.show_info("No previous sessions found.".into());
         return SlashResult::Handled;
@@ -2989,10 +3031,20 @@ fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
 /// sentinel and runs `fork_local_session`.  No args short-circuits
 /// through the picker; `/session fork <sid>` falls back to the
 /// line-mode handler (covers scripted use).
-fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
+async fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
     use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-    let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+    let disco = match tokio::task::spawn_blocking(|| {
+        SessionDiscovery::new(FsSessionSource::new(), 50)
+    })
+    .await
+    {
+        Ok(d) => d,
+        Err(error) => {
+            ctx.show_info(format!("session discovery failed: {error}"));
+            return SlashResult::Handled;
+        }
+    };
     if disco.total() == 0 {
         ctx.show_info("No previous sessions to fork from.".into());
         return SlashResult::Handled;
@@ -3433,6 +3485,71 @@ async fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> S
         Err(message) => {
             ctx.show_error(message);
             SlashResult::Handled
+        }
+    }
+}
+
+#[cfg(test)]
+mod blocking_io_guard_tests {
+    /// Source-level guard: every slash command that loads from disk must do
+    /// it on a blocking thread. Specifically, the three known offenders —
+    /// `/timeline`, `/worktrees`, the SessionDiscovery used by `/resume`
+    /// and `/session list|fork` — must each appear in a `spawn_blocking`
+    /// closure. This test catches accidental regressions where someone
+    /// inlines a sync filesystem call back onto the runtime thread (which
+    /// freezes the TUI for hundreds of ms on long sessions).
+    #[test]
+    fn known_blocking_paths_are_wrapped_in_spawn_blocking() {
+        let source = include_str!("slash_dispatch.rs");
+
+        // /worktrees: the parse(porcelain) + list_sessions_by_git_root
+        // bundle must happen on a blocking thread. Look for the
+        // distinctive `list_sessions_by_git_root` call appearing inside
+        // a `spawn_blocking` block.
+        let worktrees_idx = source
+            .find("\"/worktrees\"")
+            .expect("/worktrees handler must exist");
+        let worktrees_block_end = worktrees_idx
+            + source[worktrees_idx..]
+                .find("\n        }")
+                .expect("/worktrees handler must close");
+        let worktrees_block = &source[worktrees_idx..worktrees_block_end];
+        assert!(
+            worktrees_block.contains("spawn_blocking"),
+            "/worktrees handler must wrap fs IO in spawn_blocking"
+        );
+        assert!(
+            worktrees_block.contains("list_sessions_by_git_root"),
+            "/worktrees handler should still enrich entries with session count"
+        );
+
+        // /timeline must build Timeline on a blocking thread.
+        let timeline_idx = source
+            .find("\"/timeline\"")
+            .expect("/timeline handler must exist");
+        let timeline_block_end = timeline_idx
+            + source[timeline_idx..]
+                .find("\n        }")
+                .expect("/timeline handler must close");
+        let timeline_block = &source[timeline_idx..timeline_block_end];
+        assert!(
+            timeline_block.contains("spawn_blocking"),
+            "/timeline handler must wrap Timeline::new in spawn_blocking"
+        );
+
+        // SessionDiscovery::new must always be called inside spawn_blocking.
+        // Allow the test snapshot blocks themselves to call it directly.
+        for (idx, _) in source.match_indices("SessionDiscovery::new(") {
+            let preceding = &source[..idx];
+            let last_512 = if preceding.len() > 512 {
+                &preceding[preceding.len() - 512..]
+            } else {
+                preceding
+            };
+            assert!(
+                last_512.contains("spawn_blocking"),
+                "SessionDiscovery::new at byte {idx} must be inside a spawn_blocking closure"
+            );
         }
     }
 }

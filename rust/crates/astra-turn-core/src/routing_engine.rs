@@ -33,11 +33,6 @@ pub use astra_pipeline::routing::{
     CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label,
 };
 
-use crate::llm_classify::{ClassificationContext, LlmIntentClassifier};
-// LlmClassification is used by MockLlmClassifier in tests
-#[cfg(test)]
-use crate::llm_classify::LlmClassification;
-
 // ─── RoutingDecision ─────────────────────────────────────────────────────────
 
 /// Unified routing decision — single analysis pass, shared by all consumers.
@@ -69,9 +64,6 @@ pub struct RoutingDecision {
 
     /// Disambiguation result (from embedded IntentDisambiguation).
     pub disambiguation: IntentDisambiguation,
-
-    /// Whether the LLM fallback classifier was used for this decision.
-    pub llm_fallback_used: bool,
 }
 
 // ─── Preference Detection ────────────────────────────────────────────────────
@@ -477,16 +469,12 @@ impl RoutingEngine {
     /// - `recent_tools`: Tools used in recent turns
     /// - `memory_hints`: Domain hints from memory service (e.g., "matrixorigin = GitHub org")
     /// - `boost_terms`: Pre-extracted boost terms from history + memory
-    /// - `llm_classifier`: Optional LLM-based classifier for low-confidence / Unknown fallback.
-    ///   When `Some`, the LLM is called for queries where keyword classification yields
-    ///   `TaskType::Unknown` or confidence < 0.25 (VeryLow tier).
     pub fn analyze(
         query: &str,
         turn_count: u32,
         recent_tools: &[String],
         memory_hints: &[String],
         boost_terms: Vec<String>,
-        llm_classifier: Option<&dyn LlmIntentClassifier>,
     ) -> RoutingDecision {
         // 1. Build ConversationState (reuses existing signal extraction)
         let conversation_state =
@@ -510,36 +498,14 @@ impl RoutingEngine {
         let domain_hint = extract_domain_hint(&conversation_state, memory_hints);
 
         // 5. Compute unified confidence
-        let mut confidence = compute_routing_confidence(
+        let confidence = compute_routing_confidence(
             &conversation_state,
             &task_type,
             memory_hints.len(),
             &disambiguation,
         );
 
-        // 6. LLM fallback: reclassify when keyword-based result is uncertain
-        let mut task_type = task_type;
-        let mut llm_fallback_used = false;
-        if let Some(classifier) = llm_classifier {
-            let needs_llm = task_type == TaskType::Unknown || confidence < 0.25;
-            if needs_llm {
-                let ctx = ClassificationContext {
-                    query: query.to_string(),
-                    turn_count,
-                    recent_tools: recent_tools.to_vec(),
-                    memory_hints: memory_hints.to_vec(),
-                };
-                if let Some(llm_result) = classifier.classify(&ctx) {
-                    task_type = llm_result.task_type;
-                    // Blend: use the higher of keyword confidence and LLM confidence
-                    // to avoid over-trusting a single LLM response on edge cases.
-                    confidence = confidence.max(llm_result.confidence);
-                    llm_fallback_used = true;
-                }
-            }
-        }
-
-        // 7. Determine tool filter
+        // 6. Determine tool filter
         let tool_filter = determine_tool_filter(
             &conversation_state,
             &disambiguation.recommendation,
@@ -547,7 +513,7 @@ impl RoutingEngine {
             confidence,
         );
 
-        // 8. Estimate rounds
+        // 7. Estimate rounds
         let estimated_rounds = estimate_rounds(&task_type, confidence);
 
         RoutingDecision {
@@ -560,7 +526,6 @@ impl RoutingEngine {
             tool_filter,
             estimated_rounds,
             disambiguation,
-            llm_fallback_used,
         }
     }
 }
@@ -572,17 +537,17 @@ mod tests {
     use super::*;
 
     fn analyze(query: &str) -> RoutingDecision {
-        RoutingEngine::analyze(query, 1, &[], &[], vec![], None)
+        RoutingEngine::analyze(query, 1, &[], &[], vec![])
     }
 
     fn analyze_with_recent(query: &str, turn_count: u32, recent_tools: &[&str]) -> RoutingDecision {
         let recent_tools: Vec<String> = recent_tools.iter().map(|s| s.to_string()).collect();
-        RoutingEngine::analyze(query, turn_count, &recent_tools, &[], vec![], None)
+        RoutingEngine::analyze(query, turn_count, &recent_tools, &[], vec![])
     }
 
     fn analyze_with_memory(query: &str, hints: &[&str]) -> RoutingDecision {
         let hints: Vec<String> = hints.iter().map(|s| s.to_string()).collect();
-        RoutingEngine::analyze(query, 1, &[], &hints, vec![], None)
+        RoutingEngine::analyze(query, 1, &[], &hints, vec![])
     }
 
     // ── Task Type Classification ─────────────────────────────────────────
@@ -861,115 +826,13 @@ mod tests {
         );
     }
 
-    /// Mock LLM classifier that returns a predefined classification.
-    struct MockLlmClassifier {
-        task_type: TaskType,
-        confidence: f64,
-    }
-
-    impl LlmIntentClassifier for MockLlmClassifier {
-        fn classify(&self, _ctx: &ClassificationContext) -> Option<LlmClassification> {
-            Some(LlmClassification {
-                task_type: self.task_type,
-                confidence: self.confidence,
-                reasoning: "mock classification".into(),
-            })
-        }
-    }
-
-    fn analyze_with_llm(query: &str, classifier: &dyn LlmIntentClassifier) -> RoutingDecision {
-        RoutingEngine::analyze(query, 1, &[], &[], vec![], Some(classifier))
-    }
-
-    // ── LLM Fallback Tests ────────────────────────────────────────────────
-
-    #[test]
-    fn llm_fallback_used_for_unknown_task() {
-        let mock = MockLlmClassifier {
-            task_type: TaskType::Fetch,
-            confidence: 0.8,
-        };
-        // "matrixorigin" alone is Unknown to keyword classifier
-        let d = analyze_with_llm("matrixorigin", &mock);
-        assert_eq!(d.task_type, TaskType::Fetch);
-        assert!(d.llm_fallback_used);
-        assert!(d.confidence >= 0.8);
-    }
-
-    #[test]
-    fn llm_fallback_not_used_for_confident_keyword_result() {
-        let mock = MockLlmClassifier {
-            task_type: TaskType::Conversational,
-            confidence: 0.9,
-        };
-        // "list the open PRs" is confidently classified as Fetch by keywords
-        let d = analyze_with_llm("list the open PRs", &mock);
-        assert_eq!(d.task_type, TaskType::Fetch); // keyword result, not LLM
-        assert!(!d.llm_fallback_used);
-    }
-
-    #[test]
-    fn llm_fallback_used_for_low_confidence() {
-        let mock = MockLlmClassifier {
-            task_type: TaskType::Reasoning,
-            confidence: 0.7,
-        };
-        // Single-word query with no signals → low confidence
-        let d = analyze_with_llm("matrixorigin", &mock);
-        assert!(d.llm_fallback_used);
-        assert_eq!(d.task_type, TaskType::Reasoning);
-        // Confidence should be max(keyword_conf, llm_conf)
-        assert!(d.confidence >= 0.7);
-    }
-
-    #[test]
-    fn llm_fallback_preserves_higher_keyword_confidence() {
-        let mock = MockLlmClassifier {
-            task_type: TaskType::Reasoning,
-            confidence: 0.1, // LLM gives very low confidence
-        };
-        // "why does this fail" is Reasoning per keywords + has signals
-        let d = analyze_with_llm("why does this fail", &mock);
-        assert_eq!(d.task_type, TaskType::Reasoning);
-        // keyword confidence should be higher than LLM's 0.1
-        assert!(
-            d.confidence > 0.2,
-            "keyword conf should dominate: {}",
-            d.confidence
-        );
-    }
-
-    #[test]
-    fn llm_fallback_none_preserves_keyword_result() {
-        // No LLM classifier → "matrixorigin" stays Unknown (keyword can't classify it)
-        let d = analyze("matrixorigin");
-        assert_eq!(d.task_type, TaskType::Unknown);
-        assert!(!d.llm_fallback_used);
-    }
-
-    #[test]
-    fn llm_fallback_classifies_semantic_query() {
-        let mock = MockLlmClassifier {
-            task_type: TaskType::Reasoning,
-            confidence: 0.85,
-        };
-        // "is this approach architecturally sound?" has no
-        // matching keywords but semantically is a Reasoning query.
-        // First verify it's Unknown without LLM:
-        let d_no_llm = analyze("is this approach architecturally sound?");
-        assert_eq!(d_no_llm.task_type, TaskType::Unknown);
-
-        // Then verify LLM fallback reclassifies it:
-        let d = analyze_with_llm("is this approach architecturally sound?", &mock);
-        assert_eq!(d.task_type, TaskType::Reasoning);
-        assert!(d.llm_fallback_used);
-    }
-
-    #[test]
-    fn llm_fallback_respects_null_classifier() {
-        // Tests the None path — no LLM classifier, so no fallback attempted
-        let d = analyze("matrixorigin");
-        assert_eq!(d.task_type, TaskType::Unknown);
-        assert!(!d.llm_fallback_used);
-    }
+    // Note: an `LlmIntentClassifier` semantic-fallback path used to live
+    // here. It was a partial implementation — every production caller passed
+    // `None` so the entire path was unreachable shipping code, and it had
+    // unguarded prompt-injection (raw user input interpolated into the
+    // LLM prompt), no timeout, no caching, no telemetry. Per the project
+    // rule against half-finished features, the path was removed entirely.
+    // If a real semantic fallback is needed in the future, it must be
+    // wired into the analyze() signature with explicit timeout, cache,
+    // and prompt-sanitization guarantees, not bolted on as an Option.
 }

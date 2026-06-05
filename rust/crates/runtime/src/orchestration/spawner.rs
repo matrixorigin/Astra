@@ -3145,6 +3145,69 @@ mod tests {
             .await;
     }
 
+    /// Late-waiter coverage: even when the notifier is already gone (finalize
+    /// has run to completion AND removed the entry), the pre-check at the
+    /// top of `wait_for_agent_outcome` reads `completed_agents` and surfaces
+    /// the terminal status. Asserting this explicitly so a refactor that
+    /// removes the pre-check or reorders archive vs notifier-removal would
+    /// trip immediately.
+    #[tokio::test]
+    async fn wait_for_agent_outcome_late_arrival_returns_completed_status() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+
+        // Drive the agent fully through finalize: archived AND notifier
+        // removed. Both conditions must be observable before we test the
+        // late-waiter path.
+        for _ in 0..1000 {
+            let archived = spawner
+                .completed_agents
+                .read()
+                .await
+                .iter()
+                .any(|s| s.agent_id == agent_id);
+            let notifier_gone = !spawner
+                .completion_notifiers
+                .read()
+                .await
+                .contains_key(&agent_id);
+            if archived && notifier_gone {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Sanity: precondition for the test.
+        assert!(
+            !spawner
+                .completion_notifiers
+                .read()
+                .await
+                .contains_key(&agent_id),
+            "test precondition failed: notifier should already be gone"
+        );
+
+        // Late wait: notifier missing, so the lookup at line 1471 returns
+        // None. The bug was: classify_wait_failure then reports TimedOut
+        // (because get_agent_state_any sees the archived state). Correct
+        // behaviour: surface the terminal Status from completed_agents.
+        let outcome = spawner
+            .wait_for_agent_outcome(&agent_id, std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(outcome, WaitForAgentOutcome::Status(AgentStatus::Completed { .. })),
+            "late waiter must see Completed terminal status, got {outcome:?}"
+        );
+    }
+
     /// Regression: background task completes BEFORE shutdown_and_wait is called.
     /// Uses BlockingExecutorFactory so the child finishes before
     /// shutdown_and_wait is called, but after spawn returned Launched.
