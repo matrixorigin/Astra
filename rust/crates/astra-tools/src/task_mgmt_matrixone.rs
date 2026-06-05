@@ -31,7 +31,7 @@ use crate::task_mgmt::{
     InMemoryTaskStore, SESSION_TASK_STATUS_ARCHIVED, SESSION_TASK_STATUS_CANCELLED,
     SESSION_TASK_STATUS_COMPLETED, SESSION_TASK_STATUS_FAILED, SESSION_TASK_STATUS_IN_PROGRESS,
     SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
-    TaskStore, prefix_summary, session_task_can_be_archived, session_task_status_kind,
+    TaskStore, prefix_summary, session_task_can_be_archived,
 };
 
 /// Soft cap on the number of rows a single `session_todos` full-replace
@@ -102,9 +102,9 @@ async fn insert_session_tasks(
             tasks[start..end].iter().enumerate(),
             |mut row, (offset, task)| {
                 let encoded = encode_task_json_fields(task);
-                let archived_at = (session_task_status_kind(&task.status)
-                    == SessionTaskStatusKind::Archived)
+                let archived_at = (task.status == SessionTaskStatusKind::Archived)
                     .then(|| to_mo_datetime(&task.updated_at));
+                let status_str = task.status.to_string();
                 row.push_bind(session_id)
                     .push_bind(&task.id)
                     .push_bind(user_id)
@@ -112,7 +112,7 @@ async fn insert_session_tasks(
                     .push_bind(&task.title)
                     .push_bind(&task.description)
                     .push_bind(&task.active_form)
-                    .push_bind(&task.status)
+                    .push_bind(status_str)
                     .push_bind(&task.owner)
                     .push_bind(encoded.metadata)
                     .push_bind(encoded.blocks)
@@ -254,7 +254,8 @@ fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> 
     let title: String = row.try_get("title")?;
     let description: Option<String> = row.try_get("description").ok().flatten();
     let active_form: Option<String> = row.try_get("active_form").ok().flatten();
-    let status: String = row.try_get("status")?;
+    let status_str: String = row.try_get("status")?;
+    let status = SessionTaskStatusKind::from_status_str(&status_str);
     let owner: Option<String> = row.try_get("owner").ok().flatten();
     let metadata: Option<serde_json::Map<String, serde_json::Value>> = row
         .try_get::<Option<String>, _>("metadata")
@@ -327,8 +328,8 @@ impl TaskStore for MatrixOneTaskStore {
              ORDER BY ordinal ASC",
         )
         .bind(session_id)
-        .bind(SESSION_TASK_STATUS_PENDING)
-        .bind(SESSION_TASK_STATUS_IN_PROGRESS)
+        .bind(SESSION_TASK_STATUS_PENDING.to_string())
+        .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -379,7 +380,8 @@ impl TaskStore for MatrixOneTaskStore {
                     .to_string(),
                 ));
             };
-            if session_task_status_kind(&status) == SessionTaskStatusKind::Archived {
+            let status_kind = SessionTaskStatusKind::from_status_str(&status);
+            if status_kind == SessionTaskStatusKind::Archived {
                 return Ok(prefix_summary(
                     format!("Refused: task #{task_id} is already archived"),
                     json!({
@@ -392,7 +394,7 @@ impl TaskStore for MatrixOneTaskStore {
                     .to_string(),
                 ));
             }
-            if !session_task_can_be_archived(&status) {
+            if !session_task_can_be_archived(&status_kind) {
                 return Ok(prefix_summary(
                     format!(
                         "Refused: task #{task_id} is '{status}' — only completed, failed, or cancelled tasks can be archived"
@@ -418,12 +420,12 @@ impl TaskStore for MatrixOneTaskStore {
                      WHERE session_id = ? AND todo_id = ? \
                        AND status IN (?, ?, ?)",
                 )
-                .bind(SESSION_TASK_STATUS_ARCHIVED)
+                .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
                 .bind(session_id)
                 .bind(task_id)
-                .bind(SESSION_TASK_STATUS_COMPLETED)
-                .bind(SESSION_TASK_STATUS_FAILED)
-                .bind(SESSION_TASK_STATUS_CANCELLED)
+                .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
+                .bind(SESSION_TASK_STATUS_FAILED.to_string())
+                .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
                 .execute(&self.pool)
                 .await
             } else {
@@ -433,13 +435,13 @@ impl TaskStore for MatrixOneTaskStore {
                      WHERE user_id = ? AND session_id = ? AND todo_id = ? \
                        AND status IN (?, ?, ?)",
                 )
-                .bind(SESSION_TASK_STATUS_ARCHIVED)
+                .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
                 .bind(&self.user_id)
                 .bind(session_id)
                 .bind(task_id)
-                .bind(SESSION_TASK_STATUS_COMPLETED)
-                .bind(SESSION_TASK_STATUS_FAILED)
-                .bind(SESSION_TASK_STATUS_CANCELLED)
+                .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
+                .bind(SESSION_TASK_STATUS_FAILED.to_string())
+                .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
                 .execute(&self.pool)
                 .await
             }
@@ -490,9 +492,9 @@ impl TaskStore for MatrixOneTaskStore {
                  WHERE session_id = ? AND status = ? \
                    AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
-            .bind(SESSION_TASK_STATUS_ARCHIVED)
+            .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
             .bind(session_id)
-            .bind(SESSION_TASK_STATUS_COMPLETED)
+            .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
             .bind(days)
             .execute(&self.pool)
             .await
@@ -503,9 +505,9 @@ impl TaskStore for MatrixOneTaskStore {
                  WHERE user_id = ? AND status = ? \
                    AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
-            .bind(SESSION_TASK_STATUS_ARCHIVED)
+            .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
             .bind(&self.user_id)
-            .bind(SESSION_TASK_STATUS_COMPLETED)
+            .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
             .bind(days)
             .execute(&self.pool)
             .await
