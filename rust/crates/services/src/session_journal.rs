@@ -5128,6 +5128,39 @@ mod tests {
     }
 
     #[test]
+    fn read_journal_ignores_truncated_final_json_line() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "00000000-0000-0000-0000-000000000191";
+        let event = JournalEvent::turn(
+            Some(sid),
+            1,
+            Some("test-model"),
+            "user",
+            "assistant",
+            0,
+            0,
+            0,
+            0,
+        );
+        let valid = serde_json::to_string(&event).unwrap();
+        std::fs::write(
+            journal_file_path(sid),
+            format!("{valid}\n{{\"type\":\"turn\",\"turn\":"),
+        )
+        .unwrap();
+
+        let events = read_journal(sid).expect("truncated tail should not poison journal");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].turn, Some(1));
+
+        let (_events, non_empty_lines, malformed_lines) =
+            read_journal_for_digest(sid).expect("digest read should count malformed tail");
+        assert_eq!(non_empty_lines, 2);
+        assert_eq!(malformed_lines, 1);
+    }
+
+    #[test]
     fn journal_event_cloud_pull_sync_marker_round_trip() {
         let keys = vec!["explain_mode".to_string()];
         let evt = JournalEvent::cloud_pull_sync_marker(

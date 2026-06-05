@@ -69,6 +69,34 @@ pub use astra_core::composite_snapshot::{
     CompositeSnapshot, DataSnapshotRef, MemorySnapshotRef, SnapshotRef, SnapshotSpec,
 };
 
+struct ForkArtifactGuard {
+    session_id: String,
+    committed: bool,
+}
+
+impl ForkArtifactGuard {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ForkArtifactGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = std::fs::remove_file(journal_file_path(&self.session_id));
+        let _ = std::fs::remove_dir_all(session_workspace::workspace_dir_for(&self.session_id));
+    }
+}
+
 /// Fork parent journal into a new session file and workspace metadata.
 ///
 /// Fails if the target journal path already exists or the parent journal is empty.
@@ -107,14 +135,18 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         })
         .or_else(|| events.iter().find_map(|e| e.model.clone()));
 
-    let max_turn = session_workspace::read_workspace(&parent)
-        .map(|w| w.turn_count)
-        .unwrap_or_else(|_| {
-            events
-                .iter()
-                .filter(|e| e.event_type == JournalEventType::Turn)
-                .count() as u32
-        });
+    let parent_workspace = match session_workspace::read_workspace(&parent) {
+        Ok(ws) => Some(ws),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read parent workspace: {e}")),
+    };
+    let workspace_turn_count = parent_workspace.as_ref().map(|w| w.turn_count);
+    let max_turn = workspace_turn_count.unwrap_or_else(|| {
+        events
+            .iter()
+            .filter(|e| e.event_type == JournalEventType::Turn)
+            .count() as u32
+    });
     let forked_at_turn = match opts.forked_after_turn {
         Some(t) if t <= max_turn => t,
         Some(t) => {
@@ -162,6 +194,7 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         copied += 1;
     }
 
+    let artifact_guard = ForkArtifactGuard::new(new_id.clone());
     let writer = JournalWriter::new(&new_id).map_err(|e| e.to_string())?;
     for evt in &out {
         writer.append(evt).map_err(|e| e.to_string())?;
@@ -170,17 +203,14 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         "[audit] forked session {parent} → {new_id} (turn {forked_at_turn}, {copied} events copied)"
     );
 
-    let mut ws = session_workspace::read_workspace(&parent)
-        .unwrap_or_else(|_| WorkspaceMetadata::new(&parent, model.as_deref().unwrap_or("default")));
+    let mut ws = parent_workspace
+        .unwrap_or_else(|| WorkspaceMetadata::new(&parent, model.as_deref().unwrap_or("default")));
     ws.session_id = new_id.clone();
     ws.parent_session_id = Some(parent.clone());
     ws.fork_note = opts.label.clone();
     ws.forked_at_turn = Some(forked_at_turn);
     // Carry forward an existing correlation id, else use parent session id as chain root for multi-agent / audit.
-    ws.correlation_id = session_workspace::read_workspace(&parent)
-        .ok()
-        .and_then(|w| w.correlation_id.clone())
-        .or_else(|| Some(parent.clone()));
+    ws.correlation_id = ws.correlation_id.clone().or_else(|| Some(parent.clone()));
     ws.turn_count = forked_at_turn;
     ws.agent_role = None;
     let now = chrono::Utc::now().to_rfc3339();
@@ -189,10 +219,13 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     ws.status = "active".to_string();
     session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
 
-    // Copy step_checkpoints/ so the forked session can resume with conversation
-    // context (heavy checkpoints contain the full messages array).
-    // Skip composite_snapshots.json (index file, not a checkpoint).
-    {
+    // Copy step checkpoints only for full-history forks. When forking from an
+    // earlier turn, the parent's latest heavy checkpoint may describe future
+    // conversation state that is no longer present in the child journal.
+    // Skipping checkpoint copy in that case is strictly safer than restoring
+    // stale future context. Higher-level CLI flows synthesize a fresh child
+    // snapshot immediately after the fork completes.
+    if workspace_turn_count.is_some() && forked_at_turn == max_turn {
         let sessions_dir = crate::local_session_artifact_store().sessions_root();
         let parent_cp_dir = sessions_dir.join(&parent).join("step_checkpoints");
         if parent_cp_dir.is_dir() {
@@ -231,6 +264,7 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         )
     });
 
+    artifact_guard.commit();
     Ok(ForkSessionResult {
         new_session_id: new_id,
         events_copied: copied,
@@ -521,5 +555,147 @@ mod tests {
 
         cleanup_session(&parent_id);
         cleanup_session(&result.new_session_id);
+    }
+
+    #[test]
+    fn fork_before_latest_does_not_copy_future_step_checkpoints() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        setup_test_session(&parent_id, 4);
+
+        let sessions_dir = crate::session_journal::local_sessions_dir();
+        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("000001-heavy.json"), r#"{"turn":1}"#).unwrap();
+        std::fs::write(cp_dir.join("000004-heavy.json"), r#"{"turn":4}"#).unwrap();
+
+        let result = fork_local_session(ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: None,
+            label: None,
+            forked_after_turn: Some(2),
+            data_branch: None,
+            snapshot_spec: None,
+        })
+        .expect("fork should succeed");
+
+        let child_cp_dir = sessions_dir
+            .join(&result.new_session_id)
+            .join("step_checkpoints");
+        assert!(
+            !child_cp_dir.exists(),
+            "earlier-turn fork must not copy parent checkpoints that may encode future state"
+        );
+
+        cleanup_session(&parent_id);
+        cleanup_session(&result.new_session_id);
+    }
+
+    #[test]
+    fn fork_without_workspace_does_not_copy_step_checkpoints() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        setup_test_session(&parent_id, 3);
+
+        let sessions_dir = crate::session_journal::local_sessions_dir();
+        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("000003-heavy.json"), r#"{"turn":3}"#).unwrap();
+        std::fs::remove_file(
+            session_workspace::workspace_dir_for(&parent_id).join("workspace.yaml"),
+        )
+        .unwrap();
+
+        let result = fork_local_session(ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: None,
+            label: None,
+            forked_after_turn: None,
+            data_branch: None,
+            snapshot_spec: None,
+        })
+        .expect("fork should succeed");
+
+        let child_cp_dir = sessions_dir
+            .join(&result.new_session_id)
+            .join("step_checkpoints");
+        assert!(
+            !child_cp_dir.exists(),
+            "without workspace turn_count we should not infer that latest journal events are full history"
+        );
+
+        cleanup_session(&parent_id);
+        cleanup_session(&result.new_session_id);
+    }
+
+    #[test]
+    fn fork_rejects_corrupt_parent_workspace_before_writing_child_artifacts() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        let child_id = uuid::Uuid::new_v4().to_string();
+        setup_test_session(&parent_id, 3);
+
+        std::fs::write(
+            session_workspace::workspace_dir_for(&parent_id).join("workspace.yaml"),
+            ":\nnot-valid-yaml",
+        )
+        .unwrap();
+
+        let error = fork_local_session(ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: Some(child_id.clone()),
+            label: None,
+            forked_after_turn: None,
+            data_branch: None,
+            snapshot_spec: None,
+        })
+        .expect_err("corrupt parent workspace should fail fork");
+
+        assert!(error.contains("read parent workspace"), "{error}");
+        assert!(
+            !journal_file_path(&child_id).exists(),
+            "fork must not create the child journal when parent workspace is unreadable"
+        );
+        assert!(
+            !session_workspace::workspace_dir_for(&child_id).exists(),
+            "fork must not create child workspace artifacts on parent workspace read failure"
+        );
+
+        cleanup_session(&parent_id);
+    }
+
+    #[test]
+    fn fork_cleans_up_child_artifacts_when_checkpoint_copy_fails() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        let child_id = uuid::Uuid::new_v4().to_string();
+        setup_test_session(&parent_id, 3);
+
+        let sessions_dir = crate::session_journal::local_sessions_dir();
+        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::create_dir(cp_dir.join("000003-heavy.json")).unwrap();
+
+        let error = fork_local_session(ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: Some(child_id.clone()),
+            label: None,
+            forked_after_turn: None,
+            data_branch: None,
+            snapshot_spec: None,
+        })
+        .expect_err("checkpoint copy failure should fail fork");
+
+        assert!(error.contains("copy checkpoint"), "{error}");
+        assert!(
+            !journal_file_path(&child_id).exists(),
+            "failed fork must remove the child journal"
+        );
+        assert!(
+            !session_workspace::workspace_dir_for(&child_id).exists(),
+            "failed fork must remove child workspace and checkpoint artifacts"
+        );
+
+        cleanup_session(&parent_id);
     }
 }

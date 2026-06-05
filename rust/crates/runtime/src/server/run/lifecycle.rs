@@ -30,8 +30,9 @@ use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    RunInputData, RunInputRecord, RunLifecycleService, RunListRecord, RunMutationRecord,
-    RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
+    DurableRunStatusKind, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
+    RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
+    durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
@@ -70,6 +71,7 @@ use astra_core::{
     STATUS_WAITING,
 };
 
+use crate::orchestration::spawner::project_subrun_status_to_spawn;
 use crate::server::run::engine::{RunEngine, RunStartContext};
 use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
@@ -2137,6 +2139,30 @@ impl RunStatus {
         }
     }
 
+    fn from_durable_status(status: &str) -> Option<Self> {
+        match durable_run_status_kind(status) {
+            DurableRunStatusKind::Running => Some(Self::Running),
+            DurableRunStatusKind::Paused => Some(Self::Paused),
+            DurableRunStatusKind::Waiting => Some(Self::Waiting),
+            DurableRunStatusKind::Completed => Some(Self::Completed),
+            DurableRunStatusKind::Failed => Some(Self::Failed),
+            DurableRunStatusKind::Cancelled => Some(Self::Cancelled),
+            DurableRunStatusKind::Other => None,
+        }
+    }
+
+    fn is_resumable(&self) -> bool {
+        matches!(self, Self::Paused | Self::Waiting)
+    }
+
+    fn blocks_session(&self, waiting_for: Option<&str>) -> bool {
+        match self {
+            Self::Running | Self::Waiting => true,
+            Self::Paused => waiting_for.is_some(),
+            Self::Completed | Self::Failed | Self::Cancelled => false,
+        }
+    }
+
     /// Validate a status transition. Returns `Err` if the transition is illegal.
     ///
     /// Rules:
@@ -2994,12 +3020,7 @@ impl AgenticRunLifecycleService {
     ///   `budget_exhausted`; the user-facing contract says the next message can
     ///   continue from the checkpoint, so it must not block a fresh web turn.
     fn blocks_new_session_run(run: &RunState, session_id: &str) -> bool {
-        run.session_id == session_id
-            && match run.status {
-                RunStatus::Running | RunStatus::Waiting => true,
-                RunStatus::Paused => run.waiting_for.is_some(),
-                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => false,
-            }
+        run.session_id == session_id && run.status.blocks_session(run.waiting_for.as_deref())
     }
 
     fn session_has_blocking_run(runs: &HashMap<String, RunState>, session_id: &str) -> bool {
@@ -3805,18 +3826,12 @@ impl AgenticRunLifecycleService {
     fn run_status_from_durable(
         status: &str,
     ) -> Result<RunStatus, (StatusCode, Json<ErrorResponse>)> {
-        match status {
-            STATUS_RUNNING => Ok(RunStatus::Running),
-            STATUS_PAUSED => Ok(RunStatus::Paused),
-            STATUS_WAITING => Ok(RunStatus::Waiting),
-            STATUS_COMPLETED => Ok(RunStatus::Completed),
-            STATUS_FAILED => Ok(RunStatus::Failed),
-            STATUS_CANCELLED => Ok(RunStatus::Cancelled),
-            other => Err(error_response(
+        RunStatus::from_durable_status(status).ok_or_else(|| {
+            error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid durable run status '{other}'"),
-            )),
-        }
+                format!("Invalid durable run status '{status}'"),
+            )
+        })
     }
 
     fn run_state_conflict(action: &str, status: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -4295,7 +4310,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     } else if run.status.try_transition(&final_status).is_ok() {
                         run.status = final_status.clone();
                     }
-                    if run.status != RunStatus::Waiting && run.status != RunStatus::Paused {
+                    if !run.status.is_resumable() {
                         run.live_tx = None;
                     }
                 }
@@ -4318,7 +4333,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Schedule eviction of the terminal run from the in-memory cache.
             // Waiting and paused runs are NOT evicted — they may still be resumed.
-            if persisted_status != RunStatus::Waiting && persisted_status != RunStatus::Paused {
+            if !persisted_status.is_resumable() {
                 Self::schedule_run_eviction(&runs, bg_run_id.clone());
             }
 
@@ -4780,7 +4795,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     } else if run.status.try_transition(&final_status).is_ok() {
                         run.status = final_status.clone();
                     }
-                    if run.status != RunStatus::Waiting && run.status != RunStatus::Paused {
+                    if !run.status.is_resumable() {
                         run.live_tx = None;
                     }
                     flush_turn_observability(&mut state, &bg_session_id, false);
@@ -4804,7 +4819,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Schedule eviction of the terminal run from the in-memory cache.
             // Waiting and paused runs are NOT evicted — they may still be resumed.
-            if persisted_status != RunStatus::Waiting && persisted_status != RunStatus::Paused {
+            if !persisted_status.is_resumable() {
                 Self::schedule_run_eviction(&runs, bg_run_id.clone());
             }
 
@@ -5571,17 +5586,6 @@ fn spawn_system_prompt(config: &SpawnRunConfig) -> String {
     }
 }
 
-fn spawn_status_to_finish_reason(status: &str) -> &'static str {
-    match status {
-        STATUS_COMPLETED => "normal",
-        STATUS_WAITING => "waiting",
-        STATUS_CANCELLED => "cancelled",
-        STATUS_FAILED => "failed",
-        STATUS_PAUSED => "paused",
-        _ => "unknown",
-    }
-}
-
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
@@ -5684,31 +5688,15 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             executor
         };
         let result = executor.execute(subrun).await?;
-        let finish_reason = spawn_status_to_finish_reason(&result.status).to_string();
-        let status = match result.status.as_str() {
-            STATUS_COMPLETED => "completed",
-            STATUS_WAITING => "waiting",
-            STATUS_CANCELLED => "cancelled",
-            STATUS_FAILED => "failed",
-            STATUS_PAUSED => "completed",
-            _ => "failed",
-        }
-        .to_string();
-        let error = if status == "failed" {
-            result
-                .error
-                .or_else(|| Some(format!("server spawned agent ended with {}", result.status)))
-        } else {
-            result.error
-        };
+        let projection = project_subrun_status_to_spawn(&result.status, result.error);
 
         Ok(SpawnRunResult {
             agent_id: result.agent_id,
             run_id: result.run_id,
-            status,
-            finish_reason,
+            status: projection.status.to_string(),
+            finish_reason: projection.finish_reason.to_string(),
             output: result.output,
-            error,
+            error: projection.error,
             prompt_tokens: result.prompt_tokens,
             completion_tokens: result.completion_tokens,
             tool_calls: result.tool_calls,
@@ -9015,6 +9003,64 @@ mod tests {
         assert_eq!(RunStatus::Waiting.as_str(), "waiting");
     }
 
+    #[test]
+    fn run_status_live_semantics_align_with_durable_owner() {
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_RUNNING),
+            Some(RunStatus::Running)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_WAITING),
+            Some(RunStatus::Waiting)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_PAUSED),
+            Some(RunStatus::Paused)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_COMPLETED),
+            Some(RunStatus::Completed)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_FAILED),
+            Some(RunStatus::Failed)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_CANCELLED),
+            Some(RunStatus::Cancelled)
+        );
+        assert_eq!(RunStatus::from_durable_status("mystery"), None);
+
+        assert!(RunStatus::Waiting.is_resumable());
+        assert!(RunStatus::Paused.is_resumable());
+        assert!(!RunStatus::Running.is_resumable());
+        assert!(!RunStatus::Completed.is_resumable());
+
+        assert_eq!(
+            RunStatus::Running.blocks_session(None),
+            astra_services::runs::durable_run_status_blocks_session(STATUS_RUNNING, None)
+        );
+        assert_eq!(
+            RunStatus::Waiting.blocks_session(None),
+            astra_services::runs::durable_run_status_blocks_session(STATUS_WAITING, None)
+        );
+        assert_eq!(
+            RunStatus::Paused.blocks_session(Some("tool_approval")),
+            astra_services::runs::durable_run_status_blocks_session(
+                STATUS_PAUSED,
+                Some("tool_approval")
+            )
+        );
+        assert_eq!(
+            RunStatus::Paused.blocks_session(None),
+            astra_services::runs::durable_run_status_blocks_session(STATUS_PAUSED, None)
+        );
+        assert_eq!(
+            RunStatus::Completed.blocks_session(None),
+            astra_services::runs::durable_run_status_blocks_session(STATUS_COMPLETED, None)
+        );
+    }
+
     /// P1-A: finalize_run_events must preserve Waiting as a non-error status.
     #[test]
     fn finalize_run_events_preserves_waiting_without_error_event() {
@@ -9125,23 +9171,14 @@ mod tests {
         );
     }
 
-    /// Waiting runs must NOT be evicted from the in-memory cache.
-    /// If evicted, they cannot be resumed (no in-memory state to transition).
     #[test]
-    fn waiting_runs_skip_eviction_in_both_spawn_paths() {
-        let source = include_str!("lifecycle.rs");
-        let prod_code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
-
-        // Find the two guarded eviction sites (create_run normal exit + stream_chat normal exit).
-        // The cancelled-run path doesn't need a Waiting guard (cancelled != Waiting).
-        // Each guarded site has `if final_status != RunStatus::Waiting` before the call.
-        let waiting_guards = prod_code
-            .matches("final_status != RunStatus::Waiting")
-            .count();
-        assert!(
-            waiting_guards >= 2,
-            "at least 2 schedule_run_eviction sites must be guarded by Waiting check, found {waiting_guards}"
-        );
+    fn resumable_run_statuses_stay_live_for_resume() {
+        assert!(RunStatus::Waiting.is_resumable());
+        assert!(RunStatus::Paused.is_resumable());
+        assert!(!RunStatus::Running.is_resumable());
+        assert!(!RunStatus::Completed.is_resumable());
+        assert!(!RunStatus::Failed.is_resumable());
+        assert!(!RunStatus::Cancelled.is_resumable());
     }
 
     /// A Waiting run persisted in durable store must be cancellable even after

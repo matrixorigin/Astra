@@ -62,7 +62,9 @@ use serde_json::Value;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
-use astra_tools::task_mgmt::{SessionTask, TaskManager};
+use astra_tools::task_mgmt::{
+    SessionTask, TaskManager, session_task_is_active, session_task_is_in_progress,
+};
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
@@ -675,10 +677,13 @@ impl TaskBoardSnapshot {
     pub fn from_active_tasks(tasks: &[SessionTask]) -> Self {
         let mut snapshot = Self::default();
         for task in tasks {
-            match task.status.as_str() {
-                "pending" => snapshot.pending_count += 1,
-                "in_progress" => snapshot.in_progress_count += 1,
-                _ => continue,
+            if !session_task_is_active(&task.status) {
+                continue;
+            }
+            if session_task_is_in_progress(&task.status) {
+                snapshot.in_progress_count += 1;
+            } else {
+                snapshot.pending_count += 1;
             }
             if !task.blocked_by.is_empty() {
                 snapshot.blocked_count += 1;
@@ -2705,6 +2710,76 @@ pub(crate) mod tests {
             "1 in_progress, 1 pending task(s) remain"
         );
         assert!(VolatileKind::TaskBoardCompletionGate.is_singleton());
+    }
+
+    #[test]
+    fn task_board_snapshot_ignores_terminal_and_archived_tasks() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[
+            SessionTask {
+                id: "task-1".to_string(),
+                title: "waiting".to_string(),
+                description: None,
+                status: "pending".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            },
+            SessionTask {
+                id: "task-2".to_string(),
+                title: "done".to_string(),
+                description: None,
+                status: "completed".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            },
+            SessionTask {
+                id: "task-3".to_string(),
+                title: "cancelled".to_string(),
+                description: None,
+                status: "cancelled".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            },
+            SessionTask {
+                id: "task-4".to_string(),
+                title: "archived".to_string(),
+                description: None,
+                status: "archived".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(snapshot.pending_count, 1);
+        assert_eq!(snapshot.in_progress_count, 0);
+        assert_eq!(snapshot.blocked_count, 0);
+        assert_eq!(
+            snapshot.active_tasks,
+            vec!["task-1 waiting [pending]".to_string()]
+        );
     }
 
     // ── Original tests ──────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ use astra_tools::task_mgmt::SessionTask;
 pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub model: Option<&'a str>,
     pub last_turn_interrupted: bool,
+    pub session_persistence_error: Option<&'a str>,
     pub plan_mode_active: bool,
     pub plan_mode: Option<&'a PlanModeState>,
     pub executing_plan: Option<&'a TaskPlan>,
@@ -38,6 +39,7 @@ pub(crate) fn format_for_session_state(
     format_summary(ExecutionStateSummaryInput {
         model: state.model.as_deref(),
         last_turn_interrupted: state.last_turn_interrupted,
+        session_persistence_error: state.session_persistence_error.as_deref(),
         plan_mode_active: state.plan_mode_active(),
         plan_mode: state.cloud_plan_mirror.as_ref(),
         executing_plan: state.executing_plan.as_ref(),
@@ -60,6 +62,16 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
         lifecycle_lines.push(
             "turn state: last turn was interrupted; inspect partial work before resuming".into(),
         );
+    }
+    if let Some(error) = input
+        .session_persistence_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        lifecycle_lines.push(format!(
+            "session persistence: degraded · {}",
+            preview(error, 160)
+        ));
     }
     if let Some(plan_mode) = input.plan_mode.filter(|_| input.plan_mode_active) {
         let mut line = format!(
@@ -400,6 +412,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: true,
+            session_persistence_error: None,
             plan_mode_active: true,
             plan_mode: Some(&plan_mode),
             executing_plan: Some(&executing_plan),
@@ -450,6 +463,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: false,
+            session_persistence_error: None,
             plan_mode_active: false,
             plan_mode: None,
             executing_plan: None,
@@ -492,6 +506,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: None,
             last_turn_interrupted: false,
+            session_persistence_error: None,
             plan_mode_active: false,
             plan_mode: None,
             executing_plan: Some(&executing_plan),
@@ -524,6 +539,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: false,
+            session_persistence_error: None,
             plan_mode_active: false,
             plan_mode: Some(&plan_mode),
             executing_plan: Some(&executing_plan),
@@ -544,5 +560,29 @@ mod tests {
             out.contains("plan execution: goal=\"Keep executing plan visible\""),
             "executing-plan summary must remain visible when only plan authoring is stale: {out}"
         );
+    }
+
+    #[test]
+    fn summary_surfaces_session_persistence_degradation() {
+        let out = format_summary(ExecutionStateSummaryInput {
+            model: Some("gpt-5.4"),
+            last_turn_interrupted: false,
+            session_persistence_error: Some(
+                "failed to append turn event: Is a directory (os error 21)",
+            ),
+            plan_mode_active: false,
+            plan_mode: None,
+            executing_plan: None,
+            executing_plan_goal: None,
+            plan_execution_rounds: 0,
+            plan_execution_corrections: &[],
+            durable_contract: None,
+            last_turn_event: None,
+            tasks: &[],
+        })
+        .expect("summary");
+
+        assert!(out.contains("session persistence: degraded"), "{out}");
+        assert!(out.contains("failed to append turn event"), "{out}");
     }
 }

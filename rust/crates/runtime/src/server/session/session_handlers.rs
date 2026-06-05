@@ -1,5 +1,7 @@
 use crate::server::*;
 use astra_core::{STATUS_CANCELLED, is_duplicate_key_error};
+use astra_services::context_manifest::session_artifact_raw_payload_is_available;
+use astra_services::session_restore::SessionRestoreService;
 use astra_services::session_workspace::{WORKSPACE_METADATA_ARTIFACT_KIND, WorkspaceMetadata};
 use astra_services::{
     DatabaseSessionArtifactStore, DatabaseStateProjectionStore, PresignedArtifactDownload,
@@ -15,7 +17,19 @@ use uuid::Uuid;
 
 const DEFAULT_TRANSCRIPT_LIMIT: u32 = 50;
 const MAX_TRANSCRIPT_LIMIT: u32 = 200;
+const DEFAULT_RESUMABLE_SESSION_LIMIT: u32 = 20;
+const MAX_RESUMABLE_SESSION_LIMIT: u32 = 50;
 const DEVICE_LEASE_TTL_HOURS: i64 = 2;
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ResumableSessionsQuery {
+    #[serde(default = "default_resumable_session_limit")]
+    pub limit: u32,
+}
+
+fn default_resumable_session_limit() -> u32 {
+    DEFAULT_RESUMABLE_SESSION_LIMIT
+}
 
 #[derive(Deserialize, Default)]
 pub(crate) struct SessionStateQuery {
@@ -320,6 +334,32 @@ pub(crate) async fn list_sessions_handler(
         })
         .await?;
     Ok(Json(SessionListResponse::from(sessions)))
+}
+
+pub(crate) async fn list_resumable_sessions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ResumableSessionsQuery>,
+) -> Result<
+    Json<astra_services::session_restore::ResumableSessionsResponse>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let Some(shared_pool) = state.shared_pool.as_ref() else {
+        return Err(internal_error("shared MatrixOne pool is not configured"));
+    };
+    let limit = query.limit.clamp(1, MAX_RESUMABLE_SESSION_LIMIT);
+    let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
+    let mut sessions = svc
+        .list_resumable_sessions(&user.user_id)
+        .await
+        .map_err(internal_error)?;
+    if sessions.len() > limit as usize {
+        sessions.truncate(limit as usize);
+    }
+    Ok(Json(
+        astra_services::session_restore::ResumableSessionsResponse { sessions, limit },
+    ))
 }
 
 pub(crate) async fn get_session_handler(
@@ -1216,7 +1256,8 @@ pub(crate) async fn resume_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<astra_services::session_restore::RestoredSession>, (StatusCode, Json<ErrorResponse>)>
+{
     let user = state.auth_service.current_user(&headers).await?;
     let session = state
         .session_service
@@ -1230,7 +1271,21 @@ pub(crate) async fn resume_session_handler(
             },
         )
         .await?;
-    Ok(Json(SessionResponse::from(session)))
+    let Some(shared_pool) = state.shared_pool.as_ref() else {
+        return Err(internal_error("shared MatrixOne pool is not configured"));
+    };
+    let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
+    let restored = svc
+        .restore_session(&session.session_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("session {} has no resumable state", session.session_id),
+            )
+        })?;
+    Ok(Json(restored))
 }
 
 pub(crate) async fn cancel_session_handler(
@@ -1372,7 +1427,7 @@ pub(crate) async fn download_session_artifact_handler(
     .map_err(internal_artifact_error)?
     .ok_or_else(session_artifact_not_found)?;
     let status = row.try_get::<String, _>("status").unwrap_or_default();
-    if status == "expired" {
+    if !session_artifact_raw_payload_is_available(&status) {
         return Err((
             StatusCode::GONE,
             Json(ErrorResponse::new(

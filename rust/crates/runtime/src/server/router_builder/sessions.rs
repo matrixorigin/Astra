@@ -8,6 +8,10 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
                 .get(session::session_handlers::list_sessions_handler),
         )
         .route(
+            "/sessions/resumable",
+            get(session::session_handlers::list_resumable_sessions_handler),
+        )
+        .route(
             "/sessions/{session_id}",
             get(session::session_handlers::get_session_handler)
                 .put(session::session_handlers::update_session_handler)

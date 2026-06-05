@@ -205,6 +205,10 @@ pub(crate) struct SessionState {
     pub last_turn_interrupted: bool,
     /// Last turn's journal event — for /turn command display.
     pub last_turn_event: Option<session_journal::JournalEvent>,
+    /// Last failure while durably persisting session state after a turn.
+    /// When set, local resume/fork may restore stale data until a later
+    /// successful commit or recovery sync clears it.
+    pub session_persistence_error: Option<String>,
     /// Full context-assembly trace from the last successfully committed turn.
     pub latest_context_assembly_trace:
         Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
@@ -248,6 +252,8 @@ pub(crate) struct SessionState {
     pub plan_run_task_id: Option<String>,
     /// Latest `(progress_pct, items_done, items_total)` from [`PlanUpdate::PlanProgress`].
     pub plan_run_task_last_progress: Option<(u32, u32, u32)>,
+    /// Terminal outcome reported by the plan executor when it exits cleanly.
+    pub plan_run_task_last_outcome: Option<astra_services::task_orchestrator::TaskOutcome>,
     /// Set when the executor exits with [`PlanUpdate::PlanError`].
     pub plan_run_task_last_error: Option<String>,
 
@@ -501,6 +507,7 @@ impl Default for SessionState {
             current_plan_subtask_id: None,
             last_turn_interrupted: false,
             last_turn_event: None,
+            session_persistence_error: None,
             latest_context_assembly_trace: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
@@ -522,6 +529,7 @@ impl Default for SessionState {
             plan_handle: None,
             plan_run_task_id: None,
             plan_run_task_last_progress: None,
+            plan_run_task_last_outcome: None,
             plan_run_task_last_error: None,
             pending_approval: None,
             plan_in_token_stream: false,
@@ -599,6 +607,12 @@ fn default_auto_approve_from_env() -> bool {
 }
 
 impl SessionState {
+    fn clear_resume_recovery_state(&mut self) {
+        self.plan_mode_sync_error = None;
+        self.resume_guidance = None;
+        self.resume_restricted_tools.clear();
+    }
+
     /// Set the current session id and keep the Tier 1 task manager in sync
     /// (so `session_todos` reads/writes hit the correct session). Prefer
     /// this over `self.session_id = Some(...)` at any path that rebinds
@@ -614,9 +628,98 @@ impl SessionState {
     pub fn clear_session_id(&mut self) {
         self.task_manager.rebind("");
         self.session_id = None;
-        self.plan_mode_sync_error = None;
-        self.resume_guidance = None;
-        self.resume_restricted_tools.clear();
+        self.clear_resume_recovery_state();
+        self.session_persistence_error = None;
+    }
+
+    /// Reset session-scoped runtime state after starting a new session.
+    ///
+    /// Intentionally preserves user preferences, model selection, project
+    /// instructions, runtime config, and long-lived registries/services.
+    ///
+    /// Call `prepare_for_session_rebind().await` before using this at a
+    /// session boundary; this synchronous reset does not tear down the
+    /// asynchronously registered root mailbox.
+    pub fn reset_for_new_session(&mut self) {
+        self.pending_recovery = None;
+        self.run_id = None;
+        self.turn = 0;
+        self.last_response = None;
+        self.continuation_anchor = None;
+        self.diagnostics_context = None;
+        self.queued_message = None;
+        self.pending_followup_suggestion = None;
+        self.history.clear();
+        self.total_prompt_tokens = 0;
+        self.total_completion_tokens = 0;
+        self.total_cache_read_tokens = 0;
+        self.total_cache_creation_tokens = 0;
+        self.total_session_cost = 0.0;
+        self.journal = None;
+        self.recent_tools.clear();
+        self.executing_plan = None;
+        self.plan_execution_config = None;
+        self.executing_plan_goal = None;
+        self.executing_plan_id = None;
+        self.plan_execution_rounds = 0;
+        self.current_plan_subtask_id = None;
+        self.last_turn_interrupted = false;
+        self.last_turn_event = None;
+        self.session_persistence_error = None;
+        self.latest_context_assembly_trace = None;
+        self.durable_task_state = None;
+        self.last_delivery_report = None;
+        self.plan_execution_corrections.clear();
+        self.plan_handle = None;
+        self.plan_run_task_id = None;
+        self.plan_run_task_last_progress = None;
+        self.plan_run_task_last_outcome = None;
+        self.plan_run_task_last_error = None;
+        self.pending_approval = None;
+        self.plan_in_token_stream = false;
+        self.plan_md_renderer = None;
+        self.plan_thinking_pane = None;
+        self.pending_idle_agent_messages.clear();
+        self.redo_stack.clear();
+        self.clear_resume_recovery_state();
+        self.drift_compressed_turns.clear();
+        self.drift_user_corrections.clear();
+        self.drift_original_query = None;
+        self.session_lessons.clear();
+        self.session_lessons_loaded = false;
+        self.lesson_checkpointer = Default::default();
+        self.memory_model_params = None;
+        self.latest_skill_diagnosis = None;
+        self.latest_turn_quality_feedback = None;
+        self.cloud_plan_mirror = None;
+        self.observability_session = None;
+        self.pending_adaptive_state = None;
+        self.csl_manager = None;
+        self.perm_manager.clear_session_overrides();
+        self.pending_bg_notifications.clear();
+        self.turns_since_task_use = 0;
+        self.turns_since_task_reminder = 0;
+    }
+
+    /// Reset live state before restoring a different session into this REPL.
+    ///
+    /// Stronger than `reset_for_new_session()`: resume must also drop the
+    /// current session binding and any workspace-derived skill/adaptive state
+    /// so the next restore cannot inherit stale values from the previous
+    /// session. Call `prepare_for_session_rebind().await` first so any
+    /// root mailbox tied to the old session is unregistered before the
+    /// next session binds.
+    pub fn reset_for_session_restore(&mut self) {
+        self.reset_for_new_session();
+        self.clear_session_id();
+        self.pinned_skills.clear();
+        self.discovered_skills.clear();
+    }
+
+    /// Tear down session-bound routing before this REPL is rebound to a
+    /// different session id.
+    pub async fn prepare_for_session_rebind(&mut self) {
+        self.unregister_root_mailbox().await;
     }
 
     /// Unregister and drop the root mailbox so a subsequent turn can
@@ -663,6 +766,272 @@ mod default_tests {
             PermissionManager::new(true).mode()
         );
         unsafe { std::env::remove_var("ASTRA_CLI_AUTO_APPROVE") };
+    }
+
+    #[test]
+    fn reset_for_new_session_clears_session_scoped_fields() {
+        let mut state = SessionState {
+            pending_recovery: Some("stale".into()),
+            run_id: Some("run-1".into()),
+            turn: 3,
+            last_response: Some("answer".into()),
+            continuation_anchor: Some("anchor".into()),
+            diagnostics_context: Some("diag".into()),
+            queued_message: Some("queued".into()),
+            history: vec![("u".into(), "a".into())],
+            total_prompt_tokens: 11,
+            total_completion_tokens: 22,
+            total_cache_read_tokens: 33,
+            total_cache_creation_tokens: 44,
+            total_session_cost: 1.25,
+            recent_tools: vec!["bash".into()],
+            redo_stack: vec![("u".into(), "a".into(), 1)],
+            resume_guidance: Some("resume".into()),
+            resume_restricted_tools: vec!["read_file".into()],
+            drift_compressed_turns: vec![2],
+            drift_user_corrections: vec![3],
+            drift_original_query: Some("orig".into()),
+            session_lessons_loaded: true,
+            latest_skill_diagnosis: Some(astra_skills::auto_invoke::SkillDiagnosis::new(
+                "diag",
+                &astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 5 },
+                "headline",
+                vec!["finding".to_string()],
+                None,
+            )),
+            latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
+                turn: 1,
+                findings: vec!["finding".into()],
+                recommended_action: "act".into(),
+            }),
+            executing_plan_goal: Some("goal".into()),
+            executing_plan_id: Some("plan-1".into()),
+            plan_execution_rounds: 5,
+            last_turn_interrupted: true,
+            plan_mode_sync_error: Some("err".into()),
+            session_persistence_error: Some("journal append failed".into()),
+            pending_bg_notifications: vec!["bg".into()],
+            turns_since_task_use: 9,
+            turns_since_task_reminder: 7,
+            ..Default::default()
+        };
+        state.perm_manager.record_approval("bash", None, true);
+
+        state.reset_for_new_session();
+
+        assert!(state.pending_recovery.is_none());
+        assert!(state.run_id.is_none());
+        assert_eq!(state.turn, 0);
+        assert!(state.last_response.is_none());
+        assert!(state.continuation_anchor.is_none());
+        assert!(state.diagnostics_context.is_none());
+        assert!(state.queued_message.is_none());
+        assert!(state.history.is_empty());
+        assert_eq!(state.total_prompt_tokens, 0);
+        assert_eq!(state.total_completion_tokens, 0);
+        assert_eq!(state.total_cache_read_tokens, 0);
+        assert_eq!(state.total_cache_creation_tokens, 0);
+        assert_eq!(state.total_session_cost, 0.0);
+        assert!(state.recent_tools.is_empty());
+        assert!(state.redo_stack.is_empty());
+        assert!(state.resume_guidance.is_none());
+        assert!(state.resume_restricted_tools.is_empty());
+        assert!(state.drift_compressed_turns.is_empty());
+        assert!(state.drift_user_corrections.is_empty());
+        assert!(state.drift_original_query.is_none());
+        assert!(state.session_lessons.is_empty());
+        assert!(!state.session_lessons_loaded);
+        assert!(state.latest_skill_diagnosis.is_none());
+        assert!(state.latest_turn_quality_feedback.is_none());
+        assert!(state.executing_plan_goal.is_none());
+        assert!(state.executing_plan_id.is_none());
+        assert_eq!(state.plan_execution_rounds, 0);
+        assert!(!state.last_turn_interrupted);
+        assert!(state.plan_mode_sync_error.is_none());
+        assert!(state.session_persistence_error.is_none());
+        assert!(state.perm_manager.export_session_overrides().is_none());
+        assert!(state.pending_bg_notifications.is_empty());
+        assert_eq!(state.turns_since_task_use, 0);
+        assert_eq!(state.turns_since_task_reminder, 0);
+    }
+
+    #[test]
+    fn reset_for_new_session_preserves_user_preferences() {
+        let runtime_config = astra_config::runtime_config::RuntimeConfig::load();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut state = SessionState {
+            model: Some("gpt-5".into()),
+            explain: ExplainMode::Verbose,
+            verbose_mode: true,
+            auto_memory_enabled: false,
+            notifications_enabled: false,
+            notification_method: crate::cli::notifications::NotificationMethod::Bell,
+            notification_threshold_secs: 30,
+            max_budget_limit: 12.5,
+            project_instructions: Some("follow repo policy".into()),
+            runtime_config: runtime_config.clone(),
+            skill_search: skill_search.clone(),
+            ..Default::default()
+        };
+
+        state.reset_for_new_session();
+
+        assert_eq!(state.model.as_deref(), Some("gpt-5"));
+        assert_eq!(state.explain, ExplainMode::Verbose);
+        assert!(state.verbose_mode);
+        assert!(!state.auto_memory_enabled);
+        assert!(!state.notifications_enabled);
+        assert_eq!(
+            state.notification_method,
+            crate::cli::notifications::NotificationMethod::Bell
+        );
+        assert_eq!(state.notification_threshold_secs, 30);
+        assert_eq!(state.max_budget_limit, 12.5);
+        assert_eq!(
+            state.project_instructions.as_deref(),
+            Some("follow repo policy")
+        );
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config.tool_selection).unwrap(),
+            serde_json::to_value(&runtime_config.tool_selection).unwrap()
+        );
+        assert_eq!(state.skill_search, skill_search);
+    }
+
+    #[test]
+    fn clear_session_id_clears_resume_recovery_fields() {
+        let mut state = SessionState {
+            session_id: Some("sess-1".into()),
+            resume_guidance: Some("resume".into()),
+            resume_restricted_tools: vec!["read_file".into()],
+            plan_mode_sync_error: Some("sync".into()),
+            session_persistence_error: Some("journal append failed".into()),
+            ..Default::default()
+        };
+
+        state.clear_session_id();
+
+        assert!(state.session_id.is_none());
+        assert!(state.resume_guidance.is_none());
+        assert!(state.resume_restricted_tools.is_empty());
+        assert!(state.plan_mode_sync_error.is_none());
+        assert!(state.session_persistence_error.is_none());
+    }
+
+    #[test]
+    fn session_state_accumulates_cache_tokens_across_turns() {
+        let mut state = SessionState::default();
+
+        state.total_prompt_tokens += 1000;
+        state.total_completion_tokens += 500;
+        state.total_cache_read_tokens += 800;
+        state.total_cache_creation_tokens += 100;
+        state.turn += 1;
+
+        state.total_prompt_tokens += 2000;
+        state.total_completion_tokens += 1000;
+        state.total_cache_read_tokens += 1500;
+        state.total_cache_creation_tokens += 0;
+        state.turn += 1;
+
+        assert_eq!(state.total_prompt_tokens, 3000);
+        assert_eq!(state.total_completion_tokens, 1500);
+        assert_eq!(state.total_cache_read_tokens, 2300);
+        assert_eq!(state.total_cache_creation_tokens, 100);
+        assert_eq!(state.turn, 2);
+    }
+
+    #[test]
+    fn session_cost_accumulation() {
+        let mut state = SessionState::default();
+        state.cached_pricing = astra_services::models::PricingData {
+            prompt: 3.0,
+            completion: 15.0,
+            cache_read: Some(0.3),
+            cache_write: Some(3.75),
+        };
+
+        let cost1 =
+            crate::cli::slash_stats::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
+        state.total_session_cost += cost1;
+        assert!(cost1 > 0.0);
+
+        let cost2 =
+            crate::cli::slash_stats::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
+        state.total_session_cost += cost2;
+
+        assert!((state.total_session_cost - (cost1 + cost2)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn state_default_values() {
+        let state = SessionState::default();
+        assert_eq!(state.diagnosis_criteria_met, 0);
+        assert_eq!(state.diagnosis_criteria_failed, 0);
+    }
+
+    #[test]
+    fn reset_for_session_restore_clears_resume_specific_state() {
+        let mut state = SessionState {
+            session_id: Some("sess-restore".into()),
+            history: vec![("u".into(), "a".into())],
+            recent_tools: vec!["bash".into()],
+            pinned_skills: ["skill-a".to_string()].into_iter().collect(),
+            discovered_skills: ["skill-b".to_string()].into_iter().collect(),
+            executing_plan_id: Some("plan-1".into()),
+            plan_run_task_id: Some("task-1".into()),
+            plan_run_task_last_progress: Some((10, 1, 9)),
+            plan_run_task_last_outcome: Some(
+                astra_services::task_orchestrator::TaskOutcome::Partial,
+            ),
+            plan_run_task_last_error: Some("stale".into()),
+            plan_mode_sync_error: Some("sync".into()),
+            resume_guidance: Some("resume".into()),
+            resume_restricted_tools: vec!["read_file".into()],
+            session_persistence_error: Some("journal append failed".into()),
+            ..Default::default()
+        };
+        state.perm_manager.record_approval("bash", None, false);
+
+        state.reset_for_session_restore();
+
+        assert!(state.session_id.is_none());
+        assert!(state.history.is_empty());
+        assert!(state.recent_tools.is_empty());
+        assert!(state.pinned_skills.is_empty());
+        assert!(state.discovered_skills.is_empty());
+        assert!(state.executing_plan_id.is_none());
+        assert!(state.plan_run_task_id.is_none());
+        assert!(state.plan_run_task_last_progress.is_none());
+        assert!(state.plan_run_task_last_outcome.is_none());
+        assert!(state.plan_run_task_last_error.is_none());
+        assert!(state.plan_mode_sync_error.is_none());
+        assert!(state.resume_guidance.is_none());
+        assert!(state.resume_restricted_tools.is_empty());
+        assert!(state.session_persistence_error.is_none());
+        assert!(state.perm_manager.export_session_overrides().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_for_session_rebind_unregisters_root_mailbox() {
+        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = std::sync::Arc::new(
+            astra_runtime::server::delegation::engine::DelegationTracker::new(),
+        );
+        let router =
+            std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let root_addr = astra_messaging::AgentAddress::new("old-session", "main");
+
+        let mut state = SessionState::default();
+        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
+
+        state.prepare_for_session_rebind().await;
+
+        assert!(state.root_mailbox.is_none());
+        router
+            .register(root_addr, None)
+            .await
+            .expect("old root mailbox address should be reusable after unregister");
     }
 }
 

@@ -1,3 +1,7 @@
+use crate::orchestration::{
+    agent_trace_requires_result_collection, agent_trace_status_from_event,
+    is_agent_trace_settled_event,
+};
 use crate::server::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -327,6 +331,7 @@ fn build_trace_tree(events: &[TraceApiEvent]) -> TraceTreeNode {
         .map(|(run_id, child_events)| {
             let status = child_events
                 .iter()
+                .rev()
                 .find_map(|event| lifecycle_status(event).map(ToString::to_string));
             TraceChildRunNode {
                 run_id,
@@ -445,12 +450,7 @@ fn evaluate_trace_completeness(
         .collect::<HashMap<_, _>>();
     let terminal_by_run = events
         .iter()
-        .filter(|event| {
-            matches!(
-                event.event_type.as_str(),
-                "agent_completed" | "agent_failed" | "agent_cancelled"
-            )
-        })
+        .filter(|event| is_agent_trace_settled_event(event.event_type.as_str()))
         .filter_map(|event| event.run_id.as_deref().map(|run_id| (run_id, event)))
         .collect::<HashMap<_, _>>();
     let collected_child_runs = events
@@ -480,7 +480,12 @@ fn evaluate_trace_completeness(
             .get("run_in_background")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            && terminal_by_run.contains_key(run_id)
+            && terminal_by_run.get(run_id).is_some_and(|event| {
+                agent_trace_requires_result_collection(
+                    event.event_type.as_str(),
+                    event.metadata.get("status").and_then(Value::as_str),
+                )
+            })
             && !collected_child_runs.contains(*run_id)
             && !turn_running
         {
@@ -492,22 +497,10 @@ fn evaluate_trace_completeness(
 }
 
 fn lifecycle_status(event: &TraceApiEvent) -> Option<&'static str> {
-    match event.event_type.as_str() {
-        "agent_completed" => Some("completed"),
-        "agent_failed" => Some("failed"),
-        "agent_cancelled" => Some("cancelled"),
-        _ => event
-            .metadata
-            .get("status")
-            .and_then(Value::as_str)
-            .map(|status| match status {
-                "completed" => "completed",
-                "failed" => "failed",
-                "cancelled" => "cancelled",
-                "running" => "running",
-                _ => "unknown",
-            }),
-    }
+    agent_trace_status_from_event(
+        event.event_type.as_str(),
+        event.metadata.get("status").and_then(Value::as_str),
+    )
 }
 
 fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
@@ -586,6 +579,100 @@ mod tests {
         );
         assert!(response.complete, "{:?}", response.missing);
         assert_eq!(response.source, "database");
+    }
+
+    #[test]
+    fn child_trace_status_prefers_latest_terminal_status_over_spawned() {
+        let mut events = vec![
+            event("user_query", "root-run"),
+            event("llm_response", "root-run"),
+        ];
+
+        let mut spawned = event("agent_spawned", "child-run");
+        spawned.parent_run_id = Some("root-run".to_string());
+        spawned.metadata = serde_json::json!({"status": "spawned"});
+        events.push(spawned);
+
+        let mut completed = event("agent_completed", "child-run");
+        completed.parent_run_id = Some("root-run".to_string());
+        completed.metadata = serde_json::json!({"status": "completed"});
+        events.push(completed);
+
+        let response = build_trace_response(
+            "session-1".to_string(),
+            "turn-1".to_string(),
+            events,
+            TraceRunLiveness::default(),
+        );
+        assert_eq!(
+            response.tree.children[0].status.as_deref(),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn child_trace_status_preserves_interrupted_terminal_status() {
+        let mut events = vec![
+            event("user_query", "root-run"),
+            event("llm_response", "root-run"),
+        ];
+
+        let mut spawned = event("agent_spawned", "child-run");
+        spawned.parent_run_id = Some("root-run".to_string());
+        events.push(spawned);
+
+        let mut interrupted = event("agent_interrupted", "child-run");
+        interrupted.parent_run_id = Some("root-run".to_string());
+        interrupted.metadata = serde_json::json!({"status": "interrupted"});
+        events.push(interrupted);
+
+        let response = build_trace_response(
+            "session-1".to_string(),
+            "turn-1".to_string(),
+            events,
+            TraceRunLiveness::default(),
+        );
+        assert_eq!(
+            response.tree.children[0].status.as_deref(),
+            Some("interrupted")
+        );
+    }
+
+    #[test]
+    fn background_waiting_child_does_not_require_result_collected() {
+        let mut events = vec![
+            event("user_query", "root-run"),
+            event("llm_round_completed", "root-run"),
+            event("llm_response", "root-run"),
+        ];
+
+        let mut tool = event("tool_call_completed", "root-run");
+        tool.trace_kind = Some("tool_call".to_string());
+        tool.tool_call_id = Some("tool-1".to_string());
+        tool.metadata = serde_json::json!({
+            "action": "spawn",
+            "child_run_id": "child-run"
+        });
+        events.push(tool);
+
+        let mut spawned = event("agent_spawned", "child-run");
+        spawned.parent_run_id = Some("root-run".to_string());
+        spawned.metadata = serde_json::json!({"run_in_background": true});
+        events.push(spawned);
+
+        let mut waiting = event("agent_waiting", "child-run");
+        waiting.parent_run_id = Some("root-run".to_string());
+        waiting.metadata = serde_json::json!({"status": "waiting"});
+        events.push(waiting);
+
+        let response = build_trace_response(
+            "session-1".to_string(),
+            "turn-1".to_string(),
+            events,
+            TraceRunLiveness::default(),
+        );
+        assert!(response.complete, "{:?}", response.missing);
+        assert_eq!(response.tree.children[0].status.as_deref(), Some("waiting"));
     }
 
     #[test]

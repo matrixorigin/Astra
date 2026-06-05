@@ -56,6 +56,7 @@ pub struct RunSurface {
     pub status: String,
     pub phase: String,
     pub turn_count: u32,
+    pub persistence_error: Option<String>,
     pub goal: Option<String>,
     pub active_skill: Option<String>,
     pub latest_user_request: Option<String>,
@@ -194,6 +195,7 @@ pub struct SelfSurfaceCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub goal: Option<String>,
     pub phase: String,
     pub capabilities: CapabilitySurface,
@@ -234,6 +236,7 @@ impl Default for SurfaceConstraints {
 #[derive(Debug, Clone, Serialize)]
 pub struct GoalSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub goal: Option<String>,
     pub plan_goal: Option<String>,
     pub phase: String,
@@ -246,6 +249,7 @@ pub struct GoalSurface {
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub recent_steps: Vec<StepRecord>,
     pub recent_decisions: Vec<DecisionRecord>,
     pub compact_trace: Option<ContextTraceSignal>,
@@ -278,6 +282,7 @@ impl Default for BudgetConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct BudgetSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub budget: Option<BudgetState>,
     pub tool_budget_tokens: u32,
     pub compression_threshold: f64,
@@ -290,6 +295,7 @@ pub struct BudgetSurface {
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalsSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub risk_flags: Vec<String>,
     pub records: Vec<EvolutionRecord>,
 }
@@ -297,6 +303,7 @@ pub struct SignalsSurface {
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub phase: String,
     pub risk_flags: Vec<String>,
     pub pending_blockers: Vec<String>,
@@ -310,6 +317,7 @@ pub struct HealthSurface {
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub phase: String,
     pub total_events: usize,
     pub returned: usize,
@@ -319,6 +327,7 @@ pub struct JournalSurface {
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationSurface {
     pub session_id: String,
+    pub persistence_error: Option<String>,
     pub ok: bool,
     pub acceptance_ok: bool,
     pub objective_ok: bool,
@@ -388,13 +397,15 @@ pub struct EventPreview {
 }
 
 #[derive(Debug, Clone)]
-struct SessionArtifacts {
-    session_id: String,
-    workspace: Option<WorkspaceMetadata>,
-    restored: Option<RestoredSession>,
-    journal_events: Vec<JournalEvent>,
-    latest_full_context_trace: Option<serde_json::Value>,
+pub struct LoadedSelfSurfaceArtifacts {
+    pub session_id: String,
+    pub workspace: Option<WorkspaceMetadata>,
+    pub restored: Option<RestoredSession>,
+    pub journal_events: Vec<JournalEvent>,
+    pub latest_full_context_trace: Option<serde_json::Value>,
 }
+
+type SessionArtifacts = LoadedSelfSurfaceArtifacts;
 
 #[async_trait]
 pub trait SelfSurfaceService: Send + Sync {
@@ -410,6 +421,11 @@ pub trait SelfSurfaceService: Send + Sync {
         dimension: SelfSurfaceDimension,
         journal_limit: usize,
     ) -> Result<SelfSurfaceResponse, String>;
+}
+
+#[async_trait]
+pub trait SelfSurfaceArtifactLoader: Send + Sync {
+    async fn load_artifacts(&self, session_id: &str) -> Result<LoadedSelfSurfaceArtifacts, String>;
 }
 
 pub trait SelfSurfaceRuntimeSupport: Send + Sync {
@@ -437,14 +453,26 @@ impl SelfSurfaceRuntimeSupport for NoopSelfSurfaceRuntimeSupport {
     }
 }
 
+#[derive(Default)]
+struct LocalSelfSurfaceArtifactLoader;
+
+#[async_trait]
+impl SelfSurfaceArtifactLoader for LocalSelfSurfaceArtifactLoader {
+    async fn load_artifacts(&self, session_id: &str) -> Result<LoadedSelfSurfaceArtifacts, String> {
+        load_local_artifacts(session_id).await
+    }
+}
+
 pub struct LocalSelfSurfaceService {
     runtime_support: Arc<dyn SelfSurfaceRuntimeSupport>,
+    artifact_loader: Arc<dyn SelfSurfaceArtifactLoader>,
 }
 
 impl Default for LocalSelfSurfaceService {
     fn default() -> Self {
         Self {
             runtime_support: Arc::new(NoopSelfSurfaceRuntimeSupport),
+            artifact_loader: Arc::new(LocalSelfSurfaceArtifactLoader),
         }
     }
 }
@@ -461,6 +489,14 @@ impl LocalSelfSurfaceService {
         self.runtime_support = runtime_support;
         self
     }
+
+    pub fn with_artifact_loader(
+        mut self,
+        artifact_loader: Arc<dyn SelfSurfaceArtifactLoader>,
+    ) -> Self {
+        self.artifact_loader = artifact_loader;
+        self
+    }
 }
 
 #[async_trait]
@@ -470,7 +506,7 @@ impl SelfSurfaceService for LocalSelfSurfaceService {
         session_id: &str,
         journal_limit: usize,
     ) -> Result<PersistentSelfSnapshot, String> {
-        let artifacts = load_artifacts(session_id.to_string()).await?;
+        let artifacts = self.artifact_loader.load_artifacts(session_id).await?;
         build_persistent_snapshot(
             &artifacts,
             journal_limit.max(1),
@@ -485,7 +521,7 @@ impl SelfSurfaceService for LocalSelfSurfaceService {
         journal_limit: usize,
     ) -> Result<SelfSurfaceResponse, String> {
         let snapshot = self.snapshot(session_id, journal_limit).await?;
-        let artifacts = load_artifacts(session_id.to_string()).await?;
+        let artifacts = self.artifact_loader.load_artifacts(session_id).await?;
 
         Ok(match dimension {
             SelfSurfaceDimension::Snapshot => SelfSurfaceResponse::Snapshot(snapshot),
@@ -507,6 +543,7 @@ impl SelfSurfaceService for LocalSelfSurfaceService {
             )?),
             SelfSurfaceDimension::Signals => SelfSurfaceResponse::Signals(SignalsSurface {
                 session_id: artifacts.session_id.clone(),
+                persistence_error: snapshot.run.persistence_error.clone(),
                 risk_flags: snapshot.run.risk_flags.clone(),
                 records: snapshot.evolution.records.clone(),
             }),
@@ -525,11 +562,14 @@ impl SelfSurfaceService for LocalSelfSurfaceService {
     }
 }
 
-async fn load_artifacts(session_id: String) -> Result<SessionArtifacts, String> {
-    let workspace = session_workspace::read_workspace(&session_id).ok();
-    let journal_events = session_journal::read_journal(&session_id).unwrap_or_default();
+async fn load_local_artifacts(session_id: &str) -> Result<LoadedSelfSurfaceArtifacts, String> {
+    session_journal::validate_session_id(session_id)
+        .map_err(|error| format!("invalid session id '{session_id}': {error}"))?;
+    let workspace = session_workspace::read_workspace_optional(session_id)
+        .map_err(|error| format!("failed to read workspace for session {session_id}: {error}"))?;
+    let journal_events = read_journal_events(session_id)?;
     let restore_service = HybridRestoreService::local_only();
-    let restored = restore_service.restore_session(&session_id).await?;
+    let restored = restore_service.restore_session(session_id).await?;
     if workspace.is_none() && restored.is_none() && journal_events.is_empty() {
         return Err(format!(
             "no persistent local state found for session {session_id}"
@@ -539,12 +579,18 @@ async fn load_artifacts(session_id: String) -> Result<SessionArtifacts, String> 
         .iter()
         .rev()
         .find_map(|event| event.context_assembly_trace.clone());
-    Ok(SessionArtifacts {
-        session_id,
+    Ok(LoadedSelfSurfaceArtifacts {
+        session_id: session_id.to_string(),
         workspace,
         restored,
         journal_events,
         latest_full_context_trace,
+    })
+}
+
+fn read_journal_events(session_id: &str) -> Result<Vec<JournalEvent>, String> {
+    session_journal::read_journal(session_id).map_err(|error| {
+        format!("failed to read session journal for session {session_id}: {error}")
     })
 }
 
@@ -644,8 +690,19 @@ fn build_run_surface(
     evolution: &EvolutionSurface,
 ) -> RunSurface {
     let budget = budget_state_from_artifacts(artifacts);
-    let risk_flags = build_risk_flags(&budget, health, runtime_checks, evolution);
-    let pending_blockers = build_pending_blockers(health, runtime_checks, &[]);
+    let persistence_error = session_persistence_error(artifacts);
+    let risk_flags = build_risk_flags(
+        &budget,
+        health,
+        runtime_checks,
+        evolution,
+        persistence_error,
+    );
+    let pending_blockers = build_pending_blockers(
+        health,
+        runtime_checks,
+        &persistence_pending_blockers(persistence_error),
+    );
     let effective_goal = artifacts
         .workspace
         .as_ref()
@@ -680,6 +737,7 @@ fn build_run_surface(
                     .map(|restored| restored.turn_count)
             })
             .unwrap_or_default(),
+        persistence_error: persistence_error.map(str::to_string),
         goal: effective_goal,
         active_skill: latest_active_skill(&artifacts.journal_events),
         latest_user_request: latest_event_text(&artifacts.journal_events, true),
@@ -776,6 +834,7 @@ fn build_profile_surface(
     let health = build_health_data(artifacts);
     ProfileSurface {
         session_id: snapshot.run.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         goal: snapshot.run.goal.clone(),
         phase: snapshot.run.phase.clone(),
         capabilities: CapabilitySurface {
@@ -803,6 +862,7 @@ fn build_goal_surface(
 
     GoalSurface {
         session_id: artifacts.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         goal: plan_goal.clone(),
         plan_goal,
         phase: snapshot.run.phase.clone(),
@@ -837,6 +897,7 @@ fn build_trace_surface(
 ) -> TraceSurface {
     TraceSurface {
         session_id: artifacts.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         recent_steps: snapshot.recent_steps.clone(),
         recent_decisions: snapshot.recent_decisions.clone(),
         compact_trace: latest_context_trace(artifacts).cloned(),
@@ -863,6 +924,7 @@ fn build_budget_surface(
     )?;
     Ok(BudgetSurface {
         session_id: artifacts.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         budget: snapshot.run.budget.clone(),
         tool_budget_tokens: budget_config.tool_budget_tokens,
         compression_threshold: budget_config.compression_threshold,
@@ -880,6 +942,7 @@ fn build_health_surface(
     let health = build_health_data(artifacts);
     HealthSurface {
         session_id: artifacts.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         phase: snapshot.run.phase.clone(),
         risk_flags: snapshot.run.risk_flags.clone(),
         pending_blockers: snapshot.run.pending_blockers.clone(),
@@ -906,6 +969,7 @@ fn build_journal_surface(
 
     JournalSurface {
         session_id: artifacts.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         phase: snapshot.run.phase.clone(),
         total_events: artifacts.journal_events.len(),
         returned: events.len(),
@@ -934,6 +998,7 @@ fn build_verification_surface(
 
     VerificationSurface {
         session_id: artifacts.session_id.clone(),
+        persistence_error: snapshot.run.persistence_error.clone(),
         ok,
         acceptance_ok,
         objective_ok,
@@ -1446,6 +1511,7 @@ fn build_acceptance_surface(
     evolution: &EvolutionSurface,
 ) -> AcceptanceSurface {
     let mut checks = runtime_checks;
+    let persistence_error = session_persistence_error(artifacts);
     checks.push(SelfSurfaceCheck {
         name: "workspace_or_restore_present".to_string(),
         ok: artifacts.workspace.is_some() || artifacts.restored.is_some(),
@@ -1469,6 +1535,13 @@ fn build_acceptance_surface(
         name: "journal_present".to_string(),
         ok: !artifacts.journal_events.is_empty(),
         detail: format!("journal_events={}", artifacts.journal_events.len()),
+    });
+    checks.push(SelfSurfaceCheck {
+        name: "session_persistence_healthy".to_string(),
+        ok: persistence_error.is_none(),
+        detail: persistence_error
+            .map(str::to_string)
+            .unwrap_or_else(|| "healthy".to_string()),
     });
     checks.push(SelfSurfaceCheck {
         name: "steps_present_when_journal_present".to_string(),
@@ -1569,6 +1642,7 @@ fn build_risk_flags(
     health: &HealthData,
     runtime_checks: &[SelfSurfaceCheck],
     evolution: &EvolutionSurface,
+    persistence_error: Option<&str>,
 ) -> Vec<String> {
     let mut flags = Vec::new();
 
@@ -1600,6 +1674,9 @@ fn build_risk_flags(
     }
     if runtime_checks.iter().any(|check| !check.ok) {
         flags.push("runtime_config_issues".to_string());
+    }
+    if persistence_error.is_some() {
+        flags.push("session_persistence_degraded".to_string());
     }
 
     flags.sort();
@@ -1648,6 +1725,21 @@ fn build_pending_blockers_from_lists(primary: &[String], extra: &[String]) -> Ve
     blockers.dedup();
     blockers.truncate(8);
     blockers
+}
+
+fn session_persistence_error(artifacts: &SessionArtifacts) -> Option<&str> {
+    artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.last_persistence_error.as_deref())
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+}
+
+fn persistence_pending_blockers(persistence_error: Option<&str>) -> Vec<String> {
+    persistence_error
+        .map(|error| vec![format!("session_persistence: {}", truncate(error, 80))])
+        .unwrap_or_default()
 }
 
 fn merged_deprioritized_tools(artifacts: &SessionArtifacts) -> Vec<String> {
@@ -2098,6 +2190,31 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn snapshot_rejects_invalid_session_id() {
+        let service = LocalSelfSurfaceService::new();
+        let error = service
+            .snapshot("../bad", 5)
+            .await
+            .expect_err("invalid session id should error");
+        assert!(error.contains("invalid session id"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_session_journal_io_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "svc-self-journal-error";
+        std::fs::create_dir_all(temp.path().join(format!("{session_id}.jsonl"))).unwrap();
+
+        let service = LocalSelfSurfaceService::new();
+        let error = service
+            .snapshot(session_id, 5)
+            .await
+            .expect_err("journal io error should surface");
+        assert!(error.contains("failed to read session journal"));
+    }
+
     fn sample_verification_criterion(id: &str) -> crate::verification::VerificationCriterion {
         crate::verification::VerificationCriterion {
             id: id.to_string(),
@@ -2372,6 +2489,89 @@ mod tests {
         let snapshot = service.snapshot(session_id, 10).await.unwrap();
 
         assert_eq!(snapshot.run.goal.as_deref(), Some("execute migration plan"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_session_persistence_degradation_as_risk_and_blocker() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "svc-self-persistence-degraded";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.last_persistence_error = Some("failed to append turn event".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+        append_turn_event(session_id, 1);
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+        let snapshot = service.snapshot(session_id, 10).await.unwrap();
+
+        assert_eq!(
+            snapshot.run.persistence_error.as_deref(),
+            Some("failed to append turn event")
+        );
+        assert!(
+            snapshot
+                .run
+                .risk_flags
+                .contains(&"session_persistence_degraded".to_string())
+        );
+        assert!(
+            snapshot
+                .run
+                .pending_blockers
+                .iter()
+                .any(|blocker| blocker.contains("session_persistence: failed to append turn event"))
+        );
+        assert!(!snapshot.acceptance.ok);
+        assert!(
+            snapshot
+                .acceptance
+                .failing_checks
+                .contains(&"session_persistence_healthy".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn self_surface_variants_expose_persistence_error_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "svc-self-surface-persistence-field";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.last_persistence_error = Some("failed to append turn event".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+        append_turn_event(session_id, 1);
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+
+        for dimension in [
+            SelfSurfaceDimension::Profile,
+            SelfSurfaceDimension::Goal,
+            SelfSurfaceDimension::Trace,
+            SelfSurfaceDimension::Budget,
+            SelfSurfaceDimension::Signals,
+            SelfSurfaceDimension::Health,
+            SelfSurfaceDimension::Journal,
+            SelfSurfaceDimension::Verify,
+        ] {
+            let surface = service.surface(session_id, dimension, 10).await.unwrap();
+            let persistence_error = match surface {
+                SelfSurfaceResponse::Profile(body) => body.persistence_error,
+                SelfSurfaceResponse::Goal(body) => body.persistence_error,
+                SelfSurfaceResponse::Trace(body) => body.persistence_error,
+                SelfSurfaceResponse::Budget(body) => body.persistence_error,
+                SelfSurfaceResponse::Signals(body) => body.persistence_error,
+                SelfSurfaceResponse::Health(body) => body.persistence_error,
+                SelfSurfaceResponse::Journal(body) => body.persistence_error,
+                SelfSurfaceResponse::Verify(body) => body.persistence_error,
+                SelfSurfaceResponse::Snapshot(_) => unreachable!("snapshot not requested"),
+            };
+            assert_eq!(
+                persistence_error.as_deref(),
+                Some("failed to append turn event"),
+                "dimension {dimension:?} should surface persistence degradation explicitly"
+            );
+        }
     }
 
     #[tokio::test]

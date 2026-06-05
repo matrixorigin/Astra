@@ -17,6 +17,207 @@ pub(crate) struct SessionStartupArtifacts {
 
 // Note: `selector` field was removed — tool selection is now handled by the LLM directly.
 
+pub(crate) struct GoalSteeringChange {
+    pub previous_goal: Option<String>,
+    pub turn: u32,
+}
+
+pub(crate) fn steer_observability_goal(
+    _state: &mut SessionState,
+    _goal: &str,
+) -> Option<GoalSteeringChange> {
+    None
+}
+
+/// Apply persisted adaptive engine state to a newly created ObservabilitySession.
+/// Called when pending_adaptive_state was stashed during workspace restore and the
+/// ObservabilitySession is now available to receive it.
+pub(crate) fn apply_pending_adaptive_state(state: &mut SessionState) {
+    let adaptive = match state.pending_adaptive_state.take() {
+        Some(a) => a,
+        None => return,
+    };
+    let obs = match &state.observability_session {
+        Some(o) => o,
+        None => {
+            state.pending_adaptive_state = Some(adaptive);
+            return;
+        }
+    };
+    let mut guard = match obs.write() {
+        Ok(guard) => guard,
+        Err(_) => {
+            state.pending_adaptive_state = Some(adaptive);
+            return;
+        }
+    };
+    guard.last_scenario_change_turn = adaptive.last_scenario_change_turn;
+    guard.last_token_budget_direction = adaptive.last_token_budget_direction;
+    guard.last_token_budget_change_turn = adaptive.last_token_budget_change_turn;
+    if let Some(json) = &adaptive.tuned_config_json {
+        if let Ok(saved_config) =
+            serde_json::from_str::<astra_config::runtime_config::RuntimeConfig>(json)
+        {
+            let current = std::mem::take(&mut guard.config);
+            guard.config = current.merge(saved_config);
+        }
+    }
+}
+
+pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
+    initialize_journal(state, session_id);
+}
+
+fn record_session_persistence_error(state: &mut SessionState, detail: &str) {
+    match state.session_persistence_error.as_deref() {
+        Some(existing) if existing == detail => {}
+        Some(existing) => {
+            state.session_persistence_error = Some(format!("{existing}; {detail}"));
+        }
+        None => state.session_persistence_error = Some(detail.to_string()),
+    }
+}
+
+fn initialize_journal(state: &mut SessionState, session_id: &str) {
+    let target_path = session_journal::journal_file_path(session_id);
+    let already_attached = state
+        .journal
+        .as_ref()
+        .map(|journal| journal.path() == &target_path)
+        .unwrap_or(false);
+
+    if !already_attached {
+        state.journal = match session_journal::JournalWriter::new(session_id) {
+            Ok(journal) => Some(journal),
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    format!("  ⚠ Session journal not available for {session_id}: {err}").yellow()
+                );
+                None
+            }
+        };
+    }
+
+    let needs_start_event =
+        session_journal::journal_needs_session_start(session_id).unwrap_or(true);
+
+    if !already_attached && needs_start_event {
+        if state.journal.is_none() {
+            return;
+        }
+        let start_event = session_journal::JournalEvent::session_start(
+            Some(session_id),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
+        );
+        let start_append = state
+            .journal
+            .as_ref()
+            .expect("checked journal presence")
+            .append(&start_event);
+        if let Err(error) = start_append {
+            eprintln!("  ⚠ failed to append session start event: {error}");
+            record_session_persistence_error(state, "failed to append session start event");
+        }
+        super::session_side_effects::enqueue_ingestion_pub(state, &start_event);
+
+        use astra_config::config_versions::ConfigVersionStore;
+        if state.config_version_id.is_none()
+            && let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root()
+        {
+            let meta = astra_config::config_versions::PutMetadata {
+                source_session: Some(session_id.to_string()),
+                parent: None,
+            };
+            if let Ok(id) = store.put(&state.runtime_config, meta) {
+                let ev = session_journal::JournalEvent::config_version_change(
+                    Some(session_id),
+                    state.turn,
+                    None,
+                    id.as_str(),
+                    "startup",
+                );
+                if let Err(error) = state
+                    .journal
+                    .as_ref()
+                    .expect("checked journal presence")
+                    .append(&ev)
+                {
+                    eprintln!("  ⚠ failed to append config version change event: {error}");
+                }
+                super::session_side_effects::enqueue_ingestion_pub(state, &ev);
+                state.config_version_id = Some(id.as_str().to_string());
+            }
+        }
+    }
+
+    let (mut ws, mut dirty, workspace_existed) =
+        match astra_services::session_workspace::read_workspace_optional(session_id) {
+            Ok(Some(ws)) => (ws, false, true),
+            Ok(None) => (
+                astra_services::session_workspace::WorkspaceMetadata::new(
+                    session_id,
+                    astra_core::model_override::normalize_model_override(state.model.as_deref())
+                        .unwrap_or("default"),
+                ),
+                true,
+                false,
+            ),
+            Err(error) => (
+                session_recovery::workspace_metadata_from_live_state_after_read_failure(
+                    state, session_id, &error,
+                ),
+                true,
+                false,
+            ),
+        };
+    if ws.status != "active" {
+        ws.status = "active".to_string();
+        dirty = true;
+    }
+    if let Some(model) =
+        astra_core::model_override::normalize_model_override(state.model.as_deref())
+        && (ws.model.is_none() || (!workspace_existed && ws.model.as_deref() != Some(model)))
+    {
+        ws.model = Some(model.to_string());
+        dirty = true;
+    }
+    if !workspace_existed {
+        ws.turn_count = ws.turn_count.max(state.turn);
+        ws.total_tokens_in = ws.total_tokens_in.max(state.total_prompt_tokens);
+        ws.total_tokens_out = ws.total_tokens_out.max(state.total_completion_tokens);
+        ws.total_cache_read_tokens = ws
+            .total_cache_read_tokens
+            .max(state.total_cache_read_tokens);
+        ws.total_cache_creation_tokens = ws
+            .total_cache_creation_tokens
+            .max(state.total_cache_creation_tokens);
+        session_recovery::sync_plan_fields_to_workspace(state, &mut ws);
+        session_recovery::sync_context_trace_to_workspace(state, &mut ws);
+        session_recovery::sync_session_state_to_workspace(state, &mut ws);
+    }
+    if state.session_persistence_error.is_some()
+        && ws.last_persistence_error != state.session_persistence_error
+    {
+        ws.last_persistence_error = state.session_persistence_error.clone();
+        dirty = true;
+    }
+    if dirty {
+        ws.updated_at = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
+            eprintln!("  ⚠ workspace write failed during init: {e}");
+            record_session_persistence_error(state, "failed to write workspace metadata");
+        }
+    }
+
+    if state.observability_session.is_none() {
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
+        )));
+        apply_pending_adaptive_state(state);
+    }
+}
+
 async fn prune_stale_pending_recovery(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -29,7 +230,11 @@ async fn prune_stale_pending_recovery(
         preflight_remote_resume_session(api, profile, &session_id).await,
         SessionResumePreflight::Missing
     ) {
-        let _ = clear_profile_last_session_if_matches(profile, &session_id);
+        clear_profile_last_session_if_matches_or_warn(
+            profile,
+            &session_id,
+            "session_startup:prune_stale_pending_recovery",
+        );
         state.pending_recovery = None;
     }
 }
@@ -633,6 +838,33 @@ mod tests {
         crate::cli::cli_utils::save_credentials(&creds).unwrap();
     }
 
+    fn poisoned_observability_session(
+        session_id: &str,
+    ) -> std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>> {
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
+        ));
+        let poisoned = session.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison observability lock");
+        }));
+        session
+    }
+
+    fn workspace_backup_path_for(session_id: &str) -> Option<std::path::PathBuf> {
+        let workspace_dir = astra_services::session_workspace::workspace_dir_for(session_id);
+        std::fs::read_dir(workspace_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("workspace.yaml.corrupt-"))
+            })
+    }
+
     // Verify that no_instructions=true prevents project instructions from being
     // loaded into SessionState, regardless of what's on disk.
     #[test]
@@ -753,6 +985,358 @@ mod tests {
         prune_stale_pending_recovery(&api, None, &mut state).await;
 
         assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
+    }
+
+    #[test]
+    fn initialize_journal_attaches_without_duplicate_start_or_workspace_reset() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-attach-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                3,
+                None,
+                "hello",
+                "world",
+                0,
+                10,
+                5,
+                20,
+            ))
+            .unwrap();
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.turn_count = 3;
+        ws.total_tokens_in = 10;
+        ws.total_tokens_out = 5;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = SessionState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::SessionStart
+                })
+                .count(),
+            1,
+        );
+
+        let restored_ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(restored_ws.turn_count, 3);
+        assert_eq!(restored_ws.total_tokens_in, 10);
+        assert_eq!(restored_ws.total_tokens_out, 5);
+        assert_eq!(restored_ws.status, "active");
+    }
+
+    #[test]
+    fn initialize_journal_reopens_completed_session_without_resetting_workspace() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-reopen-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_end(Some(&sid), 3))
+            .unwrap();
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.turn_count = 3;
+        ws.total_tokens_in = 120;
+        ws.total_tokens_out = 45;
+        ws.status = "completed".to_string();
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = SessionState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::SessionStart
+                })
+                .count(),
+            2,
+        );
+        let last_two: Vec<_> = events
+            .iter()
+            .rev()
+            .take(2)
+            .map(|e| e.event_type.clone())
+            .collect();
+        assert_eq!(
+            last_two,
+            vec![
+                session_journal::JournalEventType::ConfigChange,
+                session_journal::JournalEventType::SessionStart,
+            ],
+            "reopen must produce SessionStart followed by a startup ConfigChange",
+        );
+
+        let restored_ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(restored_ws.turn_count, 3);
+        assert_eq!(restored_ws.total_tokens_in, 120);
+        assert_eq!(restored_ws.total_tokens_out, 45);
+        assert_eq!(restored_ws.status, "active");
+    }
+
+    #[test]
+    fn initialize_journal_does_not_duplicate_start_after_sync_marker() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-sync-marker-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "hello",
+                "world",
+                0,
+                10,
+                5,
+                20,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::cloud_pull_sync_marker(
+                Some(&sid),
+                "default",
+                "session_startup",
+                &["blocked_tools".to_string()],
+                false,
+            ))
+            .unwrap();
+
+        let mut state = SessionState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::SessionStart
+                })
+                .count(),
+            1,
+        );
+        assert_eq!(
+            events.last().map(|event| &event.event_type),
+            Some(&session_journal::JournalEventType::SyncMarker)
+        );
+    }
+
+    #[test]
+    fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
+        let mut state = SessionState::default();
+        state.pending_adaptive_state = Some(super::session_state::PersistedAdaptiveState {
+            last_scenario_change_turn: Some(3),
+            last_token_budget_direction: 1,
+            last_token_budget_change_turn: Some(2),
+            active_experiment_id: Some("exp-1".to_string()),
+            active_variant: Some("variant-a".to_string()),
+            tuned_config_json: None,
+        });
+        state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
+
+        apply_pending_adaptive_state(&mut state);
+
+        let adaptive = state
+            .pending_adaptive_state
+            .as_ref()
+            .expect("adaptive state should remain pending");
+        assert_eq!(adaptive.last_token_budget_direction, 1);
+        assert_eq!(adaptive.active_experiment_id.as_deref(), Some("exp-1"));
+    }
+
+    #[test]
+    fn initialize_journal_preserves_existing_workspace() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = "sess-existing-workspace";
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(sid, "old-model");
+        ws.turn_count = 7;
+        ws.last_context_trace = Some(astra_services::session_workspace::ContextTraceSignal {
+            turn_id: "turn-7".into(),
+            captured_at: None,
+            tool_selection: Some(
+                astra_services::session_workspace::ContextTraceToolSelection {
+                    tools_available: 8,
+                    selected_tools: vec!["lsp".into()],
+                    selection_scope: "latest_round".into(),
+                    rejected_tools: 2,
+                    strategy: "code-intel".into(),
+                    confidence: 0.9,
+                    latency_ms: 11,
+                },
+            ),
+            memory: None,
+            history: None,
+            budget: Some(
+                astra_services::session_workspace::ContextTraceBudgetSignal {
+                    max_tokens: 4096,
+                    total_used: 700,
+                    budget_pressure: 0.17,
+                    compression_triggered: false,
+                },
+            ),
+            timing: None,
+            explanations: Vec::new(),
+        });
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = SessionState::default();
+        state.model = Some("new-model".into());
+        initialize_journal(&mut state, sid);
+
+        let persisted = astra_services::session_workspace::read_workspace(sid).unwrap();
+        assert_eq!(persisted.model.as_deref(), Some("old-model"));
+        assert_eq!(persisted.turn_count, 7);
+        assert_eq!(
+            persisted
+                .last_context_trace
+                .as_ref()
+                .map(|trace| trace.turn_id.as_str()),
+            Some("turn-7")
+        );
+    }
+
+    #[test]
+    fn initialize_journal_repairs_corrupt_workspace_yaml_from_live_state() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-corrupt-workspace-{}", uuid::Uuid::new_v4());
+        let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let workspace_path = workspace_dir.join("workspace.yaml");
+        let corrupt_bytes = b":\nnot-valid-yaml".to_vec();
+        std::fs::write(&workspace_path, &corrupt_bytes).unwrap();
+
+        let mut state = SessionState {
+            model: Some("gpt-5".to_string()),
+            turn: 2,
+            total_prompt_tokens: 20,
+            total_completion_tokens: 10,
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        assert_ne!(std::fs::read(&workspace_path).unwrap(), corrupt_bytes);
+        let backup =
+            workspace_backup_path_for(&sid).expect("corrupt workspace should be backed up");
+        assert_eq!(std::fs::read(backup).unwrap(), corrupt_bytes);
+        let workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(workspace.turn_count, 2);
+        assert_eq!(workspace.total_tokens_in, 20);
+        assert_eq!(workspace.total_tokens_out, 10);
+        assert_eq!(workspace.model.as_deref(), Some("gpt-5"));
+        assert_eq!(workspace.status, "active");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initialize_journal_marks_persistence_error_when_session_start_append_fails() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-init-start-append-fail-{}", uuid::Uuid::new_v4());
+        let sessions_root = session_journal::journal_file_path(&sid)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sessions_root, std::fs::Permissions::from_mode(0o500))
+                .unwrap();
+        }
+
+        let mut state = SessionState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sessions_root, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        let error = state
+            .session_persistence_error
+            .as_deref()
+            .expect("persistence error");
+        assert!(
+            error.contains("failed to append session start event"),
+            "got: {error}"
+        );
+        assert!(
+            error.contains("failed to write workspace metadata"),
+            "got: {error}"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initialize_journal_marks_persistence_error_when_workspace_write_fails() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-init-workspace-write-fail-{}", uuid::Uuid::new_v4());
+        let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&workspace_dir, std::fs::Permissions::from_mode(0o500))
+                .unwrap();
+        }
+
+        let mut state = SessionState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&workspace_dir, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        assert_eq!(
+            state.session_persistence_error.as_deref(),
+            Some("failed to write workspace metadata")
+        );
     }
 
     #[serial_test::serial]

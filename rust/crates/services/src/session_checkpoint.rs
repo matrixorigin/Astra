@@ -109,23 +109,76 @@ pub fn write_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::R
     }
 
     let slug = slugify(&checkpoint.title);
-    let filename = format!("{:03}-{}.md", checkpoint.number, slug);
-    let path = dir.join(&filename);
+    let path = checkpoint_file_path(&dir, checkpoint, &slug);
     std::fs::write(&path, checkpoint.to_markdown())?;
 
     // Update checkpoint index
-    update_index(&dir, checkpoint)?;
+    if let Err(error) = update_index(&dir, checkpoint) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
 
     Ok(path)
+}
+
+/// Remove a checkpoint file and its index entry after a failed commit.
+///
+/// This is best-effort cleanup for callers that wrote a checkpoint but could
+/// not durably publish the workspace metadata that references it.
+///
+/// The operation intentionally updates `index.md` before deleting the file: a
+/// crash after index update leaves an unreferenced file, while the inverse can
+/// leave recovery reading a stale index entry. Per-session turn commits are
+/// serialized by the CLI, so this helper does not take its own file lock.
+pub fn remove_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::Result<()> {
+    let dir = super::session_workspace::workspace_dir_for(session_id).join("checkpoints");
+    let slug = slugify(&checkpoint.title);
+    let path = checkpoint_file_path(&dir, checkpoint, &slug);
+
+    remove_index_entry(&dir, checkpoint)?;
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn checkpoint_file_path(dir: &Path, checkpoint: &Checkpoint, slug: &str) -> PathBuf {
+    dir.join(format!("{:03}-{}.md", checkpoint.number, slug))
+}
+
+fn index_entry(checkpoint: &Checkpoint) -> String {
+    format!(
+        "  {:03} - Turn {:>2} - {}\n",
+        checkpoint.number, checkpoint.turn, checkpoint.title
+    )
+}
+
+fn remove_index_entry(dir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
+    let index_path = dir.join("index.md");
+    match std::fs::read_to_string(&index_path) {
+        Ok(content) => {
+            let entry = index_entry(checkpoint);
+            let updated = content.replace(&entry, "");
+            if updated != content {
+                let tmp_path = index_path.with_extension("md.tmp");
+                std::fs::write(&tmp_path, updated)?;
+                std::fs::rename(&tmp_path, &index_path).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp_path);
+                })?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Update the checkpoint index file.
 fn update_index(dir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
     let index_path = dir.join("index.md");
-    let entry = format!(
-        "  {:03} - Turn {:>2} - {}\n",
-        checkpoint.number, checkpoint.turn, checkpoint.title
-    );
+    let entry = index_entry(checkpoint);
 
     let mut content = if index_path.exists() {
         std::fs::read_to_string(&index_path)?
@@ -157,6 +210,32 @@ pub fn read_checkpoint_index(session_id: &str) -> std::io::Result<Vec<String>> {
         .map(|line| line.trim().to_string())
         .collect();
     Ok(entries)
+}
+
+/// Read checkpoint turn numbers from the checkpoint index.
+pub fn read_checkpoint_turns(session_id: &str) -> std::io::Result<Vec<u32>> {
+    read_checkpoint_index(session_id)?
+        .into_iter()
+        .map(|entry| {
+            let turn_text = entry
+                .split(" - Turn ")
+                .nth(1)
+                .and_then(|rest| rest.split(" - ").next())
+                .map(str::trim)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("malformed checkpoint index entry: {entry}"),
+                    )
+                })?;
+            turn_text.parse::<u32>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid checkpoint turn '{turn_text}': {error}"),
+                )
+            })
+        })
+        .collect()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -265,6 +344,138 @@ mod tests {
     }
 
     #[test]
+    fn remove_checkpoint_removes_file_and_index_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-remove-{}", uuid::Uuid::new_v4());
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "First checkpoint".to_string(),
+            summary: "Did some stuff.".to_string(),
+            tools_used: vec!["bash".to_string()],
+            total_tokens: 1000,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+
+        let path = write_checkpoint(&session_id, &cp).unwrap();
+        assert!(path.exists());
+        assert_eq!(read_checkpoint_index(&session_id).unwrap().len(), 1);
+
+        remove_checkpoint(&session_id, &cp).unwrap();
+
+        assert!(!path.exists());
+        assert!(
+            read_checkpoint_index(&session_id).unwrap().is_empty(),
+            "checkpoint index must not reference a removed checkpoint"
+        );
+    }
+
+    #[test]
+    fn write_checkpoint_removes_file_when_index_update_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-index-fail-{}", uuid::Uuid::new_v4());
+        let dir =
+            super::super::session_workspace::workspace_dir_for(&session_id).join("checkpoints");
+        std::fs::create_dir_all(dir.join("index.md.tmp")).unwrap();
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "First checkpoint".to_string(),
+            summary: "Did some stuff.".to_string(),
+            tools_used: vec!["bash".to_string()],
+            total_tokens: 1000,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+        let path = dir.join("001-first-checkpoint.md");
+
+        let error = write_checkpoint(&session_id, &cp).expect_err("index update should fail");
+
+        assert!(
+            !path.exists(),
+            "checkpoint file must be removed when index update fails: {error}"
+        );
+    }
+
+    #[test]
+    fn remove_checkpoint_removes_index_entry_when_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-remove-missing-file-{}", uuid::Uuid::new_v4());
+        let dir =
+            super::super::session_workspace::workspace_dir_for(&session_id).join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "First checkpoint".to_string(),
+            summary: "Did some stuff.".to_string(),
+            tools_used: vec!["bash".to_string()],
+            total_tokens: 1000,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+        std::fs::write(
+            dir.join("index.md"),
+            format!("# Checkpoint Index\n\n{}", index_entry(&cp)),
+        )
+        .unwrap();
+
+        remove_checkpoint(&session_id, &cp).unwrap();
+
+        assert!(
+            read_checkpoint_index(&session_id).unwrap().is_empty(),
+            "remove_checkpoint must remove stale index entries even when file is missing"
+        );
+    }
+
+    #[test]
+    fn remove_checkpoint_keeps_file_when_index_update_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-remove-index-fail-{}", uuid::Uuid::new_v4());
+        let dir =
+            super::super::session_workspace::workspace_dir_for(&session_id).join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("index.md.tmp")).unwrap();
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "First checkpoint".to_string(),
+            summary: "Did some stuff.".to_string(),
+            tools_used: vec!["bash".to_string()],
+            total_tokens: 1000,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+        let path = dir.join("001-first-checkpoint.md");
+        std::fs::write(&path, cp.to_markdown()).unwrap();
+        std::fs::write(
+            dir.join("index.md"),
+            format!("# Checkpoint Index\n\n{}", index_entry(&cp)),
+        )
+        .unwrap();
+
+        let error = remove_checkpoint(&session_id, &cp).expect_err("index update should fail");
+
+        assert!(
+            path.exists(),
+            "checkpoint file should remain when index update fails first: {error}"
+        );
+    }
+
+    #[test]
     fn checkpoint_no_tools_shows_none() {
         let cp = Checkpoint {
             number: 1,
@@ -279,5 +490,37 @@ mod tests {
         };
         let md = cp.to_markdown();
         assert!(md.contains("Tools used: none"));
+    }
+
+    #[test]
+    fn read_checkpoint_turns_parses_index_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "test-cp-turns";
+        let sessions_dir = tmp.path().join(".astra").join("sessions");
+        let dir = sessions_dir.join(session_id).join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.md"),
+            "# Checkpoint Index\n\n  001 - Turn  5 - Initial exploration\n  002 - Turn 12 - Follow-up\n",
+        )
+        .unwrap();
+
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions_dir);
+        let turns = read_checkpoint_turns(session_id).unwrap();
+        assert_eq!(turns, vec![5, 12]);
+    }
+
+    #[test]
+    fn read_checkpoint_turns_rejects_malformed_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "test-cp-turns-bad";
+        let sessions_dir = tmp.path().join(".astra").join("sessions");
+        let dir = sessions_dir.join(session_id).join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.md"), "# Checkpoint Index\n\n  nonsense\n").unwrap();
+
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions_dir);
+        let error = read_checkpoint_turns(session_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

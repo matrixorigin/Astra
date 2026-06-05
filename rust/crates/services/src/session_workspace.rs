@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore,
@@ -290,6 +290,10 @@ pub struct WorkspaceMetadata {
     /// Compact summary of the most recent context-assembly trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_trace: Option<ContextTraceSignal>,
+    /// Last turn-commit persistence error observed by the live session.
+    /// When present, local resume should assume workspace/journal state may be stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_persistence_error: Option<String>,
 
     // ─── Session state persistence (for resume) ───
     /// Skills explicitly pinned by the user.
@@ -429,6 +433,7 @@ impl WorkspaceMetadata {
             correlation_id: None,
             agent_role: None,
             last_context_trace: None,
+            last_persistence_error: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
@@ -478,6 +483,7 @@ impl WorkspaceMetadata {
             correlation_id: None,
             agent_role: None,
             last_context_trace: None,
+            last_persistence_error: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
@@ -565,8 +571,9 @@ pub async fn persist_remote_workspace(
 
 /// Write workspace metadata to disk.
 pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
-    let dir = workspace_dir(&metadata.session_id);
+    let dir = validated_workspace_dir(&metadata.session_id)?;
     std::fs::create_dir_all(&dir)?;
+    sync_parent_dir(&dir)?;
     let path = dir.join("workspace.yaml");
     let yaml = serde_yaml_ng::to_string(metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -587,12 +594,13 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    sync_parent_dir(&path)?;
     Ok(())
 }
 
 /// Read workspace metadata from disk.
 pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
-    let path = workspace_dir(session_id).join("workspace.yaml");
+    let path = workspace_file_path(session_id)?;
     let metadata = std::fs::metadata(&path)?;
     const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024; // 1 MB
     if metadata.len() > MAX_WORKSPACE_YAML_SIZE {
@@ -608,6 +616,52 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
     let content = std::fs::read_to_string(&path)?;
     serde_yaml_ng::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Read workspace metadata when present, while preserving corruption as an error.
+pub fn read_workspace_optional(session_id: &str) -> std::io::Result<Option<WorkspaceMetadata>> {
+    match read_workspace(session_id) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Get the `workspace.yaml` path for a validated session id.
+pub fn workspace_file_path(session_id: &str) -> std::io::Result<PathBuf> {
+    Ok(validated_workspace_dir(session_id)?.join("workspace.yaml"))
+}
+
+/// Move an unreadable or corrupt `workspace.yaml` aside before rebuilding it.
+///
+/// Returns the backup path when a workspace file existed and was renamed.
+pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option<PathBuf>> {
+    let path = workspace_file_path(session_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup_path = path.with_file_name(format!("workspace.yaml.corrupt-{stamp}"));
+    std::fs::rename(&path, &backup_path)?;
+    sync_parent_dir(&backup_path)?;
+    Ok(Some(backup_path))
+}
+
+fn validated_workspace_dir(session_id: &str) -> std::io::Result<PathBuf> {
+    crate::session_journal::validate_session_id(session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    Ok(workspace_dir(session_id))
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
 }
 
 /// Get the workspace directory for a session.
@@ -668,8 +722,18 @@ pub fn list_sessions_by_git_root(
         {
             continue;
         }
-        // Try reading workspace metadata; skip if unavailable
-        if let Ok(ws) = read_workspace(sid)
+        // Try reading workspace metadata; skip if unavailable, but surface corruption.
+        let workspace = match read_workspace_optional(sid) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                eprintln!(
+                    "[knowledge-backflow] Failed to read workspace for {}: {}",
+                    sid, error
+                );
+                continue;
+            }
+        };
+        if let Some(ws) = workspace
             && ws.git_root.as_deref() == Some(git_root)
         {
             results.push(ProjectSessionSummary {
@@ -717,13 +781,25 @@ pub fn format_project_context(summaries: &[ProjectSessionSummary]) -> String {
 /// Returns the summary string if one was found.
 pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
     // Read current workspace; bail if it doesn't exist
-    let mut ws = match read_workspace(session_id) {
-        Ok(ws) => ws,
-        Err(_) => return None,
+    let mut ws = match read_workspace_optional(session_id) {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("[knowledge-backflow] Failed to read workspace on end: {error}");
+            return None;
+        }
     };
 
     // Extract summary from the last compact event's metadata
-    let summary = extract_last_compact_summary(session_id);
+    let summary = match extract_last_compact_summary(session_id) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!(
+                "[knowledge-backflow] Failed to read compact summary from journal on end: {error}"
+            );
+            None
+        }
+    };
 
     ws.mark_completed(summary.as_deref());
 
@@ -735,9 +811,9 @@ pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
 }
 
 /// Extract the summary from the last Compact journal event that has compact_summary metadata.
-fn extract_last_compact_summary(session_id: &str) -> Option<String> {
-    let events = crate::session_journal::read_journal(session_id).ok()?;
-    events
+fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<String>> {
+    let events = crate::session_journal::read_journal(session_id)?;
+    Ok(events
         .iter()
         .rev()
         .filter(|e| e.event_type == crate::session_journal::JournalEventType::Compact)
@@ -748,7 +824,7 @@ fn extract_last_compact_summary(session_id: &str) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
-        })
+        }))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -756,6 +832,7 @@ fn extract_last_compact_summary(session_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_journal::JournalDirGuard;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -1185,6 +1262,36 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn list_sessions_by_git_root_skips_corrupt_workspace_without_hiding_valid_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+
+        let valid_sid = "git-root-valid";
+        let corrupt_sid = "git-root-corrupt";
+        std::fs::write(sessions_dir.join(format!("{valid_sid}.jsonl")), "").unwrap();
+        std::fs::write(sessions_dir.join(format!("{corrupt_sid}.jsonl")), "").unwrap();
+
+        let mut valid = WorkspaceMetadata::new(valid_sid, "gpt-5");
+        valid.git_root = Some("/repo".to_string());
+        valid.summary = Some("keep me".to_string());
+        write_workspace(&valid).unwrap();
+
+        let mut corrupt = WorkspaceMetadata::new(corrupt_sid, "gpt-5");
+        corrupt.git_root = Some("/repo".to_string());
+        write_workspace(&corrupt).unwrap();
+        let corrupt_path = workspace_file_path(corrupt_sid).unwrap();
+        std::fs::write(&corrupt_path, ":\nnot-valid-yaml").unwrap();
+
+        let summaries = list_sessions_by_git_root("/repo", None, 10);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, valid_sid);
+        assert_eq!(summaries[0].summary.as_deref(), Some("keep me"));
+    }
+
+    #[test]
     fn finalize_workspace_on_end_with_compact_summary() {
         use crate::session_journal;
 
@@ -1236,6 +1343,41 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
+    }
+
+    #[test]
+    fn finalize_workspace_on_end_ignores_invalid_workspace_without_overwriting() {
+        let sid = format!("test-finalize-invalid-{}", std::process::id());
+        let ws = WorkspaceMetadata::new(&sid, "test-model");
+        write_workspace(&ws).unwrap();
+
+        let workspace_path = workspace_file_path(&sid).unwrap();
+        std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
+
+        let summary = finalize_workspace_on_end(&sid);
+        assert!(summary.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&workspace_path).unwrap(),
+            ":\nnot-valid-yaml"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn extract_last_compact_summary_surfaces_unreadable_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "workspace-summary-unreadable";
+        std::fs::create_dir_all(crate::session_journal::journal_file_path(sid)).unwrap();
+
+        let error = extract_last_compact_summary(sid)
+            .expect_err("directory journal path should surface an error");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
     }
 
     #[test]
@@ -1304,5 +1446,68 @@ mod tests {
             !yaml.contains("deprioritized_tools"),
             "should omit empty vectors"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_workspace_optional_distinguishes_missing_invalid_and_existing() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-optional-session";
+
+        assert!(read_workspace_optional(session_id).unwrap().is_none());
+
+        let mut ws = WorkspaceMetadata::new(session_id, "gpt-5");
+        ws.cwd = "/repo".to_string();
+        write_workspace(&ws).unwrap();
+        assert_eq!(
+            read_workspace_optional(session_id).unwrap().unwrap().cwd,
+            "/repo"
+        );
+
+        std::fs::write(
+            workspace_file_path(session_id).unwrap(),
+            ":\nnot-valid-yaml",
+        )
+        .unwrap();
+        let error = read_workspace_optional(session_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backup_invalid_workspace_file_preserves_corrupt_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-backup-session";
+
+        let path = workspace_file_path(session_id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let corrupt_bytes = b":\nnot-valid-yaml".to_vec();
+        std::fs::write(&path, &corrupt_bytes).unwrap();
+
+        let backup = backup_invalid_workspace_file(session_id)
+            .unwrap()
+            .expect("existing corrupt workspace should be moved aside");
+
+        assert!(!path.exists(), "original workspace path should be vacated");
+        assert_eq!(std::fs::read(&backup).unwrap(), corrupt_bytes);
+        assert!(
+            backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("workspace.yaml.corrupt-"))
+        );
+    }
+
+    #[test]
+    fn write_workspace_rejects_invalid_session_id() {
+        let ws = WorkspaceMetadata::with_context("../bad", "gpt-5", "/repo", Some("main"));
+        let error = write_workspace(&ws).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

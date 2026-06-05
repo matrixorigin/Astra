@@ -15,6 +15,24 @@ pub const BENCHMARK_TOOL_PREVIEW_BUDGET: u32 = 2_500;
 pub const RECENT_TAIL_BENCHMARK_FLOOR: u32 = 1_600;
 pub const DELEGATION_MAX_RENDERED_CHILDREN: usize =
     (DELEGATION_ZONE_CAP / DELEGATION_CHILD_FLOOR) as usize;
+pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionArtifactStatusKind {
+    Expired,
+    Other,
+}
+
+pub fn session_artifact_status_kind(status: &str) -> SessionArtifactStatusKind {
+    match status {
+        SESSION_ARTIFACT_STATUS_EXPIRED => SessionArtifactStatusKind::Expired,
+        _ => SessionArtifactStatusKind::Other,
+    }
+}
+
+pub fn session_artifact_raw_payload_is_available(status: &str) -> bool {
+    session_artifact_status_kind(status) != SessionArtifactStatusKind::Expired
+}
 
 pub const CONTEXT_MANIFEST_REASONS: &[(&str, &str, Option<&str>)] = &[
     ("initial_turn", "lifecycle", Some("session_anchor")),
@@ -770,7 +788,7 @@ impl DatabaseContextManifestStore {
             content_json.as_str(),
         );
 
-        if status == "expired" {
+        if !session_artifact_raw_payload_is_available(&status) {
             return Ok(expired_artifact_placeholder(
                 artifact_id,
                 summary.as_deref(),
@@ -858,5 +876,30 @@ pub fn cross_session_retrieval_requires_user_filter(
         Ok(())
     } else {
         Err(ContextManifestError::CrossSessionAuthMissing)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_artifact_status_helpers_treat_expired_as_non_downloadable() {
+        assert_eq!(
+            session_artifact_status_kind(SESSION_ARTIFACT_STATUS_EXPIRED),
+            SessionArtifactStatusKind::Expired
+        );
+        assert!(!session_artifact_raw_payload_is_available(
+            SESSION_ARTIFACT_STATUS_EXPIRED
+        ));
+        assert!(session_artifact_raw_payload_is_available("active"));
+    }
+
+    #[test]
+    fn expired_artifact_placeholder_preserves_summary_hint() {
+        let rendered =
+            expired_artifact_placeholder("artifact-1", Some("important preserved summary"));
+        assert!(rendered.contains("historical, raw no longer available"));
+        assert!(rendered.contains("important preserved summary"));
     }
 }

@@ -59,9 +59,11 @@ fn emergency_session_end() {
             ctx.end_written = true;
             let end_event =
                 session_journal::JournalEvent::session_end(Some(ctx.session_id.as_str()), ctx.turn);
-            if let Ok(writer) = session_journal::JournalWriter::new(&ctx.session_id) {
-                let _ = writer.append(&end_event);
-            }
+            crate::cli::cli_utils::append_session_journal_event_or_warn(
+                &ctx.session_id,
+                &end_event,
+                "session_guard:emergency_session_end",
+            );
         }
     }
 }
@@ -87,7 +89,12 @@ pub(crate) fn try_write_session_end(
         return false; // poisoned lock
     }
     let end_event = session_journal::JournalEvent::session_end(session_id, turn);
-    let _ = journal.append(&end_event);
+    crate::cli::cli_utils::append_journal_event_or_warn(
+        journal,
+        session_id,
+        &end_event,
+        "session_guard:try_write_session_end",
+    );
     true
 }
 

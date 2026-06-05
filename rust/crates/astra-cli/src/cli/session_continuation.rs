@@ -51,21 +51,78 @@ pub(crate) fn sanitize_continuation_messages(
 
 /// Extract text content from a message regardless of format.
 /// Handles both string content and array-format content blocks.
-fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
     if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
         return Some(s.to_string());
     }
     if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
         let texts: Vec<&str> = arr
             .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .filter_map(|block| {
+                let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match kind {
+                    "text" | "output_text" => block
+                        .get("text")
+                        .or_else(|| block.get("content"))
+                        .and_then(|t| t.as_str()),
+                    _ => None,
+                }
+            })
             .collect();
         if !texts.is_empty() {
             return Some(texts.join("\n"));
         }
     }
     None
+}
+
+/// Reconstruct CLI `(user, assistant)` history pairs from OpenAI-style messages.
+///
+/// Rules:
+/// - preserve assistant-only context entries such as manual compaction summaries,
+/// - ignore tool/system messages,
+/// - ignore assistant tool-call stubs that have no visible text,
+/// - concatenate multiple visible assistant chunks in the same turn.
+pub(crate) fn history_pairs_from_messages(msgs: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut current_user = String::new();
+    let mut current_assistant = String::new();
+
+    for msg in msgs {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let text = extract_text_content(msg).unwrap_or_default();
+        match role {
+            "user" => {
+                if !current_user.is_empty() || !current_assistant.is_empty() {
+                    pairs.push((
+                        std::mem::take(&mut current_user),
+                        std::mem::take(&mut current_assistant),
+                    ));
+                }
+                if !text.trim().is_empty() {
+                    current_user = text;
+                }
+            }
+            "assistant" => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if current_assistant.is_empty() {
+                    current_assistant = text;
+                } else {
+                    current_assistant.push_str("\n\n");
+                    current_assistant.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !current_user.is_empty() || !current_assistant.is_empty() {
+        pairs.push((current_user, current_assistant));
+    }
+
+    pairs
 }
 
 fn is_runtime_injected_user_msg(content: &str) -> bool {
@@ -265,5 +322,27 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["content"], "✓ Deployment finished successfully.");
+    }
+
+    #[test]
+    fn history_pairs_preserve_assistant_only_summary_and_structured_text() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "Earlier context compacted."}),
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Sure."}]}),
+            json!({"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "1", "content": "ok"}),
+            json!({"role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}),
+        ];
+
+        let pairs = super::history_pairs_from_messages(&msgs);
+
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0],
+            ("".to_string(), "Earlier context compacted.".to_string())
+        );
+        assert_eq!(pairs[1].0, "continue");
+        assert_eq!(pairs[1].1, "Sure.\n\nDone.");
     }
 }

@@ -104,6 +104,15 @@ pub struct RestoredSession {
     /// Latest structured context-trace signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_trace: Option<super::session_workspace::ContextTraceSignal>,
+    /// Authoritative workspace metadata snapshot when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<super::session_workspace::WorkspaceMetadata>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResumableSessionsResponse {
+    pub sessions: Vec<RestoredSession>,
+    pub limit: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -220,8 +229,12 @@ impl HybridRestoreService {
     fn restore_local_workspace(
         &self,
         session_id: &str,
-    ) -> Option<super::session_workspace::WorkspaceMetadata> {
-        super::session_workspace::read_workspace(session_id).ok()
+    ) -> Result<Option<super::session_workspace::WorkspaceMetadata>, String> {
+        match super::session_workspace::read_workspace(session_id) {
+            Ok(ws) => Ok(Some(ws)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read local workspace for {session_id}: {e}")),
+        }
     }
 
     /// Try restoring workspace metadata from remote session artifacts.
@@ -353,6 +366,13 @@ impl HybridRestoreService {
                     .await
                     .ok()
                     .flatten();
+                let transcript_messages = match heavy_state.as_ref() {
+                    Some(heavy) if !heavy.messages.is_empty() => Vec::new(),
+                    _ => self
+                        .restore_cloud_transcript_messages(session_id)
+                        .await
+                        .unwrap_or_default(),
+                };
 
                 let last_context_trace = self
                     .restore_latest_context_trace_signal(session_id)
@@ -410,7 +430,8 @@ impl HybridRestoreService {
                     conversation_messages: heavy_state
                         .as_ref()
                         .map(|heavy| heavy.messages.clone())
-                        .unwrap_or_default(),
+                        .filter(|messages| !messages.is_empty())
+                        .unwrap_or(transcript_messages),
                     blocked_tools: heavy_state
                         .as_ref()
                         .map(|heavy| heavy.blocked_tools.clone())
@@ -604,6 +625,43 @@ impl HybridRestoreService {
             return Ok(None);
         };
         parse_cloud_heavy_checkpoint_state(&state_json)
+    }
+
+    async fn restore_cloud_transcript_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+
+        let rows = sqlx::query(
+            "SELECT role, content FROM session_transcript_items \
+             WHERE session_id = ? ORDER BY item_seq",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
+
+        use sqlx::Row;
+        let mut messages = Vec::new();
+        for row in rows {
+            let role = row.try_get::<String, _>("role").unwrap_or_default();
+            let content = row.try_get::<String, _>("content").unwrap_or_default();
+            if content.trim().is_empty() {
+                continue;
+            }
+            match role.as_str() {
+                "user" | "assistant" | "system" | "tool" => messages.push(serde_json::json!({
+                    "role": role,
+                    "content": content,
+                })),
+                _ => {}
+            }
+        }
+        Ok(messages)
     }
 
     /// List checkpoints from MatrixOne.
@@ -821,10 +879,18 @@ struct CloudWorkspaceArtifact {
     metadata: super::session_workspace::WorkspaceMetadata,
 }
 
-fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
-    let (events, _, _) = crate::session_journal::read_journal_for_digest(session_id).ok()?;
+fn summarize_local_journal(session_id: &str) -> Result<Option<LocalJournalSummary>, String> {
+    let (events, _, _) = match crate::session_journal::read_journal_for_digest(session_id) {
+        Ok(digest) => digest,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read session journal for {session_id}: {error}"
+            ));
+        }
+    };
     if events.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut summary = LocalJournalSummary {
@@ -875,7 +941,7 @@ fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
         }
     }
 
-    Some(summary)
+    Ok(Some(summary))
 }
 
 fn restored_session_from_workspace(
@@ -885,6 +951,7 @@ fn restored_session_from_workspace(
     checkpoint_count: u32,
     restored_from_cloud: bool,
 ) -> RestoredSession {
+    let workspace = ws.clone();
     let turn_count = local_journal
         .map(|summary| ws.turn_count.max(summary.turn_count))
         .unwrap_or(ws.turn_count);
@@ -916,18 +983,19 @@ fn restored_session_from_workspace(
         total_cache_creation_tokens,
         recent_tools,
         checkpoint_count,
-        last_status: ws.status,
-        git_branch: ws.git_branch,
-        model: ws.model,
+        last_status: ws.status.clone(),
+        git_branch: ws.git_branch.clone(),
+        model: ws.model.clone(),
         title: None,
         restored_from_cloud,
-        executing_plan_json: ws.executing_plan_json,
-        plan_goal: ws.plan_goal,
-        plan_config_json: ws.plan_config_json,
+        executing_plan_json: ws.executing_plan_json.clone(),
+        plan_goal: ws.plan_goal.clone(),
+        plan_config_json: ws.plan_config_json.clone(),
         plan_execution_rounds: ws.plan_execution_rounds,
-        contract_json: ws.contract_json,
-        plan_corrections: ws.plan_corrections,
-        last_context_trace: ws.last_context_trace,
+        contract_json: ws.contract_json.clone(),
+        plan_corrections: ws.plan_corrections.clone(),
+        last_context_trace: ws.last_context_trace.clone(),
+        workspace: Some(workspace),
         ..Default::default()
     }
 }
@@ -995,8 +1063,16 @@ pub fn parse_cloud_heavy_checkpoint_state(
 impl SessionRestoreService for HybridRestoreService {
     async fn restore_session(&self, session_id: &str) -> Result<Option<RestoredSession>, String> {
         // Step 1: Try local workspace metadata first
-        let local_journal = summarize_local_journal(session_id);
-        if let Some(ws) = self.restore_local_workspace(session_id) {
+        let local_journal = summarize_local_journal(session_id)?;
+        let mut local_workspace_error = None;
+        let local_workspace = match self.restore_local_workspace(session_id) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                local_workspace_error = Some(error);
+                None
+            }
+        };
+        if let Some(ws) = local_workspace {
             let mut recent_tools = if self.pool.is_some() {
                 self.restore_recent_tools(session_id)
                     .await
@@ -1081,7 +1157,16 @@ impl SessionRestoreService for HybridRestoreService {
         }
 
         // Step 2: Fall back to MatrixOne
-        self.restore_cloud_session(session_id).await
+        let cloud_result = self.restore_cloud_session(session_id).await?;
+        if cloud_result.is_some() {
+            return Ok(cloud_result);
+        }
+
+        if let Some(error) = local_workspace_error {
+            return Err(error);
+        }
+
+        Ok(None)
     }
 
     async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
@@ -1188,17 +1273,47 @@ impl SessionRestoreService for HybridRestoreService {
                 row.try_get("latest_model").ok().flatten(),
             );
             let model = metadata_state.model.clone().or(latest_model);
-
-            sessions.push(RestoredSession {
-                session_id,
-                turn_count: turn_count as u32,
-                last_status: status,
-                title,
-                git_branch: metadata_state.git_branch.clone(),
-                model,
-                restored_from_cloud: true,
-                ..Default::default()
-            });
+            let mut restored =
+                if let Some(workspace) = self.restore_cloud_workspace(&session_id).await? {
+                    let mut recent_tools = self
+                        .restore_recent_tools(&session_id)
+                        .await
+                        .unwrap_or_default();
+                    if recent_tools.is_empty() {
+                        recent_tools = recent_tools_from_context_trace(
+                            workspace.metadata.last_context_trace.as_ref(),
+                        );
+                    }
+                    let checkpoint_count = self
+                        .cloud_checkpoints(&session_id)
+                        .await
+                        .map(|checkpoints| checkpoints.len() as u32)
+                        .unwrap_or(0);
+                    restored_session_from_workspace(
+                        workspace.metadata,
+                        None,
+                        recent_tools,
+                        checkpoint_count,
+                        true,
+                    )
+                } else {
+                    RestoredSession {
+                        session_id: session_id.clone(),
+                        restored_from_cloud: true,
+                        ..Default::default()
+                    }
+                };
+            restored.turn_count = restored.turn_count.max(turn_count.max(0) as u32);
+            restored.last_status = status;
+            restored.title = restored.title.or(title);
+            if restored.git_branch.is_none() {
+                restored.git_branch = metadata_state.git_branch.clone();
+            }
+            if restored.model.is_none() {
+                restored.model = model;
+            }
+            restored.restored_from_cloud = true;
+            sessions.push(restored);
         }
         Ok(sessions)
     }
@@ -2073,6 +2188,67 @@ mod tests {
         assert_eq!(restored.turn_count, 1);
         assert_eq!(restored.total_tokens_in, 33_659);
         assert_eq!(restored.total_tokens_out, 2_855);
+    }
+
+    #[tokio::test]
+    async fn local_restore_corrupt_workspace_falls_back_to_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        let writer = crate::session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&crate::session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("test-model"),
+            ))
+            .unwrap();
+        writer
+            .append(&crate::session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                Some("test-model"),
+                "continue",
+                "restored",
+                0,
+                10,
+                5,
+                5,
+            ))
+            .unwrap();
+
+        let workspace_dir = session_workspace::workspace_dir_for(&sid);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("workspace.yaml"), ":\nnot-valid-yaml").unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let restored = svc
+            .restore_session(&sid)
+            .await
+            .unwrap()
+            .expect("corrupt workspace should still restore from journal");
+        assert_eq!(restored.session_id, sid);
+        assert_eq!(restored.turn_count, 1);
+        assert_eq!(restored.model.as_deref(), Some("test-model"));
+        assert_eq!(restored.last_status, "local");
+        assert!(!restored.restored_from_cloud);
+    }
+
+    #[tokio::test]
+    async fn local_restore_unreadable_journal_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        std::fs::create_dir_all(tmp.path().join(format!("{sid}.jsonl"))).unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let error = svc
+            .restore_session(&sid)
+            .await
+            .expect_err("unreadable journal should fail local restore");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
     }
 
     // ── Restored session field coverage ──

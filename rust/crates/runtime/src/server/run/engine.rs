@@ -37,7 +37,7 @@ use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
-        RequestedTurnInteractionMode, RunStateStore,
+        DurableRunStatusKind, RequestedTurnInteractionMode, RunStateStore, durable_run_status_kind,
     },
 };
 
@@ -370,9 +370,9 @@ impl RunEngine {
         let record = self.store.load_run(run_id).await?;
         Ok(match record {
             None => Some(RunControlStatus::Cancelled),
-            Some(r) => match r.status.as_str() {
-                STATUS_CANCELLED => Some(RunControlStatus::Cancelled),
-                s if s == STATUS_PAUSED => Some(RunControlStatus::Paused),
+            Some(r) => match durable_run_status_kind(&r.status) {
+                DurableRunStatusKind::Cancelled => Some(RunControlStatus::Cancelled),
+                DurableRunStatusKind::Paused => Some(RunControlStatus::Paused),
                 _ => None,
             },
         })
@@ -898,6 +898,45 @@ mod tests {
         assert_eq!(blocked.unwrap().run_id, "running");
         assert!(free.is_none());
         assert!(done.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_control_status_uses_shared_durable_taxonomy() {
+        let engine = test_engine();
+        engine
+            .start_run("paused", "user-1", "sess-paused")
+            .await
+            .unwrap();
+        engine
+            .persist_status("paused", "paused", Some("user_resume"), None)
+            .await
+            .unwrap();
+        engine
+            .start_run("waiting", "user-1", "sess-waiting")
+            .await
+            .unwrap();
+        engine
+            .persist_status("waiting", "waiting", Some("tool_approval"), None)
+            .await
+            .unwrap();
+        engine
+            .start_run("cancelled", "user-1", "sess-cancelled")
+            .await
+            .unwrap();
+        engine
+            .persist_status("cancelled", "cancelled", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.check_control_status("paused").await.unwrap(),
+            Some(RunControlStatus::Paused)
+        );
+        assert_eq!(engine.check_control_status("waiting").await.unwrap(), None);
+        assert_eq!(
+            engine.check_control_status("cancelled").await.unwrap(),
+            Some(RunControlStatus::Cancelled)
+        );
     }
 
     #[tokio::test]

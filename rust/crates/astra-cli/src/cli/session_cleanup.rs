@@ -14,9 +14,9 @@ use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::time::Duration;
 
-use super::auth_flow::clear_profile_last_session;
-use super::chat_turn::enqueue_ingestion_pub;
+use super::cli_utils::clear_profile_last_session_if_matches_or_warn;
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
+use super::session_side_effects::enqueue_ingestion_pub;
 use crate::SessionState;
 use crate::edge_tools;
 
@@ -66,8 +66,14 @@ pub(crate) async fn finalize_session_exit(
         eprintln!("{}", format!("    {command}").cyan());
     }
 
-    if should_clear_last_session_id(reason) && state.session_id.is_some() {
-        let _ = clear_profile_last_session(profile);
+    if should_clear_last_session_id(reason)
+        && let Some(ref session_id) = state.session_id
+    {
+        clear_profile_last_session_if_matches_or_warn(
+            profile,
+            session_id,
+            "session_cleanup:finalize_repl_exit",
+        );
     }
 }
 
@@ -105,7 +111,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
             let _ = svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
                 session_id: session_id.to_string(),
-                messages: super::chat_turn::history_as_messages(&state.history),
+                messages: super::session_projection::history_as_messages(&state.history),
                 session_facts: shutdown_session_facts(state),
                 current_tokens: state
                     .total_prompt_tokens
@@ -247,7 +253,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
                 None
             }
         };
-        let report = super::chat_turn::close_pending_memory_feedback_at_turn_end(
+        let report = super::session_side_effects::close_pending_memory_feedback_at_turn_end(
             Some(sid),
             cloud_base,
             super::session_runtime::current_access_token(None),
@@ -344,6 +350,7 @@ fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
 
     #[test]
     fn resume_hint_is_shown_for_graceful_exit_paths() {
@@ -380,5 +387,35 @@ mod tests {
         let (label, command) = resume_hint_lines("1234-5678");
         assert_eq!(label, "Resume this session with:");
         assert_eq!(command, "/resume 1234-5678");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn eof_cleanup_only_clears_matching_last_session_pointer() {
+        let _creds_guard = crate::tests::isolate_credentials();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some("sess-new".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mut state = SessionState {
+            session_id: Some("sess-old".into()),
+            turn: 1,
+            ..SessionState::default()
+        };
+        finalize_session_exit(&mut state, None, SessionExit::Eof).await;
+
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["default"].last_session_id.as_deref(),
+            Some("sess-new"),
+            "EOF cleanup must not clear a different session pointer"
+        );
     }
 }

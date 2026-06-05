@@ -48,7 +48,7 @@ pub(crate) async fn resolve_task_service(
 
 /// Resolve the astra server base URL. Returns `None` when no server
 /// is configured (offline mode).
-fn resolve_cloud_base() -> Option<String> {
+pub(crate) fn resolve_cloud_base() -> Option<String> {
     std::env::var("ASTRA_API_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -707,7 +707,7 @@ pub(crate) fn initialize_session_state(
             .unwrap_or_else(|| "anonymous".to_string());
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
         // Apply any adaptive state stashed during workspace restore.
-        super::chat_turn::apply_pending_adaptive_state(&mut state);
+        super::session_startup::apply_pending_adaptive_state(&mut state);
     }
 
     // Restore persisted feedback aggregator state (if any)
@@ -721,15 +721,55 @@ pub(crate) fn initialize_session_state(
 }
 
 fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> {
-    let session_id = resumable_last_session_id(cli_profile)?;
-    let workspace = astra_services::session_workspace::read_workspace(&session_id).ok()?;
-    workspace_matches_current_project(&workspace).then_some(session_id)
+    let session_id = crate::cli::cli_utils::local_resumable_last_session_id(cli_profile)?;
+    match astra_services::session_workspace::read_workspace_optional(&session_id) {
+        Ok(Some(workspace)) => workspace_matches_current_project(&workspace).then_some(session_id),
+        Ok(None) => Some(session_id),
+        Err(error) => {
+            eprintln!(
+                "  ⚠ workspace read failed while checking pending recovery for {session_id}: {error}"
+            );
+            Some(session_id)
+        }
+    }
 }
 
 fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
-    state.pending_recovery.as_ref().map(|_| {
-        "previous session available via /resume or a short continue/fix/test follow-up".to_string()
+    state.pending_recovery.as_ref().map(|session_id| {
+        let mut line =
+            "previous session available via /resume or a short continue/fix/test follow-up"
+                .to_string();
+        match astra_services::session_workspace::read_workspace_optional(session_id) {
+            Ok(Some(workspace)) => {
+                if let Some(error) = workspace
+                    .last_persistence_error
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|error| !error.is_empty())
+                {
+                    line.push_str(&format!(" [persistence degraded: {error}]"));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                line.push_str(&format!(
+                    " [workspace metadata unreadable: {}]",
+                    truncate_status_detail(&error.to_string(), 96)
+                ));
+            }
+        }
+        line
     })
+}
+
+fn truncate_status_detail(detail: &str, max_chars: usize) -> String {
+    let total = detail.chars().count();
+    if total <= max_chars {
+        return detail.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let truncated: String = detail.chars().take(keep).collect();
+    format!("{truncated}…")
 }
 
 fn workspace_matches_current_project(
@@ -776,7 +816,7 @@ fn path_contains_or_matches(left: &std::path::Path, right: &std::path::Path) -> 
     left == right || left.starts_with(&right) || right.starts_with(&left)
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct RestoredSessionState {
     pub history: Vec<(String, String)>,
     pub turn: u32,
@@ -787,20 +827,46 @@ pub struct RestoredSessionState {
     pub total_cache_creation_tokens: u64,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RestoredJournalState {
+    pub exists: bool,
+    pub session: RestoredSessionState,
+    pub last_turn_event: Option<session_journal::JournalEvent>,
+}
+
 /// Rebuild `(user_msg, assistant_msg)` history from the session journal.
 /// Only `Turn` events with both user_input and assistant_output are included.
-pub(crate) fn restore_history_from_journal(session_id: &str) -> Vec<(String, String)> {
-    restore_session_state_from_journal(session_id).history
+pub(crate) fn restore_history_from_journal(
+    session_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    Ok(restore_session_state_from_journal(session_id)?
+        .session
+        .history)
 }
 
 /// Full session counters + history from local JSONL (used after `/session fork`).
-pub fn session_state_from_journal(session_id: &str) -> RestoredSessionState {
+pub fn session_state_from_journal(session_id: &str) -> Result<RestoredSessionState, String> {
+    Ok(restore_session_state_from_journal(session_id)?.session)
+}
+
+pub(crate) fn restored_journal_state(session_id: &str) -> Result<RestoredJournalState, String> {
     restore_session_state_from_journal(session_id)
 }
 
-fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState {
-    let Ok(events) = session_journal::read_journal(session_id) else {
-        return RestoredSessionState::default();
+fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJournalState, String> {
+    session_journal::validate_session_id(session_id)
+        .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
+    let journal_exists = session_journal::journal_file_path(session_id).exists();
+    if !journal_exists {
+        return Ok(RestoredJournalState::default());
+    }
+    let events = match session_journal::read_journal(session_id) {
+        Ok(events) => events,
+        Err(error) => {
+            return Err(format!(
+                "failed to read session journal for {session_id}: {error}"
+            ));
+        }
     };
 
     let mut restored = RestoredSessionState::default();
@@ -809,6 +875,11 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
         .rposition(|event| event.event_type == session_journal::JournalEventType::SessionStart)
         .map(|idx| idx + 1)
         .unwrap_or(0);
+    let last_turn_event = events[start_idx..]
+        .iter()
+        .rev()
+        .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+        .cloned();
 
     for event in events.into_iter().skip(start_idx) {
         if event.event_type != session_journal::JournalEventType::Turn {
@@ -830,7 +901,11 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
         }
     }
 
-    restored
+    Ok(RestoredJournalState {
+        exists: journal_exists,
+        session: restored,
+        last_turn_event,
+    })
 }
 
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
@@ -1244,7 +1319,7 @@ mod tests {
     #[test]
     fn restore_history_empty_for_unknown_session() {
         let (_tmp, _g) = isolated_sessions_dir();
-        let history = restore_history_from_journal("nonexistent-session-xyz-123");
+        let history = restore_history_from_journal("nonexistent-session-xyz-123").unwrap();
         assert!(history.is_empty());
     }
 
@@ -1281,7 +1356,7 @@ mod tests {
             ))
             .unwrap();
 
-        let history = restore_history_from_journal(&sid);
+        let history = restore_history_from_journal(&sid).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].0, "what is Rust?");
         assert_eq!(history[0].1, "Rust is a systems language.");
@@ -1321,7 +1396,7 @@ mod tests {
             ))
             .unwrap();
 
-        let history = restore_history_from_journal(&sid);
+        let history = restore_history_from_journal(&sid).unwrap();
         assert_eq!(history.len(), 1, "only Turn events should be included");
         assert_eq!(history[0].0, "hello");
     }
@@ -1376,7 +1451,7 @@ mod tests {
             )
             .unwrap();
 
-        let restored = restore_session_state_from_journal(&sid);
+        let restored = restore_session_state_from_journal(&sid).unwrap().session;
         assert_eq!(
             restored.turn, 2,
             "turn should reflect restored conversation length"
@@ -1453,7 +1528,7 @@ mod tests {
             )
             .unwrap();
 
-        let restored = restore_session_state_from_journal(&sid);
+        let restored = restore_session_state_from_journal(&sid).unwrap().session;
         assert_eq!(
             restored.history,
             vec![("latest question".into(), "latest answer".into())]
@@ -1530,12 +1605,83 @@ mod tests {
             )
             .unwrap();
 
-        let restored = restore_session_state_from_journal(&sid);
+        let restored = restore_session_state_from_journal(&sid).unwrap().session;
         assert_eq!(restored.history, vec![("latest".into(), "three".into())]);
         assert_eq!(restored.turn, 3);
         assert_eq!(restored.total_prompt_tokens, 30);
         assert_eq!(restored.total_completion_tokens, 8);
         assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
+    }
+
+    #[test]
+    fn restore_session_state_from_journal_surfaces_unreadable_journal() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-unreadable-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
+        let error = restore_session_state_from_journal(&sid)
+            .expect_err("directory journal path should surface an error");
+
+        assert!(error.contains("failed to read session journal"), "{error}");
+    }
+
+    #[test]
+    fn restored_journal_state_tracks_existence_and_last_turn_event() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-restore-journal-state-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+
+        let missing = restored_journal_state("missing-session-xyz").unwrap();
+        assert!(!missing.exists);
+        assert!(missing.last_turn_event.is_none());
+        assert_eq!(missing.session, RestoredSessionState::default());
+
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "first",
+                "one",
+                0,
+                10,
+                4,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                3,
+                None,
+                "latest",
+                "three",
+                0,
+                30,
+                8,
+                10,
+            ))
+            .unwrap();
+
+        let restored = restored_journal_state(&sid).unwrap();
+        assert!(restored.exists);
+        assert_eq!(restored.session.turn, 3);
+        assert_eq!(
+            restored.last_turn_event.and_then(|event| event.turn),
+            Some(3)
+        );
     }
 
     #[serial_test::serial]
@@ -1573,7 +1719,7 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
-                last_session_id: Some(sid),
+                last_session_id: Some(sid.clone()),
                 ..Default::default()
             },
         );
@@ -1759,6 +1905,26 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
+    fn pending_recovery_status_line_surfaces_persistence_degradation() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("pending-recovery-{}", uuid::Uuid::new_v4());
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        workspace.last_persistence_error = Some("failed to append turn event".to_string());
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let state = SessionState {
+            pending_recovery: Some(sid),
+            ..SessionState::default()
+        };
+
+        let line = pending_recovery_status_line(&state).expect("pending recovery line");
+        assert!(line.contains("previous session available via /resume"));
+        assert!(line.contains("persistence degraded: failed to append turn event"));
+    }
+
+    #[serial_test::serial]
+    #[test]
     fn initialize_session_state_ignores_pending_recovery_from_other_project() {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
@@ -1799,7 +1965,7 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
-                last_session_id: Some(sid),
+                last_session_id: Some(sid.clone()),
                 ..Default::default()
             },
         );
@@ -1814,6 +1980,184 @@ mod tests {
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initialize_session_state_preserves_pending_recovery_when_workspace_is_corrupt() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+
+        let sid = format!("test-corrupt-pending-recovery-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(&sid),
+                0,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 0,
+                    "turns_completed": 0,
+                    "remaining_turns": 5,
+                }),
+            ))
+            .unwrap();
+
+        let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("workspace.yaml"), ":\nnot-valid-yaml").unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initialize_session_state_preserves_pending_recovery_for_workspace_only_corrupt_session() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+
+        let sid = format!(
+            "test-workspace-only-corrupt-recovery-{}",
+            uuid::Uuid::new_v4()
+        );
+        let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("workspace.yaml"), ":\nnot-valid-yaml").unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initialize_session_state_preserves_pending_recovery_when_workspace_missing() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+
+        let sid = format!("test-missing-pending-recovery-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(&sid),
+                0,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 0,
+                    "turns_completed": 0,
+                    "remaining_turns": 5,
+                }),
+            ))
+            .unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initialize_session_state_ignores_stale_pending_recovery_without_local_state() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+
+        let sid = format!("test-stale-pending-recovery-{}", uuid::Uuid::new_v4());
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery, None);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn pending_recovery_status_line_surfaces_workspace_unreadable() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("pending-recovery-corrupt-{}", uuid::Uuid::new_v4());
+        let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("workspace.yaml"), ":\nnot-valid-yaml").unwrap();
+
+        let state = SessionState {
+            pending_recovery: Some(sid),
+            ..SessionState::default()
+        };
+
+        let line = pending_recovery_status_line(&state).expect("pending recovery line");
+        assert!(line.contains("previous session available via /resume"));
+        assert!(line.contains("workspace metadata unreadable:"), "{line}");
     }
 
     // ── Session display logic ──────────────────────────────────────────────

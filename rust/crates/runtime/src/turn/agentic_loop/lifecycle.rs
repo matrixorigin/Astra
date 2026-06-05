@@ -13,6 +13,10 @@ use super::host::{
     try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
+use crate::orchestration::{
+    AgentToolRecordActionKind, project_agent_tool_budget_record,
+    render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
+};
 use astra_services::SessionArtifactStore;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interruption::{
@@ -255,90 +259,6 @@ struct ParallelAgentBudgetRollup {
     unfinished: Vec<UnfinishedParallelAgent>,
 }
 
-fn parse_embedded_json(raw: Option<&str>) -> Option<Value> {
-    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
-}
-
-fn agent_id_from_record(
-    record: &astra_services::session_journal::ToolCallRecord,
-    parsed_result: Option<&Value>,
-) -> Option<String> {
-    record
-        .args_full
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| {
-            value
-                .get("agent_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            parsed_result
-                .and_then(|value| value.get("agent_id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-}
-
-fn summarize_agent_result(text: &str) -> String {
-    const MAX_CHARS: usize = 320;
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= MAX_CHARS {
-        trimmed.to_string()
-    } else {
-        let mut clipped: String = trimmed.chars().take(MAX_CHARS.saturating_sub(1)).collect();
-        clipped.push('…');
-        clipped
-    }
-}
-
-fn summarize_control_error(error: &str) -> String {
-    if error.contains("duplicate_within_turn") {
-        "same-turn retries hit duplicate_within_turn".to_string()
-    } else if error.contains("blocked_tool") {
-        "later retries were blocked after the tool was restricted".to_string()
-    } else {
-        error.lines().next().unwrap_or(error).trim().to_string()
-    }
-}
-
-fn summarize_incomplete_agent_state(parsed: &Value) -> Option<String> {
-    match parsed.get("status").and_then(Value::as_str) {
-        Some("still_running") => {
-            let detail = parsed
-                .get("current_status")
-                .and_then(Value::as_str)
-                .unwrap_or("still running");
-            Some(format!(
-                "still running when the wait window expired ({detail})"
-            ))
-        }
-        Some("timeout") => Some(
-            parsed
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("timed out while waiting for the child result")
-                .to_string(),
-        ),
-        Some("failed") => Some(
-            parsed
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("child result retrieval failed")
-                .to_string(),
-        ),
-        Some("unknown") => Some(
-            parsed
-                .get("detail")
-                .and_then(Value::as_str)
-                .unwrap_or("child agent returned an unknown status")
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
 fn collect_parallel_agent_budget_rollup(
     state: &AgenticLoopState,
 ) -> Option<ParallelAgentBudgetRollup> {
@@ -349,17 +269,11 @@ fn collect_parallel_agent_budget_rollup(
         if record.name != "agent" {
             continue;
         }
-        let action = record.args_preview.as_deref().unwrap_or_default();
-        let parsed_result = parse_embedded_json(
-            record
-                .result_full
-                .as_deref()
-                .or(record.result_preview.as_deref()),
-        );
+        let projection = project_agent_tool_budget_record(record);
 
-        match action {
-            "spawn" => {
-                let Some(agent_id) = agent_id_from_record(record, parsed_result.as_ref()) else {
+        match projection.action {
+            AgentToolRecordActionKind::Spawn => {
+                let Some(agent_id) = projection.agent_id.clone() else {
                     continue;
                 };
                 if !order.iter().any(|id| id == &agent_id) {
@@ -367,35 +281,18 @@ fn collect_parallel_agent_budget_rollup(
                 }
                 let entry = summaries.entry(agent_id).or_default();
                 if entry.label.is_none() {
-                    entry.label = parsed_result
-                        .as_ref()
-                        .and_then(|value| value.get("description"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| {
-                            record
-                                .args_full
-                                .as_deref()
-                                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                                .and_then(|value| {
-                                    value
-                                        .get("description")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string)
-                                })
-                        });
+                    entry.label = projection.display_name_hint.clone();
                 }
             }
-            "get_result" => {
-                let Some(agent_id) = agent_id_from_record(record, parsed_result.as_ref()) else {
+            AgentToolRecordActionKind::GetResult => {
+                let Some(agent_id) = projection.agent_id.clone() else {
                     continue;
                 };
                 if !order.iter().any(|id| id == &agent_id) {
                     order.push(agent_id.clone());
                 }
                 let entry = summaries.entry(agent_id).or_default();
-                if let Some(error) = record.error.as_deref() {
-                    let summarized = summarize_control_error(error);
+                if let Some(summarized) = projection.control_error_summary.clone() {
                     if !entry
                         .control_errors
                         .iter()
@@ -404,22 +301,13 @@ fn collect_parallel_agent_budget_rollup(
                         entry.control_errors.push(summarized);
                     }
                 }
-                if let Some(parsed) = parsed_result.as_ref() {
-                    match parsed.get("status").and_then(Value::as_str) {
-                        Some("completed") | Some("interrupted") => {
-                            if let Some(result) = parsed.get("result").and_then(Value::as_str) {
-                                entry.completed_result = Some(result.to_string());
-                            }
-                        }
-                        _ => {
-                            if entry.completed_result.is_none() {
-                                entry.incomplete_reason = summarize_incomplete_agent_state(parsed);
-                            }
-                        }
-                    }
+                if let Some(result) = projection.completed_result.clone() {
+                    entry.completed_result = Some(result);
+                } else if entry.completed_result.is_none() {
+                    entry.incomplete_reason = projection.incomplete_reason.clone();
                 }
             }
-            _ => {}
+            AgentToolRecordActionKind::Other => {}
         }
     }
 
@@ -491,26 +379,17 @@ fn parallel_agent_budget_exhaustion_summary(
             "{}. {} — {}",
             idx + 1,
             entry.label,
-            summarize_agent_result(&entry.result)
+            summarize_agent_tool_budget_result(&entry.result)
         ));
     }
     lines.push(String::new());
     lines.push("Unfinished sub-agent results:".to_string());
     for (idx, entry) in rollup.unfinished.iter().enumerate() {
-        let mut detail = entry
-            .incomplete_reason
-            .as_deref()
-            .map(str::to_string)
-            .unwrap_or_else(|| "did not finish before the turn budget was exhausted".to_string());
-        if cancelled_agents.contains(&entry.agent_id) {
-            detail.push_str(
-                "; the parent turn budget was exhausted and the parent cancelled this sub-agent",
-            );
-        }
-        if !entry.control_errors.is_empty() {
-            detail.push_str("; ");
-            detail.push_str(&entry.control_errors.join("; "));
-        }
+        let detail = render_agent_tool_budget_unfinished_detail(
+            entry.incomplete_reason.as_deref(),
+            &entry.control_errors,
+            cancelled_agents.contains(&entry.agent_id),
+        );
         lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
     }
     Some(lines.join("\n"))
@@ -2344,6 +2223,184 @@ mod tests {
             text.contains("duplicate_within_turn") || text.contains("restricted"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn budget_exhaustion_summary_uses_shared_child_result_projection() {
+        let mut state = make_state();
+        state.max_turns = 9;
+        state.remaining_turns = 0;
+        state.llm_rounds_completed = 9;
+        state.total_tool_calls = 6;
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({"description":"Review architecture"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-a",
+                    "description":"Review architecture"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review security"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-b",
+                    "description":"Review security"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review infra"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-c",
+                    "description":"Review infra"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-a"}),
+                Some(json!({
+                    "status":"interrupted",
+                    "agent_id":"agent-a",
+                    "finish_reason":"budget_exhausted",
+                    "result":"Partial architecture findings."
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-b"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-b"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-c"}),
+                Some(json!({
+                    "status":"cancelled",
+                    "agent_id":"agent-c",
+                    "reason":"parent cancelled this sub-agent"
+                })),
+                None,
+            ),
+        ];
+
+        let text = budget_exhaustion_completion_text(&state, &HashSet::new());
+
+        assert!(text.contains("Partial architecture findings."), "{text}");
+        assert!(
+            text.contains("launched and has not produced a child result yet"),
+            "{text}"
+        );
+        assert!(text.contains("parent cancelled this sub-agent"), "{text}");
+    }
+
+    #[test]
+    fn budget_exhaustion_summary_uses_record_projection_when_args_preview_is_missing() {
+        let mut state = make_state();
+        state.max_turns = 5;
+        state.remaining_turns = 0;
+        state.llm_rounds_completed = 5;
+        state.total_tool_calls = 4;
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "spawn",
+                        "agent_id": "agent-a",
+                        "description": "Review architecture"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"launched",
+                        "description":"Review architecture"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "get_result",
+                        "agent_id": "agent-a"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"interrupted",
+                        "result":"Partial architecture findings.",
+                        "finish_reason":"budget_exhausted"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "spawn",
+                        "agent_id": "agent-b",
+                        "description": "Review security"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"launched",
+                        "description":"Review security"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "get_result",
+                        "agent_id": "agent-b"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"launched"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+        ];
+
+        let text = budget_exhaustion_completion_text(&state, &HashSet::new());
+        assert!(text.contains("Review architecture"), "{text}");
+        assert!(text.contains("Partial architecture findings."), "{text}");
+        assert!(text.contains("Review security"), "{text}");
     }
 
     #[tokio::test]

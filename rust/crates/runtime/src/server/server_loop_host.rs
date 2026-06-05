@@ -3470,8 +3470,27 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
                 "timestamp": ts,
             }
         })),
+        ProgressEventType::Interrupted {
+            reason,
+            partial_summary,
+            total_tool_calls,
+            total_tokens,
+            duration_ms,
+        } => Some(json!({
+            "event_type": "agent_interrupted",
+            "data": {
+                "agent_id": agent_id,
+                "status": "interrupted",
+                "reason": reason,
+                "partial_summary": partial_summary,
+                "total_tool_calls": total_tool_calls,
+                "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
+                "duration_ms": duration_ms,
+                "timestamp": ts,
+            }
+        })),
         ProgressEventType::Failed { error } => Some(json!({
-            "event_type": "agent_completed",
+            "event_type": "agent_failed",
             "data": {
                 "agent_id": agent_id,
                 "status": "failed",
@@ -3480,7 +3499,7 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
             }
         })),
         ProgressEventType::Cancelled { reason } => Some(json!({
-            "event_type": "agent_completed",
+            "event_type": "agent_cancelled",
             "data": {
                 "agent_id": agent_id,
                 "status": "cancelled",
@@ -6275,6 +6294,55 @@ mod tests {
         assert_eq!(sse["event_type"], "agent_completed");
         assert_eq!(sse["data"]["status"], "completed");
         assert_eq!(sse["data"]["total_tool_calls"], 5);
+    }
+
+    #[test]
+    fn progress_event_interrupted_to_sse() {
+        use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+
+        let evt = AgentProgressEvent {
+            agent_id: "agent-2".to_string(),
+            event_type: ProgressEventType::Interrupted {
+                reason: "budget_exhausted".to_string(),
+                partial_summary: "Partial".to_string(),
+                total_tool_calls: 5,
+                total_tokens: (100, 200),
+                duration_ms: 3000,
+            },
+            timestamp_epoch_ms: 2000,
+        };
+        let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
+        assert_eq!(sse["event_type"], "agent_interrupted");
+        assert_eq!(sse["data"]["status"], "interrupted");
+        assert_eq!(sse["data"]["reason"], "budget_exhausted");
+    }
+
+    #[test]
+    fn progress_event_failed_and_cancelled_use_distinct_terminal_event_types() {
+        use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+
+        let failed = AgentProgressEvent {
+            agent_id: "agent-f".to_string(),
+            event_type: ProgressEventType::Failed {
+                error: "boom".to_string(),
+            },
+            timestamp_epoch_ms: 1,
+        };
+        let cancelled = AgentProgressEvent {
+            agent_id: "agent-c".to_string(),
+            event_type: ProgressEventType::Cancelled {
+                reason: "user request".to_string(),
+            },
+            timestamp_epoch_ms: 2,
+        };
+
+        let failed_sse = super::progress_event_to_sse(&failed).expect("failed SSE");
+        let cancelled_sse = super::progress_event_to_sse(&cancelled).expect("cancelled SSE");
+
+        assert_eq!(failed_sse["event_type"], "agent_failed");
+        assert_eq!(failed_sse["data"]["status"], "failed");
+        assert_eq!(cancelled_sse["event_type"], "agent_cancelled");
+        assert_eq!(cancelled_sse["data"]["status"], "cancelled");
     }
 
     #[test]
