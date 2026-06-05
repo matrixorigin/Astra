@@ -1264,7 +1264,7 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile};
     use crate::tests::isolate_credentials;
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};

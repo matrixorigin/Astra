@@ -1,3 +1,4 @@
+use astra_services::session_journal;
 //! `astra-cli` library crate.
 //!
 //! Provides the CLI application logic shared between the main `astra` binary
@@ -57,10 +58,10 @@ pub mod tui;
 pub(crate) use cli::*;
 
 // SSE streaming types
-pub(crate) use cli::streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
+pub(crate) use crate::cli::stream::streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
 
 // Session state
-pub(crate) use cli::plan_monitor::{format_duration_short, format_plan_progress};
+pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
 pub(crate) use cli::session_state::{ExplainMode, SessionState, SkillDevState};
 
 // Cloud sync

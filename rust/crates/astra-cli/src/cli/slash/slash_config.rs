@@ -15,7 +15,7 @@ use crossterm::style::Stylize;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
-use super::theme;
+use crate::cli::theme;
 
 static ACTIVE_MODEL_FOR_DISPLAY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 

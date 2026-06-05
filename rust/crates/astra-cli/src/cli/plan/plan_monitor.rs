@@ -1,14 +1,14 @@
 //! Plan execution progress rendering and blocking monitor loop.
 
 use crate::cli::chat_stream;
-use crate::cli::cli_formatting;
-use crate::cli::cli_utils::append_journal_event_or_warn;
+use crate::cli::cli_config::cli_formatting;
+use crate::cli::cli_config::cli_utils::append_journal_event_or_warn;
 use crate::cli::durable_bridge;
 use crate::cli::effects;
-use crate::cli::plan_executor;
-use crate::cli::session_state::SessionState;
-use crate::cli::stream_render;
-use crate::cli::streaming_md;
+use crate::cli::plan;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::stream_render;
+use crate::cli::stream::streaming_md;
 use crate::cli::theme;
 use crate::cli::tool_result_status::tool_result_status_icon;
 use crossterm::style::Stylize;
@@ -166,7 +166,7 @@ fn display_plan_updates_live(
     plan_spinner: &mut Option<PlanSpinner>,
     current_subtask_tag: &mut String,
 ) -> PlanMonitorOutcome {
-    use plan_executor::PlanUpdate;
+    use crate::cli::plan::plan_executor::PlanUpdate;
     let mut outcome = PlanMonitorOutcome::Continue;
 
     /// Finish any in-flight markdown stream: clear spinner, finalize renderer, newline.
@@ -1134,7 +1134,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
 /// Apply a single trailing update from the plan executor channel.
 /// Called when draining remaining messages after PlanFinished/PlanError.
 fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionState) {
-    use plan_executor::PlanUpdate;
+    use crate::cli::plan::plan_executor::PlanUpdate;
     match update {
         PlanUpdate::HistoryEntry {
             user_msg,

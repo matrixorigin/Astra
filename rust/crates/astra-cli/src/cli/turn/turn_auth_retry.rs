@@ -1,5 +1,5 @@
-use super::auth_flow::is_auth_error;
-use super::session_runtime;
+use crate::cli::auth_flow::is_auth_error;
+use crate::cli::session::session_runtime;
 
 pub(crate) fn should_retry_after_auth_refresh(error: &str) -> bool {
     is_auth_error(error)

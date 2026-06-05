@@ -5821,6 +5821,7 @@ mod tests {
             InjectionLevel, InjectionRecord, StalenessSignals,
         };
         use std::time::{Duration, SystemTime};
+use astra_services::session_journal;
 
         let (executor, obs) = attach_empty_observatory(test_executor());
         let big = "x".repeat(1000); // > PREVIEW_CHAR_CAP on purpose

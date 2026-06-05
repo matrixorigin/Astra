@@ -7,9 +7,9 @@
 //! 2. a session-not-found retry must clear the persisted "last session"
 //!    pointer before retrying without a session id.
 
-use super::chat_stream::{ApprovalRequestTx, BasicCliChatContext, ChatTurnParams, stream_chat_sse};
-use super::permission_manager::PermissionManager;
-use super::streaming_types::{StreamResult, TurnFailure};
+use crate::cli::chat_stream::{ApprovalRequestTx, BasicCliChatContext, ChatTurnParams, stream_chat_sse};
+use crate::cli::permission_manager::PermissionManager;
+use crate::cli::stream::streaming_types::{StreamResult, TurnFailure};
 use super::turn_session_retry::{
     clear_stale_last_session_pointer, should_retry_after_session_not_found,
 };

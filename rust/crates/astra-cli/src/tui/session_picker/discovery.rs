@@ -346,6 +346,7 @@ fn haystack(e: &SessionEntry) -> String {
 mod tests {
     use super::*;
     use astra_services::{
+use astra_services::session_journal;
         session_journal::{JournalDirGuard, JournalEvent, JournalWriter},
         session_workspace,
     };

@@ -2,7 +2,7 @@
 use super::csl::*;
 use super::io::*;
 use super::workspace::*;
-use crate::cli::session_projection::history_as_messages;
+use crate::cli::session::session_projection::history_as_messages;
 use crate::cli::*;
 
 pub(crate) fn delegation_from_heavy_checkpoint(

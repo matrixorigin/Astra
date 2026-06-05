@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::skill_install_status_surface::skill_install_status_surface;
+use crate::cli::surface::skill_install_status_surface::skill_install_status_surface;
 
 pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category

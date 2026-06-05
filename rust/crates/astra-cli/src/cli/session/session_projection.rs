@@ -2,8 +2,8 @@ use astra_text_utils::str_preview::truncate_str;
 use astra_tools::task_mgmt::SessionTask;
 
 use super::*;
-use crate::cli::session_task_surface::session_task_active_priority;
-use crate::cli::streaming_types::StreamResult;
+use crate::cli::surface::session_task_surface::session_task_active_priority;
+use crate::cli::stream::streaming_types::StreamResult;
 
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
     let mut lines = Vec::new();

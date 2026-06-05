@@ -571,11 +571,11 @@ pub(crate) async fn run_tui_session(
     max_budget: f64,
     cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<(), String> {
-    use crate::cli::session_runtime::{
+    use crate::cli::session::session_runtime::{
         initialize_session_state, install_task_service, install_task_store, resolve_task_service,
         resolve_task_store,
     };
-    use crate::cli::session_startup::complete_session_startup;
+    use crate::cli::session::session_startup::complete_session_startup;
     use crate::cli::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────

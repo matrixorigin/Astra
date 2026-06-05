@@ -4,7 +4,7 @@
 //! so plan execution can show contract generation, verification results, and delivery
 //! reports in a user-friendly way.
 
-use crate::cli::cli_utils::{prefix_chars, truncate_str};
+use crate::cli::cli_config::cli_utils::{prefix_chars, truncate_str};
 
 use astra_services::task_orchestrator::TaskOutcome;
 use astra_services::{

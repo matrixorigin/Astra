@@ -299,7 +299,7 @@ pub type PlanReviewRequestTx = mpsc::UnboundedSender<PlanReviewRequest>;
 
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
-use crate::cli::cli_context::CliContext;
+use crate::cli::cli_config::cli_context::CliContext;
 
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,

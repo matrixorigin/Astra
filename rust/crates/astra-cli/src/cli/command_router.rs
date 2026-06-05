@@ -4,8 +4,8 @@ use crate::cli::arg_render::{
     render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
 use crate::cli::auth_flow::*;
-use crate::cli::cli_args::*;
-use crate::cli::cli_utils::*;
+use crate::cli::cli_config::cli_args::*;
+use crate::cli::cli_config::cli_utils::*;
 use crate::cli::config_manager::{
     execute_config_command, latest_artifact_id, resolve_download_output_path,
     resolve_remote_session_id, write_downloaded_capture,
@@ -17,29 +17,29 @@ use crate::cli::one_shot_session_routing::{
 };
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::project_instructions::*;
-use crate::cli::session_runtime;
-use crate::cli::session_runtime::*;
-use crate::cli::session_state::*;
+use crate::cli::session::session_runtime;
+use crate::cli::session::session_runtime::*;
+use crate::cli::session::session_state::*;
 use crate::cli::skill_catalog::{
     SkillCatalogFilter, list_skill_record_from_registry, load_skill_record_from_registry,
     normalize_source_filter,
 };
-use crate::cli::slash_bug::*;
-use crate::cli::slash_debug::*;
-use crate::cli::slash_info::*;
-use crate::cli::slash_memory::*;
-use crate::cli::slash_messaging::*;
-use crate::cli::streaming_types::*;
-use crate::cli::task_result_artifact::write_task_output;
-use crate::cli::task_result_projection::{
+use crate::cli::slash::slash_bug::*;
+use crate::cli::slash::slash_debug::*;
+use crate::cli::slash::slash_info::*;
+use crate::cli::slash::slash_memory::*;
+use crate::cli::slash::slash_messaging::*;
+use crate::cli::stream::streaming_types::*;
+use crate::cli::task::task_result_artifact::write_task_output;
+use crate::cli::task::task_result_projection::{
     error_kind_for_exit_code, stream_result_completion_outcome, stream_result_exit_code,
     stream_result_failure_reason, task_checkpoint_state_from_result,
 };
-use crate::cli::task_result_surface::{
+use crate::cli::surface::task_result_surface::{
     load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
     task_result_json_payload,
 };
-use crate::cli::task_surface::encode_task_failure_message;
+use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
 use crate::cli::{
     agent_loader, cli_utils, delegate_subrun, diff_presenter, journal_diff, journal_digest,
     journal_tree, slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry, theme,
@@ -4339,21 +4339,21 @@ mod task_run_projection_tests {
     #[test]
     fn task_status_label_marks_partial_completed_tasks() {
         assert_eq!(
-            crate::cli::task_surface::task_status_label(
+            crate::cli::task_checkpoint_surface::task_status_label(
                 astra_services::TaskStatus::Completed,
                 Some(astra_services::TaskOutcome::Partial),
             ),
             "partial"
         );
         assert_eq!(
-            crate::cli::task_surface::task_status_label(
+            crate::cli::task_checkpoint_surface::task_status_label(
                 astra_services::TaskStatus::Completed,
                 Some(astra_services::TaskOutcome::Success),
             ),
             "completed"
         );
         assert_eq!(
-            crate::cli::task_surface::task_status_label(astra_services::TaskStatus::Failed, None,),
+            crate::cli::task_checkpoint_surface::task_status_label(astra_services::TaskStatus::Failed, None,),
             "failed"
         );
     }

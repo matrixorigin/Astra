@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 
-use crate::cli::cli_args::Cli;
+use crate::cli::cli_config::cli_args::Cli;
 use tracing_appender::non_blocking::WorkerGuard;
 
 /// Keeps the [`WorkerGuard`] alive so the non-blocking writer flushes on process exit (drop on shutdown).

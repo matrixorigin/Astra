@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use super::session_side_effects::enqueue_ingestion_pub;
-use super::session_startup;
+use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_startup;
 use super::*;
 
 pub(crate) fn report_turn_failure(

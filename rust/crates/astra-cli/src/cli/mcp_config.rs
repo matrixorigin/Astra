@@ -2,7 +2,7 @@
 //!
 //! Extracted from `command_router.rs` as part of the god-module refactor (P0-2).
 
-use super::cli_args::McpCmd;
+use crate::cli::cli_config::cli_args::McpCmd;
 use super::theme;
 use crossterm::style::Stylize;
 use std::io::Write;

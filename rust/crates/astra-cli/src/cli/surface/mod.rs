@@ -7,5 +7,5 @@ pub mod session_source_surface;
 pub mod session_task_surface;
 pub mod session_workspace_status_surface;
 pub mod skill_install_status_surface;
+pub mod task_checkpoint_surface;
 pub mod task_result_surface;
-pub mod task_surface;

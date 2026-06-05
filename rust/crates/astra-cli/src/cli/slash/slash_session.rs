@@ -7,15 +7,15 @@ use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
 use super::*;
-use crate::cli::agent_journal_event_surface::{project_agent_spawned, project_agent_terminated};
-use crate::cli::delegation_event_surface::{
+use crate::cli::surface::agent_journal_event_surface::{project_agent_spawned, project_agent_terminated};
+use crate::cli::surface::delegation_event_surface::{
     project_delegation_completed, project_delegation_retry, project_delegation_started,
     project_delegation_sub_run_completed, project_delegation_sub_run_started,
 };
-use crate::cli::session_restore_client;
-use crate::cli::session_runtime;
-use crate::cli::session_source_surface::session_source_surface;
-use crate::cli::session_workspace_status_surface::session_workspace_status_surface;
+use crate::cli::session::session_restore_client;
+use crate::cli::session::session_runtime;
+use crate::cli::surface::session_source_surface::session_source_surface;
+use crate::cli::surface::session_workspace_status_surface::session_workspace_status_surface;
 use crate::cli::tool_call_groups;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).

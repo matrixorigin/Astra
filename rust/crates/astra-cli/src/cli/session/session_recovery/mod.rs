@@ -33,7 +33,7 @@ mod tests {
         with_workspace_lock, write_bytes_atomic,
     };
     use super::*;
-    use crate::cli::session_state::SessionState;
+    use crate::cli::session::session_state::SessionState;
     use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
     use astra_pipeline::step_protocol::StepCheckpoint;
     use astra_services::session_journal;

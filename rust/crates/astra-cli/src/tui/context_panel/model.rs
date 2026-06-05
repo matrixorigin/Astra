@@ -14,7 +14,7 @@
 
 #![allow(dead_code)]
 
-use crate::cli::session_state::ContinuationAnchor;
+use crate::cli::session::session_state::ContinuationAnchor;
 use astra_turn_core::context_assembly_trace::{
     ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
     MemorySelection, RejectionReason, SkillInjection, ToolSelected,

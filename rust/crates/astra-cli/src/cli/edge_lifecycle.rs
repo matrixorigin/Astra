@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
-use crate::cli::session_runtime::{attempt_token_refresh, current_access_token};
+use crate::cli::session::session_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::edge::edge_register_with_capabilities;
 use astra_thin_client::{EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError};
 use tokio_util::sync::CancellationToken;

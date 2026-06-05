@@ -41,7 +41,7 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
-use crate::cli::session_state::SessionState;
+use crate::cli::session::session_state::SessionState;
 
 const SCHEMA_VERSION: &str = "astra.context_dump/v1";
 

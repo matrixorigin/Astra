@@ -15,7 +15,7 @@ use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
-use super::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::{ExplainMode, SessionState};
 
 /// Result from cloud pull attempt at session start.

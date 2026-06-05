@@ -1,8 +1,8 @@
-use super::cli_utils::{
+use crate::cli::cli_config::cli_utils::{
     local_resumable_last_session_id, local_session_is_resumable, preflight_remote_resume_session,
 };
-use super::session_continuation::load_session_messages_for_continuation;
-use super::session_restore_client::list_cloud_resumable_sessions;
+use crate::cli::session::session_continuation::load_session_messages_for_continuation;
+use crate::cli::session::session_restore_client::list_cloud_resumable_sessions;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OneShotSessionRouting {
@@ -124,7 +124,7 @@ pub(crate) async fn resolve_one_shot_session_routing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_pipeline::step_checkpoint::write_step_checkpoint;
     use astra_pipeline::step_protocol::{
         HeavyCheckpoint, LightCheckpoint, PROTOCOL_VERSION, StepCheckpoint, epoch_ms,

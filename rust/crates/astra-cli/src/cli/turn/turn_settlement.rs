@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::session_state::SessionState;
+use crate::cli::session::session_state::SessionState;
 use super::turn_cancellation::apply_user_cancelled_turn;
 use super::turn_entry::TurnContext;
 use super::turn_failure_reporting::report_turn_failure;

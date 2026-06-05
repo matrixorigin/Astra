@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 
-use crate::cli::cli_args;
+use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,7 +1,7 @@
 use astra_runtime::plan;
 use serde_json::Value;
 
-use crate::cli::session_runtime;
+use crate::cli::session::session_runtime;
 use astra_services::session_journal;
 
 fn parse_session_id(value: &Value) -> Option<String> {

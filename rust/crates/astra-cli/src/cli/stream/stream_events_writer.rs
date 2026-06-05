@@ -4,7 +4,7 @@
 //! JSON object per line to stderr.  Gateway reads these lines to drive
 //! progressive WeChat delivery (text deltas, tool status, thinking state).
 
-use super::chat_stream::StreamEvent;
+use crate::cli::chat_stream::StreamEvent;
 use tokio::sync::mpsc;
 
 pub(crate) fn spawn_stderr_writer(

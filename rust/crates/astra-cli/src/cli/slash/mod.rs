@@ -1,3 +1,4 @@
+pub use astra_services::session_journal;
 pub mod slash_account;
 pub mod slash_agent;
 pub mod slash_bug;

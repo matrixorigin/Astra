@@ -39,22 +39,10 @@ mod tests {
         assert!(!SessionTaskStatusKind::Cancelled.is_active());
         assert!(SessionTaskStatusKind::Failed.is_unsuccessful());
         assert!(SessionTaskStatusKind::Cancelled.is_unsuccessful());
-        assert_eq!(
-            SessionTaskStatusKind::InProgress.status_marker(),
-            "▸"
-        );
-        assert_eq!(
-            SessionTaskStatusKind::Pending.status_marker(),
-            "·"
-        );
-        assert_eq!(
-            SessionTaskStatusKind::Cancelled.status_marker(),
-            "⏹"
-        );
-        assert_eq!(
-            SessionTaskStatusKind::Archived.status_marker(),
-            "·"
-        );
+        assert_eq!(SessionTaskStatusKind::InProgress.status_marker(), "▸");
+        assert_eq!(SessionTaskStatusKind::Pending.status_marker(), "·");
+        assert_eq!(SessionTaskStatusKind::Cancelled.status_marker(), "⏹");
+        assert_eq!(SessionTaskStatusKind::Archived.status_marker(), "·");
         assert_eq!(
             session_task_active_priority(SessionTaskStatusKind::InProgress),
             0

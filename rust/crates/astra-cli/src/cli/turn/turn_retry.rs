@@ -1,4 +1,4 @@
-use super::session_state::SessionState;
+use crate::cli::session::session_state::SessionState;
 use super::turn_auth_retry::prepare_auth_refresh_retry;
 use super::turn_session_retry::{
     prepare_session_not_found_retry, should_retry_after_session_not_found,

@@ -2,7 +2,7 @@ use astra_services::session_restore::{
     HybridRestoreService, RestoredSession, ResumableSessionsResponse, SessionRestoreService,
 };
 
-use super::session_runtime;
+use crate::cli::session::session_runtime;
 
 fn validate_remote_session_id(session_id: &str) -> Result<(), String> {
     super::cli_utils::validate_cli_session_id(session_id)
@@ -162,7 +162,7 @@ pub(crate) async fn list_cloud_resumable_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

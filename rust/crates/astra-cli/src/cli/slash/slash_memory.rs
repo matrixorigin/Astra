@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::health_status_surface::health_status_icon;
+use crate::cli::surface::health_status_surface::health_status_icon;
 use astra_services::session_artifact_store::SessionArtifactStore;
 
 pub(crate) const MEMORY_BROWSE_QUERY: &str = "memory knowledge fact preference plan task note";

@@ -1,11 +1,11 @@
 use chrono::Utc;
 use serde::Serialize;
 
-use crate::cli::cli_args::{
+use crate::cli::cli_config::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
 };
-use crate::cli::cli_utils::local_resumable_last_session_id;
-use crate::cli::session_continuation::extract_text_content;
+use crate::cli::cli_config::cli_utils::local_resumable_last_session_id;
+use crate::cli::session::session_continuation::extract_text_content;
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
@@ -19,7 +19,7 @@ use super::surface::self_surface;
 type SessionArtifacts = LoadedSelfSurfaceArtifacts;
 
 #[derive(Debug, Serialize)]
-struct IdentityView {
+pub(crate) struct IdentityView {
     name: &'static str,
     version: &'static str,
     runtime: &'static str,
@@ -292,11 +292,11 @@ pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> 
     }
 }
 
-fn to_json<T: Serialize>(value: &T) -> Result<String, String> {
+pub(crate) fn to_json<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|e| e.to_string())
 }
 
-fn identity_view() -> IdentityView {
+pub(crate) fn identity_view() -> IdentityView {
     IdentityView {
         name: "astra",
         version: env!("CARGO_PKG_VERSION"),
@@ -764,7 +764,7 @@ fn effective_runtime_config(
     }
 }
 
-fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<CheckResult> {
+pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<CheckResult> {
     let mut checks = Vec::new();
     let config = match tuned_config_json {
         Some(json) => match serde_json::from_str::<RuntimeConfig>(json) {
@@ -955,8 +955,8 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_args::SelfSessionArgs;
-    use crate::cli::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
+    use crate::cli::cli_config::cli_args::SelfSessionArgs;
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, load_credentials, save_credentials};
     use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
     use astra_services::session_workspace::ContextTraceSignal;
     use wiremock::matchers::{method, path};

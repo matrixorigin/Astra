@@ -5,9 +5,9 @@ use astra_turn_core::chat_turn_heuristics::looks_like_live_query_with_context;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 #[cfg(test)]
-use super::session_improvement;
-use super::session_projection::build_continuation_anchor;
-use super::session_startup;
+use crate::cli::session::session_improvement;
+use crate::cli::session::session_projection::build_continuation_anchor;
+use crate::cli::session::session_startup;
 use super::turn_commit::TurnCommitOutcome;
 use super::turn_commit::commit_turn_journal_workspace_and_sidecars;
 use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};

@@ -386,7 +386,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/allow" => {
-            use permission_manager::PermissionMode;
+            use crate::cli::permission_manager::PermissionMode;
             match arg {
                 "" => {
                     let next = match state.perm_manager.mode() {

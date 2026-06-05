@@ -3,13 +3,13 @@
 //! This module defines `SessionState`, the central struct that holds all session state
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
 
-use crate::cli::cli_context::CliContext;
+use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::durable_bridge;
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::plan_executor;
-use crate::cli::slash_team;
+use crate::cli::plan;
+use crate::cli::slash::slash_team;
 use crate::mcp_client;
-use astra_runtime::plan;
+use astra_runtime::plan as runtime_plan;
 use astra_runtime::prompts;
 use astra_runtime::tool_registry;
 use astra_services::session_journal;
@@ -307,7 +307,7 @@ pub(crate) struct SessionState {
     /// (which reads `perm_manager`) for that. The mirror only
     /// supplies the goal/plan-text consumers need (status line,
     /// `execution_state_summary`, plan-monitor UI).
-    pub cloud_plan_mirror: Option<plan::PlanModeState>,
+    pub cloud_plan_mirror: Option<runtime_plan::PlanModeState>,
     /// Last remote mirror-sync failure for the active cloud plan.
     /// When set, the mirror in `cloud_plan_mirror` may be stale and
     /// callers that want fresh data should re-sync before reading.
@@ -315,7 +315,7 @@ pub(crate) struct SessionState {
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
     /// Configuration for current plan execution.
-    pub plan_execution_config: Option<plan::PlanExecutionConfig>,
+    pub plan_execution_config: Option<runtime_plan::PlanExecutionConfig>,
     /// Goal text for the executing plan (for summary generation).
     pub executing_plan_goal: Option<String>,
     /// Cloud `plan_id` this execution is mirroring to, for posting

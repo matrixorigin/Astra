@@ -10,7 +10,7 @@
 use termimad::crossterm::style::Color;
 use termimad::{FmtText, MadSkin};
 
-use super::terminal_region::TerminalRegion;
+use crate::cli::terminal_region::TerminalRegion;
 use std::time::Instant;
 
 /// Incremental markdown renderer that streams formatted output.

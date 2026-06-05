@@ -14,10 +14,10 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
-use crate::cli::cli_utils::get_profile_and_token;
+use crate::cli::cli_config::cli_utils::get_profile_and_token;
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
-use crate::cli::session_runtime;
-use crate::cli::streaming_types::StreamResult;
+use crate::cli::session::session_runtime;
+use crate::cli::stream::streaming_types::StreamResult;
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
 
 type JsonWriter = Arc<Mutex<std::io::Stdout>>;

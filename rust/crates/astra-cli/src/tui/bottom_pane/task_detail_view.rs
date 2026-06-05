@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::view::{BottomPaneView, CancellationEvent};
-use crate::cli::session_task_surface::{SessionTaskStatusKind};
+use crate::cli::surface::session_task_surface::{SessionTaskStatusKind};
 use crate::tui::history_cell::task::{ChildStatus, TaskCell, TaskStatus};
 use astra_tools::task_mgmt::SessionTask;
 

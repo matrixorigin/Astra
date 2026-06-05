@@ -15,7 +15,7 @@
 //!   `None` so the caller just skips injection instead of padding
 //!   the prompt with "no tasks".
 
-use crate::cli::session_task_surface::{SessionTaskStatusKind};
+use crate::cli::surface::session_task_surface::{SessionTaskStatusKind};
 use astra_tools::task_mgmt::SessionTask;
 
 /// Render the summary. `None` means "the model doesn't need to

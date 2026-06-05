@@ -1,14 +1,16 @@
 use super::*;
-use crate::cli::task_result_surface::{
-    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
-};
-use crate::cli::task_surface::{
+use crate::cli::surface::task_checkpoint_surface::{
     encode_task_failure_message, task_list_item_claimability_icon,
     task_list_item_claimability_label, task_list_item_outcome, task_list_item_status_icon,
     task_list_item_status_label,
 };
 #[cfg(test)]
-use crate::cli::task_surface::{task_checkpoint_surface, task_status_icon, task_status_label};
+use crate::cli::surface::task_checkpoint_surface::{
+    task_checkpoint_surface, task_status_icon, task_status_label,
+};
+use crate::cli::surface::task_result_surface::{
+    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
+};
 
 async fn mark_background_task_failed(
     svc: &dyn astra_services::TaskService,
@@ -1048,7 +1050,7 @@ mod tests {
         assert!(snapshot.failed_error.is_some());
         assert!(!snapshot.completed);
         assert_eq!(
-            crate::cli::task_surface::parse_task_failure_message(
+            crate::cli::task_checkpoint_surface::parse_task_failure_message(
                 snapshot.failed_error.as_deref().unwrap()
             ),
             (
@@ -1153,7 +1155,7 @@ mod tests {
         assert!(!snapshot.completed);
         assert!(snapshot.completed_outcome.is_none());
         assert_eq!(
-            crate::cli::task_surface::parse_task_failure_message(
+            crate::cli::task_checkpoint_surface::parse_task_failure_message(
                 snapshot.failed_error.as_deref().unwrap()
             ),
             (Some("persistence_error"), "failed to append turn event")

@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::session_journal;
 
 pub(crate) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
 use crossterm::event::{Event, KeyCode, KeyModifiers};

@@ -1,4 +1,4 @@
-use super::session_input::detect_correction_signal;
+use crate::cli::session::session_input::detect_correction_signal;
 use super::*;
 
 /// Minimal async-capable chat completion abstraction so the skill-improvement

@@ -12,3 +12,5 @@ pub mod turn_session_retry;
 pub mod turn_settlement;
 pub mod turn_stream_runner;
 pub mod turn_success;
+
+pub use astra_services::session_journal;

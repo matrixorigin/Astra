@@ -17,3 +17,5 @@ pub mod session_startup;
 pub mod session_state;
 pub mod session_stats_scan;
 pub mod session_todo_client;
+
+pub use astra_services::session_journal;

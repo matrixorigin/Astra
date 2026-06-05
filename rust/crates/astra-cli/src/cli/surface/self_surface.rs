@@ -1,4 +1,4 @@
-use super::{IdentityView, identity_view, to_json, verify_runtime_config};
+use crate::cli::self_command::{identity_view, to_json, verify_runtime_config, IdentityView};
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
 
-use crate::cli::session_restore_client;
+use crate::cli::session::session_restore_client;
 
 #[derive(Debug, Serialize)]
 struct SnapshotEnvelope {

@@ -1,4 +1,4 @@
-use crate::cli::streaming_types::StreamResult;
+use crate::cli::stream::streaming_types::StreamResult;
 
 pub(crate) fn task_checkpoint_state_from_result(
     sr: &StreamResult,

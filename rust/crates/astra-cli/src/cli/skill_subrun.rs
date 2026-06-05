@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
-use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
+use crate::cli::stream::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
 use crate::edge_tools;
 

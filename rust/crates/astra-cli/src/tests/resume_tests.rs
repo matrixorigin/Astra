@@ -1,6 +1,6 @@
 use super::chat_stream_tests::sse_text_response;
 use super::*;
-use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
+use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
 use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -775,6 +775,7 @@ async fn resume_handles_missing_workspace() {
 async fn resume_lists_checkpoints_for_session() {
     let _creds = isolate_credentials();
     use astra_services::session_restore::SessionRestoreService;
+use astra_services::session_journal;
 
     let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 

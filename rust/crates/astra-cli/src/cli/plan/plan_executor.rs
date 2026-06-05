@@ -935,9 +935,9 @@ use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
 use crate::StreamResult;
 
-use super::chat_stream::ChatTurnParams;
-use super::durable_bridge;
-use super::permission_manager::PermissionManager;
+use crate::cli::chat_stream::ChatTurnParams;
+use crate::cli::durable_bridge;
+use crate::cli::permission_manager::PermissionManager;
 
 /// Post a start + finish pair to `/plans/{plan_id}/step-runs` so the cloud
 /// `plan_step_runs` table carries an audit row for this attempt.
@@ -1158,7 +1158,7 @@ async fn plan_executor_task(
     update_tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PlanCommand>,
 ) {
-    use super::chat_stream::stream_chat_sse;
+    use crate::cli::chat_stream::stream_chat_sse;
 
     let plan_start = std::time::Instant::now();
     let mut subtask_durations: Vec<Duration> = Vec::new();

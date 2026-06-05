@@ -1,5 +1,5 @@
-use super::session_recovery;
-use super::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_recovery;
+use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use super::*;
 
 /// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,

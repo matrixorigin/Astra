@@ -5,9 +5,9 @@
 //! when applicable.
 
 use crate::cli::durable_bridge;
-use crate::cli::plan_executor;
+use crate::cli::plan;
 
-use crate::cli::session_state::SessionState;
+use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
 use crossterm::style::Stylize;
 

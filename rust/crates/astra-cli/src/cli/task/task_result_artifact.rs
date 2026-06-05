@@ -1,4 +1,4 @@
-use crate::cli::task_surface::task_checkpoint_surface;
+use crate::cli::surface::task_checkpoint_surface::task_checkpoint_surface;
 use astra_services::TaskRecord;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -185,14 +185,12 @@ mod tests {
         temp_env::with_var("HOME", Some(temp.path()), || {
             let artifact = load_task_result_artifact(&base_task()).unwrap();
             assert!(artifact.is_none());
-            assert!(
-                !temp
-                    .path()
-                    .join(".astra")
-                    .join("tasks")
-                    .join("outputs")
-                    .exists()
-            );
+            assert!(!temp
+                .path()
+                .join(".astra")
+                .join("tasks")
+                .join("outputs")
+                .exists());
         });
     }
 

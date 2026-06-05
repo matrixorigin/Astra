@@ -11,12 +11,12 @@
 //! - `/agent help`: Show help
 
 use super::*;
-use crate::cli::delegation_event_surface::{
+use crate::cli::surface::delegation_event_surface::{
     delegation_event_id, delegation_sub_run_detail, project_delegation_completed,
     project_delegation_retry, project_delegation_started, project_delegation_sub_run_completed,
     project_delegation_sub_run_started,
 };
-use crate::cli::run_status_surface::{
+use crate::cli::surface::run_status_surface::{
     RunStatusKind, run_status_icon, run_status_is_active, run_status_is_done, run_status_is_failed,
     run_status_kind,
 };

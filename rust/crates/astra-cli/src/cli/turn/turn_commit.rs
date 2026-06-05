@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use super::session_recovery;
-use super::session_side_effects::{build_bridge_pipeline_journal_events, enqueue_ingestion_pub};
+use crate::cli::session::session_recovery;
+use crate::cli::session::session_side_effects::{build_bridge_pipeline_journal_events, enqueue_ingestion_pub};
 use super::turn_learning::TurnLearningSnapshot;
 use super::*;
 use crate::StreamResult;

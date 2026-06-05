@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::health_status_surface::api_probe_is_healthy;
+use crate::cli::surface::health_status_surface::api_probe_is_healthy;
 use crate::edge_tools;
 use astra_services::session_journal;
 

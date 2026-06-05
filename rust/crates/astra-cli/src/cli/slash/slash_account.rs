@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::agent_runtime::initialize_multi_agent_runtime;
-use crate::cli::session_runtime::current_access_token;
+use crate::cli::session::session_runtime::current_access_token;
 use crate::post_auth_cloud_resync;
 use crate::{cli_dim, cli_err, cli_ok, cli_section};
 
@@ -100,7 +100,7 @@ pub(crate) async fn handle_account_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile};
 
     #[serial_test::serial]
     #[tokio::test]

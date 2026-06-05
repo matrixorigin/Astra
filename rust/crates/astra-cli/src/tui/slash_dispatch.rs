@@ -8,7 +8,7 @@
 use crate::ExplainMode;
 use crate::cli::command_registry;
 use crate::cli::command_registry::TuiHandler;
-use crate::cli::session_state::SessionState;
+use crate::cli::session::session_state::SessionState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::history_cell::system::SystemCell;
@@ -1851,7 +1851,7 @@ fn split_sub(text: &str) -> (&str, &str) {
 }
 
 async fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
-    use crate::cli::slash_mcp::ParsedMcpCommand as Cmd;
+    use crate::cli::slash::slash_mcp::ParsedMcpCommand as Cmd;
 
     match crate::cli::slash_mcp::parse_mcp_command(args) {
         Cmd::Help => {
@@ -3711,7 +3711,7 @@ mod context_history_tests {
 mod view_result_tests {
     use super::{handle_view_result, next_permission_mode_for_cycle};
     use crate::cli::permission_manager::PermissionMode;
-    use crate::cli::session_state::SessionState;
+    use crate::cli::session::session_state::SessionState;
     use crate::tui::bottom_pane::BottomPane;
     use crate::tui::chat_widget::ChatWidget;
     use crate::tui::history_cell::system::SystemCell;
@@ -4020,7 +4020,7 @@ mod fmt_tokens_tests {
 #[cfg(test)]
 mod session_hub_tests {
     use super::session_hub_persistence_error;
-    use crate::cli::session_state::SessionState;
+    use crate::cli::session::session_state::SessionState;
     use astra_services::session_workspace::WorkspaceMetadata;
 
     #[test]

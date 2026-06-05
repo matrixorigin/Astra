@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::run_status_surface::run_status_icon;
+use crate::cli::surface::run_status_surface::run_status_icon;
 use astra_runtime::server::team::orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
@@ -1907,7 +1907,7 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile};
     use axum::{Router, routing::get, routing::post};
 
     async fn spawn_mock(app: Router) -> String {

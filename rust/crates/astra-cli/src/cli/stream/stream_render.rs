@@ -80,13 +80,13 @@ fn tool_output_event_text(tool: &str, output: &str) -> String {
 }
 
 // CLI formatting utilities
-use super::cli_formatting::{
+use crate::cli::cli_config::cli_formatting::{
     colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block, format_byte_size,
     format_duration_suffix, github_repo_display, shorten_path, truncate_line,
 };
 
 // Effects module types
-use super::effects::{
+use crate::cli::effects::{
     ThinkingSpinnerKind, ToolRegionState, ToolStdoutLineAnim, thinking_viewport_rows,
 };
 
@@ -328,7 +328,7 @@ fn approval_memory_action(
     always_scope: astra_turn_core::permission::scope::AllowScope,
     stale_revalidation_passed: bool,
 ) -> ApprovalMemoryAction {
-    use super::chat_stream::ApprovalResponse;
+    use crate::cli::chat_stream::ApprovalResponse;
     use astra_turn_core::permission::scope::AllowScope;
 
     if response.is_approved() && !stale_revalidation_passed {
@@ -443,8 +443,8 @@ fn apply_approval_memory_action(
 pub use astra_turn_core::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
 // Re-export effects types for callers
-pub(crate) use super::effects::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
-pub(crate) use super::effects::{
+pub(crate) use crate::cli::effects::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
+pub(crate) use crate::cli::effects::{
     Spinner, ThinkingPreviewPane, ToolRunningLineSpinner, TtftWaitLineSpinner,
 };
 
@@ -2198,7 +2198,7 @@ impl CliSseStreamHost<'_> {
         display_label: Option<&str>,
         approval_kind: astra_thin_client::ApprovalKind,
     ) -> astra_thin_client::ApprovalDecision {
-        use super::chat_stream::ApprovalResponse;
+        use crate::cli::chat_stream::ApprovalResponse;
         use astra_thin_client::ApprovalDecision;
 
         if let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
@@ -2302,7 +2302,7 @@ impl CliSseStreamHost<'_> {
     }
 
     async fn ask_user_via_tui(&mut self, args: &serde_json::Value) -> String {
-        use super::chat_stream::{AskUserRequest, AskUserResponse};
+        use crate::cli::chat_stream::{AskUserRequest, AskUserResponse};
 
         let prompt = match crate::edge_tools::parse_ask_user_prompt(args) {
             Ok(prompt) => prompt,
@@ -2455,7 +2455,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         // Forward to stream event channel (even when quiet/suppress are on)
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
-            use super::chat_stream::StreamEvent;
+            use crate::cli::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
                     SseRenderEffect::StreamText(s) if !s.is_empty() => {
@@ -2722,7 +2722,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 reason,
             } => {
                 if let Some(tx) = &self.approval_request_tx {
-                    use super::chat_stream::ApprovalResponse;
+                    use crate::cli::chat_stream::ApprovalResponse;
                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                     // Issue #326 P3: compute the metadata bundle so
                     // the TUI card can render the remember preview,
@@ -3127,7 +3127,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 ..
                             } => {
                                 if let Some(tx) = &self.approval_request_tx {
-                                    use super::chat_stream::ApprovalResponse;
+                                    use crate::cli::chat_stream::ApprovalResponse;
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                     // `🔒 ` prefix visually marks sandbox-escape
                                     // prompts; header/detail/reason otherwise
@@ -3976,7 +3976,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     detail,
                     reason,
                 } => {
-                    use super::chat_stream::ApprovalResponse;
+                    use crate::cli::chat_stream::ApprovalResponse;
                     if let Some(tx) = &self.approval_request_tx {
                         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                         let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
@@ -6821,7 +6821,7 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
     use tempfile::tempdir;
@@ -7194,7 +7194,7 @@ mod tests {
 
     #[test]
     fn approval_memory_action_does_not_remember_allow_once() {
-        use super::chat_stream::ApprovalResponse;
+        use crate::cli::chat_stream::ApprovalResponse;
         use astra_turn_core::permission::scope::AllowScope;
 
         assert_eq!(
@@ -7205,7 +7205,7 @@ mod tests {
 
     #[test]
     fn approval_memory_action_maps_always_scope_to_storage_effect() {
-        use super::chat_stream::ApprovalResponse;
+        use crate::cli::chat_stream::ApprovalResponse;
         use astra_turn_core::permission::scope::AllowScope;
 
         assert_eq!(
@@ -8019,7 +8019,7 @@ mod tests {
 
     #[test]
     fn could_become_suppressed_tag_matches_known_prefixes() {
-        use crate::cli::streaming_md::could_become_suppressed_tag;
+        use crate::cli::stream::streaming_md::could_become_suppressed_tag;
         assert!(could_become_suppressed_tag("<"));
         assert!(could_become_suppressed_tag("</"));
         assert!(could_become_suppressed_tag("<t"));
@@ -8035,7 +8035,7 @@ mod tests {
 
     #[test]
     fn could_become_suppressed_tag_rejects_other_tags() {
-        use crate::cli::streaming_md::could_become_suppressed_tag;
+        use crate::cli::stream::streaming_md::could_become_suppressed_tag;
         assert!(!could_become_suppressed_tag("<co")); // <code>
         assert!(!could_become_suppressed_tag("<p"));
         assert!(!could_become_suppressed_tag("<div"));

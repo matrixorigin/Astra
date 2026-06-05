@@ -4,7 +4,7 @@
 //! reconstruct the operator-facing command line from parsed argument structs
 //! without duplicating formatting logic at each call site.
 
-use super::cli_args::{
+use crate::cli::cli_config::cli_args::{
     AgentArgs, AgentSubcommand, BugArgs, BugSubcommand, DebugArgs, DiffArgs, DiffSubcommand,
     GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, MessagingArgs, MessagingSubcommand,
     PermissionsArgs, PermissionsSubcommand, ReviewArgs, ReviewSubcommand, TaskArgs, TaskSubcommand,
@@ -230,7 +230,7 @@ pub(crate) fn render_bug_args(args: &BugArgs) -> String {
 #[cfg(test)]
 mod arg_render_tests {
     use super::*;
-    use crate::cli::cli_args::{PermissionsTraceArgs, TaskArgs, TaskSubcommand};
+    use crate::cli::cli_config::cli_args::{PermissionsTraceArgs, TaskArgs, TaskSubcommand};
 
     #[test]
     fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {

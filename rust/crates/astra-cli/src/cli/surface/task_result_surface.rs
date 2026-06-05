@@ -1,8 +1,8 @@
-use crate::cli::task_result_artifact::{TaskResultArtifact, load_task_result_artifact};
-use crate::cli::task_surface::{
+use crate::cli::surface::task_checkpoint_surface::{
     task_checkpoint_surface, task_record_error_detail, task_record_error_kind, task_record_outcome,
     task_record_status_label,
 };
+use crate::cli::task::task_result_artifact::{load_task_result_artifact, TaskResultArtifact};
 use astra_services::TaskRecord;
 use crossterm::style::{StyledContent, Stylize};
 
@@ -274,7 +274,7 @@ pub(crate) fn task_result_effective_error_kind<'a>(
 
 pub(crate) fn task_result_missing_text(task: &TaskRecord) -> &'static str {
     if task_result_is_unfinished(task) {
-        crate::cli::task_surface::unfinished_task_notice(task.status)
+        crate::cli::task_checkpoint_surface::unfinished_task_notice(task.status)
     } else {
         "No result available."
     }
@@ -359,7 +359,7 @@ mod tests {
     fn task_result_header_surface_exposes_structured_failure_metadata() {
         let mut task = base_task();
         task.status = TaskStatus::Failed;
-        task.error_message = Some(crate::cli::task_surface::encode_task_failure_message(
+        task.error_message = Some(crate::cli::task_checkpoint_surface::encode_task_failure_message(
             "persistence_error",
             "disk full",
         ));
@@ -456,7 +456,7 @@ mod tests {
     fn task_result_lookup_exit_code_prefers_structured_row_persistence_error_without_checkpoint() {
         let mut task = base_task();
         task.status = TaskStatus::Failed;
-        task.error_message = Some(crate::cli::task_surface::encode_task_failure_message(
+        task.error_message = Some(crate::cli::task_checkpoint_surface::encode_task_failure_message(
             "persistence_error",
             "failed to save background task result: disk full",
         ));
@@ -548,7 +548,7 @@ mod tests {
         task.status = TaskStatus::Pending;
         assert_eq!(
             task_result_missing_text(&task),
-            crate::cli::task_surface::unfinished_task_notice(TaskStatus::Pending)
+            crate::cli::task_checkpoint_surface::unfinished_task_notice(TaskStatus::Pending)
         );
 
         task.status = TaskStatus::Completed;
@@ -585,7 +585,7 @@ mod tests {
         assert_eq!(read.effective_error_kind, Some("unfinished"));
         assert_eq!(
             read.missing_text,
-            crate::cli::task_surface::unfinished_task_notice(TaskStatus::Paused)
+            crate::cli::task_checkpoint_surface::unfinished_task_notice(TaskStatus::Paused)
         );
     }
 }

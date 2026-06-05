@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use super::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
-use super::session_input::{
+use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
+use crate::cli::session::session_input::{
     active_task_attachment, build_effective_line_with_attachment,
     clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
 };

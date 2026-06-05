@@ -1,7 +1,7 @@
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use serde_json::Value;
 
-use crate::cli::session_state::SessionState;
+use crate::cli::session::session_state::SessionState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedPlanCommand {

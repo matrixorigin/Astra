@@ -5,7 +5,7 @@
 
 use crossterm::style::Stylize;
 
-use super::cli_context::CliContext;
+use crate::cli::cli_config::cli_context::CliContext;
 
 pub(crate) async fn run_interactive_chat(
     api: &astra_thin_client::ThinClient,
