@@ -105,24 +105,34 @@ fn prioritize_active_tasks_for_anchor(mut tasks: Vec<SessionTask>) -> Vec<Sessio
     tasks
 }
 
+fn active_task_anchor_items(active_tasks: &[SessionTask]) -> Vec<String> {
+    active_tasks
+        .iter()
+        .take(3)
+        .map(|task| {
+            let blocked = if task.blocked_by.is_empty() {
+                String::new()
+            } else {
+                format!(" [blocked by: {}]", task.blocked_by.join(", "))
+            };
+            format!(
+                "[{}] {}: {}{}",
+                task.status,
+                task.id,
+                truncate_str(&task.title, 120),
+                blocked
+            )
+        })
+        .collect()
+}
+
 fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
     if active_tasks.is_empty() {
         return None;
     }
     let mut lines = vec!["Active task board:".to_string()];
-    for task in active_tasks.iter().take(3) {
-        let blocked = if task.blocked_by.is_empty() {
-            String::new()
-        } else {
-            format!(" [blocked by: {}]", task.blocked_by.join(", "))
-        };
-        lines.push(format!(
-            "- [{}] {}: {}{}",
-            task.status,
-            task.id,
-            truncate_str(&task.title, 120),
-            blocked
-        ));
+    for item in active_task_anchor_items(active_tasks) {
+        lines.push(format!("- {item}"));
     }
     if active_tasks.len() > 3 {
         lines.push(format!(
@@ -184,9 +194,9 @@ fn session_memory_recap(memory_md: &str) -> Option<String> {
 }
 
 pub(crate) fn merge_continuation_anchor_with_session_memory(
-    anchor: Option<String>,
+    anchor: Option<ContinuationAnchor>,
     session_memory_markdown: Option<&str>,
-) -> Option<String> {
+) -> Option<ContinuationAnchor> {
     let Some(recap) = session_memory_markdown.and_then(session_memory_recap) else {
         return anchor;
     };
@@ -198,11 +208,24 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
     }
     let merged = match anchor {
         Some(anchor) if !anchor.trim().is_empty() => {
-            format!("{anchor}\n\n[Session memory recap]\n{recap}")
+            return Some(ContinuationAnchor::from_parts(
+                truncate_str(
+                    &format!("{}\n\n[Session memory recap]\n{recap}", anchor.text),
+                    900,
+                ),
+                anchor.latest_user_task,
+                anchor.assistant_direction,
+                anchor.active_task_board,
+            ));
         }
         _ => format!("[Session memory recap]\n{recap}"),
     };
-    Some(truncate_str(&merged, 900))
+    Some(ContinuationAnchor::from_parts(
+        truncate_str(&merged, 900),
+        None,
+        None,
+        Vec::new(),
+    ))
 }
 
 async fn load_active_tasks_for_anchor(state: &SessionState) -> Vec<SessionTask> {
@@ -221,7 +244,7 @@ fn build_continuation_anchor_with_active_tasks(
     line: &str,
     result: &StreamResult,
     active_tasks: &[SessionTask],
-) -> Option<String> {
+) -> Option<ContinuationAnchor> {
     let user_line = line.trim();
     if user_line.is_empty() {
         return state.continuation_anchor.clone();
@@ -229,11 +252,16 @@ fn build_continuation_anchor_with_active_tasks(
 
     let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
+    let active_task_board = active_task_anchor_items(active_tasks);
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
     }
 
-    if let Some(assistant_summary) = summarize_assistant_for_anchor(&result.full_text) {
+    let assistant_summary = summarize_assistant_for_anchor(&result.full_text);
+    let assistant_direction = assistant_summary
+        .as_deref()
+        .map(|summary| summary.lines().collect::<Vec<_>>().join(" "));
+    if let Some(assistant_summary) = assistant_summary {
         sections.push(format!("Latest assistant summary:\n{assistant_summary}"));
     }
 
@@ -245,7 +273,12 @@ fn build_continuation_anchor_with_active_tasks(
     if sections.is_empty() {
         None
     } else {
-        Some(sections.join("\n"))
+        Some(ContinuationAnchor::from_parts(
+            sections.join("\n"),
+            Some(user_summary.to_string()),
+            assistant_direction,
+            active_task_board,
+        ))
     }
 }
 
@@ -253,7 +286,7 @@ pub(crate) fn build_continuation_anchor(
     state: &SessionState,
     line: &str,
     result: &StreamResult,
-) -> Option<String> {
+) -> Option<ContinuationAnchor> {
     build_continuation_anchor_with_active_tasks(state, line, result, &[])
 }
 
@@ -274,18 +307,28 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
 
     let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
+    let active_task_board = active_task_anchor_items(active_tasks);
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
     }
 
-    if let Some(assistant_summary) = summarize_assistant_for_anchor(assistant_text) {
+    let assistant_summary = summarize_assistant_for_anchor(assistant_text);
+    let assistant_direction = assistant_summary
+        .as_deref()
+        .map(|summary| summary.lines().collect::<Vec<_>>().join(" "));
+    if let Some(assistant_summary) = assistant_summary {
         sections.push(format!("Latest assistant summary:\n{assistant_summary}"));
     }
 
     sections.extend(summarize_event_anchor_artifacts(
         state.last_turn_event.as_ref(),
     ));
-    state.continuation_anchor = Some(sections.join("\n"));
+    state.continuation_anchor = Some(ContinuationAnchor::from_parts(
+        sections.join("\n"),
+        Some(user_summary.to_string()),
+        assistant_direction,
+        active_task_board,
+    ));
 }
 
 pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
@@ -481,7 +524,7 @@ mod tests {
     #[test]
     fn continuation_anchor_preserves_on_empty_input() {
         let state = SessionState {
-            continuation_anchor: Some("Previous anchor content".to_string()),
+            continuation_anchor: Some("Previous anchor content".into()),
             ..SessionState::default()
         };
         let result = stub_stream_result("new response");
@@ -545,7 +588,11 @@ mod tests {
 - Removed legacy extractor
 ";
         let merged = merge_continuation_anchor_with_session_memory(
-            Some("Latest user task: tighten session memory".to_string()),
+            Some(
+                "Latest user task: tighten session memory"
+                    .to_string()
+                    .into(),
+            ),
             Some(memory),
         )
         .expect("merged anchor");
@@ -566,7 +613,8 @@ mod tests {
         state.turn = 1;
         state.continuation_anchor = Some(
             "Latest user task: explain ownership\nLatest assistant summary:\nOwnership in Rust means each value has exactl"
-                .to_string(),
+                .to_string()
+                .into(),
         );
 
         state.history.push((
@@ -586,7 +634,8 @@ mod tests {
 
         state.continuation_anchor = Some(
             "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
-                .to_string(),
+                .to_string()
+                .into(),
         );
         let effective = build_effective_line(
             "continue",

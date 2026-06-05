@@ -1529,6 +1529,7 @@ async fn plan_executor_task(
                     token: &ctx.token,
                     auth_profile: ctx.profile.as_deref(),
                     message: &prompt,
+                    semantic_query_override: None,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
                     provider: None,

@@ -18,9 +18,9 @@
 
 use std::{sync::Arc, time::Duration};
 
+use crate::lock_recovery::LockRecovery;
 #[cfg(test)]
 use astra_services::session_journal::ToolCallRecord;
-use crate::lock_recovery::LockRecovery;
 use astra_services::session_journal::{JournalEvent, JournalEventType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use tokio::sync::broadcast;

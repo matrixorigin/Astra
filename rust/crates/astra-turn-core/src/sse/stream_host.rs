@@ -1043,7 +1043,10 @@ mod tests {
             fn on_stream_complete(&mut self) {}
 
             fn on_session_id(&mut self, session_id: &str) {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("session:{session_id}"));
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("session:{session_id}"));
             }
 
             async fn execute_tool(
@@ -1052,7 +1055,10 @@ mod tests {
                 tool: &str,
                 args: &Value,
             ) -> EdgeToolExecResult {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("tool:{request_id}"));
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("tool:{request_id}"));
                 EdgeToolExecResult {
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -1758,7 +1764,10 @@ mod tests {
                 &mut self,
                 requests: Vec<ToolBatchRequest>,
             ) -> Vec<EdgeToolExecResult> {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(requests.len());
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(requests.len());
                 requests
                     .into_iter()
                     .map(|req| EdgeToolExecResult {
@@ -1854,7 +1863,10 @@ mod tests {
                 tool: &str,
                 args: &Value,
             ) -> EdgeToolExecResult {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(tool.to_string());
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(tool.to_string());
                 EdgeToolExecResult {
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
@@ -2200,7 +2212,10 @@ mod tests {
                 tool: &str,
                 args: &Value,
             ) -> EdgeToolExecResult {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("exec:{rid}:{tool}"));
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("exec:{rid}:{tool}"));
                 EdgeToolExecResult {
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
@@ -2220,7 +2235,10 @@ mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
             ) -> EdgeApprovalResult {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("approve:{rid}:{tool}"));
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("approve:{rid}:{tool}"));
                 EdgeApprovalResult {
                     request_id: rid.to_string(),
                     decision: "allow".to_string(),

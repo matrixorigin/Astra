@@ -1244,6 +1244,7 @@ pub(crate) async fn handle_info_command(
                 token: tok,
                 auth_profile: profile,
                 message: &prompt,
+                semantic_query_override: None,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
                 provider: None,
@@ -1714,22 +1715,21 @@ pub(crate) async fn handle_info_command(
 
             // ── Attention ──
             if let Some(ref anchor) = state.continuation_anchor {
-                let parsed = parse_continuation_anchor(anchor);
-                if let Some(task) = parsed.task.as_deref() {
+                if let Some(task) = anchor.latest_user_task.as_deref() {
                     eprintln!(
                         "  {:<12}  {}",
                         "task".magenta(),
                         truncate_str(task, 80).dim()
                     );
                 }
-                if let Some(direction) = parsed.direction.as_deref() {
+                if let Some(direction) = anchor.assistant_direction.as_deref() {
                     eprintln!(
                         "  {:<12}  {}",
                         "direction".magenta(),
                         truncate_str(direction, 80).dim()
                     );
                 }
-                if parsed.task.is_none() && parsed.direction.is_none() {
+                if anchor.latest_user_task.is_none() && anchor.assistant_direction.is_none() {
                     eprintln!(
                         "  {:<12}  {}",
                         "focus".magenta(),
@@ -2029,45 +2029,6 @@ pub(crate) async fn handle_info_command(
     }
 
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ContinuationAnchorParts {
-    task: Option<String>,
-    direction: Option<String>,
-}
-
-fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
-    let mut task = None;
-    let mut direction = None;
-    let mut summary_lines = Vec::new();
-    let mut in_summary = false;
-
-    for line in anchor
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if let Some(rest) = line.strip_prefix("Latest user task: ") {
-            task = Some(rest.to_string());
-            in_summary = false;
-        } else if let Some(rest) = line.strip_prefix("Latest assistant direction: ") {
-            direction = Some(rest.to_string());
-            in_summary = false;
-        } else if line == "Latest assistant summary:" {
-            in_summary = true;
-        } else if line.starts_with("Recent tools: ") || line.starts_with("Artifact: ") {
-            in_summary = false;
-        } else if in_summary {
-            summary_lines.push(line.to_string());
-        }
-    }
-
-    if direction.is_none() && !summary_lines.is_empty() {
-        direction = Some(summary_lines.join(" "));
-    }
-
-    ContinuationAnchorParts { task, direction }
 }
 
 fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace) {
@@ -2642,36 +2603,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_continuation_anchor_extracts_task_and_direction() {
-        let parsed = parse_continuation_anchor(
+    fn continuation_anchor_extracts_task_and_direction() {
+        let parsed = ContinuationAnchor::from_rendered(
             "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path",
         );
-        assert_eq!(parsed.task.as_deref(), Some("debug Chinese input drops"));
         assert_eq!(
-            parsed.direction.as_deref(),
+            parsed.latest_user_task.as_deref(),
+            Some("debug Chinese input drops")
+        );
+        assert_eq!(
+            parsed.assistant_direction.as_deref(),
             Some("inspect prompt redraw path")
         );
     }
 
     #[test]
-    fn parse_continuation_anchor_handles_task_only() {
-        let parsed = parse_continuation_anchor("Latest user task: fix auth");
-        assert_eq!(parsed.task.as_deref(), Some("fix auth"));
-        assert_eq!(parsed.direction, None);
+    fn continuation_anchor_handles_task_only() {
+        let parsed = ContinuationAnchor::from_rendered("Latest user task: fix auth");
+        assert_eq!(parsed.latest_user_task.as_deref(), Some("fix auth"));
+        assert_eq!(parsed.assistant_direction, None);
     }
 
     #[test]
-    fn parse_continuation_anchor_reads_multiline_summary_format() {
-        let parsed = parse_continuation_anchor(
+    fn continuation_anchor_reads_multiline_summary_format() {
+        let parsed = ContinuationAnchor::from_rendered(
             "Latest user task: review commit aa1f419b\n\
              Latest assistant summary:\n\
              ## Review\n\
              P5 still blocks large merge commits.\n\
              Recent tools: read_file, bash",
         );
-        assert_eq!(parsed.task.as_deref(), Some("review commit aa1f419b"));
         assert_eq!(
-            parsed.direction.as_deref(),
+            parsed.latest_user_task.as_deref(),
+            Some("review commit aa1f419b")
+        );
+        assert_eq!(
+            parsed.assistant_direction.as_deref(),
             Some("## Review P5 still blocks large merge commits.")
         );
     }

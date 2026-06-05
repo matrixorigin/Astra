@@ -414,6 +414,7 @@ pub(crate) async fn handle_task_command(
                     token: &token_str,
                     auth_profile: bg_profile.as_deref(),
                     message: &prompt,
+                    semantic_query_override: None,
                     session_id: bg_session_id.as_deref(),
                     model: bg_model.as_deref(),
                     provider: None,

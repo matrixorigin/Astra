@@ -1026,7 +1026,12 @@ mod tests {
         let stored = persist_remote_workspace(&ws, "user-1", &store)
             .await
             .unwrap();
-        let seen = store.seen.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("captured record");
+        let seen = store
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("captured record");
 
         assert_eq!(seen.artifact_kind, WORKSPACE_METADATA_ARTIFACT_KIND);
         assert_eq!(seen.turn, Some(1));

@@ -411,39 +411,7 @@ impl ObservabilitySession {
     ///
     /// Heuristic detection of correction phrases that indicate drift.
     pub fn detect_correction_signal(&mut self, query: &str) -> bool {
-        let query_lower = query.to_lowercase();
-        let correction_patterns = [
-            "no,",
-            "no i",
-            "that's wrong",
-            "that's not",
-            "i meant",
-            "i mean",
-            "not that",
-            "wrong,",
-            "wrong.",
-            "incorrect",
-            "actually,",
-            "actually i",
-            "instead,",
-            "forget that",
-            "ignore that",
-            "let me clarify",
-            "to clarify",
-            "what i want",
-            "wait,",
-            "hold on",
-            "stop,",
-            "不对",
-            "错了",
-            "不是这样",
-            "我的意思是",
-            "我是说",
-            "等等",
-            "停一下",
-        ];
-
-        let is_correction = correction_patterns.iter().any(|p| query_lower.contains(p));
+        let is_correction = astra_turn_core::input_classifier::is_correction_signal(query);
 
         if is_correction {
             self.record_user_correction();

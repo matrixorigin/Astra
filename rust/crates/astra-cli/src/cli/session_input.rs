@@ -1,44 +1,52 @@
 use super::*;
-use astra_turn_core::chat_turn_heuristics::is_short_continuation_prompt;
+use astra_turn_core::input_classifier;
 
-/// Correction phrase patterns that indicate user is redirecting/correcting.
-const CORRECTION_PATTERNS: &[&str] = &[
-    "no,",
-    "no i",
-    "that's wrong",
-    "that's not",
-    "i meant",
-    "i mean",
-    "not that",
-    "wrong,",
-    "wrong.",
-    "incorrect",
-    "actually,",
-    "actually i",
-    "instead,",
-    "forget that",
-    "ignore that",
-    "let me clarify",
-    "to clarify",
-    "what i want",
-    "wait,",
-    "hold on",
-    "stop,",
-    "不对",
-    "错了",
-    "不是这样",
-    "我的意思是",
-    "我是说",
-    "等等",
-    "停一下",
-];
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveTaskAttachment {
+    pub anchor: ContinuationAnchor,
+    pub followup: String,
+}
+
+impl ActiveTaskAttachment {
+    pub(crate) fn render(&self, effective_line: &str) -> String {
+        let task_board_reanchor = if self.anchor.has_active_task_board() {
+            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, set the current task to in_progress before doing the work, and update statuses as tasks complete.\n"
+        } else {
+            ""
+        };
+        format!(
+            "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+{task_board_reanchor}\
+{}\n\n[User follow-up]\n{effective_line}",
+            self.anchor.text
+        )
+    }
+
+    pub(crate) fn semantic_query(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(task) = self.anchor.latest_user_task.as_deref() {
+            parts.push(format!("Task: {task}"));
+        }
+        if !self.anchor.active_task_board.is_empty() {
+            parts.push(format!(
+                "Active tasks: {}",
+                self.anchor.active_task_board.join(" | ")
+            ));
+        }
+        if let Some(direction) = self.anchor.assistant_direction.as_deref() {
+            parts.push(format!("Assistant summary: {direction}"));
+        }
+        parts.push(format!("Follow-up: {}", self.followup.trim()));
+        parts.join("\n")
+    }
+}
 
 /// Detect if a user message appears to be a correction/redirection.
 pub(crate) fn detect_correction_signal(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    CORRECTION_PATTERNS
-        .iter()
-        .any(|pattern| lower.contains(pattern))
+    input_classifier::is_correction_signal(message)
 }
 
 pub(crate) fn apply_resume_context(
@@ -112,10 +120,25 @@ pub(crate) async fn finalize_effective_line(
     apply_resume_context(effective_line, resume_guidance)
 }
 
-pub(crate) fn build_effective_line(
+pub(crate) fn active_task_attachment(
+    line: &str,
+    state: &SessionState,
+) -> Option<ActiveTaskAttachment> {
+    let anchor = state
+        .continuation_anchor
+        .clone()
+        .filter(|_| is_low_information_followup(line))?;
+    Some(ActiveTaskAttachment {
+        anchor,
+        followup: line.to_string(),
+    })
+}
+
+pub(crate) fn build_effective_line_with_attachment(
     line: &str,
     state: &SessionState,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+    attachment: Option<&ActiveTaskAttachment>,
 ) -> String {
     let mut effective_line = if let Some(skill_dev) = state.skill_dev.as_ref() {
         let skill_md = skill_dev.dir.join("SKILL.md");
@@ -161,100 +184,24 @@ pub(crate) fn build_effective_line(
         effective_line = format!("{block}\n\n{effective_line}");
     }
 
-    if let Some(anchor) = state
-        .continuation_anchor
-        .as_deref()
-        .filter(|_| is_low_information_followup(line))
-    {
-        let task_board_reanchor = if anchor.contains("Active task board:") {
-            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, set the current task to in_progress before doing the work, and update statuses as tasks complete.\n"
-        } else {
-            ""
-        };
-        effective_line = format!(
-            "[Active task attachment]\n\
-Resume the active task/thread below unless the user explicitly changes topic.\n\
-Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
-If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-{task_board_reanchor}\
-{anchor}\n\n[User follow-up]\n{effective_line}"
-        );
+    if let Some(attachment) = attachment {
+        effective_line = attachment.render(&effective_line);
     }
 
     effective_line
 }
 
-fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| haystack.contains(token))
+pub(crate) fn build_effective_line(
+    line: &str,
+    state: &SessionState,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+) -> String {
+    let attachment = active_task_attachment(line, state);
+    build_effective_line_with_attachment(line, state, ui, attachment.as_ref())
 }
 
 pub(crate) fn is_low_information_followup(line: &str) -> bool {
-    if is_short_continuation_prompt(line) {
-        return true;
-    }
-
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 32 {
-        return false;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let has_action = contains_any_token(
-        &lower,
-        &[
-            "fix",
-            "patch",
-            "repair",
-            "implement",
-            "apply",
-            "edit",
-            "update",
-            "test",
-            "verify",
-            "run",
-            "commit",
-            "push",
-            "continue",
-            "resume",
-            "retry",
-        ],
-    ) || contains_any_token(
-        trimmed,
-        &[
-            "修复",
-            "修一下",
-            "改一下",
-            "改下",
-            "处理一下",
-            "处理下",
-            "优化一下",
-            "优化下",
-            "测一下",
-            "测试一下",
-            "验证一下",
-            "提交一下",
-            "推一下",
-            "继续",
-            "重试",
-        ],
-    );
-    if !has_action {
-        return false;
-    }
-
-    let has_deictic_reference =
-        contains_any_token(&lower, &["this", "it", "that", "them", "here", "there"])
-            || contains_any_token(trimmed, &["这", "这个", "这里", "它", "这些", "那个"]);
-    let has_question_shape =
-        trimmed.ends_with('?') || trimmed.ends_with('？') || trimmed.ends_with('吗');
-    let token_count = trimmed
-        .split(|c: char| c.is_whitespace() || c == ',' || c == '，')
-        .filter(|part| !part.is_empty())
-        .count();
-    let short_ascii_action =
-        (trimmed.is_ascii() || trimmed.contains(char::is_whitespace)) && token_count <= 3;
-
-    has_deictic_reference || has_question_shape || short_ascii_action
+    input_classifier::is_low_information_followup(line)
 }
 
 #[cfg(test)]
@@ -273,7 +220,8 @@ mod tests {
         let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             ),
             ..SessionState::default()
         };
@@ -302,7 +250,7 @@ mod tests {
         let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
-                    .to_string(),
+                    .into(),
             ),
             ..SessionState::default()
         };
@@ -319,8 +267,7 @@ mod tests {
     fn build_effective_line_reanchors_generic_followup_to_task_board() {
         let state = SessionState {
             continuation_anchor: Some(
-                "Latest user task: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD"
-                    .to_string(),
+                "Latest user task: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD".into(),
             ),
             ..SessionState::default()
         };
@@ -339,7 +286,7 @@ mod tests {
     #[test]
     fn build_effective_line_leaves_normal_prompt_untouched() {
         let state = SessionState {
-            continuation_anchor: Some("Latest user task: debug Chinese input drops".to_string()),
+            continuation_anchor: Some("Latest user task: debug Chinese input drops".into()),
             ..SessionState::default()
         };
 
@@ -514,7 +461,7 @@ mod tests {
                 dir: skill_dir,
             }),
             active_system_skills: vec![prompts::builtin_concise_skill()],
-            continuation_anchor: Some("Previous task: fix auth".to_string()),
+            continuation_anchor: Some("Previous task: fix auth".into()),
             ..SessionState::default()
         };
 

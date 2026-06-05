@@ -4,7 +4,6 @@
 //! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
 //! `fetch_chat_turn_sse` for use by [`crate::cli_loop_host::CliAgenticLoopHost`].
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -111,91 +110,8 @@ fn message_has_tool_calls(m: &Value) -> bool {
         .is_some_and(|calls| !calls.is_empty())
 }
 
-fn semantic_query_from_message(message: &str) -> Cow<'_, str> {
-    let trimmed = message.trim();
-    if !trimmed.starts_with("[Active task attachment]") {
-        return Cow::Borrowed(message);
-    }
-
-    let mut latest_task = None;
-    let mut active_tasks = Vec::new();
-    let mut assistant_summary = Vec::new();
-    let mut followup = Vec::new();
-    let mut in_active_tasks = false;
-    let mut in_summary = false;
-    let mut in_followup = false;
-
-    for line in trimmed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if let Some(rest) = line.strip_prefix("Latest user task: ") {
-            latest_task = Some(rest.to_string());
-            in_active_tasks = false;
-            in_summary = false;
-            in_followup = false;
-            continue;
-        }
-        if line == "Active task board:" {
-            in_active_tasks = true;
-            in_summary = false;
-            in_followup = false;
-            continue;
-        }
-        if line == "Latest assistant summary:" {
-            in_active_tasks = false;
-            in_summary = true;
-            in_followup = false;
-            continue;
-        }
-        if line == "[User follow-up]" {
-            in_active_tasks = false;
-            in_summary = false;
-            in_followup = true;
-            continue;
-        }
-        if line.starts_with("Recent tools: ") || line.starts_with("Artifact: ") {
-            in_active_tasks = false;
-            in_summary = false;
-            in_followup = false;
-            continue;
-        }
-        if in_active_tasks && active_tasks.len() < 3 {
-            active_tasks.push(line.trim_start_matches("- ").to_string());
-        } else if in_summary && assistant_summary.len() < 3 {
-            assistant_summary.push(line.to_string());
-        } else if in_followup {
-            followup.push(line.to_string());
-        }
-    }
-
-    let mut parts = Vec::new();
-    if let Some(task) = latest_task {
-        parts.push(format!("Task: {task}"));
-    }
-    if !active_tasks.is_empty() {
-        parts.push(format!("Active tasks: {}", active_tasks.join(" | ")));
-    }
-    if !assistant_summary.is_empty() {
-        parts.push(format!(
-            "Assistant summary: {}",
-            assistant_summary.join(" ")
-        ));
-    }
-    if !followup.is_empty() {
-        parts.push(format!("Follow-up: {}", followup.join(" ")));
-    }
-
-    if parts.is_empty() {
-        Cow::Borrowed(message)
-    } else {
-        Cow::Owned(parts.join("\n"))
-    }
-}
-
-fn should_skip_memory_boost(message: &str, history: &[(String, String)]) -> bool {
-    !history.is_empty() && matches!(semantic_query_from_message(message), Cow::Owned(_))
+fn should_skip_memory_boost(has_attachment_override: bool, history: &[(String, String)]) -> bool {
+    !history.is_empty() && has_attachment_override
 }
 
 fn retained_history_messages(messages: &[Value]) -> &[Value] {
@@ -275,6 +191,7 @@ struct PrepareChatTurnRequest<'a> {
     explain: AgenticChatExplainFlags,
     project_root: &'a Path,
     message: &'a str,
+    semantic_query_override: Option<&'a str>,
     history: &'a [(String, String)],
     recent_tools: &'a [String],
     executor: Arc<ToolExecutor>,
@@ -441,13 +358,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         budget_pressure_for_chat_turn(ctx.messages, requested_model, schema_tokens as usize)
     };
 
-    let semantic_query = semantic_query_from_message(ctx.message);
-    let semantic_query_str = semantic_query.as_ref();
+    let semantic_query_str = ctx.semantic_query_override.unwrap_or(ctx.message);
     let mut boost_terms =
         astra_turn_core::retrieval::extract_boost_terms_from_pairs(ctx.history, semantic_query_str);
     let mut memoria_insights_text: Option<String> = None;
     {
-        if should_skip_memory_boost(ctx.message, ctx.history) {
+        if should_skip_memory_boost(ctx.semantic_query_override.is_some(), ctx.history) {
             if let Some(collector) = ctx.telem.trace_collector {
                 collector.record_memory_retrieval(semantic_query_str, 0, &[], 0);
             }
@@ -962,6 +878,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub term_width: usize,
     pub render_policy: RenderPolicy,
     pub message: &'a str,
+    pub semantic_query_override: Option<&'a str>,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
     pub project_root: &'a Path,
@@ -1166,6 +1083,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         observability_hub,
         incremental_state,
         append_system_prompt,
+        semantic_query_override,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -1188,6 +1106,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             }),
             project_root,
             message,
+            semantic_query_override,
             history,
             recent_tools,
             executor: Arc::clone(&executor),
@@ -1299,8 +1218,7 @@ mod tests {
     use super::{
         PrepareChatTurnRequest, PrepareTurnTelemetry, build_retained_history_turns,
         inject_bridge_turn_identity, inject_runtime_turn_overrides, msg_content,
-        prepare_chat_turn_payload, retained_history_messages, semantic_query_from_message,
-        should_skip_memory_boost,
+        prepare_chat_turn_payload, retained_history_messages, should_skip_memory_boost,
     };
     use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
@@ -1428,44 +1346,14 @@ mod tests {
     }
 
     #[test]
-    fn semantic_query_from_attachment_compacts_wrapper_text() {
-        let message = "[Active task attachment]\n\
-Resume the active task/thread below unless the user explicitly changes topic.\n\
-Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
-If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
-Latest assistant summary:\n\
-## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
-Two independent fixes in one commit. Let me review each.\n\
-P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
-[User follow-up]\n修复?";
-        let semantic = semantic_query_from_message(message);
-        let semantic = semantic.as_ref();
-
-        assert!(semantic.contains("Task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b"));
-        assert!(semantic.contains("Assistant summary: ## Review: `aa1f419b`"));
-        assert!(semantic.contains("Follow-up: 修复?"));
-        assert!(!semantic.contains("[Active task attachment]"));
-        assert!(!semantic.contains("Treat brief follow-ups"));
-    }
-
-    #[test]
-    fn plain_message_keeps_borrowed_semantic_query() {
-        let semantic = semantic_query_from_message("fix the timeout path");
-        assert!(matches!(semantic, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(semantic.as_ref(), "fix the timeout path");
-    }
-
-    #[test]
     fn active_task_attachment_skips_memory_boost_once_history_exists() {
         let history = vec![(
             "review 这个: aa1f419b".to_string(),
             "Need to fix timeout.".to_string(),
         )];
-        let attachment = "[Active task attachment]\nLatest user task: review 这个: aa1f419b\nLatest assistant summary:\nNeed to fix timeout.\n\n[User follow-up]\n修复?";
-        assert!(should_skip_memory_boost(attachment, &history));
-        assert!(!should_skip_memory_boost(attachment, &[]));
-        assert!(!should_skip_memory_boost("fix the timeout path", &history));
+        assert!(should_skip_memory_boost(true, &history));
+        assert!(!should_skip_memory_boost(true, &[]));
+        assert!(!should_skip_memory_boost(false, &history));
     }
 
     #[test]
@@ -1634,6 +1522,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
+            semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -1754,6 +1643,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
+            semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -1817,6 +1707,111 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
     }
 
     #[tokio::test]
+    async fn prepare_chat_turn_payload_prefers_structured_attachment_override() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+            turn::turn_trace_collector::TurnTraceCollector,
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("read_file"), schema("write_file")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(2);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let attachment_message = "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+Latest user task: review timeout handling\n\n\
+[User follow-up]\n修复?";
+        let messages = vec![json!({"role": "user", "content": attachment_message})];
+        let history = vec![(
+            "review timeout handling".to_string(),
+            "Need a fix.".to_string(),
+        )];
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let tool_results = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+        let trace_collector = TurnTraceCollector::new("turn-1", "session-1");
+        let semantic_query_override =
+            "Task: review timeout handling\nAssistant summary: Need a fix.\nFollow-up: 修复?";
+
+        let _payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: attachment_message,
+            semantic_query_override: Some(semantic_query_override),
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: Some(&trace_collector),
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let trace = trace_collector.finalize();
+        assert_eq!(trace.memory.query, semantic_query_override);
+        assert!(!trace.memory.query.contains("[Active task attachment]"));
+    }
+
+    #[tokio::test]
     async fn prepare_chat_turn_payload_applies_pending_round_tool_boost() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
@@ -1868,6 +1863,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "implement the approved plan",
+            semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -1971,6 +1967,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
+            semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -2034,6 +2031,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
+            semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,

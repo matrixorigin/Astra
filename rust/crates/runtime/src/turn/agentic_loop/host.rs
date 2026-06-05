@@ -59,6 +59,7 @@ use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use astra_config::user_profile::TurnIntent;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -74,6 +75,8 @@ use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
 use tokio_util::sync::CancellationToken;
+
+use crate::turn::agentic::turn_intent::infer_turn_intent;
 
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
 /// later reads stay monotonic even if `SystemTime` jumps backwards.
@@ -167,6 +170,15 @@ pub trait AgenticLoopHost: Send {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError>;
+
+    /// Optional semantic judge for the current user turn.
+    ///
+    /// The default implementation provides a deterministic baseline from the
+    /// current message plus `TaskExecutionProfile`; hosts can override it with a
+    /// higher-fidelity classifier if they have one.
+    async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
+        infer_turn_intent(&state.message, state.task_profile)
+    }
 
     /// Whether the host already injects round budget guidance into the system
     /// prompt during `execute_turn`.  When true, the agentic loop skips its
@@ -1615,9 +1627,9 @@ fn apply_harness_pause_recovery_threshold(
 }
 
 pub(crate) use super::super::agentic::adaptive_tuning::{
-    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
-    apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
-    should_emit_adaptive_scenario_event,
+    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile_with_intent,
+    apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
+    record_loop_completion_feedback, should_emit_adaptive_scenario_event,
 };
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;
@@ -2286,6 +2298,7 @@ pub(crate) mod tests {
         pub(crate) injected_schemas: Vec<Value>,
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
+        pub(crate) turn_intent: Option<TurnIntent>,
         /// PR 5a test observer: number of times the turn loop has
         /// invoked the parent-turn-completed hook. Each entry is the
         /// value of `state.current_run_id` at hook time so tests can
@@ -2307,6 +2320,7 @@ pub(crate) mod tests {
                 injected_schemas: Vec::new(),
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
+                turn_intent: None,
                 turn_completed_run_ids: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
             }
@@ -2319,6 +2333,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_interaction_mode(mut self, mode: TurnInteractionMode) -> Self {
             self.interaction_mode = mode;
+            self
+        }
+
+        pub(crate) fn with_turn_intent(mut self, intent: TurnIntent) -> Self {
+            self.turn_intent = Some(intent);
             self
         }
 
@@ -2343,6 +2362,12 @@ pub(crate) mod tests {
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
             Ok(result)
+        }
+
+        async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
+            self.turn_intent
+                .clone()
+                .or_else(|| infer_turn_intent(&state.message, state.task_profile))
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -6461,7 +6486,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     // ── Auto-tuning integration tests ───────────────────────────────────────
 
-    fn make_hub() -> std::sync::Arc<crate::observability::ObservabilityHub> {
+    pub(crate) fn make_hub() -> std::sync::Arc<crate::observability::ObservabilityHub> {
         std::sync::Arc::new(crate::observability::ObservabilityHub::new())
     }
 
@@ -6482,7 +6507,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    fn make_session()
+    pub(crate) fn make_session()
     -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
@@ -6870,7 +6895,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             }
         }
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let guard = session.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
@@ -6915,7 +6940,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             scenario_before = guard.profile.current_scenario;
         }
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let guard = session.read().unwrap_or_else(|e| e.into_inner());
         // Flag must be consumed (one-turn suppression only).
@@ -6953,7 +6978,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
 
         // First call: suppressed (flag was true) — scenario unchanged.
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
         {
             let guard = session.read().unwrap_or_else(|e| e.into_inner());
             assert!(!guard.previous_turn_user_cancelled);
@@ -6961,7 +6986,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
 
         // Second call: normal detection path runs.
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
         let guard = session.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             guard.profile.current_scenario,
@@ -6984,7 +7009,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             guard.config.token_budget.max_turn_input_tokens = 64_000;
         }
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         assert!(state.tactical_adapter.is_some());
         assert!(state.step_signal_collector.is_some());
@@ -7012,7 +7037,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             guard.config.context_window.adaptive = false;
         }
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         assert!(state.tactical_adapter.is_none());
         assert!(state.step_signal_collector.is_none());
@@ -7233,7 +7258,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             }
         }
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let guard = session.read().unwrap();
         // CodeReview scenario should set memory_top_k=7 and verification_strictness=0.7
@@ -7269,7 +7294,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 guard.record_query("fix the crash in the parser module");
             }
         }
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let scenario_after_first = {
             let guard = session.read().unwrap();
@@ -7287,7 +7312,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 guard.record_query("review the PR diff and approve the change");
             }
         }
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let scenario_after_second = {
             let guard = session.read().unwrap();
@@ -7320,7 +7345,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 guard.record_query("fix the crash in the parser module");
             }
         }
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         // Second call at turn 10 (well past cooldown of 5): switch to CodeReview
         state.message = "review the PR diff and approve the change".into();
@@ -7333,7 +7358,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 guard.record_query("review the PR diff and approve the change");
             }
         }
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let guard = session.read().unwrap();
         // After cooldown expires, scenario should be allowed to change
@@ -7454,7 +7479,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             }
         }
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         // Verify a scenario was detected (journal event emission is best-effort
         // in tests since we don't have a real journal backend, but the function
@@ -7563,7 +7588,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.recent_tools = tools.iter().map(|s| s.to_string()).collect();
 
         // Phase 1: scenario routing
-        apply_adaptive_execution_profile(state);
+        apply_adaptive_execution_profile_with_intent(state, None);
 
         // Phase 2: micro-adaptation
         apply_per_turn_adaptation(state, tokens_used);
@@ -7779,7 +7804,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             state.message = query.into();
             state.recent_tools = vec!["view".into()];
 
-            apply_adaptive_execution_profile(&mut state);
+            apply_adaptive_execution_profile_with_intent(&mut state, None);
 
             let current = {
                 let guard = session.read().unwrap();
@@ -8392,7 +8417,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(lowered_tool_budget < 1100);
         assert!(lowered_turn_budget < 100_000);
 
-        apply_adaptive_execution_profile(&mut state);
+        apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let guard = session.read().unwrap();
         assert_eq!(

@@ -30,10 +30,19 @@ pub(crate) async fn execute_stream_turn(
     token: &str,
     message: &str,
     session_id: Option<&str>,
+    semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
     let prepared = prepare_turn_stream_state(state).await;
-    let params =
-        build_turn_stream_params(state, api, profile, token, message, session_id, &prepared);
+    let params = build_turn_stream_params(
+        state,
+        api,
+        profile,
+        token,
+        message,
+        session_id,
+        semantic_query_override,
+        &prepared,
+    );
     let (result, was_user_cancel) = await_stream_with_interrupts(params, &prepared).await;
 
     if was_user_cancel {
@@ -68,6 +77,7 @@ fn build_turn_stream_params<'a>(
     token: &'a str,
     message: &'a str,
     session_id: Option<&'a str>,
+    semantic_query_override: Option<&'a str>,
     prepared: &'a PreparedTurnStreamState,
 ) -> ChatTurnParams<'a> {
     ChatTurnParams {
@@ -75,6 +85,7 @@ fn build_turn_stream_params<'a>(
         token,
         auth_profile: profile,
         message,
+        semantic_query_override,
         session_id,
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
@@ -234,6 +245,7 @@ mod tests {
             "token",
             "continue",
             Some("sess-1"),
+            None,
             &prepared,
         );
 

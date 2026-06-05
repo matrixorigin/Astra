@@ -130,7 +130,8 @@ mod tests {
             continuation_anchor: Some(
                 "Latest user task: debug lifetime in tokio::spawn\n\
                  Latest assistant direction: add 'static bound to closure"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             ),
             history,
             ..SessionState::default()

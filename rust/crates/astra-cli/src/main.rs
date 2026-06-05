@@ -28,8 +28,8 @@ mod skill_instructions;
 mod test_utils;
 
 mod cli;
-mod lock_recovery;
 mod explain_dag;
+mod lock_recovery;
 
 mod diff_utils;
 mod sandbox_retry;

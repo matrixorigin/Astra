@@ -187,10 +187,10 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
 }
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
+use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
 use worktree::detect_git_remote_repos;
-use crate::lock_recovery::LockRecovery;
 #[cfg(test)]
 use worktree::extract_github_owner_repo;
 #[path = "edge_tools/memoria.rs"]

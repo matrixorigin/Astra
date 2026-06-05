@@ -14,7 +14,7 @@
 #[cfg(test)]
 use crate::cli::session_task_surface::session_task_is_completed;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -255,11 +255,11 @@ impl TaskStore for HttpTaskStore {
 mod wiring_e2e {
     use super::*;
     use crate::lock_recovery::LockRecovery;
-    use crate::tui::task_board_observer::{TaskBoardObserver, COMPLETED_TASK_TTL};
+    use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
     use astra_tools::task_mgmt::{SessionTask, TaskStore};
     use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -359,11 +359,7 @@ mod wiring_e2e {
             pump();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if cond() {
-            Ok(start.elapsed())
-        } else {
-            Err(())
-        }
+        if cond() { Ok(start.elapsed()) } else { Err(()) }
     }
 
     /// REGRESSION: `route_task_action` POSTs to the cloud on a `task.create`,

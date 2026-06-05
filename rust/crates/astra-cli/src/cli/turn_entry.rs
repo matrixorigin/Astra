@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use super::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
 use super::session_input::{
-    build_effective_line, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
+    active_task_attachment, build_effective_line_with_attachment,
+    clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
 };
 use super::turn_retry::settle_turn_attempt;
 use super::turn_settlement::TurnDispatch;
@@ -21,9 +22,19 @@ async fn run_chat_turn(
     token: &str,
     message: &str,
     session_id: Option<&str>,
+    semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
     prepare_turn_adaptation(state, api, token, message).await;
-    let attempt = execute_stream_turn(state, api, profile, token, message, session_id).await;
+    let attempt = execute_stream_turn(
+        state,
+        api,
+        profile,
+        token,
+        message,
+        session_id,
+        semantic_query_override,
+    )
+    .await;
     finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
     attempt
 }
@@ -35,9 +46,16 @@ fn run_chat_turn_boxed<'a>(
     token: &'a str,
     message: &'a str,
     session_id: Option<&'a str>,
+    semantic_query_override: Option<&'a str>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnAttempt> + 'a>> {
     Box::pin(run_chat_turn(
-        state, api, profile, token, message, session_id,
+        state,
+        api,
+        profile,
+        token,
+        message,
+        session_id,
+        semantic_query_override,
     ))
 }
 
@@ -112,14 +130,18 @@ pub(crate) async fn handle_chat_input_with_ui(
     }
 
     let resume_guidance = state.resume_guidance.take();
+    let active_attachment = active_task_attachment(&line, state);
     let effective_line = finalize_effective_line(
-        build_effective_line(&line, state, ui),
+        build_effective_line_with_attachment(&line, state, ui, active_attachment.as_ref()),
         resume_guidance,
         state,
     )
     .await;
     let turn_start = Instant::now();
     let session_id = state.session_id.clone();
+    let semantic_query_override = active_attachment
+        .as_ref()
+        .map(|attachment| attachment.semantic_query());
     let attempt = run_chat_turn(
         state,
         ctx.api,
@@ -127,6 +149,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         token,
         &effective_line,
         session_id.as_deref(),
+        semantic_query_override.as_deref(),
     )
     .await;
     let mut dispatch = TurnDispatch {
@@ -135,6 +158,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         effective_line: &effective_line,
         token,
         session_id: session_id.as_deref(),
+        semantic_query_override: semantic_query_override.as_deref(),
         turn_start,
         ui,
     };
@@ -160,6 +184,16 @@ mod tests {
                 && !pre_turn_gate.contains("is_low_information_followup(&line)")
                 && pre_turn_gate.contains("clear_pending_recovery_for_ordinary_chat_input(state);"),
             "ordinary chat input must not auto-restore pending recovery; resume is explicit only"
+        );
+    }
+
+    #[test]
+    fn retry_runner_keeps_semantic_query_override() {
+        let source = include_str!("turn_entry.rs");
+        assert!(
+            source.contains("settle_turn_attempt(")
+                && source.contains("semantic_query_override.as_deref(),"),
+            "retry path must preserve semantic_query_override instead of rebuilding it from wrapped prompt text"
         );
     }
 }

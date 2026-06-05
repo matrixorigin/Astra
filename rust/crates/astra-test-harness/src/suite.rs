@@ -844,7 +844,11 @@ mod tests {
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
         assert_eq!(report.passed(), 1);
-        assert_eq!(exec.calls.lock().unwrap_or_else(|e| e.into_inner()).len(), 0, "executor must not run");
+        assert_eq!(
+            exec.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            0,
+            "executor must not run"
+        );
         assert!(
             report.runs[0]
                 .outcome
@@ -1160,7 +1164,10 @@ mod tests {
             Some(crate::classify::FailureClass::PlatformSetupFailed)
         );
         assert!(
-            exec.calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            exec.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
             "executor must NOT be called when setup fails"
         );
     }
@@ -1325,7 +1332,10 @@ mod tests {
                 _m: Option<&str>,
                 _o: &RunOutcome,
             ) -> Result<crate::judger::JudgerScore, String> {
-                self.questions.lock().unwrap_or_else(|e| e.into_inner()).push(q.to_string());
+                self.questions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(q.to_string());
                 Ok(crate::judger::JudgerScore {
                     score: 1.0,
                     rationale: "ok".into(),

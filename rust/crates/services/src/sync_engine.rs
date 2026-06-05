@@ -1572,12 +1572,12 @@ mod tests {
                 .as_slice(),
             &[ConflictStrategy::UnionMerge]
         );
-        assert!(orch
-            .event_log()
-            .iter()
-            .any(
-                |event| matches!(event.operation, SyncOperation::ConflictResolve) && event.success
-            ));
+        assert!(
+            orch.event_log().iter().any(|event| matches!(
+                event.operation,
+                SyncOperation::ConflictResolve
+            ) && event.success)
+        );
     }
 
     struct SharedMockAdapter(Arc<MockAdapter>);

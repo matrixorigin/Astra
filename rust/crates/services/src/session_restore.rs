@@ -648,8 +648,28 @@ impl HybridRestoreService {
         use sqlx::Row;
         let mut messages = Vec::new();
         for row in rows {
-            let role = row.try_get::<String, _>("role").unwrap_or_default();
-            let content = row.try_get::<String, _>("content").unwrap_or_default();
+            let role = match row.try_get::<String, _>("role") {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        %session_id,
+                        error = %e,
+                        "restore_cloud_transcript: failed to read 'role' column — possible schema drift"
+                    );
+                    continue;
+                }
+            };
+            let content = match row.try_get::<String, _>("content") {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        %session_id,
+                        error = %e,
+                        "restore_cloud_transcript: failed to read 'content' column — possible schema drift"
+                    );
+                    continue;
+                }
+            };
             if content.trim().is_empty() {
                 continue;
             }

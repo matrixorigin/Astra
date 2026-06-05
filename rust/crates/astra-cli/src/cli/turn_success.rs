@@ -2,11 +2,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use astra_turn_core::chat_turn_heuristics::looks_like_live_query_with_context;
+use astra_turn_core::conversation_log::manager::CslManager;
 
 #[cfg(test)]
 use super::session_improvement;
 use super::session_projection::build_continuation_anchor;
 use super::session_startup;
+use super::turn_commit::TurnCommitOutcome;
 use super::turn_commit::commit_turn_journal_workspace_and_sidecars;
 use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
 use super::turn_post_commit::{extract_csl_fields_from_result, run_turn_post_commit_tasks};
@@ -26,7 +28,7 @@ pub(crate) fn apply_turn_success(
     result: StreamResult,
     turn_start: Instant,
 ) {
-    apply_turn_success_sync(state, profile, line, result, turn_start);
+    let _ = apply_turn_success_sync(state, profile, line, result, turn_start);
     session_improvement::check_skill_improvement_sync(state);
 }
 
@@ -41,20 +43,25 @@ pub(crate) async fn apply_turn_success_async(
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
-    apply_turn_success_sync(state, profile, line, result, turn_start);
-    run_turn_post_commit_tasks(
-        state,
-        api,
-        profile,
-        final_messages,
-        csl_checkpoint_fields,
-        turn_start,
-        ui,
-    )
-    .await;
+    let commit_outcome = apply_turn_success_sync(state, profile, line, result, turn_start);
+    if commit_outcome.turn_persisted {
+        run_turn_post_commit_tasks(
+            state,
+            api,
+            profile,
+            final_messages,
+            csl_checkpoint_fields,
+            turn_start,
+            ui,
+        )
+        .await;
+    }
 }
 
 struct TurnSuccessLiveSnapshot {
+    session_id: Option<String>,
+    run_id: Option<String>,
+    had_journal: bool,
     turn: u32,
     total_prompt_tokens: u64,
     total_completion_tokens: u64,
@@ -62,7 +69,7 @@ struct TurnSuccessLiveSnapshot {
     total_cache_creation_tokens: u64,
     total_session_cost: f64,
     last_response: Option<String>,
-    continuation_anchor: Option<String>,
+    continuation_anchor: Option<ContinuationAnchor>,
     pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
     redo_stack: Vec<(String, String, u32)>,
     history: Vec<(String, String)>,
@@ -73,12 +80,20 @@ struct TurnSuccessLiveSnapshot {
     latest_context_assembly_trace:
         Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
     last_turn_event: Option<session_journal::JournalEvent>,
+    observability_session: Option<
+        std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
+    >,
+    pending_adaptive_state: Option<crate::cli::session_state::PersistedAdaptiveState>,
+    last_turn_interrupted: bool,
     session_persistence_error: Option<String>,
 }
 
 impl TurnSuccessLiveSnapshot {
     fn capture(state: &SessionState) -> Self {
         Self {
+            session_id: state.session_id.clone(),
+            run_id: state.run_id.clone(),
+            had_journal: state.journal.is_some(),
             turn: state.turn,
             total_prompt_tokens: state.total_prompt_tokens,
             total_completion_tokens: state.total_completion_tokens,
@@ -96,11 +111,25 @@ impl TurnSuccessLiveSnapshot {
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.clone(),
             latest_context_assembly_trace: state.latest_context_assembly_trace.clone(),
             last_turn_event: state.last_turn_event.clone(),
+            observability_session: state.observability_session.clone(),
+            pending_adaptive_state: state.pending_adaptive_state.clone(),
+            last_turn_interrupted: state.last_turn_interrupted,
             session_persistence_error: state.session_persistence_error.clone(),
         }
     }
 
     fn restore(self, state: &mut SessionState) {
+        state.journal = None;
+        match self.session_id.as_deref() {
+            Some(session_id) => {
+                state.set_session_id(session_id.to_string());
+                if self.had_journal {
+                    session_startup::attach_session_journal_pub(state, session_id);
+                }
+            }
+            None => state.clear_session_id(),
+        }
+        state.run_id = self.run_id;
         state.turn = self.turn;
         state.total_prompt_tokens = self.total_prompt_tokens;
         state.total_completion_tokens = self.total_completion_tokens;
@@ -118,8 +147,50 @@ impl TurnSuccessLiveSnapshot {
         state.latest_turn_quality_feedback = self.latest_turn_quality_feedback;
         state.latest_context_assembly_trace = self.latest_context_assembly_trace;
         state.last_turn_event = self.last_turn_event;
+        state.observability_session = self.observability_session;
+        state.pending_adaptive_state = self.pending_adaptive_state;
+        state.last_turn_interrupted = self.last_turn_interrupted;
         state.session_persistence_error = self.session_persistence_error;
     }
+}
+
+fn build_csl_manager(session_id: &str) -> Option<CslManager> {
+    let store = Arc::new(
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(
+            astra_services::session_journal::local_sessions_dir(),
+        ),
+    );
+    match CslManager::new(store, session_id.to_string(), Default::default()) {
+        Ok(manager) => Some(manager),
+        Err(error) => {
+            astra_core::agent_warn!("csl", "manager init failed: {error}");
+            None
+        }
+    }
+}
+
+fn initialize_post_commit_session_state(
+    state: &mut SessionState,
+    session_id: &str,
+    session_rebound: bool,
+) {
+    if session_rebound || state.csl_manager.is_none() {
+        state.csl_manager = build_csl_manager(session_id);
+    }
+}
+
+fn clear_rebound_observability_session(state: &mut SessionState) {
+    if let Some(session_id) = state.observability_session.as_ref().map(|session| {
+        session
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_id
+            .clone()
+    }) && let Some(hub) = &state.observability_hub
+    {
+        let _ = hub.end_session(&session_id);
+    }
+    state.observability_session = None;
 }
 
 fn apply_turn_success_sync(
@@ -128,51 +199,17 @@ fn apply_turn_success_sync(
     line: &str,
     result: StreamResult,
     turn_start: Instant,
-) {
+) -> TurnCommitOutcome {
     // Capture before session/turn mutation. If the primary turn event cannot
     // be persisted, this snapshot restores the live user-visible turn state.
     let live_snapshot = TurnSuccessLiveSnapshot::capture(state);
+    let result_session_id = result.session_id.clone();
+    let session_rebound = result_session_id.as_deref() != live_snapshot.session_id.as_deref();
 
-    if let Some(session_id) = result.session_id.as_deref() {
-        persist_profile_last_session_or_warn(
-            profile,
-            session_id,
-            "turn_success:apply_turn_success_sync",
-        );
-        session_startup::initialize_journal_pub(state, session_id);
+    if let Some(session_id) = result_session_id.as_deref() {
+        session_startup::attach_session_journal_pub(state, session_id);
         state.set_session_id(session_id.to_string());
         state.run_id = result.run_id.clone();
-
-        if state.csl_manager.is_none() {
-            let store = Arc::new(
-                astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                    astra_services::session_journal::local_sessions_dir(),
-                ),
-            );
-            state.csl_manager = match astra_turn_core::conversation_log::manager::CslManager::new(
-                store,
-                session_id.to_string(),
-                Default::default(),
-            ) {
-                Ok(manager) => Some(manager),
-                Err(error) => {
-                    astra_core::agent_warn!("csl", "manager init failed: {error}");
-                    None
-                }
-            };
-        }
-
-        if state.observability_session.is_none()
-            && let Some(hub) = &state.observability_hub
-        {
-            let user_id = state
-                .ingestion_user_id
-                .clone()
-                .unwrap_or_else(|| "anonymous".to_string());
-            let obs_session = hub.start_session(&user_id, session_id);
-            state.observability_session = Some(obs_session);
-            session_startup::apply_pending_adaptive_state(state);
-        }
     }
 
     state.turn += 1;
@@ -231,12 +268,26 @@ fn apply_turn_success_sync(
         turn_start,
     );
     if !commit_outcome.turn_persisted {
-        let persistence_error = commit_outcome.persistence_error;
+        let persistence_error = commit_outcome.persistence_error.clone();
         live_snapshot.restore(state);
         state.session_persistence_error = persistence_error;
-        return;
+        return commit_outcome;
     }
 
+    if let Some(session_id) = result_session_id.as_deref() {
+        persist_profile_last_session_or_warn(
+            profile,
+            session_id,
+            "turn_success:apply_turn_success_sync",
+        );
+        if session_rebound {
+            clear_rebound_observability_session(state);
+        }
+        session_startup::initialize_journal_pub(state, session_id);
+        initialize_post_commit_session_state(state, session_id, session_rebound);
+    }
+
+    state.last_turn_interrupted = false;
     print_turn_status_line(state, &result, turn_start);
     if state.tui_render_policy.is_none() {
         if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
@@ -256,11 +307,24 @@ fn apply_turn_success_sync(
             );
         }
     }
+
+    commit_outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct CollectingUi;
+
+    impl crate::cli::ui_adapter::ReplUiAdapter for CollectingUi {
+        fn show_error(&mut self, _msg: &str) {}
+        fn show_warning(&mut self, _msg: &str) {}
+        fn show_info(&mut self, _msg: &str) {}
+        fn show_status(&mut self, _msg: &str) {}
+        fn blank_line(&mut self) {}
+    }
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -376,7 +440,9 @@ mod tests {
         result.cache_creation_tokens = 19;
         result.tools_used = vec!["bash".into()];
 
-        apply_turn_success_sync(&mut state, None, "new question", result, Instant::now());
+        let outcome =
+            apply_turn_success_sync(&mut state, None, "new question", result, Instant::now());
+        assert!(!outcome.turn_persisted);
 
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 100);
@@ -397,5 +463,106 @@ mod tests {
                 .unwrap_or_default()
                 .contains("append turn event")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn apply_turn_success_async_rolls_back_first_turn_without_post_commit_side_effects() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("turn-success-first-turn-fail-{}", uuid::Uuid::new_v4());
+        let journal_path = session_journal::journal_file_path(&sid);
+        std::fs::create_dir_all(&journal_path).unwrap();
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut ui = CollectingUi;
+        let mut state = SessionState {
+            last_turn_interrupted: true,
+            observability_hub: Some(std::sync::Arc::new(
+                astra_runtime::observability::ObservabilityHub::new(),
+            )),
+            pending_adaptive_state: Some(PersistedAdaptiveState {
+                active_experiment_id: Some("exp-1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut result = stub_stream_result("new response");
+        result.session_id = Some(sid.clone());
+        result.run_id = Some("run-1".into());
+        result.final_messages = vec![serde_json::json!({"role": "assistant", "content": "done"})];
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "new question",
+            result,
+            Instant::now(),
+            &mut ui,
+        )
+        .await;
+
+        assert!(state.session_id.is_none());
+        assert!(state.run_id.is_none());
+        assert!(state.journal.is_none());
+        assert!(state.csl_manager.is_none());
+        assert!(state.observability_session.is_none());
+        assert!(state.last_turn_interrupted);
+        assert_eq!(state.task_manager.session_id(), "");
+        assert!(state.pending_adaptive_state.is_some());
+        assert!(
+            !crate::cli::session_recovery::csl::csl_log_path_for(&sid).exists(),
+            "post-commit CSL persistence must be skipped when the primary turn commit fails"
+        );
+        assert!(
+            state
+                .session_persistence_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("append turn event")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_rebinds_observability_session_through_hub() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
+        let pending = hub.start_session("user-1", "pending");
+        let mut state = SessionState {
+            ingestion_user_id: Some("user-1".into()),
+            observability_hub: Some(hub.clone()),
+            observability_session: Some(pending),
+            pending_adaptive_state: Some(PersistedAdaptiveState {
+                active_experiment_id: Some("exp-1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut result = stub_stream_result("done");
+        result.session_id = Some("sess-live".into());
+        result.run_id = Some("run-1".into());
+
+        let outcome = apply_turn_success_sync(&mut state, None, "continue", result, Instant::now());
+
+        assert!(outcome.turn_persisted);
+        assert_eq!(state.session_id.as_deref(), Some("sess-live"));
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .session_id
+                        .clone()
+                })
+                .as_deref(),
+            Some("sess-live")
+        );
+        assert!(hub.get_session("pending").is_none());
+        assert!(hub.get_session("sess-live").is_some());
+        assert!(state.pending_adaptive_state.is_none());
     }
 }

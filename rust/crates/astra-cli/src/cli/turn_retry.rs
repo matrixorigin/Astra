@@ -19,6 +19,7 @@ pub(crate) async fn settle_turn_attempt(
         &'a str,
         &'a str,
         Option<&'a str>,
+        Option<&'a str>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
@@ -57,6 +58,7 @@ async fn try_retry_after_session_not_found(
         &'a str,
         &'a str,
         Option<&'a str>,
+        Option<&'a str>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
@@ -77,6 +79,7 @@ async fn try_retry_after_session_not_found(
         dispatch.token,
         dispatch.effective_line,
         None,
+        dispatch.semantic_query_override,
     )
     .await;
     settle_retry_attempt(state, dispatch, retry).await;
@@ -93,6 +96,7 @@ async fn try_retry_after_auth_refresh(
         Option<&'a str>,
         &'a str,
         &'a str,
+        Option<&'a str>,
         Option<&'a str>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
@@ -112,6 +116,7 @@ async fn try_retry_after_auth_refresh(
         &new_token,
         dispatch.effective_line,
         dispatch.session_id,
+        dispatch.semantic_query_override,
     )
     .await;
     settle_retry_attempt(state, dispatch, retry).await;
@@ -211,6 +216,7 @@ mod tests {
             effective_line: "continue",
             token: "token",
             session_id: Some("sess-stale"),
+            semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
         };
@@ -219,7 +225,7 @@ mod tests {
             partial: crate::PartialTurnData::default(),
         })));
 
-        settle_turn_attempt(&mut state, &mut dispatch, attempt, |_, _, _, _, _, _| {
+        settle_turn_attempt(&mut state, &mut dispatch, attempt, |_, _, _, _, _, _, _| {
             Box::pin(async move {
                 TurnAttempt::Completed(Box::new(Ok(stub_stream_result("Recovered"))))
             })

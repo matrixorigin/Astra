@@ -51,8 +51,7 @@ fn bind_state_to_session(state: &mut crate::SessionState, profile: Option<&str>,
             "plan mode: failed to persist profile last_session_id"
         );
     }
-    state.task_manager.rebind(session_id);
-    state.session_id = Some(session_id.to_string());
+    state.set_session_id(session_id.to_string());
     if state.journal.is_none() {
         match session_journal::JournalWriter::new(session_id) {
             Ok(writer) => state.journal = Some(writer),
@@ -293,6 +292,7 @@ mod tests {
 
         assert_eq!(plan_id, "plan-1");
         assert_eq!(state.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(state.task_manager.session_id(), "sess-1");
         assert_eq!(
             state
                 .cloud_plan_mirror
@@ -338,6 +338,7 @@ mod tests {
 
         assert!(error.contains("503"), "got: {error}");
         assert_eq!(state.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(state.task_manager.session_id(), "sess-1");
         assert!(
             state.cloud_plan_mirror.is_none(),
             "failed plan create must not arm local mirror"

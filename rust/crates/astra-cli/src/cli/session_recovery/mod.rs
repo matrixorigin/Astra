@@ -1,62 +1,42 @@
 //! Session recovery: checkpoint, workspace, CSL, and I/O primitives.
 //! Sub-modules split by concern to keep files manageable.
 
+pub(crate) mod checkpoint;
+pub(crate) mod csl;
 pub(crate) mod io;
 pub(crate) mod workspace;
-pub(crate) mod csl;
-pub(crate) mod checkpoint;
 
 // Re-export public items from sub-modules
-pub(crate) use io::{
-    csl_log_path_for,
-    workspace_path_for,
-    composite_index_path_for,
-    workspace_lock_path_for,
-    RecoveryCheckpointRollback,
-    WorkspaceLockGuard,
-    with_workspace_lock,
-    append_rollback_error,
-    sync_parent_dir,
-    write_bytes_atomic,
-    read_optional_file_bytes,
-    restore_optional_file_bytes,
-};
-pub(crate) use csl::{
-    ensure_loaded_csl_state,
-    rebuild_csl_from_history,
-    write_full_csl_snapshot_atomic,
-};
-pub(crate) use workspace::{
-    fresh_workspace_metadata,
-    workspace_metadata_from_live_state_after_read_failure,
-    workspace_metadata_from_live_state,
-    persist_recovery_workspace_snapshot,
-    sync_plan_fields_to_workspace,
-    sync_session_state_to_workspace,
-    context_trace_signal_from_trace,
-    latest_context_trace_signal,
-    sync_context_trace_to_workspace,
-    session_workspace_git_root,
-};
 pub(crate) use checkpoint::{
-    delegation_from_heavy_checkpoint,
-    session_state_compact_from_heavy_checkpoint,
-    previous_session_state_for_history_sync,
-    load_previous_recovery_state,
-    next_step_checkpoint_number,
-    build_manual_heavy_step_checkpoint,
-    persist_manual_heavy_and_composite,
-    persist_recovery_checkpoint,
-    rollback_recovery_checkpoint,
-    sync_recovery_snapshot_after_history_edit,
+    build_manual_heavy_step_checkpoint, delegation_from_heavy_checkpoint,
+    next_step_checkpoint_number, persist_manual_heavy_and_composite,
+    session_state_compact_from_heavy_checkpoint, sync_recovery_snapshot_after_history_edit,
+};
+
+pub(crate) use workspace::{
+    session_workspace_git_root, sync_context_trace_to_workspace, sync_plan_fields_to_workspace,
+    sync_session_state_to_workspace, workspace_metadata_from_live_state,
+    workspace_metadata_from_live_state_after_read_failure,
 };
 
 #[cfg(test)]
 mod tests {
+    use super::checkpoint::{
+        load_previous_recovery_state, persist_recovery_checkpoint, rollback_recovery_checkpoint,
+    };
+    use super::csl::{
+        csl_log_path_for, ensure_loaded_csl_state, rebuild_csl_from_history,
+        write_full_csl_snapshot_atomic,
+    };
+    use super::io::{
+        composite_index_path_for, read_optional_file_bytes, restore_optional_file_bytes,
+        with_workspace_lock, write_bytes_atomic,
+    };
     use super::*;
-    use astra_services::session_journal;
+    use crate::cli::session_state::SessionState;
     use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
     use astra_pipeline::step_protocol::StepCheckpoint;
+    use astra_services::session_journal;
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1287,5 +1267,4 @@ mod tests {
             .expect("restored session");
         assert_eq!(restored.messages.len(), 4);
     }
-
 }

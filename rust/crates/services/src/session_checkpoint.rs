@@ -94,19 +94,7 @@ pub fn write_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::R
     let dir = super::session_workspace::workspace_dir_for(session_id).join("checkpoints");
     std::fs::create_dir_all(&dir)?;
 
-    // Symlink safety: verify the checkpoint directory resolves within the session dir
-    let canonical_dir = dir.canonicalize()?;
-    let session_dir = super::session_workspace::workspace_dir_for(session_id).canonicalize()?;
-    if !canonical_dir.starts_with(&session_dir) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "checkpoint directory escapes session boundary: {} is not under {}",
-                canonical_dir.display(),
-                session_dir.display()
-            ),
-        ));
-    }
+    ensure_checkpoint_dir_within_session(session_id, &dir)?;
 
     let slug = slugify(&checkpoint.title);
     let path = checkpoint_file_path(&dir, checkpoint, &slug);
@@ -128,10 +116,15 @@ pub fn write_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::R
 ///
 /// The operation intentionally updates `index.md` before deleting the file: a
 /// crash after index update leaves an unreferenced file, while the inverse can
-/// leave recovery reading a stale index entry. Per-session turn commits are
-/// serialized by the CLI, so this helper does not take its own file lock.
+/// leave recovery reading a stale index entry. An advisory `flock` on
+/// `index.lock` serializes concurrent checkpoint writes against the same
+/// session.
 pub fn remove_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::Result<()> {
     let dir = super::session_workspace::workspace_dir_for(session_id).join("checkpoints");
+    if !dir.exists() {
+        return Ok(());
+    }
+    ensure_checkpoint_dir_within_session(session_id, &dir)?;
     let slug = slugify(&checkpoint.title);
     let path = checkpoint_file_path(&dir, checkpoint, &slug);
 
@@ -142,6 +135,22 @@ pub fn remove_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn ensure_checkpoint_dir_within_session(session_id: &str, dir: &Path) -> std::io::Result<()> {
+    let canonical_dir = dir.canonicalize()?;
+    let session_dir = super::session_workspace::workspace_dir_for(session_id).canonicalize()?;
+    if !canonical_dir.starts_with(&session_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "checkpoint directory escapes session boundary: {} is not under {}",
+                canonical_dir.display(),
+                session_dir.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn checkpoint_file_path(dir: &Path, checkpoint: &Checkpoint, slug: &str) -> PathBuf {
@@ -155,8 +164,26 @@ fn index_entry(checkpoint: &Checkpoint) -> String {
     )
 }
 
+/// Per-session turn commits are serialized by the CLI, but `save_checkpoint`
+/// and `remove_checkpoint` are `pub` and may be called in concurrent contexts.
+/// Use an advisory `flock` on `index.lock` to serialize reads and writes of
+/// `index.md`. On Linux ≥ 2.6.12, `flock()` detects same-process conflicts,
+/// protecting against accidental multi-threaded checkpoint access.
+fn lock_checkpoint_index(dir: &Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt;
+    let lock_path = dir.join("index.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
 fn remove_index_entry(dir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
     let index_path = dir.join("index.md");
+    let _lock = lock_checkpoint_index(dir)?;
     match std::fs::read_to_string(&index_path) {
         Ok(content) => {
             let entry = index_entry(checkpoint);
@@ -180,10 +207,14 @@ fn update_index(dir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
     let index_path = dir.join("index.md");
     let entry = index_entry(checkpoint);
 
-    let mut content = if index_path.exists() {
-        std::fs::read_to_string(&index_path)?
-    } else {
-        "# Checkpoint Index\n\n".to_string()
+    let _lock = lock_checkpoint_index(dir)?;
+
+    let mut content = match std::fs::read_to_string(&index_path) {
+        Ok(c) => c,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "# Checkpoint Index\n\n".to_string()
+        }
+        Err(error) => return Err(error),
     };
     content.push_str(&entry);
     // Atomic write: tmp file + rename to prevent corruption on crash.
@@ -435,6 +466,69 @@ mod tests {
         assert!(
             read_checkpoint_index(&session_id).unwrap().is_empty(),
             "remove_checkpoint must remove stale index entries even when file is missing"
+        );
+    }
+
+    #[test]
+    fn remove_checkpoint_noops_when_checkpoint_dir_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-remove-missing-dir-{}", uuid::Uuid::new_v4());
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "Missing checkpoint".to_string(),
+            summary: "No file was ever written.".to_string(),
+            tools_used: Vec::new(),
+            total_tokens: 0,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+
+        remove_checkpoint(&session_id, &cp).unwrap();
+
+        assert!(
+            read_checkpoint_index(&session_id).unwrap().is_empty(),
+            "best-effort removal should stay a no-op when checkpoint storage was never created"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_checkpoint_rejects_checkpoint_dir_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-remove-escape-{}", uuid::Uuid::new_v4());
+        let session_dir = super::super::session_workspace::workspace_dir_for(&session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let outside = tmp.path().join("outside-checkpoints");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, session_dir.join("checkpoints")).unwrap();
+
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "Escaped checkpoint".to_string(),
+            summary: "Should not be removed.".to_string(),
+            tools_used: Vec::new(),
+            total_tokens: 0,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+        let escaped_path = outside.join("001-escaped-checkpoint.md");
+        std::fs::write(&escaped_path, cp.to_markdown()).unwrap();
+
+        let error = remove_checkpoint(&session_id, &cp)
+            .expect_err("checkpoint cleanup must reject session-boundary escapes");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            escaped_path.exists(),
+            "cleanup must not delete checkpoint files outside the session boundary"
         );
     }
 

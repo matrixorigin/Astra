@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile;
+use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile_with_intent;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
 use super::host::{
@@ -1379,7 +1379,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    apply_adaptive_execution_profile(state);
+    let turn_intent = host.judge_turn_intent(state).await;
+    apply_adaptive_execution_profile_with_intent(state, turn_intent.as_ref());
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
@@ -1565,31 +1566,48 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // retains() stay for a grace period to scrub checkpoints
         // restored from pre-migration sessions (working-set / attention
         // manifests were removed in wip-3).
-        const LEGACY_WORKING_SET_HEADER: &str = "[working-set:v1]\n";
-        const LEGACY_ATTENTION_HEADER: &str = "[attention:v1]\n";
         state.messages.retain(|m| {
             let role = m.get("role").and_then(Value::as_str);
             let content = m.get("content").and_then(Value::as_str);
             match (role, content) {
-                (Some("system"), Some(c)) if c.starts_with(LEGACY_WORKING_SET_HEADER) => false,
-                (Some("user"), Some(c)) if c.starts_with(LEGACY_ATTENTION_HEADER) => false,
+                (Some("system"), Some(c))
+                    if astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
+                        == Some(
+                            astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::WorkingSetManifest,
+                        ) =>
+                {
+                    false
+                }
+                (Some("user"), Some(c))
+                    if astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
+                        == Some(
+                            astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::AttentionManifest,
+                        ) =>
+                {
+                    false
+                }
                 _ => true,
             }
         });
 
-        const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
+        const INVENTORY_HEADER: &str = astra_turn_core::runtime_scaffolding::ALREADY_FETCHED_PREFIX;
         state.messages.retain(|m| {
             m.get("role").and_then(Value::as_str) != Some("system")
                 || !m
                     .get("content")
                     .and_then(Value::as_str)
-                    .is_some_and(|c| c.starts_with(INVENTORY_HEADER))
+                    .is_some_and(|c| {
+                        astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
+                            == Some(
+                                astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::AlreadyFetchedInventory,
+                            )
+                    })
         });
         let inventory = state.semantic_dedup.context_inventory();
         if !inventory.is_empty() {
             state.push_volatile(
                 super::host::VolatileKind::AlreadyFetched,
-                format!("{INVENTORY_HEADER}{inventory}"),
+                format!("{INVENTORY_HEADER} (do NOT re-read/re-grep these)\n{inventory}"),
             );
         }
     }
@@ -1797,6 +1815,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 mod tests {
     use std::sync::Arc;
 
+    use astra_config::user_profile::{Scenario, TurnIntent};
     use astra_services::session_journal::ToolCallRecord;
     use astra_skills::hooks::SkillHooks;
     use astra_skills::manifest::{ExecutionContext, SkillSourceKind, TrustTier};
@@ -1804,7 +1823,9 @@ mod tests {
     use serde_json::json;
 
     use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
-    use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
+    use crate::turn::agentic_loop::host::tests::{
+        MockHost, make_hub, make_session, make_state, text_result,
+    };
 
     use super::*;
 
@@ -2535,6 +2556,71 @@ mod tests {
                         content.contains("<skill-loaded name=\"review-changes\"/>")
                     })
         }));
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_applies_host_judged_turn_intent() {
+        let intent = TurnIntent::default().with_requested_scenario(Scenario::CodeReview);
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "please inspect the current changes".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_infers_default_code_review_intent() {
+        let mut host = MockHost::new(Vec::new());
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "please inspect the current changes".into();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_infers_default_quick_answer_intent() {
+        let mut host = MockHost::new(Vec::new());
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "where is the auth flow defined?".into();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
     }
 
     #[test]

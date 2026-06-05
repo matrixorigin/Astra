@@ -453,6 +453,7 @@ pub(crate) async fn stream_chat_sse(
         None
     };
     let task_profile = infer_task_execution_profile(p.message);
+    let circuit_breaker_config = circuit_breaker_config.for_task_profile(task_profile);
 
     let turn_guard = if p.tool_health_entries.is_empty() {
         TurnGuard::with_profile(task_profile)

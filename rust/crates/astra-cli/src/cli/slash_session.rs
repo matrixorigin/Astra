@@ -4944,7 +4944,9 @@ fn apply_heavy_state_fallback(
         state.recent_tools = recent_tools.to_vec();
     }
     if state.history.is_empty() {
-        let pairs = super::session_continuation::history_pairs_from_messages(messages);
+        let pairs = super::session_continuation::history_pairs_from_messages(
+            &super::session_continuation::sanitize_continuation_messages(messages.to_vec()),
+        );
         if !pairs.is_empty() {
             state.history = pairs;
         }
@@ -4997,7 +4999,7 @@ struct ForkStateSnapshot {
     recent_tools: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
     last_response: Option<String>,
-    continuation_anchor: Option<String>,
+    continuation_anchor: Option<ContinuationAnchor>,
 }
 
 impl ForkStateSnapshot {
@@ -6689,6 +6691,38 @@ mod resume_tests {
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         let guidance = state.resume_guidance.expect("resume guidance");
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_heavy_fallback_sanitizes_runtime_scaffolding_messages() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-cloud-sanitize-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 2);
+        write_invalid_local_step_checkpoint(&session_id, 2);
+
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 2,
+            model: Some("gpt-5".into()),
+            last_status: "active".into(),
+            conversation_messages: vec![
+                serde_json::json!({"role": "user", "content": "[Active task attachment]\nResume the active task/thread below unless the user explicitly changes topic.\n[User follow-up]\n继续"}),
+                serde_json::json!({"role": "user", "content": "continue"}),
+                serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
+            ],
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("cloud fallback should sanitize runtime scaffolding");
+
+        assert_eq!(
+            state.history,
+            vec![("continue".to_string(), "cloud fallback".to_string())]
+        );
     }
 
     #[serial_test::serial]

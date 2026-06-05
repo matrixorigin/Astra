@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use astra_config::user_profile::{Scenario, TurnIntent};
 use astra_services::session_audit::{
     RuntimePromotionController, RuntimePromotionEventData, RuntimePromotionOutcome,
     RuntimePromotionRecommendation,
@@ -55,142 +56,55 @@ fn shrink_u32_budget(current: u32, percent: u32, floor: u32) -> u32 {
         .max(floor)
 }
 
-fn looks_like_code_review_query(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    ["review", "diff", "change", "pull request", "pr"]
-        .iter()
-        .any(|kw| lower.contains(kw))
-}
-
-/// Detects short conceptual questions that should be answered with a tight
-/// tool budget rather than routed through the main Exploration path.
-///
-/// Rationale: a 37-token "why does X do Y?" does not need a 15-tool exploration
-/// budget. When the classifier mistakes such a question for Exploration it
-/// loosens `max_tools_per_turn` / `tool_budget_tokens` and the model happily
-/// fans out across the codebase instead of answering from the two or three
-/// files that would suffice. QuickAnswer is the narrow-scope counterpart.
-///
-/// Preconditions (ALL must hold):
-/// - Query is short (heuristic: ≤200 chars / roughly ≤50 tokens)
-/// - Query starts with or contains an interrogative (why/what/where/which/how
-///   plus common Chinese equivalents), or ends with `?` / `？`
-/// - Task profile is read-only (no workspace mutation expected)
-///
-/// The short-length check is load-bearing: we want the model to spend budget
-/// proportional to question complexity, not proportional to the loosest scenario
-/// that happens to match.
-fn looks_like_quick_answer_query(message: &str) -> bool {
-    let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 200 {
-        return false;
-    }
-    let lower = trimmed.to_lowercase();
-    let has_question_mark = trimmed.ends_with('?') || trimmed.ends_with('？');
-
-    // English markers are matched at word boundaries only — naive substring
-    // matching on "how " false-positives on "show me…" (index 1..5 == "how ").
-    // We build word-boundary-aware matching by splitting on whitespace/punctuation.
-    let english_markers = [
-        "why", "what", "where", "which", "how", "who", "whose", "whom",
-    ];
-    let has_english_interrogative = lower
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| english_markers.contains(&word));
-
-    // Chinese interrogatives — substring matching is fine here since the
-    // shape is unambiguous (these are multi-character markers that don't
-    // appear as internal substrings of unrelated words).
-    let chinese_markers = [
-        "为啥",
-        "为什么",
-        "怎么",
-        "哪里",
-        "哪个",
-        "什么是",
-        "什么情况",
-    ];
-    let has_chinese_interrogative = chinese_markers.iter().any(|m| lower.contains(m));
-
-    has_question_mark || has_english_interrogative || has_chinese_interrogative
-}
-
-fn looks_like_low_info_continuation(message: &str) -> bool {
-    use astra_turn_core::chat_turn_heuristics::{
-        starts_with_chinese_continuation_prefix, trim_trailing_punctuation,
-    };
-    let trimmed = trim_trailing_punctuation(message);
-    if trimmed.is_empty() || trimmed.chars().count() > 32 {
-        return false;
-    }
-
-    let lower = trimmed.to_lowercase();
-    if [
-        "continue",
-        "go on",
-        "go ahead",
-        "resume",
-        "next",
-        "what else",
-        "anything else",
-        "what next",
-        "next step",
-    ]
-    .iter()
-    .any(|phrase| lower == *phrase || lower.starts_with(&format!("{phrase} ")))
-    {
-        return true;
-    }
-
-    starts_with_chinese_continuation_prefix(trimmed)
-}
-
-fn looks_like_debug_query(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    [
-        "bug", "error", "crash", "debug", "issue", "problem", "wrong", "fail", "broken",
-    ]
-    .iter()
-    .any(|kw| lower.contains(kw))
-}
-
-fn fallback_scenario_from_routing(
-    message: &str,
+fn fallback_scenario_from_task(
     task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
     task_type: crate::pipeline::routing::TaskType,
-) -> Option<astra_config::user_profile::Scenario> {
-    // QuickAnswer fast-path — checked BEFORE other scenarios so it wins over
-    // Exploration for the "why does X do Y?" case. Only fires when the task
-    // is read-only; debug/review keywords take precedence because they imply
-    // deeper intent even on short queries.
-    if !task_profile.mutates_workspace
-        && !looks_like_code_review_query(message)
-        && !looks_like_debug_query(message)
-        && !looks_like_low_info_continuation(message)
-        && looks_like_quick_answer_query(message)
-    {
-        return Some(astra_config::user_profile::Scenario::QuickAnswer);
-    }
-    if !task_profile.mutates_workspace && looks_like_code_review_query(message) {
-        return Some(astra_config::user_profile::Scenario::CodeReview);
-    }
-    if !task_profile.mutates_workspace && looks_like_debug_query(message) {
-        return Some(astra_config::user_profile::Scenario::Debugging);
-    }
-
+) -> Option<Scenario> {
     match task_type {
         crate::pipeline::routing::TaskType::Code | crate::pipeline::routing::TaskType::Mutate
             if task_profile.mutates_workspace =>
         {
-            Some(astra_config::user_profile::Scenario::Implementation)
+            Some(Scenario::Implementation)
         }
         crate::pipeline::routing::TaskType::Code
         | crate::pipeline::routing::TaskType::Reasoning
         | crate::pipeline::routing::TaskType::Fetch
-        | crate::pipeline::routing::TaskType::Mutate => {
-            Some(astra_config::user_profile::Scenario::Exploration)
-        }
+        | crate::pipeline::routing::TaskType::Mutate => Some(Scenario::Exploration),
         _ => None,
+    }
+}
+
+/// Resolve scenario priority in descending order: explicit turn intent,
+/// detector/history signal, then coarse task-type fallback.
+fn resolve_scenario_from_routing(
+    task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+    task_type: crate::pipeline::routing::TaskType,
+    detected_scenario: Option<Scenario>,
+    turn_intent: Option<&TurnIntent>,
+) -> Option<Scenario> {
+    if turn_intent.is_some_and(TurnIntent::continues_current_objective) {
+        return None;
+    }
+
+    if let Some(intent) = turn_intent
+        && let Some(requested) = intent
+            .requested_scenario
+            .filter(|s| intent.allows_scenario(*s))
+    {
+        return Some(requested);
+    }
+
+    if let Some(scenario) =
+        detected_scenario.filter(|s| turn_intent.is_none_or(|intent| intent.allows_scenario(*s)))
+    {
+        return Some(scenario);
+    }
+
+    let fallback = fallback_scenario_from_task(task_profile, task_type)?;
+    if turn_intent.is_none_or(|intent| intent.allows_scenario(fallback)) {
+        Some(fallback)
+    } else {
+        None
     }
 }
 
@@ -328,7 +242,10 @@ fn carry_forward_tactical_runtime_mutations(
     }
 }
 
-pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
+pub(crate) fn apply_adaptive_execution_profile_with_intent(
+    state: &mut AgenticLoopState,
+    turn_intent: Option<&TurnIntent>,
+) {
     let (hub, session) = match (
         &state.telemetry.observability_hub,
         &state.telemetry.observability_session,
@@ -379,13 +296,21 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let mut profile =
         astra_config::execution_profile::ExecutionProfile::from_base(session_guard.config.clone());
 
-    if let Some((scenario, confidence)) = detector.detect() {
+    let detected = detector.detect();
+    let resolved_scenario = resolve_scenario_from_routing(
+        state.task_profile,
+        routing.task_type,
+        detected.map(|(scenario, _)| scenario),
+        turn_intent,
+    );
+
+    if let Some(scenario) = resolved_scenario {
         profile.apply_scenario(scenario);
-        profile.confidence = profile.confidence.min(confidence.lower);
-    } else if let Some(scenario) =
-        fallback_scenario_from_routing(&state.message, state.task_profile, routing.task_type)
-    {
-        profile.apply_scenario(scenario);
+        if let Some((detected_scenario, confidence)) = detected
+            && detected_scenario == scenario
+        {
+            profile.confidence = profile.confidence.min(confidence.lower);
+        }
     }
 
     let mut boosts = routing.boost_terms.clone();
@@ -1129,18 +1054,69 @@ fn write_session_journal_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{fallback_scenario_from_routing, looks_like_low_info_continuation};
+    use super::{fallback_scenario_from_task, resolve_scenario_from_routing};
     use crate::pipeline::routing::TaskType;
-    use astra_config::user_profile::Scenario;
+    use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 
     #[test]
-    fn review_like_analysis_query_prefers_code_review_over_implementation_fallback() {
-        let task_profile = infer_task_execution_profile("review local changes");
+    fn typed_intent_request_selects_semantic_scenario() {
+        let task_profile = infer_task_execution_profile("please inspect the local changes");
         assert!(!task_profile.mutates_workspace);
+        let intent = TurnIntent::default().with_requested_scenario(Scenario::CodeReview);
+
         assert_eq!(
-            fallback_scenario_from_routing("review local changes", task_profile, TaskType::Code),
+            resolve_scenario_from_routing(task_profile, TaskType::Code, None, Some(&intent)),
             Some(Scenario::CodeReview)
+        );
+    }
+
+    #[test]
+    fn typed_intent_prohibition_suppresses_detected_code_review() {
+        let task_profile = infer_task_execution_profile("continue the current work");
+        let intent = TurnIntent::default().prohibit_scenario(Scenario::CodeReview);
+
+        assert_ne!(
+            resolve_scenario_from_routing(
+                task_profile,
+                TaskType::Code,
+                Some(Scenario::CodeReview),
+                Some(&intent),
+            ),
+            Some(Scenario::CodeReview),
+            "typed user intent must outrank historical detector bias"
+        );
+    }
+
+    #[test]
+    fn typed_continuation_does_not_reclassify_objective() {
+        let task_profile = infer_task_execution_profile("continue");
+        let intent = TurnIntent::default()
+            .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
+
+        assert_eq!(
+            resolve_scenario_from_routing(
+                task_profile,
+                TaskType::Code,
+                Some(Scenario::CodeReview),
+                Some(&intent),
+            ),
+            None,
+            "continuation is a relationship to the existing objective, not a fresh scenario"
+        );
+    }
+
+    #[test]
+    fn prohibited_requested_scenario_does_not_apply() {
+        let task_profile = infer_task_execution_profile("inspect the current changes");
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::CodeReview)
+            .prohibit_scenario(Scenario::CodeReview);
+
+        assert_ne!(
+            resolve_scenario_from_routing(task_profile, TaskType::Code, None, Some(&intent)),
+            Some(Scenario::CodeReview),
+            "policy must not apply a scenario that the typed intent prohibits"
         );
     }
 
@@ -1149,7 +1125,7 @@ mod tests {
         let task_profile = infer_task_execution_profile("fix the bug");
         assert!(task_profile.mutates_workspace);
         assert_eq!(
-            fallback_scenario_from_routing("fix the bug", task_profile, TaskType::Code),
+            fallback_scenario_from_task(task_profile, TaskType::Code),
             Some(Scenario::Implementation)
         );
     }
@@ -1159,100 +1135,49 @@ mod tests {
         let task_profile = infer_task_execution_profile("explain the auth flow");
         assert!(!task_profile.mutates_workspace);
         assert_eq!(
-            fallback_scenario_from_routing("explain the auth flow", task_profile, TaskType::Code),
+            fallback_scenario_from_task(task_profile, TaskType::Code),
             Some(Scenario::Exploration)
         );
     }
 
     #[test]
-    fn debug_like_analysis_query_prefers_debugging_over_exploration_fallback() {
-        let task_profile = infer_task_execution_profile("why is this test failing");
+    fn detected_scenario_still_applies_when_not_prohibited() {
+        let task_profile = infer_task_execution_profile("inspect the current behavior");
         assert!(!task_profile.mutates_workspace);
+
         assert_eq!(
-            fallback_scenario_from_routing(
-                "why is this test failing",
+            resolve_scenario_from_routing(
                 task_profile,
-                TaskType::Code
+                TaskType::Code,
+                Some(Scenario::Debugging),
+                None,
             ),
             Some(Scenario::Debugging)
         );
     }
 
-    // ─── QuickAnswer fast-path ──────────────────────────────────────────
+    #[test]
+    fn typed_debug_intent_wins_over_exploration_fallback() {
+        let task_profile = infer_task_execution_profile("why is this failing");
+        assert!(!task_profile.mutates_workspace);
+        let intent = TurnIntent::default().with_requested_scenario(Scenario::Debugging);
+
+        assert_eq!(
+            resolve_scenario_from_routing(task_profile, TaskType::Code, None, Some(&intent)),
+            Some(Scenario::Debugging),
+        );
+    }
 
     #[test]
-    fn short_interrogative_routes_to_quick_answer_not_exploration() {
-        let q = "why does the circuit breaker abort here?";
-        let task_profile = infer_task_execution_profile(q);
+    fn typed_quick_answer_intent_wins_over_exploration_fallback() {
+        let task_profile = infer_task_execution_profile("why does this abort?");
         assert!(!task_profile.mutates_workspace);
+        let intent = TurnIntent::default().with_requested_scenario(Scenario::QuickAnswer);
+
         assert_eq!(
-            fallback_scenario_from_routing(q, task_profile, TaskType::Code),
+            resolve_scenario_from_routing(task_profile, TaskType::Code, None, Some(&intent)),
             Some(Scenario::QuickAnswer),
-            "short interrogative read-only query should route to QuickAnswer"
+            "QuickAnswer is semantic intent, not a runtime keyword heuristic"
         );
-    }
-
-    #[test]
-    fn short_chinese_interrogative_routes_to_quick_answer() {
-        // The literal session-36500dd9 turn-4 query shape.
-        let q = "为啥其他models即使配置了reasoning, /model选择后，也看不到thinking?";
-        let task_profile = infer_task_execution_profile(q);
-        assert!(!task_profile.mutates_workspace);
-        assert_eq!(
-            fallback_scenario_from_routing(q, task_profile, TaskType::Code),
-            Some(Scenario::QuickAnswer)
-        );
-    }
-
-    #[test]
-    fn generic_followup_question_does_not_route_to_quick_answer() {
-        let q = "还有什么？";
-        let task_profile = infer_task_execution_profile(q);
-        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
-        assert_ne!(res, Some(Scenario::QuickAnswer));
-    }
-
-    #[test]
-    fn continuation_query_detector_handles_expanded_short_phrases() {
-        assert!(looks_like_low_info_continuation("go on"));
-        assert!(looks_like_low_info_continuation("接着"));
-        assert!(looks_like_low_info_continuation("补一下"));
-        assert!(!looks_like_low_info_continuation(
-            "go on and explain the whole runtime pipeline in detail"
-        ));
-    }
-
-    #[test]
-    fn debug_keyword_wins_over_quick_answer() {
-        // Even when short and interrogative, a debug query (already has "failing")
-        // should route to Debugging — it needs more tools than QuickAnswer offers.
-        let q = "why is this test failing?";
-        let task_profile = infer_task_execution_profile(q);
-        assert_eq!(
-            fallback_scenario_from_routing(q, task_profile, TaskType::Code),
-            Some(Scenario::Debugging)
-        );
-    }
-
-    #[test]
-    fn long_question_does_not_route_to_quick_answer() {
-        // Even if interrogative, a long question implies complexity — Exploration
-        // wins (budget-loose) instead of QuickAnswer (budget-tight).
-        let q = "why does the agentic loop trip the circuit breaker when we have more than five \
-                 consecutive rounds of read-only tool calls but only when the model is claude-sonnet-4-6 \
-                 with thinking:high and how does that interact with the adaptive scenario classifier?";
-        let task_profile = infer_task_execution_profile(q);
-        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
-        assert_ne!(res, Some(Scenario::QuickAnswer));
-    }
-
-    #[test]
-    fn non_interrogative_short_query_does_not_route_to_quick_answer() {
-        // "show me the file" is short but not interrogative in the strict sense —
-        // falls through to Exploration.
-        let q = "show me the auth flow";
-        let task_profile = infer_task_execution_profile(q);
-        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
-        assert_ne!(res, Some(Scenario::QuickAnswer));
     }
 }

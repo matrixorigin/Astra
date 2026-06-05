@@ -4,8 +4,8 @@
 //! Registration with the runtime's `MetricsRegistry` happens externally
 //! (via `register_with`) to avoid a cyclic crate dependency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ─── Latency Tracker ───────────────────────────────────────────────────────
@@ -42,20 +42,12 @@ impl LatencyTracker {
         let _ = self
             .min_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if us < cur {
-                    Some(us)
-                } else {
-                    None
-                }
+                if us < cur { Some(us) } else { None }
             });
         let _ = self
             .max_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if us > cur {
-                    Some(us)
-                } else {
-                    None
-                }
+                if us > cur { Some(us) } else { None }
             });
     }
 

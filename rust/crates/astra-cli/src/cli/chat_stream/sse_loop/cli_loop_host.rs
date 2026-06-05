@@ -485,6 +485,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             term_width: self.term_width,
             render_policy: self.render_policy,
             message: self.message,
+            semantic_query_override: None,
             history: self.history,
             recent_tools: self.recent_tools,
             project_root: self.project_root.as_path(),

@@ -13,6 +13,7 @@ pub(crate) struct TurnDispatch<'a, 'b> {
     pub(crate) effective_line: &'a str,
     pub(crate) token: &'a str,
     pub(crate) session_id: Option<&'a str>,
+    pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) turn_start: Instant,
     pub(crate) ui: &'a mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 }
@@ -39,7 +40,6 @@ pub(crate) async fn settle_successful_turn(
     dispatch: &mut TurnDispatch<'_, '_>,
     result: StreamResult,
 ) {
-    state.last_turn_interrupted = false;
     apply_turn_success_async(
         state,
         dispatch.ctx.api,
@@ -138,6 +138,7 @@ mod tests {
             effective_line: "continue",
             token: "token",
             session_id: None,
+            semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
         };

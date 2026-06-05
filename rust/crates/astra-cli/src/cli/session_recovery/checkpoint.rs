@@ -2,6 +2,7 @@
 use super::csl::*;
 use super::io::*;
 use super::workspace::*;
+use crate::cli::session_projection::history_as_messages;
 use crate::cli::*;
 
 pub(crate) fn delegation_from_heavy_checkpoint(
@@ -90,15 +91,11 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
     previous_heavy: Option<&astra_pipeline::step_protocol::HeavyCheckpoint>,
 ) -> astra_pipeline::step_protocol::StepCheckpoint {
     use astra_pipeline::step_protocol::{
-        epoch_ms, ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepCheckpoint,
-        PROTOCOL_VERSION,
+        ExecutionCursor, HeavyCheckpoint, LightCheckpoint, PROTOCOL_VERSION, StepCheckpoint,
+        epoch_ms,
     };
 
-    let mut messages = Vec::new();
-    for (u, a) in &state.history {
-        messages.push(serde_json::json!({ "role": "user", "content": u }));
-        messages.push(serde_json::json!({ "role": "assistant", "content": a }));
-    }
+    let messages = history_as_messages(&state.history);
 
     let max_turns = state.cli_context.max_turns.unwrap_or(50u32);
     let now_ms = epoch_ms();
@@ -318,4 +315,38 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_heavy_checkpoint_preserves_assistant_only_history_entries() {
+        let state = SessionState {
+            history: vec![
+                ("".into(), "Earlier context compacted.".into()),
+                ("continue".into(), "Done.".into()),
+            ],
+            ..Default::default()
+        };
+
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "sess-checkpoint-history",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            None,
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+
+        assert_eq!(heavy.messages.len(), 3);
+        assert_eq!(heavy.messages[0]["role"], "assistant");
+        assert_eq!(heavy.messages[0]["content"], "Earlier context compacted.");
+        assert_eq!(heavy.messages[1]["role"], "user");
+        assert_eq!(heavy.messages[1]["content"], "continue");
+        assert_eq!(heavy.messages[2]["role"], "assistant");
+        assert_eq!(heavy.messages[2]["content"], "Done.");
+    }
 }

@@ -68,6 +68,11 @@ pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str)
     initialize_journal(state, session_id);
 }
 
+fn initialize_journal(state: &mut SessionState, session_id: &str) {
+    attach_session_journal(state, session_id);
+    initialize_session_artifacts(state, session_id);
+}
+
 fn record_session_persistence_error(state: &mut SessionState, detail: &str) {
     match state.session_persistence_error.as_deref() {
         Some(existing) if existing == detail => {}
@@ -78,7 +83,11 @@ fn record_session_persistence_error(state: &mut SessionState, detail: &str) {
     }
 }
 
-fn initialize_journal(state: &mut SessionState, session_id: &str) {
+pub(crate) fn attach_session_journal_pub(state: &mut SessionState, session_id: &str) {
+    attach_session_journal(state, session_id);
+}
+
+fn attach_session_journal(state: &mut SessionState, session_id: &str) {
     let target_path = session_journal::journal_file_path(session_id);
     let already_attached = state
         .journal
@@ -98,11 +107,13 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
             }
         };
     }
+}
 
+fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
     let needs_start_event =
         session_journal::journal_needs_session_start(session_id).unwrap_or(true);
 
-    if !already_attached && needs_start_event {
+    if needs_start_event {
         if state.journal.is_none() {
             return;
         }
@@ -211,9 +222,17 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
     }
 
     if state.observability_session.is_none() {
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
-        )));
+        state.observability_session = Some(if let Some(hub) = &state.observability_hub {
+            let user_id = state
+                .ingestion_user_id
+                .clone()
+                .unwrap_or_else(|| "anonymous".to_string());
+            hub.start_session(&user_id, session_id)
+        } else {
+            std::sync::Arc::new(std::sync::RwLock::new(
+                astra_runtime::observability::ObservabilitySession::new_simple(session_id),
+            ))
+        });
         apply_pending_adaptive_state(state);
     }
 }

@@ -307,6 +307,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Credential profile used for in-turn auth refresh when edge result posts hit 401.
     pub(crate) auth_profile: Option<&'a str>,
     pub(crate) message: &'a str,
+    /// Structured semantic query derived before prompt wrapping when the CLI
+    /// knows the message is an active-thread follow-up attachment.
+    pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) model: Option<&'a str>,
     /// Explicit provider hint for provider-specific cache/compaction behavior.
@@ -538,6 +541,7 @@ impl<'a> ChatTurnParams<'a> {
             token,
             auth_profile: ctx.auth_profile,
             message: ctx.message,
+            semantic_query_override: None,
             session_id,
             model: ctx.model,
             provider: ctx.provider,

@@ -71,6 +71,29 @@ impl InterruptionKind {
         }
     }
 
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "budget_exhausted" => Some(Self::BudgetExhausted),
+            "empty_completion" => Some(Self::EmptyCompletion),
+            "token_budget_exceeded" => Some(Self::TokenBudgetExceeded),
+            "cumulative_budget_exceeded" => Some(Self::CumulativeBudgetExceeded),
+            "rate_limited" => Some(Self::RateLimited),
+            "cooldown_rejected" => Some(Self::CooldownRejected),
+            "user_cancelled" => Some(Self::UserCancelled),
+            "context_overflow" => Some(Self::ContextOverflow),
+            "auth_failure" => Some(Self::AuthFailure),
+            "critical_verdict" => Some(Self::CriticalVerdict),
+            "approval_rejected" => Some(Self::ApprovalRejected),
+            "server_overload" => Some(Self::ServerOverload),
+            "stream_transport" => Some(Self::StreamTransport),
+            "stream_idle" => Some(Self::StreamIdle),
+            "harness_blocked" => Some(Self::HarnessBlocked),
+            "harness_paused" => Some(Self::HarnessPaused),
+            _ => None,
+        }
+    }
+
     /// Whether progress made before this interruption is preserved and resumable.
     #[must_use]
     pub fn is_resumable(self) -> bool {
@@ -111,6 +134,52 @@ pub enum ResumeAction {
     StartNewSession,
 }
 
+/// Runtime mode the next turn should use when resuming this interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    /// Resume normal execution under the user's next instruction.
+    #[default]
+    Continue,
+    /// Do not broaden execution; synthesize preserved state into user-visible
+    /// output. Tool availability is enforced separately via
+    /// `resume_restricted_tools`.
+    Settle,
+}
+
+impl ResumeMode {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Settle => "settle",
+        }
+    }
+
+    #[must_use]
+    pub fn default_for_interruption(kind: InterruptionKind) -> Self {
+        match kind {
+            InterruptionKind::EmptyCompletion => Self::Settle,
+            _ => Self::Continue,
+        }
+    }
+
+    fn from_json_value(value: Option<&serde_json::Value>, kind: &str) -> Self {
+        value
+            .and_then(|value| value.as_str())
+            .and_then(|raw| match raw {
+                "continue" => Some(Self::Continue),
+                "settle" => Some(Self::Settle),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                InterruptionKind::from_label(kind)
+                    .map(Self::default_for_interruption)
+                    .unwrap_or_default()
+            })
+    }
+}
+
 /// Structured record of an agentic loop interruption.
 ///
 /// Captures enough context for the next turn/session to understand what happened
@@ -121,6 +190,9 @@ pub struct InterruptionRecord {
     pub kind: InterruptionKind,
     /// Recommended next action for the caller.
     pub resume_action: ResumeAction,
+    /// Runtime execution mode for the next resumed turn.
+    #[serde(default)]
+    pub resume_mode: ResumeMode,
     /// Whether a heavy checkpoint was written before/during the interruption.
     pub has_checkpoint: bool,
     /// Number of tool calls completed before the interruption.
@@ -159,9 +231,11 @@ impl InterruptionRecord {
         state_summary: InterruptionStateSummary,
     ) -> Self {
         let user_message = Self::format_user_message(kind, &resume_action, &state_summary);
+        let resume_mode = ResumeMode::default_for_interruption(kind);
         Self {
             kind,
             resume_action,
+            resume_mode,
             has_checkpoint: state_summary.has_checkpoint,
             tool_calls_completed: state_summary.tool_calls_completed,
             turns_completed: state_summary.turns_completed,
@@ -191,6 +265,7 @@ impl InterruptionRecord {
             "kind": self.kind.label(),
             "resumable": self.kind.is_resumable(),
             "resume_action": self.resume_action,
+            "resume_mode": self.resume_mode,
             "has_checkpoint": self.has_checkpoint,
             "tool_calls_completed": self.tool_calls_completed,
             "turns_completed": self.turns_completed,
@@ -450,6 +525,7 @@ fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
 #[derive(Debug)]
 struct ResumeInput<'j> {
     kind: &'j str,
+    resume_mode: ResumeMode,
     turns: u64,
     tool_calls: u64,
     has_checkpoint: bool,
@@ -462,6 +538,7 @@ struct ResumeInput<'j> {
 impl<'j> ResumeInput<'j> {
     fn from_json(v: &'j serde_json::Value) -> Option<Self> {
         let kind = v.get("kind")?.as_str()?;
+        let resume_mode = ResumeMode::from_json_value(v.get("resume_mode"), kind);
         let turns = v
             .get("turns_completed")
             .and_then(|x| x.as_u64())
@@ -480,6 +557,7 @@ impl<'j> ResumeInput<'j> {
         let resume_restricted_tools = resume_restricted_tools_from_interruption_json(v);
         Some(Self {
             kind,
+            resume_mode,
             turns,
             tool_calls,
             has_checkpoint,
@@ -534,75 +612,80 @@ pub fn build_resume_guidance_with_context(
         g.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
     }
 
-    // Kind-specific advice
-    match inp.kind {
-        "empty_completion" => g.push_str(
-            "  Action: Continue from the preserved context and produce a direct final answer. \
-             Do not stop after hidden reasoning with no user-visible output.\n",
-        ),
-        "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
-            g.push_str(
-                "  Action: Prioritize completing the most important remaining work first. \
-                  Avoid exploratory tool calls — focus on delivering a result.\n",
-            );
-            if let Some(sig) = inp.stall_signal.and_then(summarize_stall_signal_for_user) {
-                writeln!(g, "  Cause: {}.", sig.cause).ok();
-                writeln!(g, "  Correction: {}.", sig.correction).ok();
-            }
-            if let Some(detail) = inp.error_detail.filter(|d| d.contains("Likely cause:")) {
-                writeln!(g, "  Runtime detail: {detail}").ok();
-            }
-        }
-        "rate_limited" | "cooldown_rejected" | "server_overload" => g.push_str(
-            "  Action: The rate limit has likely expired. Resume normally, \
-             but batch tool calls to minimize API round-trips.\n",
-        ),
-        "context_overflow" => {
-            g.push_str(
-                "  Action: Context was compacted. Some older tool results may be \
-                 summarized. Re-read any files you need before making edits.\n",
-            );
-            if let Some(ctx) = compaction_context.filter(|c| c.compaction_attempts > 0) {
-                write!(
-                    g,
-                    "  Compaction: {} attempt(s), ~{} tokens freed total",
-                    ctx.compaction_attempts, ctx.total_tokens_freed
-                )
-                .ok();
-                if ctx.last_was_insufficient {
-                    g.push_str(" (last compaction was insufficient — context may still be tight)");
-                }
-                g.push('\n');
+    if inp.resume_mode == ResumeMode::Settle {
+        g.push_str(
+            "  Action: Enter settlement: synthesize the preserved evidence into a direct \
+             user-visible answer. Do not create new tasks, spawn agents, or use tools.\n",
+        );
+    } else {
+        // Kind-specific advice
+        match inp.kind {
+            "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
                 g.push_str(
-                    "  Tip: Keep responses concise and avoid requesting large file dumps.\n",
+                    "  Action: Prioritize completing the most important remaining work first. \
+                  Avoid exploratory tool calls — focus on delivering a result.\n",
                 );
+                if let Some(sig) = inp.stall_signal.and_then(summarize_stall_signal_for_user) {
+                    writeln!(g, "  Cause: {}.", sig.cause).ok();
+                    writeln!(g, "  Correction: {}.", sig.correction).ok();
+                }
+                if let Some(detail) = inp.error_detail.filter(|d| d.contains("Likely cause:")) {
+                    writeln!(g, "  Runtime detail: {detail}").ok();
+                }
             }
-        }
-        "user_cancelled" => g.push_str(
-            "  Action: The user cancelled the previous run. Wait for their \
+            "rate_limited" | "cooldown_rejected" | "server_overload" => g.push_str(
+                "  Action: The rate limit has likely expired. Resume normally, \
+             but batch tool calls to minimize API round-trips.\n",
+            ),
+            "context_overflow" => {
+                g.push_str(
+                    "  Action: Context was compacted. Some older tool results may be \
+                 summarized. Re-read any files you need before making edits.\n",
+                );
+                if let Some(ctx) = compaction_context.filter(|c| c.compaction_attempts > 0) {
+                    write!(
+                        g,
+                        "  Compaction: {} attempt(s), ~{} tokens freed total",
+                        ctx.compaction_attempts, ctx.total_tokens_freed
+                    )
+                    .ok();
+                    if ctx.last_was_insufficient {
+                        g.push_str(
+                            " (last compaction was insufficient — context may still be tight)",
+                        );
+                    }
+                    g.push('\n');
+                    g.push_str(
+                        "  Tip: Keep responses concise and avoid requesting large file dumps.\n",
+                    );
+                }
+            }
+            "user_cancelled" => g.push_str(
+                "  Action: The user cancelled the previous run. Wait for their \
              instructions before proceeding.\n",
-        ),
-        "critical_verdict" => g.push_str(
-            "  Action: The previous run was stopped by TurnGuard due to repeated \
+            ),
+            "critical_verdict" => g.push_str(
+                "  Action: The previous run was stopped by TurnGuard due to repeated \
              errors and stalls. Review what went wrong, try a different approach, \
              and avoid the tool patterns that caused failures.\n",
-        ),
-        "harness_paused" => g.push_str(
-            "  Action: The previous run was paused by the harness due to a \
+            ),
+            "harness_paused" => g.push_str(
+                "  Action: The previous run was paused by the harness due to a \
              read-heavy stall without any mutation. Reuse the evidence already \
              gathered and take one concrete next action: edit the relevant file, \
              run targeted verification, or explicitly report why the task cannot \
              be completed. If one specific fact is still missing, fetch only that \
              fact instead of reopening broad or overlapping reads.\n",
-        ),
-        "approval_rejected" => g.push_str(
-            "  Action: Tool approvals were repeatedly denied. Use only read-only \
+            ),
+            "approval_rejected" => g.push_str(
+                "  Action: Tool approvals were repeatedly denied. Use only read-only \
              tools or ask the user for explicit permission before attempting \
              write operations.\n",
-        ),
-        _ => {
-            if !inp.user_msg.is_empty() {
-                writeln!(g, "  Detail: {}", inp.user_msg).ok();
+            ),
+            _ => {
+                if !inp.user_msg.is_empty() {
+                    writeln!(g, "  Detail: {}", inp.user_msg).ok();
+                }
             }
         }
     }
@@ -700,6 +783,7 @@ mod tests {
                 label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                 "label should be snake_case: {label}"
             );
+            assert_eq!(InterruptionKind::from_label(label), Some(kind));
         }
     }
 
@@ -735,12 +819,39 @@ mod tests {
         );
         let json = record.to_json();
         assert_eq!(json["kind"], "budget_exhausted");
+        assert_eq!(record.resume_mode, ResumeMode::Continue);
+        assert_eq!(json["resume_mode"], "continue");
         assert_eq!(json["resumable"], true);
         assert_eq!(json["has_checkpoint"], true);
         assert_eq!(json["tool_calls_completed"], 5);
         assert!(
             json.get("stall_signal").is_none(),
             "stall_signal omitted from JSON when None for backwards compat: {json:?}"
+        );
+    }
+
+    #[test]
+    fn empty_completion_records_settlement_resume_mode() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::EmptyCompletion,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 5,
+                turns_completed: 3,
+                remaining_turns: 4,
+                error_detail: None,
+                stall_signal: None,
+                resume_restricted_tools: vec!["agent".to_string(), "bash".to_string()],
+            },
+        );
+
+        let json = record.to_json();
+        assert_eq!(record.resume_mode, ResumeMode::Settle);
+        assert_eq!(json["resume_mode"], "settle");
+        assert_eq!(
+            json["resume_restricted_tools"],
+            serde_json::json!(["agent", "bash"])
         );
     }
 
@@ -1050,7 +1161,30 @@ mod tests {
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("empty_completion"));
-        assert!(guidance.contains("direct final answer"));
+        assert!(guidance.contains("Enter settlement"));
+        assert!(guidance.contains("synthesize the preserved evidence"));
+        assert!(guidance.contains("Do not create new tasks"));
+        assert!(guidance.contains("or use tools"));
+    }
+
+    #[test]
+    fn resume_guidance_settlement_mode_overrides_kind_specific_advice() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resume_mode": "settle",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 20,
+            "turns_completed": 10,
+            "remaining_turns": 0,
+            "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("Enter settlement"), "{guidance}");
+        assert!(
+            !guidance.contains("Prioritize completing"),
+            "settlement mode should not fall back to execute-mode budget advice: {guidance}"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 #![allow(dead_code)]
 
+use crate::cli::session_state::ContinuationAnchor;
 use astra_turn_core::context_assembly_trace::{
     ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
     MemorySelection, RejectionReason, SkillInjection, ToolSelected,
@@ -176,7 +177,7 @@ pub(crate) struct SessionSummary {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
-    pub continuation_anchor: Option<String>,
+    pub continuation_anchor: Option<ContinuationAnchor>,
     pub queued_message: Option<String>,
     pub diagnostics_context: Option<String>,
 }

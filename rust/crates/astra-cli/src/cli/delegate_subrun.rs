@@ -415,7 +415,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     astra_turn_core::loop_circuit_breaker::BreakerConfig {
                         absolute_max_rounds: 40,
                         ..Default::default()
-                    },
+                    }
+                    .for_task_profile(task_profile),
                 );
                 s
             },

@@ -588,6 +588,13 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     }
 }
 
+fn settlement_interruption_summary(
+    state: &AgenticLoopState,
+    error_detail: Option<String>,
+) -> astra_turn_core::interruption::InterruptionStateSummary {
+    interruption_state_summary(state, error_detail)
+}
+
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
     if state.hooks.task_board_snapshot.has_unfinished_tasks() {
         let detail = format!(
@@ -598,7 +605,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
                 astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
                 astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-                interruption_state_summary(state, Some(detail)),
+                settlement_interruption_summary(state, Some(detail)),
             ));
         }
         state.final_text = task_board_terminal_message(
@@ -615,7 +622,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            interruption_state_summary(
+            settlement_interruption_summary(
                 state,
                 Some("agentic loop completed without final text".to_string()),
             ),
@@ -1122,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_and_render_converts_blank_completion_into_empty_completion() {
-        let mut host = MockHost::new(Vec::new());
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["agent", "bash", "read_file"]);
         let mut state = make_state();
         state.final_text = "   ".into();
         state.total_tool_calls = 3;
@@ -1137,6 +1144,11 @@ mod tests {
         assert_eq!(
             interruption.kind,
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion
+        );
+        assert_eq!(
+            interruption.resume_restricted_tools,
+            Vec::<String>::new(),
+            "empty completion should preserve the user's full tool surface; settlement is guidance/state, not a tool denylist"
         );
         assert!(state.final_text.contains("without a final answer"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);

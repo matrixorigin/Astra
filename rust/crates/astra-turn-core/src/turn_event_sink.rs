@@ -12,8 +12,8 @@
 //! - `snapshot()` takes a non-consuming snapshot, safe on poisoned mutexes.
 
 use astra_services::session_journal::ToolCallRecord;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Backpressure cap: oldest records are evicted when this is exceeded.
 const MAX_TOOL_RECORDS: usize = 200;

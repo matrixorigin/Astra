@@ -13,7 +13,7 @@ use sqlx::Row;
 use super::hold_cache::TaskLeaseHoldCache;
 use super::metrics::SharedMultiAgentMetrics;
 use crate::task_orchestrator::{
-    MatrixOneTaskService, TaskListItem, TaskRecord, TaskStatus, AGENT_TASK_DETAIL_SELECT_COLUMNS,
+    AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskListItem, TaskRecord, TaskStatus,
 };
 
 /// Default maximum number of tasks to return in a pack pull.
@@ -817,10 +817,11 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_task_lease_errors() {
         let s = UnconfiguredTaskLeaseService;
-        assert!(s
-            .claim_next_claimable_lease("u", "a", "e", 60)
-            .await
-            .is_err());
+        assert!(
+            s.claim_next_claimable_lease("u", "a", "e", 60)
+                .await
+                .is_err()
+        );
         assert!(s.try_claim_lease("u", "t", "a", "e", 60).await.is_err());
     }
 }

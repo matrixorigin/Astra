@@ -40,6 +40,132 @@ pub(crate) struct SkillDevState {
     pub dir: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ContinuationAnchor {
+    pub text: String,
+    pub latest_user_task: Option<String>,
+    pub assistant_direction: Option<String>,
+    pub active_task_board: Vec<String>,
+}
+
+impl ContinuationAnchor {
+    pub(crate) fn from_rendered(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let (latest_user_task, assistant_direction, active_task_board) =
+            Self::parse_rendered(&text);
+        Self {
+            text,
+            latest_user_task,
+            assistant_direction,
+            active_task_board,
+        }
+    }
+
+    pub(crate) fn from_parts(
+        text: impl Into<String>,
+        latest_user_task: Option<String>,
+        assistant_direction: Option<String>,
+        active_task_board: Vec<String>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            latest_user_task,
+            assistant_direction,
+            active_task_board,
+        }
+    }
+
+    pub(crate) fn has_active_task_board(&self) -> bool {
+        !self.active_task_board.is_empty()
+    }
+
+    fn parse_rendered(text: &str) -> (Option<String>, Option<String>, Vec<String>) {
+        let mut latest_user_task = None;
+        let mut assistant_direction = None;
+        let mut active_task_board = Vec::new();
+        let mut summary_lines = Vec::new();
+        let mut in_active_tasks = false;
+        let mut in_summary = false;
+
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if let Some(rest) = line.strip_prefix("Latest user task: ") {
+                latest_user_task = Some(rest.to_string());
+                in_active_tasks = false;
+                in_summary = false;
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("Latest assistant direction: ") {
+                assistant_direction = Some(rest.to_string());
+                in_active_tasks = false;
+                in_summary = false;
+                continue;
+            }
+            if line == "Active task board:" {
+                in_active_tasks = true;
+                in_summary = false;
+                continue;
+            }
+            if line == "Latest assistant summary:" {
+                in_active_tasks = false;
+                in_summary = true;
+                continue;
+            }
+            if line == "[Session memory recap]"
+                || line.starts_with("Recent tools: ")
+                || line.starts_with("Artifact: ")
+            {
+                in_active_tasks = false;
+                in_summary = false;
+                continue;
+            }
+
+            if in_active_tasks {
+                active_task_board.push(line.trim_start_matches("- ").to_string());
+            } else if in_summary {
+                summary_lines.push(line.to_string());
+            }
+        }
+
+        if assistant_direction.is_none() && !summary_lines.is_empty() {
+            assistant_direction = Some(summary_lines.join(" "));
+        }
+
+        (latest_user_task, assistant_direction, active_task_board)
+    }
+}
+
+impl std::ops::Deref for ContinuationAnchor {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
+    }
+}
+
+impl AsRef<str> for ContinuationAnchor {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for ContinuationAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl From<String> for ContinuationAnchor {
+    fn from(text: String) -> Self {
+        Self::from_rendered(text)
+    }
+}
+
+impl From<&str> for ContinuationAnchor {
+    fn from(text: &str) -> Self {
+        Self::from_rendered(text)
+    }
+}
+
 /// Adaptive engine state persisted between sessions.
 /// Holds anti-flap dampening, experiment enrollment, and tuned config so the
 /// adaptive engine doesn't oscillate or lose progress on session restart.
@@ -103,7 +229,7 @@ pub(crate) struct SessionState {
     pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
-    pub continuation_anchor: Option<String>,
+    pub continuation_anchor: Option<ContinuationAnchor>,
     /// One-shot diagnostics context injected by `/ask`. Prepended to the next
     /// user message so the LLM sees runtime state alongside the question.
     /// Consumed (cleared) after one turn.

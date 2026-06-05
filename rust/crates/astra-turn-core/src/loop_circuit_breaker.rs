@@ -110,6 +110,29 @@ pub struct BreakerConfig {
     pub absolute_max_rounds: usize,
 }
 
+impl BreakerConfig {
+    /// Tune the generic breaker thresholds for the active objective.
+    ///
+    /// The breaker itself only sees round-level progress signals; this method
+    /// injects the missing goal semantics at configuration time. For mutating
+    /// work, read-only novelty is useful only briefly, so prolonged read-only
+    /// work should settle earlier. Read-only analysis/review keeps the wider
+    /// defaults because novel evidence is the work product.
+    #[must_use]
+    pub fn for_task_profile(
+        mut self,
+        profile: crate::chat_turn_heuristics::TaskExecutionProfile,
+    ) -> Self {
+        if profile.mutates_workspace {
+            self.read_only_stall_threshold = self
+                .read_only_stall_threshold
+                .min(self.stall_threshold.max(4));
+            self.max_introspect_emissions = self.max_introspect_emissions.min(1);
+        }
+        self
+    }
+}
+
 impl Default for BreakerConfig {
     fn default() -> Self {
         Self {
@@ -456,6 +479,7 @@ impl Default for LoopCircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_turn_heuristics::infer_task_execution_profile;
 
     fn sig(tools: &[&str]) -> BTreeSet<String> {
         tools.iter().map(|s| s.to_string()).collect()
@@ -543,6 +567,40 @@ mod tests {
 
         assert_eq!(cb.observe(done), BreakerAction::SoftStop);
         assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn mutating_objective_tightens_read_only_stall_threshold() {
+        let profile = infer_task_execution_profile("fix the runtime bug");
+        assert!(profile.mutates_workspace);
+
+        let cfg = BreakerConfig {
+            stall_threshold: 6,
+            read_only_stall_threshold: 12,
+            max_introspect_emissions: 3,
+            ..Default::default()
+        }
+        .for_task_profile(profile);
+
+        assert_eq!(cfg.read_only_stall_threshold, 6);
+        assert_eq!(cfg.max_introspect_emissions, 1);
+    }
+
+    #[test]
+    fn read_only_review_keeps_wider_exploration_threshold() {
+        let profile = infer_task_execution_profile("review local changes");
+        assert!(!profile.mutates_workspace);
+
+        let cfg = BreakerConfig {
+            stall_threshold: 6,
+            read_only_stall_threshold: 12,
+            max_introspect_emissions: 3,
+            ..Default::default()
+        }
+        .for_task_profile(profile);
+
+        assert_eq!(cfg.read_only_stall_threshold, 12);
+        assert_eq!(cfg.max_introspect_emissions, 3);
     }
 
     #[test]

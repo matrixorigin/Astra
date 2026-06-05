@@ -74,13 +74,6 @@ pub(crate) async fn resolve_one_shot_session_routing(
     }
 
     if let Some(session_id) = current_session_id {
-        if !local_continuation_available(&session_id) {
-            return Ok(select_one_shot_session_routing(
-                Some(session_id),
-                None,
-                None,
-            ));
-        }
         return Ok(
             match preflight_remote_resume_session(api, profile, &session_id).await {
                 super::cli_utils::SessionResumePreflight::Missing => {
@@ -276,7 +269,7 @@ mod tests {
         mock_empty_cloud_resumable_list(&server).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let routing = resolve_one_shot_session_routing(&api, None, None, true)
+        let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
             .await
             .expect("routing should resolve");
 
@@ -288,6 +281,7 @@ mod tests {
             routing.history_source_session_id.as_deref(),
             Some(session_id.as_str())
         );
+        assert_eq!(routing.task_scope_session_id(), None);
 
         let continuation = routing
             .continuation_messages()
@@ -295,6 +289,39 @@ mod tests {
         assert_eq!(continuation.len(), 2);
         assert_eq!(continuation[0]["content"], "previous question");
         assert_eq!(continuation[1]["content"], "previous answer");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_rejects_missing_explicit_session_without_local_history()
+     {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                last_session_id: Some(session_id.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_missing_session(&server, &session_id).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = resolve_one_shot_session_routing(&api, None, Some(session_id.clone()), true)
+            .await
+            .expect_err("missing explicit session should fail even without local continuation");
+
+        assert!(
+            error.contains("does not exist"),
+            "explicit stale session should fail closed before the turn request: {error}"
+        );
     }
 
     #[serial_test::serial]

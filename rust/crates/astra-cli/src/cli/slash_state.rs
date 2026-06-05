@@ -59,6 +59,7 @@ impl<'a> CompactCtx<'a> {
             token: self.token,
             auth_profile: self.profile,
             message,
+            semantic_query_override: None,
             session_id: self.state.session_id.as_deref(),
             model: self.state.model.as_deref(),
             provider: None,
@@ -141,7 +142,7 @@ struct HistoryEditSnapshot {
     redo_stack: Vec<(String, String, u32)>,
     turn: u32,
     last_response: Option<String>,
-    continuation_anchor: Option<String>,
+    continuation_anchor: Option<ContinuationAnchor>,
     recent_tools: Vec<String>,
 }
 
@@ -2158,7 +2159,7 @@ mod tests {
     #[test]
     fn undo_clears_continuation_anchor() {
         let mut state = state_with_turns(3);
-        state.continuation_anchor = Some("some anchor".to_string());
+        state.continuation_anchor = Some("some anchor".into());
         // Simulate undo
         state.history.pop();
         state.turn = state.turn.saturating_sub(1);

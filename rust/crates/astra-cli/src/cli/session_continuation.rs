@@ -39,11 +39,7 @@ pub(crate) fn sanitize_continuation_messages(
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content_text = extract_text_content(m);
         let content = content_text.as_deref().unwrap_or("");
-        match role {
-            "user" => !is_runtime_injected_user_msg(content),
-            "system" => !is_runtime_injected_system_msg(content),
-            _ => true,
-        }
+        !astra_turn_core::runtime_scaffolding::is_continuation_scaffolding_for_role(role, content)
     });
     trim_trailing_incomplete_tool_round(&mut msgs);
     msgs
@@ -123,25 +119,6 @@ pub(crate) fn history_pairs_from_messages(msgs: &[serde_json::Value]) -> Vec<(St
     }
 
     pairs
-}
-
-fn is_runtime_injected_user_msg(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with("## ⚠ Sequential Tool Calls Detected")
-        || trimmed.starts_with("✓ Previous round:")
-        || trimmed.starts_with("[attention:")
-        || trimmed.starts_with("[working-set:")
-        || trimmed.starts_with("[session-anchor]")
-}
-
-fn is_runtime_injected_system_msg(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with("[working-set:")
-        || trimmed.starts_with("[attention:")
-        || trimmed.starts_with("[session-anchor]")
-        || trimmed.starts_with("## Already Fetched")
-        || trimmed.starts_with("## Cross-Session Project Context")
-        || trimmed.starts_with("✓ Previous round:")
 }
 
 /// If the conversation ends with an incomplete tool round (assistant tool_use
@@ -265,6 +242,21 @@ mod tests {
         assert_eq!(result[0]["content"], "review code");
         assert_eq!(result[1]["content"], "Here is the review...");
         assert_eq!(result[2]["content"], "你好");
+    }
+
+    #[test]
+    fn sanitize_strips_active_task_attachment_wrappers() {
+        let msgs = vec![
+            json!({"role": "user", "content": "review code"}),
+            json!({"role": "user", "content": "[Active task attachment]\nResume the active task/thread below unless the user explicitly changes topic.\n[User follow-up]\n继续"}),
+            json!({"role": "assistant", "content": "Here is the review..."}),
+        ];
+
+        let result = super::sanitize_continuation_messages(msgs);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["content"], "review code");
+        assert_eq!(result[1]["content"], "Here is the review...");
     }
 
     #[test]

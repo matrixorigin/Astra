@@ -395,6 +395,70 @@ pub enum Scenario {
     QuickAnswer,
 }
 
+/// Semantic turn intent produced by an upstream judge/classifier.
+///
+/// This type is deliberately structural: the runtime policy consumes the
+/// requested/prohibited scenarios deterministically and does not parse natural
+/// language negations itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TurnIntent {
+    /// Scenario the current user turn asks to enter, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_scenario: Option<Scenario>,
+    /// Scenarios the current user turn explicitly forbids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prohibited_scenarios: Vec<Scenario>,
+    /// Whether the user is continuing the current objective rather than
+    /// starting a fresh scenario.
+    #[serde(default)]
+    pub continuation_mode: TurnContinuationMode,
+}
+
+impl TurnIntent {
+    #[must_use]
+    pub fn with_requested_scenario(mut self, scenario: Scenario) -> Self {
+        self.requested_scenario = Some(scenario);
+        self
+    }
+
+    #[must_use]
+    pub fn with_continuation_mode(mut self, mode: TurnContinuationMode) -> Self {
+        self.continuation_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn prohibit_scenario(mut self, scenario: Scenario) -> Self {
+        if !self.prohibited_scenarios.contains(&scenario) {
+            self.prohibited_scenarios.push(scenario);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn allows_scenario(&self, scenario: Scenario) -> bool {
+        !self.prohibited_scenarios.contains(&scenario)
+    }
+
+    #[must_use]
+    pub fn continues_current_objective(&self) -> bool {
+        self.continuation_mode == TurnContinuationMode::ContinueCurrentObjective
+    }
+}
+
+/// LLM-judged relationship between this turn and the existing objective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnContinuationMode {
+    /// No reliable continuation signal was supplied.
+    #[default]
+    Unknown,
+    /// The user is asking to proceed with the existing objective.
+    ContinueCurrentObjective,
+    /// The user is starting or replacing with a new objective.
+    NewObjective,
+}
+
 impl Scenario {
     /// Get recommended tool preferences for this scenario.
     pub fn recommended_tools(&self) -> Vec<&'static str> {
@@ -1023,6 +1087,28 @@ mod tests {
         profile.leave_experiment("exp-001");
         assert_eq!(profile.active_experiments.len(), 1);
         assert_eq!(profile.active_experiments[0], "exp-002");
+    }
+
+    #[test]
+    fn turn_intent_tracks_requested_and_prohibited_scenarios() {
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::Implementation)
+            .prohibit_scenario(Scenario::CodeReview)
+            .prohibit_scenario(Scenario::CodeReview);
+
+        assert_eq!(intent.requested_scenario, Some(Scenario::Implementation));
+        assert!(intent.allows_scenario(Scenario::Implementation));
+        assert!(!intent.allows_scenario(Scenario::CodeReview));
+        assert_eq!(intent.prohibited_scenarios, vec![Scenario::CodeReview]);
+    }
+
+    #[test]
+    fn turn_intent_continuation_mode_is_explicit() {
+        let intent = TurnIntent::default()
+            .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
+
+        assert!(intent.continues_current_objective());
+        assert!(!TurnIntent::default().continues_current_objective());
     }
 
     #[test]

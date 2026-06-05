@@ -1581,20 +1581,8 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     // round-cadence detection — otherwise the single-tool-streak
     // counter always returns 0 on live sessions and the
     // parallel-batching force never fires.
-    if content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX) {
-        return true;
-    }
-    // Legacy attention manifest carried as a `role:user` scaffolding
-    // message. Emission was dropped in wip-3; this check remains so
-    // restored checkpoints from older versions still route around it.
-    content.starts_with("[attention:v1]\n")
+    astra_turn_core::runtime_scaffolding::is_trailing_user_runtime_scaffolding(content)
 }
-
-/// Wrapper tag applied by the volatile lane to mark runtime-injected
-/// scaffolding carried on a `role=user` message (git state / self-
-/// awareness / volatile nudges). See `wire_assembly`, `bridge_inprocess`,
-/// and `server_loop_host` for producers.
-const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
 
 fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
     messages
