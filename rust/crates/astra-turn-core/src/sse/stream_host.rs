@@ -1043,7 +1043,7 @@ mod tests {
             fn on_stream_complete(&mut self) {}
 
             fn on_session_id(&mut self, session_id: &str) {
-                self.0.lock().unwrap().push(format!("session:{session_id}"));
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("session:{session_id}"));
             }
 
             async fn execute_tool(
@@ -1052,7 +1052,7 @@ mod tests {
                 tool: &str,
                 args: &Value,
             ) -> EdgeToolExecResult {
-                self.0.lock().unwrap().push(format!("tool:{request_id}"));
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("tool:{request_id}"));
                 EdgeToolExecResult {
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -1092,7 +1092,7 @@ mod tests {
         assert!(abort.is_none());
         assert_eq!(result.accum.session_id.as_deref(), Some("sess-hook"));
         assert_eq!(
-            order.lock().unwrap().as_slice(),
+            order.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
             &["session:sess-hook".to_string(), "tool:tr-1".to_string()]
         );
     }
@@ -1758,7 +1758,7 @@ mod tests {
                 &mut self,
                 requests: Vec<ToolBatchRequest>,
             ) -> Vec<EdgeToolExecResult> {
-                self.0.lock().unwrap().push(requests.len());
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(requests.len());
                 requests
                     .into_iter()
                     .map(|req| EdgeToolExecResult {
@@ -1821,7 +1821,7 @@ mod tests {
         assert!(abort.is_none(), "unexpected abort: {abort:?}");
         assert_eq!(result.tool_results.len(), 3);
         assert_eq!(
-            *batch_sizes.lock().unwrap(),
+            *batch_sizes.lock().unwrap_or_else(|e| e.into_inner()),
             vec![3],
             "agent spawn requests should execute as one parallel batch"
         );
@@ -1854,7 +1854,7 @@ mod tests {
                 tool: &str,
                 args: &Value,
             ) -> EdgeToolExecResult {
-                self.0.lock().unwrap().push(tool.to_string());
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(tool.to_string());
                 EdgeToolExecResult {
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
@@ -1892,7 +1892,7 @@ mod tests {
 
         assert!(abort.is_none());
         assert_eq!(result.tool_results.len(), 2);
-        let exec_order = order.lock().unwrap();
+        let exec_order = order.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             exec_order[0], "skill",
             "skill should execute before bash, got: {:?}",
@@ -2100,7 +2100,7 @@ mod tests {
         assert!(abort.is_none());
 
         // Both approval and tool execution should be recorded.
-        let recorded = ops.lock().unwrap();
+        let recorded = ops.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             recorded.len(),
             2,
@@ -2200,7 +2200,7 @@ mod tests {
                 tool: &str,
                 args: &Value,
             ) -> EdgeToolExecResult {
-                self.0.lock().unwrap().push(format!("exec:{rid}:{tool}"));
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("exec:{rid}:{tool}"));
                 EdgeToolExecResult {
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
@@ -2220,7 +2220,7 @@ mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
             ) -> EdgeApprovalResult {
-                self.0.lock().unwrap().push(format!("approve:{rid}:{tool}"));
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(format!("approve:{rid}:{tool}"));
                 EdgeApprovalResult {
                     request_id: rid.to_string(),
                     decision: "allow".to_string(),
@@ -2259,7 +2259,7 @@ mod tests {
         .await;
         assert!(abort.is_none(), "unexpected abort: {abort:?}");
 
-        let recorded = ops.lock().unwrap().clone();
+        let recorded = ops.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
             recorded.len(),
             2,

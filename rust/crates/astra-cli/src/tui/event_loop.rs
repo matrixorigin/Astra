@@ -20,6 +20,7 @@ use std::{sync::Arc, time::Duration};
 
 #[cfg(test)]
 use astra_services::session_journal::ToolCallRecord;
+use crate::lock_recovery::LockRecovery;
 use astra_services::session_journal::{JournalEvent, JournalEventType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use tokio::sync::broadcast;
@@ -2995,7 +2996,7 @@ pub(crate) async fn run_tui_session(
                 // Drain background task commands from the tool executor.
                 {
                     let cmds: Vec<_> = {
-                        state.bg_task_commands.lock().unwrap().drain(..).collect()
+                        state.bg_task_commands.lock_recover().drain(..).collect()
                     };
                     for cmd in cmds {
                         match cmd {

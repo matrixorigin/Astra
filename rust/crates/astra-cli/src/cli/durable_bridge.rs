@@ -875,6 +875,7 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use astra_services::durable_task::VerifierKind;
     use astra_services::durable_task::{
         ContractStatus, DurableSubtask, SubtaskExecutionContext, SubtaskStage,
@@ -960,7 +961,7 @@ mod tests {
         }
 
         fn amend_calls(&self) -> usize {
-            *self.amend_calls.lock().unwrap()
+            *self.amend_calls.lock_recover()
         }
     }
 
@@ -985,7 +986,7 @@ mod tests {
             _: &str,
             amendment: ContractAmendment,
         ) -> Result<astra_services::TaskContract, String> {
-            *self.amend_calls.lock().unwrap() += 1;
+            *self.amend_calls.lock_recover() += 1;
             if let Some(error) = &self.amend_error {
                 return Err(error.clone());
             }
@@ -1160,7 +1161,7 @@ mod tests {
                 _: &str,
                 _: &str,
             ) -> Result<SubtaskVerificationReport, String> {
-                *self.verify_calls.lock().unwrap() += 1;
+                *self.verify_calls.lock_recover() += 1;
                 Ok(SubtaskVerificationReport {
                     subtask_id: "s1".into(),
                     results: vec![],
@@ -1220,7 +1221,7 @@ mod tests {
 
         assert!(!passed);
         assert!(report.is_none());
-        assert_eq!(*lifecycle.verify_calls.lock().unwrap(), 0);
+        assert_eq!(*lifecycle.verify_calls.lock_recover(), 0);
         assert!(matches!(
             durable.contract.subtasks[0].stage,
             SubtaskStage::ExecutionFailed { .. }
@@ -2436,7 +2437,7 @@ mod tests {
                 async move {
                     // Capture the model field from the request
                     if let Some(m) = body["model"].as_str() {
-                        *cap.lock().unwrap() = m.to_string();
+                        *cap.lock_recover() = m.to_string();
                     }
                     Json(serde_json::json!({
                         "id": "mock-1",
@@ -2462,7 +2463,7 @@ mod tests {
             ServerProxyLlmJudge::new(api, "fake-token".into(), Some("custom-model-v2".into()));
 
         let _score = judge.evaluate("test", "test context").await.unwrap();
-        assert_eq!(*captured.lock().unwrap(), "custom-model-v2");
+        assert_eq!(*captured.lock_recover(), "custom-model-v2");
         server.abort();
     }
 
@@ -2498,14 +2499,14 @@ mod tests {
         }
 
         fn call_count(&self) -> usize {
-            self.calls.lock().unwrap().len()
+            self.calls.lock_recover().len()
         }
     }
 
     #[async_trait::async_trait]
     impl LlmJudge for FakeJudge {
         async fn evaluate(&self, prompt: &str, _context: &str) -> Result<f64, String> {
-            self.calls.lock().unwrap().push(prompt.to_string());
+            self.calls.lock_recover().push(prompt.to_string());
             Ok(self.score)
         }
     }

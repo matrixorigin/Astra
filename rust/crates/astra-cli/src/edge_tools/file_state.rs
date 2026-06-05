@@ -544,6 +544,7 @@ fn enforce_limits(state: &mut HashMap<PathBuf, FileState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
 
     #[test]
     fn merge_range_u64_max_no_overflow() {
@@ -696,7 +697,7 @@ mod tests {
             },
         );
 
-        let state = exe.file_state.lock().unwrap();
+        let state = exe.file_state.lock_recover();
         let fs = state.get(&key).unwrap();
         // Both ranges persist across the turn boundary because mtime is
         // unchanged. They merge into [(1, 4)].
@@ -735,7 +736,7 @@ mod tests {
         exe.record_read(&file, false, ReadDedupKey::Full);
         exe.record_write(&file);
 
-        let state = exe.file_state.lock().unwrap();
+        let state = exe.file_state.lock_recover();
         let fs = state.get(&key).unwrap();
         assert!(!fs.from_read);
         assert!(fs.read_ranges.is_empty());

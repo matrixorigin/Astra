@@ -140,18 +140,21 @@ pub(crate) mod test_support {
             }
         }
         pub fn seed_ok(&self, session_id: &str, json: serde_json::Value) {
-            self.results.lock().unwrap().insert(
-                session_id.to_string(),
-                Ok(DigestArtifact {
-                    session_id: session_id.to_string(),
-                    json,
-                }),
-            );
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    session_id.to_string(),
+                    Ok(DigestArtifact {
+                        session_id: session_id.to_string(),
+                        json,
+                    }),
+                );
         }
         pub fn seed_err(&self, session_id: &str, err: &str) {
             self.results
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(session_id.to_string(), Err(err.to_string()));
         }
     }
@@ -159,10 +162,13 @@ pub(crate) mod test_support {
     #[async_trait]
     impl DigestCollector for FakeDigestCollector {
         async fn collect(&self, session_id: &str) -> Result<DigestArtifact, String> {
-            self.calls.lock().unwrap().push(session_id.to_string());
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(session_id.to_string());
             self.results
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(session_id)
                 .cloned()
                 .unwrap_or_else(|| Err(format!("fake: no seed for {session_id}")))
@@ -232,7 +238,7 @@ mod tests {
         let got = c.collect("sess-1").await.unwrap();
         assert_eq!(got.session_id, "sess-1");
         assert_eq!(got.json["turns"], 4);
-        assert_eq!(c.calls.lock().unwrap().len(), 1);
+        assert_eq!(c.calls.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
     }
 
     #[tokio::test]

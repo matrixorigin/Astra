@@ -12,8 +12,8 @@
 //! - `snapshot()` takes a non-consuming snapshot, safe on poisoned mutexes.
 
 use astra_services::session_journal::ToolCallRecord;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Backpressure cap: oldest records are evicted when this is exceeded.
 const MAX_TOOL_RECORDS: usize = 200;
@@ -463,7 +463,10 @@ mod tests {
         // Poison the partial_text mutex by panicking while holding the lock.
         let state_clone = state.clone();
         let handle = std::thread::spawn(move || {
-            let _guard = state_clone.partial_text.lock().unwrap();
+            let _guard = state_clone
+                .partial_text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             panic!("deliberate poison");
         });
         let _ = handle.join(); // thread panicked → mutex is poisoned

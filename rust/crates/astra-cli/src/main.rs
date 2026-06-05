@@ -28,6 +28,7 @@ mod skill_instructions;
 mod test_utils;
 
 mod cli;
+mod lock_recovery;
 mod explain_dag;
 
 mod diff_utils;

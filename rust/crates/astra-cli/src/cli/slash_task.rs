@@ -626,6 +626,7 @@ pub(crate) async fn find_task_by_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -714,7 +715,7 @@ mod tests {
             if let Some(error) = &self.save_checkpoint_error {
                 return Err(error.clone());
             }
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock_recover();
             state.saved_checkpoint = true;
             state.checkpoint = Some(checkpoint.clone());
             Ok(())
@@ -728,7 +729,7 @@ mod tests {
             if let Some(fail_error) = &self.fail_task_error {
                 return Err(fail_error.clone());
             }
-            self.state.lock().unwrap().failed_error = Some(error.to_string());
+            self.state.lock_recover().failed_error = Some(error.to_string());
             Ok(())
         }
 
@@ -736,7 +737,7 @@ mod tests {
             if let Some(error) = &self.complete_task_error {
                 return Err(error.clone());
             }
-            self.state.lock().unwrap().completed = true;
+            self.state.lock_recover().completed = true;
             Ok(())
         }
 
@@ -748,7 +749,7 @@ mod tests {
             _: u32,
             outcome: astra_services::TaskOutcome,
         ) -> Result<(), String> {
-            self.state.lock().unwrap().completed_outcome = Some(outcome);
+            self.state.lock_recover().completed_outcome = Some(outcome);
             Ok(())
         }
 
@@ -757,7 +758,7 @@ mod tests {
             _: &str,
             outcome: astra_services::TaskOutcome,
         ) -> Result<(), String> {
-            self.state.lock().unwrap().completed_outcome = Some(outcome);
+            self.state.lock_recover().completed_outcome = Some(outcome);
             Ok(())
         }
 
@@ -846,7 +847,7 @@ mod tests {
             _: &str,
             _: usize,
         ) -> Result<Vec<astra_services::TaskListItem>, String> {
-            self.users.lock().unwrap().push(user_id.to_string());
+            self.users.lock_recover().push(user_id.to_string());
             Ok(self.results.clone())
         }
 
@@ -1042,7 +1043,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        let snapshot = state.lock().unwrap();
+        let snapshot = state.lock_recover();
         assert!(snapshot.failed_error.is_some());
         assert!(!snapshot.completed);
         assert_eq!(
@@ -1078,7 +1079,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = state.lock().unwrap();
+        let snapshot = state.lock_recover();
         assert_eq!(outcome, astra_services::TaskOutcome::Success);
         assert!(snapshot.saved_checkpoint);
         assert!(snapshot.completed);
@@ -1111,7 +1112,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = state.lock().unwrap();
+        let snapshot = state.lock_recover();
         assert_eq!(outcome, astra_services::TaskOutcome::Partial);
         assert!(snapshot.saved_checkpoint);
         assert!(!snapshot.completed);
@@ -1146,7 +1147,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        let snapshot = state.lock().unwrap();
+        let snapshot = state.lock_recover();
         assert!(snapshot.saved_checkpoint);
         assert!(!snapshot.completed);
         assert!(snapshot.completed_outcome.is_none());
@@ -1190,7 +1191,7 @@ mod tests {
 
         let found = find_task_by_query(&svc, "user-123", "Build").await.unwrap();
         assert_eq!(found.as_deref(), Some("task-123"));
-        assert_eq!(users.lock().unwrap().as_slice(), ["user-123"]);
+        assert_eq!(users.lock_recover().as_slice(), ["user-123"]);
     }
 
     #[tokio::test]

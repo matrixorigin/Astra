@@ -539,7 +539,7 @@ fn place_cache_markers(
 mod tests {
     use super::*;
     use crate::context_binder::bind_all;
-    use crate::context_planner::{PlanInput, plan_turn};
+    use crate::context_planner::{plan_turn, PlanInput};
     use crate::context_sources::*;
     use crate::emergent_context::EmergentContext;
     use crate::microcompact::{CompactStrategy, ProviderCacheStrategy};
@@ -759,15 +759,11 @@ mod tests {
 
         let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         assert_eq!(result.stats.tool_results_cleared, 0);
-        assert!(
-            result
-                .stats
-                .skipped
-                .iter()
-                .any(|s| s.step == "tool_result_clearing"
-                    || s.step == "reorder"
-                    || s.step == "spill")
-        );
+        assert!(result
+            .stats
+            .skipped
+            .iter()
+            .any(|s| s.step == "tool_result_clearing" || s.step == "reorder" || s.step == "spill"));
     }
 
     #[test]
@@ -1269,7 +1265,7 @@ mod tests {
     #[test]
     fn rehydrate_sections_restores_spilled_section_content() {
         use crate::spill_backend::{
-            DEFAULT_SCHEME, FileSystemSpillBackend, SpillBackend, SpillRegistry,
+            FileSystemSpillBackend, SpillBackend, SpillRegistry, DEFAULT_SCHEME,
         };
         use std::sync::Arc;
         use tempfile::TempDir;
@@ -1407,7 +1403,7 @@ mod tests {
 
         impl crate::spill_backend::SpillBackend for InMemorySpillBackend {
             fn store(&self, key_hint: &str, _bytes: &[u8]) -> std::io::Result<String> {
-                let mut n = self.counter.lock().unwrap();
+                let mut n = self.counter.lock().unwrap_or_else(|e| e.into_inner());
                 *n += 1;
                 Ok(format!("memory://{key_hint}-{}", *n))
             }

@@ -4,8 +4,8 @@
 //! Registration with the runtime's `MetricsRegistry` happens externally
 //! (via `register_with`) to avoid a cyclic crate dependency.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ─── Latency Tracker ───────────────────────────────────────────────────────
@@ -42,12 +42,20 @@ impl LatencyTracker {
         let _ = self
             .min_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if us < cur { Some(us) } else { None }
+                if us < cur {
+                    Some(us)
+                } else {
+                    None
+                }
             });
         let _ = self
             .max_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if us > cur { Some(us) } else { None }
+                if us > cur {
+                    Some(us)
+                } else {
+                    None
+                }
             });
     }
 
@@ -231,15 +239,26 @@ mod tests {
         }
 
         fn registrations(&self) -> Vec<(String, String)> {
-            self.registered.lock().unwrap().clone()
+            self.registered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         fn gauge(&self, name: &str) -> Option<f64> {
-            self.gauges.lock().unwrap().get(name).copied()
+            self.gauges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .copied()
         }
 
         fn counter(&self, name: &str) -> Option<u64> {
-            self.counters.lock().unwrap().get(name).copied()
+            self.counters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .copied()
         }
     }
 
@@ -259,11 +278,17 @@ mod tests {
         }
 
         fn set_gauge(&self, name: &str, value: f64) {
-            self.gauges.lock().unwrap().insert(name.into(), value);
+            self.gauges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.into(), value);
         }
 
         fn set_counter(&self, name: &str, value: u64) {
-            self.counters.lock().unwrap().insert(name.into(), value);
+            self.counters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.into(), value);
         }
     }
 

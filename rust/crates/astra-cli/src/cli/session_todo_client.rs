@@ -14,7 +14,7 @@
 #[cfg(test)]
 use crate::cli::session_task_surface::session_task_is_completed;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -254,11 +254,12 @@ impl TaskStore for HttpTaskStore {
 #[cfg(test)]
 mod wiring_e2e {
     use super::*;
-    use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
+    use crate::lock_recovery::LockRecovery;
+    use crate::tui::task_board_observer::{TaskBoardObserver, COMPLETED_TASK_TTL};
     use astra_tools::task_mgmt::{SessionTask, TaskStore};
     use serde_json::json;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -279,7 +280,7 @@ mod wiring_e2e {
         Mock::given(method("GET"))
             .and(wiremock::matchers::path_regex(r"^/sessions/[^/]+/todos$"))
             .respond_with(move |_req: &Request| {
-                let tasks = state_get.lock().unwrap().clone();
+                let tasks = state_get.lock_recover().clone();
                 ResponseTemplate::new(200).set_body_json(json!({ "tasks": tasks }))
             })
             .mount(&server)
@@ -296,7 +297,7 @@ mod wiring_e2e {
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 let args = body.get("args").cloned().unwrap_or(Value::Null);
-                let mut tasks = state_exec.lock().unwrap();
+                let mut tasks = state_exec.lock_recover();
                 let output = match action {
                     "create" => {
                         let next = counter_exec.fetch_add(1, Ordering::SeqCst) + 1;
@@ -358,7 +359,11 @@ mod wiring_e2e {
             pump();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if cond() { Ok(start.elapsed()) } else { Err(()) }
+        if cond() {
+            Ok(start.elapsed())
+        } else {
+            Err(())
+        }
     }
 
     /// REGRESSION: `route_task_action` POSTs to the cloud on a `task.create`,

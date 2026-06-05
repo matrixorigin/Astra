@@ -52,8 +52,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -62,10 +62,10 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
-use crate::ToolExecutor;
 use crate::rpc_bridge::{
-    AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO, handle_rpc_connection, kill_process_group,
+    handle_rpc_connection, kill_process_group, AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO,
 };
+use crate::ToolExecutor;
 
 // Re-export only what external callers need. The char-boundary helpers are
 // implementation details of `truncate_head_tail`; keep them crate-private.
@@ -793,7 +793,10 @@ fn python_cache() -> &'static std::sync::Mutex<Vec<(String, PythonFingerprint, b
 /// Clear the version-probe cache. Test-only.
 #[cfg(test)]
 pub(crate) fn clear_python_cache() {
-    python_cache().lock().unwrap().clear();
+    python_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Check if a Python interpreter is usable (>= 3.8). Cached per
@@ -804,7 +807,7 @@ pub(crate) fn clear_python_cache() {
 fn is_usable_python(path: &str) -> bool {
     let fingerprint = PythonFingerprint::for_path(path);
     {
-        let cache = python_cache().lock().unwrap();
+        let cache = python_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, _, hit)) = cache
             .iter()
             .find(|(k, fp, _)| k == path && *fp == fingerprint)
@@ -824,7 +827,7 @@ fn is_usable_python(path: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    let mut cache = python_cache().lock().unwrap();
+    let mut cache = python_cache().lock().unwrap_or_else(|e| e.into_inner());
     // Remove any stale entry for this path (different fingerprint) — we
     // just learned the up-to-date answer, keep only one entry per path.
     cache.retain(|(k, _, _)| k != path);
@@ -1249,7 +1252,10 @@ mod tests {
             }
         }
         fn call_count(&self) -> usize {
-            self.call_log.lock().unwrap().len()
+            self.call_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
         }
     }
     #[async_trait]
@@ -1257,7 +1263,7 @@ mod tests {
         async fn execute(&self, name: &str, args: &Value) -> ToolResult {
             self.call_log
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((name.to_string(), args.clone()));
             match name {
                 "read_file" => {
@@ -2089,7 +2095,10 @@ mod tests {
         for i in 0..(PYTHON_CACHE_CAP + 10) {
             let _ = is_usable_python(&format!("/nonexistent/probe-{i}"));
         }
-        let size = python_cache().lock().unwrap().len();
+        let size = python_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         assert!(
             size <= PYTHON_CACHE_CAP,
             "cache should never exceed cap={PYTHON_CACHE_CAP}, got {size}"
@@ -2109,7 +2118,7 @@ mod tests {
         for i in 0..total {
             let _ = is_usable_python(&format!("/nonexistent/recent-{i}"));
         }
-        let cache = python_cache().lock().unwrap();
+        let cache = python_cache().lock().unwrap_or_else(|e| e.into_inner());
         // Last inserted path MUST be present.
         let last_path = format!("/nonexistent/recent-{}", total - 1);
         assert!(

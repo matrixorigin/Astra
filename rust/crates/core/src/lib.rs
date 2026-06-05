@@ -283,7 +283,7 @@ mod connection_quota_tests {
     fn poison_recovery_after_panic() {
         // First, simulate a poison by panicking inside a locked scope
         let _ = std::panic::catch_unwind(|| {
-            let _g = TEST_MUTEX.lock().unwrap();
+            let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             panic!("simulated test panic while holding mutex");
         });
 

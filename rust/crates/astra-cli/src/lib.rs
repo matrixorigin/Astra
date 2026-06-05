@@ -31,6 +31,7 @@ pub mod diff_utils;
 pub mod edge_tools;
 pub mod explain_dag;
 pub mod git_branch_cache;
+pub mod lock_recovery;
 pub mod manifest_loader;
 pub mod mcp_client;
 pub mod sandbox_retry;

@@ -3586,7 +3586,7 @@ mod tests {
             let captured = captured.clone();
             let resp = response_body.clone();
             async move {
-                *captured.lock().unwrap() = Some(body);
+                *captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
                 axum::Json(resp)
             }
         };

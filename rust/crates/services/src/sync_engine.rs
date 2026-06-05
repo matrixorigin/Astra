@@ -1459,7 +1459,10 @@ mod tests {
             _local: &SyncPayload,
             _remote: &SyncPayload,
         ) -> Result<SyncPayload, SyncError> {
-            self.resolved_strategies.lock().unwrap().push(strategy);
+            self.resolved_strategies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(strategy);
             Ok(test_payload())
         }
 
@@ -1468,11 +1471,14 @@ mod tests {
         }
 
         fn envelope(&self) -> SyncEnvelope {
-            self.envelope.lock().unwrap().clone()
+            self.envelope
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         fn set_envelope(&self, envelope: SyncEnvelope) {
-            *self.envelope.lock().unwrap() = envelope;
+            *self.envelope.lock().unwrap_or_else(|e| e.into_inner()) = envelope;
         }
     }
 
@@ -1499,7 +1505,7 @@ mod tests {
             _payload: &SyncPayload,
             _expected_version: Option<u64>,
         ) -> Result<PushResult, SyncError> {
-            let mut pushes = self.pushes.lock().unwrap();
+            let mut pushes = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
             *pushes += 1;
             if *pushes == 1 {
                 Ok(PushResult {
@@ -1559,15 +1565,19 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(
-            adapter.resolved_strategies.lock().unwrap().as_slice(),
+            adapter
+                .resolved_strategies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
             &[ConflictStrategy::UnionMerge]
         );
-        assert!(
-            orch.event_log().iter().any(|event| matches!(
-                event.operation,
-                SyncOperation::ConflictResolve
-            ) && event.success)
-        );
+        assert!(orch
+            .event_log()
+            .iter()
+            .any(
+                |event| matches!(event.operation, SyncOperation::ConflictResolve) && event.success
+            ));
     }
 
     struct SharedMockAdapter(Arc<MockAdapter>);

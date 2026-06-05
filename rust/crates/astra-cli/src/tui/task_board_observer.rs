@@ -651,6 +651,7 @@ fn same_board(a: &[SessionTask], b: &[SessionTask]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager};
     use serde_json::json;
 
@@ -688,7 +689,7 @@ mod tests {
         // The fix path must respect both the dirty flag and the
         // window so this seeding still gates on FAST_POLL elapsing.
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.last_fetch = Instant::now()
                 .checked_sub(Duration::from_millis(60))
                 .unwrap_or_else(Instant::now);
@@ -753,7 +754,7 @@ mod tests {
         // Force the TTL clock backwards so the row is older than the
         // window without a 30s sleep in unit tests.
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.completed_at.insert(
                 "task-1".to_string(),
                 Instant::now()
@@ -804,7 +805,7 @@ mod tests {
             1,
             "observer must adopt the broadcast sid and surface mid-turn writes"
         );
-        let st = obs.inner.state.lock().unwrap();
+        let st = obs.inner.state.lock_recover();
         assert_eq!(st.session_id, "sess-mid-turn");
     }
 
@@ -892,7 +893,7 @@ mod tests {
         // state and force `hide_at` into the past, then one more tick
         // flips `hidden`.
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.hide_at = Some(
                 Instant::now()
                     .checked_sub(Duration::from_secs(1))
@@ -923,7 +924,7 @@ mod tests {
         )
         .await;
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.snapshot.hidden = true;
         }
 
@@ -963,7 +964,7 @@ mod tests {
         )
         .await;
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.snapshot.hidden = true;
             st.hide_at = None;
             st.last_fetch = Instant::now()
@@ -988,7 +989,7 @@ mod tests {
         )
         .await;
 
-        let st = obs.inner.state.lock().unwrap();
+        let st = obs.inner.state.lock_recover();
         assert!(
             st.hide_at.is_none(),
             "manual reveal should pin completed board open until the user collapses it"
@@ -1016,7 +1017,7 @@ mod tests {
         )
         .await;
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.snapshot.hidden = false;
             st.hide_at = Some(Instant::now() + HIDE_DELAY);
         }
@@ -1026,7 +1027,7 @@ mod tests {
             "manual expansion during hide grace should still pin the board"
         );
 
-        let st = obs.inner.state.lock().unwrap();
+        let st = obs.inner.state.lock_recover();
         assert!(
             st.hide_at.is_none(),
             "pending auto-hide should be cancelled"
@@ -1088,7 +1089,7 @@ mod tests {
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let obs = obs.clone();
             move || {
-                let mut st = obs.inner.state.lock().unwrap();
+                let mut st = obs.inner.state.lock_recover();
                 st.fetch_in_flight = true;
                 panic!("poison task board state for regression test");
             }

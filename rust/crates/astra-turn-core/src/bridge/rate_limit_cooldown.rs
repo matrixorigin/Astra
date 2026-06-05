@@ -1043,7 +1043,7 @@ mod tests {
 
         // Poison the mutex by panicking while holding the lock.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = rl2.cooldown_info.lock().unwrap();
+            let _guard = rl2.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
             panic!("intentional poison");
         }));
         assert!(result.is_err(), "should have panicked");

@@ -847,7 +847,7 @@ mod tests {
             &self,
             record: SessionArtifactJsonRecord,
         ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
-            *self.seen.lock().unwrap() = Some(record.clone());
+            *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(record.clone());
             Ok(StoredSessionArtifact {
                 artifact_id: "artifact-1".into(),
                 session_id: record.session_id,
@@ -1026,7 +1026,7 @@ mod tests {
         let stored = persist_remote_workspace(&ws, "user-1", &store)
             .await
             .unwrap();
-        let seen = store.seen.lock().unwrap().clone().expect("captured record");
+        let seen = store.seen.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("captured record");
 
         assert_eq!(seen.artifact_kind, WORKSPACE_METADATA_ARTIFACT_KIND);
         assert_eq!(seen.turn, Some(1));

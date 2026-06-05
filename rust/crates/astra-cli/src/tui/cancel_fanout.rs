@@ -56,6 +56,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -66,13 +67,13 @@ mod tests {
         let errs = fanout(&[], move |id| {
             let c = c.clone();
             async move {
-                c.lock().unwrap().push(id);
+                c.lock_recover().push(id);
                 Ok(())
             }
         })
         .await;
         assert!(errs.is_empty());
-        assert!(called.lock().unwrap().is_empty());
+        assert!(called.lock_recover().is_empty());
     }
 
     #[tokio::test]
@@ -88,13 +89,13 @@ mod tests {
         let errs = fanout(&ids, move |id| {
             let c = c.clone();
             async move {
-                c.lock().unwrap().push(id);
+                c.lock_recover().push(id);
                 Ok(())
             }
         })
         .await;
         assert!(errs.is_empty());
-        let mut actual = called.lock().unwrap().clone();
+        let mut actual = called.lock_recover().clone();
         actual.sort();
         assert_eq!(
             actual, ids,
@@ -113,7 +114,7 @@ mod tests {
         let errs = fanout(&ids, move |id| {
             let c = c.clone();
             async move {
-                c.lock().unwrap().push(id.clone());
+                c.lock_recover().push(id.clone());
                 if id == "tu_2" {
                     Err("service unavailable".into())
                 } else {
@@ -124,7 +125,7 @@ mod tests {
         .await;
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].0, "tu_2");
-        let mut actual = called.lock().unwrap().clone();
+        let mut actual = called.lock_recover().clone();
         actual.sort();
         assert_eq!(actual, vec!["tu_1", "tu_2", "tu_3"]);
     }
@@ -156,7 +157,7 @@ mod tests {
         let errs = fanout(&ids, move |id| {
             let c = c.clone();
             async move {
-                c.lock().unwrap().push(id.clone());
+                c.lock_recover().push(id.clone());
                 if id == "slow" {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }

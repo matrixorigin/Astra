@@ -530,7 +530,10 @@ mod tests {
             }
         }
         fn call_count(&self) -> usize {
-            self.call_log.lock().unwrap().len()
+            self.call_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
         }
     }
     #[async_trait]
@@ -538,7 +541,7 @@ mod tests {
         async fn execute(&self, name: &str, args: &Value) -> ToolResult {
             self.call_log
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((name.to_string(), args.clone()));
             if self.payload_size > 0 {
                 ToolResult::text("A".repeat(self.payload_size))

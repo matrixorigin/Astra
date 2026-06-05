@@ -664,7 +664,7 @@ mod tests {
         };
         let out = fe.execute(&case, "qwen-flash").await;
         assert_eq!(out.text, "hello");
-        assert_eq!(fe.calls.lock().unwrap().len(), 1);
+        assert_eq!(fe.calls.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
 
         // Unknown model → synthetic -1 outcome.
         let out2 = fe.execute(&case, "never-seeded").await;

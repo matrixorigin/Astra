@@ -972,6 +972,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use astra_turn_core::agent_live_event::{
         AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
     };
@@ -981,7 +982,7 @@ mod tests {
 
     impl AgentLiveEventSink for RecordingLiveSink {
         fn send(&self, event: AgentLiveEvent) -> Result<(), AgentLiveSendError> {
-            self.0.lock().unwrap().push(event);
+            self.0.lock_recover().push(event);
             Ok(())
         }
     }
@@ -1044,7 +1045,7 @@ mod tests {
             parent_tool_use_id: None,
         });
 
-        let events = live_sink.0.lock().unwrap();
+        let events = live_sink.0.lock_recover();
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0].kind, AgentLiveEventKind::OutputDelta(_)));
         assert!(matches!(
@@ -1085,7 +1086,7 @@ mod tests {
         let live_token = std::sync::Arc::new(std::sync::Mutex::new("v1".to_string()));
         let live_token_for_closure = live_token.clone();
         let provider: TokenProvider =
-            std::sync::Arc::new(move || Some(live_token_for_closure.lock().unwrap().clone()));
+            std::sync::Arc::new(move || Some(live_token_for_closure.lock_recover().clone()));
         let executor = CliSpawnAgentExecutor::new(
             api,
             "stale-frozen-fallback".to_string(),
@@ -1101,7 +1102,7 @@ mod tests {
             "provider must take precedence over the captured fallback"
         );
         // Simulate a token refresh in the parent flow.
-        *live_token.lock().unwrap() = "v2-refreshed".to_string();
+        *live_token.lock_recover() = "v2-refreshed".to_string();
         assert_eq!(
             executor.resolve_token(),
             "v2-refreshed",
@@ -1195,7 +1196,7 @@ mod tests {
             .expect_err("token provider panic should fail execute");
 
         assert!(err.contains("token provider task failed"), "{err}");
-        let events = live_sink.0.lock().unwrap();
+        let events = live_sink.0.lock_recover();
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0].kind,

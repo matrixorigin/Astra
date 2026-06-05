@@ -190,6 +190,7 @@ mod worktree;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
 use worktree::detect_git_remote_repos;
+use crate::lock_recovery::LockRecovery;
 #[cfg(test)]
 use worktree::extract_github_owner_repo;
 #[path = "edge_tools/memoria.rs"]
@@ -2084,7 +2085,7 @@ impl ToolExecutor {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut cmds = bg_commands.lock().unwrap();
+            let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::SpawnShell {
                 command,
                 description,
@@ -2162,7 +2163,7 @@ impl ToolExecutor {
                 // with no output must exit the loop, not spin to timeout.
                 let (status_tx, status_rx) = tokio::sync::oneshot::channel();
                 {
-                    let mut cmds = bg_commands.lock().unwrap();
+                    let mut cmds = bg_commands.lock_recover();
                     cmds.push(BgTaskCommand::IsTerminal {
                         task_id: task_id.clone(),
                         reply: status_tx,
@@ -2176,7 +2177,7 @@ impl ToolExecutor {
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 {
-                    let mut cmds = bg_commands.lock().unwrap();
+                    let mut cmds = bg_commands.lock_recover();
                     cmds.push(BgTaskCommand::GetOutputSince {
                         task_id: task_id.clone(),
                         offset,
@@ -2208,7 +2209,7 @@ impl ToolExecutor {
         } else {
             let (tx, rx) = tokio::sync::oneshot::channel();
             {
-                let mut cmds = bg_commands.lock().unwrap();
+                let mut cmds = bg_commands.lock_recover();
                 cmds.push(BgTaskCommand::GetOutputSince {
                     task_id: task_id.clone(),
                     offset,
@@ -2240,7 +2241,7 @@ impl ToolExecutor {
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut cmds = bg_commands.lock().unwrap();
+            let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::Kill {
                 task_id: task_id.clone(),
                 reply: tx,
@@ -4598,6 +4599,7 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use std::path::PathBuf;
 
     pub(super) fn test_executor() -> ToolExecutor {
@@ -5033,7 +5035,7 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-a");
 
-        let journal = executor.file_journal.lock().unwrap();
+        let journal = executor.file_journal.lock_recover();
         assert!(
             journal.persist_dir().is_some(),
             "persistence must be enabled after session-id is set"
@@ -5063,7 +5065,7 @@ mod tests {
             astra_turn_core::file_edit_journal::FileEditJournal::new(500),
         ));
         assert!(
-            shared.lock().unwrap().persist_dir().is_none(),
+            shared.lock_recover().persist_dir().is_none(),
             "fresh shared journal starts in-memory"
         );
 
@@ -5081,7 +5083,7 @@ mod tests {
         );
 
         // AND that shared journal must now carry the persistence binding.
-        let journal = shared.lock().unwrap();
+        let journal = shared.lock_recover();
         assert_eq!(
             journal.persist_dir(),
             Some(expected.as_path()),
@@ -5113,7 +5115,7 @@ mod tests {
         let file = work.path().join("pre.txt");
         std::fs::write(&file, b"v0").unwrap();
         {
-            let mut j = shared.lock().unwrap();
+            let mut j = shared.lock_recover();
             j.record_before(&file, "pre", 0);
             j.record_after(&file, "pre", b"v1");
         }
@@ -5123,7 +5125,7 @@ mod tests {
             .with_active_session_id("session-c");
 
         let expected = tmp.path().join("session-c").join("file_checkpoints");
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(j.persist_dir(), Some(expected.as_path()));
         assert!(std::sync::Arc::ptr_eq(&executor.file_journal, &shared));
         assert_eq!(
@@ -5165,11 +5167,11 @@ mod tests {
             astra_turn_core::file_edit_journal::FileEditJournal::new(500),
         ));
         {
-            let mut j = shared.lock().unwrap();
+            let mut j = shared.lock_recover();
             j.record_before(&file, "early-call", 0);
             j.record_after(&file, "early-call", b"after");
         }
-        assert_eq!(shared.lock().unwrap().len(), 1);
+        assert_eq!(shared.lock_recover().len(), 1);
 
         // Now wire into an executor and set the session id.
         let _executor = test_executor()
@@ -5177,7 +5179,7 @@ mod tests {
             .with_active_session_id("session-d");
 
         // The pre-session entry MUST survive the binding.
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(j.len(), 1, "pre-session in-memory entry must not be lost");
         let entries: Vec<_> = j.entries().collect();
         assert_eq!(entries[0].path, file);
@@ -5219,7 +5221,7 @@ mod tests {
             .with_shared_file_journal(shared.clone())
             .with_active_session_id("session-e");
 
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(j.len(), 1, "prior-run entry must load from disk");
         let entries: Vec<_> = j.entries().collect();
         assert_eq!(entries[0].tool_call_id, "prior");
@@ -5268,7 +5270,7 @@ mod tests {
             astra_turn_core::file_edit_journal::FileEditJournal::new(500),
         ));
         {
-            let mut j = shared.lock().unwrap();
+            let mut j = shared.lock_recover();
             j.record_before(&pre_file, "pre-session", 0);
             j.record_after(&pre_file, "pre-session", b"v1");
         }
@@ -5279,7 +5281,7 @@ mod tests {
             .with_active_session_id("session-f");
 
         // Must have ALL 3 entries (2 disk + 1 pre-session).
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(
             j.len(),
             3,
@@ -5319,18 +5321,18 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-g");
         {
-            let mut j = executor.file_journal.lock().unwrap();
+            let mut j = executor.file_journal.lock_recover();
             j.record_before(&file, "call", 0);
             j.record_after(&file, "call", b"v1");
         }
 
-        let before_len = executor.file_journal.lock().unwrap().len();
+        let before_len = executor.file_journal.lock_recover().len();
         assert_eq!(before_len, 1);
 
         // Second call with same sid.
         executor.set_active_session_id("session-g");
 
-        let after_len = executor.file_journal.lock().unwrap().len();
+        let after_len = executor.file_journal.lock_recover().len();
         assert_eq!(
             after_len, before_len,
             "re-binding same sid must not duplicate entries"
@@ -5351,7 +5353,7 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-h1");
         {
-            let mut j = executor.file_journal.lock().unwrap();
+            let mut j = executor.file_journal.lock_recover();
             j.record_before(&file, "call-h1", 0);
             j.record_after(&file, "call-h1", b"v1");
         }
@@ -5362,7 +5364,7 @@ mod tests {
         executor.set_active_session_id("session-h2");
         let h2_dir = tmp.path().join("session-h2").join("file_checkpoints");
         assert_eq!(
-            executor.file_journal.lock().unwrap().persist_dir(),
+            executor.file_journal.lock_recover().persist_dir(),
             Some(h2_dir.as_path()),
             "persist_dir must redirect to the new session"
         );
@@ -5399,12 +5401,12 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-i1");
         {
-            let mut j = executor.file_journal.lock().unwrap();
+            let mut j = executor.file_journal.lock_recover();
             j.record_before(&file, "call-i1", 0);
             j.record_after(&file, "call-i1", b"v1");
         }
         // Confirm sid1 has an entry in memory.
-        assert_eq!(executor.file_journal.lock().unwrap().len(), 1);
+        assert_eq!(executor.file_journal.lock_recover().len(), 1);
 
         // Rebind to a fresh session.
         executor.set_active_session_id("session-i2");
@@ -5412,7 +5414,7 @@ mod tests {
 
         // In-memory journal starts clean under the new session.
         assert_eq!(
-            executor.file_journal.lock().unwrap().len(),
+            executor.file_journal.lock_recover().len(),
             0,
             "memory must be cleared on rebind-to-different-sid"
         );

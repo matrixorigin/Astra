@@ -1491,6 +1491,7 @@ fn render_local_reflect_report(
 #[cfg(test)]
 mod state_command_tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1687,7 +1688,7 @@ mod state_command_tests {
         state.history = vec![("q1".into(), "a1".into())];
         state.last_response = Some("a1".into());
         {
-            let mut journal = state.file_journal.lock().unwrap();
+            let mut journal = state.file_journal.lock_recover();
             std::fs::write(&file_path, b"before").unwrap();
             journal.record_before(&file_path, "tool-1", 1);
             std::fs::write(&file_path, b"after").unwrap();

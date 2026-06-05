@@ -844,7 +844,7 @@ mod tests {
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
         assert_eq!(report.passed(), 1);
-        assert_eq!(exec.calls.lock().unwrap().len(), 0, "executor must not run");
+        assert_eq!(exec.calls.lock().unwrap_or_else(|e| e.into_inner()).len(), 0, "executor must not run");
         assert!(
             report.runs[0]
                 .outcome
@@ -941,7 +941,7 @@ mod tests {
                 _m: Option<&str>,
                 _o: &RunOutcome,
             ) -> Result<JudgerScore, String> {
-                *self.hits.lock().unwrap() += 1;
+                *self.hits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 Ok(JudgerScore {
                     score: 1.0,
                     rationale: "".into(),
@@ -987,7 +987,7 @@ mod tests {
         assert_eq!(report.passed(), 1);
         // Judger fires for BOTH cases — quality score is diagnostic
         // even when Hard criteria fail.
-        assert_eq!(*judger.hits.lock().unwrap(), 2);
+        assert_eq!(*judger.hits.lock().unwrap_or_else(|e| e.into_inner()), 2);
     }
 
     #[tokio::test]
@@ -1083,7 +1083,7 @@ mod tests {
         let report = runner.run_all(&cases).await;
         assert_eq!(report.passed(), 1);
         assert_eq!(report.failed(), 1);
-        let calls = digest.calls.lock().unwrap();
+        let calls = digest.calls.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], "sess-m");
     }
@@ -1160,7 +1160,7 @@ mod tests {
             Some(crate::classify::FailureClass::PlatformSetupFailed)
         );
         assert!(
-            exec.calls.lock().unwrap().is_empty(),
+            exec.calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "executor must NOT be called when setup fails"
         );
     }
@@ -1325,7 +1325,7 @@ mod tests {
                 _m: Option<&str>,
                 _o: &RunOutcome,
             ) -> Result<crate::judger::JudgerScore, String> {
-                self.questions.lock().unwrap().push(q.to_string());
+                self.questions.lock().unwrap_or_else(|e| e.into_inner()).push(q.to_string());
                 Ok(crate::judger::JudgerScore {
                     score: 1.0,
                     rationale: "ok".into(),
@@ -1360,7 +1360,7 @@ mod tests {
             timeout_seconds: None,
         }];
         let _ = runner.run_all(&[case]).await;
-        let questions = judger.questions.lock().unwrap();
+        let questions = judger.questions.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(questions.len(), 1);
         let q = &questions[0];
         assert!(

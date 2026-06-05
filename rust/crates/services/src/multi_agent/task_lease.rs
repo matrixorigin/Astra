@@ -13,11 +13,17 @@ use sqlx::Row;
 use super::hold_cache::TaskLeaseHoldCache;
 use super::metrics::SharedMultiAgentMetrics;
 use crate::task_orchestrator::{
-    AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskListItem, TaskRecord, TaskStatus,
+    MatrixOneTaskService, TaskListItem, TaskRecord, TaskStatus, AGENT_TASK_DETAIL_SELECT_COLUMNS,
 };
 
 /// Default maximum number of tasks to return in a pack pull.
 pub const DEFAULT_TASKS_PACK_LIMIT: u32 = 2000;
+
+/// Max candidate tasks to scan when claiming the next lease.
+/// Balances database load against starvation risk: if all candidates in
+/// one batch are contested by concurrent pods, the caller retries in the
+/// next poll cycle.
+pub const CLAIM_CANDIDATE_SCAN_LIMIT: u32 = 100;
 
 // ─── Task pack sync (MatrixOne) ──────────────────────────────────────────────
 
@@ -399,7 +405,8 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
              WHERE t.user_id = ? \
                AND {CLAIMABLE_TASK_STATUS_SQL} \
                AND (l.task_id IS NULL OR l.expires_at < NOW(6)) \
-             ORDER BY t.created_at ASC, t.task_id ASC"
+             ORDER BY t.created_at ASC, t.task_id ASC \
+             LIMIT {CLAIM_CANDIDATE_SCAN_LIMIT}"
         ))
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -810,11 +817,10 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_task_lease_errors() {
         let s = UnconfiguredTaskLeaseService;
-        assert!(
-            s.claim_next_claimable_lease("u", "a", "e", 60)
-                .await
-                .is_err()
-        );
+        assert!(s
+            .claim_next_claimable_lease("u", "a", "e", 60)
+            .await
+            .is_err());
         assert!(s.try_claim_lease("u", "t", "a", "e", 60).await.is_err());
     }
 }

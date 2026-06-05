@@ -384,8 +384,8 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_or_compute_miss_then_hit() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
         let cache = new_shared_cache(8, None);
         let sig = CallSignature::from_args("read_file", &json!({"path": "a"}));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -468,7 +468,7 @@ mod tests {
 
         // Poison the mutex.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = cache2.lock().unwrap();
+            let _guard = cache2.lock().unwrap_or_else(|e| e.into_inner());
             panic!("intentional poison");
         }));
         assert!(result.is_err());

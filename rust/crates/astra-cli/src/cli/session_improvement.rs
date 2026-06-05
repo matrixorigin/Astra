@@ -384,6 +384,7 @@ fn check_skill_improvement_inner(state: &mut SessionState) {
 mod tests {
     use super::*;
     use crate::cli::SessionState;
+    use crate::lock_recovery::LockRecovery;
 
     struct FakeLlm {
         responses: std::sync::Mutex<Vec<String>>,
@@ -392,7 +393,7 @@ mod tests {
     #[async_trait::async_trait]
     impl SkillImproveLlm for FakeLlm {
         async fn complete(&self, _system: &str, _user: &str) -> Result<String, String> {
-            let mut responses = self.responses.lock().unwrap();
+            let mut responses = self.responses.lock_recover();
             if responses.is_empty() {
                 Err("no canned response".into())
             } else {

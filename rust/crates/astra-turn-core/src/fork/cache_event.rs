@@ -453,7 +453,7 @@ mod tests {
     struct CollectSink(Mutex<Vec<ForkCacheEvent>>);
     impl ForkCacheEventSink for CollectSink {
         fn emit(&self, event: ForkCacheEvent) {
-            self.0.lock().unwrap().push(event);
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(event);
         }
     }
 
@@ -501,7 +501,7 @@ mod tests {
             ForkCacheThresholds::default(),
         ));
 
-        let events = sink.0.lock().unwrap();
+        let events = sink.0.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].outcome, ForkCacheOutcome::Hit);
         assert_eq!(events[1].outcome, ForkCacheOutcome::Miss);

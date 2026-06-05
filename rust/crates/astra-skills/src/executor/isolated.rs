@@ -464,9 +464,18 @@ mod tests {
             effort: Option<&str>,
             agent_type: Option<&str>,
         ) -> Result<SubRunResult, String> {
-            *self.captured_effort.lock().unwrap() = effort.map(String::from);
-            *self.captured_agent_type.lock().unwrap() = agent_type.map(String::from);
-            *self.captured_recursion_depth.lock().unwrap() = Some(parent_recursion_depth);
+            *self
+                .captured_effort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = effort.map(String::from);
+            *self
+                .captured_agent_type
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = agent_type.map(String::from);
+            *self
+                .captured_recursion_depth
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(parent_recursion_depth);
             Ok(SubRunResult {
                 output: "done".into(),
                 tokens_used: 100,
@@ -504,17 +513,26 @@ mod tests {
         let _result = executor.execute(&skill, &context).await.unwrap();
 
         assert_eq!(
-            *executor_inner.captured_effort.lock().unwrap(),
+            *executor_inner
+                .captured_effort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
             Some("high".to_string()),
             "effort should be threaded through to SubRunExecutor"
         );
         assert_eq!(
-            *executor_inner.captured_agent_type.lock().unwrap(),
+            *executor_inner
+                .captured_agent_type
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
             Some("coder".to_string()),
             "agent_type should be threaded through to SubRunExecutor"
         );
         assert_eq!(
-            *executor_inner.captured_recursion_depth.lock().unwrap(),
+            *executor_inner
+                .captured_recursion_depth
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
             Some(2),
             "recursion depth should be threaded through to SubRunExecutor"
         );
@@ -545,10 +563,25 @@ mod tests {
         };
 
         let _result = executor.execute(&skill, &context).await.unwrap();
-        assert_eq!(*executor_inner.captured_effort.lock().unwrap(), None);
-        assert_eq!(*executor_inner.captured_agent_type.lock().unwrap(), None);
         assert_eq!(
-            *executor_inner.captured_recursion_depth.lock().unwrap(),
+            *executor_inner
+                .captured_effort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            None
+        );
+        assert_eq!(
+            *executor_inner
+                .captured_agent_type
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            None
+        );
+        assert_eq!(
+            *executor_inner
+                .captured_recursion_depth
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
             Some(0)
         );
     }
