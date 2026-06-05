@@ -1110,9 +1110,14 @@ impl DynamicAgentSpawner {
                 messaging_address: messaging_address.map(|a| a.to_string()),
             })
         } else {
-            // Sync mode: wait for completion
+            // Sync mode: wait for completion. Funnel through the same
+            // `finalize_background_agent` path as background spawns so both
+            // modes archive into `completed_agents`, persist the
+            // `agent_terminated` journal event, emit the terminal trace, and
+            // clear `active_agents`. Two parallel finalization paths is how
+            // observers (wait_for_agent / get_agent_history / archive
+            // consumers) drift between modes.
             if let Some(ref executor) = self.executor {
-                // Update status to running
                 self.update_status(
                     &agent_id,
                     AgentStatus::Running {
@@ -1132,33 +1137,17 @@ impl DynamicAgentSpawner {
 
                 match result {
                     Ok(run_result) => {
-                        if let Some(state) = self.active_agents.write().await.get_mut(&agent_id) {
-                            state.metrics.tool_calls = run_result.tool_calls;
-                            state.metrics.prompt_tokens = run_result.prompt_tokens;
-                            state.metrics.completion_tokens = run_result.completion_tokens;
-                            state.metrics.permission_requests = run_result.permission_requests;
-                            state.metrics.permission_requests_approved =
-                                run_result.permission_requests_approved;
-                            state.metrics.tools_blocked = run_result.tools_blocked;
-                            if let Some(summary) = run_result.permission_summary.clone() {
-                                state.permission_summary = summary;
-                            }
-                        }
-                        if let Some(state) = self.active_agents.read().await.get(&agent_id).cloned()
-                        {
-                            self.emit_agent_terminal_trace(
-                                &state,
-                                &run_result.status,
-                                Some(run_result.finish_reason.as_str()),
-                                run_result.output.as_deref(),
-                                run_result.error.as_deref(),
-                            )
-                            .await;
-                        }
-
                         let status = spawn_run_result_to_agent_status(&run_result);
-                        self.update_status(&agent_id, status).await;
-                        self.unregister_mailbox(&agent_id).await;
+                        self.finalize_background_agent(
+                            &agent_id,
+                            status,
+                            &run_result.status,
+                            Some(run_result.finish_reason.as_str()),
+                            Some(&run_result),
+                            run_result.output.as_deref(),
+                            run_result.error.as_deref(),
+                        )
+                        .await;
 
                         let duration_ms = started_at
                             .elapsed()
@@ -1172,26 +1161,19 @@ impl DynamicAgentSpawner {
                         ))
                     }
                     Err(e) => {
-                        if let Some(state) = self.active_agents.read().await.get(&agent_id).cloned()
-                        {
-                            self.emit_agent_terminal_trace(
-                                &state,
-                                "failed",
-                                None,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await;
-                        }
-                        self.update_status(
+                        self.finalize_background_agent(
                             &agent_id,
                             AgentStatus::Failed {
                                 error: e.clone(),
                                 finish_reason: None,
                             },
+                            "failed",
+                            None,
+                            None,
+                            None,
+                            Some(e.as_str()),
                         )
                         .await;
-                        self.unregister_mailbox(&agent_id).await;
 
                         Ok(SpawnAgentOutput::Failed {
                             error: e,
@@ -1388,24 +1370,6 @@ impl DynamicAgentSpawner {
             completed.remove(0);
         }
         completed.push(state);
-    }
-
-    async fn unregister_mailbox(&self, agent_id: &str) {
-        let messaging_address = self
-            .active_agents
-            .write()
-            .await
-            .get_mut(agent_id)
-            .and_then(|state| state.messaging_address.take());
-
-        if let Some(addr) = messaging_address
-            && let Err(err) = self.mailbox_router.unregister(&addr).await
-        {
-            eprintln!(
-                "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
-                agent_id, err
-            );
-        }
     }
 
     async fn notify_completion(&self, agent_id: &str) {
@@ -2784,6 +2748,95 @@ mod tests {
             run_in_background: true,
             ..Default::default()
         }
+    }
+
+    fn make_sync_input() -> SpawnAgentInput {
+        SpawnAgentInput {
+            description: "sync test".to_string(),
+            prompt: "do it".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: false,
+            ..Default::default()
+        }
+    }
+
+    /// Sync-mode parity regression: a synchronous spawn must drive the same
+    /// finalization path as a background spawn. Concretely the agent must:
+    /// (a) leave `active_agents` (no slow leak), and
+    /// (b) appear in `completed_agents` (so wait_for / get_agent_history /
+    ///     archive-based observers see the terminal state).
+    ///
+    /// History: sync-mode used to call only `update_status` +
+    /// `unregister_mailbox`, leaving the agent in `active_agents` forever and
+    /// never archiving. Two paths produced different persisted state for the
+    /// same logical event.
+    #[tokio::test]
+    async fn sync_spawn_archives_into_completed_agents_and_clears_active() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_sync_input(), &make_bg_context())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, SpawnAgentOutput::Completed { .. }),
+            "sync spawn must return Completed for a fast-success child, got {result:?}"
+        );
+
+        // active_agents must be empty (sync child has finished).
+        let active = spawner.active_agents.read().await;
+        assert!(
+            active.is_empty(),
+            "sync-mode finalize must remove from active_agents; got {} entries",
+            active.len()
+        );
+        drop(active);
+
+        // completed_agents must contain the run.
+        let completed = spawner.completed_agents.read().await;
+        assert_eq!(
+            completed.len(),
+            1,
+            "sync-mode finalize must archive into completed_agents"
+        );
+        assert!(matches!(
+            completed[0].status,
+            AgentStatus::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_spawn_failure_archives_with_failed_status() {
+        struct FailingExecutor;
+        #[async_trait]
+        impl SpawnAgentExecutor for FailingExecutor {
+            async fn execute(
+                &self,
+                _config: SpawnRunConfig,
+            ) -> Result<SpawnRunResult, String> {
+                Err("kaboom".to_string())
+            }
+        }
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(FailingExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let _ = spawner
+            .spawn(make_sync_input(), &make_bg_context())
+            .await
+            .unwrap();
+
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "active_agents must be empty after sync-mode failure finalize"
+        );
+        let completed = spawner.completed_agents.read().await;
+        assert_eq!(completed.len(), 1, "failed sync agent must be archived");
+        assert!(
+            matches!(completed[0].status, AgentStatus::Failed { .. }),
+            "archived status must reflect failure: got {:?}",
+            completed[0].status
+        );
     }
 
     /// Background spawn returns immediately even when the child is fast.

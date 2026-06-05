@@ -878,24 +878,74 @@ impl DelegationTracker {
             .insert(run_id.to_string(), token);
     }
 
-    /// Cancel ALL sub-runs that have a given parent run ID.
-    /// Returns the number of sub-runs cancelled.
+    /// Cancel ALL sub-runs in the subtree rooted at `parent_run_id`.
+    ///
+    /// Walks the `parents` map transitively so grandchildren and deeper
+    /// descendants are cancelled too. A flat one-level scan would leave
+    /// sub-runs spawned by cancelled children executing — which was the
+    /// historical bug.
+    ///
+    /// Returns the number of cancel tokens fired (one per descendant that
+    /// has a registered token; descendants without a token are still pause-
+    /// flagged for cooperative loops).
+    ///
+    /// Lock order: `parents → pause_flags → cancel_tokens` (canonical engine
+    /// order; matches `cleanup_delegation` and the load path). Reversing
+    /// this order permits an ABBA deadlock with concurrent cleanup.
     pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
-        let children = self.get_children(parent_run_id).await;
-        let tokens = self.cancel_tokens.read().await;
+        let descendants = self.collect_descendants(parent_run_id).await;
+        if descendants.is_empty() {
+            return 0;
+        }
         let flags = self.pause_flags.read().await;
+        let tokens = self.cancel_tokens.read().await;
         let mut count = 0;
-        for child_id in &children {
+        for child_id in &descendants {
             if let Some(token) = tokens.get(child_id) {
                 token.cancel();
                 count += 1;
             }
-            // Also set pause flag to stop cooperative loops
             if let Some(flag) = flags.get(child_id) {
                 flag.store(true, Ordering::SeqCst);
             }
         }
         count
+    }
+
+    /// Walk the `parents` map starting from `root`, collecting every
+    /// descendant run_id. BFS so siblings cancel before grandchildren —
+    /// minimizing the time a freshly-spawned grandchild has to do work
+    /// before being cancelled. Cycle-safe via `visited`.
+    async fn collect_descendants(&self, root: &str) -> Vec<String> {
+        let parents = self.parents.read().await;
+        // Build child-by-parent index once so the walk is O(N) total
+        // rather than O(N) per level.
+        let mut by_parent: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for (child, parent) in parents.iter() {
+            by_parent
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+        let mut visited = std::collections::HashSet::new();
+        let mut frontier: Vec<String> = by_parent
+            .get(root)
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        while let Some(rid) = frontier.pop() {
+            if !visited.insert(rid.clone()) {
+                continue;
+            }
+            if let Some(grand) = by_parent.get(rid.as_str()) {
+                for g in grand {
+                    frontier.push((*g).to_string());
+                }
+            }
+            out.push(rid);
+        }
+        out
     }
 
     /// Check if a sub-run is currently paused.
@@ -6724,6 +6774,166 @@ mod tests {
         assert_eq!(count, 2, "both children must be cancelled");
         assert!(token1.is_cancelled(), "child1 token must be cancelled");
         assert!(token2.is_cancelled(), "child2 token must be cancelled");
+    }
+
+    /// Subtree cancellation: cancel_children_of must propagate to grandchildren
+    /// (and deeper). Previously the implementation filtered the parents map by
+    /// direct `parent_run_id` match only, leaving any sub-runs spawned by a
+    /// cancelled child still alive — a real correctness bug for any
+    /// multi-level delegation tree.
+    #[tokio::test]
+    async fn cancel_children_of_propagates_to_grandchildren() {
+        let tracker = DelegationTracker::new();
+        let parent = "parent-run";
+        let child = "child-run";
+        let grandchild = "grandchild-run";
+
+        for (rid, prid, did) in [
+            (child, parent, "deleg-1"),
+            (grandchild, child, "deleg-2"),
+        ] {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: rid.into(),
+                    parent_run_id: prid.into(),
+                    delegation_id: did.into(),
+                    agent_id: "agent".into(),
+                    depth: 0,
+                    state: SubRunState::Running,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        let token_child = Arc::new(tokio_util::sync::CancellationToken::new());
+        let token_grand = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker
+            .register_cancel_token(child, token_child.clone())
+            .await;
+        tracker
+            .register_cancel_token(grandchild, token_grand.clone())
+            .await;
+
+        let count = tracker.cancel_children_of(parent).await;
+        assert!(
+            token_child.is_cancelled(),
+            "direct child must be cancelled"
+        );
+        assert!(
+            token_grand.is_cancelled(),
+            "grandchild MUST be cancelled (subtree, not just first level)"
+        );
+        assert_eq!(count, 2, "count must include all descendants");
+    }
+
+    /// Lock-order regression: cancel_children_of and cleanup_delegation
+    /// must agree on the canonical lock order
+    /// (delegations → parents → pause_flags → cancel_tokens → progress).
+    ///
+    /// History: cancel_children_of used to take cancel_tokens THEN pause_flags
+    /// while cleanup_delegation takes pause_flags THEN cancel_tokens — a
+    /// classic ABBA deadlock under contention. This stress test interleaves
+    /// many concurrent calls of both and asserts everything completes within
+    /// a generous wall-clock budget. With reverse lock order the test would
+    /// hang and trip the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_children_of_does_not_deadlock_with_cleanup_delegation() {
+        use std::time::Duration;
+        let tracker = Arc::new(DelegationTracker::new());
+
+        // Pre-populate many delegation/run records so each iteration has work.
+        const PARENTS: usize = 8;
+        const CHILDREN_PER: usize = 4;
+        for p in 0..PARENTS {
+            for c in 0..CHILDREN_PER {
+                let parent = format!("parent-{p}");
+                let child = format!("child-{p}-{c}");
+                tracker
+                    .record_sub_run(SubRunRecord {
+                        run_id: child.clone(),
+                        parent_run_id: parent.clone(),
+                        delegation_id: format!("deleg-{p}"),
+                        agent_id: format!("agent-{p}-{c}"),
+                        depth: 0,
+                        state: SubRunState::Running,
+                        retry_of: None,
+                    })
+                    .await;
+                tracker
+                    .register_cancel_token(
+                        &child,
+                        Arc::new(tokio_util::sync::CancellationToken::new()),
+                    )
+                    .await;
+            }
+        }
+
+        // Workload A: hammer cancel_children_of across all parents.
+        let a = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    for p in 0..PARENTS {
+                        let _ = tracker.cancel_children_of(&format!("parent-{p}")).await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+
+        // Workload B: hammer cleanup_delegation cycles. Re-register records
+        // after each cleanup so the workload keeps having locks to take.
+        let b = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    for p in 0..PARENTS {
+                        // Force completion so cleanup can proceed.
+                        for c in 0..CHILDREN_PER {
+                            tracker
+                                .complete_sub_run(
+                                    &format!("child-{p}-{c}"),
+                                    SubRunState::Completed,
+                                )
+                                .await;
+                        }
+                        let _ = tracker.cleanup_delegation(&format!("deleg-{p}")).await;
+
+                        // Re-register so the next iteration has work.
+                        for c in 0..CHILDREN_PER {
+                            let child = format!("child-{p}-{c}");
+                            tracker
+                                .record_sub_run(SubRunRecord {
+                                    run_id: child.clone(),
+                                    parent_run_id: format!("parent-{p}"),
+                                    delegation_id: format!("deleg-{p}"),
+                                    agent_id: format!("agent-{p}-{c}"),
+                                    depth: 0,
+                                    state: SubRunState::Running,
+                                    retry_of: None,
+                                })
+                                .await;
+                            tracker
+                                .register_cancel_token(
+                                    &child,
+                                    Arc::new(tokio_util::sync::CancellationToken::new()),
+                                )
+                                .await;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let _ = tokio::join!(a, b);
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "cancel_children_of and cleanup_delegation must not deadlock"
+        );
     }
 
     /// P1-B source guard: cancel_run must call cancel_children_of on delegation engine.

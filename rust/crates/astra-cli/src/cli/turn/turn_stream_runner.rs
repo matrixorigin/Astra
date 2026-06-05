@@ -43,7 +43,8 @@ pub(crate) async fn execute_stream_turn(
         semantic_query_override,
         &prepared,
     );
-    let (result, was_user_cancel) = await_stream_with_interrupts(params, &prepared).await;
+    let (result, was_user_cancel) =
+        await_stream_with_interrupts(params, &prepared, api, token).await;
 
     if was_user_cancel {
         TurnAttempt::Interrupted(Box::new(result))
@@ -155,6 +156,8 @@ fn build_turn_stream_params<'a>(
 async fn await_stream_with_interrupts<'a>(
     params: ChatTurnParams<'a>,
     prepared: &PreparedTurnStreamState,
+    api: &astra_thin_client::ThinClient,
+    bearer: &str,
 ) -> (Result<StreamResult, crate::TurnFailure>, bool) {
     let cancel_token_for_signal = prepared.cancel_token.clone();
     let incremental_state = prepared.incremental_state.clone();
@@ -168,6 +171,7 @@ async fn await_stream_with_interrupts<'a>(
         result = &mut stream_fut => (result, false),
         _ = tokio::signal::ctrl_c() => {
             cancel_token_for_signal.cancel();
+            notify_server_to_cancel_run(api, bearer, &incremental_state, "Ctrl+C");
             if tui_cancel_token.is_none() {
                 eprintln!("\n{}", "  Interrupted. (press Ctrl+C again to force-exit, or wait up to 10s for graceful drain)".dim());
             }
@@ -186,6 +190,7 @@ async fn await_stream_with_interrupts<'a>(
             }
         } => {
             cancel_token_for_signal.cancel();
+            notify_server_to_cancel_run(api, bearer, &incremental_state, "TUI cancel");
             let drained = drain_after_cancel(
                 &mut stream_fut,
                 drain_timeout,
@@ -197,9 +202,80 @@ async fn await_stream_with_interrupts<'a>(
     }
 }
 
+/// Fire-and-forget: tell the server to cancel the durable run that is
+/// currently streaming. Without this call, the only effect of a user
+/// cancellation is closing the local SSE stream — the server-side run
+/// keeps executing tool calls and burning tokens until it finishes
+/// naturally. We snapshot the run_id from the incremental state (the SSE
+/// loop populates it as soon as the server emits the run header), then
+/// dispatch a DELETE in the background so cancellation does not block
+/// the drain path. Errors are logged at warn level only — the user has
+/// already asked to stop, and surfacing a cancel-API failure on top of
+/// that adds noise without giving them an action to take.
+fn notify_server_to_cancel_run(
+    api: &astra_thin_client::ThinClient,
+    bearer: &str,
+    incremental_state: &Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
+    source: &'static str,
+) {
+    let snap = incremental_state.snapshot();
+    let Some(run_id) = snap.run_id else {
+        tracing::debug!(
+            target: "astra::cli::cancel",
+            source,
+            "no run_id captured yet; server-side cancel skipped"
+        );
+        return;
+    };
+    let api = api.clone();
+    let bearer = bearer.to_string();
+    tokio::spawn(async move {
+        match api.cancel_run(Some(&bearer), &run_id).await {
+            Ok(_) => tracing::info!(
+                target: "astra::cli::cancel",
+                run_id = %run_id,
+                source,
+                "server-side run cancellation requested"
+            ),
+            Err(e) => tracing::warn!(
+                target: "astra::cli::cancel",
+                run_id = %run_id,
+                source,
+                error = %e,
+                "server-side run cancellation failed"
+            ),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source-level guard: cancellation paths in `await_stream_with_interrupts`
+    /// MUST notify the server so the durable run does not keep running on the
+    /// backend after the local SSE stream is dropped. Asserting on the source
+    /// is the only stable way to prove this short of a full E2E test against
+    /// a live server — and the regression risk (silent removal during a
+    /// refactor) is exactly the failure mode that produced this bug.
+    #[test]
+    fn await_stream_with_interrupts_calls_server_cancel_on_user_cancel() {
+        let source = include_str!("turn_stream_runner.rs");
+        let fn_start = source
+            .find("async fn await_stream_with_interrupts")
+            .expect("await_stream_with_interrupts must exist");
+        let fn_end = source[fn_start..]
+            .find("\n}\n")
+            .map(|p| fn_start + p)
+            .expect("function must have a closing brace");
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("notify_server_to_cancel_run"),
+            "await_stream_with_interrupts must call notify_server_to_cancel_run \
+             on user-cancel paths so the server-side run does not keep \
+             executing after the SSE reader closes"
+        );
+    }
 
     #[tokio::test]
     async fn prepare_turn_stream_state_includes_active_task_board_prompt() {
