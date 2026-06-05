@@ -136,6 +136,45 @@ impl SessionTaskStatusKind {
     pub fn is_started(&self) -> bool {
         matches!(self, Self::InProgress | Self::Completed)
     }
+
+    /// Single-character marker for task-board rendering.
+    pub fn status_marker(self) -> &'static str {
+        match self {
+            Self::InProgress => "▸",
+            Self::Pending
+            | Self::Archived
+            | Self::Deleted
+            | Self::Other => "·",
+            Self::Completed => "✓",
+            Self::Failed => "✗",
+            Self::Cancelled => "⏹",
+        }
+    }
+
+    /// Sort priority (low = first). InProgress → Pending → everything else.
+    pub fn active_priority(self) -> u8 {
+        match self {
+            Self::InProgress => 0,
+            Self::Pending => 1,
+            Self::Completed
+            | Self::Failed
+            | Self::Cancelled
+            | Self::Archived
+            | Self::Deleted
+            | Self::Other => 2,
+        }
+    }
+
+    pub fn can_be_archived(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled
+        )
+    }
+
+    pub fn can_be_stopped(&self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
 }
 
 impl SessionTaskStatusKind {
@@ -179,60 +218,6 @@ impl From<&str> for SessionTaskStatusKind {
     }
 }
 
-/// Deprecated: prefer `SessionTaskStatusKind::from_status_str` directly.
-/// Kept for backward compatibility with external callers.
-pub fn session_task_status_kind(status: &str) -> SessionTaskStatusKind {
-    SessionTaskStatusKind::from_status_str(status)
-}
-
-pub fn session_task_is_active(status: &SessionTaskStatusKind) -> bool {
-    status.is_active()
-}
-
-pub fn session_task_is_in_progress(status: &SessionTaskStatusKind) -> bool {
-    status.is_in_progress()
-}
-
-pub fn session_task_is_pending(status: &SessionTaskStatusKind) -> bool {
-    status.is_pending()
-}
-
-pub fn session_task_is_completed(status: &SessionTaskStatusKind) -> bool {
-    status.is_completed()
-}
-
-pub fn session_task_is_failed(status: &SessionTaskStatusKind) -> bool {
-    status.is_failed()
-}
-
-pub fn session_task_is_cancelled(status: &SessionTaskStatusKind) -> bool {
-    status.is_cancelled()
-}
-
-pub fn session_task_is_unsuccessful(status: &SessionTaskStatusKind) -> bool {
-    status.is_unsuccessful()
-}
-
-pub fn session_task_is_started(status: &SessionTaskStatusKind) -> bool {
-    status.is_started()
-}
-
-pub fn session_task_can_be_archived(status: &SessionTaskStatusKind) -> bool {
-    matches!(
-        status,
-        SessionTaskStatusKind::Completed
-            | SessionTaskStatusKind::Failed
-            | SessionTaskStatusKind::Cancelled
-    )
-}
-
-pub fn session_task_can_be_stopped(status: &SessionTaskStatusKind) -> bool {
-    matches!(
-        status,
-        SessionTaskStatusKind::Pending | SessionTaskStatusKind::InProgress
-    )
-}
-
 /// Point-in-time snapshot of a single session's task list plus its id counter.
 /// Used by the session-state rollback journal to undo a turn's task mutations.
 #[derive(Debug, Clone)]
@@ -273,7 +258,7 @@ pub trait TaskStore: Send + Sync {
             .load(session_id)
             .await?
             .into_iter()
-            .filter(|t| session_task_is_active(&t.status))
+            .filter(|t| t.status.is_active())
             .collect())
     }
 
@@ -340,7 +325,7 @@ pub trait TaskStore: Send + Sync {
                             ),
                         });
                     }
-                    if !session_task_can_be_archived(&previous_status) {
+                    if !previous_status.can_be_archived() {
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
@@ -383,7 +368,7 @@ pub trait TaskStore: Send + Sync {
 
                 let mut archived = 0u64;
                 for task in &mut tasks {
-                    if !session_task_is_completed(&task.status) {
+                    if !task.status.is_completed() {
                         continue;
                     }
                     let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
@@ -771,9 +756,9 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
     let all_completed = task
         .subtasks
         .iter()
-        .all(|st| session_task_is_completed(&st.status));
+        .all(|st| st.status.is_completed());
     if all_completed {
-        if session_task_is_active(&task.status) {
+        if task.status.is_active() {
             task.status = SessionTaskStatusKind::Completed;
         }
         return;
@@ -782,9 +767,9 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
     let any_started = task
         .subtasks
         .iter()
-        .any(|st| session_task_is_started(&st.status));
-    if (any_started && session_task_is_pending(&task.status))
-        || session_task_is_completed(&task.status)
+        .any(|st| st.status.is_started());
+    if (any_started && task.status.is_pending())
+        || task.status.is_completed()
     {
         task.status = SessionTaskStatusKind::InProgress;
     }
@@ -959,7 +944,7 @@ impl TaskManager {
                     // duplicating.
                     let normalized_new = normalize_title(&mutation_title);
                     if let Some(dup) = tasks.iter().find(|t| {
-                        session_task_is_active(&t.status)
+                        t.status.is_active()
                             && normalize_title(&t.title) == normalized_new
                     }) {
                         let response = prefix_summary(
@@ -1092,7 +1077,7 @@ impl TaskManager {
                     let done = t
                         .subtasks
                         .iter()
-                        .filter(|st| session_task_is_completed(&st.status))
+                        .filter(|st| st.status.is_completed())
                         .count();
                     format!(" [{}/{}]", done, t.subtasks.len())
                 };
@@ -1113,7 +1098,7 @@ impl TaskManager {
                 // sees "why" without a follow-up `task.get`. Only on
                 // failed rows; other statuses don't have an
                 // error_message so the field would be confusing noise.
-                if session_task_is_failed(&t.status) {
+                if t.status.is_failed() {
                     let preview = t
                         .metadata
                         .as_ref()
@@ -1407,9 +1392,9 @@ impl TaskManager {
                             // Cascade parent→subtask completion, but preserve any
                             // subtask already in a terminal non-success state.
                             for subtask in &mut task.subtasks {
-                                if !session_task_is_failed(&subtask.status)
-                                    && !session_task_is_cancelled(&subtask.status)
-                                    && !session_task_is_completed(&subtask.status)
+                                if !subtask.status.is_failed()
+                                    && !subtask.status.is_cancelled()
+                                    && !subtask.status.is_completed()
                                 {
                                     subtask.status = SessionTaskStatusKind::Completed;
                                 }
@@ -1523,7 +1508,7 @@ impl TaskManager {
                     };
                     let task_status = tasks[task_idx].status.clone();
 
-                    if !session_task_can_be_stopped(&task_status) {
+                    if !task_status.can_be_stopped() {
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
@@ -1548,7 +1533,7 @@ impl TaskManager {
 
                     let mut cancelled_subtasks = 0;
                     for subtask in &mut task.subtasks {
-                        if session_task_can_be_stopped(&subtask.status) {
+                        if subtask.status.can_be_stopped() {
                             subtask.status = SessionTaskStatusKind::Cancelled;
                             cancelled_subtasks += 1;
                         }
@@ -1609,56 +1594,56 @@ mod tests {
     #[test]
     fn session_task_status_helpers_cover_domain_taxonomy() {
         assert_eq!(
-            session_task_status_kind("pending"),
+            SessionTaskStatusKind::from_status_str("pending"),
             SessionTaskStatusKind::Pending
         );
         assert_eq!(
-            session_task_status_kind("in_progress"),
+            SessionTaskStatusKind::from_status_str("in_progress"),
             SessionTaskStatusKind::InProgress
         );
         assert_eq!(
-            session_task_status_kind("completed"),
+            SessionTaskStatusKind::from_status_str("completed"),
             SessionTaskStatusKind::Completed
         );
         assert_eq!(
-            session_task_status_kind("failed"),
+            SessionTaskStatusKind::from_status_str("failed"),
             SessionTaskStatusKind::Failed
         );
         assert_eq!(
-            session_task_status_kind("cancelled"),
+            SessionTaskStatusKind::from_status_str("cancelled"),
             SessionTaskStatusKind::Cancelled
         );
         assert_eq!(
-            session_task_status_kind("archived"),
+            SessionTaskStatusKind::from_status_str("archived"),
             SessionTaskStatusKind::Archived
         );
         assert_eq!(
-            session_task_status_kind("deleted"),
+            SessionTaskStatusKind::from_status_str("deleted"),
             SessionTaskStatusKind::Deleted
         );
         assert_eq!(
-            session_task_status_kind("paused"),
+            SessionTaskStatusKind::from_status_str("paused"),
             SessionTaskStatusKind::Other
         );
     }
 
     #[test]
     fn session_task_status_helpers_keep_active_archive_and_stop_semantics_distinct() {
-        assert!(session_task_is_active(&SessionTaskStatusKind::Pending));
-        assert!(session_task_is_active(&SessionTaskStatusKind::InProgress));
-        assert!(!session_task_is_active(&SessionTaskStatusKind::Completed));
-        assert!(session_task_is_started(&SessionTaskStatusKind::Completed));
-        assert!(!session_task_is_started(&SessionTaskStatusKind::Cancelled));
-        assert!(session_task_can_be_archived(&SessionTaskStatusKind::Completed));
-        assert!(session_task_can_be_archived(&SessionTaskStatusKind::Failed));
-        assert!(session_task_can_be_archived(&SessionTaskStatusKind::Cancelled));
-        assert!(!session_task_can_be_archived(&SessionTaskStatusKind::Archived));
-        assert!(session_task_can_be_stopped(&SessionTaskStatusKind::Pending));
-        assert!(session_task_can_be_stopped(&SessionTaskStatusKind::InProgress));
-        assert!(!session_task_can_be_stopped(&SessionTaskStatusKind::Cancelled));
-        assert!(session_task_is_unsuccessful(&SessionTaskStatusKind::Failed));
-        assert!(session_task_is_unsuccessful(&SessionTaskStatusKind::Cancelled));
-        assert!(!session_task_is_unsuccessful(&SessionTaskStatusKind::Archived));
+        assert!(SessionTaskStatusKind::Pending.is_active());
+        assert!(SessionTaskStatusKind::InProgress.is_active());
+        assert!(!SessionTaskStatusKind::Completed.is_active());
+        assert!(SessionTaskStatusKind::Completed.is_started());
+        assert!(!SessionTaskStatusKind::Cancelled.is_started());
+        assert!(SessionTaskStatusKind::Completed.can_be_archived());
+        assert!(SessionTaskStatusKind::Failed.can_be_archived());
+        assert!(SessionTaskStatusKind::Cancelled.can_be_archived());
+        assert!(!SessionTaskStatusKind::Archived.can_be_archived());
+        assert!(SessionTaskStatusKind::Pending.can_be_stopped());
+        assert!(SessionTaskStatusKind::InProgress.can_be_stopped());
+        assert!(!SessionTaskStatusKind::Cancelled.can_be_stopped());
+        assert!(SessionTaskStatusKind::Failed.is_unsuccessful());
+        assert!(SessionTaskStatusKind::Cancelled.is_unsuccessful());
+        assert!(!SessionTaskStatusKind::Archived.is_unsuccessful());
     }
 
     #[tokio::test]

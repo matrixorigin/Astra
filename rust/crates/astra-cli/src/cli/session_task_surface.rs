@@ -1,41 +1,5 @@
 pub(crate) use astra_tools::task_mgmt::SessionTaskStatusKind;
 
-/// By-value convenience wrappers delegating to `task_mgmt` reference-based functions.
-/// `SessionTaskStatusKind` is Copy, so callers frequently pass `t.status` by value
-/// rather than `&t.status`.
-
-pub(crate) fn session_task_is_active(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_active(&status)
-}
-
-pub(crate) fn session_task_is_in_progress(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_in_progress(&status)
-}
-
-pub(crate) fn session_task_is_pending(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_pending(&status)
-}
-
-pub(crate) fn session_task_is_completed(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_completed(&status)
-}
-
-pub(crate) fn session_task_is_failed(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_failed(&status)
-}
-
-pub(crate) fn session_task_is_cancelled(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_cancelled(&status)
-}
-
-pub(crate) fn session_task_is_unsuccessful(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_unsuccessful(&status)
-}
-
-pub(crate) fn session_task_is_started(status: SessionTaskStatusKind) -> bool {
-    astra_tools::task_mgmt::session_task_is_started(&status)
-}
-
 pub(crate) fn session_task_status_marker(status: SessionTaskStatusKind) -> &'static str {
     match status {
         SessionTaskStatusKind::InProgress => "▸",
@@ -76,19 +40,19 @@ mod tests {
         assert!(SessionTaskStatusKind::Failed.is_unsuccessful());
         assert!(SessionTaskStatusKind::Cancelled.is_unsuccessful());
         assert_eq!(
-            session_task_status_marker(SessionTaskStatusKind::InProgress),
+            SessionTaskStatusKind::InProgress.status_marker(),
             "▸"
         );
         assert_eq!(
-            session_task_status_marker(SessionTaskStatusKind::Pending),
+            SessionTaskStatusKind::Pending.status_marker(),
             "·"
         );
         assert_eq!(
-            session_task_status_marker(SessionTaskStatusKind::Cancelled),
+            SessionTaskStatusKind::Cancelled.status_marker(),
             "⏹"
         );
         assert_eq!(
-            session_task_status_marker(SessionTaskStatusKind::Archived),
+            SessionTaskStatusKind::Archived.status_marker(),
             "·"
         );
         assert_eq!(

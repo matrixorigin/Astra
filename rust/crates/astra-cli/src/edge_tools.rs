@@ -2404,12 +2404,12 @@ impl ToolExecutor {
         let tasks = self.task_manager.snapshot().await;
         let active_tasks: Vec<_> = tasks
             .iter()
-            .filter(|t| task_mgmt::session_task_is_active(&t.status))
+            .filter(|t| t.status.is_active())
             .collect();
         if !active_tasks.is_empty() {
             out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
             for t in active_tasks.iter().take(5) {
-                let status_icon = if task_mgmt::session_task_is_in_progress(&t.status) {
+                let status_icon = if t.status.is_in_progress() {
                     "▶"
                 } else {
                     "○"

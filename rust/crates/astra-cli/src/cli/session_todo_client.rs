@@ -11,8 +11,6 @@
 //! the LLM/UI consumes; on error a stringified failure suitable to
 //! return as an `Error: ...` ToolResult.
 
-#[cfg(test)]
-use crate::cli::session_task_surface::session_task_is_completed;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -501,7 +499,7 @@ mod wiring_e2e {
                     .snapshot()
                     .tasks
                     .iter()
-                    .any(|t| session_task_is_completed(t.status))
+                    .any(|t| t.status.is_completed())
             },
             500,
             || observer.maybe_refresh(),

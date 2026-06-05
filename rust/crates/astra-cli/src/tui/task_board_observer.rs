@@ -31,7 +31,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::cli::session_task_surface::{session_task_is_active, session_task_is_completed};
 
 /// Fallback poll cadence when nothing has broadcast a change. Matches
 /// the "only poll while incomplete" gate in the reference TUI — if a
@@ -80,7 +79,7 @@ pub(crate) enum ViewMode {
 
 impl TaskBoardSnapshot {
     pub fn has_incomplete(&self) -> bool {
-        self.tasks.iter().any(|t| session_task_is_active(t.status))
+        self.tasks.iter().any(|t| t.status.is_active())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -295,7 +294,7 @@ impl TaskBoardObserver {
         let now = Instant::now();
         let mut snap = st.snapshot.clone();
         snap.tasks.retain(|task| {
-            if !session_task_is_completed(task.status) {
+            if !task.status.is_completed() {
                 return true;
             }
             match st.completed_at.get(&task.id) {
@@ -329,7 +328,7 @@ impl TaskBoardObserver {
             .snapshot
             .tasks
             .iter()
-            .filter(|t| session_task_is_active(t.status))
+            .filter(|t| t.status.is_active())
             .count();
         (open, total, st.snapshot.hidden)
     }
@@ -565,7 +564,7 @@ impl TaskBoardObserver {
                                 ..
                             } = event
                             {
-                                if session_task_is_completed(*to) {
+                                if to.is_completed() {
                                     st.completed_at.insert(task_id.clone(), at);
                                 } else {
                                     st.completed_at.remove(task_id);
@@ -605,7 +604,7 @@ impl TaskBoardObserver {
                             .snapshot
                             .tasks
                             .iter()
-                            .filter(|t| session_task_is_completed(t.status))
+                            .filter(|t| t.status.is_completed())
                             .filter(|t| !st.completed_at.contains_key(&t.id))
                             .map(|t| t.id.clone())
                             .collect();

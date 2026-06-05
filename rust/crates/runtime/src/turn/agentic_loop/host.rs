@@ -64,7 +64,7 @@ use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{
-    SessionTask, TaskManager, session_task_is_active, session_task_is_in_progress,
+    SessionTask, TaskManager,
 };
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
@@ -689,10 +689,10 @@ impl TaskBoardSnapshot {
     pub fn from_active_tasks(tasks: &[SessionTask]) -> Self {
         let mut snapshot = Self::default();
         for task in tasks {
-            if !session_task_is_active(&task.status) {
+            if !task.status.is_active() {
                 continue;
             }
-            if session_task_is_in_progress(&task.status) {
+            if task.status.is_in_progress() {
                 snapshot.in_progress_count += 1;
             } else {
                 snapshot.pending_count += 1;

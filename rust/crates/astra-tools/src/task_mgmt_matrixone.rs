@@ -31,7 +31,7 @@ use crate::task_mgmt::{
     InMemoryTaskStore, SESSION_TASK_STATUS_ARCHIVED, SESSION_TASK_STATUS_CANCELLED,
     SESSION_TASK_STATUS_COMPLETED, SESSION_TASK_STATUS_FAILED, SESSION_TASK_STATUS_IN_PROGRESS,
     SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
-    TaskStore, prefix_summary, session_task_can_be_archived,
+    TaskStore, prefix_summary,
 };
 
 /// Soft cap on the number of rows a single `session_todos` full-replace
@@ -394,7 +394,7 @@ impl TaskStore for MatrixOneTaskStore {
                     .to_string(),
                 ));
             }
-            if !session_task_can_be_archived(&status_kind) {
+            if !status_kind.can_be_archived() {
                 return Ok(prefix_summary(
                     format!(
                         "Refused: task #{task_id} is '{status}' — only completed, failed, or cancelled tasks can be archived"

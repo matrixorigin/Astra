@@ -15,10 +15,7 @@
 //!   `None` so the caller just skips injection instead of padding
 //!   the prompt with "no tasks".
 
-use crate::cli::session_task_surface::{
-    session_task_is_completed, session_task_is_in_progress, session_task_is_pending,
-    session_task_status_marker, SessionTaskStatusKind,
-};
+use crate::cli::session_task_surface::{SessionTaskStatusKind};
 use astra_tools::task_mgmt::SessionTask;
 
 /// Render the summary. `None` means "the model doesn't need to
@@ -44,15 +41,15 @@ pub(crate) fn format_summary(tasks: &[SessionTask]) -> Option<String> {
     // the model sees what it SHOULD still be doing.
     let mut picks: Vec<&SessionTask> = tasks
         .iter()
-        .filter(|t| session_task_is_in_progress(t.status))
+        .filter(|t| t.status.is_in_progress())
         .collect();
     if picks.len() < 3 {
-        picks.extend(tasks.iter().filter(|t| session_task_is_pending(t.status)));
+        picks.extend(tasks.iter().filter(|t| t.status.is_pending()));
     }
     picks.truncate(3);
 
     for t in picks {
-        let marker = session_task_status_marker(t.status);
+        let marker = t.status.status_marker();
         lines.push(format!("{marker} {}", task_line(t)));
     }
 
@@ -68,18 +65,18 @@ fn task_line(task: &SessionTask) -> String {
     let completed = task
         .subtasks
         .iter()
-        .filter(|s| session_task_is_completed(s.status))
+        .filter(|s| s.status.is_completed())
         .count();
     let total = task.subtasks.len();
     let current = task
         .subtasks
         .iter()
-        .find(|s| session_task_is_in_progress(s.status))
+        .find(|s| s.status.is_in_progress())
         .map(|s| ("now", s))
         .or_else(|| {
             task.subtasks
                 .iter()
-                .find(|s| session_task_is_pending(s.status))
+                .find(|s| s.status.is_pending())
                 .map(|s| ("next", s))
         });
 
