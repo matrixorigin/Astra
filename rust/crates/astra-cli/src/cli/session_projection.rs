@@ -101,7 +101,7 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
 }
 
 fn prioritize_active_tasks_for_anchor(mut tasks: Vec<SessionTask>) -> Vec<SessionTask> {
-    tasks.sort_by_key(|task| session_task_active_priority(&task.status));
+    tasks.sort_by_key(|task| session_task_active_priority(task.status));
     tasks
 }
 

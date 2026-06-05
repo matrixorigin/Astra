@@ -17,7 +17,7 @@
 
 use crate::cli::session_task_surface::{
     SessionTaskStatusKind, session_task_is_completed, session_task_is_in_progress,
-    session_task_is_pending, session_task_status_kind, session_task_status_marker,
+    session_task_is_pending, session_task_status_marker,
 };
 use astra_tools::task_mgmt::SessionTask;
 
@@ -44,15 +44,15 @@ pub(crate) fn format_summary(tasks: &[SessionTask]) -> Option<String> {
     // the model sees what it SHOULD still be doing.
     let mut picks: Vec<&SessionTask> = tasks
         .iter()
-        .filter(|t| session_task_is_in_progress(&t.status))
+        .filter(|t| session_task_is_in_progress(t.status))
         .collect();
     if picks.len() < 3 {
-        picks.extend(tasks.iter().filter(|t| session_task_is_pending(&t.status)));
+        picks.extend(tasks.iter().filter(|t| session_task_is_pending(t.status)));
     }
     picks.truncate(3);
 
     for t in picks {
-        let marker = session_task_status_marker(&t.status);
+        let marker = session_task_status_marker(t.status);
         lines.push(format!("{marker} {}", task_line(t)));
     }
 
@@ -68,18 +68,18 @@ fn task_line(task: &SessionTask) -> String {
     let completed = task
         .subtasks
         .iter()
-        .filter(|s| session_task_is_completed(&s.status))
+        .filter(|s| session_task_is_completed(s.status))
         .count();
     let total = task.subtasks.len();
     let current = task
         .subtasks
         .iter()
-        .find(|s| session_task_is_in_progress(&s.status))
+        .find(|s| session_task_is_in_progress(s.status))
         .map(|s| ("now", s))
         .or_else(|| {
             task.subtasks
                 .iter()
-                .find(|s| session_task_is_pending(&s.status))
+                .find(|s| session_task_is_pending(s.status))
                 .map(|s| ("next", s))
         });
 
@@ -97,7 +97,7 @@ fn counts(tasks: &[SessionTask]) -> (usize, usize, usize, usize) {
     let mut completed = 0;
     let mut other = 0;
     for t in tasks {
-        match session_task_status_kind(&t.status) {
+        match t.status {
             SessionTaskStatusKind::Pending => pending += 1,
             SessionTaskStatusKind::InProgress => in_progress += 1,
             SessionTaskStatusKind::Completed => completed += 1,

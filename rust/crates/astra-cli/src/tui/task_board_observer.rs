@@ -80,7 +80,7 @@ pub(crate) enum ViewMode {
 
 impl TaskBoardSnapshot {
     pub fn has_incomplete(&self) -> bool {
-        self.tasks.iter().any(|t| session_task_is_active(&t.status))
+        self.tasks.iter().any(|t| session_task_is_active(t.status))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -295,7 +295,7 @@ impl TaskBoardObserver {
         let now = Instant::now();
         let mut snap = st.snapshot.clone();
         snap.tasks.retain(|task| {
-            if !session_task_is_completed(&task.status) {
+            if !session_task_is_completed(task.status) {
                 return true;
             }
             match st.completed_at.get(&task.id) {
@@ -329,7 +329,7 @@ impl TaskBoardObserver {
             .snapshot
             .tasks
             .iter()
-            .filter(|t| session_task_is_active(&t.status))
+            .filter(|t| session_task_is_active(t.status))
             .count();
         (open, total, st.snapshot.hidden)
     }
@@ -565,7 +565,7 @@ impl TaskBoardObserver {
                                 ..
                             } = event
                             {
-                                if session_task_is_completed(to) {
+                                if session_task_is_completed(*to) {
                                     st.completed_at.insert(task_id.clone(), at);
                                 } else {
                                     st.completed_at.remove(task_id);
@@ -605,7 +605,7 @@ impl TaskBoardObserver {
                             .snapshot
                             .tasks
                             .iter()
-                            .filter(|t| session_task_is_completed(&t.status))
+                            .filter(|t| session_task_is_completed(t.status))
                             .filter(|t| !st.completed_at.contains_key(&t.id))
                             .map(|t| t.id.clone())
                             .collect();

@@ -1,17 +1,51 @@
 use super::types::AgentStatus;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::str::FromStr;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Wire-level status of an agent tool result.
+///
+/// Serde round-trips to the lowercase wire strings (e.g. `"completed"`,
+/// `"timeout"`, `"still_running"`) that LLMs see in JSON output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentToolResultStatusKind {
     Completed,
     Failed,
+    #[serde(rename = "timeout")]
     TimedOut,
     Cancelled,
     Interrupted,
     StillRunning,
     Launched,
+    /// Catch-all for unknown wire statuses.
     Other,
+}
+
+impl AgentToolResultStatusKind {
+    /// Return the serde wire name (the lowercase string used in JSON output).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::StillRunning => "still_running",
+            Self::Launched => "launched",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl FromStr for AgentToolResultStatusKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_owned()))
+            .map_err(|e| format!("unknown agent tool status: '{s}': {e}"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,32 +69,8 @@ pub struct AgentToolWireProjection<'a> {
     pub has_result: bool,
 }
 
-pub const AGENT_TOOL_STATUS_COMPLETED: &str = "completed";
-pub const AGENT_TOOL_STATUS_FAILED: &str = "failed";
-pub const AGENT_TOOL_STATUS_TIMEOUT: &str = "timeout";
-pub const AGENT_TOOL_STATUS_CANCELLED: &str = "cancelled";
-pub const AGENT_TOOL_STATUS_INTERRUPTED: &str = "interrupted";
-pub const AGENT_TOOL_STATUS_STILL_RUNNING: &str = "still_running";
-pub const AGENT_TOOL_STATUS_LAUNCHED: &str = "launched";
-
 pub const AGENT_RESULT_INTERRUPTED_ERROR: &str =
     "Agent did not return a final result before it was interrupted.";
-
-pub fn agent_tool_result_status_kind(status: &str) -> AgentToolResultStatusKind {
-    match status {
-        AGENT_TOOL_STATUS_COMPLETED => AgentToolResultStatusKind::Completed,
-        AGENT_TOOL_STATUS_FAILED => AgentToolResultStatusKind::Failed,
-        AGENT_TOOL_STATUS_TIMEOUT => AgentToolResultStatusKind::TimedOut,
-        AGENT_TOOL_STATUS_CANCELLED => AgentToolResultStatusKind::Cancelled,
-        AGENT_TOOL_STATUS_INTERRUPTED => AgentToolResultStatusKind::Interrupted,
-        AGENT_TOOL_STATUS_STILL_RUNNING => AgentToolResultStatusKind::StillRunning,
-        AGENT_TOOL_STATUS_LAUNCHED => AgentToolResultStatusKind::Launched,
-        other => {
-            tracing::warn!(%other, "agent_tool_result_status_kind: unknown status");
-            AgentToolResultStatusKind::Other
-        }
-    }
-}
 
 pub fn project_agent_tool_wire<'a>(
     action: &str,
@@ -70,7 +80,7 @@ pub fn project_agent_tool_wire<'a>(
     let status_kind = parsed
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
-        .map(agent_tool_result_status_kind);
+        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok());
     let finish_reason = parsed
         .and_then(|value| value.get("finish_reason"))
         .and_then(Value::as_str);
@@ -127,7 +137,7 @@ pub fn agent_tool_completed_result_text(parsed: &Value) -> Option<String> {
     match parsed
         .get("status")
         .and_then(Value::as_str)
-        .map(agent_tool_result_status_kind)
+        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok())
     {
         Some(AgentToolResultStatusKind::Completed | AgentToolResultStatusKind::Interrupted) => {
             parsed
@@ -163,7 +173,7 @@ pub fn agent_tool_incomplete_reason(parsed: &Value) -> Option<String> {
     match parsed
         .get("status")
         .and_then(Value::as_str)
-        .map(agent_tool_result_status_kind)
+        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok())
     {
         Some(AgentToolResultStatusKind::StillRunning) => {
             let detail = parsed
@@ -213,7 +223,7 @@ pub fn agent_tool_running_preview(parsed: &Value) -> Option<String> {
     match parsed
         .get("status")
         .and_then(Value::as_str)
-        .map(agent_tool_result_status_kind)
+        .and_then(|s| AgentToolResultStatusKind::from_str(s).ok())
     {
         Some(AgentToolResultStatusKind::StillRunning) => {
             let current_status = parsed
@@ -266,9 +276,9 @@ pub fn render_completed_agent_result(
     let interrupted = reason != "normal";
     let mut body = json!({
         "status": if interrupted {
-            AGENT_TOOL_STATUS_INTERRUPTED
+            AgentToolResultStatusKind::Interrupted.as_str()
         } else {
-            AGENT_TOOL_STATUS_COMPLETED
+            AgentToolResultStatusKind::Completed.as_str()
         },
         "agent_id": agent_id,
         "result": result,
@@ -290,7 +300,7 @@ pub fn render_wait_timeout_outcome(
 ) -> String {
     match live_status {
         Some(status) if !status.is_terminal() => json!({
-            "status": AGENT_TOOL_STATUS_STILL_RUNNING,
+            "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": format!("{status:?}"),
             "waited_secs": timeout.as_secs(),
@@ -300,7 +310,7 @@ pub fn render_wait_timeout_outcome(
         })
         .to_string(),
         _ => json!({
-            "status": AGENT_TOOL_STATUS_TIMEOUT,
+            "status": AgentToolResultStatusKind::TimedOut.as_str(),
             "agent_id": agent_id,
             "error": format!(
                 "Agent '{agent_id}' did not complete within {}s and has no live state",
@@ -321,9 +331,9 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             error,
             finish_reason,
         } => {
-            let reason = finish_reason.as_deref().unwrap_or(AGENT_TOOL_STATUS_FAILED);
+            let reason = finish_reason.as_deref().unwrap_or(AgentToolResultStatusKind::Failed.as_str());
             json!({
-                "status": AGENT_TOOL_STATUS_FAILED,
+                "status": AgentToolResultStatusKind::Failed.as_str(),
                 "agent_id": agent_id,
                 "error": error,
                 "finish_reason": reason,
@@ -331,18 +341,18 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             .to_string()
         }
         AgentStatus::Cancelled => json!({
-            "status": AGENT_TOOL_STATUS_CANCELLED,
+            "status": AgentToolResultStatusKind::Cancelled.as_str(),
             "agent_id": agent_id,
             "reason": "cancelled",
         })
         .to_string(),
         AgentStatus::Initializing => json!({
-            "status": AGENT_TOOL_STATUS_LAUNCHED,
+            "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": agent_id,
         })
         .to_string(),
         AgentStatus::Running { activity } => json!({
-            "status": AGENT_TOOL_STATUS_STILL_RUNNING,
+            "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": "running",
             "activity": activity,
@@ -350,7 +360,7 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
         })
         .to_string(),
         AgentStatus::Idle => json!({
-            "status": AGENT_TOOL_STATUS_STILL_RUNNING,
+            "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": "idle",
             "hint": "The child agent is still running. Call `agent(action='get_result', agent_id=...)` again to continue waiting.",
@@ -365,7 +375,7 @@ pub fn render_unknown_agent_result(agent_id: &str, message: &str) -> String {
 
 pub fn render_agent_tool_error(agent_id: Option<&str>, message: &str) -> String {
     let mut body = json!({
-        "status": AGENT_TOOL_STATUS_FAILED,
+        "status": AgentToolResultStatusKind::Failed.as_str(),
         "error": message,
     });
     if let Some(agent_id) = agent_id {
@@ -411,7 +421,7 @@ mod tests {
     #[test]
     fn wire_projection_covers_interrupted_running_legacy_and_tool_failure_paths() {
         let interrupted = json!({
-            "status": AGENT_TOOL_STATUS_INTERRUPTED,
+            "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "agent_id": "a1",
             "finish_reason": "budget_exhausted",
             "result": "partial"
@@ -423,7 +433,7 @@ mod tests {
         assert!(projection.has_result);
 
         let launched = json!({
-            "status": AGENT_TOOL_STATUS_LAUNCHED,
+            "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "a1"
         });
         let projection = project_agent_tool_wire("get_result", true, Some(&launched));
@@ -440,7 +450,7 @@ mod tests {
     #[test]
     fn running_preview_covers_still_running_and_launched() {
         let still_running = json!({
-            "status": AGENT_TOOL_STATUS_STILL_RUNNING,
+            "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "current_status": "running",
             "waited_secs": 120,
             "hint": "call again"
@@ -451,7 +461,7 @@ mod tests {
         );
 
         let launched = json!({
-            "status": AGENT_TOOL_STATUS_LAUNCHED,
+            "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "a"
         });
         assert_eq!(
@@ -479,7 +489,7 @@ mod tests {
     #[test]
     fn status_summary_prefers_result_then_running_then_reason() {
         let completed = json!({
-            "status": AGENT_TOOL_STATUS_INTERRUPTED,
+            "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "result": "partial draft\nmore",
             "finish_reason": "budget_exhausted"
         });
@@ -489,7 +499,7 @@ mod tests {
         );
 
         let launched = json!({
-            "status": AGENT_TOOL_STATUS_LAUNCHED,
+            "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "a"
         });
         assert_eq!(
@@ -498,7 +508,7 @@ mod tests {
         );
 
         let failed = json!({
-            "status": AGENT_TOOL_STATUS_FAILED,
+            "status": AgentToolResultStatusKind::Failed.as_str(),
             "error": "child result retrieval failed"
         });
         assert_eq!(

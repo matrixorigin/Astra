@@ -15,7 +15,7 @@
 //! rather than position, so a board reshuffled by priority doesn't
 //! spuriously fire Created/Removed pairs.
 
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind};
 
 /// One thing the observer detected between two snapshots. Ordered
 /// oldest first so the ring buffer trims from the front.
@@ -29,8 +29,8 @@ pub(crate) enum TaskBoardEvent {
     StatusChanged {
         task_id: String,
         title: String,
-        from: String,
-        to: String,
+        from: SessionTaskStatusKind,
+        to: SessionTaskStatusKind,
     },
     /// Task disappeared from the snapshot (deleted / cancelled +
     /// pruned, etc.).
@@ -64,8 +64,8 @@ pub(crate) fn diff(prev: &[SessionTask], new: &[SessionTask]) -> Vec<TaskBoardEv
                 events.push(TaskBoardEvent::StatusChanged {
                     task_id: task.id.clone(),
                     title: task.title.clone(),
-                    from: p.status.clone(),
-                    to: task.status.clone(),
+                    from: p.status,
+                    to: task.status,
                 });
             }
             _ => {}

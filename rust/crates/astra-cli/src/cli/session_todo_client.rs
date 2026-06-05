@@ -497,7 +497,7 @@ mod wiring_e2e {
                     .snapshot()
                     .tasks
                     .iter()
-                    .any(|t| session_task_is_completed(&t.status))
+                    .any(|t| session_task_is_completed(t.status))
             },
             500,
             || observer.maybe_refresh(),

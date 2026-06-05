@@ -92,6 +92,21 @@ pub const SESSION_TASK_STATUS_ARCHIVED: SessionTaskStatusKind = SessionTaskStatu
 pub const SESSION_TASK_STATUS_DELETED: SessionTaskStatusKind = SessionTaskStatusKind::Deleted;
 
 impl SessionTaskStatusKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionTaskStatusKind::InProgress => "in_progress",
+            SessionTaskStatusKind::Pending => "pending",
+            SessionTaskStatusKind::Completed => "completed",
+            SessionTaskStatusKind::Failed => "failed",
+            SessionTaskStatusKind::Cancelled => "cancelled",
+            SessionTaskStatusKind::Archived => "archived",
+            SessionTaskStatusKind::Deleted => "deleted",
+            SessionTaskStatusKind::Other => "other",
+        }
+    }
+}
+
+impl SessionTaskStatusKind {
     /// Parse a status string with normalization.
     pub fn from_status_str(status: &str) -> Self {
         match status.trim().to_ascii_lowercase().as_str() {

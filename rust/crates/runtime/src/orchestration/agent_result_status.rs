@@ -7,15 +7,12 @@ use astra_turn_core::orchestration_types::AgentStatus;
 use serde_json::json;
 
 use astra_turn_core::orchestration::agent_result_wire::{
-    AGENT_RESULT_INTERRUPTED_ERROR, AGENT_TOOL_STATUS_CANCELLED, AGENT_TOOL_STATUS_COMPLETED,
-    AGENT_TOOL_STATUS_FAILED, AGENT_TOOL_STATUS_INTERRUPTED, AGENT_TOOL_STATUS_LAUNCHED,
-    AGENT_TOOL_STATUS_STILL_RUNNING, AGENT_TOOL_STATUS_TIMEOUT, AgentToolResultStatusKind,
-    AgentToolWireOutcomeKind, AgentToolWireProjection, agent_tool_completed_result_text,
-    agent_tool_error_message, agent_tool_incomplete_reason, agent_tool_interrupted_message,
-    agent_tool_result_output_summary, agent_tool_result_status_kind, agent_tool_running_preview,
+    agent_tool_completed_result_text, agent_tool_error_message, agent_tool_incomplete_reason,
+    agent_tool_interrupted_message, agent_tool_result_output_summary, agent_tool_running_preview,
     agent_tool_status_summary, project_agent_tool_wire, render_agent_tool_error,
     render_completed_agent_result, render_unknown_agent_result, render_wait_for_agent_status,
-    render_wait_timeout_outcome,
+    render_wait_timeout_outcome, AgentToolResultStatusKind, AgentToolWireOutcomeKind,
+    AgentToolWireProjection, AGENT_RESULT_INTERRUPTED_ERROR,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,26 +165,27 @@ fn summarize_agent_tool_control_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use std::time::Duration;
 
     #[test]
-    fn shared_agent_tool_status_kind_covers_terminal_and_live_states() {
+    fn shared_agent_tool_status_kind_roundtrips_via_from_str() {
         assert_eq!(
-            agent_tool_result_status_kind(AGENT_TOOL_STATUS_INTERRUPTED),
+            AgentToolResultStatusKind::from_str(AgentToolResultStatusKind::Interrupted.as_str())
+                .unwrap(),
             AgentToolResultStatusKind::Interrupted
         );
         assert_eq!(
-            agent_tool_result_status_kind(AGENT_TOOL_STATUS_STILL_RUNNING),
+            AgentToolResultStatusKind::from_str(AgentToolResultStatusKind::StillRunning.as_str())
+                .unwrap(),
             AgentToolResultStatusKind::StillRunning
         );
         assert_eq!(
-            agent_tool_result_status_kind(AGENT_TOOL_STATUS_LAUNCHED),
+            AgentToolResultStatusKind::from_str(AgentToolResultStatusKind::Launched.as_str())
+                .unwrap(),
             AgentToolResultStatusKind::Launched
         );
-        assert_eq!(
-            agent_tool_result_status_kind("weird"),
-            AgentToolResultStatusKind::Other
-        );
+        assert!(AgentToolResultStatusKind::from_str("weird").is_err());
     }
 
     #[test]
@@ -211,7 +209,7 @@ mod tests {
         let out =
             render_completed_agent_result("reviewer-tests", "partial", Some("budget_exhausted"));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], AGENT_TOOL_STATUS_INTERRUPTED);
+        assert_eq!(v["status"], AgentToolResultStatusKind::Interrupted.as_str());
         assert_eq!(v["incomplete"], true);
     }
 
@@ -219,7 +217,7 @@ mod tests {
     fn completed_result_keeps_normal_completion_completed() {
         let out = render_completed_agent_result("reviewer-tests", "done", Some("normal"));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], AGENT_TOOL_STATUS_COMPLETED);
+        assert_eq!(v["status"], AgentToolResultStatusKind::Completed.as_str());
         assert_eq!(v["incomplete"], false);
     }
 
@@ -231,7 +229,10 @@ mod tests {
         let out =
             render_wait_timeout_outcome("reviewer-tests", Some(&status), Duration::from_secs(120));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], AGENT_TOOL_STATUS_STILL_RUNNING);
+        assert_eq!(
+            v["status"],
+            AgentToolResultStatusKind::StillRunning.as_str()
+        );
     }
 
     #[test]
@@ -250,7 +251,7 @@ mod tests {
         for terminal in terminals {
             let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));
             let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-            assert_eq!(v["status"], AGENT_TOOL_STATUS_TIMEOUT);
+            assert_eq!(v["status"], AgentToolResultStatusKind::TimedOut.as_str());
         }
     }
 
@@ -262,30 +263,42 @@ mod tests {
         };
         let failed_out = render_wait_for_agent_status("ag", &failed);
         let failed_json: serde_json::Value = serde_json::from_str(&failed_out).unwrap();
-        assert_eq!(failed_json["status"], AGENT_TOOL_STATUS_FAILED);
+        assert_eq!(
+            failed_json["status"],
+            AgentToolResultStatusKind::Failed.as_str()
+        );
         assert_eq!(failed_json["error"], "boom");
 
         let idle = AgentStatus::Idle;
         let idle_out = render_wait_for_agent_status("ag", &idle);
         let idle_json: serde_json::Value = serde_json::from_str(&idle_out).unwrap();
-        assert_eq!(idle_json["status"], AGENT_TOOL_STATUS_STILL_RUNNING);
+        assert_eq!(
+            idle_json["status"],
+            AgentToolResultStatusKind::StillRunning.as_str()
+        );
         assert_eq!(idle_json["current_status"], "idle");
 
         let initializing = AgentStatus::Initializing;
         let init_out = render_wait_for_agent_status("ag", &initializing);
         let init_json: serde_json::Value = serde_json::from_str(&init_out).unwrap();
-        assert_eq!(init_json["status"], AGENT_TOOL_STATUS_LAUNCHED);
+        assert_eq!(
+            init_json["status"],
+            AgentToolResultStatusKind::Launched.as_str()
+        );
 
         let cancelled = AgentStatus::Cancelled;
         let cancelled_out = render_wait_for_agent_status("ag", &cancelled);
         let cancelled_json: serde_json::Value = serde_json::from_str(&cancelled_out).unwrap();
-        assert_eq!(cancelled_json["status"], AGENT_TOOL_STATUS_CANCELLED);
+        assert_eq!(
+            cancelled_json["status"],
+            AgentToolResultStatusKind::Cancelled.as_str()
+        );
     }
 
     #[test]
     fn completed_text_extracts_interrupted_partial_results() {
         let parsed = json!({
-            "status": AGENT_TOOL_STATUS_INTERRUPTED,
+            "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "agent_id": "reviewer@abc",
             "result": "partial findings",
             "finish_reason": "budget_exhausted"
@@ -298,13 +311,14 @@ mod tests {
 
     #[test]
     fn incomplete_reason_covers_live_cancelled_and_unknown_states() {
-        let launched = json!({"status": AGENT_TOOL_STATUS_LAUNCHED, "agent_id": "a"});
+        let launched =
+            json!({"status": AgentToolResultStatusKind::Launched.as_str(), "agent_id": "a"});
         assert_eq!(
             agent_tool_incomplete_reason(&launched).as_deref(),
             Some("launched and has not produced a child result yet")
         );
 
-        let cancelled = json!({"status": AGENT_TOOL_STATUS_CANCELLED, "reason": "parent cancelled this sub-agent"});
+        let cancelled = json!({"status": AgentToolResultStatusKind::Cancelled.as_str(), "reason": "parent cancelled this sub-agent"});
         assert_eq!(
             agent_tool_incomplete_reason(&cancelled).as_deref(),
             Some("parent cancelled this sub-agent")
@@ -320,7 +334,7 @@ mod tests {
     #[test]
     fn running_preview_covers_still_running_and_launched() {
         let still_running = json!({
-            "status": AGENT_TOOL_STATUS_STILL_RUNNING,
+            "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "current_status": "running",
             "waited_secs": 120,
             "hint": "call again"
@@ -331,7 +345,7 @@ mod tests {
         );
 
         let launched = json!({
-            "status": AGENT_TOOL_STATUS_LAUNCHED,
+            "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "reviewer@abc"
         });
         assert_eq!(
@@ -343,7 +357,7 @@ mod tests {
     #[test]
     fn result_output_summary_prefers_parsed_result_and_falls_back_to_raw_output() {
         let parsed = json!({
-            "status": AGENT_TOOL_STATUS_INTERRUPTED,
+            "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "result": "partial findings"
         });
         assert_eq!(
@@ -360,7 +374,7 @@ mod tests {
     #[test]
     fn error_message_prefers_payload_error_and_falls_back() {
         let parsed = json!({
-            "status": AGENT_TOOL_STATUS_FAILED,
+            "status": AgentToolResultStatusKind::Failed.as_str(),
             "error": "child exploded"
         });
         assert_eq!(
@@ -373,7 +387,7 @@ mod tests {
     #[test]
     fn wire_projection_covers_interrupted_running_legacy_and_tool_failure_paths() {
         let interrupted = json!({
-            "status": AGENT_TOOL_STATUS_INTERRUPTED,
+            "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "agent_id": "reviewer@abc",
             "finish_reason": "budget_exhausted"
         });
@@ -383,7 +397,7 @@ mod tests {
         assert_eq!(projection.finish_reason, Some("budget_exhausted"));
 
         let launched = json!({
-            "status": AGENT_TOOL_STATUS_LAUNCHED,
+            "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "reviewer@abc",
             "description": "Architecture review"
         });
@@ -419,7 +433,7 @@ mod tests {
             ),
             result_full: Some(
                 json!({
-                    "status": AGENT_TOOL_STATUS_LAUNCHED,
+                    "status": AgentToolResultStatusKind::Launched.as_str(),
                     "description": "Launched child"
                 })
                 .to_string(),
@@ -440,7 +454,10 @@ mod tests {
     fn render_agent_tool_error_optionally_includes_agent_id() {
         let without_id: Value =
             serde_json::from_str(&render_agent_tool_error(None, "boom")).unwrap();
-        assert_eq!(without_id["status"], AGENT_TOOL_STATUS_FAILED);
+        assert_eq!(
+            without_id["status"],
+            AgentToolResultStatusKind::Failed.as_str()
+        );
         assert_eq!(without_id["error"], "boom");
         assert!(without_id.get("agent_id").is_none());
 
@@ -465,7 +482,7 @@ mod tests {
             ),
             result_full: Some(
                 json!({
-                    "status": AGENT_TOOL_STATUS_LAUNCHED,
+                    "status": AgentToolResultStatusKind::Launched.as_str(),
                     "agent_id": "reviewer@abc"
                 })
                 .to_string(),

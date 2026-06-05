@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::view::{BottomPaneView, CancellationEvent};
-use crate::cli::session_task_surface::{SessionTaskStatusKind, session_task_status_kind};
+use crate::cli::session_task_surface::{SessionTaskStatusKind};
 use crate::tui::history_cell::task::{ChildStatus, TaskCell, TaskStatus};
 use astra_tools::task_mgmt::SessionTask;
 
@@ -78,7 +78,7 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
 
-    let status_color = match session_task_status_kind(&task.status) {
+    let status_color = match task.status {
         SessionTaskStatusKind::InProgress => Color::Yellow,
         SessionTaskStatusKind::Completed => Color::Green,
         SessionTaskStatusKind::Failed => Color::Red,
@@ -87,7 +87,7 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
     };
     out.push(Line::from(vec![
         Span::styled("  Status: ", dim),
-        Span::styled(task.status.clone(), Style::default().fg(status_color)),
+        Span::styled(task.status.as_str(), Style::default().fg(status_color)),
     ]));
 
     if let Some(ref owner) = task.owner {
@@ -122,7 +122,7 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
         for (i, sub) in task.subtasks.iter().enumerate() {
             let is_last = i + 1 == task.subtasks.len();
             let connector = if is_last { "└" } else { "├" };
-            let (icon, icon_color) = match session_task_status_kind(&sub.status) {
+            let (icon, icon_color) = match sub.status {
                 SessionTaskStatusKind::Completed => ("✓", Color::Green),
                 SessionTaskStatusKind::InProgress => ("◦", Color::Yellow),
                 SessionTaskStatusKind::Pending => ("·", Color::DarkGray),

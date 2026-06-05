@@ -15,7 +15,7 @@
 //! can land in parallel.
 
 use crate::cli::session_task_surface::session_task_is_active;
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind};
 
 /// A flat row in the cross-session task view. Mirrors the
 /// session-scoped `SessionTask` but adds a `session_id` column and
@@ -27,7 +27,7 @@ pub(crate) struct MultiSessionRow {
     pub session_short: String,
     pub task_id: String,
     pub title: String,
-    pub status: String,
+    pub status: SessionTaskStatusKind,
     pub updated_at: String,
 }
 
@@ -44,7 +44,7 @@ where
     for (sid, tasks) in per_session {
         let short = sid.chars().take(8).collect::<String>();
         for t in tasks {
-            if !session_task_is_active(&t.status) {
+            if !session_task_is_active(t.status) {
                 continue;
             }
             rows.push(MultiSessionRow {
@@ -52,7 +52,7 @@ where
                 session_short: short.clone(),
                 task_id: t.id.clone(),
                 title: t.title.clone(),
-                status: t.status.clone(),
+                status: t.status,
                 updated_at: t.updated_at.clone(),
             });
         }
