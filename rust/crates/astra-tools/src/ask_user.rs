@@ -177,7 +177,21 @@ fn parse_questions(value: &Value) -> Result<Vec<AskUserQuestion>, String> {
     let items: Vec<&Value> = if let Some(items) = value.as_array() {
         items.iter().collect()
     } else if value.is_object() {
-        vec![value]
+        // Handle {"item": <single-question-or-array>} wrapper produced by
+        // some LLM providers (XML-to-JSON serialization artifact).
+        if let Some(inner) = value.get("item") {
+            if let Some(arr) = inner.as_array() {
+                arr.iter().collect()
+            } else if inner.is_object() {
+                vec![inner]
+            } else {
+                return Err(ask_user_contract_error(
+                    "'questions' must be an array of question objects.",
+                ));
+            }
+        } else {
+            vec![value]
+        }
     } else {
         return Err(ask_user_contract_error(
             "'questions' must be an array of question objects.",
@@ -267,6 +281,10 @@ fn parse_choices(
     let value = normalized.as_ref();
     let items = value
         .as_array()
+        .or_else(|| {
+            // Handle {"item": [...]} wrapper produced by some LLM providers.
+            value.get("item").and_then(|v| v.as_array())
+        })
         .ok_or_else(|| ask_user_contract_error("'options' must be an array"))?;
     if items.is_empty() && allow_freeform {
         return Ok(Vec::new());
@@ -1120,5 +1138,96 @@ mod tests {
         );
 
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn reproduce_ask_user_bug_with_typical_llm_args() {
+        // Simulates the exact args shape an LLM would produce for ask_user
+        let args = json!({
+            "questions": [{
+                "question": "你现在能看到 ask_user 的问卷界面吗？",
+                "header": "检测",
+                "options": ["是，能看到", "否，看不到"]
+            }]
+        });
+        let result = parse_ask_user_prompt(&args);
+        match result {
+            Ok(prompt) => {
+                eprintln!(
+                    "✅ Parsed successfully: {} questions",
+                    prompt.questions.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("❌ Parse error: {}", e);
+                panic!("unexpected parse error: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_accepts_item_wrapped_questions() {
+        // Some LLM providers serialize arrays as {"item": <value>}
+        // (XML-to-JSON artifact). The parser must unwrap these.
+        let args = json!({
+            "questions": {
+                "item": {
+                    "question": "你现在能看到 ask_user 的问卷界面吗？",
+                    "header": "功能测试",
+                    "multi_select": false,
+                    "options": {
+                        "item": [
+                            {"label": "能看到界面", "description": "问卷正常弹出"},
+                            {"label": "完全看不到"}
+                        ]
+                    }
+                }
+            }
+        });
+        let prompt = parse_ask_user_prompt(&args).unwrap();
+        assert_eq!(prompt.questions.len(), 1);
+        assert_eq!(
+            prompt.questions[0].question,
+            "你现在能看到 ask_user 的问卷界面吗？"
+        );
+        assert_eq!(prompt.questions[0].header, "功能测试");
+        assert_eq!(prompt.questions[0].options.len(), 2);
+        assert_eq!(prompt.questions[0].options[0].label, "能看到界面");
+        assert_eq!(prompt.questions[0].options[1].label, "完全看不到");
+    }
+
+    #[test]
+    fn parse_accepts_item_wrapped_array_of_questions() {
+        // "item" wrapping a full array of question objects.
+        let args = json!({
+            "questions": {
+                "item": [
+                    {
+                        "question": "Q1?",
+                        "header": "H1"
+                    },
+                    {
+                        "question": "Q2?",
+                        "header": "H2"
+                    }
+                ]
+            }
+        });
+        let prompt = parse_ask_user_prompt(&args).unwrap();
+        assert_eq!(prompt.questions.len(), 2);
+    }
+
+    #[test]
+    fn parse_accepts_item_wrapped_options_as_strings() {
+        // Options wrapped in {"item": [...]} with plain strings.
+        let args = json!({
+            "questions": [{
+                "question": "Pick one",
+                "header": "H",
+                "options": {"item": ["A", "B", "C"]}
+            }]
+        });
+        let prompt = parse_ask_user_prompt(&args).unwrap();
+        assert_eq!(prompt.questions[0].options.len(), 3);
     }
 }
