@@ -20,6 +20,7 @@ pub enum AgentToolResultStatusKind {
     StillRunning,
     Launched,
     /// Catch-all for unknown wire statuses.
+    #[serde(other)]
     Other,
 }
 
@@ -467,6 +468,14 @@ mod tests {
         assert_eq!(
             agent_tool_running_preview(&launched).as_deref(),
             Some("Agent launched; waiting for get_result output.")
+        );
+    }
+
+    #[test]
+    fn unknown_status_deserializes_to_other() {
+        assert_eq!(
+            AgentToolResultStatusKind::from_str("mystery").unwrap(),
+            AgentToolResultStatusKind::Other
         );
     }
 

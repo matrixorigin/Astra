@@ -18,7 +18,7 @@ pub(crate) fn analyze_chat_turn_learning(
     };
     use astra_turn_core::routing_engine::RoutingEngine;
 
-    let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
+    let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![], None);
 
     let has_verdict_warning = result.verdict_events.iter().any(|verdict| {
         verdict.severity.eq_ignore_ascii_case("warning")

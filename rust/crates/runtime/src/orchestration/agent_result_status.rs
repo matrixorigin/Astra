@@ -185,7 +185,10 @@ mod tests {
                 .unwrap(),
             AgentToolResultStatusKind::Launched
         );
-        assert!(AgentToolResultStatusKind::from_str("weird").is_err());
+        assert_eq!(
+            AgentToolResultStatusKind::from_str("weird").unwrap(),
+            AgentToolResultStatusKind::Other
+        );
     }
 
     #[test]

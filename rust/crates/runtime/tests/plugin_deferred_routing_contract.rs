@@ -118,7 +118,7 @@ fn selector_does_not_include_plugin_in_production_path() {
     registry.register_plugins(&plugins);
 
     let query = "please check the weather in Beijing and tell me";
-    let routing = RoutingEngine::analyze(query, 1, &[], &[], vec![]);
+    let routing = RoutingEngine::analyze(query, 1, &[], &[], vec![], None);
     let (schemas, _report) = registry.select_routed_with_pressure(
         query,
         &routing,
