@@ -77,6 +77,9 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
 pub(crate) struct StreamResult {
     pub(crate) session_id: Option<String>,
     pub(crate) run_id: Option<String>,
+    /// Durable local persistence failure recorded after the runtime finished
+    /// successfully (for example one-shot journal append failure).
+    pub(crate) session_persistence_error: Option<String>,
     pub(crate) full_text: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
@@ -145,6 +148,46 @@ impl StreamResult {
     ) {
         self.routing_domain_hint = routing_domain_hint;
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
+    }
+}
+
+impl Default for StreamResult {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            run_id: None,
+            session_persistence_error: None,
+            full_text: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_count: 0,
+            tools_selected: vec![],
+            selected_skills: vec![],
+            tools_used: vec![],
+            tool_call_records: vec![],
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: vec![],
+            verdict_events: vec![],
+            step_recorder_summary: None,
+            tool_health_export: vec![],
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            memoria_ms: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            interruption: None,
+            final_state: "completed".to_string(),
+            interruption_kind: None,
+            final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
+        }
     }
 }
 

@@ -33,7 +33,7 @@ async fn execute_cli_health_command() {
 #[test]
 fn build_effective_line_plain() {
     let state = SessionState::default();
-    let result = chat_turn::build_effective_line(
+    let result = crate::cli::session_input::build_effective_line(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -48,7 +48,7 @@ fn build_effective_line_with_system_skills() {
     if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
         state.active_system_skills.push(md.clone());
     }
-    let result = chat_turn::build_effective_line(
+    let result = crate::cli::session_input::build_effective_line(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -63,7 +63,7 @@ fn history_as_messages_normal_turns() {
         ("q1".to_string(), "a1".to_string()),
         ("q2".to_string(), "a2".to_string()),
     ];
-    let msgs = chat_turn::history_as_messages(&history);
+    let msgs = crate::cli::session_projection::history_as_messages(&history);
     assert_eq!(msgs.len(), 4);
     assert_eq!(msgs[0]["role"], "user");
     assert_eq!(msgs[1]["role"], "assistant");
@@ -72,7 +72,7 @@ fn history_as_messages_normal_turns() {
 #[test]
 fn history_as_messages_compacted_turn() {
     let history = vec![("".to_string(), "summary".to_string())];
-    let msgs = chat_turn::history_as_messages(&history);
+    let msgs = crate::cli::session_projection::history_as_messages(&history);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0]["role"], "assistant");
 }

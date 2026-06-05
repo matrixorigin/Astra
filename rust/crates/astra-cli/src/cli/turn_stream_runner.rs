@@ -1,0 +1,251 @@
+use super::turn_cancellation::drain_after_cancel;
+use super::*;
+use std::sync::Arc;
+
+struct PreparedTurnStreamState {
+    cancel_token: Arc<tokio_util::sync::CancellationToken>,
+    incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
+    tui_cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
+    observability_session: Option<
+        std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
+    >,
+    append_system_prompt: Option<String>,
+}
+
+pub(crate) enum TurnAttempt {
+    Completed(Box<Result<StreamResult, crate::TurnFailure>>),
+    /// User-cancelled (Ctrl+C / TUI cancel) but the stream was awaited to
+    /// completion so partial text + tool records reach the same persistence
+    /// paths that successful turns use. Carries the same payload as
+    /// `Completed`; the distinction is purely policy: skip auth/session
+    /// retries (the user said stop) and skip auto-invoke (latency).
+    Interrupted(Box<Result<StreamResult, crate::TurnFailure>>),
+}
+
+pub(crate) async fn execute_stream_turn(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    message: &str,
+    session_id: Option<&str>,
+) -> TurnAttempt {
+    let prepared = prepare_turn_stream_state(state).await;
+    let params =
+        build_turn_stream_params(state, api, profile, token, message, session_id, &prepared);
+    let (result, was_user_cancel) = await_stream_with_interrupts(params, &prepared).await;
+
+    if was_user_cancel {
+        TurnAttempt::Interrupted(Box::new(result))
+    } else {
+        TurnAttempt::Completed(Box::new(result))
+    }
+}
+
+async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamState {
+    let append_system_prompt = {
+        let tasks = state.task_manager.snapshot().await;
+        crate::cli::execution_state_summary::format_for_session_state(state, &tasks)
+    };
+
+    PreparedTurnStreamState {
+        cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
+        incremental_state: Arc::new(
+            astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
+        ),
+        tui_cancel_token: state.tui_cancel_token.clone(),
+        observability_hub: state.observability_hub.clone(),
+        observability_session: state.observability_session.clone(),
+        append_system_prompt,
+    }
+}
+
+fn build_turn_stream_params<'a>(
+    state: &'a mut SessionState,
+    api: &'a astra_thin_client::ThinClient,
+    profile: Option<&'a str>,
+    token: &'a str,
+    message: &'a str,
+    session_id: Option<&'a str>,
+    prepared: &'a PreparedTurnStreamState,
+) -> ChatTurnParams<'a> {
+    ChatTurnParams {
+        api,
+        token,
+        auth_profile: profile,
+        message,
+        session_id,
+        model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
+        provider: None,
+        explain: state.explain,
+        render_md: true,
+        history: &state.history,
+        perm_manager: &mut state.perm_manager,
+        verbose_mode: state.verbose_mode,
+        render_policy: state
+            .tui_render_policy
+            .unwrap_or(crate::cli::stream_render::RenderPolicy::Stream),
+        cli_context: Some(&state.cli_context),
+        recent_tools: &state.recent_tools,
+        tool_health_entries: &state.tool_health_entries,
+        resume_restricted_tools: &state.resume_restricted_tools,
+        session_lessons: &state.session_lessons,
+        latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
+        latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
+        unified_skill_registry: &state.unified_skill_registry,
+        is_plan_subtask: state.current_plan_subtask_id.is_some(),
+        plan_subtask_id: state.current_plan_subtask_id.as_deref(),
+        delegation_engine: state.delegation_engine.clone(),
+        cancel_token: Some(prepared.cancel_token.clone()),
+        incremental_state: Some(prepared.incremental_state.clone()),
+        plan_assemble_line_release: None,
+        stream_event_tx: state.tui_stream_event_tx.clone(),
+        agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
+        approval_request_tx: state.tui_approval_request_tx.clone(),
+        ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
+        plan_review_request_tx: state.tui_plan_review_request_tx.clone(),
+        mcp_manager: Some(state.mcp_manager.clone()),
+        skill_search: &state.skill_search,
+        skill_quality_tracker: &mut state.skill_quality_tracker,
+        discovered_skills: Some(&mut state.discovered_skills),
+        messaging_metrics: state.messaging_metrics.clone(),
+        agent_spawner: state.agent_spawner.clone(),
+        root_agent_id: Some("main"),
+        root_mailbox_slot: Some(&mut state.root_mailbox),
+        observability_hub: prepared.observability_hub.clone(),
+        observability_session: prepared.observability_session.clone(),
+        file_journal: Some(state.file_journal.clone()),
+        file_state: Some(state.file_state.clone()),
+        database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
+        git_stash_journal: Some(state.git_stash_journal.clone()),
+        git_commit_journal: Some(state.git_commit_journal.clone()),
+        git_worktree_journal: Some(state.git_worktree_journal.clone()),
+        session_state_journal: Some(state.session_state_journal.clone()),
+        task_manager: Some(state.task_manager.clone()),
+        task_notify_tx: state.task_notify_tx.clone(),
+        bg_task_commands: Some(state.bg_task_commands.clone()),
+        bash_detach_slot: Some(state.bash_detach_slot.clone()),
+        turn_index: state.turn,
+        pipeline_state: None,
+        pre_loaded_messages: None,
+        append_system_prompt: prepared.append_system_prompt.clone(),
+        session_memory_extractor: state.session_memory_extractor.clone(),
+        #[cfg(feature = "harness")]
+        harness_sink: Some(state.harness_sink.clone()),
+        #[cfg(feature = "harness")]
+        harness_trace: Some(state.harness_trace.clone()),
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
+    }
+}
+
+async fn await_stream_with_interrupts<'a>(
+    params: ChatTurnParams<'a>,
+    prepared: &PreparedTurnStreamState,
+) -> (Result<StreamResult, crate::TurnFailure>, bool) {
+    let cancel_token_for_signal = prepared.cancel_token.clone();
+    let incremental_state = prepared.incremental_state.clone();
+    let tui_cancel_token = prepared.tui_cancel_token.clone();
+    let stream_fut = stream_chat_sse(params);
+    tokio::pin!(stream_fut);
+
+    let drain_timeout = std::time::Duration::from_secs(10);
+    tokio::select! {
+        biased;
+        result = &mut stream_fut => (result, false),
+        _ = tokio::signal::ctrl_c() => {
+            cancel_token_for_signal.cancel();
+            if tui_cancel_token.is_none() {
+                eprintln!("\n{}", "  Interrupted. (press Ctrl+C again to force-exit, or wait up to 10s for graceful drain)".dim());
+            }
+            let drained = drain_after_cancel(
+                &mut stream_fut,
+                drain_timeout,
+                "Ctrl+C",
+                incremental_state.clone(),
+            ).await;
+            (drained, true)
+        }
+        _ = async {
+            match tui_cancel_token.as_ref() {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            cancel_token_for_signal.cancel();
+            let drained = drain_after_cancel(
+                &mut stream_fut,
+                drain_timeout,
+                "TUI cancel",
+                incremental_state.clone(),
+            ).await;
+            (drained, true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prepare_turn_stream_state_includes_active_task_board_prompt() {
+        let state = SessionState::default();
+        state.task_manager.rebind("sess-stream");
+        let create = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Validate stream projection"}))
+            .await;
+        assert!(!create.starts_with("Error:"), "{create}");
+
+        let prepared = prepare_turn_stream_state(&state).await;
+        let prompt = prepared
+            .append_system_prompt
+            .as_deref()
+            .expect("task board prompt");
+        assert!(prompt.contains("Validate stream projection"), "{prompt}");
+    }
+
+    #[test]
+    fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
+        let mut state = SessionState {
+            tui_render_policy: Some(crate::cli::stream_render::RenderPolicy::Silent),
+            current_plan_subtask_id: Some("subtask-1".into()),
+            resume_restricted_tools: vec!["read_file".into()],
+            ..SessionState::default()
+        };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let prepared = PreparedTurnStreamState {
+            cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
+            incremental_state: Arc::new(
+                astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
+            ),
+            tui_cancel_token: None,
+            observability_hub: None,
+            observability_session: None,
+            append_system_prompt: Some("task board".into()),
+        };
+
+        let params = build_turn_stream_params(
+            &mut state,
+            &api,
+            Some("profile"),
+            "token",
+            "continue",
+            Some("sess-1"),
+            &prepared,
+        );
+
+        assert_eq!(
+            params.render_policy,
+            crate::cli::stream_render::RenderPolicy::Silent
+        );
+        assert!(params.is_plan_subtask);
+        assert_eq!(params.plan_subtask_id, Some("subtask-1"));
+        assert_eq!(params.append_system_prompt.as_deref(), Some("task board"));
+        assert_eq!(params.resume_restricted_tools, &["read_file".to_string()]);
+        assert!(params.cancel_token.is_some());
+        assert!(params.incremental_state.is_some());
+    }
+}

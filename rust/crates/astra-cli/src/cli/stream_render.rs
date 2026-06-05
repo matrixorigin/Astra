@@ -1,6 +1,9 @@
 use super::*;
+use crate::cli::tool_result_status::{
+    tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_success,
+};
 use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
-use astra_services::session_journal::{JournalEvent, JournalWriter};
+use astra_services::session_journal::JournalEvent;
 use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -1515,10 +1518,11 @@ impl<'a> CliSseStreamHost<'a> {
         let Some(session_id) = self.executor.active_session_id() else {
             return;
         };
-        let Ok(writer) = JournalWriter::new(&session_id) else {
-            return;
-        };
-        let _ = writer.append(&event);
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &event,
+            "stream_render:append_session_journal_event",
+        );
     }
 
     fn sync_permission_manager_session_id(&mut self) {
@@ -2035,7 +2039,7 @@ impl<'a> CliSseStreamHost<'a> {
 
             if let Some(active) = active_tx.as_ref() {
                 if metadata.as_ref().is_some_and(|meta| meta.id == active.id)
-                    && result.status == "error"
+                    && tool_result_status_is_failure(&result.status)
                 {
                     let rollback = self.rollback_active_batch_transaction(active).await;
                     let failure_reason = result.output.clone();
@@ -2396,11 +2400,11 @@ fn sync_incremental_tool_result_state(
     incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
     result: &EdgeToolExecResult,
 ) {
-    let error = (result.status != "ok").then(|| result.output.clone());
+    let error = tool_result_status_is_failure(&result.status).then(|| result.output.clone());
     incremental_state.push_tool_record(astra_services::session_journal::ToolCallRecord {
         tool_call_id: Some(result.request_id.clone()),
         name: result.tool.clone(),
-        ok: result.status == "ok",
+        ok: tool_result_status_is_success(&result.status),
         ms: result.duration_ms,
         error,
         output_bytes: Some(result.output.len().min(u32::MAX as usize) as u32),
@@ -3292,7 +3296,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         // Rollback policy: only trigger turn rollback for HARD errors on mutation tools.
         // Soft errors (e.g., "old_str == new_str", "file not found") let the agent retry.
-        if status == "error"
+        if tool_result_status_is_failure(&status)
             && Self::tool_error_triggers_turn_rollback(tool, args)
             && tool_error_triggers_rollback(tool, &output)
             && let Some(active) = self.active_turn_rollback.clone()
@@ -3322,7 +3326,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         // Mutation tools: clear cached read-only outputs before processing
         // the result. Disjoint from the read-only branch below.
-        if allowed && status != "error" && tool_call_invalidates_read_cache(tool, Some(args)) {
+        if allowed
+            && !tool_result_status_is_failure(&status)
+            && tool_call_invalidates_read_cache(tool, Some(args))
+        {
             // A successful mutation changes the workspace baseline, so cached
             // read-only outputs and duplicate-call counts are no longer valid.
             // Keep mutation-tool counters so runaway write loops still trip the
@@ -3331,7 +3338,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         // Read-only tools: populate output cache for cross-turn dedup.
         if allowed
-            && status != "error"
+            && !tool_result_status_is_failure(&status)
             && READ_ONLY_TOOLS.contains(&tool)
             && let Some(validation) = self.cache_validation_for_tool(tool, args)
         {
@@ -4424,8 +4431,8 @@ fn tool_completion_icon(
     output: &str,
     duration_ms: u64,
 ) -> (String, bool) {
-    if status == "error" {
-        return (theme::icon_err(), false);
+    if tool_result_status_is_failure(status) {
+        return (tool_result_status_icon(status), false);
     }
 
     let trimmed = output.trim();
@@ -5390,7 +5397,7 @@ impl StreamRenderState {
         let duration_suffix = format_duration_suffix(duration_ms);
         // Get smart icon based on status and output analysis.
         let (icon, is_warning) = tool_completion_icon(tool, status, output, duration_ms);
-        let extra_line = if status == "error" {
+        let extra_line = if tool_result_status_is_failure(status) {
             let err_msg = output_summary
                 .as_ref()
                 .map(|summary| summary.text.clone())
@@ -5467,7 +5474,7 @@ impl StreamRenderState {
 
         // Get smart icon based on status and output analysis.
         let (icon, is_warning) = tool_completion_icon(tool, status, output, duration_ms);
-        let extra_line = if status == "error" {
+        let extra_line = if tool_result_status_is_failure(status) {
             let err_msg = output_summary
                 .as_ref()
                 .map(|summary| summary.text.clone())
@@ -5521,7 +5528,7 @@ impl StreamRenderState {
             kind: ToolOutputSummaryKind::Preview,
             text,
         };
-        if status == "error" {
+        if tool_result_status_is_failure(status) {
             return Some(ToolOutputSummary {
                 kind: ToolOutputSummaryKind::Error,
                 text: format_tool_error_summary(tool, output),
@@ -7015,7 +7022,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|is_low_information_followup" rust/crates/astra-cli/src/cli/chat_turn.rs"#}),
+            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|is_low_information_followup" rust/crates/astra-cli/src/cli/session_input.rs"#}),
             false,
             false,
         );
@@ -7846,6 +7853,14 @@ mod tests {
             !is_warning,
             "stdout may contain compiler warning: lines; do not treat as completion warning"
         );
+    }
+
+    #[test]
+    fn tool_completion_icon_treats_non_ok_status_as_error() {
+        let (icon, is_warning) =
+            tool_completion_icon("bash", "permission_denied", "Permission denied", 50);
+        assert_eq!(icon, theme::icon_err());
+        assert!(!is_warning);
     }
 
     /// `dispatch_turn_event_block` with `quiet` must still fill the shared runtime accumulator.

@@ -3,15 +3,16 @@
 //! This centralizes two invariants that used to be duplicated at multiple
 //! call sites in `command_router.rs`:
 //! 1. the first attempt may include preloaded continuation messages, but a
-//!    session-not-found retry must not replay them;
+//!    session-not-found retry must preserve them so local continuation is not lost;
 //! 2. a session-not-found retry must clear the persisted "last session"
 //!    pointer before retrying without a session id.
 
-use super::auth_flow::clear_profile_last_session;
 use super::chat_stream::{ApprovalRequestTx, BasicCliChatContext, ChatTurnParams, stream_chat_sse};
 use super::permission_manager::PermissionManager;
 use super::streaming_types::{StreamResult, TurnFailure};
-use astra_turn_core::chat_turn_heuristics::is_session_not_found_error;
+use super::turn_session_retry::{
+    clear_stale_last_session_pointer, should_retry_after_session_not_found,
+};
 
 #[derive(Clone, Default)]
 pub(crate) struct BasicCliTurnOptions {
@@ -45,7 +46,13 @@ fn should_retry_without_session(
     session_id: Option<&str>,
     retry_disabled: bool,
 ) -> bool {
-    !retry_disabled && session_id.is_some() && is_session_not_found_error(error)
+    !retry_disabled && should_retry_after_session_not_found(error, session_id.is_some())
+}
+
+fn retry_pre_loaded_messages(
+    pre_loaded_messages: &Option<Vec<serde_json::Value>>,
+) -> Option<Vec<serde_json::Value>> {
+    pre_loaded_messages.clone()
 }
 
 pub(crate) async fn execute_basic_cli_turn<'a>(
@@ -58,6 +65,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
     mut options: BasicCliTurnOptions,
 ) -> Result<StreamResult, TurnFailure> {
     let pre_loaded_messages = options.pre_loaded_messages.take();
+    let retry_messages = retry_pre_loaded_messages(&pre_loaded_messages);
     let params = build_basic_cli_turn_params(
         ctx,
         token,
@@ -75,10 +83,13 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
                 options.disable_session_not_found_retry,
             ) =>
         {
-            if let Err(clear_error) = clear_profile_last_session(profile) {
+            if let Some(stale_session_id) = session_id
+                && let Err(clear_error) =
+                    clear_stale_last_session_pointer(profile, stale_session_id)
+            {
                 tracing::warn!(
                     error = %clear_error,
-                    session_id = ?session_id,
+                    session_id = ?stale_session_id,
                     "failed to clear stale last-session pointer before retrying without session id"
                 );
             }
@@ -89,7 +100,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
                 perm_manager,
                 skill_quality_tracker,
                 &options,
-                None,
+                retry_messages,
             ))
             .await
         }
@@ -140,5 +151,16 @@ mod tests {
             Some("1234"),
             false
         ));
+    }
+
+    #[test]
+    fn session_not_found_retry_replays_preloaded_messages() {
+        let original = Some(vec![
+            serde_json::json!({"role": "assistant", "content": "previous answer"}),
+        ]);
+
+        let retry = retry_pre_loaded_messages(&original);
+
+        assert_eq!(retry, original);
     }
 }
