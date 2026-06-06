@@ -77,7 +77,6 @@ pub(crate) struct BottomPane {
     mention_range: Option<(usize, usize)>,
     file_provider: Option<Arc<dyn FileProvider>>,
     approval_queue: ApprovalQueue,
-    pub queued_messages: Vec<String>,
 }
 
 impl BottomPane {
@@ -95,26 +94,6 @@ impl BottomPane {
             mention_range: None,
             file_provider: None,
             approval_queue: ApprovalQueue::new(),
-            queued_messages: Vec::new(),
-        }
-    }
-
-    /// Pop the last queued message back into composer for editing.
-    pub fn edit_last_queued(&mut self) -> bool {
-        if let Some(msg) = self.queued_messages.pop() {
-            self.composer.set_text(&msg);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Take the first queued message for auto-dispatch.
-    pub fn take_next_queued(&mut self) -> Option<String> {
-        if self.queued_messages.is_empty() {
-            None
-        } else {
-            Some(self.queued_messages.remove(0))
         }
     }
 
@@ -564,14 +543,6 @@ impl BottomPane {
         true
     }
 
-    fn queue_preview_height(&self) -> u16 {
-        if self.queued_messages.is_empty() {
-            0
-        } else {
-            (self.queued_messages.len().min(3) + 1) as u16 // header + up to 3 messages
-        }
-    }
-
     /// Build a live `ApprovalCell` from the currently focused queue
     /// entry. `None` when nothing is pending.
     pub fn focused_approval_cell(
@@ -641,13 +612,12 @@ impl BottomPane {
             return h;
         }
         let content_h = self.composer.desired_height(width);
-        let queue_h = self.queue_preview_height();
         let approval_h = self.focused_approval_height(width);
         let popup_h = self.popup_height();
         if popup_h > 0 {
-            content_h + queue_h + approval_h + 1 + popup_h
+            content_h + approval_h + 1 + popup_h
         } else {
-            content_h + queue_h + approval_h + 1 + 1
+            content_h + approval_h + 1 + 1
         }
     }
 
@@ -1034,48 +1004,6 @@ impl BottomPane {
         self.composer.is_flashing()
     }
 
-    fn render_queue_preview(&self, area: Rect, buf: &mut Buffer) {
-        if self.queued_messages.is_empty() || area.height == 0 {
-            return;
-        }
-        let dim = ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray);
-        let italic = ratatui::style::Style::default()
-            .fg(ratatui::style::Color::DarkGray)
-            .add_modifier(ratatui::style::Modifier::ITALIC);
-        let mut y = area.y;
-
-        // Header
-        if y < area.bottom() {
-            let hint = if self.queued_messages.len() == 1 {
-                "  ⏳ Queued for next tool call (↑ to edit):"
-            } else {
-                "  ⏳ Queued for next tool call (↑ to edit last):"
-            };
-            ratatui::widgets::Widget::render(
-                ratatui::text::Line::from(ratatui::text::Span::styled(hint, dim)),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
-            y += 1;
-        }
-
-        for msg in self.queued_messages.iter().take(3) {
-            if y >= area.bottom() {
-                break;
-            }
-            let preview: String = msg.chars().take(area.width as usize - 6).collect();
-            ratatui::widgets::Widget::render(
-                ratatui::text::Line::from(ratatui::text::Span::styled(
-                    format!("    ↳ {preview}"),
-                    italic,
-                )),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
-            y += 1;
-        }
-    }
-
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if let Some(view) = self.active_view() {
             // Stack optional footers under the view area:
@@ -1105,14 +1033,12 @@ impl BottomPane {
 
         let popup_h = self.popup_height();
         let content_h = self.composer.desired_height(area.width);
-        let queue_h = self.queue_preview_height();
 
         let approval_h = self.focused_approval_height(area.width);
         if popup_h > 0 {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
                 Constraint::Length(content_h),
-                Constraint::Length(queue_h),
                 Constraint::Length(1),
                 Constraint::Length(popup_h),
             ])
@@ -1121,19 +1047,17 @@ impl BottomPane {
             self.render_focused_approval(chunks[0], buf);
             self.composer
                 .render(chunks[1], buf, self.task_status.is_active());
-            self.render_queue_preview(chunks[2], buf);
             if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render(menu, chunks[4], buf);
+                slash_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[4], buf);
+                mention_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[4], buf);
+                popup.render(chunks[3], buf);
             }
         } else {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
                 Constraint::Length(content_h),
-                Constraint::Length(queue_h),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
@@ -1142,8 +1066,7 @@ impl BottomPane {
             self.render_focused_approval(chunks[0], buf);
             self.composer
                 .render(chunks[1], buf, self.task_status.is_active());
-            self.render_queue_preview(chunks[2], buf);
-            self.footer.render(chunks[4], buf);
+            self.footer.render(chunks[3], buf);
         }
     }
 

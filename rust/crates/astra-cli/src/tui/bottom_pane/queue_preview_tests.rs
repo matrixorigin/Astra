@@ -35,15 +35,3 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
         "active composer should advertise the real interrupt gesture; got {rendered:?}"
     );
 }
-
-#[test]
-fn queued_preview_header_spells_out_next_tool_call_boundary() {
-    let mut pane = BottomPane::new();
-    pane.queued_messages.push("stop please".into());
-
-    let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
-    assert!(
-        rendered.contains("Queued for next tool call"),
-        "queue preview must explain deferred delivery; got {rendered:?}"
-    );
-}

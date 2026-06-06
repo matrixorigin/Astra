@@ -912,7 +912,6 @@ pub(crate) async fn run_tui_session(
         }
     }
     let mut status_indicator = status_indicator::StatusIndicator::new();
-    let mut inject_submit: Option<String> = None;
     let mut pending_deferred_slash_flush = false;
 
     // Task board observer + toggle state. Observer is tick-driven
@@ -946,14 +945,6 @@ pub(crate) async fn run_tui_session(
             .map_err(|e| format!("failed to restore terminal input mode: {e}"))?;
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
-
-        // After turn ends, load first queued message into composer for review/send.
-        // The inner `select!` blocks until the turn completes, so by the time
-        // control returns here the turn is always over — no guard needed.
-        if let Some(text) = inject_submit.take() {
-            bottom_pane.composer.set_text(&text);
-            frame_requester.schedule_frame();
-        }
 
         tokio::select! {
             Some(ev) = event_stream.next() => {
@@ -2024,15 +2015,8 @@ pub(crate) async fn run_tui_session(
                                                             }
                                                             // During turn: composer stays usable.
                                                             // Enter queues a deferred input against the active run.
-                                                            // Up edits last queued. Ctrl+C interrupts.
-                                                            // Up arrow with queued messages → edit last
-                                                            if k.code == crossterm::event::KeyCode::Up
-                                                                && !bottom_pane.queued_messages.is_empty()
-                                                                && bottom_pane.composer.is_empty()
-                                                            {
-                                                                bottom_pane.edit_last_queued();
-                                                            } else {
-                                                                match bottom_pane.handle_key(k) {
+                                                            // Ctrl+C interrupts.
+                                                            match bottom_pane.handle_key(k) {
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         // Agent drill-in sentinel: user pressed Enter
                                                                         // on a row in InFlightAgentsView mid-turn.
@@ -2231,7 +2215,6 @@ pub(crate) async fn run_tui_session(
                                                                     }
                                                                     _ => {}
                                                                 }
-                                                            }
                                                             frame_requester.schedule_frame();
                                                             {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -2590,8 +2573,6 @@ pub(crate) async fn run_tui_session(
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
-                                    // Auto-send first queued message (will be picked up next iteration)
-                                    inject_submit = bottom_pane.take_next_queued();
                                 }
                             }
                             BottomPaneAction::OpenExternalEditor(initial) => {
