@@ -440,6 +440,17 @@ export type RunStatus = {
   waitingFor?: string | null;
 };
 
+export type RunInputRequestBody = {
+  idempotencyKey: string;
+  input?: unknown;
+};
+
+export type RunInputResponse = {
+  runId: string;
+  accepted: boolean;
+  duplicate: boolean;
+};
+
 export type SessionInfo = {
   sessionId: string;
   createdAt: string;

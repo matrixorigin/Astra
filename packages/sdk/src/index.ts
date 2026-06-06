@@ -49,6 +49,8 @@ export type {
   SSEClientOptions,
   // API types
   ChatRequest,
+  RunInputRequestBody,
+  RunInputResponse,
   RunStatus,
   RunListResponse,
   SessionInfo,
@@ -150,6 +152,7 @@ export {
   chatSessionDecisionTracePath,
   chatRunPath,
   chatRunStreamPath,
+  chatRunInputPath,
   chatRunPausePath,
   chatRunResumePath,
   chatRunDelegatePath,

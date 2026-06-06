@@ -667,6 +667,20 @@ pub struct MessagingState {
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
+    /// Deferred user-input events submitted while the run is still active.
+    /// The execution phase releases entries only after a later tool-call round
+    /// completes.
+    pub deferred_user_inputs: Vec<DeferredUserInput>,
+    /// Durable event cursor for deferred user-input polling.
+    pub deferred_user_input_cursor: usize,
+    /// Monotonic count of completed tool-call rounds observed by this run.
+    pub tool_call_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredUserInput {
+    pub content: String,
+    pub queued_at_tool_generation: u64,
 }
 
 /// Point-in-time summary of the active session task board.
@@ -907,6 +921,9 @@ pub enum VolatileKind {
     Corrective,
     /// Mailbox / agent-to-agent volatile drop-offs.
     Mailbox,
+    /// User message queued during execution for delivery after the next
+    /// completed tool-call round.
+    DeferredUserInput,
     /// Budget-review acknowledgment.
     BudgetReview,
     /// Open-ended exploration budget reminder.
@@ -973,6 +990,7 @@ impl VolatileKind {
             | Self::TaskBoardCompletionGate
             | Self::ExecutionRetry
             | Self::ExplorationBudget
+            | Self::DeferredUserInput
             | Self::BudgetReview => "user",
             // System-role: prevents injection via attacker-crafted file content.
             Self::HallucinationTripwire => "system",

@@ -98,6 +98,11 @@ export type ChatDetail = {
   };
   messages: ChatMessage[];
   project?: { id: string; name: string };
+  activeRun?: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  };
   pendingTurn?: {
     messageId: string;
     content: string;
@@ -133,6 +138,15 @@ export type SendMessageRequest = {
 export type SendMessageResponse = {
   userMessage: ChatMessage;
   assistantMessage: ChatMessage;
+};
+
+export type QueueRunInputResponse = {
+  userMessage: ChatMessage;
+  activeRun: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  };
 };
 
 export type ProjectSummary = {

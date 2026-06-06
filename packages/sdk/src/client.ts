@@ -19,6 +19,8 @@ import type {
   ReflectReport,
   RegisterSkillBody,
   PublishSkillBody,
+  RunInputRequestBody,
+  RunInputResponse,
   RunListResponse,
   RunStatus,
   RuntimeChatResponse,
@@ -76,6 +78,7 @@ import {
   chatRunDelegationsPath,
   chatRunDelegationsPausePath,
   chatRunDelegationsResumePath,
+  chatRunInputPath,
   chatRunPath,
   chatRunPausePath,
   chatRunResumePath,
@@ -121,6 +124,12 @@ type RunListWire = {
   offset: number;
 };
 
+type RunInputResponseWire = {
+  run_id: string;
+  accepted: boolean;
+  duplicate: boolean;
+};
+
 type ChatResponseWire = RuntimeChatResponse;
 
 function normalizeSession(w: SessionWire): SessionInfo {
@@ -151,6 +160,14 @@ function normalizeRunList(w: RunListWire): RunListResponse {
     total: w.total,
     limit: w.limit,
     offset: w.offset,
+  };
+}
+
+function normalizeRunInputResponse(w: RunInputResponseWire): RunInputResponse {
+  return {
+    runId: w.run_id,
+    accepted: Boolean(w.accepted),
+    duplicate: Boolean(w.duplicate),
   };
 }
 
@@ -584,6 +601,14 @@ export class AstraClient {
 
   async pauseRun(runId: string): Promise<void> {
     await this.post(chatRunPausePath(runId));
+  }
+
+  async submitRunInput(runId: string, body: RunInputRequestBody): Promise<RunInputResponse> {
+    const raw = await this.post<RunInputResponseWire>(chatRunInputPath(runId), {
+      idempotency_key: body.idempotencyKey,
+      input: body.input,
+    });
+    return normalizeRunInputResponse(raw);
   }
 
   async resumeRun(runId: string): Promise<void> {

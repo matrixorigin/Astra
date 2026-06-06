@@ -503,13 +503,49 @@ impl RunEngine {
     }
 }
 
-use crate::turn::run_control::{RunControlProvider, RunControlStatus};
+use crate::turn::run_control::{
+    QueuedRunInputEvent, RunControlProvider, RunControlStatus, RunQueuedInputPoll,
+};
 
 #[async_trait::async_trait]
 impl RunControlProvider for RunEngine {
     #[allow(clippy::blocks_in_conditions)]
     async fn control_status(&self, run_id: &str) -> Option<RunControlStatus> {
         self.check_control_status(run_id).await.ok().flatten()
+    }
+
+    async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll {
+        let Some(run) = self.store.load_run(run_id).await.ok().flatten() else {
+            return RunQueuedInputPoll {
+                next_cursor: after_event_index,
+                inputs: Vec::new(),
+            };
+        };
+
+        let inputs = run
+            .events
+            .iter()
+            .enumerate()
+            .skip(after_event_index)
+            .filter_map(|(event_index, event)| {
+                let payload = event
+                    .get("event_type")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|event_type| *event_type == "user_input")
+                    .and_then(|_| event.get("data"))
+                    .and_then(|data| data.get("input"))
+                    .cloned()?;
+                Some(QueuedRunInputEvent {
+                    event_index,
+                    input: payload,
+                })
+            })
+            .collect();
+
+        RunQueuedInputPoll {
+            next_cursor: run.events.len(),
+            inputs,
+        }
     }
 }
 

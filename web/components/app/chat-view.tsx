@@ -12,7 +12,7 @@ import { MoveChatModal } from '@/components/app/move-chat-modal';
 import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
-import { getChat, streamChatMessage, updateChatModel } from '@/lib/api/chats';
+import { getChat, queueChatRunInput, streamChatMessage, updateChatModel } from '@/lib/api/chats';
 import { isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
@@ -20,7 +20,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const router = useRouter();
   const [detail, setDetail] = useState(initial);
   const [moveOpen, setMoveOpen] = useState(false);
-  const [sending, setSending] = useState(false);
+  const [startingRun, setStartingRun] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
@@ -29,6 +29,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const latestMessage = detail.messages[detail.messages.length - 1];
   const isArchived = Boolean(detail.chat.archivedAt);
   const chatListHref = detail.chat.projectId ? `/projects/${detail.chat.projectId}` : '/chats';
+  const activeRunLabel = detail.activeRun?.waitingFor
+    ? `Waiting for ${detail.activeRun.waitingFor}`
+    : detail.activeRun?.runId
+      ? `Run ${detail.activeRun.status}`
+      : isArchived
+        ? 'Archived'
+        : 'Active';
 
   const startStream = useCallback(async ({
     text,
@@ -74,7 +81,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       }));
     };
 
-    setSending(true);
+    setStartingRun(true);
     setDetail((current) => ({
       ...current,
       chat: {
@@ -92,6 +99,34 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         options,
         pendingMessageId,
       }, {
+        onRunStarted: (runId) => {
+          setStartingRun(false);
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId,
+              status: 'running',
+              waitingFor: null,
+            },
+          }));
+        },
+        onRunUpdated: (run) => {
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId: run.runId,
+              status: run.status,
+              waitingFor: run.waitingFor ?? null,
+            },
+          }));
+        },
+        onRunFinished: () => {
+          setStartingRun(false);
+          setDetail((current) => ({
+            ...current,
+            activeRun: undefined,
+          }));
+        },
         onReasoning: (reasoning) => {
           patchAssistant({ reasoning, reasoningStatus: 'streaming', status: 'streaming' });
         },
@@ -133,9 +168,51 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         status: 'failed',
       });
     } finally {
-      setSending(false);
+      setStartingRun(false);
     }
   }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router]);
+
+  const queueDeferredInput = useCallback(async ({
+    text,
+    options,
+  }: {
+    text: string;
+    options: ComposerOptions;
+  }) => {
+    if (detail.chat.archivedAt) {
+      return;
+    }
+
+    try {
+      const result = await queueChatRunInput(detail.chat.id, {
+        content: text,
+        options,
+      });
+      setDetail((current) => ({
+        ...current,
+        activeRun: result.activeRun,
+        messages: [...current.messages, result.userMessage],
+      }));
+    } catch (error) {
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+        return;
+      }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      const refreshed = await getChat(detail.chat.id).catch(() => null);
+      if (refreshed) {
+        setDetail(refreshed);
+        if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
+          await startStream({ text, options, appendUser: true });
+          return;
+        }
+      }
+      window.alert(error instanceof Error ? error.message : 'Failed to queue input for the active run.');
+    }
+  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router, startStream]);
 
   useEffect(() => {
     if (pinnedRef.current) {
@@ -222,7 +299,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">{detail.chat.title ?? 'Untitled'}</h1>
           <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
             <span className="size-1.5 rounded-full bg-success" />
-            <span>{isArchived ? 'Archived' : 'Active'} · {detail.chat.model ?? 'Default model'}</span>
+            <span>{activeRunLabel} · {detail.chat.model ?? 'Default model'}</span>
           </div>
         </div>
         <div className="min-w-0 flex-1" />
@@ -281,13 +358,17 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             </div>
           ) : (
             <Composer
-              disabled={sending}
+              disabled={startingRun}
               placeholder="Reply to Astra..."
               initialModel={detail.pendingTurn?.options.model ?? detail.chat.model ?? undefined}
               persistModelPreference={false}
               onModelChange={handleModelChange}
               projectContext={detail.chat.projectId ? { projectId: detail.chat.projectId } : undefined}
               onSubmit={async ({ text, options }) => {
+                if (detail.activeRun?.runId) {
+                  await queueDeferredInput({ text, options });
+                  return;
+                }
                 await startStream({ text, options, appendUser: true });
               }}
             />

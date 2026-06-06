@@ -6,6 +6,7 @@ import type {
   ChatListResponse,
   CreateChatRequest,
   CreateChatResponse,
+  QueueRunInputResponse,
   SendMessageRequest,
   SendMessageResponse,
 } from '@/lib/api/types';
@@ -64,12 +65,22 @@ export function sendChatMessage(chatId: string, payload: SendMessageRequest) {
   });
 }
 
+export function queueChatRunInput(chatId: string, payload: SendMessageRequest) {
+  return requestJson<QueueRunInputResponse>(`/api/chats/${encodeURIComponent(chatId)}/input`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export type ChatStreamHandlers = {
   onLocalMessages?: (messages: { userMessage: ChatMessage; assistantMessage: ChatMessage }) => void;
   onArtifacts?: (artifacts: NonNullable<ChatMessage['artifacts']>) => void;
   onReasoning?: (reasoning: string) => void;
   onReasoningDone?: (reasoning: string) => void;
   onText?: (text: string) => void;
+  onRunStarted?: (runId: string) => void;
+  onRunUpdated?: (run: { runId: string; status: string; waitingFor?: string | null }) => void;
+  onRunFinished?: (run: { runId?: string; status: string; error?: string | null }) => void;
   onDone?: (text: string) => void;
 };
 
@@ -209,9 +220,31 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
     return;
   }
 
+  if (type === 'session_info' && typeof event.run_id === 'string') {
+    handlers.onRunStarted?.(event.run_id);
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
+    return;
+  }
+
   if (type === 'text_delta' && typeof event.content === 'string') {
     state.rawText = mergeTextDelta(state.rawText, event.content);
     applyAssistantText(state.rawText, state, handlers);
+    return;
+  }
+
+  if (type === 'run_started' && typeof event.run_id === 'string') {
+    handlers.onRunStarted?.(event.run_id);
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
+    return;
+  }
+
+  if (type === 'run_paused' && typeof event.run_id === 'string') {
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'paused', waitingFor: null });
+    return;
+  }
+
+  if (type === 'run_resumed' && typeof event.run_id === 'string') {
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
     return;
   }
 
@@ -253,6 +286,11 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
 
   if (type === 'run_finished') {
     const status = typeof event.status === 'string' ? event.status : 'completed';
+    handlers.onRunFinished?.({
+      runId: typeof event.run_id === 'string' ? event.run_id : undefined,
+      status,
+      error: typeof event.error === 'string' ? event.error : null,
+    });
     if (status === 'failed' || status === 'cancelled') {
       state.error = typeof event.error === 'string' ? event.error : state.error ?? 'Astra run failed.';
     }

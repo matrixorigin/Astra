@@ -5,6 +5,7 @@ import {
   beginStreamingMessage,
   getChatHydrated,
   resolveBackendModelName,
+  setChatActiveRun,
   updateStreamingAssistantMessage,
 } from '@/lib/api/web-store';
 import {
@@ -347,6 +348,40 @@ export async function POST(
             });
             controller.enqueue(sseFrame({ type: 'error', message }));
           }
+          if (typeof event.run_id === 'string') {
+            setChatActiveRun(ownerUserId, chatId, {
+              runId: event.run_id,
+              status: 'running',
+              waitingFor: null,
+            });
+          }
+          return;
+        }
+
+        if (type === 'run_started' && typeof event.run_id === 'string') {
+          setChatActiveRun(ownerUserId, chatId, {
+            runId: event.run_id,
+            status: 'running',
+            waitingFor: null,
+          });
+          return;
+        }
+
+        if (type === 'run_paused' && typeof event.run_id === 'string') {
+          setChatActiveRun(ownerUserId, chatId, {
+            runId: event.run_id,
+            status: 'paused',
+            waitingFor: null,
+          });
+          return;
+        }
+
+        if (type === 'run_resumed' && typeof event.run_id === 'string') {
+          setChatActiveRun(ownerUserId, chatId, {
+            runId: event.run_id,
+            status: 'running',
+            waitingFor: null,
+          });
           return;
         }
 
@@ -403,6 +438,7 @@ export async function POST(
 
         if (type === 'run_finished') {
           const status = typeof event.status === 'string' ? event.status : 'completed';
+          setChatActiveRun(ownerUserId, chatId, undefined);
           if (status === 'failed' || status === 'cancelled') {
             const message = typeof event.error === 'string' ? event.error : assistantText;
             assistantText = message || assistantText;
@@ -471,6 +507,7 @@ export async function POST(
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Astra stream failed.';
+        setChatActiveRun(ownerUserId, chatId, undefined);
         updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
           content: assistantText || message,
           status: 'failed',

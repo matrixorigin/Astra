@@ -1,3 +1,5 @@
+import { WebApiError } from '@/lib/api/errors';
+
 export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -15,7 +17,7 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
     } catch {
       // Preserve the HTTP status.
     }
-    throw new Error(detail);
+    throw new WebApiError(response.status, detail);
   }
 
   return (await response.json()) as T;

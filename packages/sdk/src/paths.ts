@@ -128,6 +128,10 @@ export function chatRunStreamPath(runId: string): string {
   return `/chat/runs/${encodeURIComponent(runId)}/stream`;
 }
 
+export function chatRunInputPath(runId: string): string {
+  return `/chat/runs/${encodeURIComponent(runId)}/input`;
+}
+
 export function chatRunPausePath(runId: string): string {
   return `/chat/runs/${encodeURIComponent(runId)}/pause`;
 }

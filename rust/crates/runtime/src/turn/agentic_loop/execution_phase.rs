@@ -62,6 +62,69 @@ fn global_alert_dispatcher()
         .as_ref()
 }
 
+fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
+    if let Some(text) = input.as_str() {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    if let Some(text) = input.get("content").and_then(serde_json::Value::as_str) {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    if let Some(text) = input.get("text").and_then(serde_json::Value::as_str) {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    None
+}
+
+fn render_deferred_user_input(content: &str) -> String {
+    format!(
+        "Queued user message submitted during execution after a tool call boundary:\n{content}\n\nAdjust the current plan before making more tool calls."
+    )
+}
+
+async fn poll_and_release_deferred_user_inputs(state: &mut AgenticLoopState) {
+    if let (Some(run_control), Some(run_id)) =
+        (state.run_control.as_ref(), state.current_run_id.as_deref())
+    {
+        let poll = run_control
+            .poll_user_inputs(run_id, state.messaging.deferred_user_input_cursor)
+            .await;
+        state.messaging.deferred_user_input_cursor = poll.next_cursor;
+        for event in poll.inputs {
+            let Some(content) = deferred_user_input_text(&event.input) else {
+                continue;
+            };
+            state
+                .messaging
+                .deferred_user_inputs
+                .push(super::host::DeferredUserInput {
+                    content,
+                    queued_at_tool_generation: state.messaging.tool_call_generation,
+                });
+        }
+    }
+
+    let mut ready = Vec::new();
+    let current_generation = state.messaging.tool_call_generation;
+    state.messaging.deferred_user_inputs.retain(|entry| {
+        if current_generation > entry.queued_at_tool_generation {
+            ready.push(render_deferred_user_input(&entry.content));
+            false
+        } else {
+            true
+        }
+    });
+
+    for message in ready {
+        state.push_volatile(super::host::VolatileKind::DeferredUserInput, message);
+    }
+}
+
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
     state: &mut AgenticLoopState,
@@ -312,6 +375,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
+
+    poll_and_release_deferred_user_inputs(state).await;
 
     // ── Nudge suppression gate ──────────────────────────────────────────
     // In PermissionMode::Auto the user has explicitly asked to let the
@@ -831,6 +896,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     let turn_result = turn_result?;
+    let completed_tool_round =
+        turn_result.accum.has_tool_calls || !turn_result.edge_tool_round.is_empty();
+    if completed_tool_round {
+        state.messaging.tool_call_generation =
+            state.messaging.tool_call_generation.saturating_add(1);
+    }
     state.rate_limit_cooldown.record_success();
     // Clear pipeline recovery escalation after a successful LLM call —
     // the PTL pressure is relieved.
@@ -2751,12 +2822,13 @@ fn record_tool_selection(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::Arc;
     use std::time::Duration;
 
     use astra_services::session_journal::ToolCallRecord;
     use async_trait::async_trait;
+    use tokio::sync::Mutex;
 
     use super::*;
     use crate::observability::ObservabilityHub;
@@ -2764,6 +2836,7 @@ mod tests {
     use crate::turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, VolatileKind, run_agentic_loop_with_host,
     };
+    use crate::turn::run_control::{RunControlProvider, RunQueuedInputPoll};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     struct SnapshotClearingHost {
@@ -2783,6 +2856,43 @@ mod tests {
                 rendered_final_text: Vec::new(),
                 valid_tools: HashSet::new(),
             }
+        }
+    }
+
+    struct StubRunControlProvider {
+        polls: Mutex<VecDeque<RunQueuedInputPoll>>,
+    }
+
+    impl StubRunControlProvider {
+        fn new(polls: Vec<RunQueuedInputPoll>) -> Self {
+            Self {
+                polls: Mutex::new(VecDeque::from(polls)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RunControlProvider for StubRunControlProvider {
+        async fn control_status(
+            &self,
+            _run_id: &str,
+        ) -> Option<crate::turn::run_control::RunControlStatus> {
+            None
+        }
+
+        async fn poll_user_inputs(
+            &self,
+            _run_id: &str,
+            after_event_index: usize,
+        ) -> RunQueuedInputPoll {
+            self.polls
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or(RunQueuedInputPoll {
+                    next_cursor: after_event_index,
+                    inputs: Vec::new(),
+                })
         }
     }
 
@@ -4557,6 +4667,79 @@ mod tests {
                 .and_then(|c| c.as_str())
                 .is_some_and(|s| s.starts_with(prefix))
         })
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_releases_after_next_tool_call_boundary() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-queued".into());
+        state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
+            RunQueuedInputPoll {
+                next_cursor: 2,
+                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 1,
+                    input: serde_json::json!({"content": "Switch to writing tests first."}),
+                }],
+            },
+            RunQueuedInputPoll {
+                next_cursor: 2,
+                inputs: Vec::new(),
+            },
+        ])));
+
+        poll_and_release_deferred_user_inputs(&mut state).await;
+        assert!(state.volatile_pending.is_empty());
+        assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
+        assert_eq!(state.messaging.deferred_user_input_cursor, 2);
+
+        state.messaging.tool_call_generation = 1;
+        poll_and_release_deferred_user_inputs(&mut state).await;
+
+        assert!(state.messaging.deferred_user_inputs.is_empty());
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.kind == VolatileKind::DeferredUserInput
+                && entry.content.contains("Switch to writing tests first.")
+        }));
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_submitted_after_tool_round_waits_for_future_tool_round() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-late-queued".into());
+        state.messaging.tool_call_generation = 1;
+        state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
+            RunQueuedInputPoll {
+                next_cursor: 4,
+                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 3,
+                    input: serde_json::json!("Stop reading and patch the code."),
+                }],
+            },
+            RunQueuedInputPoll {
+                next_cursor: 4,
+                inputs: Vec::new(),
+            },
+            RunQueuedInputPoll {
+                next_cursor: 4,
+                inputs: Vec::new(),
+            },
+        ])));
+
+        poll_and_release_deferred_user_inputs(&mut state).await;
+        assert!(state.volatile_pending.is_empty());
+        assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
+
+        poll_and_release_deferred_user_inputs(&mut state).await;
+        assert!(state.volatile_pending.is_empty());
+        assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
+
+        state.messaging.tool_call_generation = 2;
+        poll_and_release_deferred_user_inputs(&mut state).await;
+        assert!(state.messaging.deferred_user_inputs.is_empty());
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.kind == VolatileKind::DeferredUserInput
+                && entry.content.contains("Stop reading and patch the code.")
+        }));
     }
 
     #[tokio::test]

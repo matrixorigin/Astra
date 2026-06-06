@@ -3,6 +3,8 @@ import {
   buildQueryString,
   chatRunStreamPath,
   parseSseDataEvents,
+  type RunListResponse,
+  type RunStatus,
   type RuntimeSessionListResponse,
   type RuntimeSessionResponse,
   type RuntimeTranscriptItemResponse,
@@ -38,6 +40,11 @@ type ChatRecord = ChatSummary & {
   createdAt: string;
   archivedAt?: string | null;
   messages: ChatMessage[];
+  activeRun?: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  };
   pendingTurn?: {
     messageId: string;
     content: string;
@@ -56,6 +63,7 @@ type Store = {
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
+const RUN_SYNC_PAGE_SIZE = 200;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
 
 type StreamResult = {
@@ -95,6 +103,16 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort((left, right) => (
     left.localeCompare(right)
   ));
+}
+
+function runBlocksChatTurn(status?: string | null) {
+  const normalized = status?.trim().toLowerCase();
+  return Boolean(
+    normalized
+    && normalized !== 'completed'
+    && normalized !== 'failed'
+    && normalized !== 'cancelled'
+  );
 }
 
 function seedStore(): Store {
@@ -361,6 +379,7 @@ export function getChat(ownerUserId: string, chatId: string): ChatDetail | null 
     },
     messages: chat.messages,
     project: project ? { id: project.id, name: project.name } : undefined,
+    activeRun: chat.activeRun,
     pendingTurn: chat.pendingTurn,
   };
 }
@@ -406,6 +425,7 @@ export async function createChatWithMessage(ownerUserId: string, payload: {
     lastMessagePreview: payload.message,
     model: payload.model,
     messages: [userMessage],
+    activeRun: undefined,
     pendingTurn: {
       messageId: userMessage.id,
       content: payload.message,
@@ -525,6 +545,66 @@ export function beginStreamingMessage(ownerUserId: string, chatId: string, paylo
     userMessage,
     assistantMessage,
     sessionId: chat.id,
+  };
+}
+
+export function setChatActiveRun(ownerUserId: string, chatId: string, activeRun?: ChatRecord['activeRun']) {
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  chat.activeRun = activeRun;
+  return chat.activeRun;
+}
+
+export async function queueDeferredRunInput(ownerUserId: string, chatId: string, payload: {
+  content: string;
+  options?: ComposerOptions;
+}) {
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  if (!chat.activeRun?.runId) {
+    throw new Error('No active run is available for deferred input.');
+  }
+
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `submit deferred run input for ${chat.activeRun.runId}`,
+  });
+
+  const activeSkills = normalizedActiveSkills(payload.options?.activeSkills);
+  await client.sdk.submitRunInput(chat.activeRun.runId, {
+    idempotencyKey: crypto.randomUUID(),
+    input: {
+      content: payload.content,
+      active_skills: activeSkills.length ? activeSkills : undefined,
+    },
+  });
+
+  const timestamp = nowIso();
+  const userMessage: ChatMessage = {
+    id: crypto.randomUUID(),
+    role: 'user',
+    content: payload.content,
+    activeSkills: activeSkills.length ? activeSkills : undefined,
+    createdAt: timestamp,
+    status: 'complete',
+  };
+
+  chat.messages.push(userMessage);
+  chat.lastMessageAt = timestamp;
+  chat.lastMessagePreview = payload.content;
+  if (chat.projectId) {
+    touchProjectInStore(store, chat.projectId);
+  }
+
+  return {
+    userMessage,
+    activeRun: chat.activeRun,
   };
 }
 
@@ -792,8 +872,54 @@ function chatRecordFromBackendSession(session: RuntimeSessionResponse, existing?
     archivedAt,
     model,
     messages: existing?.messages ?? [],
+    activeRun: existing?.activeRun,
     pendingTurn: existing?.pendingTurn,
   };
+}
+
+async function listAllBackendRuns(
+  client: WebRuntimeClient,
+  ownerUserId: string,
+): Promise<RunStatus[]> {
+  const runs: RunStatus[] = [];
+  let offset = 0;
+
+  for (;;) {
+    let parsed: RunListResponse;
+    try {
+      parsed = await client.sdk.listRuns({
+        limit: RUN_SYNC_PAGE_SIZE,
+        offset,
+      });
+    } catch (error) {
+      throw runtimeOperationError(
+        `Cannot sync active runs for user ${ownerUserId}`,
+        error,
+      );
+    }
+
+    const page = Array.isArray(parsed.runs) ? parsed.runs : [];
+    runs.push(...page);
+
+    const responseLimit = typeof parsed.limit === 'number' && parsed.limit > 0
+      ? parsed.limit
+      : RUN_SYNC_PAGE_SIZE;
+    const total = typeof parsed.total === 'number' && Number.isFinite(parsed.total)
+      ? parsed.total
+      : null;
+
+    if (
+      page.length === 0
+      || page.length < responseLimit
+      || (total !== null && offset + page.length >= total)
+    ) {
+      break;
+    }
+
+    offset += page.length;
+  }
+
+  return runs;
 }
 
 async function listAllBackendSessions(
@@ -851,9 +977,22 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   }
 
   const sessions = await listAllBackendSessions(client, ownerUserId);
+  const runs = await listAllBackendRuns(client, ownerUserId);
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
   const backendChatIds = new Set<string>();
+  const activeRunBySession = new Map<string, NonNullable<ChatRecord['activeRun']>>();
+
+  for (const run of runs) {
+    if (!runBlocksChatTurn(run.status) || activeRunBySession.has(run.sessionId)) {
+      continue;
+    }
+    activeRunBySession.set(run.sessionId, {
+      runId: run.runId,
+      status: run.status,
+      waitingFor: run.waitingFor ?? null,
+    });
+  }
 
   for (const session of sessions) {
     const existing = session.session_id ? byId.get(session.session_id) : undefined;
@@ -861,6 +1000,7 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     if (!record) {
       continue;
     }
+    record.activeRun = activeRunBySession.get(record.id);
     backendChatIds.add(record.id);
     const index = store.chats.findIndex((chat) => chat.id === record.id);
     if (index >= 0) {
