@@ -1224,21 +1224,7 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
 #[test]
 #[serial_test::serial]
 fn lsp_diagnostics_returns_file_snapshot_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "diagnostics",
@@ -1339,21 +1325,7 @@ fn lsp_surfaces_rust_lsp_startup_errors_for_supported_workspaces() {
 #[test]
 #[serial_test::serial]
 fn lsp_implementation_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "implementation",
@@ -1378,21 +1350,7 @@ fn lsp_implementation_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_prepare_rename_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "prepare_rename",
@@ -1417,21 +1375,7 @@ fn lsp_prepare_rename_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_declaration_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "declaration",
@@ -1453,21 +1397,7 @@ fn lsp_declaration_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_type_definition_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "type_definition",
@@ -1492,21 +1422,7 @@ fn lsp_type_definition_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_document_highlight_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "document_highlight",
@@ -1528,21 +1444,7 @@ fn lsp_document_highlight_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_document_links_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "document_links",
@@ -1562,21 +1464,7 @@ fn lsp_document_links_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_inlay_hints_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "inlay_hints",
@@ -1694,21 +1582,7 @@ fn lsp_color_presentations_use_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_semantic_tokens_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "semantic_tokens",
@@ -1728,21 +1602,7 @@ fn lsp_semantic_tokens_use_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_supertypes_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "trait Greeting {}\nstruct HelloType;\nimpl Greeting for HelloType {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace("trait Greeting {}\nstruct HelloType;\nimpl Greeting for HelloType {}\n");
 
     let result = exe.lsp(&json!({
         "operation": "supertypes",
@@ -1761,21 +1621,7 @@ fn lsp_supertypes_use_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_subtypes_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "trait Greeting {}\nstruct FriendlyGreeting;\nimpl Greeting for FriendlyGreeting {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace("trait Greeting {}\nstruct FriendlyGreeting;\nimpl Greeting for FriendlyGreeting {}\n");
 
     let result = exe.lsp(&json!({
         "operation": "subtypes",
@@ -1797,21 +1643,7 @@ fn lsp_subtypes_use_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_lenses_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "code_lenses",
@@ -1831,21 +1663,7 @@ fn lsp_code_lenses_use_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_lenses_resolve_selected_item_when_item_index_provided() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "code_lenses",
@@ -1867,21 +1685,7 @@ fn lsp_code_lenses_resolve_selected_item_when_item_index_provided() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_lenses_execute_selected_item_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "code_lenses",
@@ -2008,21 +1812,7 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
 #[test]
 #[serial_test::serial]
 fn lsp_selection_ranges_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "selection_ranges",
@@ -2047,21 +1837,7 @@ fn lsp_selection_ranges_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_linked_editing_range_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp(hello_from_lsp: i32) {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace("pub fn hello_from_lsp(hello_from_lsp: i32) {}\n");
 
     let result = exe.lsp(&json!({
         "operation": "linked_editing_range",
@@ -2086,21 +1862,7 @@ fn lsp_linked_editing_range_uses_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_format_document_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub  fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace("pub  fn hello_from_lsp() {}\n");
 
     let result = exe.lsp(&json!({
         "operation": "format_document",
@@ -2149,21 +1911,7 @@ fn lsp_format_document_applies_text_edits_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_format_range_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub  fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace("pub  fn hello_from_lsp() {}\n");
 
     let result = exe.lsp(&json!({
         "operation": "format_range",
@@ -2223,21 +1971,7 @@ fn lsp_format_range_applies_text_edits_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_format_on_type_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "format_on_type",
@@ -2295,21 +2029,7 @@ fn lsp_format_on_type_applies_text_edits_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -2371,21 +2091,7 @@ fn lsp_code_actions_apply_selected_workspace_edit_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_execute_selected_command_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -2481,21 +2187,7 @@ fn lsp_code_actions_apply_selected_snippet_workspace_edit_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_completions_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "completions",
@@ -2517,21 +2209,7 @@ fn lsp_completions_use_real_lsp_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_completions_resolve_selected_item_when_item_index_provided() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "completions",
@@ -2591,21 +2269,7 @@ fn lsp_completions_apply_selected_item_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_signature_help_uses_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp(name: &str) {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace("pub fn hello_from_lsp(name: &str) {}\n");
 
     let result = exe.lsp(&json!({
         "operation": "signature_help",
@@ -2809,21 +2473,7 @@ fn lsp_code_lenses_execute_native_rust_analyzer_code_lens_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_document_symbols_prefers_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "document_symbols",
@@ -2914,21 +2564,7 @@ fn write_file_syncs_lsp_once_before_followup_query() {
 #[test]
 #[serial_test::serial]
 fn lsp_rename_uses_real_lsp_preview_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
 
     let result = exe.lsp(&json!({
         "operation": "rename",
