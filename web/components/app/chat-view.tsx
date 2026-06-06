@@ -12,7 +12,7 @@ import { MoveChatModal } from '@/components/app/move-chat-modal';
 import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
-import { getChat, queueChatRunInput, streamChatMessage, updateChatModel } from '@/lib/api/chats';
+import { getChat, queueChatRunInput, stopChatRun, streamChatMessage, updateChatModel } from '@/lib/api/chats';
 import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
@@ -21,6 +21,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [detail, setDetail] = useState(initial);
   const [moveOpen, setMoveOpen] = useState(false);
   const [startingRun, setStartingRun] = useState(false);
+  const [stoppingRun, setStoppingRun] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
@@ -29,13 +30,36 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const latestMessage = detail.messages[detail.messages.length - 1];
   const isArchived = Boolean(detail.chat.archivedAt);
   const chatListHref = detail.chat.projectId ? `/projects/${detail.chat.projectId}` : '/chats';
-  const activeRunLabel = detail.activeRun?.waitingFor
-    ? `Waiting for ${detail.activeRun.waitingFor}`
-    : detail.activeRun?.runId
-      ? `Run ${detail.activeRun.status}`
-      : isArchived
-        ? 'Archived'
-        : 'Active';
+  const activeRunStatus = detail.activeRun?.status.trim().toLowerCase() ?? null;
+  const canQueueDeferredInput = Boolean(
+    detail.activeRun?.runId
+      && activeRunStatus
+      && activeRunStatus !== 'paused'
+      && activeRunStatus !== 'cancelling',
+  );
+  const canStopRun = Boolean(
+    detail.activeRun?.runId
+      && activeRunStatus
+      && activeRunStatus !== 'paused'
+      && activeRunStatus !== 'cancelling',
+  );
+  const composerDisabled = startingRun || stoppingRun || activeRunStatus === 'paused' || activeRunStatus === 'cancelling';
+  const composerPlaceholder = activeRunStatus === 'paused'
+    ? 'Run paused. Resume is not available in this UI yet.'
+    : activeRunStatus === 'cancelling'
+      ? 'Stopping current run...'
+      : canQueueDeferredInput
+        ? 'Queue a follow-up for the next tool call...'
+        : 'Reply to Astra...';
+  const activeRunLabel = activeRunStatus === 'cancelling'
+    ? 'Stopping current run'
+    : detail.activeRun?.waitingFor
+      ? `Waiting for ${detail.activeRun.waitingFor}`
+      : detail.activeRun?.runId
+        ? `Run ${detail.activeRun.status}`
+        : isArchived
+          ? 'Archived'
+          : 'Active';
 
   const startStream = useCallback(async ({
     text,
@@ -121,6 +145,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           }));
         },
         onRunFinished: () => {
+          setStoppingRun(false);
           setStartingRun(false);
           setDetail((current) => ({
             ...current,
@@ -142,6 +167,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         onDone: (content) => {
           patchAssistant({
             content: content || 'Astra completed the run without returning visible text.',
+            reasoningStatus: 'complete',
+            status: 'complete',
+          });
+        },
+        onCancelled: (content) => {
+          patchAssistant({
+            content: content || 'Stopped.',
             reasoningStatus: 'complete',
             status: 'complete',
           });
@@ -215,6 +247,31 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       window.alert(error instanceof Error ? error.message : 'Failed to queue input for the active run.');
     }
   }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router, startStream]);
+
+  const stopActiveRun = useCallback(async () => {
+    if (!detail.activeRun?.runId || !canStopRun) {
+      return;
+    }
+    setStoppingRun(true);
+    try {
+      const result = await stopChatRun(detail.chat.id);
+      setDetail((current) => ({
+        ...current,
+        activeRun: result.activeRun,
+      }));
+    } catch (error) {
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+        return;
+      }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      window.alert(error instanceof Error ? error.message : 'Failed to stop the active run.');
+      setStoppingRun(false);
+    }
+  }, [canStopRun, chatListHref, detail.activeRun?.runId, detail.chat.id, router]);
 
   useEffect(() => {
     if (pinnedRef.current) {
@@ -359,21 +416,44 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               </div>
             </div>
           ) : (
-            <Composer
-              disabled={startingRun}
-              placeholder="Reply to Astra..."
-              initialModel={detail.pendingTurn?.options.model ?? detail.chat.model ?? undefined}
-              persistModelPreference={false}
-              onModelChange={handleModelChange}
-              projectContext={detail.chat.projectId ? { projectId: detail.chat.projectId } : undefined}
-              onSubmit={async ({ text, options }) => {
-                if (detail.activeRun?.runId) {
-                  await queueDeferredInput({ text, options });
-                  return;
-                }
-                await startStream({ text, options, appendUser: true });
-              }}
-            />
+            <>
+              <Composer
+                disabled={composerDisabled}
+                placeholder={composerPlaceholder}
+                initialModel={detail.pendingTurn?.options.model ?? detail.chat.model ?? undefined}
+                persistModelPreference={false}
+                onModelChange={handleModelChange}
+                projectContext={detail.chat.projectId ? { projectId: detail.chat.projectId } : undefined}
+                onSubmit={async ({ text, options }) => {
+                  if (canQueueDeferredInput) {
+                    await queueDeferredInput({ text, options });
+                    return;
+                  }
+                  await startStream({ text, options, appendUser: true });
+                }}
+              />
+              {detail.activeRun?.runId ? (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
+                  <p>
+                    {canQueueDeferredInput
+                      ? 'New messages are queued after the next tool call. Use Stop to interrupt now.'
+                      : activeRunStatus === 'paused'
+                        ? 'This run is paused. New input is disabled until it resumes or finishes.'
+                        : 'Stopping the current run. New input stays disabled until cancellation completes.'}
+                  </p>
+                  {canStopRun ? (
+                    <button
+                      type="button"
+                      onClick={() => { void stopActiveRun(); }}
+                      disabled={stoppingRun}
+                      className="shrink-0 rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {stoppingRun ? 'Stopping...' : 'Stop'}
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </>
           )}
         </div>
       </div>

@@ -149,6 +149,14 @@ export type QueueRunInputResponse = {
   };
 };
 
+export type StopRunResponse = {
+  activeRun: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  };
+};
+
 export type ProjectSummary = {
   id: string;
   name: string;

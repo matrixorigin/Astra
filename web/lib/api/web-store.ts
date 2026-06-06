@@ -625,6 +625,33 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
   };
 }
 
+export async function stopActiveRun(ownerUserId: string, chatId: string) {
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  if (!chat.activeRun?.runId) {
+    throw new Error('No active run is available to stop.');
+  }
+
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `cancel active run ${chat.activeRun.runId}`,
+  });
+
+  await client.sdk.cancelRun(chat.activeRun.runId);
+  chat.activeRun = {
+    runId: chat.activeRun.runId,
+    status: 'cancelling',
+    waitingFor: null,
+  };
+
+  return {
+    activeRun: chat.activeRun,
+  };
+}
+
 export function updateStreamingAssistantMessage(ownerUserId: string, chatId: string, messageId: string, patch: {
   content?: string;
   reasoning?: string;

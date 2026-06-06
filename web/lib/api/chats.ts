@@ -9,6 +9,7 @@ import type {
   QueueRunInputResponse,
   SendMessageRequest,
   SendMessageResponse,
+  StopRunResponse,
 } from '@/lib/api/types';
 
 export function listChats(params: {
@@ -72,6 +73,12 @@ export function queueChatRunInput(chatId: string, payload: SendMessageRequest) {
   });
 }
 
+export function stopChatRun(chatId: string) {
+  return requestJson<StopRunResponse>(`/api/chats/${encodeURIComponent(chatId)}/stop`, {
+    method: 'POST',
+  });
+}
+
 export type ChatStreamHandlers = {
   onLocalMessages?: (messages: { userMessage: ChatMessage; assistantMessage: ChatMessage }) => void;
   onArtifacts?: (artifacts: NonNullable<ChatMessage['artifacts']>) => void;
@@ -81,6 +88,7 @@ export type ChatStreamHandlers = {
   onRunStarted?: (runId: string) => void;
   onRunUpdated?: (run: { runId: string; status: string; waitingFor?: string | null }) => void;
   onRunFinished?: (run: { runId?: string; status: string; error?: string | null }) => void;
+  onCancelled?: (text: string) => void;
   onDone?: (text: string) => void;
 };
 
@@ -88,6 +96,7 @@ type ChatStreamState = {
   rawText: string;
   text: string;
   reasoning: string;
+  cancelled?: boolean;
   error?: string;
 };
 
@@ -291,7 +300,11 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
       status,
       error: typeof event.error === 'string' ? event.error : null,
     });
-    if (status === 'failed' || status === 'cancelled') {
+    if (status === 'cancelled') {
+      state.cancelled = true;
+      return;
+    }
+    if (status === 'failed') {
       state.error = typeof event.error === 'string' ? event.error : state.error ?? 'Astra run failed.';
     }
   }
@@ -357,6 +370,10 @@ export async function streamChatMessage(
 
   if (state.error) {
     throw new Error(state.error);
+  }
+  if (state.cancelled) {
+    handlers.onCancelled?.(state.text);
+    return state.text;
   }
   handlers.onDone?.(state.text);
   return state.text;

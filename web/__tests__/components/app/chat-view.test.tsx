@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import { ChatView } from '@/components/app/chat-view';
 import { WebApiError } from '@/lib/api/errors';
 import type { ChatDetail, ComposerOptions } from '@/lib/api/types';
-import { getChat, queueChatRunInput, streamChatMessage, updateChatModel } from '@/lib/api/chats';
+import { getChat, queueChatRunInput, stopChatRun, streamChatMessage, updateChatModel } from '@/lib/api/chats';
 
 const pushMock = jest.fn();
 const replaceMock = jest.fn();
@@ -96,12 +96,14 @@ jest.mock('@/components/app/composer', () => ({
 jest.mock('@/lib/api/chats', () => ({
   getChat: jest.fn(),
   queueChatRunInput: jest.fn(),
+  stopChatRun: jest.fn(),
   streamChatMessage: jest.fn(),
   updateChatModel: jest.fn(),
 }));
 
 const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
 const mockQueueChatRunInput = queueChatRunInput as jest.MockedFunction<typeof queueChatRunInput>;
+const mockStopChatRun = stopChatRun as jest.MockedFunction<typeof stopChatRun>;
 const mockStreamChatMessage = streamChatMessage as jest.MockedFunction<typeof streamChatMessage>;
 const mockUpdateChatModel = updateChatModel as jest.MockedFunction<typeof updateChatModel>;
 
@@ -143,6 +145,7 @@ describe('ChatView deferred-input unhappy paths', () => {
     refreshMock.mockReset();
     mockGetChat.mockReset();
     mockQueueChatRunInput.mockReset();
+    mockStopChatRun.mockReset();
     mockStreamChatMessage.mockReset();
     mockUpdateChatModel.mockReset();
     window.alert = jest.fn();
@@ -193,5 +196,28 @@ describe('ChatView deferred-input unhappy paths', () => {
       );
     });
     expect(window.alert).not.toHaveBeenCalled();
+  });
+
+  it('shows an explicit stop action instead of pretending queued input interrupts immediately', async () => {
+    const user = userEvent.setup();
+    mockStopChatRun.mockResolvedValue({
+      activeRun: {
+        runId: 'run-123',
+        status: 'cancelling',
+        waitingFor: null,
+      },
+    });
+
+    render(<ChatView initial={makeDetail()} />);
+
+    expect(screen.getByText('New messages are queued after the next tool call. Use Stop to interrupt now.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Stop' }));
+
+    await waitFor(() => {
+      expect(mockStopChatRun).toHaveBeenCalledWith('chat-123');
+    });
+    expect(screen.getByText('Stopping the current run. New input stays disabled until cancellation completes.')).toBeInTheDocument();
+    expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 });
