@@ -982,51 +982,42 @@ async fn find_definition_no_doc_still_works() {
 }
 
 #[test]
-fn extract_doc_comment_rust_triple_slash() {
-    let source = "/// First line.\n/// Second line.\nfn foo() {}\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 3);
-    assert!(
-        doc.contains("First line"),
-        "should extract first line: {doc}"
-    );
-    assert!(
-        doc.contains("Second line"),
-        "should extract second line: {doc}"
-    );
-}
-
-#[test]
-fn extract_doc_comment_block_comment() {
-    let source = "/**\n * A block doc comment.\n * With multiple lines.\n */\nfn foo() {}\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 5);
-    assert!(
-        doc.contains("block doc comment"),
-        "should extract block: {doc}"
-    );
-    assert!(
-        doc.contains("multiple lines"),
-        "should extract multi-line: {doc}"
-    );
-}
-
-#[test]
-fn extract_doc_comment_python_docstring() {
-    let source = "def foo():\n    \"\"\"A short docstring.\"\"\"\n    pass\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Python, 1);
-    assert!(
-        doc.contains("short docstring"),
-        "should extract docstring: {doc}"
-    );
-}
-
-#[test]
-fn extract_doc_comment_go_comments() {
-    let source = "// Package foo provides utilities.\n// It does things.\nfunc Foo() {}\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Go, 3);
-    assert!(
-        doc.contains("Package foo"),
-        "should extract Go comments: {doc}"
-    );
+fn extract_doc_comment_handles_all_formats() {
+    for (label, source, lang, line, expected) in [
+        (
+            "rust triple slash",
+            "/// First line.\n/// Second line.\nfn foo() {}\n",
+            code_intel::Language::Rust,
+            3usize,
+            vec!["First line", "Second line"],
+        ),
+        (
+            "rust block comment",
+            "/**\n * A block doc comment.\n * With multiple lines.\n */\nfn foo() {}\n",
+            code_intel::Language::Rust,
+            5usize,
+            vec!["block doc comment", "multiple lines"],
+        ),
+        (
+            "python docstring",
+            "def foo():\n    \"\"\"A short docstring.\"\"\"\n    pass\n",
+            code_intel::Language::Python,
+            1usize,
+            vec!["short docstring"],
+        ),
+        (
+            "go comments",
+            "// Package foo provides utilities.\n// It does things.\nfunc Foo() {}\n",
+            code_intel::Language::Go,
+            3usize,
+            vec!["Package foo"],
+        ),
+    ] {
+        let doc = code_intel::extract_doc_comment(source, lang, line);
+        for needle in expected {
+            assert!(doc.contains(needle), "[{label}] missing '{needle}': {doc}");
+        }
+    }
 }
 
 #[test]
