@@ -52,7 +52,7 @@ pub(crate) struct ChatComposer {
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
 const IDLE_COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor";
-const ACTIVE_TURN_PLACEHOLDER: &str = "Enter queues for next tool call  · Ctrl+C interrupts";
+const ACTIVE_TURN_PLACEHOLDER: &str = "Enter defers to next tool call  · Ctrl+C interrupts";
 
 impl ChatComposer {
     pub fn new() -> Self {
