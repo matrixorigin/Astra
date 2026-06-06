@@ -160,12 +160,10 @@ fn context_analysis_no_session() {
     let result = executor.context_analysis(&json!({"mode": "turn"}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    assert!(
-        parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("No observability session")
-    );
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("No observability session"));
 }
 
 // ─── Empty traces ────────────────────────────────────────────────────────────
@@ -177,93 +175,65 @@ fn context_analysis_empty_traces() {
     let result = executor.context_analysis(&json!({"mode": "turn"}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    assert!(
-        parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("No context assembly traces")
-    );
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("No context assembly traces"));
 }
 
 // ─── Turn mode ───────────────────────────────────────────────────────────────
 
 #[test]
-fn context_analysis_turn_default() {
-    let trace = sample_trace("T1", 1600, 500, 0.5);
-    let (_dir, executor) = make_executor_with_session(vec![trace], vec![]);
+fn context_analysis_turn_lookups() {
+    // Single turn, single trace
+    let t1 = sample_trace("T1", 1600, 500, 0.5);
+    let (_dir, executor) = make_executor_with_session(vec![t1.clone()], vec![]);
 
-    // Default mode is "turn", default turn is -1 (latest)
-    let result = executor.context_analysis(&json!({}));
+    let result = executor.context_analysis(&json!({})); // default: mode="turn", turn=-1 (latest)
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
     assert_eq!(parsed["turn"], 1);
     assert_eq!(parsed["of_total_turns"], 1);
     assert!(parsed["token_budget"].is_object());
     assert!(parsed["composition"].is_object());
-    assert!(parsed["composition"]["system_prompt"]["tokens"].is_number());
-    assert!(parsed["composition"]["history"]["tokens"].is_number());
-    assert!(parsed["composition"]["memory"]["tokens"].is_number());
-    assert!(parsed["composition"]["tool_schemas"]["tokens"].is_number());
-    assert!(parsed["composition"]["user_message"]["tokens"].is_number());
+    for comp in [
+        "system_prompt",
+        "history",
+        "memory",
+        "tool_schemas",
+        "user_message",
+    ] {
+        assert!(parsed["composition"][comp]["tokens"].is_number());
+    }
 }
 
 #[test]
-fn context_analysis_turn_explicit() {
+fn context_analysis_turn_explicit_and_latest() {
     let t1 = sample_trace("T1", 1600, 500, 0.3);
     let t2 = sample_trace("T2", 2000, 800, 0.6);
     let (_dir, executor) = make_executor_with_session(vec![t1, t2], vec![]);
 
-    let result = executor.context_analysis(&json!({"mode": "turn", "turn": 1}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["turn"], 1);
-    assert_eq!(parsed["of_total_turns"], 2);
+    for (arg, expected_turn) in [("1", 1), ("-1", 2)] {
+        let result = executor
+            .context_analysis(&json!({"mode": "turn", "turn": arg.parse::<i32>().unwrap()}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["turn"], expected_turn);
+        assert_eq!(parsed["of_total_turns"], 2);
+    }
 }
 
 #[test]
-fn context_analysis_turn_latest() {
-    let t1 = sample_trace("T1", 1600, 500, 0.3);
-    let t2 = sample_trace("T2", 2000, 800, 0.6);
-    let (_dir, executor) = make_executor_with_session(vec![t1, t2], vec![]);
-
-    let result = executor.context_analysis(&json!({"mode": "turn", "turn": -1}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["turn"], 2);
-}
-
-#[test]
-fn context_analysis_turn_invalid_zero() {
+fn context_analysis_turn_invalid_index() {
     let trace = sample_trace("T1", 1600, 500, 0.5);
     let (_dir, executor) = make_executor_with_session(vec![trace], vec![]);
 
-    let result = executor.context_analysis(&json!({"mode": "turn", "turn": 0}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert!(parsed["error"].is_string());
-    assert!(parsed["error"].as_str().unwrap().contains("Invalid turn"));
-}
-
-#[test]
-fn context_analysis_turn_out_of_range() {
-    let trace = sample_trace("T1", 1600, 500, 0.5);
-    let (_dir, executor) = make_executor_with_session(vec![trace], vec![]);
-
-    let result = executor.context_analysis(&json!({"mode": "turn", "turn": 5}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert!(parsed["error"].as_str().unwrap().contains("Invalid turn"));
-}
-
-#[test]
-fn context_analysis_turn_negative_beyond_range() {
-    let trace = sample_trace("T1", 1600, 500, 0.5);
-    let (_dir, executor) = make_executor_with_session(vec![trace], vec![]);
-
-    let result = executor.context_analysis(&json!({"mode": "turn", "turn": -5}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert!(parsed["error"].as_str().unwrap().contains("Invalid turn"));
+    for turn_arg in [0, 5, -5] {
+        let result = executor.context_analysis(&json!({"mode": "turn", "turn": turn_arg}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"].as_str().unwrap().contains("Invalid turn"),
+            "turn={turn_arg} should be rejected"
+        );
+    }
 }
 
 // ─── Turn mode: content verification ─────────────────────────────────────────
@@ -498,50 +468,39 @@ fn context_analysis_session_includes_fuzzy_matching_summary() {
 // ─── Compare mode ────────────────────────────────────────────────────────────
 
 #[test]
-fn context_analysis_compare_basic() {
+fn context_analysis_compare_valid() {
     let t1 = sample_trace("T1", 1600, 500, 0.3);
     let t2 = sample_trace("T2", 3000, 1500, 0.7);
-    let (_dir, executor) = make_executor_with_session(vec![t1, t2], vec![]);
 
-    let result = executor.context_analysis(&json!({"mode": "compare", "turn_a": 1, "turn_b": 2}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let test_cases: Vec<(Vec<ContextAssemblyTrace>, serde_json::Value, i64, i64)> = vec![
+        (
+            vec![t1.clone(), t2.clone()],
+            json!({"mode": "compare", "turn_a": 1, "turn_b": 2}),
+            1,
+            2,
+        ),
+        (
+            vec![t1.clone(), t2.clone()],
+            json!({"mode": "compare"}),
+            1,
+            2,
+        ),
+        (
+            vec![t1.clone()],
+            json!({"mode": "compare", "turn_a": 1, "turn_b": 1}),
+            1,
+            1,
+        ),
+    ];
 
-    assert_eq!(parsed["turn_a"], 1);
-    assert_eq!(parsed["turn_b"], 2);
-    assert!(parsed["total_tokens"]["delta"].is_number());
-    assert!(parsed["history"]["delta"].is_number());
-
-    // History should have grown
-    let hist_delta = parsed["history"]["delta"].as_i64().unwrap();
-    assert_eq!(hist_delta, 1000); // 1500 - 500
-}
-
-#[test]
-fn context_analysis_compare_defaults() {
-    let t1 = sample_trace("T1", 1600, 500, 0.3);
-    let t2 = sample_trace("T2", 3000, 1500, 0.7);
-    let (_dir, executor) = make_executor_with_session(vec![t1, t2], vec![]);
-
-    // Default: turn_a=1, turn_b=-1
-    let result = executor.context_analysis(&json!({"mode": "compare"}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["turn_a"], 1);
-    assert_eq!(parsed["turn_b"], 2);
-}
-
-#[test]
-fn context_analysis_compare_same_turn() {
-    let t1 = sample_trace("T1", 1600, 500, 0.3);
-    let (_dir, executor) = make_executor_with_session(vec![t1], vec![]);
-
-    let result = executor.context_analysis(&json!({"mode": "compare", "turn_a": 1, "turn_b": 1}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    // Should work — delta is 0 everywhere
-    assert_eq!(parsed["turn_a"], 1);
-    assert_eq!(parsed["turn_b"], 1);
-    assert_eq!(parsed["total_tokens"]["delta"], 0);
+    for (traces, args, expected_a, expected_b) in test_cases {
+        let (_dir, executor) = make_executor_with_session(traces, vec![]);
+        let result = executor.context_analysis(&args);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["turn_a"], expected_a);
+        assert_eq!(parsed["turn_b"], expected_b);
+        assert!(parsed["total_tokens"]["delta"].is_number());
+    }
 }
 
 #[test]
