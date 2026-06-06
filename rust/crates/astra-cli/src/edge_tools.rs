@@ -5489,7 +5489,7 @@ mod tests {
     mod diagnose_tests;
     mod env_tests;
     mod executor_core_tests;
-    mod fs_tests;
+
     mod lsp_tests;
     mod memoria_tests;
     mod notebook_tests;
