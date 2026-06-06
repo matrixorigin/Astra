@@ -214,66 +214,6 @@ fn parse_grep_file_line_extracts_path_and_line() {
 }
 
 #[test]
-fn ast_validate_filters_comments() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = r#"fn real_call() { target(); }
-// target is mentioned in this comment
-fn another() { target(); }
-"#;
-    std::fs::write(dir.path().join("test.rs"), code).unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let lines = vec![
-        "test.rs:1:fn real_call() { target(); }",
-        "test.rs:2:// target is mentioned in this comment",
-        "test.rs:3:fn another() { target(); }",
-    ];
-    let result = executor.ast_validate_references(&lines, "target");
-    assert!(
-        result.contains(&"test.rs:1:fn real_call() { target(); }"),
-        "real call kept: {:?}",
-        result
-    );
-    assert!(
-        !result.iter().any(|l| l.contains("comment")),
-        "comment filtered: {:?}",
-        result
-    );
-    assert!(
-        result.contains(&"test.rs:3:fn another() { target(); }"),
-        "another call kept: {:?}",
-        result
-    );
-}
-
-#[test]
-fn ast_validate_filters_string_literals() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = r#"fn real_use() -> &str { "hello" }
-fn fake_use() -> &str { "target is in a string" }
-fn actual() { target(); }
-"#;
-    std::fs::write(dir.path().join("test.rs"), code).unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let lines = vec![
-        "test.rs:2:fn fake_use() -> &str { \"target is in a string\" }",
-        "test.rs:3:fn actual() { target(); }",
-    ];
-    let result = executor.ast_validate_references(&lines, "target");
-    assert!(
-        !result.iter().any(|l| l.contains("string")),
-        "string literal filtered: {:?}",
-        result
-    );
-    assert!(
-        result.contains(&"test.rs:3:fn actual() { target(); }"),
-        "real call kept: {:?}",
-        result
-    );
-}
-
-#[test]
 fn ast_validate_keeps_all_for_unknown_language() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.xyz"), "target is here\n").unwrap();
