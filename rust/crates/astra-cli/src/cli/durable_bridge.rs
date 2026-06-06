@@ -870,6 +870,73 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
     }
 }
 
+// ─── Server Proxy Turn Intent Judge ──────────────────────────────────────────
+
+/// [`astra_services::TurnIntentJudge`] routed through the API server's
+/// `/v1/chat/completions` proxy.
+///
+/// Mirrors [`ServerProxyLlmJudge`] (verification): same auth, same model
+/// resolution, no extra credentials. Hosts wire this into
+/// `ServerAgenticLoopHost::set_turn_intent_judge` so the agentic loop's
+/// per-turn intent classification uses the LLM rather than only a
+/// keyword-matching fallback. On any error (transport, malformed output,
+/// rejection), the host falls back to the deterministic classifier so a
+/// transient outage never blocks the user's session.
+pub struct ServerProxyTurnIntentJudge {
+    api: astra_thin_client::ThinClient,
+    token: String,
+    model: Option<String>,
+}
+
+impl ServerProxyTurnIntentJudge {
+    pub fn new(api: astra_thin_client::ThinClient, token: String, model: Option<String>) -> Self {
+        Self { api, token, model }
+    }
+}
+
+#[async_trait::async_trait]
+impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
+    async fn judge(
+        &self,
+        ctx: &astra_services::TurnIntentJudgeContext,
+    ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
+        let prompt = astra_services::build_turn_intent_prompt(ctx);
+        let system_msg = serde_json::json!({
+            "role": "system",
+            "content": "You output ONLY a JSON object as described in the user message. No prose. No markdown fences."
+        });
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": prompt,
+        });
+
+        let mut body = serde_json::json!({
+            "messages": [system_msg, user_msg],
+            // Keep judge replies tight — the schema is fixed and small.
+            "max_tokens": 256,
+            // Low temperature for deterministic classification.
+            "temperature": 0.0,
+        });
+        if let Some(ref m) = self.model {
+            body["model"] = serde_json::json!(m);
+        }
+
+        let resp = self
+            .api
+            .post_completions(&self.token, &body)
+            .await
+            .map_err(|e| astra_services::TurnIntentJudgeError::Transport(e.to_string()))?;
+
+        let content = resp["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| astra_services::TurnIntentJudgeError::Malformed {
+                raw: format!("missing content in response: {resp}"),
+            })?;
+
+        astra_services::parse_turn_intent_response(content)
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

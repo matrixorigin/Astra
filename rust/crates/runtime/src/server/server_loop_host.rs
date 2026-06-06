@@ -824,6 +824,12 @@ pub struct ServerAgenticLoopHost {
     /// `CaptureRequest.tool_schemas` for per-tool drift attribution.
     /// Updated by `execute_turn` each round.
     last_turn_tool_schemas: Vec<Value>,
+    /// Optional LLM-based turn intent judge. When set, every turn first asks
+    /// the judge to classify the user's message; on judge failure the host
+    /// falls back to the deterministic keyword classifier so a transient LLM
+    /// outage never blocks the session. When unset (the default), the host
+    /// uses the keyword classifier exclusively — same as the trait default.
+    turn_intent_judge: Option<Arc<dyn astra_services::TurnIntentJudge>>,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -1109,6 +1115,7 @@ impl ServerAgenticLoopHostBuilder {
             }),
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
+            turn_intent_judge: None,
         }
     }
 
@@ -1147,6 +1154,18 @@ impl ServerAgenticLoopHost {
     /// new plan state instead of the snapshot baked at loop start.
     pub(crate) fn plan_resume_hint_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
         Arc::clone(&self.plan_resume_hint)
+    }
+
+    /// Inject an LLM-based turn intent judge.
+    ///
+    /// The judge is consulted at the start of every user turn (see
+    /// [`AgenticLoopHost::judge_turn_intent`]); on judge failure the host
+    /// falls back to the deterministic keyword classifier so a transient
+    /// LLM outage never blocks the session. When this setter is not
+    /// called the host uses the keyword classifier exclusively, matching
+    /// the trait default.
+    pub fn set_turn_intent_judge(&mut self, judge: Arc<dyn astra_services::TurnIntentJudge>) {
+        self.turn_intent_judge = Some(judge);
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -2364,6 +2383,42 @@ impl ServerAgenticLoopHost {
 impl AgenticLoopHost for ServerAgenticLoopHost {
     fn injects_round_guidance(&self) -> bool {
         true // Server injects guidance into the system prompt in execute_turn.
+    }
+
+    async fn judge_turn_intent(
+        &mut self,
+        state: &AgenticLoopState,
+    ) -> Option<astra_config::user_profile::TurnIntent> {
+        // When an LLM judge is wired, route through it with keyword
+        // fallback. Otherwise fall back to the deterministic-only
+        // pathway (same as the trait default). The judge sees enough
+        // context (turn count + recent tools + has-prior-assistant)
+        // to disambiguate paraphrases the keyword classifier misses.
+        match self.turn_intent_judge.as_ref() {
+            Some(judge) => {
+                let has_prior_assistant_turn = state
+                    .messages
+                    .iter()
+                    .rev()
+                    .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+                // Use 1-based turn count: llm_rounds_completed counts
+                // *prior* rounds, so the current user turn is +1.
+                let turn_count = state.llm_rounds_completed.saturating_add(1);
+                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm_fallback(
+                    judge.as_ref(),
+                    &state.message,
+                    state.task_profile,
+                    turn_count,
+                    &state.recent_tools,
+                    has_prior_assistant_turn,
+                )
+                .await
+            }
+            None => crate::turn::agentic::turn_intent::infer_turn_intent(
+                &state.message,
+                state.task_profile,
+            ),
+        }
     }
 
     fn turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
@@ -6865,6 +6920,150 @@ mod tests {
             state.current_run_id = None; // simulate pre-run state
             host.on_turn_completed(&state);
             assert_eq!(store.tracked_count(), 0, "missing run_id must skip capture");
+        }
+    }
+
+    // ── Turn intent judge wiring ────────────────────────────────────────
+    //
+    // Pin the contract that ServerAgenticLoopHost honors an injected LLM
+    // judge in preference to the deterministic keyword classifier — and
+    // falls back to the keyword classifier when the judge errors. Without
+    // this wiring the turn-intent path silently degrades to keyword-only
+    // even though a judge has been wired (the bug we're guarding against).
+    mod turn_intent_judge_wiring {
+        use super::*;
+        use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+        use astra_services::{TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError};
+        use async_trait::async_trait;
+
+        struct ScriptedJudge {
+            calls: std::sync::Mutex<Vec<TurnIntentJudgeContext>>,
+            response: std::sync::Mutex<Option<Result<TurnIntent, TurnIntentJudgeError>>>,
+        }
+
+        impl ScriptedJudge {
+            fn ok(intent: TurnIntent) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                    response: std::sync::Mutex::new(Some(Ok(intent))),
+                })
+            }
+            fn err(error: TurnIntentJudgeError) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                    response: std::sync::Mutex::new(Some(Err(error))),
+                })
+            }
+            fn calls(&self) -> Vec<TurnIntentJudgeContext> {
+                self.calls.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait]
+        impl TurnIntentJudge for ScriptedJudge {
+            async fn judge(
+                &self,
+                ctx: &TurnIntentJudgeContext,
+            ) -> Result<TurnIntent, TurnIntentJudgeError> {
+                self.calls.lock().unwrap().push(ctx.clone());
+                self.response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("ScriptedJudge consumed twice")
+            }
+        }
+
+        fn host_with_judge(judge: Arc<dyn TurnIntentJudge>) -> ServerAgenticLoopHost {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .build();
+            host.set_turn_intent_judge(judge);
+            host
+        }
+
+        #[tokio::test]
+        async fn judge_turn_intent_invokes_wired_judge_and_returns_its_result() {
+            let llm_intent = TurnIntent::default()
+                .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
+            let judge = ScriptedJudge::ok(llm_intent.clone());
+            let mut host = host_with_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
+
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.message = "可以了，按你刚才说的方向继续往下走".to_string();
+            state.messages = vec![
+                serde_json::json!({"role": "user", "content": "earlier"}),
+                serde_json::json!({"role": "assistant", "content": "ok"}),
+            ];
+            state.recent_tools = vec!["read_file".to_string()];
+            state.llm_rounds_completed = 4;
+
+            let intent = host.judge_turn_intent(&state).await;
+            assert_eq!(intent, Some(llm_intent));
+
+            let calls = judge.calls();
+            assert_eq!(calls.len(), 1, "judge must be called exactly once");
+            let call = &calls[0];
+            assert_eq!(call.message, "可以了，按你刚才说的方向继续往下走");
+            assert_eq!(call.turn_count, 5, "turn count should be llm_rounds_completed+1");
+            assert_eq!(call.recent_tools, vec!["read_file".to_string()]);
+            assert!(
+                call.has_prior_assistant_turn,
+                "must surface the prior-assistant signal so the judge can detect follow-ups"
+            );
+        }
+
+        #[tokio::test]
+        async fn judge_turn_intent_falls_back_to_keyword_when_judge_errors() {
+            // Message is detectable by the keyword classifier as code review.
+            // Judge errors → host MUST still produce the keyword result, not None.
+            let judge = ScriptedJudge::err(TurnIntentJudgeError::Transport(
+                "connection reset".to_string(),
+            ));
+            let mut host = host_with_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
+
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.message = "please inspect the current changes".to_string();
+            state.task_profile =
+                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+                    &state.message,
+                );
+
+            let intent = host
+                .judge_turn_intent(&state)
+                .await
+                .expect("keyword fallback must produce an intent");
+            assert_eq!(
+                intent.requested_scenario,
+                Some(Scenario::CodeReview),
+                "judge transport failure must fall back to keyword classifier"
+            );
+        }
+
+        #[tokio::test]
+        async fn judge_turn_intent_uses_keyword_only_when_no_judge_set() {
+            // Guard against an accidental "always require a judge" refactor.
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .build();
+
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.message = "please inspect the current changes".to_string();
+            state.task_profile =
+                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+                    &state.message,
+                );
+
+            let intent = host.judge_turn_intent(&state).await.expect("intent");
+            assert_eq!(intent.requested_scenario, Some(Scenario::CodeReview));
         }
     }
 }

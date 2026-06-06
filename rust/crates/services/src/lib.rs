@@ -56,6 +56,7 @@ pub mod sync_engine;
 pub mod task_orchestrator;
 pub mod team_persistence;
 pub mod triggers;
+pub mod turn_intent_judge;
 pub mod verification;
 pub mod workflows;
 
@@ -302,6 +303,10 @@ pub use task_orchestrator::{
 };
 pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
+};
+pub use turn_intent_judge::{
+    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError, build_turn_intent_prompt,
+    parse_turn_intent_response,
 };
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
