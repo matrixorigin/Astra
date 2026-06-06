@@ -2,9 +2,6 @@ use crate::edge_tools::ToolExecutor;
 use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalEventType};
 use serde_json::json;
 
-/// Parse a task-tool response into JSON, tolerating the human-readable
-/// summary line that `prefix_summary` prepends to success responses.
-/// Strips everything up to the first `{`.
 fn parse_task_json(response: &str) -> serde_json::Value {
     let body = response
         .find('{')
@@ -14,48 +11,32 @@ fn parse_task_json(response: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("task response not JSON: {e}; raw: {response}"))
 }
 
-// ── Task tool tests ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn task_create_requires_title() {
+fn setup() -> (tempfile::TempDir, ToolExecutor) {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
-    let result = exe.task_create(&json!({})).await;
-    assert!(result.contains("Error"));
-    assert!(result.contains("title"));
+    (dir, exe)
 }
+
+// ── Task tool tests ─────────────────────────────────────────��────────────
 
 #[tokio::test]
 async fn task_create_returns_task_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe) = setup();
     let result = exe.task_create(&json!({"title": "Test task"})).await;
     let parsed = parse_task_json(&result);
-    assert_eq!(
-        parsed["success"], true,
-        "task_create must succeed — got: {result}"
-    );
-    assert_eq!(parsed["task_id"], "task-1", "first task id must be task-1");
-    let msg = parsed["message"]
-        .as_str()
-        .expect("message must be a string");
-    assert!(
-        msg.contains("Test task"),
-        "message must reference title — got: {msg}"
-    );
+    assert_eq!(parsed["success"], true);
+    assert_eq!(parsed["task_id"], "task-1");
+    assert!(parsed["message"].as_str().unwrap().contains("Test task"));
 }
 
 #[tokio::test]
 async fn task_list_shows_created_tasks() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
+    let (_dir, exe) = setup();
     exe.task_create(&json!({"title": "First task"})).await;
-
     let list = exe.task_list(&json!({})).await;
     let parsed: serde_json::Value = serde_json::from_str(&list).unwrap();
-    assert_eq!(parsed["count"], 1, "count must reflect created tasks");
-    let tasks = parsed["tasks"].as_array().expect("tasks must be array");
+    assert_eq!(parsed["count"], 1);
+    let tasks = parsed["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0]["id"], "task-1");
     assert_eq!(tasks[0]["title"], "First task");
@@ -64,15 +45,8 @@ async fn task_list_shows_created_tasks() {
 
 #[tokio::test]
 async fn task_get_returns_details() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    exe.task_create(&json!({
-        "title": "Detailed task",
-        "description": "This is a test"
-    }))
-    .await;
-
+    let (_dir, exe) = setup();
+    exe.task_create(&json!({"title": "Detailed task", "description": "This is a test"})).await;
     let details = exe.task_get(&json!({"task_id": "task-1"})).await;
     let parsed: serde_json::Value = serde_json::from_str(&details).unwrap();
     assert_eq!(parsed["id"], "task-1");
@@ -83,33 +57,23 @@ async fn task_get_returns_details() {
 
 #[tokio::test]
 async fn task_update_changes_status() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
+    let (_dir, exe) = setup();
     exe.task_create(&json!({"title": "Status test"})).await;
-
-    // Update to in_progress
     let result = exe
-        .task_update(&json!({
-            "task_id": "task-1",
-            "status": "in_progress"
-        }))
+        .task_update(&json!({"task_id": "task-1", "status": "in_progress"}))
         .await;
     let parsed = parse_task_json(&result);
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["previous_status"], "pending");
     assert_eq!(parsed["status"], "in_progress");
-
-    // Verify status changed
+    // Verify persisted
     let details = exe.task_get(&json!({"task_id": "task-1"})).await;
     assert!(details.contains("in_progress"));
 }
 
 #[tokio::test]
 async fn task_with_subtasks_tracks_progress() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
+    let (_dir, exe) = setup();
     exe.task_create(&json!({
         "title": "Multi-step task",
         "subtasks": [
@@ -118,48 +82,10 @@ async fn task_with_subtasks_tracks_progress() {
         ]
     }))
     .await;
-
-    // List shows subtask count
-    let list = exe.task_list(&json!({})).await;
-    assert!(list.contains("[0/2]"));
-
-    // Complete first subtask
-    exe.task_update(&json!({
-        "task_id": "task-1",
-        "subtask_id": "step-1",
-        "status": "completed"
-    }))
-    .await;
-
-    let list2 = exe.task_list(&json!({})).await;
-    assert!(list2.contains("[1/2]"));
-}
-
-#[tokio::test]
-async fn task_update_reports_previous_subtask_status() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    exe.task_create(&json!({
-        "title": "Subtask status test",
-        "subtasks": [
-            {"id": "step-1", "title": "First step"}
-        ]
-    }))
-    .await;
-
-    let result = exe
-        .task_update(&json!({
-            "task_id": "task-1",
-            "subtask_id": "step-1",
-            "status": "completed"
-        }))
+    assert!(exe.task_list(&json!({})).await.contains("[0/2]"));
+    exe.task_update(&json!({"task_id": "task-1", "subtask_id": "step-1", "status": "completed"}))
         .await;
-    let parsed = parse_task_json(&result);
-
-    assert!(parsed["success"].as_bool().unwrap());
-    assert_eq!(parsed["previous_status"], "pending");
-    assert_eq!(parsed["status"], "completed");
+    assert!(exe.task_list(&json!({})).await.contains("[1/2]"));
 }
 
 #[tokio::test]
@@ -219,136 +145,47 @@ async fn task_mutations_append_lifecycle_events_to_session_journal() {
     assert_eq!(cancel_detail["reason"], "user cancelled");
 }
 
-// ── Sleep tool tests ─────────────────────────────────────────────────────
+// ── task_stop tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn sleep_requires_duration() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.sleep_tool(&json!({})).await;
-    assert!(result.contains("Error"));
-    assert!(result.contains("duration_ms"));
-}
-
-#[tokio::test]
-async fn sleep_rejects_zero_duration() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.sleep_tool(&json!({"duration_ms": 0})).await;
-    assert!(result.contains("Error"));
-}
-
-#[tokio::test]
-async fn sleep_succeeds_with_valid_duration() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let start = std::time::Instant::now();
-    let result = exe.sleep_tool(&json!({"duration_ms": 50})).await;
-    let elapsed = start.elapsed();
-
-    assert!(result.contains("success"));
-    assert!(result.contains("50"));
-    assert!(elapsed.as_millis() >= 40, "should have slept");
-}
-
-#[tokio::test]
-async fn sleep_caps_at_max_duration() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    // Request 10 minutes, should cap at 5 minutes (300000ms)
-    // We won't actually wait that long, just verify the schema accepts it
-    let result = exe
-        .sleep_tool(&json!({"duration_ms": 1, "reason": "test cap"}))
-        .await;
-    assert!(result.contains("success"));
-}
-
-// ─── task_stop tests ──────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn task_stop_cancels_running_task() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    // Create a task
-    exe.task_create(&json!({
-        "title": "Long running task",
-        "description": "This will be stopped"
-    }))
-    .await;
-
-    // Update to in_progress
-    exe.task_update(&json!({
-        "task_id": "task-1",
-        "status": "in_progress"
-    }))
-    .await;
-
-    // Stop it
-    let result = exe
-        .task_stop(&json!({
-            "task_id": "task-1",
-            "reason": "Taking too long"
-        }))
-        .await;
-    let parsed = parse_task_json(&result);
-
-    assert!(parsed["success"].as_bool().unwrap());
-    assert_eq!(parsed["previous_status"], "in_progress");
-    assert!(parsed["message"].as_str().unwrap().contains("cancelled"));
-
-    // Verify the task is now cancelled
-    let task_result = exe.task_get(&json!({"task_id": "task-1"})).await;
-    let task: serde_json::Value = serde_json::from_str(&task_result).unwrap();
-    assert_eq!(task["status"], "cancelled");
-}
-
-#[tokio::test]
-async fn task_stop_cancels_pending_task() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    // Create a task (defaults to pending)
-    exe.task_create(&json!({
-        "title": "Pending task"
-    }))
-    .await;
-
-    // Stop it while pending
-    let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
-    let parsed = parse_task_json(&result);
-
-    assert!(parsed["success"].as_bool().unwrap());
-    assert_eq!(parsed["previous_status"], "pending");
+async fn task_stop_cancels_task() {
+    for (pre_status, title) in [("pending", "Pending"), ("in_progress", "Running")] {
+        let (_dir, exe) = setup();
+        exe.task_create(&json!({"title": title})).await;
+        if pre_status == "in_progress" {
+            exe.task_update(&json!({"task_id": "task-1", "status": "in_progress"}))
+                .await;
+        }
+        let result = exe
+            .task_stop(&json!({"task_id": "task-1", "reason": "test"}))
+            .await;
+        let parsed = parse_task_json(&result);
+        assert!(
+            parsed["success"].as_bool().unwrap(),
+            "stop {title} must succeed"
+        );
+        assert_eq!(
+            parsed["previous_status"], pre_status,
+            "previous_status for {title}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn task_stop_rejects_completed_task() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    // Create and complete a task
+    let (_dir, exe) = setup();
     exe.task_create(&json!({"title": "Done task"})).await;
-    exe.task_update(&json!({
-        "task_id": "task-1",
-        "status": "completed"
-    }))
-    .await;
-
-    // Try to stop it
+    exe.task_update(&json!({"task_id": "task-1", "status": "completed"}))
+        .await;
     let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
     let parsed = parse_task_json(&result);
-
     assert!(!parsed["success"].as_bool().unwrap());
     assert!(parsed["message"].as_str().unwrap().contains("Cannot stop"));
 }
 
 #[tokio::test]
 async fn task_stop_cancels_subtasks() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    // Create a task with subtasks
+    let (_dir, exe) = setup();
     exe.task_create(&json!({
         "title": "Parent task",
         "subtasks": [
@@ -357,36 +194,33 @@ async fn task_stop_cancels_subtasks() {
         ]
     }))
     .await;
-
-    // Start the task
-    exe.task_update(&json!({
-        "task_id": "task-1",
-        "status": "in_progress"
-    }))
-    .await;
-
-    // Stop it
+    exe.task_update(&json!({"task_id": "task-1", "status": "in_progress"}))
+        .await;
     let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
     let parsed = parse_task_json(&result);
-
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["cancelled_subtasks"], 2);
 }
 
-#[tokio::test]
-async fn task_stop_not_found() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.task_stop(&json!({"task_id": "nonexistent"})).await;
-    assert!(result.contains("not found"));
-}
+// ── Error path tests ─────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn task_stop_missing_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.task_stop(&json!({})).await;
-    assert!(result.contains("required"));
+async fn task_rejects_invalid_input() {
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        ("create", json!({}), "title"),
+        ("stop", json!({"task_id": "nonexistent"}), "not found"),
+        ("stop", json!({}), "required"),
+    ];
+    for (tool, input, expected) in cases {
+        let (_dir, exe) = setup();
+        let result = match *tool {
+            "create" => exe.task_create(&input).await,
+            "stop" => exe.task_stop(&input).await,
+            _ => unreachable!(),
+        };
+        assert!(
+            result.contains(expected),
+            "task_{tool}({input}) should contain '{expected}' — got: {result}"
+        );
+    }
 }

@@ -5496,6 +5496,7 @@ mod tests {
     mod sandbox_tests;
     mod schema_tests;
     mod self_mod_tests;
+    mod sleep_tests;
     mod task_tests;
     mod tool_search_tests;
     mod utf16_tests;
