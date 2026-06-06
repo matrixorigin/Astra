@@ -1106,7 +1106,15 @@ impl DelegationTracker {
             if emit_completion_event {
                 if let Some(ref broadcaster) = self.progress_broadcaster {
                     use crate::orchestration::{AgentProgressEvent, ProgressEventType};
-                    let status_str = format!("{:?}", final_state);
+                    // Canonical wire string — `as_str()` is what every other
+                    // SSE/JSON site uses (line 1096 above, and the trace
+                    // emitters). Using `{:?}` here leaked Rust enum casing
+                    // ("VerificationFailed") into the user-visible payload
+                    // instead of the snake_case wire form
+                    // ("verification_failed"), and silently coupled the
+                    // SSE wire format to the Debug derive — a refactor of
+                    // the enum's variant names would corrupt SSE downstream.
+                    let status_str = final_state.as_str();
                     let event_type = match final_state {
                         SubRunState::Completed => ProgressEventType::Completed {
                             result_summary: format!("Sub-run {} finished", run_id),
@@ -6774,6 +6782,77 @@ mod tests {
         assert_eq!(count, 2, "both children must be cancelled");
         assert!(token1.is_cancelled(), "child1 token must be cancelled");
         assert!(token2.is_cancelled(), "child2 token must be cancelled");
+    }
+
+    /// Regression: the SSE Failed event for a non-Completed/Paused/Cancelled
+    /// terminal state (e.g. VerificationFailed) must surface the canonical
+    /// `as_str()` wire form, NOT the Debug-formatted Rust enum variant.
+    /// Pre-fix the broadcaster received "Sub-run terminal state:
+    /// VerificationFailed"; the wire/JSON contract everywhere else uses
+    /// "verification_failed", so the Debug leak coupled SSE consumers to
+    /// the Debug derive — a refactor of the enum casing would have
+    /// silently broken downstream parsing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sse_failed_event_uses_canonical_wire_status_not_debug() {
+        use crate::orchestration::{ProgressBroadcaster, ProgressEventType};
+        let broadcaster = Arc::new(ProgressBroadcaster::new(16));
+        let mut rx = broadcaster.subscribe();
+        let tracker =
+            DelegationTracker::new().with_progress_broadcaster(broadcaster.clone());
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-vf".into(),
+                parent_run_id: "parent-vf".into(),
+                delegation_id: "deleg-vf".into(),
+                agent_id: "agent-vf".into(),
+                depth: 0,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        tracker
+            .complete_sub_run_with_result(
+                "run-vf",
+                SubRunState::VerificationFailed,
+                Some("acceptance criterion 3 failed"),
+                None,
+            )
+            .await;
+
+        // Drain events until we see the terminal Failed (record_sub_run
+        // emits a Started/Spawned event which we don't care about here).
+        let error_text = loop {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                rx.recv(),
+            )
+            .await
+            .expect("event should arrive within timeout")
+            .expect("broadcast must deliver");
+            match event.event_type {
+                ProgressEventType::Failed { error } => break error,
+                ProgressEventType::Completed { .. }
+                | ProgressEventType::Cancelled { .. }
+                | ProgressEventType::Interrupted { .. } => {
+                    panic!(
+                        "expected Failed for VerificationFailed terminal state, got {:?}",
+                        event.event_type
+                    );
+                }
+                _ => continue, // skip non-terminal events
+            }
+        };
+
+        assert!(
+            error_text.contains("verification_failed"),
+            "SSE Failed event must use canonical wire status; got: {error_text}"
+        );
+        assert!(
+            !error_text.contains("VerificationFailed"),
+            "SSE Failed event must not leak the Rust Debug variant casing; got: {error_text}"
+        );
     }
 
     /// Subtree cancellation: cancel_children_of must propagate to grandchildren

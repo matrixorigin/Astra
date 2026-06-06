@@ -173,9 +173,16 @@ impl ResumeMode {
                 _ => None,
             })
             .unwrap_or_else(|| {
+                // Known kind → use its calibrated default. Unknown kind →
+                // fail SAFE: Settle. Unknown means we cannot reason about
+                // whether broadening execution is appropriate, and the
+                // worst outcome of an unwarranted Settle is the next turn
+                // re-broadens explicitly; the worst outcome of an
+                // unwarranted Continue is the loop charges ahead with
+                // execution authority on a state we don't understand.
                 InterruptionKind::from_label(kind)
                     .map(Self::default_for_interruption)
-                    .unwrap_or_default()
+                    .unwrap_or(Self::Settle)
             })
     }
 }
@@ -828,6 +835,57 @@ mod tests {
             json.get("stall_signal").is_none(),
             "stall_signal omitted from JSON when None for backwards compat: {json:?}"
         );
+    }
+
+    /// Regression: `ResumeMode::from_json_value` used to fail OPEN when the
+    /// `kind` was unknown — falling back to `ResumeMode::default()` =
+    /// Continue, which broadens execution. For an unknown interruption
+    /// kind we cannot reason about whether broadening is appropriate, so
+    /// the safe default is Settle. Catch any future refactor that
+    /// regresses this.
+    #[test]
+    fn from_json_value_unknown_kind_falls_back_to_settle() {
+        // No `resume_mode` field, unknown kind → must default to Settle.
+        let mode = ResumeMode::from_json_value(None, "totally_unknown_kind_v9");
+        assert_eq!(
+            mode,
+            ResumeMode::Settle,
+            "unknown interruption kind must fail-safe to Settle, not broaden via Continue"
+        );
+
+        // Also: an unrecognised resume_mode value with an unknown kind →
+        // still Settle (the unrecognised value triggers the fallback,
+        // and the fallback now hits the unknown-kind branch).
+        let mode = ResumeMode::from_json_value(
+            Some(&serde_json::json!("not_a_known_mode")),
+            "another_unknown_kind",
+        );
+        assert_eq!(mode, ResumeMode::Settle);
+    }
+
+    #[test]
+    fn from_json_value_known_kind_uses_calibrated_default() {
+        // Known kinds keep their calibrated defaults — no regression of
+        // existing behaviour.
+        assert_eq!(
+            ResumeMode::from_json_value(None, "empty_completion"),
+            ResumeMode::Settle
+        );
+        assert_eq!(
+            ResumeMode::from_json_value(None, "budget_exhausted"),
+            ResumeMode::Continue
+        );
+    }
+
+    #[test]
+    fn from_json_value_explicit_value_wins_over_kind_default() {
+        // An explicit "continue" must beat the kind default (e.g. an
+        // EmptyCompletion record whose author wants to resume normally).
+        let mode = ResumeMode::from_json_value(
+            Some(&serde_json::json!("continue")),
+            "empty_completion",
+        );
+        assert_eq!(mode, ResumeMode::Continue);
     }
 
     #[test]
