@@ -365,12 +365,33 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             })
             .to_string()
         }
-        AgentStatus::Cancelled => json!({
-            "status": AgentToolResultStatusKind::Cancelled.as_str(),
-            "agent_id": agent_id,
-            "reason": "cancelled",
-        })
-        .to_string(),
+        AgentStatus::Cancelled { by_user, reason } => {
+            let mut payload = json!({
+                "status": AgentToolResultStatusKind::Cancelled.as_str(),
+                "agent_id": agent_id,
+                "reason": if reason.is_empty() {
+                    "cancelled".to_string()
+                } else {
+                    reason.clone()
+                },
+                "cancelled_by_user": *by_user,
+            });
+            if *by_user {
+                // Make it explicit so the LLM doesn't dutifully respawn
+                // the work the user just killed. Without this, the LLM
+                // observes "cancelled" and most models treat it as a
+                // transient failure → immediately re-spawns, defeating
+                // the user's intent.
+                payload["instruction"] = json!(
+                    "The user explicitly cancelled this sub-agent. \
+                     Do NOT respawn it or retry the same work; treat \
+                     this turn as the user's signal to change direction. \
+                     If the original objective still needs attention, \
+                     ask the user what to do next."
+                );
+            }
+            payload.to_string()
+        }
         AgentStatus::Initializing => json!({
             "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": agent_id,

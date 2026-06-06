@@ -457,6 +457,21 @@ impl ChatWidget {
         self.agent_runs.get(id)
     }
 
+    /// Whether the user has issued a cancel for this agent that has
+    /// already terminated. Distinct from Failed so the strip / drill
+    /// view can render a different icon (■, dim) — a cancelled run is
+    /// the user's intent, not an alarm.
+    pub fn agent_is_cancelled(&self, id: &str) -> bool {
+        self.cancelled_task_ids.contains(id)
+    }
+
+    /// Whether the user has issued a cancel for this agent that has
+    /// NOT yet terminated. Distinct from `agent_is_cancelled` so the
+    /// strip can show "Cancelling…" while the cancel is in flight.
+    pub fn agent_is_cancelling(&self, id: &str) -> bool {
+        self.cancelling_task_ids.contains(id)
+    }
+
     fn agent_row_status(
         &self,
         id: &str,

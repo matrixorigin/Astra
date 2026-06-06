@@ -134,7 +134,7 @@ impl AgentTreeNode {
             AgentStatus::Idle => ("◯", "idle".to_string()),
             AgentStatus::Completed { .. } => ("✓", "done".to_string()),
             AgentStatus::Failed { .. } => ("✗", "failed".to_string()),
-            AgentStatus::Cancelled => ("⊘", "cancelled".to_string()),
+            AgentStatus::Cancelled { .. } => ("⊘", "cancelled".to_string()),
         };
 
         // Format elapsed time

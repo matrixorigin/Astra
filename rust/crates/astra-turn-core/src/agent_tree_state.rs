@@ -138,7 +138,7 @@ impl AgentTreeState {
                         };
                     }
                     ProgressEventType::Cancelled { .. } => {
-                        record.info.status = AgentStatus::Cancelled;
+                        record.info.status = AgentStatus::cancelled_anonymous();
                     }
                     ProgressEventType::PermissionDenied { .. } => {
                         record.info.has_permission_issues = true;
@@ -232,7 +232,7 @@ impl AgentTreeState {
 fn is_terminal_status(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled
+        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
     )
 }
 

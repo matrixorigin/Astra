@@ -525,9 +525,12 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
         return;
     }
 
-    // Update status to cancelled
+    // Update status to cancelled (user-driven via `/agent cancel`).
     spawner
-        .update_status(agent_id, AgentStatus::Cancelled)
+        .update_status(
+            agent_id,
+            AgentStatus::cancelled_by_user("user-requested via /agent cancel"),
+        )
         .await;
 
     eprintln!(
@@ -930,7 +933,7 @@ fn status_icon(status: &AgentStatus) -> &'static str {
         AgentStatus::Idle => "💤",
         AgentStatus::Completed { .. } => "✅",
         AgentStatus::Failed { .. } => "❌",
-        AgentStatus::Cancelled => "🛑",
+        AgentStatus::Cancelled { .. } => "🛑",
     }
 }
 
@@ -948,7 +951,17 @@ fn format_status(status: &AgentStatus) -> String {
             format!("completed: {preview}")
         }
         AgentStatus::Failed { error, .. } => format!("failed: {error}"),
-        AgentStatus::Cancelled => "cancelled".to_string(),
+        AgentStatus::Cancelled { by_user, reason } => {
+            if reason.is_empty() {
+                if *by_user {
+                    "cancelled by user".to_string()
+                } else {
+                    "cancelled".to_string()
+                }
+            } else {
+                format!("cancelled: {reason}")
+            }
+        }
     }
 }
 
@@ -966,7 +979,7 @@ pub(crate) fn format_duration(d: std::time::Duration) -> String {
 fn is_terminal_agent_status(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled
+        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
     )
 }
 

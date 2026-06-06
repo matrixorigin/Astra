@@ -119,7 +119,11 @@ fn spawn_run_failure_message(run_result: &SpawnRunResult) -> String {
 
 fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus {
     match spawn_run_status_kind(&run_result.status) {
-        SpawnRunStatusKind::Cancelled => AgentStatus::Cancelled,
+        // Cancellations from the spawn-run path are NOT user-driven —
+        // they come from sub-process exit codes, depth violations, etc.
+        // The user-driven path uses `cancel_agent` directly with
+        // `AgentStatus::cancelled_by_user`.
+        SpawnRunStatusKind::Cancelled => AgentStatus::cancelled_anonymous(),
         SpawnRunStatusKind::Failed | SpawnRunStatusKind::Other => AgentStatus::Failed {
             error: spawn_run_failure_message(run_result),
             finish_reason: Some(run_result.finish_reason.clone()),
@@ -215,9 +219,19 @@ fn agent_status_to_progress_event(
         AgentStatus::Failed { error, .. } => Some(ProgressEventType::Failed {
             error: error.clone(),
         }),
-        AgentStatus::Cancelled => Some(ProgressEventType::Cancelled {
-            reason: "cancelled by parent".to_string(),
-        }),
+        AgentStatus::Cancelled { by_user, reason } => {
+            Some(ProgressEventType::Cancelled {
+                reason: if reason.is_empty() {
+                    if *by_user {
+                        "cancelled by user".to_string()
+                    } else {
+                        "cancelled".to_string()
+                    }
+                } else {
+                    reason.clone()
+                },
+            })
+        }
         AgentStatus::Initializing => None,
     }
 }
@@ -1290,9 +1304,12 @@ impl DynamicAgentSpawner {
         }
 
         abort_handle.abort();
+        // `cancel_agent` is the user-driven cancel surface (Ctrl+G x,
+        // /agent cancel, etc.). Propagate the user-driven flag so the
+        // wire output tells the LLM not to respawn.
         self.finalize_background_agent(
             agent_id,
-            AgentStatus::Cancelled,
+            AgentStatus::cancelled_by_user(reason),
             "cancelled",
             Some(reason),
             None,
@@ -1422,7 +1439,7 @@ impl DynamicAgentSpawner {
             AgentStatus::Idle => "idle",
             AgentStatus::Completed { .. } => "completed",
             AgentStatus::Failed { .. } => "failed",
-            AgentStatus::Cancelled => "cancelled",
+            AgentStatus::Cancelled { .. } => "cancelled",
         }
     }
 
@@ -2874,6 +2891,196 @@ mod tests {
         }
     }
 
+    // ── Spawn-cancel UX unhappy paths ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancelling_a_failed_agent_is_idempotent_and_does_not_overwrite_status() {
+        // Race: agent fails → user presses x while the failure has
+        // already landed (slight latency between row update and key
+        // press). Must not flip the terminal status from Failed →
+        // Cancelled, and must NOT spawn anything new.
+        struct FailingExecutor;
+        #[async_trait]
+        impl SpawnAgentExecutor for FailingExecutor {
+            async fn execute(
+                &self,
+                _config: SpawnRunConfig,
+            ) -> Result<SpawnRunResult, String> {
+                Err("kaboom".into())
+            }
+        }
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(FailingExecutor) as Arc<dyn SpawnAgentExecutor>);
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+
+        // Drain to terminal Failed state.
+        let _ = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(2))
+            .await;
+
+        // Now cancel — must be a no-op (returns false), terminal state
+        // stays Failed.
+        let cancelled = spawner
+            .cancel_agent(&agent_id, "user-requested via Ctrl+G x")
+            .await;
+        assert!(
+            !cancelled,
+            "cancel_agent on a finished (failed) agent must report false"
+        );
+
+        let archived = spawner.get_agent_state_any(&agent_id).await.unwrap();
+        assert!(
+            matches!(archived.status, AgentStatus::Failed { .. }),
+            "post-cancel archived status must remain Failed: {:?}",
+            archived.status
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_agent_id_is_a_noop_returns_false() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let result = spawner.cancel_agent("nonexistent@xyz", "test").await;
+        assert!(
+            !result,
+            "cancel_agent on unknown id must NOT raise; just return false"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_cancel_is_idempotent() {
+        // A jittery user double-tapping x must not produce a second
+        // cancel side effect (no double archive, no duplicate journal
+        // event). Returns false on the second call.
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+
+        let first = spawner
+            .cancel_agent(&agent_id, "user-requested via Ctrl+G x")
+            .await;
+        let second = spawner
+            .cancel_agent(&agent_id, "user-requested via Ctrl+G x")
+            .await;
+        assert!(first, "first cancel must own the cancellation");
+        assert!(!second, "second cancel must report false (idempotent)");
+
+        // Archive must contain exactly ONE Cancelled record.
+        let cancelled_count = spawner
+            .completed_agents
+            .read()
+            .await
+            .iter()
+            .filter(|s| s.agent_id == agent_id)
+            .filter(|s| matches!(s.status, AgentStatus::Cancelled { .. }))
+            .count();
+        assert_eq!(
+            cancelled_count, 1,
+            "double-cancel must NOT duplicate the archived Cancelled record"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_fills_user_cancelled_flag_for_llm_visibility() {
+        // The wire JSON carries `cancelled_by_user: true` so the LLM
+        // sees an explicit "do NOT respawn" instruction. This test
+        // exercises the spawner side; agent_result_status_tests covers
+        // the wire serialization.
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+        let _ = spawner
+            .cancel_agent(&agent_id, "user-requested via Ctrl+G x")
+            .await;
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("cancelled agent should remain queryable");
+        match &archived.status {
+            AgentStatus::Cancelled { by_user, reason } => {
+                assert!(
+                    *by_user,
+                    "cancel_agent → wire output must report by_user=true so the LLM stops respawning"
+                );
+                assert!(
+                    reason.contains("user-requested"),
+                    "reason must surface the human-readable origin: {reason}"
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_releases_after_explicit_cancel_so_user_can_spawn_anew() {
+        // Concrete user flow: cap=2, two agents in flight, user kills
+        // one via x, expects to be able to spawn a third immediately.
+        // Without the cap re-check, the user would still be capped at
+        // "2 in flight" because cancel_agent didn't free a slot.
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_max_concurrent_agents(2);
+
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let mut input = make_bg_input();
+            input.description = format!("bg-{i}");
+            let result = spawner.spawn(input, &make_bg_context()).await.unwrap();
+            if let SpawnAgentOutput::Launched { agent_id, .. } = result {
+                ids.push(agent_id);
+            }
+        }
+
+        // Hit the cap.
+        let third = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        assert!(matches!(
+            third,
+            Err(SpawnError::ConcurrencyLimitExceeded { .. })
+        ));
+
+        // Kill one — slot should free.
+        let cancelled = spawner
+            .cancel_agent(&ids[0], "user-requested via Ctrl+G x")
+            .await;
+        assert!(cancelled, "cancel must succeed on a still-running agent");
+
+        // Now a new spawn should be accepted.
+        let after_kill = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        assert!(
+            after_kill.is_ok(),
+            "after explicit cancel the cap must accept a new spawn, got {after_kill:?}"
+        );
+
+        factory2.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+    }
+
     /// Sync-mode parity regression: a synchronous spawn must drive the same
     /// finalization path as a background spawn. Concretely the agent must:
     /// (a) leave `active_agents` (no slow leak), and
@@ -3141,7 +3348,7 @@ mod tests {
             .wait_for_agent(&agent_id, std::time::Duration::from_secs(1))
             .await;
         assert!(
-            matches!(status, Some(AgentStatus::Cancelled)),
+            matches!(status, Some(AgentStatus::Cancelled { .. })),
             "status={status:?}"
         );
 
@@ -3150,8 +3357,19 @@ mod tests {
             .await
             .expect("cancelled agent should remain queryable");
         assert!(
-            matches!(archived.status, AgentStatus::Cancelled),
+            matches!(archived.status, AgentStatus::Cancelled { .. }),
             "archived status must be cancelled: {:?}",
+            archived.status
+        );
+        // `cancel_agent` is the user-driven path → must surface the
+        // user-driven flag so the wire output instructs the LLM not
+        // to respawn.
+        assert!(
+            matches!(
+                &archived.status,
+                AgentStatus::Cancelled { by_user: true, .. }
+            ),
+            "cancel_agent must mark the cancellation as user-driven: {:?}",
             archived.status
         );
 

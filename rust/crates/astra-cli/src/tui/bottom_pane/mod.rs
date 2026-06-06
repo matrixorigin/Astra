@@ -814,6 +814,14 @@ impl BottomPane {
     fn handle_active_view_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
         let view = self.active_view_mut()?;
         view.handle_key(key);
+        // Pending side-effect: view emitted a sentinel but wants to STAY
+        // open. Surface it as `ViewSideEffect` so the dispatcher routes
+        // (e.g. kill request → spawner.cancel_agent) without popping
+        // the view — the user's selection / scroll position survives,
+        // and they see the row's status update in real time.
+        if let Some(payload) = view.take_pending_action() {
+            return Some(BottomPaneAction::ViewSideEffect { result: payload });
+        }
         if view.is_complete() {
             let completion = view.completion();
             self.view_stack.pop();
@@ -1200,6 +1208,14 @@ pub(crate) enum BottomPaneAction {
     ViewCompleted {
         result: Option<String>,
         reopen: Option<String>,
+    },
+    /// Side effect from an active view that wants to STAY open (e.g.
+    /// the in-flight agents drill view emitting a kill request while
+    /// the user keeps reviewing the strip). Dispatcher should route
+    /// `result` like a `ViewCompleted.result` would, but MUST NOT
+    /// remove the view from the stack. See `BottomPaneView::take_pending_action`.
+    ViewSideEffect {
+        result: String,
     },
     Interrupt,
     Quit,

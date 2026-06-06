@@ -80,6 +80,17 @@ pub(crate) trait BottomPaneView: Send {
         None
     }
 
+    /// Drain any pending side-effect sentinel the view emitted without
+    /// closing.
+    ///
+    /// Returns Some(payload) at most once per emission so the
+    /// dispatcher can route the sentinel (e.g. a kill request) AND
+    /// keep the view open for the user. Default `None` — most views
+    /// only signal via `completion()`.
+    fn take_pending_action(&mut self) -> Option<String> {
+        None
+    }
+
     /// Opt in to having `BottomPane`'s status-line footer (model ·
     /// cost · token budget · permission mode · git branch · pending
     /// approvals) rendered under this view. `false` keeps the view

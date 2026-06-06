@@ -2023,6 +2023,19 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         bottom_pane.queued_messages.push(queued_text);
                                                                     }
+                                                                    BottomPaneAction::ViewSideEffect { result } => {
+                                                                        let _ = try_dispatch_agent_kill_sentinel(
+                                                                            &result,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            task_service_for_cancel.clone(),
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        );
+                                                                        let rows = chat_widget.agents_drilldown_rows(AGENT_DRILLDOWN_RECENT_COMPLETED);
+                                                                        bottom_pane.refresh_agent_rows(rows);
+                                                                        frame_requester.schedule_frame();
+                                                                    }
                                                                     BottomPaneAction::ViewCompleted { result: Some(name), reopen: _ } => {
                                                                         if try_dispatch_agent_kill_sentinel(
                                                                             &name,
@@ -2523,6 +2536,26 @@ pub(crate) async fn run_tui_session(
                                         );
                                     }
                                 }
+                            }
+                            BottomPaneAction::ViewSideEffect { result } => {
+                                // View emitted a sentinel but stayed open
+                                // (e.g. Ctrl+G drill view's `x` kill).
+                                // Route the sentinel to the appropriate
+                                // handler without popping the view.
+                                let _ = try_dispatch_agent_kill_sentinel(
+                                    &result,
+                                    state.agent_spawner.clone(),
+                                    state.task_service.clone(),
+                                    &mut chat_widget,
+                                    &mut bottom_pane,
+                                    &frame_requester,
+                                );
+                                // Refresh strip rows so the view sees
+                                // Cancelling status immediately.
+                                let rows = chat_widget
+                                    .agents_drilldown_rows(AGENT_DRILLDOWN_RECENT_COMPLETED);
+                                bottom_pane.refresh_agent_rows(rows);
+                                frame_requester.schedule_frame();
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {

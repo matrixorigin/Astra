@@ -251,7 +251,7 @@ mod tests {
                 error: "boom".into(),
                 finish_reason: Some("failed".into()),
             },
-            AgentStatus::Cancelled,
+            AgentStatus::cancelled_anonymous(),
         ];
         for terminal in terminals {
             let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));
@@ -291,13 +291,29 @@ mod tests {
             AgentToolResultStatusKind::Launched.as_str()
         );
 
-        let cancelled = AgentStatus::Cancelled;
+        let cancelled = AgentStatus::cancelled_anonymous();
         let cancelled_out = render_wait_for_agent_status("ag", &cancelled);
         let cancelled_json: serde_json::Value = serde_json::from_str(&cancelled_out).unwrap();
         assert_eq!(
             cancelled_json["status"],
             AgentToolResultStatusKind::Cancelled.as_str()
         );
+        // Anonymous cancel must NOT carry the user-instruction —
+        // that's reserved for user-driven Ctrl+G x / `/agent cancel`.
+        assert_eq!(cancelled_json["cancelled_by_user"], false);
+        assert!(cancelled_json.get("instruction").is_none());
+
+        let user_cancelled = AgentStatus::cancelled_by_user("user-requested via Ctrl+G x");
+        let user_out = render_wait_for_agent_status("ag", &user_cancelled);
+        let user_json: serde_json::Value = serde_json::from_str(&user_out).unwrap();
+        assert_eq!(user_json["cancelled_by_user"], true);
+        assert!(
+            user_json["instruction"]
+                .as_str()
+                .is_some_and(|s| s.contains("Do NOT respawn")),
+            "user-cancelled wire output must include explicit instruction so the LLM doesn't respawn: {user_json}"
+        );
+        assert_eq!(user_json["reason"], "user-requested via Ctrl+G x");
     }
 
     #[test]

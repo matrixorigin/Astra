@@ -29,15 +29,44 @@ pub enum AgentStatus {
         #[allow(dead_code)]
         finish_reason: Option<String>,
     },
-    Cancelled,
+    Cancelled {
+        /// Whether the cancellation was triggered by the user (Ctrl+C
+        /// / Ctrl+G x) as opposed to a system condition (parent
+        /// cancel, depth violation, etc.). When `true`, the wire
+        /// payload tells the LLM explicitly NOT to respawn the work —
+        /// otherwise the LLM observes "cancelled" and treats it like a
+        /// transient failure, immediately spawning a replacement and
+        /// negating the user's intent.
+        by_user: bool,
+        /// Free-form rationale forwarded to the LLM; empty string =
+        /// "cancelled" (legacy default).
+        reason: String,
+    },
 }
 
 impl AgentStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled { .. }
         )
+    }
+
+    /// Construct a Cancelled status without a reason — preserves the
+    /// pre-rich-cancel call sites where no rationale was ever passed.
+    pub fn cancelled_anonymous() -> Self {
+        Self::Cancelled {
+            by_user: false,
+            reason: String::new(),
+        }
+    }
+
+    /// Construct a Cancelled status flagging the cancel as user-driven.
+    pub fn cancelled_by_user(reason: impl Into<String>) -> Self {
+        Self::Cancelled {
+            by_user: true,
+            reason: reason.into(),
+        }
     }
 }
 
