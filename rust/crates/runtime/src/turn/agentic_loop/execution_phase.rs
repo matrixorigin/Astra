@@ -63,22 +63,41 @@ fn global_alert_dispatcher()
 }
 
 fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
-    if let Some(text) = input.as_str() {
-        let trimmed = text.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string)
     }
 
-    if let Some(text) = input.get("content").and_then(serde_json::Value::as_str) {
-        let trimmed = text.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    fn active_skills_text(input: &serde_json::Value) -> Option<String> {
+        let skills = input
+            .get("active_skills")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|skill| !skill.is_empty())
+            .collect::<Vec<_>>();
+        (!skills.is_empty()).then(|| format!("Requested active skills: {}.", skills.join(", ")))
     }
 
-    if let Some(text) = input.get("text").and_then(serde_json::Value::as_str) {
-        let trimmed = text.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    if let Some(text) = trimmed_text(Some(input)) {
+        return Some(text);
     }
 
-    None
+    let content = trimmed_text(input.get("content"));
+    let text = trimmed_text(input.get("text"));
+    let active_skills = active_skills_text(input);
+
+    match (content.or(text), active_skills) {
+        (Some(content), Some(active_skills)) => Some(format!("{active_skills}\n{content}")),
+        (Some(content), None) => Some(content),
+        (None, Some(active_skills)) => Some(active_skills),
+        (None, None) => None,
+    }
 }
 
 fn render_deferred_user_input(content: &str) -> String {
@@ -4804,6 +4823,18 @@ mod tests {
                     .content
                     .contains("Stop and respond to the user first.")
         }));
+    }
+
+    #[test]
+    fn deferred_user_input_text_preserves_active_skills_hint() {
+        let rendered = deferred_user_input_text(&serde_json::json!({
+            "content": "Use the release checklist.",
+            "active_skills": ["release-manager", "deploy-auditor"],
+        }))
+        .expect("deferred input should render");
+
+        assert!(rendered.contains("Requested active skills: release-manager, deploy-auditor."));
+        assert!(rendered.contains("Use the release checklist."));
     }
 
     #[tokio::test]
