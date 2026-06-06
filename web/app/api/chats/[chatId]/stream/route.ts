@@ -487,6 +487,7 @@ export async function POST(
 
         if (lastStatus === 'streaming') {
           lastStatus = assistantText ? 'complete' : 'failed';
+          setChatActiveRun(ownerUserId, chatId, undefined);
           updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             content: assistantText || 'Astra completed the run without returning visible text.',
             reasoning: reasoningText || undefined,

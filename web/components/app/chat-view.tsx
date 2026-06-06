@@ -13,7 +13,7 @@ import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
 import { getChat, queueChatRunInput, streamChatMessage, updateChatModel } from '@/lib/api/chats';
-import { isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
+import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
@@ -202,12 +202,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         router.replace(chatListHref);
         return;
       }
-      const refreshed = await getChat(detail.chat.id).catch(() => null);
-      if (refreshed) {
-        setDetail(refreshed);
-        if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
-          await startStream({ text, options, appendUser: true });
-          return;
+      if (error instanceof WebApiError && error.status === 409) {
+        const refreshed = await getChat(detail.chat.id).catch(() => null);
+        if (refreshed) {
+          setDetail(refreshed);
+          if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
+            await startStream({ text, options, appendUser: true });
+            return;
+          }
         }
       }
       window.alert(error instanceof Error ? error.message : 'Failed to queue input for the active run.');
