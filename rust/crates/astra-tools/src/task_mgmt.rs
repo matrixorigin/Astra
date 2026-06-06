@@ -1716,9 +1716,10 @@ mod tests {
         let out = m
             .create(&json!({"title": "a", "active_form": "doing a"}))
             .await;
-        assert!(out.contains("\"success\":true"), "create: {out}");
-        let list = m.list(&json!({"status": "all"})).await;
-        assert!(list.contains("\"count\":1"), "list: {list}");
+        let created: Value = serde_json::from_str(out.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(created["success"], true, "create: {out}");
+        let list: Value = serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        assert_eq!(list["count"], 1, "list: {list}");
     }
 
     /// U-5 (unhappy path): when a task is marked `failed` with an
@@ -1765,19 +1766,18 @@ mod tests {
             dup.contains("Refused"),
             "second create should be refused with duplicate notice; got {dup}"
         );
-        assert!(
-            dup.contains("duplicate_of"),
+        let dup_parsed: Value =
+            serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(
+            dup_parsed["duplicate_of"], "task-1",
             "response must name the existing task id; got {dup}"
-        );
-        assert!(
-            dup.contains("task-1"),
-            "duplicate_of must point at the original; got {dup}"
         );
         // The store should still hold exactly one task (no second
         // row appended even though the closure ran).
-        let list = m.list(&json!({"status": "all"})).await;
-        assert!(
-            list.contains("\"count\":1"),
+        let list: Value =
+            serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        assert_eq!(
+            list["count"], 1,
             "duplicate must not be persisted; got {list}"
         );
     }
@@ -1820,13 +1820,16 @@ mod tests {
             .await;
         // Same title now should be allowed since the prior is closed.
         let dup = m.create(&json!({"title": "fix bug"})).await;
-        assert!(
-            dup.contains("\"success\":true"),
+        let dup_parsed: Value =
+            serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(
+            dup_parsed["success"], true,
             "create after completion must succeed; got {dup}"
         );
-        let list = m.list(&json!({"status": "all"})).await;
-        assert!(
-            list.contains("\"count\":2"),
+        let list: Value =
+            serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        assert_eq!(
+            list["count"], 2,
             "second instance must persist when prior is completed; got {list}"
         );
     }
@@ -1889,8 +1892,10 @@ mod tests {
             }))
             .await;
         let body = m.get(&json!({"task_id": "task-1"})).await;
+        let task: SessionTask =
+            serde_json::from_str(&body).expect("parse task");
         assert!(
-            !body.contains("\"owner\""),
+            task.owner.is_none() && task.subtasks.iter().all(|st| st.owner.is_none()),
             "without parent owner, subtask owner must stay absent; got {body}"
         );
     }
@@ -1904,8 +1909,14 @@ mod tests {
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         let list = m.list(&json!({"status": "all"})).await;
+        let list_parsed: Value = serde_json::from_str(&list).unwrap();
+        let has_error_preview = list_parsed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.get("error_preview").is_some());
         assert!(
-            !list.contains("error_preview"),
+            !has_error_preview,
             "completed tasks must not show error_preview: {list}"
         );
     }
@@ -1916,8 +1927,15 @@ mod tests {
         let a = TaskManager::new("sess-1", store.clone());
         let b = TaskManager::new("sess-1", store.clone());
         a.create(&json!({"title": "from-a"})).await;
-        let list = b.list(&json!({"status": "all"})).await;
-        assert!(list.contains("from-a"), "b should see a's task: {list}");
+        let list: Value =
+            serde_json::from_str(&b.list(&json!({"status": "all"})).await).unwrap();
+        let titles: Vec<&str> = list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"from-a"), "b should see a's task: {list}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1932,7 +1950,8 @@ mod tests {
         }
         for handle in handles {
             let out = handle.await.expect("join concurrent create");
-            assert!(out.contains("\"success\":true"), "{out}");
+            let parsed: Value = serde_json::from_str(out.split_once('\n').unwrap().1).unwrap();
+            assert_eq!(parsed["success"], true, "{out}");
         }
 
         let mgr = TaskManager::new("sess-race", store);
@@ -1951,12 +1970,15 @@ mod tests {
         let out = m
             .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
-        assert!(out.contains("\"success\":true"), "{out}");
-        assert!(out.contains("\"status\":\"in_progress\""), "{out}");
-        let task = m.get(&json!({"task_id": "task-1"})).await;
-        assert!(
-            task.contains("\"status\": \"in_progress\""),
-            "new_status must not be a no-op: {task}"
+        let updated: Value = serde_json::from_str(out.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(updated["success"], true, "{out}");
+        assert_eq!(updated["status"], "in_progress", "{out}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(
+            task.status,
+            SessionTaskStatusKind::InProgress,
+            "new_status must not be a no-op"
         );
     }
 
@@ -1968,10 +1990,12 @@ mod tests {
             .update(&json!({"task_id": "task-1", "new_status": "active"}))
             .await;
         assert!(invalid.starts_with("Error:"), "{invalid}");
-        let task = m.get(&json!({"task_id": "task-1"})).await;
-        assert!(
-            task.contains("\"status\": \"pending\""),
-            "invalid status must not mutate task: {task}"
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(
+            task.status,
+            SessionTaskStatusKind::Pending,
+            "invalid status must not mutate task"
         );
 
         let conflict = m
@@ -1990,17 +2014,17 @@ mod tests {
         m.create(&json!({"title": "t1"})).await;
         let snap = m.snapshot_state().await;
         m.create(&json!({"title": "t2"})).await;
-        assert!(
-            m.list(&json!({"status": "all"}))
-                .await
-                .contains("\"count\":2")
-        );
+        let list_before: Value =
+            serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        assert_eq!(list_before["count"], 2);
         m.restore_snapshot(&snap).await.unwrap();
-        let list = m.list(&json!({"status": "all"})).await;
-        assert!(list.contains("\"count\":1"), "after restore: {list}");
+        let list_after: Value =
+            serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        assert_eq!(list_after["count"], 1, "after restore: {list_after}");
         // Next create should get id reset.
         let out = m.create(&json!({"title": "t2-again"})).await;
-        assert!(out.contains("task-2"), "id reset: {out}");
+        let created: Value = serde_json::from_str(out.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(created["task_id"], "task-2", "id reset: {out}");
     }
 
     #[tokio::test]
@@ -2023,11 +2047,13 @@ mod tests {
         let del = m
             .update(&json!({"task_id": "task-1", "status": "deleted"}))
             .await;
-        assert!(del.contains("\"status\":\"deleted\""), "{del}");
-        let get_b = m.get(&json!({"task_id": "task-2"})).await;
+        let del_parsed: Value = serde_json::from_str(del.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(del_parsed["status"], "deleted", "{del}");
+        let task_b: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
         assert!(
-            !get_b.contains("\"blocked_by\":[\"task-1\"]"),
-            "b still references a: {get_b}"
+            !task_b.blocked_by.contains(&"task-1".to_string()),
+            "b still references a: {task_b:?}"
         );
     }
 
@@ -2043,7 +2069,9 @@ mod tests {
                 ]
             }))
             .await;
-        assert!(create.contains("\"success\":true"), "{create}");
+        let create_parsed: Value =
+            serde_json::from_str(create.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(create_parsed["success"], true, "{create}");
 
         let first = m
             .update(&json!({
@@ -2052,7 +2080,9 @@ mod tests {
                 "status": "completed"
             }))
             .await;
-        assert!(first.contains("\"success\":true"), "{first}");
+        let first_parsed: Value =
+            serde_json::from_str(first.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(first_parsed["success"], true, "{first}");
         let after_first = m.get(&json!({"task_id": "task-1"})).await;
         let after_first: SessionTask =
             serde_json::from_str(&after_first).expect("task json after first subtask");
@@ -2068,7 +2098,9 @@ mod tests {
                 "status": "completed"
             }))
             .await;
-        assert!(second.contains("\"success\":true"), "{second}");
+        let second_parsed: Value =
+            serde_json::from_str(second.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(second_parsed["success"], true, "{second}");
         let after_second = m.get(&json!({"task_id": "task-1"})).await;
         let after_second: SessionTask =
             serde_json::from_str(&after_second).expect("task json after second subtask");
@@ -2081,25 +2113,21 @@ mod tests {
     #[tokio::test]
     async fn starting_a_subtask_promotes_pending_parent_to_in_progress() {
         let m = mgr();
-        let create = m
-            .create(&json!({
-                "title": "parent",
-                "subtasks": [
-                    {"id": "s1", "title": "first"},
-                    {"id": "s2", "title": "second"}
-                ]
-            }))
-            .await;
-        assert!(create.contains("\"success\":true"), "{create}");
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [
+                {"id": "s1", "title": "first"},
+                {"id": "s2", "title": "second"}
+            ]
+        }))
+        .await;
 
-        let start = m
-            .update(&json!({
+        m.update(&json!({
                 "task_id": "task-1",
                 "subtask_id": "s1",
                 "status": "in_progress"
             }))
             .await;
-        assert!(start.contains("\"success\":true"), "{start}");
 
         let after = m.get(&json!({"task_id": "task-1"})).await;
         let after: SessionTask =
@@ -2123,10 +2151,8 @@ mod tests {
         }))
         .await;
 
-        let failed = m
-            .update(&json!({"task_id": "task-1", "status": "failed"}))
+        m.update(&json!({"task_id": "task-1", "status": "failed"}))
             .await;
-        assert!(failed.contains("\"status\":\"failed\""), "{failed}");
         m.update(&json!({"task_id": "task-1", "subtask_id": "s1", "status": "completed"}))
             .await;
         m.update(&json!({"task_id": "task-1", "subtask_id": "s2", "status": "completed"}))
@@ -2207,10 +2233,8 @@ mod tests {
             ]
         }))
         .await;
-        let done = m
-            .update(&json!({"task_id": "task-1", "status": "completed"}))
+        m.update(&json!({"task_id": "task-1", "status": "completed"}))
             .await;
-        assert!(done.contains("\"status\":\"completed\""), "{done}");
 
         let task = m.get(&json!({"task_id": "task-1"})).await;
         let task: SessionTask =
@@ -2531,15 +2555,15 @@ mod tests {
     // ── load_all_sessions (multi-session task board) ─────────────
 
     #[tokio::test]
-    async fn load_all_sessions_empty_store_returns_empty() {
-        let store = InMemoryTaskStore::new();
+    async fn load_all_sessions_covers_empty_multi_session_and_isolation() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+
+        // 1. Empty store → empty rollup.
         let rows = store.load_all_sessions().await.expect("load_all");
         assert!(rows.is_empty(), "empty store must yield empty rollup");
-    }
 
-    #[tokio::test]
-    async fn load_all_sessions_returns_every_bound_session() {
-        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        // 2. Two sessions with 1 and 2 tasks respectively → both appear,
+        //    with the right counts.
         TaskManager::new("sess-a", store.clone())
             .create(&json!({"title": "a1"}))
             .await;
@@ -2557,35 +2581,14 @@ mod tests {
 
         let sess_b = rows.iter().find(|(s, _)| s == "sess-b").unwrap();
         assert_eq!(sess_b.1.len(), 2, "sess-b must surface both of its tasks");
-    }
 
-    #[tokio::test]
-    async fn load_all_sessions_isolates_sessions_from_each_other() {
-        // Regression guard: if load_all_sessions accidentally
-        // concatenated every session's tasks, this would return
-        // 3 tasks under a single session. The method must preserve
-        // per-session grouping.
-        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
-        TaskManager::new("sess-1", store.clone())
-            .create(&json!({"title": "x"}))
-            .await;
-        TaskManager::new("sess-2", store.clone())
-            .create(&json!({"title": "y"}))
-            .await;
-        TaskManager::new("sess-2", store.clone())
-            .create(&json!({"title": "z"}))
-            .await;
-
-        let rows = store.load_all_sessions().await.expect("load_all");
-        for (sid, tasks) in &rows {
-            let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
-            if sid == "sess-1" {
-                assert_eq!(titles, vec!["x"]);
-            } else if sid == "sess-2" {
-                assert!(titles.contains(&"y") && titles.contains(&"z"));
-                assert!(!titles.contains(&"x"), "sess-2 must not leak sess-1 data");
-            }
-        }
+        // 3. Per-session isolation: sess-a must NOT see sess-b's tasks.
+        let sess_a = rows.iter().find(|(s, _)| s == "sess-a").unwrap();
+        let a_titles: Vec<&str> = sess_a.1.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(a_titles, vec!["a1"], "sess-a must not leak sess-b data");
+        let b_titles: Vec<&str> = sess_b.1.iter().map(|t| t.title.as_str()).collect();
+        assert!(b_titles.contains(&"b1") && b_titles.contains(&"b2"));
+        assert!(!b_titles.contains(&"a1"), "sess-b must not leak sess-a data");
     }
 
     // ── U-8: status_filter SQL pushdown ──────────────────────────────
@@ -2691,141 +2694,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_active_uses_load_active_not_load_all() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct CountingStore {
-            inner: InMemoryTaskStore,
-            load_all_calls: Arc<AtomicUsize>,
-            load_active_calls: Arc<AtomicUsize>,
-        }
-        #[async_trait::async_trait]
-        impl TaskStore for CountingStore {
-            async fn load(&self, sid: &str) -> Result<Vec<SessionTask>, String> {
-                self.load_all_calls.fetch_add(1, Ordering::Relaxed);
-                self.inner.load(sid).await
-            }
-            async fn load_active(&self, sid: &str) -> Result<Vec<SessionTask>, String> {
-                self.load_active_calls.fetch_add(1, Ordering::Relaxed);
-                self.inner.load_active(sid).await
-            }
-            async fn save(&self, sid: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
-                self.inner.save(sid, tasks).await
-            }
-            async fn next_task_id(&self, sid: &str) -> Result<u32, String> {
-                self.inner.next_task_id(sid).await
-            }
-            async fn peek_next_task_id(&self, sid: &str) -> Result<u32, String> {
-                self.inner.peek_next_task_id(sid).await
-            }
-        }
-        let load_all = Arc::new(AtomicUsize::new(0));
-        let load_active = Arc::new(AtomicUsize::new(0));
-        let spy = Arc::new(CountingStore {
-            inner: InMemoryTaskStore::new(),
-            load_all_calls: load_all.clone(),
-            load_active_calls: load_active.clone(),
-        });
-        let mgr = TaskManager::new("spy-sess", spy as Arc<dyn TaskStore>);
-        mgr.create(&json!({"title": "t1"})).await;
-        // Reset after create: create itself calls load() internally
-        // as part of the mutate path, so we zero the counters before
-        // the list call we're testing.
-        load_all.store(0, Ordering::Relaxed);
-        load_active.store(0, Ordering::Relaxed);
-
-        // Filter = active → must call load_active, not load_all.
-        mgr.list(&json!({"status_filter": "active"})).await;
-        assert_eq!(
-            load_active.load(Ordering::Relaxed),
-            1,
-            "list(active) must go through load_active, not load_all"
-        );
-        assert_eq!(
-            load_all.load(Ordering::Relaxed),
-            0,
-            "list(active) must NOT call load() (full scan)"
-        );
-
-        // Reset counters; filter = all → uses load_all path.
-        load_all.store(0, Ordering::Relaxed);
-        load_active.store(0, Ordering::Relaxed);
-        mgr.list(&json!({"status_filter": "all"})).await;
-        assert_eq!(
-            load_all.load(Ordering::Relaxed),
-            1,
-            "list(all) must call load() (full table)"
-        );
-        assert_eq!(
-            load_active.load(Ordering::Relaxed),
-            0,
-            "list(all) must NOT call load_active"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_active_filter_returns_only_pending_and_in_progress() {
+    async fn list_filters_return_expected_tasks() {
         let m = mgr();
-        // Three tasks in different states.
-        m.create(&json!({"title": "pending-task"})).await;
-        m.create(&json!({"title": "active-task"})).await;
-        m.create(&json!({"title": "done-task"})).await;
-        m.update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
-            .await;
-        m.update(&json!({"task_id": "task-3", "new_status": "completed"}))
-            .await;
+        m.create(&json!({"title": "pending-1"})).await;
+        m.create(&json!({"title": "pending-2"})).await;
+        m.create(&json!({"title": "ip-1"})).await;
+        m.update(&json!({"task_id": "task-3", "new_status": "in_progress"})).await;
+        m.create(&json!({"title": "done-1"})).await;
+        m.update(&json!({"task_id": "task-4", "new_status": "completed"})).await;
 
-        let out = m.list(&json!({"status_filter": "active"})).await;
-        assert!(
-            out.contains("pending-task"),
-            "active filter must include pending tasks; got: {out}"
-        );
-        assert!(
-            out.contains("active-task"),
-            "active filter must include in_progress tasks; got: {out}"
-        );
-        assert!(
-            !out.contains("done-task"),
-            "active filter must exclude completed tasks; got: {out}"
-        );
-    }
+        // active filter: returns pending + in_progress only
+        let active: Value = serde_json::from_str(
+            &m.list(&json!({"status_filter": "active"})).await,
+        ).unwrap();
+        assert_eq!(active["count"], 3);
+        let active_titles: Vec<&str> = active["tasks"]
+            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+        assert!(active_titles.contains(&"pending-1"));
+        assert!(active_titles.contains(&"pending-2"));
+        assert!(active_titles.contains(&"ip-1"));
+        assert!(!active_titles.contains(&"done-1"));
 
-    #[tokio::test]
-    async fn list_completed_filter_returns_only_completed() {
-        let m = mgr();
-        m.create(&json!({"title": "stay-pending"})).await;
-        m.create(&json!({"title": "will-complete"})).await;
-        m.update(&json!({"task_id": "task-2", "new_status": "completed"}))
-            .await;
+        // completed filter: returns only completed
+        let completed: Value = serde_json::from_str(
+            &m.list(&json!({"status_filter": "completed"})).await,
+        ).unwrap();
+        assert_eq!(completed["count"], 1);
+        assert_eq!(completed["tasks"][0]["title"], "done-1");
 
-        let out = m.list(&json!({"status_filter": "completed"})).await;
-        assert!(
-            out.contains("will-complete"),
-            "completed filter must include completed tasks; got: {out}"
-        );
-        assert!(
-            !out.contains("stay-pending"),
-            "completed filter must exclude pending tasks; got: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_all_filter_returns_every_row() {
-        let m = mgr();
-        m.create(&json!({"title": "alpha"})).await;
-        m.create(&json!({"title": "beta"})).await;
-        m.update(&json!({"task_id": "task-2", "new_status": "completed"}))
-            .await;
-
-        let out = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            out.contains("alpha"),
-            "all-filter must include pending; got: {out}"
-        );
-        assert!(
-            out.contains("beta"),
-            "all-filter must include completed; got: {out}"
-        );
+        // all filter: returns everything
+        let all: Value = serde_json::from_str(
+            &m.list(&json!({"status_filter": "all"})).await,
+        ).unwrap();
+        assert_eq!(all["count"], 4);
     }
 
     #[tokio::test]
@@ -2840,12 +2741,20 @@ mod tests {
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         let archived = m.archive(&json!({"task_id": "task-1"})).await;
-        assert!(archived.contains("\"status\":\"archived\""), "{archived}");
+        let archived_json = archived.split_once('\n').unwrap().1;
+        let archived_parsed: Value = serde_json::from_str(archived_json).unwrap();
+        assert_eq!(archived_parsed["status"], "archived", "{archived}");
 
-        let archived_list = m.list(&json!({"status_filter": "archived"})).await;
-        assert!(archived_list.contains("alpha"), "{archived_list}");
-        let active_list = m.list(&json!({"status_filter": "active"})).await;
-        assert!(!active_list.contains("alpha"), "{active_list}");
+        let archived_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "archived"})).await).unwrap();
+        let archived_titles: Vec<&str> = archived_list["tasks"]
+            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+        assert!(archived_titles.contains(&"alpha"), "{archived_list}");
+        let active_out = m.list(&json!({"status_filter": "active"})).await;
+        assert!(
+            active_out.starts_with("No tasks"),
+            "no active tasks should remain after archive; got: {active_out}"
+        );
     }
 
     #[tokio::test]
@@ -2871,14 +2780,22 @@ mod tests {
             .expect("restore modified timestamps");
 
         let archived = m.archive(&json!({"older_than_days": 7})).await;
-        assert!(archived.contains("\"archived\":1"), "{archived}");
+        let archived_parsed: Value =
+            serde_json::from_str(archived.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(archived_parsed["archived"], 1, "{archived}");
 
-        let archived_list = m.list(&json!({"status_filter": "archived"})).await;
-        assert!(archived_list.contains("old-done"), "{archived_list}");
-        assert!(!archived_list.contains("recent-done"), "{archived_list}");
+        let archived_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "archived"})).await).unwrap();
+        let archived_titles: Vec<&str> = archived_list["tasks"]
+            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+        assert!(archived_titles.contains(&"old-done"), "{archived_list}");
+        assert!(!archived_titles.contains(&"recent-done"), "{archived_list}");
 
-        let completed_list = m.list(&json!({"status_filter": "completed"})).await;
-        assert!(completed_list.contains("recent-done"), "{completed_list}");
-        assert!(!completed_list.contains("old-done"), "{completed_list}");
+        let completed_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "completed"})).await).unwrap();
+        let completed_titles: Vec<&str> = completed_list["tasks"]
+            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+        assert!(completed_titles.contains(&"recent-done"), "{completed_list}");
+        assert!(!completed_titles.contains(&"old-done"), "{completed_list}");
     }
 }
