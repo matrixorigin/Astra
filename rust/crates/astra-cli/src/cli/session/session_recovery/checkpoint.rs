@@ -1,9 +1,12 @@
 //! Checkpoint operations: build, persist, rollback, and delegation helpers.
-use super::csl::*;
-use super::io::*;
-use super::workspace::*;
+use super::csl::{ensure_loaded_csl_state, rebuild_csl_from_history};
+use super::io::{
+    RecoveryCheckpointRollback, append_rollback_error, composite_index_path_for,
+    read_optional_file_bytes, restore_optional_file_bytes, sync_parent_dir, workspace_path_for,
+};
+use super::workspace::persist_recovery_workspace_snapshot;
 use crate::cli::session::session_projection::history_as_messages;
-use crate::cli::*;
+use crate::cli::session::session_state::SessionState;
 
 pub(crate) fn delegation_from_heavy_checkpoint(
     heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
@@ -319,7 +322,8 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::build_manual_heavy_step_checkpoint;
+    use crate::cli::session::session_state::SessionState;
 
     #[test]
     fn manual_heavy_checkpoint_preserves_assistant_only_history_entries() {

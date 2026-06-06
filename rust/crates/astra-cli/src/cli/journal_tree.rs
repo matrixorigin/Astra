@@ -354,7 +354,7 @@ pub(crate) fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{fold_events_into_tree, render_text};
     use astra_services::session_journal::JournalEvent;
     use serde_json::json;
 

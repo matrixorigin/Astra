@@ -1,4 +1,10 @@
-use super::*;
+use super::test_executor;
+use crate::edge_tools::{
+    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, PERSIST_THRESHOLD, ToolExecutor,
+    per_tool_output_limit, tool_output_limit,
+};
+use serde_json::json;
+use std::path::PathBuf;
 
 // ── Multi-turn aggregate output scenarios ─────────────────────────────────
 //
@@ -438,7 +444,7 @@ fn multi_turn_scaled_limit_affects_read_file_truncation() {
 
 #[test]
 fn per_tool_output_limit_grep_capped() {
-    let limit = super::per_tool_output_limit("grep");
+    let limit = per_tool_output_limit("grep");
     assert!(
         limit <= 10_000,
         "grep should be capped at 10KB, got {limit}"
@@ -448,7 +454,7 @@ fn per_tool_output_limit_grep_capped() {
 
 #[test]
 fn per_tool_output_limit_glob_capped() {
-    let limit = super::per_tool_output_limit("glob");
+    let limit = per_tool_output_limit("glob");
     assert!(
         limit <= 100_000,
         "glob should be capped at 100KB, got {limit}"
@@ -459,7 +465,7 @@ fn per_tool_output_limit_glob_capped() {
 #[test]
 fn per_tool_output_limit_code_analysis_capped() {
     for tool in &["find_definition", "find_references"] {
-        let limit = super::per_tool_output_limit(tool);
+        let limit = per_tool_output_limit(tool);
         assert!(
             limit <= 15_000,
             "{tool} should be capped at 15KB, got {limit}"
@@ -470,8 +476,8 @@ fn per_tool_output_limit_code_analysis_capped() {
 
 #[test]
 fn per_tool_output_limit_unknown_uses_global() {
-    let global = super::tool_output_limit();
-    let limit = super::per_tool_output_limit("unknown_tool");
+    let global = tool_output_limit();
+    let limit = per_tool_output_limit("unknown_tool");
     assert_eq!(limit, global, "unknown tools should use global limit");
 }
 

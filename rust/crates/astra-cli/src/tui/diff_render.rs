@@ -201,7 +201,7 @@ fn diff_header_language(header: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{diff_header_language, render_diff_lines};
 
     #[test]
     fn diff_headers_set_language_for_highlighted_content() {

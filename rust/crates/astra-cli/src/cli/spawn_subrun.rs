@@ -515,7 +515,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 config.agent_id.clone(),
                 config.live_event_sink.clone(),
             ),
-            tool_cache: super::stream_render::EdgeToolCache::new(
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
             inherited_prefix: config.inherited_prefix.clone(),
@@ -971,11 +971,20 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
+    };
     use crate::lock_recovery::LockRecovery;
+    use astra_runtime::orchestration::{SpawnAgentExecutor, SpawnRunConfig};
     use astra_turn_core::agent_live_event::{
         AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
     };
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::cli::chat_stream::StreamEvent;
+    use crate::cli::permission_manager::PermissionMode;
 
     #[derive(Debug, Default)]
     struct RecordingLiveSink(std::sync::Mutex<Vec<AgentLiveEvent>>);

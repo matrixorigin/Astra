@@ -628,8 +628,10 @@ pub(crate) fn render_explain_dag(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_services::session_journal::SelectionTrace;
+    use super::{ExplainTurnMeta, context_trace_from_json, render_explain_dag};
+    use astra_services::session_journal::ToolCallRecord;
+    use astra_services::session_journal::{JournalEvent, SelectionTrace};
+    use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 
     #[test]
     fn render_explain_dag_includes_cache_and_parallel_batches() {

@@ -8,24 +8,22 @@
 
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use astra_runtime::tool_sandbox::{
-    SandboxMode, SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
+    SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
 
 /// Prefix returned by tool execution when the sandbox blocks a path.
 /// The agentic loop / permission manager can detect this to prompt the user
 /// for authorization instead of letting the model silently fall back to bash.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
-use chrono::{DateTime, Utc};
 use crossterm::style::Stylize;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::Client;
 use serde_json::{Value, json};
 
 #[path = "edge_tools/agent_messaging.rs"]
@@ -1504,7 +1502,7 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Acquire);
-        crate::cli::cli_utils::append_session_journal_event_or_warn(
+        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
             &session_id,
             &astra_services::session_journal::JournalEvent::task_lifecycle(
                 Some(&session_id),
@@ -1530,7 +1528,7 @@ impl ToolExecutor {
             return None;
         }
         let token = self.cloud_token();
-        match crate::cli::session_todo_client::execute_todo_action(
+        match crate::cli::session::session_todo_client::execute_todo_action(
             &cloud_base,
             token.as_deref(),
             &session_id,
@@ -1796,7 +1794,7 @@ impl ToolExecutor {
             Err(err) => {
                 return format!(
                     "Error: failed to exit plan mode: {}",
-                    crate::cli::cli_utils::map_thin_err(err)
+                    crate::cli::cli_config::cli_utils::map_thin_err(err)
                 );
             }
         };
@@ -2019,7 +2017,7 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .unwrap_or("active");
         let token = self.cloud_token();
-        match crate::cli::session_todo_client::list_user_todos(
+        match crate::cli::session::session_todo_client::list_user_todos(
             &cloud_base,
             token.as_deref(),
             status,
@@ -2547,7 +2545,7 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        crate::cli::cli_utils::append_session_journal_event_or_warn(
+        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
             &session_id,
             &astra_services::session_journal::JournalEvent::memory_suppressed(
                 Some(&session_id),
@@ -2633,7 +2631,7 @@ impl ToolExecutor {
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        crate::cli::cli_utils::append_session_journal_event_or_warn(
+        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
             &session_id,
             &astra_services::session_journal::JournalEvent::context_released(
                 Some(&session_id),
@@ -2773,12 +2771,15 @@ impl ToolExecutor {
             .active_session_id()
             .filter(|sid| !sid.is_empty())
             .map(|sid| {
-                let record = crate::cli::slash_memory::load_local_session_memory(&sid);
-                crate::cli::slash_memory::session_memory_surface_status(&sid, record.as_ref())
+                let record = crate::cli::slash::slash_memory::load_local_session_memory(&sid);
+                crate::cli::slash::slash_memory::session_memory_surface_status(
+                    &sid,
+                    record.as_ref(),
+                )
             });
         let surface_block = surface_status
             .as_ref()
-            .map(crate::cli::slash_memory::render_session_memory_surface_status)
+            .map(crate::cli::slash::slash_memory::render_session_memory_surface_status)
             .filter(|block| !block.trim().is_empty());
         let (journal_fallback, journal_pipeline, journal_notice) =
             match self.load_active_session_memory_journal() {
@@ -4592,7 +4593,10 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ToolExecutor, all_tool_schemas, detect_git_remote_repos, extract_github_owner_repo,
+        file_checkpoint_dir_for, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
+    };
     use crate::lock_recovery::LockRecovery;
     use std::path::PathBuf;
 

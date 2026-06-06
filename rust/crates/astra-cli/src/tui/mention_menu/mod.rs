@@ -18,10 +18,8 @@ pub(crate) mod menu;
 pub(crate) mod popup;
 pub(crate) mod provider;
 
-#[allow(unused_imports)]
-pub(crate) use menu::{MentionMenu, MentionToken, extract_mention_at};
-#[allow(unused_imports)]
-pub(crate) use provider::{FileEntry, FileKind, FileProvider};
+pub(crate) use menu::{MentionMenu, extract_mention_at};
+pub(crate) use provider::{FileEntry, FileProvider};
 
 #[cfg(test)]
 mod tests;

@@ -186,7 +186,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
         .unwrap_or(80);
 
     let mut md = if use_md {
-        Some(super::streaming_md::StreamingMarkdown::new(tw))
+        Some(crate::cli::stream::streaming_md::StreamingMarkdown::new(tw))
     } else {
         None
     };
@@ -614,8 +614,13 @@ pub async fn collect_sse_cancellable(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        MAX_SSE_BUFFER, SseTextResult, collect_sse_cancellable, collect_sse_text,
+        stream_sse_markdown,
+    };
     use http::Response;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     fn sse_response(body: &'static str) -> reqwest::Response {
         let r = Response::builder()

@@ -163,7 +163,7 @@ pub(crate) fn set_for_tests(theme: Theme) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Theme, color_to_rgb, current, perceived_lightness};
 
     #[test]
     fn dark_and_light_are_distinct() {

@@ -1,11 +1,31 @@
 //! REPL startup/setup orchestration extracted from `run_chat_repl`.
 
-use super::*;
-use astra_services::session_journal;
-use session_guard::{
-    install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
+use crate::cli::agent_runtime::initialize_multi_agent_runtime;
+use crate::cli::cli_config::cli_utils::{
+    SessionResumePreflight, clear_profile_last_session_if_matches_or_warn,
+    preflight_remote_resume_session,
 };
-use session_runtime::PipelineModules;
+use crate::cli::cloud_sync::{
+    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
+};
+use crate::cli::edge_lifecycle::register_and_start_heartbeat;
+use crate::cli::permission_manager;
+use crate::cli::project_instructions::discover_project_instructions;
+use crate::cli::session::{
+    session_guard::{
+        self, install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
+    },
+    session_recovery,
+    session_runtime::{self, PipelineModules, print_session_banner},
+    session_state::SessionState,
+};
+use crate::cli::slash::slash_session;
+use crate::cli::startup_trace::StartupTracer;
+use crate::cli::theme;
+use astra_runtime::tool_registry;
+use astra_services::session_journal;
+use astra_text_utils::str_preview::truncate_str;
+use crossterm::style::Stylize;
 
 pub(crate) struct SessionStartupArtifacts {
     pub pipeline_modules: PipelineModules,
@@ -248,7 +268,7 @@ async fn prune_stale_pending_recovery(
     if matches!(
         preflight_remote_resume_session(api, profile, &session_id).await,
         SessionResumePreflight::Missing
-    ) && !crate::cli::cli_utils::local_session_is_resumable(&session_id)
+    ) && !crate::cli::cli_config::cli_utils::local_session_is_resumable(&session_id)
     {
         clear_profile_last_session_if_matches_or_warn(
             profile,
@@ -618,7 +638,7 @@ pub(crate) async fn complete_session_startup(
     profile: Option<&str>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<SessionStartupArtifacts, String> {
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
@@ -808,18 +828,14 @@ pub(crate) async fn complete_session_startup(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_services::session_journal::{self, JournalDirGuard};
+    use super::{
+        apply_pending_adaptive_state, build_cli_session_memory_extractor, initialize_journal,
+        prune_stale_pending_recovery,
+    };
+    use crate::cli::session::session_state::SessionState;
+    use astra_services::session_journal;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
 
     fn write_resumable_session(session_id: &str) {
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
@@ -846,16 +862,16 @@ mod tests {
     }
 
     fn write_profile_with_token(session_id: &str) {
-        let mut creds = crate::cli::cli_utils::CredentialsFile::default();
+        let mut creds = crate::cli::cli_config::cli_utils::CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
-            crate::cli::cli_utils::Profile {
+            crate::cli::cli_config::cli_utils::Profile {
                 access_token: Some("test-token".into()),
                 last_session_id: Some(session_id.to_string()),
                 ..Default::default()
             },
         );
-        crate::cli::cli_utils::save_credentials(&creds).unwrap();
+        crate::cli::cli_config::cli_utils::save_credentials(&creds).unwrap();
     }
 
     fn poisoned_observability_session(
@@ -889,7 +905,7 @@ mod tests {
     // loaded into SessionState, regardless of what's on disk.
     #[test]
     fn no_instructions_true_skips_loading() {
-        use project_instructions::discover_instructions_from_paths;
+        use crate::cli::project_instructions::discover_instructions_from_paths;
 
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
@@ -917,7 +933,7 @@ mod tests {
     // Verify that no_instructions=false (default) still loads instructions.
     #[test]
     fn no_instructions_false_loads_instructions() {
-        use project_instructions::discover_instructions_from_paths;
+        use crate::cli::project_instructions::discover_instructions_from_paths;
 
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
@@ -944,7 +960,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn prune_stale_pending_recovery_keeps_local_state_when_remote_is_stale() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("pending-stale-{}", uuid::Uuid::new_v4());
         write_resumable_session(&session_id);
@@ -969,7 +985,7 @@ mod tests {
 
         assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
         assert_eq!(
-            crate::cli::cli_utils::load_credentials()
+            crate::cli::cli_config::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
@@ -980,7 +996,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn prune_stale_pending_recovery_keeps_live_session() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("pending-live-{}", uuid::Uuid::new_v4());
         write_resumable_session(&session_id);
@@ -1009,7 +1025,7 @@ mod tests {
 
     #[test]
     fn initialize_journal_attaches_without_duplicate_start_or_workspace_reset() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-attach-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -1064,7 +1080,7 @@ mod tests {
 
     #[test]
     fn initialize_journal_reopens_completed_session_without_resetting_workspace() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-reopen-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -1124,7 +1140,7 @@ mod tests {
 
     #[test]
     fn initialize_journal_does_not_duplicate_start_after_sync_marker() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-sync-marker-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -1181,14 +1197,15 @@ mod tests {
     #[test]
     fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
         let mut state = SessionState::default();
-        state.pending_adaptive_state = Some(super::session_state::PersistedAdaptiveState {
-            last_scenario_change_turn: Some(3),
-            last_token_budget_direction: 1,
-            last_token_budget_change_turn: Some(2),
-            active_experiment_id: Some("exp-1".to_string()),
-            active_variant: Some("variant-a".to_string()),
-            tuned_config_json: None,
-        });
+        state.pending_adaptive_state =
+            Some(crate::cli::session::session_state::PersistedAdaptiveState {
+                last_scenario_change_turn: Some(3),
+                last_token_budget_direction: 1,
+                last_token_budget_change_turn: Some(2),
+                active_experiment_id: Some("exp-1".to_string()),
+                active_variant: Some("variant-a".to_string()),
+                tuned_config_json: None,
+            });
         state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
 
         apply_pending_adaptive_state(&mut state);
@@ -1203,7 +1220,7 @@ mod tests {
 
     #[test]
     fn initialize_journal_preserves_existing_workspace() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = "sess-existing-workspace";
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(sid, "old-model");
         ws.turn_count = 7;
@@ -1254,7 +1271,7 @@ mod tests {
 
     #[test]
     fn initialize_journal_repairs_corrupt_workspace_yaml_from_live_state() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-corrupt-workspace-{}", uuid::Uuid::new_v4());
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
         std::fs::create_dir_all(&workspace_dir).unwrap();
@@ -1286,7 +1303,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_journal_marks_persistence_error_when_session_start_append_fails() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-init-start-append-fail-{}", uuid::Uuid::new_v4());
         let sessions_root = session_journal::journal_file_path(&sid)
             .parent()
@@ -1329,7 +1346,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_journal_marks_persistence_error_when_workspace_write_fails() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-init-workspace-write-fail-{}", uuid::Uuid::new_v4());
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
         std::fs::create_dir_all(&workspace_dir).unwrap();

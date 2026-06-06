@@ -1,5 +1,5 @@
-#![allow(unused_imports)]
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use crossterm::style::Stylize;
 
 #[cfg(feature = "harness")]
 /// Retention: fallback handler for `/inspect` — called from slash_router.rs.

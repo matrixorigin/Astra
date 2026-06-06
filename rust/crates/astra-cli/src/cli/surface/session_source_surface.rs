@@ -61,7 +61,7 @@ impl SessionSourceSurface<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::session_source_surface;
 
     #[test]
     fn session_source_surface_prioritizes_workspace_error_and_cloud() {

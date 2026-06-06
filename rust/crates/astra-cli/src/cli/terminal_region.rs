@@ -252,7 +252,7 @@ fn strip_ansi_codes(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{TerminalRegion, char_display_width, strip_ansi_codes, visible_char_width};
 
     #[test]
     fn new_region_is_empty() {

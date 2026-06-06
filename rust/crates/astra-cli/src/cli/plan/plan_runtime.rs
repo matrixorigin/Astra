@@ -4,8 +4,9 @@
 //! prompt is reached again) may still use [`crate::cli::plan_monitor::flush_plan_updates_between_prompts`]
 //! when applicable.
 
-use super::*;
+use crate::cli::delegate_subrun;
 use crate::cli::durable_bridge;
+use crate::cli::plan::{plan_executor, plan_monitor};
 
 use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
@@ -14,7 +15,7 @@ use crossterm::style::Stylize;
 fn build_fallback_delegation_engine()
 -> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
     let mut registry = astra_services::AgentProfileRegistry::new();
-    super::delegate_subrun::register_default_agents(&mut registry);
+    delegate_subrun::register_default_agents(&mut registry);
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
     let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
@@ -125,7 +126,7 @@ pub(crate) async fn start_and_monitor_plan(
 
     // Run the blocking monitor so the user sees live progress.
     // The monitor handles Ctrl+C (pause/cancel) and approval prompts inline.
-    super::plan_monitor::run_blocking_plan_monitor(state).await;
+    plan_monitor::run_blocking_plan_monitor(state).await;
 
     Ok(())
 }
@@ -137,7 +138,7 @@ pub(crate) async fn start_and_monitor_plan(
 /// new executor or when abandoning an in-flight run.
 pub(crate) fn shutdown_plan_executor(state: &mut SessionState) -> bool {
     if let Some(mut h) = state.plan_handle.take() {
-        let _ = h.send_command(crate::cli::plan_executor::PlanCommand::Cancel);
+        let _ = h.send_command(crate::cli::plan::plan_executor::PlanCommand::Cancel);
         while h.try_recv().is_some() {}
         true
     } else {
@@ -236,7 +237,9 @@ async fn ensure_durable_task_state(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{build_fallback_delegation_engine, shutdown_plan_executor, take_plan_context};
+    use crate::cli::plan::plan_executor;
+    use crate::cli::session::session_state::SessionState;
     use astra_services::coordination::{
         AggregationStrategy, CoordinationPattern, DelegationRequest,
     };

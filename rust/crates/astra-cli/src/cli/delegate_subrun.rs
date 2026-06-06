@@ -285,7 +285,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             agent_id: profile.agent_id.clone(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: super::stream_render::EdgeToolCache::new(
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
             // Bug B step 2: consume the inherited_prefix the
@@ -681,7 +681,9 @@ pub(crate) fn register_default_agents(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{build_restricted_tools, register_default_agents, resolve_worktree_path};
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
 
     #[test]
     fn register_default_agents_populates_registry() {

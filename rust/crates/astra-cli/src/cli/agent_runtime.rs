@@ -1,7 +1,8 @@
 //! Multi-agent runtime initialization for the interactive REPL.
 
 use super::{agent_loader, delegate_subrun, spawn_subrun};
-use crate::SessionState;
+use crate::cli::session::session_runtime;
+use crate::cli::session::session_state::SessionState;
 use std::path::PathBuf;
 
 fn attach_session_to_spawner(
@@ -251,7 +252,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
     {
         let profile_owned = profile.map(str::to_string);
         let provider: spawn_subrun::TokenProvider = std::sync::Arc::new(move || {
-            super::session_runtime::current_access_token(profile_owned.as_deref())
+            session_runtime::current_access_token(profile_owned.as_deref())
         });
         spawn_executor = spawn_executor.with_token_provider(provider);
     }

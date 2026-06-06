@@ -311,7 +311,7 @@ pub(crate) fn run_diff(args: &cli_args::JournalDiffArgs) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{JournalEvent, diff_events, render_text};
     use serde_json::json;
 
     fn evt(raw: serde_json::Value) -> JournalEvent {

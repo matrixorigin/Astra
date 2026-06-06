@@ -10,12 +10,7 @@
 pub(crate) mod model;
 pub(crate) mod view;
 
-#[allow(unused_imports)]
-pub(crate) use model::{
-    ActiveSkill, Category, CategoryKind, CompactionEventItem, CompactionSummary, ContextBreakdown,
-    ContextSnapshot, HistorySummary, MemoryItem, PressureBand, Section, SectionItem, SkillItem,
-    ToolItem, TurnDetail,
-};
+pub(crate) use model::{ContextBreakdown, ContextSnapshot, Section};
 
 #[cfg(test)]
 mod tests;

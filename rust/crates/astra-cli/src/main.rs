@@ -36,25 +36,15 @@ mod sandbox_retry;
 mod tool_safety_guard;
 mod tui;
 
-pub(crate) use cli::*;
-
 use cli::cli_config::cli_args::Cli;
+use cli::cli_config::cli_utils::{local_resumable_last_session_id, normalize_model_override_owned};
+use cli::command_router::{execute_cli_command, run_print_mode};
+use cli::exit_code::ExitCode;
+use cli::slash::slash_config;
 #[cfg(test)]
-use cli::cli_utils::save_credentials;
-use cli::cli_utils::{
-    local_resumable_last_session_id, map_thin_err, normalize_model_override_owned,
-};
-use cli::command_router::{ExitCode, execute_cli_command, run_print_mode};
+use cli::slash::slash_router::handle_slash_command;
 #[cfg(test)]
-use cli::stream_render::{RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block};
-
-#[cfg(test)]
-use cli::slash_router::handle_slash_command;
-#[cfg(test)]
-use cli::slash_session::resolve_journal_target_session;
-#[cfg(test)]
-use cli::turn_entry::{TurnContext, handle_chat_input};
-
+use cli::slash::slash_session::resolve_journal_target_session;
 // CLI argument structs moved to cli/cli_args.rs
 
 // SSE streaming types moved to cli/streaming_types.rs
@@ -64,9 +54,7 @@ pub(crate) use crate::cli::stream::streaming_types::{
 
 // Session state moved to cli/session_state.rs
 pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
-#[cfg(test)]
-use cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
-pub(crate) use cli::session_state::{ExplainMode, SessionState, SkillDevState};
+pub(crate) use cli::session::session_state::{ExplainMode, SessionState, SkillDevState};
 
 // ═══════════════════════════════════════════════ Output Styles ═════════════
 
@@ -286,7 +274,7 @@ async fn main() {
     } = cli;
 
     let _ = (startup_trace, bare);
-    let cli_context = match cli::cli_context::CliContext::from_launch_options(
+    let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         max_turns,
         &allowed_tools,
@@ -398,12 +386,15 @@ async fn main() {
 
         // For -c, resolve the last session ID from credentials
         let resolved_sid = if continue_last && session_id.is_none() {
-            if cli::session_runtime::resolve_cloud_base().is_some()
-                && cli::session_runtime::current_access_token(profile.as_deref()).is_some()
+            if cli::session::session_runtime::resolve_cloud_base().is_some()
+                && cli::session::session_runtime::current_access_token(profile.as_deref()).is_some()
             {
-                cli::cli_utils::validated_resumable_last_session_id(&api, profile.as_deref())
-                    .await
-                    .or_else(|| local_resumable_last_session_id(profile.as_deref()))
+                cli::cli_config::cli_utils::validated_resumable_last_session_id(
+                    &api,
+                    profile.as_deref(),
+                )
+                .await
+                .or_else(|| local_resumable_last_session_id(profile.as_deref()))
             } else {
                 local_resumable_last_session_id(profile.as_deref())
             }
@@ -467,25 +458,41 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     pub(crate) use super::test_utils::HomeGuard;
+    pub(crate) use super::test_utils::TestUi;
     pub(crate) use super::test_utils::isolate_credentials;
+    pub(crate) use super::test_utils::isolated_sessions_dir;
+    pub(crate) use super::test_utils::stub_stream_result;
+    pub(crate) use super::test_utils::stub_stream_result_with_records;
+    pub(crate) use super::test_utils::wait_until;
 
-    use super::*;
+    use super::{
+        Cli, SessionState, cli, execute_cli_command, format_duration_short, format_plan_progress,
+        format_project_instructions, handle_slash_command, resolve_journal_target_session,
+        resolve_system_prompt, session_journal, try_cloud_push_preferences,
+    };
+    use astra_runtime::prompts;
     use axum::{Router, routing::get, routing::post};
+    use clap::Parser;
+    use cli::auth_flow::{do_login, do_register};
     use cli::cli_config::cli_args::{
         AgentSubcommand, AuditCmd, AuditShowArgs, AuditToolsArgs, BugSubcommand, Command,
         ConfigCmd, DiffSubcommand, McpCmd, MemorySubcommand, MessagingArgs, MessagingSubcommand,
-        PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SelfCmd, SelfMutateCmd, ServeMode,
-        SessionCaptureCmd, SessionCmd, SessionShowArgs, TaskSubcommand, TeamSubcommand,
+        PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd, SessionShowArgs,
+        TaskSubcommand, TeamSubcommand,
     };
-    use cli::cli_config::cli_utils::{CredentialsFile, Profile};
+    use cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, prefix_chars, save_credentials,
+    };
     use cli::cloud_sync::{
-        ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, cloud_pull_warrants_sync_marker,
-        should_append_cloud_pull_journal,
+        ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, append_cloud_pull_sync_journal,
+        cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal, try_cloud_pull,
+        try_cloud_pull_preferences,
     };
+    use cli::permission_manager;
     use cli::project_instructions::discover_instructions_from_paths;
-    use cli::session_runtime::initialize_session_state;
-    use cli::slash::{slash_health, slash_tools};
-    use cli::slash_memory::handle_memory_domain_command;
+    use cli::session::session_runtime::initialize_session_state;
+    use cli::slash::slash_memory::handle_memory_domain_command;
+    use cli::slash::{slash_health, slash_stats, slash_task, slash_tools};
 
     async fn spawn_mock(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -754,7 +761,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
         // Health command should succeed regardless of auth
@@ -773,7 +780,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
         assert!(result.is_ok());
@@ -818,7 +825,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
 
@@ -867,7 +874,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
 
@@ -897,7 +904,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
         .unwrap_err();
@@ -919,7 +926,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
         .unwrap_err();
@@ -941,7 +948,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
         .unwrap_err();
@@ -965,7 +972,7 @@ mod tests {
             &api,
             false,
             0.0,
-            &cli::cli_context::CliContext::default(),
+            &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
         .unwrap_err();
@@ -984,7 +991,7 @@ mod tests {
     #[test]
     fn build_effective_line_plain() {
         let state = SessionState::default();
-        let result = crate::cli::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -999,7 +1006,7 @@ mod tests {
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
-        let result = crate::cli::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -1014,7 +1021,7 @@ mod tests {
             ("q1".to_string(), "a1".to_string()),
             ("q2".to_string(), "a2".to_string()),
         ];
-        let msgs = cli::session_projection::history_as_messages(&history);
+        let msgs = cli::session::session_projection::history_as_messages(&history);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
@@ -1023,7 +1030,7 @@ mod tests {
     #[test]
     fn history_as_messages_compacted_turn() {
         let history = vec![("".to_string(), "summary".to_string())];
-        let msgs = cli::session_projection::history_as_messages(&history);
+        let msgs = cli::session::session_projection::history_as_messages(&history);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "assistant");
     }
@@ -1376,14 +1383,6 @@ total_tokens_out: 500
 
     // ── handle_stats_command ─────────────────────────────────────────────────
 
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
-
     #[test]
     fn stats_no_active_session_does_not_panic() {
         // state with no session_id → should not panic
@@ -1395,7 +1394,7 @@ total_tokens_out: 500
 
     #[test]
     fn stats_history_no_sessions_does_not_panic() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let state = super::SessionState::default();
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -3324,8 +3323,11 @@ total_tokens_out: 500
     // The initialize_session_state default is 0.0; after applying the flag it must equal the value.
     #[test]
     fn max_budget_applied_to_session_state() {
-        let mut state =
-            initialize_session_state(None, None, &cli::cli_context::CliContext::default());
+        let mut state = initialize_session_state(
+            None,
+            None,
+            &cli::cli_config::cli_context::CliContext::default(),
+        );
         assert!(
             (state.max_budget_limit - 0.0).abs() < f64::EPSILON,
             "default max_budget_limit must be 0.0"
@@ -3450,7 +3452,7 @@ total_tokens_out: 500
         let state = initialize_session_state(
             None,
             None,
-            &cli::cli_context::CliContext::from_launch_options(
+            &cli::cli_config::cli_context::CliContext::from_launch_options(
                 false,
                 None,
                 &[],
@@ -3720,7 +3722,7 @@ total_tokens_out: 500
     fn build_effective_line_includes_project_instructions() {
         let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = crate::cli::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -3739,7 +3741,7 @@ total_tokens_out: 500
     #[test]
     fn build_effective_line_no_instructions_when_none() {
         let state = SessionState::default();
-        let result = crate::cli::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::build_effective_line(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,

@@ -14,9 +14,7 @@ pub(crate) mod nav;
 pub(crate) mod parser;
 pub(crate) mod view;
 
-#[allow(unused_imports)]
 pub(crate) use nav::TableNav;
-#[allow(unused_imports)]
 pub(crate) use parser::{MysqlTable, parse};
 
 #[cfg(test)]

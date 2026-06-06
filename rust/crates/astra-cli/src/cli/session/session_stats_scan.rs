@@ -45,16 +45,11 @@ pub(crate) fn collect_recent_session_stats(limit: usize) -> Result<RecentSession
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        collect_recent_session_stats, list_recent_session_ids_for_stats,
+        read_session_journal_for_stats,
+    };
     use astra_services::session_journal::{self, JournalDirGuard};
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
 
     fn write_stats_session(session_id: &str) {
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
@@ -96,7 +91,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn collect_recent_session_stats_marks_unreadable_journals() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let good_session = format!("stats-good-{}", uuid::Uuid::new_v4());
         let bad_session = format!("stats-bad-{}", uuid::Uuid::new_v4());
         write_stats_session(&good_session);
@@ -120,7 +115,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn read_session_journal_for_stats_surfaces_directory_error() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("stats-dir-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
 

@@ -55,7 +55,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::fanout;
     use crate::lock_recovery::LockRecovery;
     use std::sync::Arc;
     use std::sync::Mutex;

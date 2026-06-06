@@ -209,7 +209,10 @@ struct SkillMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        SKILL_CATALOG_MAX_LIMIT, SkillCatalogFilter, list_skill_record_from_registry,
+        load_skill_record_from_registry, normalize_source_filter, source_label,
+    };
 
     fn manifest(
         name: &str,

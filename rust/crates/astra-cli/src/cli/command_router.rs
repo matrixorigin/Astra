@@ -3,70 +3,63 @@ use crate::cli::arg_render::{
     render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
     render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
-use crate::cli::auth_flow::*;
-use crate::cli::cli_config::cli_args::*;
-use crate::cli::cli_config::cli_utils::*;
+use crate::cli::auth_flow::{clear_profile_auth, do_login, do_register, is_auth_error};
+use crate::cli::cli_config::cli_args::{
+    AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
+    TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
+};
+use crate::cli::cli_config::cli_utils;
+use crate::cli::cli_config::cli_utils::{
+    clear_profile_last_session_if_matches_or_warn, cli_user_id, get_profile_and_token,
+    load_credentials, map_thin_err, mutate_credentials, persist_profile_last_session, prefix_chars,
+    print_json_or_raw, profile_name, prompt_or, prompt_password_masked, validate_cli_session_id,
+};
 use crate::cli::config_manager::{
     execute_config_command, latest_artifact_id, resolve_download_output_path,
     resolve_remote_session_id, write_downloaded_capture,
 };
+use crate::cli::exit_code::ExitCode;
 use crate::cli::interactive_chat::run_interactive_chat;
 use crate::cli::mcp_config::execute_mcp_command;
 use crate::cli::one_shot_session_routing::{
     OneShotSessionRouting, resolve_one_shot_session_routing,
 };
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
-use crate::cli::project_instructions::*;
+use crate::cli::project_instructions::discover_project_instructions;
 use crate::cli::session::session_runtime;
-use crate::cli::session::session_runtime::*;
-use crate::cli::session::session_state::*;
+use crate::cli::session::session_runtime::{
+    create_pipeline_modules, create_pipeline_modules_quiet, initialize_session_state,
+    try_silent_auth,
+};
+use crate::cli::session::session_side_effects;
+use crate::cli::session::session_state::{ExplainMode, SessionState};
 use crate::cli::skill_catalog::{
     SkillCatalogFilter, list_skill_record_from_registry, load_skill_record_from_registry,
     normalize_source_filter,
 };
-use crate::cli::slash::slash_bug::*;
-use crate::cli::slash::slash_debug::*;
-use crate::cli::slash::slash_info::*;
-use crate::cli::slash::slash_memory::*;
-use crate::cli::slash::slash_messaging::*;
-use crate::cli::stream::streaming_types::*;
+use crate::cli::slash::slash_bug::handle_bug_command;
+use crate::cli::slash::slash_debug::handle_debug_command;
+use crate::cli::slash::slash_info::handle_info_command;
+use crate::cli::slash::slash_memory::handle_memory_domain_command;
+use crate::cli::slash::slash_messaging::handle_messaging_command;
+use crate::cli::slash::{slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry};
+use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
-use crate::cli::surface::task_result_surface::{
-    load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
-    task_result_json_payload,
-};
+use crate::cli::task::task_command_utils::task_run_title;
 use crate::cli::task::task_result_artifact::write_task_output;
-use crate::cli::task::task_result_projection::{
-    error_kind_for_exit_code, stream_result_completion_outcome, stream_result_exit_code,
-    stream_result_failure_reason, task_checkpoint_state_from_result,
+use crate::cli::task::task_result_projection::stream_result_exit_code;
+use crate::cli::task::task_worker_support::{
+    ClaimedTaskLeaseGuard, WorkerClaim, claim_task_for_worker, default_task_agent_id,
+    get_claimed_task_or_release, revert_interrupted_task_to_pending_if_still_owned,
 };
 use crate::cli::{
-    agent_loader, cli_utils, delegate_subrun, diff_presenter, journal_diff, journal_digest,
-    journal_tree, slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry, theme,
+    agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_tree,
+    theme,
 };
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
 use std::{fs, io::Read};
-
-/// Exit codes for CLI commands (for scripting integration)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExitCode {
-    /// Success (0)
-    Success = 0,
-    /// Tool execution failure (1) - at least one tool call failed
-    ToolFailure = 1,
-    /// Force stop (2) - agent was force-stopped due to errors/stalls
-    ForceStop = 2,
-    /// API/network error (3) - failed to communicate with server
-    ApiError = 3,
-    /// Local session durability failure after the turn itself succeeded (4)
-    PersistenceError = 4,
-    /// Turn produced a partial/interrupted result without a harder failure (5)
-    Partial = 5,
-    /// Task result was requested before the task had finished (6)
-    Unfinished = 6,
-}
 
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -128,15 +121,6 @@ fn maybe_wire_delegation_engine(
     state.delegation_engine = Some(std::sync::Arc::new(engine));
 }
 
-fn task_run_title(prompt: &str) -> String {
-    let summary = if prompt.chars().count() > 60 {
-        format!("{}...", prompt.chars().take(60).collect::<String>())
-    } else {
-        prompt.to_string()
-    };
-    format!("run: {summary}")
-}
-
 fn emit_task_event(enabled: bool, value: serde_json::Value) {
     if enabled {
         if let Ok(line) = serde_json::to_string(&value) {
@@ -154,6 +138,18 @@ pub(crate) fn exit_code_for_error_kind(error_kind: &str) -> Option<ExitCode> {
         "partial" => Some(ExitCode::Partial),
         "unfinished" => Some(ExitCode::Unfinished),
         _ => None,
+    }
+}
+
+pub(crate) fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
+    match exit_code {
+        ExitCode::Success => None,
+        ExitCode::ToolFailure => Some("tool_failure"),
+        ExitCode::ForceStop => Some("force_stop"),
+        ExitCode::ApiError => Some("api_error"),
+        ExitCode::PersistenceError => Some("persistence_error"),
+        ExitCode::Partial => Some("partial"),
+        ExitCode::Unfinished => Some("unfinished"),
     }
 }
 
@@ -267,62 +263,6 @@ fn task_terminal_summary_line(
     }
 }
 
-async fn finalize_headless_task_result<T: astra_services::TaskService + ?Sized>(
-    svc: &T,
-    task_id: &str,
-    sr: &StreamResult,
-    task_session_id: Option<&str>,
-    output_path: Option<&str>,
-) -> Result<ExitCode, String> {
-    use astra_services::TaskCheckpoint;
-
-    let exit_code = compute_exit_code(sr);
-    let state = task_checkpoint_state_from_result(sr, output_path, exit_code);
-    svc.save_checkpoint(
-        task_id,
-        &TaskCheckpoint {
-            active_subtask_id: None,
-            turn: 0,
-            session_id: task_session_id
-                .map(str::to_string)
-                .or_else(|| sr.session_id.clone()),
-            state,
-        },
-    )
-    .await?;
-    match exit_code {
-        ExitCode::Success => {
-            svc.complete_task(task_id).await?;
-        }
-        ExitCode::Partial => {
-            svc.complete_task_with_outcome(task_id, stream_result_completion_outcome(sr))
-                .await?;
-        }
-        ExitCode::Unfinished => {
-            unreachable!("unfinished exit code is only valid for task result lookup")
-        }
-        ExitCode::ToolFailure
-        | ExitCode::ForceStop
-        | ExitCode::ApiError
-        | ExitCode::PersistenceError => {
-            let failure_reason = stream_result_failure_reason(exit_code, sr);
-            svc.fail_task(task_id, &failure_reason).await?;
-        }
-    }
-
-    Ok(exit_code)
-}
-
-async fn resolve_task_result_task_id(
-    svc: &dyn astra_services::TaskService,
-    query: &str,
-) -> Result<String, String> {
-    let user_id = cli_user_id();
-    super::slash_task::find_task_by_query(svc, &user_id, query)
-        .await?
-        .ok_or_else(|| format!("no task matching '{query}'"))
-}
-
 fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<String>) {
     let detail = detail.into();
     match sr.session_persistence_error.as_deref() {
@@ -341,7 +281,7 @@ fn persist_one_shot_session_state(
     sr: &mut StreamResult,
     turn_start: std::time::Instant,
 ) {
-    if let Err(error) = super::session_side_effects::append_one_shot_journal_events(
+    if let Err(error) = session_side_effects::append_one_shot_journal_events(
         sr.session_id.as_deref(),
         model,
         line,
@@ -399,8 +339,8 @@ fn print_one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode, jso
 }
 
 struct HeadlessTaskInput {
-    task_id: String,
-    task_session_id: String,
+    task_id: std::sync::Arc<String>,
+    task_session_id: std::sync::Arc<String>,
     prompt: String,
     svc: std::sync::Arc<dyn astra_services::TaskService>,
     session_routing: OneShotSessionRouting,
@@ -422,9 +362,10 @@ async fn build_one_shot_task_manager(
     session_id: Option<&str>,
 ) -> std::sync::Arc<crate::edge_tools::TaskManager> {
     if let Some(session_id) = session_id {
-        let task_store = crate::cli::session_runtime::resolve_task_store(profile, Some(api_origin))
-            .await
-            .0;
+        let task_store =
+            crate::cli::session::session_runtime::resolve_task_store(profile, Some(api_origin))
+                .await
+                .0;
         std::sync::Arc::new(crate::edge_tools::TaskManager::new(
             session_id.to_string(),
             task_store,
@@ -443,7 +384,7 @@ async fn execute_headless_task_body(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     let HeadlessTaskInput {
         task_id,
@@ -461,7 +402,7 @@ async fn execute_headless_task_body(
         options.stream_events,
         serde_json::json!({
             "type": "task_started",
-            "task_id": task_id,
+            "task_id": task_id.as_str(),
             "task_type": "local_agent",
             "description": prompt,
         }),
@@ -472,18 +413,19 @@ async fn execute_headless_task_body(
             "  {} Task started: {} ({})",
             "▶".cyan(),
             prompt.chars().take(50).collect::<String>(),
-            prefix_chars(&task_id, 8).dim()
+            prefix_chars(task_id.as_str(), 8).dim()
         );
     }
 
-    svc.update_status(&task_id, TaskStatus::InProgress).await?;
+    svc.update_status(task_id.as_str(), TaskStatus::InProgress)
+        .await?;
 
     let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
     let skill_search = astra_core::SkillSearchSettings::default();
     let project_root = std::env::current_dir().unwrap_or_default();
     let mut pm = PermissionManager::with_project(true, &project_root);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let root_agent_id = format!("task-{task_id}");
+    let root_agent_id = format!("task-{}", task_id.as_str());
     let spawner = super::agent_runtime::build_one_shot_spawner(
         api,
         token.clone(),
@@ -498,16 +440,16 @@ async fn execute_headless_task_body(
 
     let (stream_event_tx, stream_event_writer) = if options.stream_events {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = crate::cli::stream_events_writer::spawn_stderr_writer(rx);
+        let handle = crate::cli::stream::stream_events_writer::spawn_stderr_writer(rx);
         (Some(tx), Some(handle))
     } else {
         (None, None)
     };
 
     let render_policy = if options.quiet || options.json {
-        crate::cli::stream_render::RenderPolicy::Silent
+        crate::cli::stream::stream_render::RenderPolicy::Silent
     } else {
-        crate::cli::stream_render::RenderPolicy::Stream
+        crate::cli::stream::stream_render::RenderPolicy::Stream
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
@@ -549,11 +491,11 @@ async fn execute_headless_task_body(
     };
 
     let turn_start = std::time::Instant::now();
-    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+    let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
         ..Default::default()
     };
-    let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
+    let mut sr = match crate::cli::turn::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         session_id.as_deref(),
@@ -566,10 +508,16 @@ async fn execute_headless_task_body(
     {
         Ok(sr) => sr,
         Err(e) => {
-            let _ = svc.fail_task(&task_id, &e.error).await;
+            let _ = svc.fail_task(task_id.as_str(), &e.error).await;
             emit_task_event(
                 options.stream_events,
-                failed_task_notification_payload(&task_id, &e.error, "turn_error", None, None),
+                failed_task_notification_payload(
+                    task_id.as_str(),
+                    &e.error,
+                    "turn_error",
+                    None,
+                    None,
+                ),
             );
             return Err(e.error);
         }
@@ -592,7 +540,7 @@ async fn execute_headless_task_body(
         turn_start,
     );
 
-    let output_path_result = write_task_output(&task_id, &sr.full_text);
+    let output_path_result = write_task_output(task_id.as_str(), &sr.full_text);
     let output_path_string = match output_path_result.as_ref() {
         Ok(path) => Some(path.to_string_lossy().to_string()),
         Err(error) => {
@@ -600,11 +548,11 @@ async fn execute_headless_task_body(
             None
         }
     };
-    let exit_code = match finalize_headless_task_result(
+    let exit_code = match crate::cli::task::task_result_command::finalize_headless_task_result(
         svc.as_ref(),
-        &task_id,
+        task_id.as_str(),
         &sr,
-        Some(&task_session_id),
+        Some(task_session_id.as_str()),
         output_path_string.as_deref(),
     )
     .await
@@ -613,14 +561,14 @@ async fn execute_headless_task_body(
         Err(e) => {
             let _ = svc
                 .fail_task(
-                    &task_id,
+                    task_id.as_str(),
                     &encode_task_failure_message("persistence_error", &e),
                 )
                 .await;
             emit_task_event(
                 options.stream_events,
                 failed_task_notification_payload(
-                    &task_id,
+                    task_id.as_str(),
                     &e,
                     "task_record_error",
                     output_path_string.as_deref(),
@@ -633,13 +581,18 @@ async fn execute_headless_task_body(
 
     emit_task_event(
         options.stream_events,
-        task_notification_payload(&task_id, &sr, output_path_string.as_deref(), exit_code),
+        task_notification_payload(
+            task_id.as_str(),
+            &sr,
+            output_path_string.as_deref(),
+            exit_code,
+        ),
     );
 
     if options.json {
         let mut json_output = final_json_output(&sr, exit_code);
         if let Some(obj) = json_output.as_object_mut() {
-            obj.insert("task_id".to_string(), serde_json::json!(task_id));
+            obj.insert("task_id".to_string(), serde_json::json!(task_id.as_str()));
             obj.insert(
                 "task_status".to_string(),
                 serde_json::json!(task_status_for_exit_code(exit_code)),
@@ -667,7 +620,7 @@ async fn execute_headless_task_body(
     } else {
         eprintln!(
             "{}",
-            task_terminal_summary_line(&task_id, output_path_string.as_deref(), exit_code)
+            task_terminal_summary_line(task_id.as_str(), output_path_string.as_deref(), exit_code)
         );
     }
 
@@ -681,7 +634,7 @@ async fn execute_headless_task_run(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     use astra_services::TaskCreateRequest;
 
@@ -716,8 +669,8 @@ async fn execute_headless_task_run(
 
     execute_headless_task_body(
         HeadlessTaskInput {
-            task_id,
-            task_session_id,
+            task_id: std::sync::Arc::new(task_id),
+            task_session_id: std::sync::Arc::new(task_session_id),
             prompt,
             svc,
             session_routing,
@@ -736,84 +689,6 @@ async fn execute_headless_task_run(
     .await
 }
 
-async fn execute_task_queue(
-    args: TaskQueueArgs,
-    cli_context: &crate::cli::cli_context::CliContext,
-) -> Result<ExitCode, String> {
-    use astra_services::TaskCreateRequest;
-
-    let prompt = join_words(&args.text);
-    if prompt.trim().is_empty() {
-        return Err("task prompt cannot be empty".to_string());
-    }
-    // execute_task_queue is a CLI subcommand without profile in
-    // scope — token comes from env via current_access_token(None).
-    // Per-user CLI sessions use `astra task worker` which threads
-    // profile through.
-    let (svc, _) = session_runtime::resolve_cloud_task_runtime(None).await?;
-    let session_id = cli_context
-        .session_id
-        .clone()
-        .unwrap_or_else(|| "cloud-queue".into());
-    let user_id = cli_user_id();
-    let task_id = svc
-        .create_task(
-            &user_id,
-            &session_id,
-            TaskCreateRequest {
-                title: task_run_title(&prompt),
-                description: Some(prompt.clone()),
-                plan: None,
-                parent_task_id: None,
-                project_type: Some("cloud-agent".to_string()),
-                goal_pattern: None,
-            },
-        )
-        .await?;
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "task_id": task_id,
-                "status": "pending",
-                "backend": "cloud-api",
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        eprintln!(
-            "  {} Cloud task queued: {} ({})",
-            theme::icon_ok(),
-            prompt.chars().take(50).collect::<String>(),
-            prefix_chars(&task_id, 8).dim()
-        );
-        eprintln!(
-            "  {}",
-            "Run `astra task worker --once` from a cloud agent/worker to claim it.".dim()
-        );
-    }
-    Ok(ExitCode::Success)
-}
-
-fn default_task_agent_id() -> String {
-    std::env::var("ASTRA_EDGE_AGENT_ID")
-        .or_else(|_| std::env::var("HOSTNAME").map(|host| format!("astra-{host}")))
-        .unwrap_or_else(|_| format!("astra-worker-{}", std::process::id()))
-}
-
-async fn claim_next_claimable_task_for_worker(
-    lease_svc: &dyn astra_services::TaskLeaseService,
-    user_id: &str,
-    agent_id: &str,
-    edge_id: &str,
-    ttl_sec: i64,
-) -> Result<astra_services::NextClaimableLeaseClaimResult, String> {
-    lease_svc
-        .claim_next_claimable_lease(user_id, agent_id, edge_id, ttl_sec)
-        .await
-}
-
 /// Outcome of a single worker poll. `Interrupted` lets the outer
 /// `--loop` driver tell a user-initiated Ctrl+C apart from a normal
 /// "task done" cycle, so the loop exits promptly instead of requiring
@@ -828,174 +703,90 @@ async fn execute_task_worker_once(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<WorkerOutcome, String> {
     let (svc, lease_svc) = session_runtime::resolve_cloud_task_runtime(profile).await?;
     let user_id = cli_user_id();
     let agent_id = args.agent_id.clone().unwrap_or_else(default_task_agent_id);
     let edge_id = std::env::var("ASTRA_EDGE_ID").unwrap_or_else(|_| agent_id.clone());
-    let claimed_task_id = match claim_next_claimable_task_for_worker(
-        &*lease_svc,
-        &user_id,
-        &agent_id,
-        &edge_id,
-        args.ttl_seconds,
-    )
-    .await?
-    {
-        astra_services::NextClaimableLeaseClaimResult::Granted {
-            task_id,
-            lease_version,
-            expires_at,
-        } => {
-            if args.json {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "claimed": true,
-                        "task_id": task_id,
-                        "agent_id": agent_id,
-                        "lease_version": lease_version,
-                        "expires_at": expires_at,
-                    })
-                );
-            } else if !args.quiet {
-                eprintln!(
-                    "  {} Claimed cloud task {} as {}",
-                    "▶".cyan(),
-                    prefix_chars(&task_id, 8).dim(),
-                    agent_id.as_str().cyan()
-                );
-            }
-            task_id
-        }
-        astra_services::NextClaimableLeaseClaimResult::NoClaimableTasks => {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"claimed": false, "reason": "no_claimable_tasks"})
-                );
-            } else if !args.quiet {
-                eprintln!("  {}", "No claimable cloud tasks.".dim());
-            }
-            return Ok(WorkerOutcome::Completed(ExitCode::Success));
-        }
-        astra_services::NextClaimableLeaseClaimResult::AllClaimableTasksLeased => {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"claimed": false, "reason": "all_claimable_tasks_leased"})
-                );
-            } else if !args.quiet {
-                eprintln!(
-                    "  {}",
-                    "All claimable cloud tasks are currently leased.".dim()
-                );
-            }
-            return Ok(WorkerOutcome::Completed(ExitCode::Success));
-        }
-    };
-
-    // `get_task` runs AFTER a successful claim — any failure here would
-    // leak the lease until TTL expiry. Bail with a release so the task
-    // is immediately re-claimable.
-    let task = match svc.get_task(&claimed_task_id).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            if let Err(e) = lease_svc
-                .release_lease(&user_id, &claimed_task_id, &agent_id)
-                .await
-            {
-                tracing::warn!(
-                    task_id = %claimed_task_id,
-                    error = %e,
-                    "release_lease failed after get_task returned None"
-                );
-            }
-            return Err(format!("claimed task disappeared: {claimed_task_id}"));
-        }
-        Err(e) => {
-            if let Err(re) = lease_svc
-                .release_lease(&user_id, &claimed_task_id, &agent_id)
-                .await
-            {
-                tracing::warn!(
-                    task_id = %claimed_task_id,
-                    error = %re,
-                    "release_lease failed after get_task error"
-                );
-            }
-            return Err(format!("get_task failed after claim: {e}"));
-        }
-    };
-    let prompt = task
-        .description
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| task.title.clone());
-
-    // Renew the lease periodically while the task runs. Renewal interval is
-    // ttl/2 so we always renew well before expiry. The renewal task is
-    // wrapped in `AbortGuard` so ANY path out of this function (success,
-    // error, Ctrl+C cancellation, panic unwind) aborts the background
-    // task — dropping a JoinHandle alone does not cancel it, which used
-    // to leave a zombie renewer refreshing a dead task's lease.
-    //
-    // Two-layer cancellation: `cancel` is the AtomicBool we check
-    // before each renew SQL call — once set, the task returns without
-    // starting another renew. `cancel_notify` wakes an in-progress
-    // sleep so we don't wait the full ttl/2 interval after the caller
-    // signals cancel. Notification loss (notify_waiters fires when no
-    // one is listening) is harmless here because every loop iteration
-    // also re-reads `cancel` before sleeping, so a lost notify just
-    // means we cancel on the next wake rather than instantly.
-    //
-    // The `AbortHandle` wrapped in `AbortGuard` is the backstop for
-    // unexpected exit paths (panic / outer cancel that skips our
-    // cooperative cancel-and-await below).
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let renewal_user_id = user_id.clone();
-    let mut renewal_handle: Option<tokio::task::JoinHandle<()>> = Some({
-        let lease_svc = lease_svc.clone();
-        let task_id = task.task_id.clone();
-        let agent_id = agent_id.clone();
-        let edge_id = edge_id.clone();
-        let ttl = args.ttl_seconds;
-        let interval_secs = (ttl / 2).max(1) as u64;
-        let cancel = cancel.clone();
-        let cancel_notify = cancel_notify.clone();
-        tokio::spawn(async move {
-            loop {
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
-                    _ = cancel_notify.notified() => {}
-                }
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-                if let Err(e) = lease_svc
-                    .renew_lease(&renewal_user_id, &task_id, &agent_id, &edge_id, ttl)
-                    .await
-                {
-                    tracing::debug!(
-                        task_id = %task_id,
-                        error = %e,
-                        "lease renewal failed (non-fatal)"
+    let claimed_task_id =
+        match claim_task_for_worker(&*lease_svc, &user_id, &agent_id, &edge_id, args.ttl_seconds)
+            .await?
+        {
+            WorkerClaim::Granted(grant) => {
+                if args.json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "claimed": true,
+                            "task_id": grant.task_id,
+                            "agent_id": agent_id,
+                            "lease_version": grant.lease_version,
+                            "expires_at": grant.expires_at,
+                        })
+                    );
+                } else if !args.quiet {
+                    eprintln!(
+                        "  {} Claimed cloud task {} as {}",
+                        "▶".cyan(),
+                        prefix_chars(&grant.task_id, 8).dim(),
+                        agent_id.as_str().cyan()
                     );
                 }
+                grant.task_id
             }
-        })
-    });
-    let _renewal_guard = AbortGuard::from_abort_handle(
-        renewal_handle
-            .as_ref()
-            .expect("just spawned")
-            .abort_handle(),
+            WorkerClaim::Idle(reason) => {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"claimed": false, "reason": reason.json_reason()})
+                    );
+                } else if !args.quiet {
+                    eprintln!("  {}", reason.human_message().dim());
+                }
+                return Ok(WorkerOutcome::Completed(ExitCode::Success));
+            }
+        };
+
+    let task =
+        get_claimed_task_or_release(&*svc, &*lease_svc, &user_id, &claimed_task_id, &agent_id)
+            .await?;
+    let astra_services::TaskRecord {
+        task_id,
+        session_id,
+        title,
+        description,
+        ..
+    } = task;
+    let prompt = description
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(title);
+    let task_session_id = std::sync::Arc::new(
+        session_id
+            .clone()
+            .unwrap_or_else(|| NON_CANONICAL_TASK_SCOPE.to_string()),
     );
+    let user_id = std::sync::Arc::new(user_id);
+    let task_id = std::sync::Arc::new(task_id);
+    let agent_id = std::sync::Arc::new(agent_id);
+    let edge_id = std::sync::Arc::new(edge_id);
+
+    let lease_guard = ClaimedTaskLeaseGuard::new(
+        lease_svc.clone(),
+        user_id.clone(),
+        task_id.clone(),
+        agent_id.clone(),
+    );
+    let mut renewal_task =
+        astra_services::LeaseRenewalTask::spawn(astra_services::LeaseRenewalConfig {
+            lease_svc: lease_svc.clone(),
+            user_id: user_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            edge_id: edge_id.clone(),
+            ttl_sec: args.ttl_seconds,
+            metrics: None,
+        });
 
     // Honour Ctrl+C during long-running task execution. Without this the
     // worker has to wait for the task body to finish, which can be
@@ -1008,16 +799,13 @@ async fn execute_task_worker_once(
             let session_routing = resolve_one_shot_session_routing(
                 api,
                 profile,
-                task.session_id.clone(),
+                session_id,
                 true,
             ).await?;
             execute_headless_task_body(
                 HeadlessTaskInput {
-                    task_id: task.task_id.clone(),
-                    task_session_id: task
-                        .session_id
-                        .clone()
-                        .unwrap_or_else(|| NON_CANONICAL_TASK_SCOPE.to_string()),
+                    task_id: task_id.clone(),
+                    task_session_id: task_session_id.clone(),
                     prompt,
                     svc: svc.clone(),
                     session_routing,
@@ -1042,130 +830,22 @@ async fn execute_task_worker_once(
         }
     };
 
-    // Cooperative cancellation: flip the atomic FIRST, then wake any
-    // sleeping renewer. This ordering matters — if we notified before
-    // setting the flag, a task just entering `select!` could miss the
-    // notification and sleep the full interval. Awaiting the handle
-    // afterwards guarantees the task has actually returned (including
-    // any in-flight renew finishing) before we issue release_lease, so
-    // there is no race window where a stale renew re-resurrects the
-    // lease after release. The guard stays as a backstop for panic /
-    // outer-cancel paths; `.abort()` on an already-finished task is
-    // a safe no-op.
-    cancel.store(true, std::sync::atomic::Ordering::Release);
-    cancel_notify.notify_waiters();
-    if let Some(h) = renewal_handle.take() {
-        let _ = h.await;
-    }
+    renewal_task.cancel_and_wait().await;
 
-    // On Ctrl+C the body was dropped while the task row was already
-    // `InProgress` (execute_headless_task_body sets that early). The
-    // task will still become claimable again after lease release/expiry,
-    // but leaving it `InProgress` is misleading in user-facing task
-    // surfaces. Revert to `Pending` before releasing the lease when we
-    // still own it so the next worker and the user both see an honest
-    // queue state.
-    //
-    // Guards:
-    // - **Lease ownership** — if another worker stole the lease while
-    //   we ran (TTL expired, they claimed), that worker is now the
-    //   authoritative state owner. Reverting their `InProgress` back
-    //   to `Pending` would cause double-claim. Check the current
-    //   lease holder first; skip revert if it isn't us.
-    // - **Terminal-state** — `update_status` returns
-    //   `Err("invalid task status transition: …")` if the row is
-    //   already in a terminal state (another worker completed it).
-    //   That's not a real failure for our path; log at debug and
-    //   move on.
-    // - **Timeout** — Ctrl+C is a prompt-exit signal; we MUST NOT
-    //   block indefinitely here if MO is unavailable. 5 s is a
-    //   generous budget for a single UPDATE; timeout degrades to
-    //   "still claimable, but visually stuck as in_progress".
     if interrupted {
         use std::time::Duration;
-        let revert_timeout = Duration::from_secs(5);
-        let still_ours = match tokio::time::timeout(
-            revert_timeout,
-            lease_svc.get_lease(&user_id, &task.task_id),
+        revert_interrupted_task_to_pending_if_still_owned(
+            &*svc,
+            &*lease_svc,
+            user_id.as_str(),
+            task_id.as_str(),
+            agent_id.as_str(),
+            Duration::from_secs(5),
         )
-        .await
-        {
-            Ok(Ok(Some(view))) => view.holder_agent_id == agent_id,
-            Ok(Ok(None)) => false, // lease already expired / released
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    task_id = %task.task_id,
-                    error = %e,
-                    "get_lease before revert failed — skipping revert"
-                );
-                false
-            }
-            Err(_) => {
-                tracing::warn!(
-                    task_id = %task.task_id,
-                    "get_lease timed out before revert — skipping revert"
-                );
-                false
-            }
-        };
-        if still_ours {
-            let revert = tokio::time::timeout(
-                revert_timeout,
-                svc.update_status(&task.task_id, astra_services::TaskStatus::Pending),
-            )
-            .await;
-            match revert {
-                Ok(Ok(())) => {
-                    tracing::debug!(task_id = %task.task_id, "interrupted task reverted to Pending");
-                }
-                Ok(Err(e)) if e.starts_with("invalid task status transition") => {
-                    // Another worker finished the task while we were
-                    // cleaning up — nothing to revert. Debug, not warn.
-                    tracing::debug!(
-                        task_id = %task.task_id,
-                        error = %e,
-                        "task already in terminal state; skipping revert"
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        task_id = %task.task_id,
-                        error = %e,
-                        "failed to revert interrupted task to Pending (task remains claimable but may still look in_progress)"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        task_id = %task.task_id,
-                        "update_status revert timed out (task remains claimable but may still look in_progress)"
-                    );
-                }
-            }
-        }
+        .await;
     }
 
-    let release_result = lease_svc
-        .release_lease(&user_id, &task.task_id, &agent_id)
-        .await;
-    match release_result {
-        Ok(true) => {
-            tracing::debug!(task_id = %task.task_id, "lease released");
-        }
-        Ok(false) => {
-            // No row deleted — either the lease expired during the
-            // task or another worker stole it. Log at info so operators
-            // can see the condition; not an error for this worker.
-            tracing::info!(
-                task_id = %task.task_id,
-                "release_lease returned false (lease already expired or stolen)"
-            );
-        }
-        Err(e) => {
-            return Err(format!(
-                "task execution finished but lease release failed: {e}"
-            ));
-        }
-    }
+    lease_guard.release_and_disarm().await?;
     body_result.map(|code| {
         if interrupted {
             WorkerOutcome::Interrupted
@@ -1175,200 +855,12 @@ async fn execute_task_worker_once(
     })
 }
 
-/// Aborts a spawned tokio task when dropped. Used to guarantee
-/// cleanup regardless of how the parent future exits (return, error,
-/// cancellation, panic). Dropping a raw `JoinHandle` does NOT abort
-/// the task — this wrapper is the fix.
-///
-/// Two constructors: `new` takes ownership of the JoinHandle (simple
-/// fire-and-forget case); `from_abort_handle` keeps only the abort
-/// side-channel so the caller retains the JoinHandle for cooperative
-/// cancel-and-await — the guard then only runs on the unhappy path.
-enum AbortGuard {
-    Handle(tokio::task::JoinHandle<()>),
-    AbortOnly(tokio::task::AbortHandle),
-}
-
-impl AbortGuard {
-    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
-        Self::Handle(handle)
-    }
-
-    fn from_abort_handle(handle: tokio::task::AbortHandle) -> Self {
-        Self::AbortOnly(handle)
-    }
-}
-
-impl Drop for AbortGuard {
-    fn drop(&mut self) {
-        match self {
-            Self::Handle(h) => h.abort(),
-            Self::AbortOnly(h) => h.abort(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod abort_guard_tests {
-    use super::AbortGuard;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    /// Proves the guard aborts the spawned task on drop. Without the
-    /// guard, a dropped `JoinHandle` leaves the task running — this is
-    /// the B2 bug regression test: Ctrl+C on the worker must stop the
-    /// lease-renewer, not leak it.
-    #[tokio::test]
-    async fn drop_aborts_spawned_task() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_inner = flag.clone();
-
-        let guard = AbortGuard::new(tokio::spawn(async move {
-            // If the guard doesn't abort us, we sleep 500ms then set the
-            // flag. The test waits 200ms before asserting — so the flag
-            // being false is only possible if we were aborted first.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            flag_inner.store(true, Ordering::SeqCst);
-        }));
-
-        // Yield once so the spawned task is actually polled.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        drop(guard);
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "spawned task kept running after guard drop — abort did not fire"
-        );
-    }
-
-    /// Models the `tokio::select!` cancellation path used on Ctrl+C:
-    /// the owning future is dropped mid-await by the select arm picking
-    /// the signal branch. The guard's Drop must still abort the child
-    /// — this is the exact scenario B2 reports (Ctrl+C → zombie
-    /// renewer).
-    #[tokio::test]
-    async fn select_cancellation_aborts_guarded_task() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_inner = flag.clone();
-
-        // A future that owns the guard and waits. We "cancel" it by
-        // racing it against a short timer in tokio::select! — the
-        // select drops the losing arm, which invokes Drop on the guard
-        // (B2's exact scenario: signal arm wins, task arm drops).
-        let owning_future = async {
-            let _guard = AbortGuard::new(tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                flag_inner.store(true, Ordering::SeqCst);
-            }));
-            tokio::time::sleep(Duration::from_secs(10)).await; // never completes in test window
-        };
-
-        tokio::select! {
-            _ = owning_future => panic!("owning future should still be blocked"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "select-cancellation dropped guard but background task kept running"
-        );
-    }
-
-    /// Models the renewer loop's cooperative cancel + await pattern
-    /// and asserts no renew call can land AFTER the caller's await on
-    /// the handle completes. This is the stronger guarantee that
-    /// `AbortGuard::abort` alone cannot provide (abort does not kill
-    /// in-flight awaits, only delivers cancellation at the next await
-    /// point). The loop shape here mirrors
-    /// `execute_task_worker_once`'s spawned renewer.
-    #[tokio::test]
-    async fn cooperative_cancel_and_await_has_no_late_renew() {
-        use std::sync::atomic::AtomicU32;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let renew_count = Arc::new(AtomicU32::new(0));
-
-        let handle = {
-            let cancel = cancel.clone();
-            let notify = notify.clone();
-            let renew_count = renew_count.clone();
-            tokio::spawn(async move {
-                loop {
-                    if cancel.load(Ordering::Acquire) {
-                        return;
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                        _ = notify.notified() => {}
-                    }
-                    if cancel.load(Ordering::Acquire) {
-                        return;
-                    }
-                    // Simulate a renew SQL call that takes 40ms.
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    renew_count.fetch_add(1, Ordering::SeqCst);
-                }
-            })
-        };
-
-        // Let at least one renew run.
-        tokio::time::sleep(Duration::from_millis(110)).await;
-        let before = renew_count.load(Ordering::SeqCst);
-        assert!(
-            before >= 1,
-            "test scaffolding: renew should have fired at least once"
-        );
-
-        // Cooperative cancel.
-        cancel.store(true, Ordering::Release);
-        notify.notify_waiters();
-        let _ = handle.await;
-
-        // Any renew happening strictly after the awaited handle would
-        // be a regression — the task is fully returned here. Wait a
-        // generous window to catch a spurious late renew.
-        let after_await = renew_count.load(Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let after_wait = renew_count.load(Ordering::SeqCst);
-        assert_eq!(
-            after_await, after_wait,
-            "renew fired after the awaited handle completed (late-renew race)"
-        );
-    }
-
-    /// Simulates the panic-unwind exit path: if the parent scope
-    /// panics, the guard's Drop still aborts the background task.
-    #[tokio::test]
-    async fn panic_still_drops_guard() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_inner = flag.clone();
-        let result = std::panic::AssertUnwindSafe(async {
-            let _guard = AbortGuard::new(tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                flag_inner.store(true, Ordering::SeqCst);
-            }));
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            panic!("simulated cancellation path");
-        });
-        let _ = futures_util::FutureExt::catch_unwind(result).await;
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "panic unwound without aborting the renewal task"
-        );
-    }
-}
-
 async fn execute_task_worker(
     args: TaskWorkerArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     if !args.once && !args.loop_mode {
         return Err("choose --once or --loop for task worker".to_string());
@@ -1407,85 +899,13 @@ async fn execute_task_worker(
     }
 }
 
-async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode, String> {
-    let query = join_words(&args.query);
-    if query.trim().is_empty() {
-        return Err("provide a task id or title fragment".to_string());
-    }
-
-    // No profile in this CLI subcommand context; HttpTaskService
-    // falls back to env-only token resolution which is fine for
-    // one-shot `astra task result <query>` invocations.
-    let svc = session_runtime::resolve_task_service(None).await;
-    let task_id = resolve_task_result_task_id(&*svc, &query).await?;
-    let task = svc
-        .get_task(&task_id)
-        .await?
-        .ok_or_else(|| format!("task disappeared: {task_id}"))?;
-    let read = load_task_result_read_surface(&task);
-
-    let short = &task.task_id[..8.min(task.task_id.len())];
-    eprintln!(
-        "\n{}",
-        format!("─── Task Result ({short}) ─────────────────────────").bold()
-    );
-    eprintln!("  {:<12} {}", "title:".dim(), task.title);
-    for field in task_result_header_fields(&read) {
-        eprintln!(
-            "  {:<12} {}",
-            field.label.dim(),
-            render_task_result_header_value(&field)
-        );
-    }
-
-    let artifact = read.load_artifact()?;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&task_result_json_payload(&read, artifact.as_ref()))
-                .unwrap_or_default()
-        );
-        eprintln!();
-        return Ok(read.exit_code);
-    }
-
-    if let Some(artifact) = artifact {
-        eprintln!();
-        println!("{}", artifact.full_text);
-        if let Some(tokens) = artifact.prompt_tokens {
-            let comp = artifact.completion_tokens;
-            let tools = artifact.tool_calls_count;
-            eprintln!(
-                "\n  {}",
-                format!("tokens: {tokens}→/{comp}← | tools: {tools}").dim()
-            );
-        }
-        if let Some(output_file) = artifact.output_file {
-            eprintln!("  {}", format!("output: {output_file}").dim());
-        }
-        eprintln!();
-        return Ok(read.exit_code);
-    }
-
-    // Unfinished / no data yet
-    if read.header.is_unfinished {
-        eprintln!("  {}", read.missing_text.yellow());
-    } else {
-        eprintln!("  {}", read.missing_text.dim());
-        eprintln!();
-        return Ok(read.exit_code);
-    }
-    eprintln!();
-    Ok(read.exit_code)
-}
-
 async fn execute_repl_bridge_command(
     slash_cmd: &str,
     arg: &str,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     try_silent_auth(api, profile).await;
 
@@ -1521,7 +941,7 @@ async fn execute_repl_bridge_command(
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
         "/plan" => {
-            crate::cli::slash_plan::handle_plan_command(
+            crate::cli::slash::slash_plan::handle_plan_command(
                 arg,
                 api,
                 profile,
@@ -1693,7 +1113,7 @@ pub(crate) async fn execute_cli_command(
     api: &astra_thin_client::ThinClient,
     no_instructions: bool,
     max_budget: f64,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive TUI (Codex-style default)
@@ -1716,10 +1136,10 @@ pub(crate) async fn execute_cli_command(
                 None => {
                     start_http_server(&args.host, args.port).await?;
                 }
-                Some(crate::cli::cli_args::ServeMode::Http(http_args)) => {
+                Some(crate::cli::cli_config::cli_args::ServeMode::Http(http_args)) => {
                     start_http_server(&http_args.host, http_args.port).await?;
                 }
-                Some(crate::cli::cli_args::ServeMode::Stdio) => {
+                Some(crate::cli::cli_config::cli_args::ServeMode::Stdio) => {
                     crate::cli::app_server::run_stdio_app_server(
                         "stdio://",
                         api,
@@ -1770,7 +1190,7 @@ pub(crate) async fn execute_cli_command(
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
-                render_policy: crate::cli::stream_render::RenderPolicy::Stream,
+                render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
@@ -1794,12 +1214,12 @@ pub(crate) async fn execute_cli_command(
                 #[cfg(feature = "harness")]
                 benchmark_profile: None,
             };
-            let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+            let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
-            let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
+            let mut sr = match crate::cli::turn::execute_basic_cli_turn(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
@@ -1820,7 +1240,7 @@ pub(crate) async fn execute_cli_command(
                                 "  {} Token refreshed, retrying…",
                                 crate::cli::theme::icon_ok()
                             );
-                            crate::cli::turn_facade::execute_basic_cli_turn(
+                            crate::cli::turn::execute_basic_cli_turn(
                                 &chat_ctx,
                                 &new_token,
                                 session_id.as_deref(),
@@ -1980,7 +1400,8 @@ pub(crate) async fn execute_cli_command(
                 .await
             }
             Some(TaskSubcommand::Queue(queue_args)) => {
-                execute_task_queue(queue_args, cli_context).await
+                crate::cli::task::task_queue_command::execute_task_queue(queue_args, cli_context)
+                    .await
             }
             Some(TaskSubcommand::Worker(worker_args)) => {
                 execute_task_worker(
@@ -1992,7 +1413,9 @@ pub(crate) async fn execute_cli_command(
                 )
                 .await
             }
-            Some(TaskSubcommand::Result(result_args)) => execute_task_result(result_args).await,
+            Some(TaskSubcommand::Result(result_args)) => {
+                crate::cli::task::task_result_command::execute_task_result(result_args).await
+            }
             _ => {
                 execute_repl_bridge_command(
                     "/task",
@@ -2122,7 +1545,7 @@ pub(crate) async fn execute_cli_command(
             // context state from a session that's already been
             // closed.
             match ctx_cmd {
-                crate::cli::cli_args::ContextCmd::Dump(args) => {
+                crate::cli::cli_config::cli_args::ContextCmd::Dump(args) => {
                     // Resolve session: explicit arg → prefix match;
                     // omitted → most recently touched session on disk.
                     let sid =
@@ -2262,9 +1685,9 @@ pub(crate) async fn execute_cli_command(
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let skill_search = astra_core::SkillSearchSettings::default();
             let render_policy = if quiet {
-                crate::cli::stream_render::RenderPolicy::Silent
+                crate::cli::stream::stream_render::RenderPolicy::Silent
             } else {
-                crate::cli::stream_render::RenderPolicy::Stream
+                crate::cli::stream::stream_render::RenderPolicy::Stream
             };
 
             // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
@@ -2300,7 +1723,7 @@ pub(crate) async fn execute_cli_command(
             let spawner_handle_for_drain = one_shot_spawner.clone();
             let (stream_event_tx, _stream_event_writer) = if args.stream_events {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let handle = crate::cli::stream_events_writer::spawn_stderr_writer(rx);
+                let handle = crate::cli::stream::stream_events_writer::spawn_stderr_writer(rx);
                 (Some(tx), Some(handle))
             } else {
                 (None, None)
@@ -2349,14 +1772,14 @@ pub(crate) async fn execute_cli_command(
                 #[cfg(feature = "harness")]
                 benchmark_profile: args.benchmark_profile,
             };
-            let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+            let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 append_system_prompt: args.append_system_prompt.clone(),
                 disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
-            let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
+            let mut sr = match crate::cli::turn::execute_basic_cli_turn(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
@@ -2993,7 +2416,7 @@ pub(crate) async fn run_print_mode(
     model: Option<&str>,
     system_prompt: Option<&str>,
     command: Option<Command>,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     // Extract message from command or stdin
     let raw_message = match command {
@@ -3075,7 +2498,7 @@ pub(crate) async fn run_print_mode(
         explain: ExplainMode::Off,
         render_md: false,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: Some(cli_context),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         skill_search: &skill_search,
@@ -3096,12 +2519,12 @@ pub(crate) async fn run_print_mode(
         benchmark_profile: None,
     };
 
-    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+    let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
         ..Default::default()
     };
     let turn_start = std::time::Instant::now();
-    let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
+    let mut sr = match crate::cli::turn::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         session_id.as_deref(),
@@ -3342,44 +2765,14 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::*;
+    use super::{
+        ExitCode, StreamResult, append_headless_inspect_snapshot, compute_exit_code,
+        message_requests_headless_inspect,
+    };
+    use crate::cli::stream::streaming_types::VerdictEvent;
 
     fn empty_stream_result() -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: String::new(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls_count: 0,
-            tools_selected: vec![],
-            selected_skills: vec![],
-            tools_used: vec![],
-            tool_call_records: vec![],
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: vec![],
-            verdict_events: vec![],
-            step_recorder_summary: None,
-            tool_health_export: vec![],
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
+        StreamResult::default()
     }
 
     #[test]
@@ -3757,43 +3150,20 @@ mod exit_code_tests {
 
 #[cfg(test)]
 mod final_json_output_tests {
-    use super::*;
+    use super::{ExitCode, StreamResult, final_json_output_with_context};
 
     fn stream_result_for_json() -> StreamResult {
         StreamResult {
             session_id: Some("session-1".to_string()),
             run_id: Some("run-1".to_string()),
-            session_persistence_error: None,
             full_text: "hello".to_string(),
             prompt_tokens: 10,
             completion_tokens: 3,
             cache_read_tokens: 2,
             cache_creation_tokens: 1,
             tool_calls_count: 2,
-            tools_selected: vec![],
-            selected_skills: vec![],
             tools_used: vec!["bash".to_string(), "read_file".to_string()],
-            tool_call_records: vec![],
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: vec![],
-            verdict_events: vec![],
-            step_recorder_summary: None,
-            tool_health_export: vec![],
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -3888,7 +3258,9 @@ mod final_json_output_tests {
 
 #[cfg(test)]
 mod one_shot_persistence_tests {
-    use super::*;
+    use super::{
+        ExitCode, StreamResult, finalize_one_shot_stream_result, persist_one_shot_session_state,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -3996,7 +3368,7 @@ mod one_shot_persistence_tests {
                 .unwrap_or_default()
                 .contains("failed to append one-shot journal events")
         );
-        let creds = crate::cli::cli_utils::load_credentials();
+        let creds = crate::cli::cli_config::cli_utils::load_credentials();
         assert_eq!(
             creds
                 .profiles
@@ -4116,156 +3488,15 @@ mod one_shot_persistence_tests {
 }
 
 #[cfg(test)]
-mod task_lookup_tests {
-    use super::*;
-    use astra_services::TaskService as _;
-
-    struct CliUserIdGuard {
-        previous: Option<String>,
-    }
-
-    impl CliUserIdGuard {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var("ASTRA_CLI_USER_ID").ok();
-            unsafe {
-                std::env::set_var("ASTRA_CLI_USER_ID", value);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for CliUserIdGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(previous) = self.previous.as_deref() {
-                    std::env::set_var("ASTRA_CLI_USER_ID", previous);
-                } else {
-                    std::env::remove_var("ASTRA_CLI_USER_ID");
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn resolve_task_result_task_id_uses_cli_user_id_scope() {
-        let _user = CliUserIdGuard::set("task-user");
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let expected = svc
-            .create_task(
-                "task-user",
-                "sess-1",
-                astra_services::TaskCreateRequest {
-                    title: "Build auth".into(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        svc.create_task(
-            "other-user",
-            "sess-2",
-            astra_services::TaskCreateRequest {
-                title: "Build auth".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let found = resolve_task_result_task_id(&svc, "Build auth")
-            .await
-            .unwrap();
-        assert_eq!(found, expected);
-    }
-
-    struct StubTaskLeaseService {
-        next_result: astra_services::NextClaimableLeaseClaimResult,
-    }
-
-    #[async_trait::async_trait]
-    impl astra_services::TaskLeaseService for StubTaskLeaseService {
-        async fn claim_next_claimable_lease(
-            &self,
-            _user_id: &str,
-            _agent_id: &str,
-            _edge_id: &str,
-            _ttl_sec: i64,
-        ) -> Result<astra_services::NextClaimableLeaseClaimResult, String> {
-            Ok(self.next_result.clone())
-        }
-
-        async fn try_claim_lease(
-            &self,
-            _user_id: &str,
-            _task_id: &str,
-            _agent_id: &str,
-            _edge_id: &str,
-            _ttl_sec: i64,
-        ) -> Result<astra_services::LeaseClaimResult, String> {
-            unreachable!("worker claim path should not fall back to per-task try_claim_lease");
-        }
-
-        async fn release_lease(
-            &self,
-            _user_id: &str,
-            _task_id: &str,
-            _agent_id: &str,
-        ) -> Result<bool, String> {
-            unreachable!("not used in this test");
-        }
-
-        async fn get_lease(
-            &self,
-            _user_id: &str,
-            _task_id: &str,
-        ) -> Result<Option<astra_services::TaskLeaseView>, String> {
-            unreachable!("not used in this test");
-        }
-
-        async fn renew_lease(
-            &self,
-            _user_id: &str,
-            _task_id: &str,
-            _agent_id: &str,
-            _edge_id: &str,
-            _ttl_sec: i64,
-        ) -> Result<Option<astra_services::TaskLeaseView>, String> {
-            unreachable!("not used in this test");
-        }
-    }
-
-    #[tokio::test]
-    async fn claim_next_claimable_task_for_worker_uses_lease_owner_result() {
-        let lease_svc = StubTaskLeaseService {
-            next_result: astra_services::NextClaimableLeaseClaimResult::Granted {
-                task_id: "task-201".into(),
-                lease_version: 9,
-                expires_at: "2025-01-03T00:00:00Z".into(),
-            },
-        };
-
-        let result =
-            claim_next_claimable_task_for_worker(&lease_svc, "task-user", "agent-1", "edge-1", 300)
-                .await
-                .unwrap();
-
-        assert_eq!(
-            result,
-            astra_services::NextClaimableLeaseClaimResult::Granted {
-                task_id: "task-201".into(),
-                lease_version: 9,
-                expires_at: "2025-01-03T00:00:00Z".into(),
-            }
-        );
-    }
-}
-
-#[cfg(test)]
 mod task_run_projection_tests {
-    use super::*;
-    use astra_services::TaskService;
+    use super::{
+        ExitCode, NON_CANONICAL_TASK_SCOPE, StreamResult, build_one_shot_task_manager,
+        failed_task_notification_payload, one_shot_completion_warning, task_notification_payload,
+        task_terminal_summary_line,
+    };
+    use crate::cli::task::task_result_projection::{
+        stream_result_failure_reason, task_checkpoint_state_from_result,
+    };
 
     fn stream_result_for_task_checkpoint() -> StreamResult {
         StreamResult {
@@ -4278,30 +3509,9 @@ mod task_run_projection_tests {
             cache_read_tokens: 2,
             cache_creation_tokens: 1,
             tool_calls_count: 2,
-            tools_selected: vec![],
-            selected_skills: vec![],
             tools_used: vec!["bash".to_string()],
-            tool_call_records: vec![],
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: vec![],
-            verdict_events: vec![],
-            step_recorder_summary: None,
-            tool_health_export: vec![],
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
             background_agent_results: vec![("agent-1".into(), "done".into())],
+            ..Default::default()
         }
     }
 
@@ -4339,21 +3549,21 @@ mod task_run_projection_tests {
     #[test]
     fn task_status_label_marks_partial_completed_tasks() {
         assert_eq!(
-            crate::cli::task_checkpoint_surface::task_status_label(
+            crate::cli::surface::task_checkpoint_surface::task_status_label(
                 astra_services::TaskStatus::Completed,
                 Some(astra_services::TaskOutcome::Partial),
             ),
             "partial"
         );
         assert_eq!(
-            crate::cli::task_checkpoint_surface::task_status_label(
+            crate::cli::surface::task_checkpoint_surface::task_status_label(
                 astra_services::TaskStatus::Completed,
                 Some(astra_services::TaskOutcome::Success),
             ),
             "completed"
         );
         assert_eq!(
-            crate::cli::task_checkpoint_surface::task_status_label(
+            crate::cli::surface::task_checkpoint_surface::task_status_label(
                 astra_services::TaskStatus::Failed,
                 None,
             ),
@@ -4506,200 +3716,6 @@ mod task_run_projection_tests {
             Some(
                 "Turn finished partially (budget_exhausted). Inspect partial output before continuing."
             )
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_headless_task_result_marks_task_failed_and_persists_checkpoint_on_persistence_error()
-     {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let tid = svc
-            .create_task(
-                "test-user",
-                "fallback-session",
-                astra_services::TaskCreateRequest {
-                    title: "run: test".to_string(),
-                    description: Some("test".to_string()),
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
-            .await
-            .unwrap();
-
-        let sr = stream_result_for_task_checkpoint();
-        let exit_code = finalize_headless_task_result(
-            &svc,
-            &tid,
-            &sr,
-            Some("fallback-session"),
-            Some("/tmp/out.txt"),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(exit_code, ExitCode::PersistenceError);
-
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
-        assert_eq!(record.status, astra_services::TaskStatus::Failed);
-        assert_eq!(
-            record.error_message.as_deref(),
-            Some("failed to append one-shot journal events")
-        );
-        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
-        assert_eq!(checkpoint.session_id.as_deref(), Some("fallback-session"));
-        assert_eq!(
-            checkpoint
-                .state
-                .get("persistence_error")
-                .and_then(|v| v.as_str()),
-            Some("failed to append one-shot journal events")
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_headless_task_result_marks_task_completed_on_clean_success() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let tid = svc
-            .create_task(
-                "test-user",
-                "fallback-session",
-                astra_services::TaskCreateRequest {
-                    title: "run: test".to_string(),
-                    description: Some("test".to_string()),
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
-            .await
-            .unwrap();
-
-        let mut sr = stream_result_for_task_checkpoint();
-        sr.session_id = None;
-        sr.session_persistence_error = None;
-
-        let exit_code = finalize_headless_task_result(
-            &svc,
-            &tid,
-            &sr,
-            Some("fallback-session"),
-            Some("/tmp/out.txt"),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(exit_code, ExitCode::Success);
-
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
-        assert_eq!(record.status, astra_services::TaskStatus::Completed);
-        assert_eq!(record.outcome, Some(astra_services::TaskOutcome::Success));
-        assert_eq!(record.error_message, None);
-        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
-        assert_eq!(checkpoint.session_id.as_deref(), Some("fallback-session"));
-        assert!(checkpoint.state["persistence_error"].is_null());
-    }
-
-    #[tokio::test]
-    async fn finalize_headless_task_result_marks_task_completed_with_partial_outcome() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let tid = svc
-            .create_task(
-                "test-user",
-                "fallback-session",
-                astra_services::TaskCreateRequest {
-                    title: "run: test".to_string(),
-                    description: Some("test".to_string()),
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
-            .await
-            .unwrap();
-
-        let mut sr = stream_result_for_task_checkpoint();
-        sr.session_persistence_error = None;
-        sr.final_state = "interrupted".into();
-        sr.interruption_kind = Some("budget_exhausted".into());
-
-        let exit_code = finalize_headless_task_result(
-            &svc,
-            &tid,
-            &sr,
-            Some("fallback-session"),
-            Some("/tmp/out.txt"),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(exit_code, ExitCode::Partial);
-
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
-        assert_eq!(record.status, astra_services::TaskStatus::Completed);
-        assert_eq!(record.outcome, Some(astra_services::TaskOutcome::Partial));
-        assert_eq!(record.error_message, None);
-        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
-        assert_eq!(checkpoint.state["final_state"], "interrupted");
-        assert_eq!(checkpoint.state["interruption_kind"], "budget_exhausted");
-    }
-
-    #[tokio::test]
-    async fn finalize_headless_task_result_persists_checkpoint_without_output_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let tid = svc
-            .create_task(
-                "test-user",
-                "fallback-session",
-                astra_services::TaskCreateRequest {
-                    title: "run: test".to_string(),
-                    description: Some("test".to_string()),
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
-            .await
-            .unwrap();
-
-        let mut sr = stream_result_for_task_checkpoint();
-        sr.session_persistence_error = Some("write task output: permission denied".into());
-
-        let exit_code =
-            finalize_headless_task_result(&svc, &tid, &sr, Some("fallback-session"), None)
-                .await
-                .unwrap();
-
-        assert_eq!(exit_code, ExitCode::PersistenceError);
-
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
-        assert_eq!(record.status, astra_services::TaskStatus::Failed);
-        let checkpoint = record.checkpoint.expect("checkpoint should be saved");
-        assert!(checkpoint.state.get("output_file").is_none());
-        assert_eq!(
-            checkpoint.state["persistence_error"],
-            "write task output: permission denied"
         );
     }
 
@@ -4935,9 +3951,9 @@ mod default_model_tests {
 
 #[cfg(test)]
 mod api_url_config_tests {
-    use super::*;
     use crate::cli::config_manager::{
-        DEFAULT_API_URL, KNOWN_SETTINGS, read_config_api_url_from, resolve_api_url_with,
+        DEFAULT_API_URL, KNOWN_SETTINGS, latest_artifact_id, read_config_api_url_from,
+        resolve_api_url_with, resolve_download_output_path, write_downloaded_capture,
     };
 
     fn no_env() -> Option<String> {

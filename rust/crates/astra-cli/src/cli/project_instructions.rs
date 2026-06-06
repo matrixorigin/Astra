@@ -119,7 +119,9 @@ pub(crate) fn format_project_instructions(instructions: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        discover_instructions_from_paths, format_project_instructions, resolve_system_prompt,
+    };
     use std::fs;
     use tempfile::TempDir;
 

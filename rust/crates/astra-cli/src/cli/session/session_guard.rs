@@ -59,7 +59,7 @@ fn emergency_session_end() {
             ctx.end_written = true;
             let end_event =
                 session_journal::JournalEvent::session_end(Some(ctx.session_id.as_str()), ctx.turn);
-            crate::cli::cli_utils::append_session_journal_event_or_warn(
+            crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
                 &ctx.session_id,
                 &end_event,
                 "session_guard:emergency_session_end",
@@ -89,7 +89,7 @@ pub(crate) fn try_write_session_end(
         return false; // poisoned lock
     }
     let end_event = session_journal::JournalEvent::session_end(session_id, turn);
-    crate::cli::cli_utils::append_journal_event_or_warn(
+    crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
         journal,
         session_id,
         &end_event,
@@ -154,7 +154,10 @@ pub(crate) fn clear_panic_guard() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ShutdownSignal, clear_panic_guard, publish_shutdown_signal, shutdown_signal_sender,
+        subscribe_shutdown_signal, try_write_session_end, update_panic_guard,
+    };
 
     #[tokio::test]
     async fn publish_shutdown_signal_updates_subscribers() {

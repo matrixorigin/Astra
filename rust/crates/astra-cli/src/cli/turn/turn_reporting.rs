@@ -2,8 +2,10 @@
 
 use std::time::Instant;
 
-use super::*;
-use crate::StreamResult;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::streaming_types::StreamResult;
+use astra_services::session_journal;
+use crossterm::style::Stylize;
 
 pub(crate) fn compact_token_count(tokens: u64) -> String {
     if tokens > 1000 {
@@ -99,7 +101,7 @@ pub(crate) fn print_turn_status_line(
     let prompt_short = compact_token_count(total_input);
     let completion_short = compact_token_count(result.completion_tokens);
 
-    let turn_cost = crate::cli::slash_stats::cost_for_tokens(
+    let turn_cost = crate::cli::slash::slash_stats::cost_for_tokens(
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -115,7 +117,7 @@ pub(crate) fn print_turn_status_line(
         "tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"
     ));
     if turn_cost > 0.0 {
-        parts.push(crate::cli::slash_stats::format_cost(turn_cost));
+        parts.push(crate::cli::slash::slash_stats::format_cost(turn_cost));
     }
     parts.push(elapsed_str);
     if let Some(ttft) = result.ttft_ms
@@ -151,7 +153,7 @@ pub(crate) fn print_turn_status_line(
             "{}",
             format!(
                 "  session: {}",
-                crate::cli::slash_stats::format_cost(session_cost)
+                crate::cli::slash::slash_stats::format_cost(session_cost)
             )
             .dim()
         );
@@ -238,45 +240,11 @@ pub(crate) fn print_context_window_warning(budget_pressure: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn stub_stream_result(full_text: &str) -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: full_text.to_string(),
-            tool_calls_count: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: Vec::new(),
-            tool_call_records: Vec::new(),
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
-    }
+    use super::{
+        build_history_text, build_turn_tool_summary, cache_hit_percentage, compact_token_count,
+        interruption_status_notice,
+    };
+    use astra_services::session_journal;
 
     fn make_record(
         name: &str,
@@ -293,7 +261,7 @@ mod tests {
 
     #[test]
     fn interruption_status_notice_prefers_user_message() {
-        let mut result = stub_stream_result("");
+        let mut result = crate::tests::stub_stream_result("");
         result.interruption = Some(serde_json::json!({
             "kind": "budget_exhausted",
             "resumable": true,
@@ -307,7 +275,7 @@ mod tests {
 
     #[test]
     fn interruption_status_notice_falls_back_to_kind_and_resumable_hint() {
-        let mut result = stub_stream_result("");
+        let mut result = crate::tests::stub_stream_result("");
         result.interruption_kind = Some("context_budget".into());
         result.interruption = Some(serde_json::json!({
             "kind": "context_budget",

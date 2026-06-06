@@ -45,7 +45,7 @@ impl StartupTracer {
             &self.phases,
             total_us,
         );
-        crate::cli::cli_utils::append_session_journal_event_or_warn(
+        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
             session_id,
             &event,
             "startup_trace:finish",
@@ -55,7 +55,7 @@ impl StartupTracer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::StartupTracer;
 
     #[test]
     fn finish_writes_bootstrap_into_real_session_journal() {

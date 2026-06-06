@@ -1366,6 +1366,19 @@ impl DynamicAgentSpawner {
             .await;
         self.persist_agent_terminated_state(&state, journal_status, finish_reason)
             .await;
+        if let Some(event_type) =
+            agent_status_to_progress_event(&state.status, &state.metrics, state.started_at)
+        {
+            let timestamp_epoch_ms = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.progress_broadcaster.emit(AgentProgressEvent {
+                agent_id: agent_id.to_string(),
+                event_type,
+                timestamp_epoch_ms,
+            });
+        }
         if let Some(addr) = messaging_address
             && let Err(err) = self.mailbox_router.unregister(&addr).await
         {

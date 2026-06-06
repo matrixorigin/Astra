@@ -481,7 +481,7 @@ fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolG
                 .calls
                 .iter()
                 .map(|call| {
-                    crate::cli::stream_render::format_tool_display_from_preview(
+                    crate::cli::stream::stream_render::format_tool_display_from_preview(
                         &call.name,
                         call.args_preview.as_deref(),
                     )
@@ -1045,7 +1045,9 @@ pub fn print_text(d: &JournalDigest) {
     }
 }
 
-pub(crate) fn run_digest(args: &crate::JournalDigestArgs) -> Result<(), String> {
+pub(crate) fn run_digest(
+    args: &crate::cli::cli_config::cli_args::JournalDigestArgs,
+) -> Result<(), String> {
     let focus = parse_focus(args.focus.as_deref())?;
     let sid = resolve_session_for_digest(args.session_id.as_deref(), args.session.as_deref())?;
     let digest = build_digest(&sid, focus)?;
@@ -1068,7 +1070,9 @@ pub(crate) fn run_digest(args: &crate::JournalDigestArgs) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DigestFocus, ErrorCategory, SCHEMA_VERSION, build_digest, result_body_signals_failure,
+    };
     use astra_services::session_journal::JournalDirGuard;
     use std::fs;
 

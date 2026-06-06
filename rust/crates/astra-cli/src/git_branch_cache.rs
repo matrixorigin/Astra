@@ -86,7 +86,8 @@ fn clear_cache() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{clear_cache, detect_git_branch_cached, detect_with_ttl, lookup_branch};
+    use std::time::{Duration, Instant};
 
     /// Calling the cached lookup twice in quick succession should not re-run
     /// `gix::discover`. We verify this indirectly: the second call must return

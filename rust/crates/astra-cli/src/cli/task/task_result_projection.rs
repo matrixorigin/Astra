@@ -3,7 +3,7 @@ use crate::cli::stream::streaming_types::StreamResult;
 pub(crate) fn task_checkpoint_state_from_result(
     sr: &StreamResult,
     output_path: Option<&str>,
-    exit_code: crate::cli::command_router::ExitCode,
+    exit_code: crate::cli::exit_code::ExitCode,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut state_map = serde_json::Map::new();
     state_map.insert(
@@ -56,7 +56,9 @@ pub(crate) fn task_checkpoint_state_from_result(
     );
     state_map.insert(
         "error_kind".to_string(),
-        serde_json::json!(error_kind_for_exit_code(exit_code)),
+        serde_json::json!(crate::cli::command_router::error_kind_for_exit_code(
+            exit_code
+        )),
     );
     state_map.insert("final_state".to_string(), serde_json::json!(sr.final_state));
     state_map.insert(
@@ -74,11 +76,11 @@ pub(crate) fn stream_result_completion_outcome(sr: &StreamResult) -> astra_servi
     }
 }
 
-pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::command_router::ExitCode {
+pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::exit_code::ExitCode {
     // Forced terminal stop always wins over softer failures because the user or
     // turn guard explicitly ended execution.
     if sr.verdict_events.iter().any(|v| v.force_stop) {
-        return crate::cli::command_router::ExitCode::ForceStop;
+        return crate::cli::exit_code::ExitCode::ForceStop;
     }
 
     // Honor explicit exit semantics when present; a failing shell command like
@@ -113,52 +115,38 @@ pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::command_
             .map(|r| !is_error(r))
             .unwrap_or(true);
         if !last_ok || !last_ok_explicit {
-            return crate::cli::command_router::ExitCode::ToolFailure;
+            return crate::cli::exit_code::ExitCode::ToolFailure;
         }
     }
 
     if sr.session_persistence_error.is_some() {
-        return crate::cli::command_router::ExitCode::PersistenceError;
+        return crate::cli::exit_code::ExitCode::PersistenceError;
     }
 
     if sr.final_state == "interrupted" {
-        return crate::cli::command_router::ExitCode::Partial;
+        return crate::cli::exit_code::ExitCode::Partial;
     }
 
-    crate::cli::command_router::ExitCode::Success
+    crate::cli::exit_code::ExitCode::Success
 }
 
 pub(crate) fn stream_result_failure_reason(
-    exit_code: crate::cli::command_router::ExitCode,
+    exit_code: crate::cli::exit_code::ExitCode,
     sr: &StreamResult,
 ) -> String {
-    if exit_code == crate::cli::command_router::ExitCode::PersistenceError {
+    if exit_code == crate::cli::exit_code::ExitCode::PersistenceError {
         sr.session_persistence_error
             .clone()
             .unwrap_or_else(|| "session persistence degraded".to_string())
-    } else if exit_code == crate::cli::command_router::ExitCode::Partial {
+    } else if exit_code == crate::cli::exit_code::ExitCode::Partial {
         sr.interruption_kind
             .clone()
             .map(|kind| format!("turn interrupted before completion ({kind})"))
             .unwrap_or_else(|| "turn interrupted before completion".to_string())
     } else {
-        error_kind_for_exit_code(exit_code)
+        crate::cli::command_router::error_kind_for_exit_code(exit_code)
             .unwrap_or("task failed")
             .to_string()
-    }
-}
-
-pub(crate) fn error_kind_for_exit_code(
-    exit_code: crate::cli::command_router::ExitCode,
-) -> Option<&'static str> {
-    match exit_code {
-        crate::cli::command_router::ExitCode::Success => None,
-        crate::cli::command_router::ExitCode::ToolFailure => Some("tool_failure"),
-        crate::cli::command_router::ExitCode::ForceStop => Some("force_stop"),
-        crate::cli::command_router::ExitCode::ApiError => Some("api_error"),
-        crate::cli::command_router::ExitCode::PersistenceError => Some("persistence_error"),
-        crate::cli::command_router::ExitCode::Partial => Some("partial"),
-        crate::cli::command_router::ExitCode::Unfinished => Some("unfinished"),
     }
 }
 
@@ -171,8 +159,12 @@ fn parse_exit_semantics_tag(tag: &str) -> Option<astra_tools::exit_semantics::Ex
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::command_router::ExitCode;
+    use super::{
+        stream_result_completion_outcome, stream_result_exit_code, stream_result_failure_reason,
+        task_checkpoint_state_from_result,
+    };
+    use crate::cli::exit_code::ExitCode;
+    use crate::cli::stream::streaming_types::StreamResult;
 
     fn interrupted_result() -> StreamResult {
         StreamResult {
@@ -185,30 +177,10 @@ mod tests {
             cache_read_tokens: 3,
             cache_creation_tokens: 1,
             tool_calls_count: 2,
-            tools_selected: vec![],
-            selected_skills: vec![],
-            tools_used: vec![],
-            tool_call_records: vec![],
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: vec![],
-            verdict_events: vec![],
-            step_recorder_summary: None,
-            tool_health_export: vec![],
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
             final_state: "interrupted".into(),
             interruption_kind: Some("budget_exhausted".into()),
-            final_messages: Vec::new(),
             background_agent_results: vec![("agent-1".into(), "done".into())],
+            ..Default::default()
         }
     }
 
@@ -217,7 +189,7 @@ mod tests {
         let state = task_checkpoint_state_from_result(
             &interrupted_result(),
             Some("/tmp/out.txt"),
-            crate::cli::command_router::ExitCode::Partial,
+            crate::cli::exit_code::ExitCode::Partial,
         );
 
         assert_eq!(state["run_id"], "run-1");

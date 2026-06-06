@@ -1,4 +1,14 @@
-use super::*;
+use crate::cli::cli_config::cli_args::{
+    Cli, Command, ConfigCmd, McpCmd, PermissionsSubcommand, ServeMode, SessionCaptureCmd,
+    SessionCmd,
+};
+use crate::cli::permission_manager;
+use crate::cli::project_instructions::{
+    discover_instructions_from_paths, format_project_instructions, resolve_system_prompt,
+};
+use crate::cli::session::session_state::ExplainMode;
+use crate::cli::session::{session_runtime, session_state::SessionState};
+use clap::Parser;
 
 // ── CLI arg parsing tests ─────────────────────────────────────────────
 
@@ -1092,7 +1102,7 @@ fn session_state_cli_context_auto_approve_activates_auto_mode() {
     let state = session_runtime::initialize_session_state(
         None,
         None,
-        &crate::cli::cli_context::CliContext::from_launch_options(
+        &crate::cli::cli_config::cli_context::CliContext::from_launch_options(
             false,
             None,
             &[],
@@ -1362,7 +1372,7 @@ fn format_project_instructions_wraps_in_tags() {
 fn build_effective_line_includes_project_instructions() {
     let mut state = SessionState::default();
     state.project_instructions = Some("Always use Rust.".to_string());
-    let result = crate::cli::session_input::build_effective_line(
+    let result = crate::cli::session::session_input::build_effective_line(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -1381,7 +1391,7 @@ fn build_effective_line_includes_project_instructions() {
 #[test]
 fn build_effective_line_no_instructions_when_none() {
     let state = SessionState::default();
-    let result = crate::cli::session_input::build_effective_line(
+    let result = crate::cli::session::session_input::build_effective_line(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,

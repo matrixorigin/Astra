@@ -248,7 +248,9 @@ pub(crate) const XTERM_COLORS: [(u8, u8, u8); 256] = [
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DefaultColors, OscColorSlot, parse_color_spec, parse_colorfgbg, parse_osc_color_response,
+    };
 
     #[test]
     fn parses_osc11_rgb_response_with_st_terminator() {

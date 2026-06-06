@@ -2,7 +2,8 @@
 
 #![cfg(test)]
 
-use super::{PermissionMode, StatusContext, StatusLine};
+use super::{StatusContext, StatusLine};
+use crate::tui::status_line::line::PermissionMode;
 use crate::tui::testing::render::{buffer_to_string, draw_widget};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

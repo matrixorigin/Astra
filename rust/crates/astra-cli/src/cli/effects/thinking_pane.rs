@@ -218,7 +218,7 @@ fn buffer_to_visual_lines(buffer: &str, w: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ThinkingPreviewPane, buffer_to_visual_lines, wrap_line_to_width};
 
     #[test]
     fn test_wrap_line_to_width() {

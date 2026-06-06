@@ -166,8 +166,10 @@ fn event_to_json(event: &StreamEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{event_to_json, spawn_stderr_writer};
+    use crate::cli::chat_stream::StreamEvent;
     use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
+    use tokio::sync::mpsc;
 
     #[test]
     fn token_event_serializes() {

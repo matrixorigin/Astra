@@ -82,9 +82,11 @@ impl BottomPaneView for WorktreesView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::WorktreesView;
+    use crate::tui::worktrees::WorktreeList;
     use crate::tui::worktrees::model::parse;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

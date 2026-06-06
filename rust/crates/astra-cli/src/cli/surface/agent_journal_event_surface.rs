@@ -43,7 +43,7 @@ fn metadata_u64(metadata: Option<&Value>, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{project_agent_spawned, project_agent_terminated};
     use serde_json::json;
 
     #[test]

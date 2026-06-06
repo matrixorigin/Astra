@@ -141,63 +141,11 @@ async fn settle_retry_attempt(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::StreamResult;
-    use crate::cli::turn_entry::TurnContext;
+    use super::{TurnAttempt, settle_turn_attempt};
+    use crate::cli::session::session_state::SessionState;
+    use crate::cli::turn::turn_entry::TurnContext;
+    use crate::cli::turn::turn_settlement::TurnDispatch;
     use std::time::Instant;
-
-    #[derive(Default)]
-    struct CollectingUi {
-        warnings: Vec<String>,
-    }
-
-    impl crate::cli::ui_adapter::ReplUiAdapter for CollectingUi {
-        fn show_error(&mut self, _msg: &str) {}
-        fn show_warning(&mut self, msg: &str) {
-            self.warnings.push(msg.to_string());
-        }
-        fn show_info(&mut self, _msg: &str) {}
-        fn show_status(&mut self, _msg: &str) {}
-        fn blank_line(&mut self) {}
-    }
-
-    fn stub_stream_result(full_text: &str) -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: full_text.to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls_count: 0,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: Vec::new(),
-            tool_call_records: Vec::new(),
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
-    }
 
     #[tokio::test]
     async fn successful_retry_clears_last_turn_interrupted() {
@@ -206,7 +154,7 @@ mod tests {
             api: &api,
             profile: None,
         };
-        let mut ui = CollectingUi::default();
+        let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
             session_id: Some("sess-stale".into()),
             last_turn_interrupted: true,
@@ -229,7 +177,7 @@ mod tests {
 
         settle_turn_attempt(&mut state, &mut dispatch, attempt, |_, _, _, _, _, _, _| {
             Box::pin(async move {
-                TurnAttempt::Completed(Box::new(Ok(stub_stream_result("Recovered"))))
+                TurnAttempt::Completed(Box::new(Ok(crate::tests::stub_stream_result("Recovered"))))
             })
         })
         .await

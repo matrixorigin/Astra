@@ -5,12 +5,12 @@ use std::time::Instant;
 use super::turn_retry::settle_turn_attempt;
 use super::turn_settlement::TurnDispatch;
 use super::turn_stream_runner::{TurnAttempt, execute_stream_turn};
-use super::*;
 use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
 use crate::cli::session::session_input::{
     active_task_attachment, build_effective_line_with_attachment,
     clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
 };
+use crate::cli::session::session_state::SessionState;
 
 /// Decision returned by `classify_shell_passthrough`.
 ///
@@ -252,8 +252,8 @@ pub(crate) async fn handle_chat_input_with_ui(
 
     ui.blank_line();
 
-    if crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(state)
-        && let Err(error) = crate::cli::plan_lifecycle::enter_remote_plan_mode(
+    if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state)
+        && let Err(error) = crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
             ctx.api,
             ctx.profile,
             token,

@@ -109,8 +109,10 @@ fn is_mutating_tool(name: &str, args: Option<&Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{MAX_RUN_CHAIN_MUTATING_STEPS, ToolSafetyGuard};
+    use crate::cli::permission_manager::{PermissionDecision, PermissionManager};
     use astra_runtime::tool_registry::ToolChain;
+    use serde_json::json;
 
     #[test]
     fn chain_guard_blocks_recursive_run_chain() {
@@ -174,7 +176,7 @@ mod tests {
 
     #[test]
     fn check_request_static_denial_overrides_auto_mode() {
-        let mut pm = crate::cli::permission_manager::PermissionManager::new(true);
+        let mut pm = PermissionManager::new(true);
         let decision = ToolSafetyGuard::check_request(
             Some(&mut pm),
             "mo_query",
@@ -182,7 +184,7 @@ mod tests {
         );
 
         match decision {
-            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+            PermissionDecision::Deny(reason) => {
                 assert!(reason.contains("blocked by default"));
             }
             other => panic!("expected deny, got: {other:?}"),
@@ -191,22 +193,19 @@ mod tests {
 
     #[test]
     fn check_request_delegates_safe_write_tool_to_permission_manager() {
-        let mut pm = crate::cli::permission_manager::PermissionManager::new(false);
+        let mut pm = PermissionManager::new(false);
         let decision = ToolSafetyGuard::check_request(
             Some(&mut pm),
             "write_file",
             &json!({"path": "file.txt", "content": "x"}),
         );
 
-        assert!(matches!(
-            decision,
-            crate::cli::permission_manager::PermissionDecision::NeedApproval { .. }
-        ));
+        assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
     }
 
     #[test]
     fn check_request_blocks_obfuscated_shell_command() {
-        let mut pm = crate::cli::permission_manager::PermissionManager::new(false);
+        let mut pm = PermissionManager::new(false);
         let decision = ToolSafetyGuard::check_request(
             Some(&mut pm),
             "bash",
@@ -214,7 +213,7 @@ mod tests {
         );
 
         match decision {
-            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+            PermissionDecision::Deny(reason) => {
                 assert!(reason.contains("shell_obfuscation"));
                 assert!(reason.contains("eval"));
             }

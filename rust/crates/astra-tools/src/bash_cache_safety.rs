@@ -217,7 +217,7 @@ fn git_subcommand_is_dangerous(lower: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::bash_command_is_cache_safe;
 
     // ── Allowlist: these MUST be cacheable ─────────────────────────
 

@@ -309,7 +309,10 @@ pub fn suggest_skills(input: &str, available: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        cli_bullet, cli_kv, cli_kvlist, cli_numbered, cli_table, find_suggestions,
+        format_invalid_value_error, format_not_found_error, fuzzy_score, suggest_models,
+    };
 
     #[test]
     fn cli_kv_prints_formatted() {

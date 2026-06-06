@@ -506,7 +506,12 @@ fn now_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ChatTurnDump, ContextDump, SCHEMA_VERSION, Totals, build_dump_from_journal, expand_tilde,
+        resolve_dump_path, resolve_session_id, write_json,
+    };
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn resolve_path_uses_arg_when_given() {

@@ -1,9 +1,35 @@
 //! Slash command fallback routing for the interactive session.
 
-use std::io::IsTerminal;
+use astra_runtime::prompts;
+use astra_services::session_journal;
+use crossterm::style::Stylize;
+use std::{io::IsTerminal, path::PathBuf};
 
-use super::*;
-use crate::cli::command_usage;
+use crate::cli::slash::{
+    slash_account::handle_account_command,
+    slash_bug::handle_bug_command,
+    slash_debug::handle_debug_command,
+    slash_info::handle_info_command,
+    slash_memory::handle_memory_domain_command,
+    slash_messaging::handle_messaging_command,
+    slash_session::handle_session_command,
+    slash_skill::handle_skill_command,
+    slash_state::{StateCommandContext, handle_state_command},
+};
+use crate::cli::{
+    cli_config::{
+        cli_output,
+        cli_utils::{self, interactive_select, map_thin_err},
+    },
+    command_registry, command_usage, diff_presenter,
+    project_instructions::discover_project_instructions,
+    session::{session_checkpointing, session_state::SessionState},
+    slash::{
+        slash_agent, slash_cache, slash_config, slash_inspect, slash_mcp, slash_profile,
+        slash_session, slash_stats, slash_sync, slash_task, slash_team, slash_telemetry,
+    },
+    theme,
+};
 
 /// GET `/models` returns `ModelListItemResponse` with field `is_active` (snake_case).
 /// Accept legacy `active` if present; if neither is a bool, treat as active for unknown servers.
@@ -291,7 +317,7 @@ pub(crate) async fn handle_slash_command(
             );
             eprintln!("{}", format!("  \u{2713}  Set model to {}", arg).green());
             if let Some(ref j) = state.journal {
-                crate::cli::cli_utils::append_journal_event_or_warn(
+                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                     j,
                     state.session_id.as_deref(),
                     &session_journal::JournalEvent::config_change(
@@ -565,7 +591,8 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/plan" => {
-            crate::cli::slash_plan::handle_plan_command(arg, api, profile, state, token).await?;
+            crate::cli::slash::slash_plan::handle_plan_command(arg, api, profile, state, token)
+                .await?;
         }
 
         "/task" => {
@@ -718,7 +745,7 @@ pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
 
 #[cfg(test)]
 mod model_list_json_tests {
-    use super::*;
+    use super::{model_list_entry_is_active, model_list_entry_thinking_capability};
 
     #[test]
     fn respects_is_active_false() {

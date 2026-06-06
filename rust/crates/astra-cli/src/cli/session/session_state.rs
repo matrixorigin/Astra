@@ -391,7 +391,7 @@ pub(crate) struct SessionState {
     /// Used to insert a newline before the next non-token event.
     pub plan_in_token_stream: bool,
     /// Streaming markdown renderer for plan execution token output.
-    pub plan_md_renderer: Option<crate::cli::streaming_md::StreamingMarkdown>,
+    pub plan_md_renderer: Option<crate::cli::stream::streaming_md::StreamingMarkdown>,
     /// Thinking preview pane for plan execution (reasoning visibility).
     pub plan_thinking_pane: Option<crate::cli::effects::ThinkingPreviewPane>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
@@ -501,7 +501,7 @@ pub(crate) struct SessionState {
 
     // ── TUI mode overrides ──
     /// When set, `run_chat_turn` uses this render policy instead of `Stream`.
-    pub tui_render_policy: Option<crate::cli::stream_render::RenderPolicy>,
+    pub tui_render_policy: Option<crate::cli::stream::stream_render::RenderPolicy>,
     /// When set, `run_chat_turn` injects this channel into ChatTurnParams.
     pub tui_stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
     /// Live child-agent event lane; does not gate parent TurnComplete.
@@ -881,7 +881,8 @@ impl SessionState {
 
 #[cfg(test)]
 mod default_tests {
-    use super::*;
+    use super::{ExplainMode, SessionState};
+    use crate::cli::permission_manager::PermissionManager;
 
     #[test]
     fn default_auto_approve_reads_env_flag() {
@@ -1077,13 +1078,23 @@ mod default_tests {
             cache_write: Some(3.75),
         };
 
-        let cost1 =
-            crate::cli::slash_stats::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
+        let cost1 = crate::cli::slash::slash_stats::cost_for_tokens(
+            1000,
+            500,
+            800,
+            100,
+            &state.cached_pricing,
+        );
         state.total_session_cost += cost1;
         assert!(cost1 > 0.0);
 
-        let cost2 =
-            crate::cli::slash_stats::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
+        let cost2 = crate::cli::slash::slash_stats::cost_for_tokens(
+            2000,
+            1000,
+            1500,
+            0,
+            &state.cached_pricing,
+        );
         state.total_session_cost += cost2;
 
         assert!((state.total_session_cost - (cost1 + cost2)).abs() < 1e-10);
@@ -1163,7 +1174,7 @@ mod default_tests {
 
 #[cfg(test)]
 mod plan_mode_invariant_tests {
-    use super::*;
+    use super::SessionState;
 
     /// Invariant I7: TUI / nudge / status-line consumers can ask
     /// `state.plan_mode_active()` and always get a fresh truth

@@ -1,5 +1,6 @@
-use super::*;
 use crate::cli::session::session_input::detect_correction_signal;
+use crate::cli::session::session_state::SessionState;
+use crossterm::style::Stylize;
 
 /// Minimal async-capable chat completion abstraction so the skill-improvement
 /// LLM path can be unit-tested without real HTTP.
@@ -382,8 +383,11 @@ fn check_skill_improvement_inner(state: &mut SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::SessionState;
+    use super::{
+        SkillImproveLlm, check_skill_improvement_sync, trim_feedback_sections,
+        try_llm_skill_improvement,
+    };
+    use crate::cli::session::session_state::SessionState;
     use crate::lock_recovery::LockRecovery;
 
     struct FakeLlm {

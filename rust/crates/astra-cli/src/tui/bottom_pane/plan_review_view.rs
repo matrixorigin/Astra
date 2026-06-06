@@ -266,7 +266,12 @@ impl BottomPaneView for PlanReviewView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::PlanReviewView;
+    use crate::cli::chat_stream::PlanReviewDecision;
+    use crate::cli::permission_manager::PermissionMode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::oneshot;
 
     fn make_view() -> (PlanReviewView, oneshot::Receiver<PlanReviewDecision>) {
         let (tx, rx) = oneshot::channel();

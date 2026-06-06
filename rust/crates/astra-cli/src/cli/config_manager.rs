@@ -124,8 +124,10 @@ pub(crate) async fn resolve_optional_remote_session_id(
             }
 
             let sessions =
-                crate::cli::session_restore_client::list_cloud_resumable_sessions(profile, api)
-                    .await?;
+                crate::cli::session::session_restore_client::list_cloud_resumable_sessions(
+                    profile, api,
+                )
+                .await?;
             if let Some(session) = sessions.into_iter().find(|session| session.turn_count > 0) {
                 persist_profile_last_session_or_warn(
                     profile,
@@ -218,11 +220,11 @@ pub(crate) async fn execute_config_command(cmd: ConfigCmd) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{resolve_optional_remote_session_id, resolve_remote_session_id};
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
-    use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
+    use astra_services::session_journal::{JournalEvent, JournalWriter};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -269,14 +271,6 @@ mod tests {
             ))
             .mount(server)
             .await;
-    }
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
     }
 
     #[serial_test::serial]
@@ -326,7 +320,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn resolve_remote_session_id_prefers_validated_last_session_pointer() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let server = MockServer::start().await;
         let session_id = format!("cfg-live-{}", uuid::Uuid::new_v4());
@@ -625,7 +619,7 @@ fn config_set(key: &str, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod config_cli_tests {
-    use super::*;
+    use super::{KNOWN_SETTINGS, read_config_api_url_from};
     use crate::cli::arg_render::apply_system_prompt;
 
     #[test]

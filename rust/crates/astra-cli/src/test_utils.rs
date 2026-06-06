@@ -129,15 +129,106 @@ pub(crate) fn isolate_credentials() -> CredentialsGuard {
     CredentialsGuard { prev, _dir: dir }
 }
 
+// ── Session Journal Isolation ──────────────────────────────────────────
+
+pub(crate) fn isolated_sessions_dir() -> (
+    tempfile::TempDir,
+    astra_services::session_journal::JournalDirGuard,
+) {
+    let tmp = tempfile::tempdir().expect("create temp sessions dir");
+    let sessions = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create isolated sessions root");
+    let guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+    (tmp, guard)
+}
+
+// ── Stream Result Fixtures ─────────────────────────────────────────────
+
+pub(crate) fn stub_stream_result(
+    full_text: &str,
+) -> crate::cli::stream::streaming_types::StreamResult {
+    crate::cli::stream::streaming_types::StreamResult {
+        full_text: full_text.to_string(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn stub_stream_result_with_records(
+    full_text: &str,
+    tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
+) -> crate::cli::stream::streaming_types::StreamResult {
+    crate::cli::stream::streaming_types::StreamResult {
+        full_text: full_text.to_string(),
+        tool_calls_count: tool_call_records.len() as u32,
+        tools_used: tool_call_records
+            .iter()
+            .map(|record| record.name.clone())
+            .collect(),
+        tool_call_records,
+        ..Default::default()
+    }
+}
+
+// ── Async Test Waits ─────────────────────────────────────────────────
+
+pub(crate) async fn wait_until(
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+    mut condition: impl FnMut() -> bool,
+) -> Result<(), ()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+// ── UI Adapter Fixtures ────────────────────────────────────────────────
+
+#[derive(Default)]
+pub(crate) struct TestUi {
+    pub(crate) errors: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) infos: Vec<String>,
+    pub(crate) statuses: Vec<String>,
+    pub(crate) blank_lines: usize,
+}
+
+impl crate::cli::ui_adapter::ReplUiAdapter for TestUi {
+    fn show_error(&mut self, msg: &str) {
+        self.errors.push(msg.to_string());
+    }
+
+    fn show_warning(&mut self, msg: &str) {
+        self.warnings.push(msg.to_string());
+    }
+
+    fn show_info(&mut self, msg: &str) {
+        self.infos.push(msg.to_string());
+    }
+
+    fn show_status(&mut self, msg: &str) {
+        self.statuses.push(msg.to_string());
+    }
+
+    fn blank_line(&mut self) {
+        self.blank_lines += 1;
+    }
+}
+
 // ── Unit tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{HomeGuard, isolate_credentials};
 
     // ── HomeGuard ──────────────────────────────────────────────────
 
-    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_temp_creates_temp_dir() {
@@ -152,7 +243,6 @@ mod tests {
         drop(guard);
     }
 
-    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_set_redirects_home() {
@@ -167,7 +257,6 @@ mod tests {
         drop(guard);
     }
 
-    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_drop_restores_previous_home() {
@@ -189,7 +278,6 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_nested_restores_correctly() {
@@ -221,7 +309,6 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[test]
     #[serial_test::serial]
     fn home_guard_path_returns_current() {

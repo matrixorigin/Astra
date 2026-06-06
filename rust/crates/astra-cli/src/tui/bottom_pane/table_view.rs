@@ -99,9 +99,10 @@ impl BottomPaneView for TablePanelView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::TablePanelView;
     use crate::tui::table_view::parse;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

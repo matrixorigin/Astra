@@ -21,6 +21,8 @@ use uuid::Uuid;
 
 mod common;
 
+const EXPIRED_TASK_LEASE_AT: &str = "2000-01-01 00:00:00.000000";
+
 async fn setup_pool() -> SharedPool {
     common::setup_pool().await
 }
@@ -263,6 +265,68 @@ async fn push_tasks_pack_held_accepts_holder_rejects_other() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn push_tasks_pack_held_rejects_stale_holder_after_lease_transfer() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("push-pack-transfer")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    let lease =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
+    lease
+        .try_claim_lease(&user, &task_id, "agent-old", "edge-old", 120)
+        .await
+        .expect("claim old lease");
+
+    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+        .bind(EXPIRED_TASK_LEASE_AT)
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .expect("expire old lease");
+
+    lease
+        .try_claim_lease(&user, &task_id, "agent-new", "edge-new", 120)
+        .await
+        .expect("claim new lease");
+
+    let mut stale = sample_task_record(&task_id, &user);
+    stale.progress_pct = 91;
+    stale.agent_id = Some("agent-old".into());
+    let stale_pack = serde_json::to_string(&[stale]).expect("json");
+
+    let rejected = push_tasks_pack_held_mysql(&pool, &user, "agent-old", &stale_pack)
+        .await
+        .expect("push stale holder");
+    assert_eq!(rejected.applied, 0);
+    assert_eq!(rejected.rejected, 1);
+
+    let row = sqlx::query("SELECT progress_pct, agent_id FROM agent_tasks WHERE task_id = ?")
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("select after stale push");
+    let pct: i32 = row.try_get("progress_pct").expect("progress_pct");
+    let agent_id: Option<String> = row.try_get("agent_id").expect("agent_id");
+    assert_ne!(pct, 91, "stale holder must not overwrite task progress");
+    assert_eq!(agent_id.as_deref(), Some("agent-new"));
+
+    cleanup_task(&pool, &task_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
 async fn task_lease_renew_extends_expiry_and_version() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -346,13 +410,12 @@ async fn task_lease_expired_cannot_be_renewed() {
         .expect("claim");
 
     // Manually expire the lease in DB for test speed
-    sqlx::query(
-        "UPDATE task_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE task_id = ?",
-    )
-    .bind(&task_id)
-    .execute(&pool)
-    .await
-    .expect("expire lease");
+    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+        .bind(EXPIRED_TASK_LEASE_AT)
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .expect("expire lease");
 
     let result = lease
         .renew_lease(&user, &task_id, "agent-expire", "e1", 60)
@@ -795,13 +858,12 @@ async fn task_lease_claim_next_reclaims_orphaned_in_progress_after_expiry() {
         .await
         .expect("claim orphaned");
 
-    sqlx::query(
-        "UPDATE task_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE task_id = ?",
-    )
-    .bind(&orphaned_in_progress)
-    .execute(&pool)
-    .await
-    .expect("expire orphaned lease");
+    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+        .bind(EXPIRED_TASK_LEASE_AT)
+        .bind(&orphaned_in_progress)
+        .execute(&pool)
+        .await
+        .expect("expire orphaned lease");
 
     let next = lease
         .claim_next_claimable_lease(&user, "agent-c", "edge-c", 120)

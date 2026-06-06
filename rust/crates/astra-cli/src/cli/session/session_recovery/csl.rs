@@ -1,6 +1,10 @@
 //! CSL (Conversation State Log) operations: load, rebuild, snapshot.
-use super::io::*;
-use crate::cli::*;
+use super::io::{
+    csl_log_path_for, read_optional_file_bytes, restore_optional_file_bytes, sync_parent_dir,
+    write_bytes_atomic,
+};
+use crate::cli::session::session_state::SessionState;
+use astra_services::session_journal;
 
 pub(crate) async fn ensure_loaded_csl_state(
     state: &mut SessionState,
@@ -55,13 +59,9 @@ pub(crate) async fn rebuild_csl_from_history(
     let csl_path = csl_log_path_for(sid);
     let csl_backup = read_optional_file_bytes(&csl_path)?;
     if let Err(error) = write_full_csl_snapshot_atomic(sid, state.turn, messages, session_state) {
-        let mut error_message = error;
-        append_rollback_error(
-            &mut error_message,
-            "CSL snapshot",
-            restore_optional_file_bytes(&csl_path, csl_backup),
-        );
-        return Err(error_message);
+        return Err(restore_csl_snapshot_after_failure(
+            &csl_path, csl_backup, error,
+        ));
     }
 
     let store = std::sync::Arc::new(
@@ -75,27 +75,35 @@ pub(crate) async fn rebuild_csl_from_history(
         Default::default(),
     )
     .map_err(|e| {
-        let mut error_message = format!("reinitialize CSL manager: {e}");
-        append_rollback_error(
-            &mut error_message,
-            "CSL snapshot",
-            restore_optional_file_bytes(&csl_path, csl_backup.clone()),
-        );
-        error_message
+        restore_csl_snapshot_after_failure(
+            &csl_path,
+            csl_backup.clone(),
+            format!("reinitialize CSL manager: {e}"),
+        )
     })?;
     if !messages.is_empty() || state.turn > 0 {
         mgr.load().await.map_err(|e| {
-            let mut error_message = format!("reload rewritten CSL state: {e}");
-            append_rollback_error(
-                &mut error_message,
-                "CSL snapshot",
-                restore_optional_file_bytes(&csl_path, csl_backup.clone()),
-            );
-            error_message
+            restore_csl_snapshot_after_failure(
+                &csl_path,
+                csl_backup.clone(),
+                format!("reload rewritten CSL state: {e}"),
+            )
         })?;
     }
     state.csl_manager = Some(mgr);
     Ok(())
+}
+
+pub(super) fn restore_csl_snapshot_after_failure(
+    path: &std::path::Path,
+    backup: Option<Vec<u8>>,
+    mut error_message: String,
+) -> String {
+    match restore_optional_file_bytes(path, backup) {
+        Ok(()) => error_message.push_str("; rolled back CSL snapshot"),
+        Err(error) => error_message.push_str(&format!("; CSL snapshot rollback failed: {error}")),
+    }
+    error_message
 }
 
 /// Read the highest `seq` present in the on-disk CSL log, if any.

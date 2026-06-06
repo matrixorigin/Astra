@@ -1583,6 +1583,9 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
 
     fn mgr() -> TaskManager {
         TaskManager::in_memory()
@@ -1628,6 +1631,64 @@ mod tests {
     fn session_task_status_deserialize_unknown_uses_warned_parser() {
         let parsed: SessionTaskStatusKind = serde_json::from_str("\"paused\"").unwrap();
         assert_eq!(parsed, SessionTaskStatusKind::Other);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedLog {
+        fn output(&self) -> String {
+            let bytes = self.0.lock().expect("log lock").clone();
+            String::from_utf8(bytes).expect("log output should be utf8")
+        }
+    }
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLog {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn unknown_session_task_status_emits_warning() {
+        let log = SharedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                SessionTaskStatusKind::from_status_str("paused"),
+                SessionTaskStatusKind::Other
+            );
+        });
+
+        let output = log.output();
+        assert!(
+            output.contains("session_task_status_kind: unknown status"),
+            "warning message missing from log: {output}"
+        );
+        assert!(
+            output.contains("paused"),
+            "raw unknown status missing from log: {output}"
+        );
     }
 
     #[test]

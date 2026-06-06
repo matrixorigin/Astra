@@ -13,8 +13,5 @@
 
 pub(crate) mod stack;
 
-#[allow(unused_imports)]
-pub(crate) use stack::{EventResult, View, ViewStack};
-
 #[cfg(test)]
 mod tests;

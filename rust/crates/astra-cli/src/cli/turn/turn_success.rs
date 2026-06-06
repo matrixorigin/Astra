@@ -11,12 +11,15 @@ use super::turn_commit::commit_turn_journal_workspace_and_sidecars;
 use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
 use super::turn_post_commit::{extract_csl_fields_from_result, run_turn_post_commit_tasks};
 use super::turn_reporting::{build_history_text, print_turn_status_line};
-use super::*;
-use crate::StreamResult;
+use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
 #[cfg(test)]
 use crate::cli::session::session_improvement;
 use crate::cli::session::session_projection::build_continuation_anchor;
 use crate::cli::session::session_startup;
+use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
+use crate::cli::stream::streaming_types::StreamResult;
+use astra_services::session_journal;
+use crossterm::style::Stylize;
 
 /// Test-only sync variant of `apply_turn_success`. Production code paths must
 /// use [`apply_turn_success_async`] so the LLM-driven skill-improvement path
@@ -85,7 +88,7 @@ struct TurnSuccessLiveSnapshot {
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
-    pending_adaptive_state: Option<crate::cli::session_state::PersistedAdaptiveState>,
+    pending_adaptive_state: Option<crate::cli::session::session_state::PersistedAdaptiveState>,
     last_turn_interrupted: bool,
     session_persistence_error: Option<String>,
 }
@@ -220,7 +223,7 @@ fn apply_turn_success_sync(
     state.total_cache_read_tokens += result.cache_read_tokens;
     state.total_cache_creation_tokens += result.cache_creation_tokens;
 
-    let turn_cost = crate::cli::slash_stats::cost_for_tokens(
+    let turn_cost = crate::cli::slash::slash_stats::cost_for_tokens(
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -265,7 +268,7 @@ fn apply_turn_success_sync(
     let commit_outcome = commit_turn_journal_workspace_and_sidecars(
         state,
         line,
-        &result,
+        &mut result,
         &learning_snap,
         turn_start,
     );
@@ -315,73 +318,19 @@ fn apply_turn_success_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{apply_turn_success, apply_turn_success_async, apply_turn_success_sync};
     use crate::cli::session::session_state::PersistedAdaptiveState;
-
-    #[derive(Default)]
-    struct CollectingUi;
-
-    impl crate::cli::ui_adapter::ReplUiAdapter for CollectingUi {
-        fn show_error(&mut self, _msg: &str) {}
-        fn show_warning(&mut self, _msg: &str) {}
-        fn show_info(&mut self, _msg: &str) {}
-        fn show_status(&mut self, _msg: &str) {}
-        fn blank_line(&mut self) {}
-    }
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
-
-    fn stub_stream_result(full_text: &str) -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: full_text.to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls_count: 0,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: Vec::new(),
-            tool_call_records: Vec::new(),
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
-    }
+    use crate::cli::session::session_state::SessionState;
+    use astra_services::session_journal;
+    use std::time::Instant;
 
     #[test]
     #[serial_test::serial]
     fn apply_turn_success_sets_prompt_hint_for_followup() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
 
         let mut state = SessionState::default();
-        let mut result = stub_stream_result("Updated the code.");
+        let mut result = crate::tests::stub_stream_result("Updated the code.");
         result.tools_used = vec!["str_replace".to_string()];
 
         apply_turn_success(&mut state, None, "fix the bug", result, Instant::now());
@@ -398,7 +347,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn apply_turn_success_clears_stale_prompt_hint_when_suppressed() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
 
         let mut state = SessionState {
             cloud_plan_mirror: Some(astra_runtime::plan::PlanModeState::new("goal".to_string())),
@@ -407,7 +356,7 @@ mod tests {
         state
             .perm_manager
             .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
-        let result = stub_stream_result("Plan updated.");
+        let result = crate::tests::stub_stream_result("Plan updated.");
 
         apply_turn_success(&mut state, None, "continue", result, Instant::now());
 
@@ -417,7 +366,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn apply_turn_success_rolls_back_live_state_when_turn_journal_fails() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("turn-success-journal-fail-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         std::fs::create_dir(writer.path()).unwrap();
@@ -436,7 +385,7 @@ mod tests {
             recent_tools: vec!["read_file".into()],
             ..Default::default()
         };
-        let mut result = stub_stream_result("new response");
+        let mut result = crate::tests::stub_stream_result("new response");
         result.prompt_tokens = 11;
         result.completion_tokens = 13;
         result.cache_read_tokens = 17;
@@ -471,13 +420,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn apply_turn_success_async_rolls_back_first_turn_without_post_commit_side_effects() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("turn-success-first-turn-fail-{}", uuid::Uuid::new_v4());
         let journal_path = session_journal::journal_file_path(&sid);
         std::fs::create_dir_all(&journal_path).unwrap();
 
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-        let mut ui = CollectingUi;
+        let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
             last_turn_interrupted: true,
             observability_hub: Some(std::sync::Arc::new(
@@ -489,7 +438,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut result = stub_stream_result("new response");
+        let mut result = crate::tests::stub_stream_result("new response");
         result.session_id = Some(sid.clone());
         result.run_id = Some("run-1".into());
         result.final_messages = vec![serde_json::json!({"role": "assistant", "content": "done"})];
@@ -514,7 +463,7 @@ mod tests {
         assert_eq!(state.task_manager.session_id(), "");
         assert!(state.pending_adaptive_state.is_some());
         assert!(
-            !crate::cli::session_recovery::io::csl_log_path_for(&sid).exists(),
+            !crate::cli::session::session_recovery::io::csl_log_path_for(&sid).exists(),
             "post-commit CSL persistence must be skipped when the primary turn commit fails"
         );
         assert!(
@@ -529,7 +478,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn apply_turn_success_rebinds_observability_session_through_hub() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
         let pending = hub.start_session("user-1", "pending");
         let mut state = SessionState {
@@ -542,7 +491,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut result = stub_stream_result("done");
+        let mut result = crate::tests::stub_stream_result("done");
         result.session_id = Some("sess-live".into());
         result.run_id = Some("run-1".into());
 

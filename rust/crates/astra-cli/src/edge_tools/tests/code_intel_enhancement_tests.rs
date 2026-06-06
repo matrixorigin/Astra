@@ -1,4 +1,6 @@
-use super::*;
+use super::{ToolExecutor, all_tool_schemas};
+use crate::edge_tools::categorize_reference;
+use serde_json::json;
 
 // ── Code Intelligence Enhancement Tests ──
 

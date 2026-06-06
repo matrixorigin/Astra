@@ -269,7 +269,17 @@ pub(crate) fn unfinished_task_notice(status: TaskStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        encode_task_failure_message, parse_task_failure_message, task_checkpoint_surface,
+        task_list_item_claimability_icon, task_list_item_claimability_label,
+        task_list_item_outcome, task_list_item_status_icon, task_list_item_status_label,
+        task_record_error_detail, task_record_error_kind, task_record_outcome,
+        task_record_status_icon, task_record_status_label, task_status_icon, task_status_label,
+        unfinished_task_notice,
+    };
+    use astra_services::{
+        TaskCheckpoint, TaskClaimability, TaskListItem, TaskOutcome, TaskRecord, TaskStatus,
+    };
 
     fn checkpoint(entries: [(&str, serde_json::Value); 4]) -> TaskCheckpoint {
         TaskCheckpoint {

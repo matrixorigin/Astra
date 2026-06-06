@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use sqlx::Row;
 
-use super::metrics::SharedMultiAgentMetrics;
+use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
 
 pub struct EdgeDispatchRow {
     pub dispatch_id: i64,
@@ -282,7 +282,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
         let affected = n.rows_affected() > 0;
         if affected && let Some(ref m) = self.metrics {
-            m.dispatch_queue_depth.fetch_sub(1, Ordering::Relaxed);
+            saturating_decrement(&m.dispatch_queue_depth);
             m.dispatch_latency.record(start.elapsed());
         }
         Ok(affected)

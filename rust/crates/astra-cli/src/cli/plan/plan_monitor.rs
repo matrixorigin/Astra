@@ -1,11 +1,12 @@
 //! Plan execution progress rendering and blocking monitor loop.
 
-use super::*;
 use crate::cli::chat_stream;
 use crate::cli::cli_config::cli_formatting;
 use crate::cli::cli_config::cli_utils::append_journal_event_or_warn;
 use crate::cli::durable_bridge;
 use crate::cli::effects;
+use crate::cli::plan::plan_executor;
+use crate::cli::session::session_side_effects;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::stream_render;
 use crate::cli::stream::streaming_md;
@@ -981,7 +982,7 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
                 &event,
                 "plan_monitor:plan_failed_event",
             );
-            super::session_side_effects::enqueue_ingestion_pub(state, &event);
+            session_side_effects::enqueue_ingestion_pub(state, &event);
         }
         // 2. interruption_recorded for the crash
         let interruption = astra_services::session_journal::JournalEvent::interruption_recorded(
@@ -999,7 +1000,7 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
             &interruption,
             "plan_monitor:plan_crash_interruption",
         );
-        super::session_side_effects::enqueue_ingestion_pub(state, &interruption);
+        session_side_effects::enqueue_ingestion_pub(state, &interruption);
     }
 
     state.executing_plan = None;
@@ -1254,7 +1255,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     };
     if let Some(goal) = state.executing_plan_goal.as_deref()
         && let Err(error) =
-            crate::cli::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
+            crate::cli::plan::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
     {
         tracing::warn!(
             goal = %goal,
@@ -1262,7 +1263,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
             "failed to ensure executing plan is mirrored into task board"
         );
     }
-    let plan_fingerprint = crate::cli::plan_task_board::plan_task_board_fingerprint(plan);
+    let plan_fingerprint = crate::cli::plan::plan_task_board::plan_task_board_fingerprint(plan);
     for subtask in &plan.subtasks {
         if let Err(error) =
             sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
@@ -1280,7 +1281,12 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
+        sync_task_board_from_executing_plan, sync_task_board_subtask_status,
+    };
+    use crate::cli::plan::plan_executor;
+    use crate::cli::session::session_state::SessionState;
     use astra_services::task_orchestrator::{
         LocalTaskService, SubtaskPlan, TaskCreateRequest, TaskOutcome, TaskPlan, TaskStatus,
     };
@@ -1336,7 +1342,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plan_fingerprint = crate::cli::plan_task_board::plan_task_board_fingerprint(&plan);
+        let plan_fingerprint =
+            crate::cli::plan::plan_task_board::plan_task_board_fingerprint(&plan);
         let create = state
             .task_manager
             .create(&serde_json::json!({
@@ -1391,7 +1398,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::cli::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
+        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
             .await
             .unwrap();
 
@@ -1404,7 +1411,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::cli::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
+        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
             .await
             .unwrap();
         state.executing_plan = Some(current);

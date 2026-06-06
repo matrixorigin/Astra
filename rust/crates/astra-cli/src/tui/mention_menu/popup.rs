@@ -151,10 +151,14 @@ pub(crate) fn format_replacement(entry: &FileEntry) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::MentionToken;
-    use super::super::provider::{FileKind, StaticFileProvider};
-    use super::*;
+    use super::super::menu::MentionToken;
+    use super::super::provider::{FileEntry, FileKind, StaticFileProvider};
+    use super::{desired_height, format_replacement, render};
+    use crate::tui::mention_menu::MentionMenu;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     fn fixture_menu() -> MentionMenu {
         let mut menu = MentionMenu::new(StaticFileProvider::with_root_listing(&[

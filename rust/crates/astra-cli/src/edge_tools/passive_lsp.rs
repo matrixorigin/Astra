@@ -698,8 +698,16 @@ impl PassiveLspManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::LspStdioSession;
+    use super::{
+        ASTRA_LSP_CONFIG_FILE, PassiveLspManager, rust_lsp_config, rust_spawn_spec,
+        should_use_rust_lsp, should_use_typescript_lsp, typescript_lsp_config,
+        typescript_spawn_spec,
+    };
+    use std::path::Path;
     use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tokio::time::sleep;
 
     struct EnvGuard {
         key: &'static str,

@@ -33,7 +33,7 @@ pub(crate) struct ExecutionStateSummaryInput<'a> {
 }
 
 pub(crate) fn format_for_session_state(
-    state: &crate::cli::session_state::SessionState,
+    state: &crate::cli::session::session_state::SessionState,
     tasks: &[SessionTask],
 ) -> Option<String> {
     format_summary(ExecutionStateSummaryInput {
@@ -99,7 +99,7 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
         lifecycle_lines.push(event_line);
     }
 
-    let task_block = crate::cli::task_summary::format_summary(input.tasks);
+    let task_block = crate::cli::task::task_summary::format_summary(input.tasks);
     if lifecycle_lines.is_empty() {
         return task_block;
     }
@@ -284,11 +284,15 @@ fn preview(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ExecutionStateSummaryInput, format_summary};
+    use astra_runtime::plan::PlanModeState;
     use astra_services::VerifierKind;
     use astra_services::durable_task::{
-        ContractStatus, DurableSubtask, TaskScope, VerificationCriterion,
+        ContractStatus, DurableSubtask, SubtaskStage, TaskContract, TaskScope,
+        VerificationCriterion,
     };
+    use astra_services::session_journal::JournalEvent;
+    use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
     use astra_tools::task_mgmt::{SessionSubtask, SessionTask};
 
     fn task(id: &str, title: &str, status: &str) -> SessionTask {

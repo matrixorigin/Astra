@@ -1,4 +1,4 @@
-use super::*;
+use astra_runtime::prompts;
 
 /// Pull a few Memoria hits after compact so the shortened context keeps
 /// session-relevant recall as an anchor after compaction.
@@ -99,7 +99,8 @@ pub(crate) fn compact_assistant_message(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::compact_assistant_message;
+    use crate::cli::session::session_state::SessionState;
 
     #[test]
     fn continuation_anchor_survives_simulated_compaction() {
@@ -137,7 +138,7 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = crate::cli::session_input::build_effective_line(
+        let effective = crate::cli::session::session_input::build_effective_line(
             "继续",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -155,7 +156,7 @@ mod tests {
             "user prompt appended"
         );
 
-        let normal = crate::cli::session_input::build_effective_line(
+        let normal = crate::cli::session::session_input::build_effective_line(
             "explain Pin in detail",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -180,7 +181,7 @@ mod tests {
             ("deploy it".into(), "docker build...".into()),
         ];
 
-        let messages = super::super::session_projection::history_as_messages(&history);
+        let messages = crate::cli::session::session_projection::history_as_messages(&history);
 
         assert_eq!(messages[0]["role"], "assistant");
         assert!(

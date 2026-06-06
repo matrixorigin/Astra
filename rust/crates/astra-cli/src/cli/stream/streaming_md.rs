@@ -488,7 +488,11 @@ fn is_block_start(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        StreamingMarkdown, could_become_suppressed_tag, find_attr_tag_open,
+        find_last_block_boundary, has_open_xml_tag, render_md, rendered_to_lines,
+        strip_leading_narration, strip_xml_tags_inplace,
+    };
 
     #[test]
     fn no_boundary_in_single_block() {

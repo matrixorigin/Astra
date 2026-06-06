@@ -1,4 +1,4 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
 use crate::{cli_dim, cli_err, cli_ok, cli_warn};
 
 /// Handle the `/bug` slash command — generate a diagnostic report for bug reports.
@@ -11,7 +11,7 @@ pub(crate) fn handle_bug_command(arg: &str, state: &SessionState) {
     let report = build_bug_report(state);
 
     match arg.trim() {
-        "copy" => match crate::cli::slash_info::copy_to_clipboard(&report) {
+        "copy" => match crate::cli::slash::slash_info::copy_to_clipboard(&report) {
             Ok(()) => cli_ok!("Bug report copied to clipboard."),
             Err(error) => {
                 cli_warn!("Could not copy to clipboard: {}", error);
@@ -90,7 +90,7 @@ fn build_bug_report(state: &SessionState) -> String {
     if state.total_session_cost > 0.0 {
         lines.push(format!(
             "- **Cost**: {}",
-            crate::cli::slash_stats::format_cost(state.total_session_cost)
+            crate::cli::slash::slash_stats::format_cost(state.total_session_cost)
         ));
     }
     lines.push(String::new());

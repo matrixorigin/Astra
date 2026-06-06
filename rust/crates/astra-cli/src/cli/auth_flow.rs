@@ -1,5 +1,7 @@
-use super::*;
-use crate::cli::cli_config::cli_utils::{CredentialStore, Profile, credential_store};
+use crate::cli::cli_config::cli_utils::{
+    CredentialStore, Profile, credential_store, map_thin_err, profile_name,
+};
+use serde::Deserialize;
 
 /// Session authentication failure that can be repaired by `/login`.
 ///
@@ -9,7 +11,7 @@ pub(crate) fn is_auth_error(error: &str) -> bool {
     if is_llm_provider_auth_error(error) {
         return false;
     }
-    crate::cli::cli_utils::is_astra_session_auth_error(error)
+    crate::cli::cli_config::cli_utils::is_astra_session_auth_error(error)
 }
 
 /// Detect upstream LLM provider authentication failures such as Bedrock or
@@ -117,8 +119,8 @@ pub(crate) async fn do_register(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::cli_config::cli_utils::{load_credentials, save_credentials};
+    use super::{clear_profile_auth, is_auth_error, is_llm_provider_auth_error};
+    use crate::cli::cli_config::cli_utils::{Profile, load_credentials, save_credentials};
 
     #[test]
     fn auth_error_predicates_distinguish_provider_from_session() {

@@ -37,7 +37,7 @@ use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 use unicode_width::UnicodeWidthStr;
 
-use crate::cli::surface::session_task_surface::SessionTaskStatusKind;
+use astra_tools::task_mgmt::SessionTaskStatusKind;
 
 /// Colour triple the widget reads for all status rendering. Built from
 /// `tui::theme::current()` at render time so light and dark terminals

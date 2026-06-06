@@ -1,7 +1,23 @@
-use super::*;
 use crate::cli::surface::health_status_surface::api_probe_is_healthy;
+use crate::cli::{
+    chat_stream::{ChatTurnParams, stream_chat_sse},
+    cli_config::cli_utils::truncate_str,
+    durable_bridge,
+    permission_manager::PermissionManager,
+    session::session_state::SessionState,
+    stream::stream_render,
+    theme,
+};
 use crate::edge_tools;
+use astra_runtime::prompts;
 use astra_services::session_journal;
+use crossterm::style::Stylize;
+use std::{
+    collections::HashSet,
+    io::Write,
+    path::PathBuf,
+    process::{Command as SysCommand, Stdio},
+};
 
 // ── Context status thresholds ────────────────────────────────────────────────
 // Used for color-coding pressure indicators in /info and context displays.
@@ -854,7 +870,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 }
                 _ => String::new(),
             };
-            let display = super::stream_render::format_tool_display_from_preview(
+            let display = stream_render::format_tool_display_from_preview(
                 &tc.name,
                 tc.args_preview.as_deref(),
             );
@@ -980,7 +996,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 (None, None) => String::new(),
             };
 
-            let display = super::stream_render::format_tool_display_from_preview(
+            let display = stream_render::format_tool_display_from_preview(
                 &tc.name,
                 tc.args_preview.as_deref(),
             );
@@ -1236,7 +1252,7 @@ pub(crate) async fn handle_info_command(
                     .magenta()
             );
             let _pipeline_modules =
-                crate::cli::session_runtime::create_pipeline_modules_quiet(api, None);
+                crate::cli::session::session_runtime::create_pipeline_modules_quiet(api, None);
             let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
@@ -1253,7 +1269,7 @@ pub(crate) async fn handle_info_command(
                 history: &state.history,
                 perm_manager: &mut pm,
                 verbose_mode: state.verbose_mode,
-                render_policy: crate::cli::stream_render::RenderPolicy::Stream,
+                render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
                 cli_context: Some(&state.cli_context),
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
@@ -1309,7 +1325,7 @@ pub(crate) async fn handle_info_command(
             .await
             .map_err(|f| f.error)?;
             if let Some(session_id) = sr.session_id.as_deref() {
-                crate::cli::session_startup::initialize_journal_pub(state, session_id);
+                crate::cli::session::session_startup::initialize_journal_pub(state, session_id);
                 state.set_session_id(session_id.to_string());
             }
             state.last_response = Some(sr.full_text.clone());
@@ -1361,7 +1377,7 @@ pub(crate) async fn handle_info_command(
                     turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
                 }
                 state.last_turn_event = Some(turn_event.clone());
-                crate::cli::cli_utils::append_journal_event_or_warn(
+                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                     journal,
                     state.session_id.as_deref(),
                     &turn_event,
@@ -1952,7 +1968,7 @@ pub(crate) async fn handle_info_command(
                     state.turn = 0;
                     state.last_response = None;
                     if let Some(ref j) = state.journal {
-                        crate::cli::cli_utils::append_journal_event_or_warn(
+                        crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                             j,
                             state.session_id.as_deref(),
                             &session_journal::JournalEvent::config_change(
@@ -1983,7 +1999,7 @@ pub(crate) async fn handle_info_command(
                     state.turn = target as u32;
                     state.last_response = state.history.last().map(|(_, a)| a.clone());
                     if let Some(ref j) = state.journal {
-                        crate::cli::cli_utils::append_journal_event_or_warn(
+                        crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                             j,
                             state.session_id.as_deref(),
                             &session_journal::JournalEvent::config_change(
@@ -2013,9 +2029,9 @@ pub(crate) async fn handle_info_command(
                 .or(state.last_delivery_report.as_ref());
 
             if let Some(report) = report {
-                super::durable_bridge::display_delivery_report(report);
+                durable_bridge::display_delivery_report(report);
                 if arg.trim() == "save" || arg.trim() == "json" {
-                    super::durable_bridge::save_delivery_report_json(report);
+                    durable_bridge::save_delivery_report_json(report);
                 }
             } else {
                 eprintln!(
@@ -2431,16 +2447,14 @@ fn print_cognition_view(state: &SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_services::session_journal::JournalDirGuard;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
+    use super::{
+        GrepRequest, ReviewGitTarget, ReviewMatch, build_review_prompt, collect_changed_files,
+        describe_context_pressure, format_review_search_result, journal_seq_for_last_turn,
+        parse_grep_request, parse_review_git_target, parse_review_match, render_cognition,
+        render_whoami,
+    };
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
+    use astra_services::session_journal;
 
     #[test]
     fn parse_grep_request_defaults_to_content_search() {
@@ -2541,7 +2555,6 @@ mod tests {
 
     #[test]
     fn parse_review_git_target_accepts_common_aliases() {
-        use super::{ReviewGitTarget, parse_review_git_target};
         assert_eq!(parse_review_git_target(""), ReviewGitTarget::Head);
         assert_eq!(parse_review_git_target("latest"), ReviewGitTarget::Head);
         assert_eq!(
@@ -2568,7 +2581,6 @@ mod tests {
 
     #[test]
     fn parse_review_git_target_recognizes_multi_commit() {
-        use super::{ReviewGitTarget, parse_review_git_target};
         assert_eq!(
             parse_review_git_target("latest 2 commits"),
             ReviewGitTarget::LastN(2)
@@ -2704,7 +2716,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn journal_seq_for_last_turn_surfaces_read_error() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("turn-seq-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
         let event = session_journal::JournalEvent::turn(

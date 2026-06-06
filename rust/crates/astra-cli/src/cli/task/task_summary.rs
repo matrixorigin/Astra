@@ -15,8 +15,7 @@
 //!   `None` so the caller just skips injection instead of padding
 //!   the prompt with "no tasks".
 
-use crate::cli::surface::session_task_surface::SessionTaskStatusKind;
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind};
 
 /// Render the summary. `None` means "the model doesn't need to
 /// hear about tasks this turn" (either nothing exists or the list
@@ -106,8 +105,8 @@ fn counts(tasks: &[SessionTask]) -> (usize, usize, usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_tools::task_mgmt::SessionSubtask;
+    use super::format_summary;
+    use astra_tools::task_mgmt::{SessionSubtask, SessionTask};
 
     fn task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {

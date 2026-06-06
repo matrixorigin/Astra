@@ -424,7 +424,13 @@ fn star_frame(now: Instant) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        IndicatorState, StatusIndicator, approx_tokens, fmt_duration_coarse, fmt_tokens,
+        label_spans_for_mode, render_for, stall_intensity_color,
+    };
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use std::time::{Duration, Instant};
 
     fn text_of(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.to_string()).collect()

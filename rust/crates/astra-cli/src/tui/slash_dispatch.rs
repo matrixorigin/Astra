@@ -5,9 +5,9 @@
 //! produce output render to scrollback. Unrecognized or complex commands
 //! fall back to `with_restored()` which temporarily exits the TUI.
 
-use crate::ExplainMode;
 use crate::cli::command_registry;
 use crate::cli::command_registry::TuiHandler;
+use crate::cli::session::session_state::ExplainMode;
 use crate::cli::session::session_state::SessionState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
@@ -168,19 +168,20 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Fallback;
             }
 
-            if crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
-                crate::cli::slash_plan::exit_local_plan_mode(ctx.state);
+            if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
+                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
                 return SlashResult::Handled;
             }
 
             if ctx.state.cloud_plan_mirror.is_some() {
                 let Some(token) =
-                    crate::cli::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile).await
+                    crate::cli::plan::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile)
+                        .await
                 else {
                     ctx.show_error("Not logged in. Use /login.".into());
                     return SlashResult::Handled;
                 };
-                if let Err(error) = crate::cli::plan_lifecycle::exit_remote_plan_mode(
+                if let Err(error) = crate::cli::plan::plan_lifecycle::exit_remote_plan_mode(
                     ctx.api, &token, ctx.state, true,
                 )
                 .await
@@ -195,12 +196,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
 
             let Some(_token) =
-                crate::cli::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile).await
+                crate::cli::plan::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile).await
             else {
                 ctx.show_error("Not logged in. Use /login.".into());
                 return SlashResult::Handled;
             };
-            crate::cli::slash_plan::enter_local_plan_mode(ctx.state);
+            crate::cli::slash::slash_plan::enter_local_plan_mode(ctx.state);
             SlashResult::Handled
         }
 
@@ -771,7 +772,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             match &ctx.state.last_response {
                 Some(resp) if !resp.is_empty() => {
                     let n = resp.chars().count();
-                    if let Err(error) = crate::cli::slash_info::copy_to_clipboard(resp) {
+                    if let Err(error) = crate::cli::slash::slash_info::copy_to_clipboard(resp) {
                         ctx.show_error(format!("Copy failed: {error}"));
                     } else {
                         let preview: String = resp.chars().take(60).collect();
@@ -965,7 +966,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     return SlashResult::Handled;
                 }
             };
-            let token = crate::cli::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
+            let token =
+                crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile)
+                    .await;
             let Some(token) = token else {
                 ctx.show_error("Not logged in. Use /login.".into());
                 return SlashResult::Handled;
@@ -976,7 +979,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     ctx.show_error("No active session yet.".into());
                     return SlashResult::Handled;
                 };
-                match crate::cli::slash_memory::load_current_session_memory(
+                match crate::cli::slash::slash_memory::load_current_session_memory(
                     ctx.api, &token, session_id,
                 )
                 .await
@@ -987,17 +990,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             .map(|memory| memory.body.as_str())
                             .unwrap_or_default();
                         let hint = if body.trim().is_empty() {
-                            crate::cli::slash_memory::latest_session_memory_status_hint(session_id)
+                            crate::cli::slash::slash_memory::latest_session_memory_status_hint(
+                                session_id,
+                            )
                         } else {
                             None
                         };
                         let summary = record.as_ref().and_then(|memory| memory.summary.as_deref());
-                        let status = crate::cli::slash_memory::session_memory_surface_status(
+                        let status = crate::cli::slash::slash_memory::session_memory_surface_status(
                             session_id,
                             record.as_ref(),
                         );
                         ctx.show_response(
-                            crate::cli::slash_memory::format_session_memory_response(
+                            crate::cli::slash::slash_memory::format_session_memory_response(
                                 summary,
                                 body,
                                 Some(session_id),
@@ -1016,7 +1021,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
                 match crate::edge_tools::memoria::memoria_health().await {
                     Ok(body) => {
-                        let lines = crate::cli::slash_memory::memory_health_lines(&body);
+                        let lines = crate::cli::slash::slash_memory::memory_health_lines(&body);
                         ctx.bottom_pane.push_view(Box::new(
                             InfoView::from_plain("Memory Health", lines)
                                 .with_reopen("/memory health"),
@@ -1030,13 +1035,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let (query, top_k, stats_view) = match route {
                 MemoryCommandRoute::Search(query) => (query, 20, false),
                 MemoryCommandRoute::List => (
-                    crate::cli::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
-                    crate::cli::slash_memory::MEMORY_BROWSE_TOP_K,
+                    crate::cli::slash::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::cli::slash::slash_memory::MEMORY_BROWSE_TOP_K,
                     false,
                 ),
                 MemoryCommandRoute::Stats => (
-                    crate::cli::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
-                    crate::cli::slash_memory::MEMORY_STATS_TOP_K,
+                    crate::cli::slash::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::cli::slash::slash_memory::MEMORY_STATS_TOP_K,
                     true,
                 ),
                 MemoryCommandRoute::Fallback => return SlashResult::Fallback,
@@ -1055,7 +1060,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             if stats_view {
                                 use crate::tui::bottom_pane::info_view::InfoView;
 
-                                let lines = crate::cli::slash_memory::memory_stats_lines(&arr);
+                                let lines =
+                                    crate::cli::slash::slash_memory::memory_stats_lines(&arr);
                                 ctx.bottom_pane.push_view(Box::new(
                                     InfoView::from_plain("Memory Stats", lines)
                                         .with_reopen("/memory stats"),
@@ -1068,7 +1074,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                                 .filter_map(|m| {
                                     let content =
                                         m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
-                                    if crate::cli::slash_memory::is_session_proto(content) {
+                                    if crate::cli::slash::slash_memory::is_session_proto(content) {
                                         hidden_session_entries += 1;
                                         return None;
                                     }
@@ -1079,7 +1085,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                                         .unwrap_or("");
                                     let short_id = &id[..std::cmp::min(8, id.len())];
                                     Some(SelectionItem {
-                                        name: crate::cli::slash_memory::format_memory_entry_line(m),
+                                        name: crate::cli::slash::slash_memory::format_memory_entry_line(m),
                                         description: Some(format!("id:{short_id}")),
                                         is_current: false,
                                     })
@@ -1551,7 +1557,8 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ("cost", format!("${:.4}", state.total_session_cost)),
             ];
             if !sid.is_empty() {
-                match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid) {
+                match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
+                {
                     Ok(events) => {
                         let stats = session_analytics::compute_session_stats(&sid, &events);
                         pairs.push((
@@ -1614,17 +1621,18 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ));
                 return;
             }
-            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
-            {
-                Ok(events) => events,
-                Err(error) => {
-                    bottom_pane.push_view(Box::new(
-                        InfoView::from_plain("Tool Performance", vec![format!("  {error}")])
-                            .with_reopen("/stats"),
-                    ));
-                    return;
-                }
-            };
+            let events =
+                match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        bottom_pane.push_view(Box::new(
+                            InfoView::from_plain("Tool Performance", vec![format!("  {error}")])
+                                .with_reopen("/stats"),
+                        ));
+                        return;
+                    }
+                };
             let profiles = session_analytics::compute_tool_profiles(&events);
             if profiles.is_empty() {
                 bottom_pane.push_view(Box::new(
@@ -1667,7 +1675,7 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
 
         "cost" => {
             let pricing = &state.cached_pricing;
-            let cost = crate::cli::slash_stats::cost_for_tokens(
+            let cost = crate::cli::slash::slash_stats::cost_for_tokens(
                 state.total_prompt_tokens,
                 state.total_completion_tokens,
                 state.total_cache_read_tokens,
@@ -1691,7 +1699,7 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                     format!(
                         "{} ({})",
                         state.total_prompt_tokens,
-                        crate::cli::slash_stats::format_cost(
+                        crate::cli::slash::slash_stats::format_cost(
                             state.total_prompt_tokens as f64 * pricing.prompt / 1000.0
                         )
                     ),
@@ -1701,7 +1709,7 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                     format!(
                         "{} ({})",
                         state.total_completion_tokens,
-                        crate::cli::slash_stats::format_cost(
+                        crate::cli::slash::slash_stats::format_cost(
                             state.total_completion_tokens as f64 * pricing.completion / 1000.0
                         )
                     ),
@@ -1714,17 +1722,17 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                     format!(
                         "{} ({})",
                         state.total_cache_read_tokens,
-                        crate::cli::slash_stats::format_cost(
+                        crate::cli::slash::slash_stats::format_cost(
                             state.total_cache_read_tokens as f64 * rate / 1000.0
                         )
                     ),
                 ));
             }
-            pairs.push(("total", crate::cli::slash_stats::format_cost(cost)));
+            pairs.push(("total", crate::cli::slash::slash_stats::format_cost(cost)));
             if state.turn > 0 {
                 pairs.push((
                     "avg/turn",
-                    crate::cli::slash_stats::format_cost(cost / state.turn as f64),
+                    crate::cli::slash::slash_stats::format_cost(cost / state.turn as f64),
                 ));
             }
             bottom_pane.push_view(Box::new(
@@ -1777,17 +1785,18 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ));
                 return;
             }
-            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
-            {
-                Ok(events) => events,
-                Err(error) => {
-                    bottom_pane.push_view(Box::new(
-                        InfoView::from_plain("Tool Health", vec![format!("  {error}")])
-                            .with_reopen("/stats"),
-                    ));
-                    return;
-                }
-            };
+            let events =
+                match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        bottom_pane.push_view(Box::new(
+                            InfoView::from_plain("Tool Health", vec![format!("  {error}")])
+                                .with_reopen("/stats"),
+                        ));
+                        return;
+                    }
+                };
             let profiles = session_analytics::compute_tool_profiles(&events);
             let mut lines = Vec::new();
             for p in &profiles {
@@ -1820,7 +1829,7 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
 fn build_recent_session_history_lines(limit: usize) -> Result<Vec<String>, String> {
     use astra_services::session_analytics;
 
-    let scan = crate::cli::session_stats_scan::collect_recent_session_stats(limit)?;
+    let scan = crate::cli::session::session_stats_scan::collect_recent_session_stats(limit)?;
     if scan.stats.is_empty() && scan.unreadable.is_empty() {
         return Ok(vec!["  No sessions found.".into()]);
     }
@@ -1885,7 +1894,7 @@ fn split_sub(text: &str) -> (&str, &str) {
 async fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::cli::slash::slash_mcp::ParsedMcpCommand as Cmd;
 
-    match crate::cli::slash_mcp::parse_mcp_command(args) {
+    match crate::cli::slash::slash_mcp::parse_mcp_command(args) {
         Cmd::Help => {
             ctx.show_response(mcp_help_text(ctx.state).await);
             SlashResult::Handled
@@ -2438,7 +2447,7 @@ fn mcp_builtin_tool_text(meta: &astra_turn_core::tool::registry::meta::ToolMeta)
 
 async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
     let manager = state.mcp_manager.read().await;
-    match crate::cli::slash_mcp::resolve_protocol_tool_query(&manager, query) {
+    match crate::cli::slash::slash_mcp::resolve_protocol_tool_query(&manager, query) {
         Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
         Err(protocol_error) => {
             for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
@@ -2577,7 +2586,8 @@ pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
 /// and Astra's own HTTP 401 format (`"request failed (401): ..."`).
 /// Generic upstream `401 Unauthorized` text must NOT trigger `/login`.
 fn is_astra_auth_error(msg: &str) -> bool {
-    crate::cli::cli_utils::is_astra_session_auth_error(msg) || msg.contains("request failed (401)")
+    crate::cli::cli_config::cli_utils::is_astra_session_auth_error(msg)
+        || msg.contains("request failed (401)")
 }
 
 /// Build the model picker view from a fetched model list and push it.
@@ -2614,8 +2624,9 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    let token = crate::cli::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
-    match crate::cli::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
+    let token =
+        crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
+    match crate::cli::slash::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
         Ok(models) => {
             if push_model_picker(ctx, models) {
                 return SlashResult::Deferred;
@@ -2627,10 +2638,16 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 // Attempt silent token refresh + retry once. If the retry
                 // itself fails with a non-auth error (e.g. 5xx after refresh),
                 // surface that real error instead of the generic /login hint.
-                if crate::cli::session_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
-                    let fresh = crate::cli::session_runtime::current_access_token(ctx.profile);
-                    match crate::cli::slash_router::fetch_model_list(ctx.api, fresh.as_deref())
-                        .await
+                if crate::cli::session::session_runtime::attempt_token_refresh(ctx.api, ctx.profile)
+                    .await
+                {
+                    let fresh =
+                        crate::cli::session::session_runtime::current_access_token(ctx.profile);
+                    match crate::cli::slash::slash_router::fetch_model_list(
+                        ctx.api,
+                        fresh.as_deref(),
+                    )
+                    .await
                     {
                         Ok(models) => {
                             if push_model_picker(ctx, models) {
@@ -2673,15 +2690,15 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.show_error("Model name cannot be empty — try `/model list`.".into());
         return;
     }
-    let Some(name) = crate::cli::cli_utils::normalize_model_override(Some(name)) else {
+    let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
-        crate::cli::slash_config::set_active_model_for_display(None);
+        crate::cli::slash::slash_config::set_active_model_for_display(None);
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model override cleared — using API default.".into());
         return;
     };
     ctx.state.model = Some(name.to_string());
-    crate::cli::slash_config::set_active_model_for_display(Some(name.to_string()));
+    crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
 }
@@ -2691,7 +2708,7 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 /// the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
-    crate::cli::slash_config::set_active_model_for_display(None);
+    crate::cli::slash::slash_config::set_active_model_for_display(None);
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model override cleared — using API default.".into());
     SlashResult::Handled
@@ -2948,7 +2965,7 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
 }
 
 fn session_hub_persistence_error(
-    state: &crate::cli::session_state::SessionState,
+    state: &crate::cli::session::session_state::SessionState,
     workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
 ) -> Option<String> {
     state
@@ -3069,9 +3086,9 @@ fn handle_session_analyze_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
         // intent without re-parsing the slash string.
         let rest = rest.trim();
         if !rest.is_empty() {
-            crate::cli::slash_config::set_deep_analyze_arg(Some(rest.to_string()));
+            crate::cli::slash::slash_config::set_deep_analyze_arg(Some(rest.to_string()));
         } else {
-            crate::cli::slash_config::set_deep_analyze_arg(None);
+            crate::cli::slash::slash_config::set_deep_analyze_arg(None);
         }
         return SlashResult::Fallback;
     }
@@ -3198,7 +3215,8 @@ fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slash
             None
         }
     };
-    let md = crate::cli::slash_session::build_export_markdown(&sid, workspace.as_ref(), &events);
+    let md =
+        crate::cli::slash::slash_session::build_export_markdown(&sid, workspace.as_ref(), &events);
     let now = chrono::Local::now();
     // Default path mirrors the legacy line-mode exporter so users
     // with scripts expecting that filename shape keep working.
@@ -3724,7 +3742,7 @@ mod mcp_ux_tests {
 
     #[tokio::test]
     async fn mcp_help_mentions_core_commands() {
-        let state = crate::cli::session_state::SessionState::default();
+        let state = crate::cli::session::session_state::SessionState::default();
         let text = mcp_help_text(&state).await;
         assert!(text.contains("/mcp list"), "missing list help: {text}");
         assert!(text.contains("/mcp tools"), "missing tools help: {text}");
@@ -4016,14 +4034,6 @@ mod stats_view_tests {
     use super::build_recent_session_history_lines;
     use astra_services::session_journal::{self, JournalDirGuard};
 
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
-
     fn write_stats_session(session_id: &str) {
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
         writer
@@ -4064,7 +4074,7 @@ mod stats_view_tests {
     #[test]
     #[serial_test::serial]
     fn build_recent_session_history_lines_marks_unreadable_journals() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let good_session = format!("stats-good-{}", uuid::Uuid::new_v4());
         let bad_session = format!("stats-bad-{}", uuid::Uuid::new_v4());
         write_stats_session(&good_session);
@@ -4085,7 +4095,7 @@ mod stats_view_tests {
     #[test]
     #[serial_test::serial]
     fn build_recent_session_history_lines_surfaces_no_readable_sessions() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let bad_session = format!("stats-bad-only-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&bad_session)).unwrap();
 
@@ -4107,12 +4117,13 @@ mod stats_view_tests {
     #[test]
     #[serial_test::serial]
     fn read_session_journal_for_stats_surfaces_directory_error() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("stats-dir-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
 
-        let error = crate::cli::session_stats_scan::read_session_journal_for_stats(&session_id)
-            .expect_err("directory journal path should fail to read");
+        let error =
+            crate::cli::session::session_stats_scan::read_session_journal_for_stats(&session_id)
+                .expect_err("directory journal path should fail to read");
 
         assert!(error.contains("failed to read session journal"), "{error}");
     }

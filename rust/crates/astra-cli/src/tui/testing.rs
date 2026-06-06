@@ -8,7 +8,7 @@
 //! Conventions:
 //! - Snapshots trim trailing whitespace per row so diffs stay small and stable.
 //! - Width/height conventions: narrow (40x12), default (80x24), wide (120x40).
-//! - Use `snapshot_buffer!("name", &buffer)` to emit a named snapshot.
+//! - Use `assert_tui_snapshot!("name", rendered)` to emit a named snapshot.
 
 #![cfg(test)]
 #![allow(dead_code)]
@@ -103,18 +103,7 @@ macro_rules! assert_tui_snapshot {
         });
     }};
 }
-#[allow(unused_imports)]
 pub(crate) use assert_tui_snapshot;
-
-#[allow(unused_macros)]
-macro_rules! snapshot_buffer {
-    ($name:expr, $buffer:expr) => {{
-        let rendered = $crate::tui::testing::render::buffer_to_string($buffer);
-        $crate::tui::testing::assert_tui_snapshot!($name, rendered);
-    }};
-}
-#[allow(unused_imports)]
-pub(crate) use snapshot_buffer;
 
 #[cfg(test)]
 mod harness_self_tests {

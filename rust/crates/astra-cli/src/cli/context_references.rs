@@ -738,8 +738,12 @@ fn format_label(reference: &ContextReference, tokens: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        RefKind, estimate_tokens, expand_references, is_outside_project, is_sensitive_path,
+        parse_references, resolve_path,
+    };
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     // ===== Parsing tests =====

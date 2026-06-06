@@ -3,9 +3,6 @@
 //! Public surface for the crate root: `ChatTurnParams`, `stream_chat_sse`, `edge_executor_instance_id`.
 //! The main loop lives under [`sse_loop`] (`mod.rs` entry + `agentic_sse_loop` / `agentic_loop_turn`).
 
-#[allow(unused_imports)]
-pub(crate) use super::*;
-
 mod edge_executor;
 mod explain_reports;
 mod params;

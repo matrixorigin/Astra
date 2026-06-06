@@ -25,25 +25,24 @@ mod tests {
         load_previous_recovery_state, persist_recovery_checkpoint, rollback_recovery_checkpoint,
     };
     use super::csl::{
-        ensure_loaded_csl_state, rebuild_csl_from_history, write_full_csl_snapshot_atomic,
+        ensure_loaded_csl_state, rebuild_csl_from_history, restore_csl_snapshot_after_failure,
+        write_full_csl_snapshot_atomic,
     };
     use super::io::{
         composite_index_path_for, csl_log_path_for, read_optional_file_bytes,
         restore_optional_file_bytes, with_workspace_lock, write_bytes_atomic,
     };
-    use super::*;
+    use super::{
+        build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
+        persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
+        session_workspace_git_root, sync_context_trace_to_workspace, sync_plan_fields_to_workspace,
+        sync_recovery_snapshot_after_history_edit, sync_session_state_to_workspace,
+        workspace_metadata_from_live_state,
+    };
     use crate::cli::session::session_state::SessionState;
     use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
     use astra_pipeline::step_protocol::StepCheckpoint;
     use astra_services::session_journal;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
 
     fn workspace_backup_path_for(session_id: &str) -> Option<std::path::PathBuf> {
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(session_id);
@@ -61,7 +60,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn workspace_metadata_from_live_state_rebuilds_missing_workspace() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-live-missing-{}", uuid::Uuid::new_v4());
         let state = SessionState {
             session_id: Some(sid.clone()),
@@ -88,7 +87,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn workspace_metadata_from_live_state_recovers_from_corrupt_workspace() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-live-corrupt-{}", uuid::Uuid::new_v4());
         let mut persisted =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-4");
@@ -128,7 +127,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn workspace_metadata_from_live_state_recovers_checkpoint_turns_from_index() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-live-checkpoints-{}", uuid::Uuid::new_v4());
         let checkpoint_dir = session_journal::local_sessions_dir()
             .join(&sid)
@@ -156,7 +155,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn workspace_metadata_from_live_state_preserves_monotonic_counters() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-live-monotonic-{}", uuid::Uuid::new_v4());
         let mut persisted =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-4");
@@ -189,7 +188,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn workspace_metadata_from_live_state_recovers_counters_from_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-live-journal-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -337,13 +336,13 @@ mod tests {
 
     #[test]
     fn next_step_checkpoint_number_empty_dir_starts_at_one() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         assert_eq!(next_step_checkpoint_number("sess-empty").unwrap(), 1);
     }
 
     #[test]
     fn next_step_checkpoint_number_one_after_max_file() {
-        let (tmp, _g) = isolated_sessions_dir();
+        let (tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = "sess-step";
         let cp_dir = tmp
             .path()
@@ -387,7 +386,7 @@ mod tests {
 
     #[test]
     fn persist_manual_heavy_and_composite_writes_heavy_and_index() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = "sess-heavy-idx";
         let state = SessionState::default();
         let step_checkpoint = build_manual_heavy_step_checkpoint(
@@ -545,7 +544,7 @@ mod tests {
 
     #[test]
     fn write_full_csl_snapshot_atomic_persists_snapshot_without_tmp_file() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("write-csl-{}", uuid::Uuid::new_v4());
         let messages = vec![
             serde_json::json!({"role": "user", "content": "hello"}),
@@ -601,7 +600,7 @@ mod tests {
         // out-of-band consumer relying on seq monotonicity inconsistent.
         // The snapshot sequence MUST exceed the highest seq present in the
         // existing log.
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("csl-seq-{}", uuid::Uuid::new_v4());
         let messages_pre = vec![serde_json::json!({"role":"user","content":"prior"})];
         let state = astra_turn_core::conversation_log::SessionStateCompact::default();
@@ -656,6 +655,33 @@ mod tests {
     }
 
     #[test]
+    fn csl_rebuild_failure_rollback_restores_previous_snapshot() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("csl-rollback-{}", uuid::Uuid::new_v4());
+        let csl_path = csl_log_path_for(&sid);
+        std::fs::create_dir_all(csl_path.parent().unwrap()).unwrap();
+        std::fs::write(&csl_path, b"{\"old\":true}\n").unwrap();
+        let backup = read_optional_file_bytes(&csl_path).unwrap();
+
+        std::fs::write(&csl_path, b"{\"new_orphan\":true}\n").unwrap();
+        let message = restore_csl_snapshot_after_failure(
+            &csl_path,
+            backup,
+            "reload rewritten CSL state: injected failure".to_string(),
+        );
+
+        assert_eq!(std::fs::read(&csl_path).unwrap(), b"{\"old\":true}\n");
+        assert!(
+            message.contains("reload rewritten CSL state: injected failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("rolled back CSL snapshot"),
+            "rollback result should be reported: {message}"
+        );
+    }
+
+    #[test]
     fn csl_max_seq_reader_is_streaming_not_whole_file() {
         let source = include_str!("csl.rs");
         let fn_start = source
@@ -675,7 +701,7 @@ mod tests {
 
     #[test]
     fn with_workspace_lock_releases_lock_after_panic() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-lock-{}", uuid::Uuid::new_v4());
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -693,7 +719,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn session_workspace_git_root_returns_root_when_workspace_exists() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("git-root-ok-{}", uuid::Uuid::new_v4());
         let mut workspace =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
@@ -709,7 +735,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn session_workspace_git_root_returns_none_for_invalid_workspace() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("git-root-bad-{}", uuid::Uuid::new_v4());
         let mut workspace =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
@@ -860,7 +886,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn history_sync_preserves_previous_recovery_state_without_existing_csl() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-sync-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
             session_id: Some(sid.clone()),
@@ -961,7 +987,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn ensure_loaded_csl_state_uses_in_memory_manager_state() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("csl-state-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(
             astra_turn_core::conversation_log::file_store::FileCslStore::new(
@@ -1002,7 +1028,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn ensure_loaded_csl_state_returns_none_when_snapshot_missing() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("csl-empty-{}", uuid::Uuid::new_v4());
         let mut state = SessionState::default();
 
@@ -1020,7 +1046,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn ensure_loaded_csl_state_returns_err_for_invalid_session_id() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let mut state = SessionState::default();
 
         let error = ensure_loaded_csl_state(&mut state, "../not-a-session")
@@ -1033,7 +1059,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn ensure_loaded_csl_state_returns_err_for_corrupt_csl_snapshot() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("csl-corrupt-{}", uuid::Uuid::new_v4());
         let session_dir = session_journal::local_sessions_dir().join(&sid);
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -1055,7 +1081,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn load_previous_recovery_state_returns_err_when_checkpoint_dir_is_invalid() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("checkpoint-bad-{}", uuid::Uuid::new_v4());
         let session_dir = session_journal::local_sessions_dir().join(&sid);
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -1072,7 +1098,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn rebuild_csl_from_history_skips_persist_for_empty_turn_zero() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("empty-turn-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(
             astra_turn_core::conversation_log::file_store::FileCslStore::new(
@@ -1113,7 +1139,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn history_sync_rolls_back_checkpoint_and_index_when_csl_rebuild_fails() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-rollback-{}", uuid::Uuid::new_v4());
 
         let mut existing_index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
@@ -1177,7 +1203,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn history_sync_rolls_back_when_workspace_yaml_is_corrupt() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-workspace-corrupt-{}", uuid::Uuid::new_v4());
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
         std::fs::create_dir_all(&workspace_dir).unwrap();
@@ -1222,7 +1248,7 @@ mod tests {
 
     #[test]
     fn rollback_recovery_checkpoint_restores_index_and_deletes_heavy() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-rollback-token-{}", uuid::Uuid::new_v4());
 
         let mut existing_index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
@@ -1275,7 +1301,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn history_sync_persists_checkpoint_workspace_and_csl_snapshot() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-sync-success-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(
             astra_turn_core::conversation_log::file_store::FileCslStore::new(

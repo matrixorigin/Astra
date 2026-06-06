@@ -37,7 +37,6 @@ pub mod mcp_client;
 pub mod sandbox_retry;
 pub(crate) mod skill_instructions;
 #[cfg(test)]
-#[cfg(test)]
 pub(crate) mod test_utils;
 pub mod tool_safety_guard;
 
@@ -46,15 +45,6 @@ pub mod cli;
 
 // ═══════════════════════════ TUI ════════════════════════════════════════
 pub mod tui;
-
-// ═══════════════════════════ Crate-internal re-exports ═══════════════════
-// These items are pub(crate) in cli submodules; we re-export them here so
-// main.rs (and tests) can access via `astra_cli::` or `crate::`.
-
-// Common external crate aliases — many cli/ files use bare `prompts::`,
-// `session_journal::`, `tool_registry::` which were previously resolved
-// via #[path]-based re-exports in main.rs.
-pub(crate) use cli::*;
 
 // SSE streaming types
 pub(crate) use crate::cli::stream::streaming_types::{
@@ -73,5 +63,10 @@ pub(crate) use cli::cloud_sync::post_auth_cloud_resync;
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) use super::test_utils::HomeGuard;
+    pub(crate) use super::test_utils::TestUi;
     pub(crate) use super::test_utils::isolate_credentials;
+    pub(crate) use super::test_utils::isolated_sessions_dir;
+    pub(crate) use super::test_utils::stub_stream_result;
+    pub(crate) use super::test_utils::stub_stream_result_with_records;
+    pub(crate) use super::test_utils::wait_until;
 }

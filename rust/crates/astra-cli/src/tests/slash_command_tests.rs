@@ -1,4 +1,8 @@
-use super::*;
+use super::spawn_mock;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::slash::slash_router::handle_slash_command;
+use crate::tests::isolate_credentials;
+use axum::{Router, routing::post};
 
 // ── slash commands with mock server ───────────────────────────────────
 

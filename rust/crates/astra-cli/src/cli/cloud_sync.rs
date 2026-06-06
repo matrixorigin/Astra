@@ -15,6 +15,7 @@ use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
+use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::{ExplainMode, SessionState};
 
@@ -53,7 +54,7 @@ pub(crate) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
             cloud_reachable: false,
         };
     };
-    let token = super::session_runtime::current_access_token(Some(profile_name));
+    let token = session_runtime::current_access_token(Some(profile_name));
     let cloud_reachable =
         crate::cli::preferences_client::probe_cloud_reachable(&cloud_base, token.as_deref()).await;
     CloudPullResult { cloud_reachable }
@@ -69,7 +70,7 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     // Best-effort: pick token from whichever profile the session
     // currently holds. Empty token still works for local dev
     // servers without auth; the server's auth_service decides.
-    let token = super::session_runtime::current_access_token(None);
+    let token = session_runtime::current_access_token(None);
     let prefs =
         match crate::cli::preferences_client::pull_all_preferences(&cloud_base, token.as_deref())
             .await
@@ -153,7 +154,7 @@ pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
     let Some(cloud_base) = resolve_cloud_base() else {
         return;
     };
-    let token = super::session_runtime::current_access_token(None);
+    let token = session_runtime::current_access_token(None);
 
     let blocked: Vec<String> = state
         .tool_health_entries
@@ -288,7 +289,9 @@ pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut Se
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        CloudPullResult, cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal,
+    };
 
     #[test]
     fn cloud_pull_result_default_not_reachable() {

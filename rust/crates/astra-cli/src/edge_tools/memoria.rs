@@ -13,9 +13,10 @@ pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
 
 fn current_memoria_proxy_target() -> Result<(String, String), String> {
     let base = crate::cli::config_manager::resolve_api_url(None)?;
-    let token = crate::cli::session_runtime::current_access_token(None).ok_or_else(|| {
-        "not logged in; memory operations must go through the Astra server".to_string()
-    })?;
+    let token =
+        crate::cli::session::session_runtime::current_access_token(None).ok_or_else(|| {
+            "not logged in; memory operations must go through the Astra server".to_string()
+        })?;
     Ok((base, token))
 }
 
@@ -460,7 +461,11 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, H
 
 #[cfg(test)]
 mod build_direct_request_tests {
-    use super::*;
+    use super::{
+        build_direct_request, memoria_branch_create, memoria_health, memoria_reflect,
+        memoria_snapshot_create,
+    };
+    use serde_json::json;
 
     #[test]
     fn retrieve_forwards_session_id() {
@@ -667,7 +672,7 @@ pub async fn memoria_store_lessons_fire_and_forget(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::memoria_store_lessons_fire_and_forget;
     use serial_test::serial;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

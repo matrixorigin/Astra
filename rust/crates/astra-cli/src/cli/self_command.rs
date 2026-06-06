@@ -315,8 +315,9 @@ fn resolve_session_id(query: Option<&str>, profile: Option<&str>) -> Result<Stri
                 })?;
                 let ws_path = session_workspace::workspace_file_path(q)?;
                 if ws_path.exists()
-                    || (crate::cli::session_runtime::resolve_cloud_base().is_some()
-                        && crate::cli::session_runtime::current_access_token(profile).is_some())
+                    || (crate::cli::session::session_runtime::resolve_cloud_base().is_some()
+                        && crate::cli::session::session_runtime::current_access_token(profile)
+                            .is_some())
                 {
                     Ok(q.to_string())
                 } else {
@@ -342,20 +343,22 @@ async fn resolve_target_session_id(
 }
 
 async fn resolve_default_session_id(profile: Option<&str>) -> Result<String, String> {
-    if let Some(api) = crate::cli::session_restore_client::cloud_resume_client()?
-        && crate::cli::session_runtime::current_access_token(profile).is_some()
+    if let Some(api) = crate::cli::session::session_restore_client::cloud_resume_client()?
+        && crate::cli::session::session_runtime::current_access_token(profile).is_some()
     {
         if let Some(session_id) =
-            crate::cli::cli_utils::validated_resumable_last_session_id(&api, profile).await
+            crate::cli::cli_config::cli_utils::validated_resumable_last_session_id(&api, profile)
+                .await
         {
             return Ok(session_id);
         }
 
-        let sessions =
-            crate::cli::session_restore_client::list_cloud_resumable_sessions(profile, &api)
-                .await?;
+        let sessions = crate::cli::session::session_restore_client::list_cloud_resumable_sessions(
+            profile, &api,
+        )
+        .await?;
         if let Some(session) = sessions.into_iter().find(|session| session.turn_count > 0) {
-            crate::cli::cli_utils::persist_profile_last_session_or_warn(
+            crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn(
                 profile,
                 &session.session_id,
                 "self_command:resolve_default_session_id",
@@ -953,13 +956,20 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::cli_config::cli_args::SelfSessionArgs;
+    use super::{
+        build_reflect_response, execute_self_command, replace_json_path, resolve_session_id,
+        verify_runtime_config,
+    };
+    use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
-    use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
-    use astra_services::session_workspace::ContextTraceSignal;
+    use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
+    use astra_services::session_journal::{
+        self, JournalDirGuard, JournalEvent, JournalEventType, ToolCallRecord,
+    };
+    use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
+    use chrono::Utc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

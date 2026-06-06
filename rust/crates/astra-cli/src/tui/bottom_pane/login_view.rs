@@ -317,8 +317,12 @@ impl BottomPaneView for LoginView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::{LoginMode, LoginView};
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
 
     struct W<'a>(&'a LoginView);
     impl ratatui::widgets::Widget for W<'_> {

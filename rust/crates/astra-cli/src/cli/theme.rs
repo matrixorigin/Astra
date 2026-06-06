@@ -298,7 +298,10 @@ pub fn strip_ansi(s: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        PROMPT_BG, PROMPT_DEFAULT, PROMPT_PAUSE, PROMPT_PLAN, PROMPT_PLAN_ONLY, dim, error, header,
+        icon_err, icon_info, icon_ok, icon_warn, section, strip_ansi, success, warning,
+    };
 
     #[test]
     fn prompt_constants_are_ascii_text() {

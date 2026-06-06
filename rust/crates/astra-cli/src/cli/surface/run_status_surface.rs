@@ -85,7 +85,7 @@ pub(crate) fn run_status_icon(status: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::run_status_icon;
 
     #[test]
     fn icon_uses_warn_for_degraded_done_states_and_error_for_timeout() {

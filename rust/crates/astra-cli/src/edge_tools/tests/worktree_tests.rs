@@ -1,4 +1,5 @@
-use super::*;
+use super::{ToolExecutor, detect_git_remote_repos, extract_github_owner_repo, test_executor};
+use serde_json::json;
 
 fn init_temp_git_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp repo");
@@ -37,17 +38,17 @@ fn init_temp_git_repo() -> tempfile::TempDir {
 fn extract_github_owner_repo_without_git_suffix() {
     let line = "origin\thttps://github.com/MatrixOrigin/Memoria (fetch)";
     assert_eq!(
-        super::extract_github_owner_repo(line),
+        extract_github_owner_repo(line),
         Some("MatrixOrigin/Memoria".to_string())
     );
 }
 
 #[test]
 fn extract_github_owner_repo_malformed_url() {
-    assert_eq!(super::extract_github_owner_repo("origin"), None);
-    assert_eq!(super::extract_github_owner_repo(""), None);
+    assert_eq!(extract_github_owner_repo("origin"), None);
+    assert_eq!(extract_github_owner_repo(""), None);
     assert_eq!(
-        super::extract_github_owner_repo("origin\thttps://not-github.com/a/b.git (fetch)"),
+        extract_github_owner_repo("origin\thttps://not-github.com/a/b.git (fetch)"),
         None
     );
 }
@@ -56,7 +57,7 @@ fn extract_github_owner_repo_malformed_url() {
 fn extract_github_owner_repo_ssh_no_dot_git() {
     let line = "upstream\tgit@github.com:org/repo (push)";
     assert_eq!(
-        super::extract_github_owner_repo(line),
+        extract_github_owner_repo(line),
         Some("org/repo".to_string())
     );
 }
@@ -66,7 +67,7 @@ fn extract_github_owner_repo_ssh_no_dot_git() {
 #[test]
 fn detect_git_remote_repos_from_current_dir() {
     // This test runs in the actual repo — should find at least one remote
-    let repos = super::detect_git_remote_repos(std::path::Path::new("."));
+    let repos = detect_git_remote_repos(std::path::Path::new("."));
     // We're in the mo-dev-agent repo, so at least one GitHub remote should exist
     // (unless running in a non-git context, in which case empty is acceptable)
     for repo in &repos {
@@ -77,7 +78,7 @@ fn detect_git_remote_repos_from_current_dir() {
 
 #[test]
 fn detect_git_remote_repos_nonexistent_dir() {
-    let repos = super::detect_git_remote_repos(std::path::Path::new("/nonexistent/path"));
+    let repos = detect_git_remote_repos(std::path::Path::new("/nonexistent/path"));
     assert!(repos.is_empty());
 }
 
@@ -85,7 +86,7 @@ fn detect_git_remote_repos_nonexistent_dir() {
 fn detect_git_remote_repos_deduplicates() {
     // The same remote appears for both fetch and push — should be deduplicated
     // This is an implicit invariant; verify by checking no duplicates
-    let repos = super::detect_git_remote_repos(std::path::Path::new("."));
+    let repos = detect_git_remote_repos(std::path::Path::new("."));
     let mut seen = std::collections::HashSet::new();
     for repo in &repos {
         assert!(

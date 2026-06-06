@@ -199,8 +199,12 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        SANDBOX_DENIED_PREFIX, extract_first_absolute_path, is_sandbox_denied,
+        sandbox_denied_message, sandbox_expand_dir_from_args,
+    };
     use serde_json::json;
+    use std::path::PathBuf;
 
     // ── sandbox_expand_dir_from_args ─────────────────────────────────────
 

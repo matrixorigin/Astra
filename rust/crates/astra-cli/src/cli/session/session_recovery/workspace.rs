@@ -1,6 +1,6 @@
 //! Workspace metadata: build, sync plan/session/context-trace fields, snapshot.
-use super::io::*;
-use crate::cli::*;
+use super::io::with_workspace_lock;
+use crate::cli::session::session_state::SessionState;
 
 pub(crate) fn sync_plan_fields_to_workspace(
     state: &SessionState,

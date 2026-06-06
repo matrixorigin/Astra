@@ -543,8 +543,9 @@ fn enforce_limits(state: &mut HashMap<PathBuf, FileState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ReadDedupKey, merge_range, ranges_cover};
     use crate::lock_recovery::LockRecovery;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn merge_range_u64_max_no_overflow() {

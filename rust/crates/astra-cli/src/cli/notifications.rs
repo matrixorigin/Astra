@@ -321,7 +321,13 @@ fn sanitize_terminal_notification(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        LAST_NOTIFICATION_AT, NOTIFICATION_COOLDOWN_SECS, NotificationBackend, NotificationConfig,
+        NotificationMethod, detect_backend, detect_backend_with, format_notification,
+        is_terminal_focused, notify_completion, send_notification,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     // ── Config parsing ──────────────────────────────────────────────────
 

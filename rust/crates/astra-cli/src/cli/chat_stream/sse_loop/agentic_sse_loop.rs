@@ -317,7 +317,13 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{StreamResultBuild, build_stream_result};
+    use astra_runtime::pipeline::step_recorder::StepRecorder;
+    use astra_runtime::turn::turn_guard::TurnGuard;
+    use astra_services::session_journal::ToolCallRecord;
+    use std::collections::HashSet;
+
+    use crate::VerdictEvent;
 
     fn make_step_recorder() -> StepRecorder {
         StepRecorder::with_persistence("test-session", "test-task")

@@ -45,9 +45,9 @@ use serde_json::{Value, json};
 
 use crate::{
     ExplainMode,
-    cli::cli_utils::compact_or_raw,
+    cli::cli_config::cli_utils::compact_or_raw,
     cli::permission_manager::PermissionManager,
-    cli::stream_render::{
+    cli::stream::stream_render::{
         ChatPrepPhaseLabel, ChatTurnPrepLineGuard, EdgeSseContext, RenderPolicy, TurnResult,
         consume_turn_sse,
     },
@@ -914,11 +914,11 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// Plan-only: release the payload-phase stderr line before SSE consumes the body.
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
-    pub stream_event_tx: Option<crate::cli::StreamEventTx>,
+    pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
-    pub approval_request_tx: Option<crate::cli::ApprovalRequestTx>,
+    pub approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
-    pub ask_user_request_tx: Option<crate::cli::AskUserRequestTx>,
+    pub ask_user_request_tx: Option<crate::cli::chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Effort level override from skill activation.
@@ -936,7 +936,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
     pub skill_continuation: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
-    pub tool_cache: &'a mut crate::cli::stream_render::EdgeToolCache,
+    pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
     /// Fallback from previous turn's confidence diagnosis for broadening.
     pub previous_confidence_fallback:
         Option<astra_turn_core::confidence_contract::ConfidenceFallback>,

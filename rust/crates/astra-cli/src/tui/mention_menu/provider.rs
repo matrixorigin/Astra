@@ -184,7 +184,7 @@ pub(crate) fn as_dyn(p: &impl FileProvider) -> &dyn FileProvider {
 
 #[cfg(test)]
 mod provider_tests {
-    use super::*;
+    use super::{FileKind, FileProvider, FsFileProvider, StaticFileProvider};
     use std::path::Path;
 
     #[test]

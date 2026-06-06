@@ -168,8 +168,11 @@ fn render_detail(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
 mod tests {
     use super::super::WorktreeList;
     use super::super::model::{WorktreeEntry, parse};
-    use super::*;
+    use super::{desired_height, render};
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     fn enrich(mut v: Vec<WorktreeEntry>, counts: &[usize]) -> Vec<WorktreeEntry> {
         for (i, e) in v.iter_mut().enumerate() {

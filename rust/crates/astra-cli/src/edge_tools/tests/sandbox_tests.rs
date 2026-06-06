@@ -1,4 +1,6 @@
-use super::*;
+use std::path::PathBuf;
+
+use super::ToolExecutor;
 
 // ── expand_sandbox_path ──────────────────────────────────────────────────
 

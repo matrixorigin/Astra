@@ -957,6 +957,7 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::wait_until;
     use tempfile::TempDir;
 
     /// Build a handle whose stdout/stderr live under a fresh tempdir.
@@ -1234,7 +1235,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("yes 'aaaaaaaaaa'", "large output");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
+            let handle = reg.tasks.get(&id).expect("background task handle");
+            let stdout_size = std::fs::metadata(&handle.stdout_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let stderr_size = std::fs::metadata(&handle.stderr_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            stdout_size.saturating_add(stderr_size) > MAX_OUTPUT_BYTES
+        })
+        .await
+        .expect("background task should exceed output cap");
         reg.stall_check();
 
         let events = reg.poll_completions();
@@ -1293,12 +1305,11 @@ mod tests {
         let command = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
         let id = reg.spawn_shell(&command, "process tree");
 
-        for _ in 0..20 {
-            if pid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_until(Duration::from_secs(1), Duration::from_millis(50), || {
+            pid_file.exists()
+        })
+        .await
+        .expect("pid file should be written");
         let pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("pid file")
             .trim()
@@ -1367,19 +1378,15 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo hi", "dedup test");
 
-        // Drain across multiple polls until we observe terminal status
-        // OR exceed a generous timeout. Each call appends to `events`.
         let mut events = Vec::new();
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_until(Duration::from_secs(1), Duration::from_millis(50), || {
             events.extend(reg.poll_completions());
-            if events
+            events
                 .iter()
                 .any(|e| matches!(e, BgTaskEvent::Completed { .. }))
-            {
-                break;
-            }
-        }
+        })
+        .await
+        .expect("task should complete");
 
         let started_count = events
             .iter()

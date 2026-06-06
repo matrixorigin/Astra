@@ -127,7 +127,7 @@ fn scope_path(scope: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::finalize;
 
     #[test]
     fn discard_and_cancel_produce_friendly_messages() {

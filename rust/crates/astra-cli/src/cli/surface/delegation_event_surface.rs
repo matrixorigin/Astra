@@ -150,7 +150,11 @@ fn metadata_u64(metadata: Option<&Value>, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        delegation_event_id, delegation_sub_run_detail, project_delegation_retry,
+        project_delegation_started, project_delegation_sub_run_completed,
+        project_delegation_sub_run_started,
+    };
     use serde_json::json;
 
     #[test]

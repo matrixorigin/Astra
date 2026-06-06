@@ -229,8 +229,10 @@ pub(crate) fn render_bug_args(args: &BugArgs) -> String {
 
 #[cfg(test)]
 mod arg_render_tests {
-    use super::*;
-    use crate::cli::cli_config::cli_args::{PermissionsTraceArgs, TaskArgs, TaskSubcommand};
+    use super::{render_permissions_args, render_task_args};
+    use crate::cli::cli_config::cli_args::{
+        PermissionsArgs, PermissionsSubcommand, PermissionsTraceArgs, TaskArgs, TaskSubcommand,
+    };
 
     #[test]
     fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {

@@ -1,19 +1,14 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::slash::{slash_stats, slash_tools};
+use crate::tests::{isolate_credentials, isolated_sessions_dir};
+use astra_services::session_journal;
 
 // ── slash_stats::handle_stats_command ─────────────────────────────────────────────────
-
-fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-    let tmp = tempfile::tempdir().unwrap();
-    let sessions = tmp.path().join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-    let guard = session_journal::JournalDirGuard::new(&sessions);
-    (tmp, guard)
-}
 
 #[test]
 fn stats_no_active_session_does_not_panic() {
     // state with no session_id → should not panic
-    let state = super::SessionState::default();
+    let state = SessionState::default();
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(slash_stats::handle_stats_command("", &state)); // current session mode, no session
@@ -22,7 +17,7 @@ fn stats_no_active_session_does_not_panic() {
 #[test]
 fn stats_history_no_sessions_does_not_panic() {
     let (_tmp, _guard) = isolated_sessions_dir();
-    let state = super::SessionState::default();
+    let state = SessionState::default();
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(slash_stats::handle_stats_command("history", &state));
@@ -82,7 +77,7 @@ fn stats_current_session_reads_journal() {
     assert_eq!(stats.avg_tokens_per_turn, 1350); // (1800+900)/2
 
     // Now verify slash_stats::handle_stats_command doesn't panic with this session
-    let state = super::SessionState {
+    let state = SessionState {
         session_id: Some(sid),
         ..Default::default()
     };
@@ -136,7 +131,7 @@ fn stats_current_session_with_unreadable_journal_does_not_panic() {
     let sid = format!("test-stats-unreadable-{}", uuid::Uuid::new_v4());
     std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
-    let state = super::SessionState {
+    let state = SessionState {
         session_id: Some(sid),
         ..Default::default()
     };
@@ -149,7 +144,7 @@ fn stats_current_session_with_unreadable_journal_does_not_panic() {
 
 #[test]
 fn tools_no_active_session_does_not_panic() {
-    let state = super::SessionState::default();
+    let state = SessionState::default();
     slash_tools::handle_tools_command(&state);
 }
 
@@ -173,7 +168,7 @@ fn tools_session_with_no_tool_calls_does_not_panic() {
         .unwrap();
     drop(writer);
 
-    let state = super::SessionState {
+    let state = SessionState {
         session_id: Some(sid),
         ..Default::default()
     };
@@ -268,7 +263,7 @@ fn tools_reads_tool_calls_from_journal() {
     assert_eq!(profiles[1].error_rate, 0.0);
 
     // Verify slash_tools::handle_tools_command doesn't panic with this data
-    let state = super::SessionState {
+    let state = SessionState {
         session_id: Some(sid),
         ..Default::default()
     };
@@ -281,7 +276,7 @@ fn tools_unreadable_journal_does_not_panic() {
     let sid = format!("test-tools-unreadable-{}", uuid::Uuid::new_v4());
     std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
-    let state = super::SessionState {
+    let state = SessionState {
         session_id: Some(sid),
         ..Default::default()
     };

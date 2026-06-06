@@ -87,7 +87,8 @@ pub(crate) fn diff(prev: &[SessionTask], new: &[SessionTask]) -> Vec<TaskBoardEv
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{TaskBoardEvent, diff};
+    use astra_tools::task_mgmt::SessionTask;
 
     fn task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {

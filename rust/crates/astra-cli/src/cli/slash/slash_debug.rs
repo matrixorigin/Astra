@@ -1,4 +1,7 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::stream_render;
+use crate::cli::theme;
+use crossterm::style::Stylize;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -432,10 +435,8 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
         } else {
             theme::icon_err()
         };
-        let display_name = super::stream_render::format_tool_display_from_preview(
-            &tc.name,
-            tc.args_preview.as_deref(),
-        );
+        let display_name =
+            stream_render::format_tool_display_from_preview(&tc.name, tc.args_preview.as_deref());
         eprintln!(
             "  {status} {} {}",
             display_name.magenta(),
@@ -1112,8 +1113,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        build_turn_messages_view, list_heavy_checkpoints, load_journal_turns,
+        load_messages_from_heavy_path, message_delta, resolve_session_id, truncate,
+    };
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn truncate_short() {

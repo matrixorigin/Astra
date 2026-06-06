@@ -1,5 +1,5 @@
 use crate::cli::cli_config::cli_utils::{
-    local_resumable_last_session_id, preflight_remote_resume_session,
+    SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::load_session_messages_for_continuation;
 use crate::cli::session::session_restore_client::list_cloud_resumable_sessions;
@@ -22,19 +22,15 @@ impl OneShotSessionRouting {
     }
 }
 
-fn explicit_resume_preflight_error(
-    session_id: &str,
-    preflight: super::cli_utils::SessionResumePreflight,
-) -> String {
+fn explicit_resume_preflight_error(session_id: &str, preflight: SessionResumePreflight) -> String {
     match preflight {
-        super::cli_utils::SessionResumePreflight::Missing => format!(
+        SessionResumePreflight::Missing => format!(
             "Explicit session {session_id} cannot be resumed: the server reports it does not exist."
         ),
-        super::cli_utils::SessionResumePreflight::NoAuth => {
+        SessionResumePreflight::NoAuth => {
             format!("Explicit session {session_id} cannot be resumed without authentication.")
         }
-        super::cli_utils::SessionResumePreflight::Valid
-        | super::cli_utils::SessionResumePreflight::Unknown => {
+        SessionResumePreflight::Valid | SessionResumePreflight::Unknown => {
             unreachable!("only definitive explicit resume failures should build a preflight error")
         }
     }
@@ -71,20 +67,19 @@ pub(crate) async fn resolve_one_shot_session_routing(
     if let Some(session_id) = current_session_id {
         return Ok(
             match preflight_remote_resume_session(api, profile, &session_id).await {
-                super::cli_utils::SessionResumePreflight::Missing => {
+                SessionResumePreflight::Missing => {
                     return Err(explicit_resume_preflight_error(
                         &session_id,
-                        super::cli_utils::SessionResumePreflight::Missing,
+                        SessionResumePreflight::Missing,
                     ));
                 }
-                super::cli_utils::SessionResumePreflight::NoAuth => {
+                SessionResumePreflight::NoAuth => {
                     return Err(explicit_resume_preflight_error(
                         &session_id,
-                        super::cli_utils::SessionResumePreflight::NoAuth,
+                        SessionResumePreflight::NoAuth,
                     ));
                 }
-                super::cli_utils::SessionResumePreflight::Valid
-                | super::cli_utils::SessionResumePreflight::Unknown => {
+                SessionResumePreflight::Valid | SessionResumePreflight::Unknown => {
                     select_one_shot_session_routing(Some(session_id), None, None)
                 }
             },
@@ -115,23 +110,17 @@ pub(crate) async fn resolve_one_shot_session_routing(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        explicit_resume_preflight_error, resolve_one_shot_session_routing,
+        select_one_shot_session_routing,
+    };
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_pipeline::step_checkpoint::write_step_checkpoint;
     use astra_pipeline::step_protocol::{
         HeavyCheckpoint, LightCheckpoint, PROTOCOL_VERSION, StepCheckpoint, epoch_ms,
     };
-    use astra_services::session_journal::JournalDirGuard;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
 
     fn write_local_resumable_session_with_checkpoint(session_id: &str) {
         let workspace =
@@ -236,13 +225,13 @@ mod tests {
     fn explicit_resume_preflight_error_describes_missing_and_noauth() {
         let missing = explicit_resume_preflight_error(
             "sess-1",
-            crate::cli::cli_utils::SessionResumePreflight::Missing,
+            crate::cli::cli_config::cli_utils::SessionResumePreflight::Missing,
         );
         assert!(missing.contains("does not exist"));
 
         let no_auth = explicit_resume_preflight_error(
             "sess-1",
-            crate::cli::cli_utils::SessionResumePreflight::NoAuth,
+            crate::cli::cli_config::cli_utils::SessionResumePreflight::NoAuth,
         );
         assert!(no_auth.contains("without authentication"));
     }
@@ -250,7 +239,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn resolve_one_shot_session_routing_keeps_local_continuation_when_cloud_has_no_session() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -296,7 +285,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn resolve_one_shot_session_routing_does_not_fail_when_auto_cloud_listing_fails() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile::default();
@@ -327,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_one_shot_session_routing_rejects_missing_explicit_session_without_local_history()
      {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -360,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_one_shot_session_routing_rejects_missing_explicit_session_even_with_local_history()
      {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = uuid::Uuid::new_v4().to_string();
         write_local_resumable_session_with_checkpoint(&session_id);

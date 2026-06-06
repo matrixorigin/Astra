@@ -911,7 +911,9 @@ impl Drop for LspStdioSession {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SyncedDocumentState, render_diagnostic_messages, sync_existing_document};
+    use serde_json::json;
+    use std::collections::HashMap;
 
     fn count_match(haystack: &str, needle: &str) -> usize {
         haystack.match_indices(needle).count()

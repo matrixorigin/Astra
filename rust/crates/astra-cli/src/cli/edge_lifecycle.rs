@@ -1,5 +1,6 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -115,11 +116,20 @@ impl EdgeLifecycleContext {
         // SystemTime is good enough here: we only need ~9 bits of entropy and
         // the cost is one syscall. Deliberately not introducing a `rand`
         // dependency just for jitter.
+        //
+        // We also mix in a per-thread monotonic counter so that jitter varies
+        // even on platforms where the OS clock has coarse resolution (e.g.
+        // macOS returns subsec_nanos in multiples of 1000).
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
             .unwrap_or(0);
-        let jitter_ms = nanos % 500;
+        let seq = JITTER_SEQ.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(1));
+            v
+        });
+        let jitter_ms = (nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 500;
         delay + Duration::from_millis(jitter_ms)
     }
 
@@ -212,6 +222,13 @@ pub fn edge_cloud_registry_enabled() -> bool {
 }
 
 // ── backoff helpers ────────────────────────────────────────────────────────
+
+// Per-thread counter to ensure jitter varies even when the OS clock has
+// coarse resolution (e.g. macOS `subsec_nanos()` always returns multiples of
+// 1000, making `nanos % 500` a constant zero).
+thread_local! {
+    static JITTER_SEQ: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Returns `delay_secs` with a random jitter in [0, 500] ms.
 fn jitter(delay: Duration) -> Duration {
@@ -415,7 +432,7 @@ async fn reexecute_pending_requests(
         let timeout_cancel = execution_cancel.clone();
         let outcome = match tokio::time::timeout(
             REPLAY_TOOL_TIMEOUT,
-            crate::cli::stream_render::execute_with_metadata_responsive(
+            crate::cli::stream::stream_render::execute_with_metadata_responsive(
                 std::sync::Arc::clone(&executor),
                 tool_name.to_string(),
                 args,
@@ -564,9 +581,16 @@ fn print_skip_notice(_e: &ThinClientError) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_thin_client::ASTRA_EDGE_ID_HEADER;
+    use super::{
+        PendingToolRequestGuard, ReplayInFlightGuard, backoff_delay,
+        completed_request_ids_snapshot, edge_cloud_registry_enabled, edge_lifecycle,
+        enrich_register_body, heartbeat_period, jitter, record_completed_request,
+        register_edge_once, send_heartbeat,
+    };
+    use astra_thin_client::{ASTRA_EDGE_ID_HEADER, EdgeRegisterRequest, ThinClient};
     use serial_test::serial;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

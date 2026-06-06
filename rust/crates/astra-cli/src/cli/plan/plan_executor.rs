@@ -14,6 +14,11 @@ use std::time::Duration;
 use astra_services::task_orchestrator::TaskOutcome;
 use crossterm::style::Stylize;
 
+use crate::cli::chat_stream;
+use crate::cli::cli_config::cli_utils;
+use crate::cli::durable_bridge;
+use crate::cli::permission_manager;
+use crate::cli::session::session_recovery;
 use crate::cli::theme;
 
 // ─── Plan Update Events (channel protocol) ───────────────────────────────────
@@ -97,7 +102,7 @@ pub enum PlanUpdate {
     /// Real-time streaming event from within an LLM turn (tokens, tool calls, model status).
     StreamingEvent {
         subtask_id: String,
-        event: super::chat_stream::StreamEvent,
+        event: chat_stream::StreamEvent,
     },
     /// Per-subtask verification report with individual criterion results.
     VerificationReport(astra_services::durable_task::SubtaskVerificationReport),
@@ -108,7 +113,7 @@ pub enum PlanUpdate {
         header: String,
         detail: Option<String>,
         reason: String,
-        response_tx: tokio::sync::oneshot::Sender<super::chat_stream::ApprovalResponse>,
+        response_tx: tokio::sync::oneshot::Sender<chat_stream::ApprovalResponse>,
     },
     /// Sync subtask status back to the session state so plan_mode stays up-to-date
     /// across re-runs. Sent after each subtask completes or fails.
@@ -436,7 +441,7 @@ pub struct PlanExecutorHandle {
 fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     let upstream_github_auth = lower.contains("github api error");
-    crate::cli::cli_utils::is_astra_session_auth_error(msg)
+    crate::cli::cli_config::cli_utils::is_astra_session_auth_error(msg)
         || lower.contains("invalid credentials")
         || (!upstream_github_auth && lower.contains("bad credentials"))
 }
@@ -470,7 +475,7 @@ fn plan_completion_action(
 /// [`plan_completion_action`] at end-of-plan emission.
 fn has_any_unresolved_verification_failure(
     subtasks: &[astra_services::task_orchestrator::SubtaskPlan],
-    durable: Option<&super::durable_bridge::DurableTaskState>,
+    durable: Option<&durable_bridge::DurableTaskState>,
 ) -> bool {
     use astra_services::durable_task::SubtaskStage;
     use astra_services::task_orchestrator::TaskStatus;
@@ -936,7 +941,6 @@ use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use crate::StreamResult;
 
 use crate::cli::chat_stream::ChatTurnParams;
-use crate::cli::durable_bridge;
 use crate::cli::permission_manager::PermissionManager;
 
 /// Post a start + finish pair to `/plans/{plan_id}/step-runs` so the cloud
@@ -1042,7 +1046,7 @@ pub(crate) struct BackgroundPlanContext {
     pub token: String,
     pub profile: Option<String>,
     pub model: Option<String>,
-    pub cli_context: crate::cli::cli_context::CliContext,
+    pub cli_context: crate::cli::cli_config::cli_context::CliContext,
     pub plan: TaskPlan,
     pub plan_goal: Option<String>,
     /// Cloud plan_id the executor should post step-run rows to. `None` when
@@ -1191,9 +1195,9 @@ async fn plan_executor_task(
     // user's restrictions still bind. apply_load_policy(HeadlessSafe)
     // strips allow_*/allow_sensitive_path_writes while preserving deny.
     let mut perm_manager = PermissionManager::with_load_policy(
-        super::permission_manager::PermissionMode::Auto,
+        permission_manager::PermissionMode::Auto,
         &ctx.workspace_root,
-        &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+        &permission_manager::PermissionLoadPolicy::HeadlessSafe,
     );
 
     loop {
@@ -1481,7 +1485,7 @@ async fn plan_executor_task(
 
             // Create stream event channel for real-time LLM/tool visibility
             let (stream_tx, mut stream_rx) =
-                tokio::sync::mpsc::unbounded_channel::<super::chat_stream::StreamEvent>();
+                tokio::sync::mpsc::unbounded_channel::<chat_stream::StreamEvent>();
             let stream_update_tx = update_tx.clone();
             let stream_subtask_id = next_id.to_string();
             let stream_forwarder = tokio::spawn(async move {
@@ -1500,7 +1504,7 @@ async fn plan_executor_task(
 
             // Create approval request channel for async permission dialogs
             let (approval_tx, mut approval_rx) =
-                tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+                tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
             let approval_update_tx = update_tx.clone();
             let approval_forwarder = tokio::spawn(async move {
                 while let Some(req) = approval_rx.recv().await {
@@ -1533,12 +1537,12 @@ async fn plan_executor_task(
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
                     provider: None,
-                    explain: crate::ExplainMode::Off,
+                    explain: crate::cli::session::session_state::ExplainMode::Off,
                     render_md: false,
                     history: &ctx.history,
                     perm_manager: &mut perm_manager,
                     verbose_mode: false,
-                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                    render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
                     cli_context: Some(&ctx.cli_context),
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
@@ -1654,11 +1658,9 @@ async fn plan_executor_task(
                             turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
                         }
                         // Attach per-turn git snapshot.
-                        let git_root = super::session_recovery::session_workspace_git_root(
-                            ctx.session_id.as_deref(),
-                        );
-                        let (git_head, git_branch) =
-                            super::cli_utils::git_snapshot(git_root.as_deref());
+                        let git_root =
+                            session_recovery::session_workspace_git_root(ctx.session_id.as_deref());
+                        let (git_head, git_branch) = cli_utils::git_snapshot(git_root.as_deref());
                         turn_event = turn_event.with_git_snapshot(git_head, git_branch);
                         annotate_plan_subtask_event(&mut turn_event, next_id);
                         emit_event(&update_tx, turn_event);
@@ -1929,7 +1931,7 @@ async fn plan_executor_task(
                         &failure.error,
                         0,
                     );
-                    crate::cli::streaming_types::apply_partial_turn_data_to_error_event(
+                    crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
                         &mut event,
                         &failure.partial,
                     );
@@ -2065,7 +2067,22 @@ async fn plan_executor_task(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        BackgroundPlanContext, ChannelSink, PlanCommand, PlanOutputSink, PlanUpdate, StderrSink,
+        annotate_plan_subtask_event, browser_verification_gap_report,
+        compact_subtask_history_entry, create_plan_channels, failed_verification_status,
+        has_any_unresolved_verification_failure, high_failure_tool_evidence, is_credential_error,
+        plan_completion_action, record_cloud_step_run, render_verifier_failure_hint,
+        report_contains_browser_verification_gap, sanitize_unverified_acceptance_claims,
+        spawn_plan_executor,
+    };
+    use crate::cli::durable_bridge;
+    use crate::cli::stream::streaming_types::StreamResult;
+    use crate::tests::stub_stream_result_with_records;
+    use astra_services::session_journal;
+    use astra_services::task_orchestrator::{TaskOutcome, TaskPlan, TaskStatus};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_background_plan_context() -> BackgroundPlanContext {
         let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
@@ -2080,7 +2097,7 @@ mod tests {
             token: String::new(),
             profile: None,
             model: None,
-            cli_context: crate::cli::cli_context::CliContext::default(),
+            cli_context: crate::cli::cli_config::cli_context::CliContext::default(),
             plan: TaskPlan::default(),
             plan_goal: None,
             plan_id: None,
@@ -2446,47 +2463,6 @@ mod tests {
             hint.contains("no matches for `use anyhow::`"),
             "hint should fall back to evidence when error is None: {hint}"
         );
-    }
-
-    fn stub_stream_result_with_records(
-        full_text: &str,
-        tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
-    ) -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: full_text.to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls_count: tool_call_records.len() as u32,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: tool_call_records.iter().map(|r| r.name.clone()).collect(),
-            tool_call_records,
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
     }
 
     #[test]

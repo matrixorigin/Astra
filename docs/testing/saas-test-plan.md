@@ -1,8 +1,10 @@
 # Astra SaaS 能力测试计划
 
-> **目的**：验证 Astra 作为 **托管云服务（SaaS）** 对外交付时，平台侧能力是否达标——用户通过 CLI / SDK / Web 连接云端 API，而非直连数据库。  
-> **范围**：认证与租户隔离、Cloud 运行时、资源治理、Admin 运维、多客户端协议、部署拓扑、可观测性与安全。  
-> **说明**：本文聚焦 **SaaS 发布质量验证**，不涉及 CI 流水线或 PR 门禁；**专门刻画 SaaS 形态下的必测项**。  
+> **目的**：验证 Astra 作为 **托管云服务（SaaS）** 对外交付时，平台侧能力是否达标——用户通过 CLI / SDK / Web 连接云端 API，而非直连数据库。
+>
+> **范围**：认证与租户隔离、Cloud 运行时、资源治理、Admin 运维、多客户端协议、部署拓扑、可观测性与安全。
+>
+> **说明**：本文聚焦 **SaaS 发布质量验证**，不涉及 CI 流水线或 PR 门禁；**专门刻画 SaaS 形态下的必测项**。
 > **相关文档**：[部署架构](../design/deployment-architecture.md) · [Edge-Cloud 分执行](../design/edge-cloud-execution.md) · [多 Agent Cloud Runtime](../design/multi-agent-cloud-runtime.md) · [信任与安全](../design/trust-and-safety.md) · [系统 E2E 矩阵](./system-e2e-matrix.md)
 
 ---
@@ -89,13 +91,13 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 
 Cloud 每一 Turn 必须完成（非简单 LLM 代理）：
 
-1. JWT 鉴权 + 限流  
-2. 持久化 Edge 上报的 `tool_results`  
-3. 上下文组装（Memoria、Skill 索引、few-shot）  
-4. 模型路由 + **预算门禁**（`ResourceGovernor.check_token_budget`）  
-5. LLM 调用（Key 不出 Cloud）  
-6. 防火墙 / 置信度  
-7. Audit（snapshot + decision + events）  
+1. JWT 鉴权 + 限流
+2. 持久化 Edge 上报的 `tool_results`
+3. 上下文组装（Memoria、Skill 索引、few-shot）
+4. 模型路由 + **预算门禁**（`ResourceGovernor.check_token_budget`）
+5. LLM 调用（Key 不出 Cloud）
+6. 防火墙 / 置信度
+7. Audit（snapshot + decision + events）
 8. SSE 返回（含 `ping` 长 Turn 保活）
 
 | 测试项 | 通过标准 |
@@ -257,8 +259,8 @@ SaaS 需自动清理 idle/ended Session，防止存储无限增长。
 | batch_limit | 500/次 | 大批量不锁表 |
 
 **测试方式：**
-- 单元：`session_reaper.rs` 中 `reap_sessions` 纯函数测试  
-- 集成：缩短 policy 时间窗口，插入测试 Session，触发 sweep，断言 DB + 文件系统  
+- 单元：`session_reaper.rs` 中 `reap_sessions` 纯函数测试
+- 集成：缩短 policy 时间窗口，插入测试 Session，触发 sweep，断言 DB + 文件系统
 - Admin：`POST /admin/cleanup` 与 scheduled reaper 结果一致
 
 ### 5.6 模型与 LLM 托管
@@ -565,4 +567,3 @@ Edge-Cloud 与 Engine 能力重叠部分只测一次。
 | Skill tenant-scope admin（P2） | 企业多租户配置 | GA 若不含则 Out of Scope |
 | Multi-Account 无自动化 | 租户隔离 | 专项手工 + 脚本化 smoke |
 | Marketplace install/rollback | 技能生态 SaaS | Beta 后迭代 |
-

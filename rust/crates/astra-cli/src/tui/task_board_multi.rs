@@ -90,7 +90,8 @@ pub(crate) fn group_by_session(rows: &[MultiSessionRow]) -> Vec<(String, Vec<Mul
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{MultiSessionRow, flatten_active, group_by_session};
+    use astra_tools::task_mgmt::SessionTask;
 
     fn task(id: &str, title: &str, status: &str, updated_at: &str) -> SessionTask {
         SessionTask {

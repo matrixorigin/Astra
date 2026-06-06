@@ -1,4 +1,4 @@
-use super::*;
+use crossterm::style::Stylize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkillInstallStatusKind {
@@ -47,7 +47,7 @@ impl SkillInstallStatusSurface<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SkillInstallStatusKind, skill_install_status_kind, skill_install_status_surface};
 
     #[test]
     fn skill_install_status_helpers_classify_known_statuses() {

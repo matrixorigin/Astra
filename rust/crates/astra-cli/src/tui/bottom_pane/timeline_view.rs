@@ -101,9 +101,11 @@ impl BottomPaneView for TimelineView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::TimelineView;
+    use crate::tui::timeline::Timeline;
     use crate::tui::timeline::model::{StaticTurnSource, TimelineTurn};
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

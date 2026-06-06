@@ -102,7 +102,7 @@ pub fn new_detach_pair() -> (DetachShellHandle, DetachShellListener) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{DetachedShellPayload, new_detach_pair};
 
     /// Sanity: pair construction yields linked signal halves and
     /// a oneshot pair where dropping the handle without taking the

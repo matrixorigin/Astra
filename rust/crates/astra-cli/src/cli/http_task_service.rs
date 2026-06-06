@@ -7,7 +7,7 @@
 //! CLI-side `TaskService` implementation that wraps each method
 //! into an HTTP request.
 //!
-//! Used by `cli::session_runtime::resolve_task_service` when
+//! Used by `cli::session::session_runtime::resolve_task_service` when
 //! `cloud_base` is configured. Offline / one-shot CLI falls back
 //! to the in-memory `LocalTaskService`.
 

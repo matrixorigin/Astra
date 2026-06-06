@@ -3,7 +3,8 @@
 #![cfg(test)]
 
 use super::provider::{FileKind, StaticFileProvider};
-use super::{MentionMenu, MentionToken, extract_mention_at};
+use super::{MentionMenu, extract_mention_at};
+use crate::tui::mention_menu::menu::MentionToken;
 
 fn fixture() -> StaticFileProvider {
     StaticFileProvider::with_root_listing(&[

@@ -2,7 +2,6 @@ use crate::cli::surface::task_checkpoint_surface::{
     task_checkpoint_surface, task_record_error_detail, task_record_error_kind, task_record_outcome,
     task_record_status_label,
 };
-use crate::cli::task::task_result_artifact::{TaskResultArtifact, load_task_result_artifact};
 use astra_services::TaskRecord;
 use crossterm::style::{StyledContent, Stylize};
 
@@ -22,10 +21,19 @@ pub(crate) struct TaskResultHeaderSurface<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct TaskResultReadSurface<'a> {
     pub(crate) task: &'a TaskRecord,
-    pub(crate) exit_code: crate::cli::command_router::ExitCode,
+    pub(crate) exit_code: crate::cli::exit_code::ExitCode,
     pub(crate) header: TaskResultHeaderSurface<'a>,
     pub(crate) effective_error_kind: Option<&'a str>,
     pub(crate) missing_text: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskResultArtifactSurface<'a> {
+    pub(crate) full_text: &'a str,
+    pub(crate) prompt_tokens: Option<u64>,
+    pub(crate) completion_tokens: u64,
+    pub(crate) tool_calls_count: u64,
+    pub(crate) output_file: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +61,7 @@ impl<'a> TaskResultReadSurface<'a> {
         let header = task_result_header_surface(task);
         let effective_error_kind = header
             .error_kind
-            .or_else(|| crate::cli::task_result_projection::error_kind_for_exit_code(exit_code));
+            .or_else(|| crate::cli::command_router::error_kind_for_exit_code(exit_code));
         let missing_text = task_result_missing_text(task);
         Self {
             task,
@@ -62,10 +70,6 @@ impl<'a> TaskResultReadSurface<'a> {
             effective_error_kind,
             missing_text,
         }
-    }
-
-    pub(crate) fn load_artifact(&self) -> Result<Option<TaskResultArtifact>, String> {
-        load_task_result_artifact(self.task)
     }
 
     pub(crate) fn header_fields(&'a self) -> Vec<TaskResultHeaderField<'a>> {
@@ -127,7 +131,10 @@ impl<'a> TaskResultReadSurface<'a> {
         fields
     }
 
-    pub(crate) fn json_payload(&self, artifact: Option<&TaskResultArtifact>) -> serde_json::Value {
+    pub(crate) fn json_payload(
+        &self,
+        artifact: Option<TaskResultArtifactSurface<'_>>,
+    ) -> serde_json::Value {
         let mut payload = serde_json::Map::from_iter([
             ("task_id".to_string(), serde_json::json!(self.task.task_id)),
             ("title".to_string(), serde_json::json!(self.task.title)),
@@ -185,7 +192,7 @@ impl<'a> TaskResultReadSurface<'a> {
                     "tool_calls_count".to_string(),
                     serde_json::json!(artifact.tool_calls_count),
                 );
-                if let Some(output_file) = artifact.output_file.as_deref() {
+                if let Some(output_file) = artifact.output_file {
                     payload.insert("output_file".to_string(), serde_json::json!(output_file));
                 }
             }
@@ -231,9 +238,7 @@ pub(crate) fn task_result_header_surface(task: &TaskRecord) -> TaskResultHeaderS
     }
 }
 
-pub(crate) fn task_result_lookup_exit_code(
-    task: &TaskRecord,
-) -> crate::cli::command_router::ExitCode {
+pub(crate) fn task_result_lookup_exit_code(task: &TaskRecord) -> crate::cli::exit_code::ExitCode {
     if let Some(error_kind) =
         task_record_error_kind(task).and_then(crate::cli::command_router::exit_code_for_error_kind)
     {
@@ -241,40 +246,36 @@ pub(crate) fn task_result_lookup_exit_code(
     }
 
     if !task.status.is_terminal() {
-        return crate::cli::command_router::ExitCode::Unfinished;
+        return crate::cli::exit_code::ExitCode::Unfinished;
     }
 
     match (task.status, task.outcome) {
         (astra_services::TaskStatus::Completed, Some(astra_services::TaskOutcome::Partial)) => {
-            crate::cli::command_router::ExitCode::Partial
+            crate::cli::exit_code::ExitCode::Partial
         }
-        (astra_services::TaskStatus::Completed, _) => crate::cli::command_router::ExitCode::Success,
-        (astra_services::TaskStatus::Cancelled, _) => {
-            crate::cli::command_router::ExitCode::ForceStop
-        }
-        (astra_services::TaskStatus::Failed, _) => {
-            crate::cli::command_router::ExitCode::ToolFailure
-        }
+        (astra_services::TaskStatus::Completed, _) => crate::cli::exit_code::ExitCode::Success,
+        (astra_services::TaskStatus::Cancelled, _) => crate::cli::exit_code::ExitCode::ForceStop,
+        (astra_services::TaskStatus::Failed, _) => crate::cli::exit_code::ExitCode::ToolFailure,
         _ => unreachable!("non-terminal statuses return Unfinished above"),
     }
 }
 
 pub(crate) fn task_result_is_unfinished(task: &TaskRecord) -> bool {
-    task_result_lookup_exit_code(task) == crate::cli::command_router::ExitCode::Unfinished
+    task_result_lookup_exit_code(task) == crate::cli::exit_code::ExitCode::Unfinished
 }
 
 pub(crate) fn task_result_effective_error_kind<'a>(
     header: &'a TaskResultHeaderSurface<'a>,
-    exit_code: crate::cli::command_router::ExitCode,
+    exit_code: crate::cli::exit_code::ExitCode,
 ) -> Option<&'a str> {
     header
         .error_kind
-        .or_else(|| crate::cli::task_result_projection::error_kind_for_exit_code(exit_code))
+        .or_else(|| crate::cli::command_router::error_kind_for_exit_code(exit_code))
 }
 
 pub(crate) fn task_result_missing_text(task: &TaskRecord) -> &'static str {
     if task_result_is_unfinished(task) {
-        crate::cli::task_checkpoint_surface::unfinished_task_notice(task.status)
+        crate::cli::surface::task_checkpoint_surface::unfinished_task_notice(task.status)
     } else {
         "No result available."
     }
@@ -288,7 +289,7 @@ pub(crate) fn task_result_header_fields<'a>(
 
 pub(crate) fn task_result_json_payload(
     read: &TaskResultReadSurface<'_>,
-    artifact: Option<&TaskResultArtifact>,
+    artifact: Option<TaskResultArtifactSurface<'_>>,
 ) -> serde_json::Value {
     read.json_payload(artifact)
 }
@@ -311,8 +312,12 @@ pub(crate) fn render_task_result_header_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_services::{TaskCheckpoint, TaskOutcome, TaskStatus};
+    use super::{
+        TaskResultArtifactSurface, load_task_result_read_surface, task_result_effective_error_kind,
+        task_result_header_fields, task_result_header_surface, task_result_json_payload,
+        task_result_lookup_exit_code, task_result_missing_text,
+    };
+    use astra_services::{TaskCheckpoint, TaskOutcome, TaskRecord, TaskStatus};
 
     fn base_task() -> TaskRecord {
         TaskRecord {
@@ -360,7 +365,7 @@ mod tests {
         let mut task = base_task();
         task.status = TaskStatus::Failed;
         task.error_message = Some(
-            crate::cli::task_checkpoint_surface::encode_task_failure_message(
+            crate::cli::surface::task_checkpoint_surface::encode_task_failure_message(
                 "persistence_error",
                 "disk full",
             ),
@@ -412,7 +417,7 @@ mod tests {
 
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::PersistenceError
+            crate::cli::exit_code::ExitCode::PersistenceError
         );
 
         task.checkpoint
@@ -422,7 +427,7 @@ mod tests {
             .insert("error_kind".into(), serde_json::json!("partial"));
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::Partial
+            crate::cli::exit_code::ExitCode::Partial
         );
     }
 
@@ -432,25 +437,25 @@ mod tests {
         task.status = TaskStatus::Pending;
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::Unfinished
+            crate::cli::exit_code::ExitCode::Unfinished
         );
 
         task.status = TaskStatus::InProgress;
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::Unfinished
+            crate::cli::exit_code::ExitCode::Unfinished
         );
 
         task.status = TaskStatus::Paused;
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::Unfinished
+            crate::cli::exit_code::ExitCode::Unfinished
         );
 
         task.status = TaskStatus::Completed;
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::Success
+            crate::cli::exit_code::ExitCode::Success
         );
     }
 
@@ -459,7 +464,7 @@ mod tests {
         let mut task = base_task();
         task.status = TaskStatus::Failed;
         task.error_message = Some(
-            crate::cli::task_checkpoint_surface::encode_task_failure_message(
+            crate::cli::surface::task_checkpoint_surface::encode_task_failure_message(
                 "persistence_error",
                 "failed to save background task result: disk full",
             ),
@@ -467,7 +472,7 @@ mod tests {
 
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::PersistenceError
+            crate::cli::exit_code::ExitCode::PersistenceError
         );
     }
 
@@ -490,7 +495,7 @@ mod tests {
 
         assert_eq!(
             task_result_lookup_exit_code(&task),
-            crate::cli::command_router::ExitCode::Unfinished
+            crate::cli::exit_code::ExitCode::Unfinished
         );
     }
 
@@ -499,15 +504,15 @@ mod tests {
         let mut task = base_task();
         task.status = TaskStatus::Paused;
         let read = load_task_result_read_surface(&task);
-        let artifact = TaskResultArtifact {
-            full_text: "partial text".into(),
+        let artifact = TaskResultArtifactSurface {
+            full_text: "partial text",
             prompt_tokens: Some(11),
             completion_tokens: 7,
             tool_calls_count: 3,
-            output_file: Some("/tmp/out.txt".into()),
+            output_file: Some("/tmp/out.txt"),
         };
 
-        let payload = task_result_json_payload(&read, Some(&artifact));
+        let payload = task_result_json_payload(&read, Some(artifact));
 
         assert_eq!(payload["status"], "unfinished");
         assert_eq!(payload["task_status"], "paused");
@@ -538,10 +543,7 @@ mod tests {
         task.status = TaskStatus::Paused;
         let header = task_result_header_surface(&task);
         assert_eq!(
-            task_result_effective_error_kind(
-                &header,
-                crate::cli::command_router::ExitCode::Unfinished,
-            ),
+            task_result_effective_error_kind(&header, crate::cli::exit_code::ExitCode::Unfinished,),
             Some("unfinished")
         );
     }
@@ -552,7 +554,9 @@ mod tests {
         task.status = TaskStatus::Pending;
         assert_eq!(
             task_result_missing_text(&task),
-            crate::cli::task_checkpoint_surface::unfinished_task_notice(TaskStatus::Pending)
+            crate::cli::surface::task_checkpoint_surface::unfinished_task_notice(
+                TaskStatus::Pending
+            )
         );
 
         task.status = TaskStatus::Completed;
@@ -581,15 +585,14 @@ mod tests {
 
         let read = load_task_result_read_surface(&task);
 
-        assert_eq!(
-            read.exit_code,
-            crate::cli::command_router::ExitCode::Unfinished
-        );
+        assert_eq!(read.exit_code, crate::cli::exit_code::ExitCode::Unfinished);
         assert!(read.header.is_unfinished);
         assert_eq!(read.effective_error_kind, Some("unfinished"));
         assert_eq!(
             read.missing_text,
-            crate::cli::task_checkpoint_surface::unfinished_task_notice(TaskStatus::Paused)
+            crate::cli::surface::task_checkpoint_surface::unfinished_task_notice(
+                TaskStatus::Paused
+            )
         );
     }
 }

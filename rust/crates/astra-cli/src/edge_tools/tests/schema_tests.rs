@@ -1,4 +1,4 @@
-use super::*;
+use super::all_tool_schemas;
 
 // ── all_tool_schemas ──────────────────────────────────────────────────────
 

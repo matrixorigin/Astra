@@ -434,7 +434,7 @@ fn current_timestamp_ms() -> u64 {
 // ═══════════════════════════════════════════════════════════ Tests ═════
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ChangeAccumulator, ChangeOp, DeltaEntry, DeltaError, current_timestamp_ms};
 
     #[test]
     fn test_create_operation() {

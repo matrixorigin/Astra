@@ -1,4 +1,4 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
 use crate::{cli_dim, cli_info, cli_section};
 
 /// Handle `/sync` without direct DB access.

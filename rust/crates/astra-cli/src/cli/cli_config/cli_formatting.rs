@@ -400,7 +400,11 @@ fn find_comment_start(code: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block,
+        find_comment_start, format_byte_size, format_duration_suffix, highlight_code_line,
+        shorten_path, truncate_line,
+    };
 
     #[test]
     fn test_truncate_line() {

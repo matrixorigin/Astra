@@ -49,7 +49,10 @@ pub fn tool_result_status_is_failure(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ToolResultStatusKind, tool_result_status_is_failure, tool_result_status_is_success,
+        tool_result_status_kind,
+    };
 
     #[test]
     fn from_status_str_success_variants() {

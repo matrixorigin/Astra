@@ -107,7 +107,8 @@ pub(crate) fn last_seen_cutoff(last_turn_event: Option<&JournalEvent>) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ResumeSummary, last_seen_cutoff, summarize};
+    use astra_services::{TaskListItem, TaskOutcome, TaskStatus, session_journal::JournalEvent};
 
     fn item(task_id: &str, status: TaskStatus, updated_at: &str) -> TaskListItem {
         TaskListItem {
@@ -133,7 +134,7 @@ mod tests {
         let mut task = item("a", TaskStatus::Completed, "2025-05-10T12:00:00Z");
         task.outcome = Some(TaskOutcome::Success);
         task.error_message = Some(
-            crate::cli::task_checkpoint_surface::encode_task_failure_message(
+            crate::cli::surface::task_checkpoint_surface::encode_task_failure_message(
                 "persistence_error",
                 "failed to append turn event",
             ),

@@ -1,6 +1,18 @@
-use super::*;
+use crate::cli::{
+    chat_stream::{ChatTurnParams, stream_chat_sse},
+    cli_config::cli_utils::{
+        compact_or_raw, map_thin_err, persist_profile_last_session_or_warn, prefix_chars,
+        print_json_or_raw, urlencoding,
+    },
+    permission_manager::PermissionManager,
+    session::session_state::{ContinuationAnchor, ExplainMode, SessionState},
+    theme,
+};
+use astra_runtime::prompts;
 use astra_runtime::turn::cloud::compaction_engine::{CompactionEngine, TokenBudget};
 use astra_runtime::turn::cloud::memoria_compact::build_compaction_layered_body;
+use astra_services::session_journal;
+use crossterm::style::Stylize;
 use std::sync::Arc;
 
 pub(crate) struct StateCommandContext<'a> {
@@ -68,7 +80,7 @@ impl<'a> CompactCtx<'a> {
             history,
             perm_manager,
             verbose_mode: false,
-            render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+            render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
             cli_context: Some(&self.state.cli_context),
             recent_tools: &[],
             tool_health_entries: &[],
@@ -262,7 +274,7 @@ fn plan_manual_compaction(
 }
 
 async fn persist_history_edit_state(state: &mut SessionState, action: &str) -> Result<(), String> {
-    crate::cli::session_recovery::sync_recovery_snapshot_after_history_edit(state)
+    crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(state)
         .await
         .map_err(|error| {
             format!(
@@ -428,7 +440,7 @@ pub(crate) async fn handle_state_command(
                 state.clear_session_id();
             }
             if let Some(ref sid) = new_sid {
-                crate::cli::session_startup::initialize_journal_pub(state, sid);
+                crate::cli::session::session_startup::initialize_journal_pub(state, sid);
             }
             let display = new_sid.as_deref().unwrap_or("(none)");
             eprintln!(
@@ -714,7 +726,8 @@ pub(crate) async fn handle_state_command(
 
             // ── Micro-compact: reduce input tokens before LLM summary call ──
             let pre_messages = {
-                let mut msgs = crate::cli::session_projection::history_as_messages(&state.history);
+                let mut msgs =
+                    crate::cli::session::session_projection::history_as_messages(&state.history);
                 let limit = astra_runtime::prompts::budget_for_model(state.model.as_deref())
                     .effective_input_limit() as u64;
                 let budget = TokenBudget {
@@ -893,7 +906,7 @@ pub(crate) async fn handle_state_command(
             let anchor = if compact_args.no_memoria {
                 None
             } else {
-                crate::cli::session_compaction::fetch_compact_memory_anchor_snippet(
+                crate::cli::session::session_compaction::fetch_compact_memory_anchor_snippet(
                     api,
                     tok,
                     state.session_id.as_deref(),
@@ -901,7 +914,7 @@ pub(crate) async fn handle_state_command(
                 )
                 .await
             };
-            let assistant_text = crate::cli::session_compaction::compact_assistant_message(
+            let assistant_text = crate::cli::session::session_compaction::compact_assistant_message(
                 trimmed_count,
                 &summary,
                 anchor.as_deref(),
@@ -1106,7 +1119,7 @@ fn is_local_reflect_report(report: &serde_json::Value) -> bool {
 /// Output enumerates tool-health entries whose failure rate, call count,
 /// or presence changed since last sync. When nothing changed (e.g. fresh
 /// session) the output is an explicit "no delta" line.
-pub(crate) fn render_reflect_diff(state: &super::session_state::SessionState) -> String {
+pub(crate) fn render_reflect_diff(state: &SessionState) -> String {
     use std::collections::HashMap;
     use std::fmt::Write;
 
@@ -1491,24 +1504,19 @@ fn render_local_reflect_report(
 
 #[cfg(test)]
 mod state_command_tests {
-    use super::*;
+    use super::{
+        HistoryEditSnapshot, StateCommandContext, handle_state_command, handle_undo_persist_failure,
+    };
+    use crate::cli::session::session_state::SessionState;
     use crate::lock_recovery::LockRecovery;
-    use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
+    use astra_services::session_journal::{self, JournalEventType};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
 
     #[serial_test::serial]
     #[tokio::test]
     async fn clear_command_starts_fresh_session_and_resets_state() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let old_sid = uuid::Uuid::new_v4().to_string();
         let new_sid = uuid::Uuid::new_v4().to_string();
         let server = MockServer::start().await;
@@ -1525,7 +1533,7 @@ mod state_command_tests {
         let mut state = SessionState::default();
         state.set_session_id(old_sid.clone());
         state.model = Some("gpt-5".to_string());
-        crate::cli::session_startup::initialize_journal_pub(&mut state, &old_sid);
+        crate::cli::session::session_startup::initialize_journal_pub(&mut state, &old_sid);
         state.pending_recovery = Some("stale".into());
         state.run_id = Some("run-1".into());
         state.turn = 4;
@@ -1622,7 +1630,7 @@ mod state_command_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn undo_rolls_back_live_state_when_recovery_persist_fails() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
         ws.turn_count = 2;
@@ -1670,7 +1678,7 @@ mod state_command_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn undo_restores_workspace_files_when_recovery_persist_fails() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let file_path = temp.path().join("edited.txt");
@@ -1753,7 +1761,7 @@ mod state_command_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn compact_single_turn_rewrites_current_turn_in_place() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
         ws.turn_count = 1;
@@ -1772,7 +1780,7 @@ mod state_command_tests {
         state.turn = 1;
         state.history = vec![("hi".into(), "hello".into())];
         state.recent_tools = vec!["bash".into()];
-        crate::cli::session_startup::initialize_journal_pub(&mut state, &sid);
+        crate::cli::session::session_startup::initialize_journal_pub(&mut state, &sid);
 
         handle_state_command(
             "/compact",
@@ -1817,7 +1825,7 @@ mod state_command_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn compact_rolls_back_live_state_when_recovery_persist_fails() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
         ws.turn_count = 1;
@@ -1839,7 +1847,7 @@ mod state_command_tests {
         state.turn = 1;
         state.history = vec![("hi".into(), "hello".into())];
         state.recent_tools = vec!["bash".into()];
-        crate::cli::session_startup::initialize_journal_pub(&mut state, &sid);
+        crate::cli::session::session_startup::initialize_journal_pub(&mut state, &sid);
 
         let error = handle_state_command(
             "/compact",
@@ -1870,7 +1878,7 @@ mod state_command_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn reflect_falls_back_to_remote_when_local_state_missing() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1907,7 +1915,7 @@ mod state_command_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn reflect_surfaces_local_artifact_error_without_remote_fallback() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1948,7 +1956,8 @@ mod state_command_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{is_local_reflect_report, parse_reflect_args, render_reflect_diff};
+    use crate::cli::session::session_state::SessionState;
 
     #[test]
     fn parse_reflect_args_recognises_diff_focus() {
@@ -1959,7 +1968,7 @@ mod tests {
 
     #[test]
     fn render_reflect_diff_reports_no_delta_on_fresh_session() {
-        let state = crate::cli::session_state::SessionState::default();
+        let state = crate::cli::session::session_state::SessionState::default();
         let out = render_reflect_diff(&state);
         assert!(out.contains("reflect diff"), "header present: {out}");
         assert!(
@@ -1971,7 +1980,7 @@ mod tests {
     #[test]
     fn render_reflect_diff_surfaces_new_and_drifting_tools() {
         use astra_turn_core::tool_health_persistence::ToolHealthEntry;
-        let mut state = crate::cli::session_state::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         // Baseline had "grep" at 10 calls / 10% fail.
         state.synced_tool_health_entries = vec![ToolHealthEntry {
             name: "grep".into(),
@@ -2192,7 +2201,13 @@ mod tests {
 
 #[cfg(test)]
 mod compact_tests {
-    use super::*;
+    use super::{
+        CompactArgs, CompactCtx, ManualCompactPlan, build_swap_memory_body, cap_swap_body,
+        compact_mem_note, parse_compact_args, plan_manual_compaction,
+    };
+    use crate::cli::permission_manager::PermissionManager;
+    use crate::cli::session::session_state::SessionState;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]

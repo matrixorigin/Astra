@@ -277,8 +277,11 @@ fn title_case(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AgentProfile, AgentTier, load_agent_profiles, load_and_merge, split_frontmatter, title_case,
+    };
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn write_agent_md(dir: &Path, name: &str, content: &str) {

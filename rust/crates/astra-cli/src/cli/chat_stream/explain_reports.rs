@@ -81,7 +81,8 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
 
 #[cfg(test)]
 mod explain_preview_tests {
-    use super::*;
+    use super::render_explain_report_text;
+    use crate::explain_dag::ExplainTurnMeta;
 
     #[test]
     fn render_explain_report_text_uses_dag_and_cache_fields() {

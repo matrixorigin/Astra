@@ -655,6 +655,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-cpp",
  "tree-sitter-go",

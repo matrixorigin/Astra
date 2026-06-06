@@ -23,7 +23,7 @@ pub async fn handle_agent_get_result_action(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::handle_agent_spawn_action;
     use serde_json::json;
 
     #[tokio::test]

@@ -10,9 +10,8 @@ pub(crate) use astra_turn_core::orchestration::agent_result_wire::project_agent_
 mod tests {
     use std::str::FromStr;
 
+    use super::{AGENT_RESULT_INTERRUPTED_ERROR, agent_control_interrupted_message};
     use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
-
-    use super::*;
 
     #[test]
     fn shared_agent_control_status_kind_roundtrips_via_from_str() {

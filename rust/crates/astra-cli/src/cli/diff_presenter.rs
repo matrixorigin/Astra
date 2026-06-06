@@ -538,7 +538,10 @@ fn print_diff_usage() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DiffScope, DiffSink, DiffStats, hyperlink_diff_path_meta, parse_diff_args,
+        render_diff_line, summarize_unified_diff,
+    };
 
     struct CollectSink(Vec<String>);
 

@@ -496,8 +496,13 @@ fn sanitize_path_for_backup(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DEFAULT_MAX_SNAPSHOTS, FileBackupState, FileHistory, MAX_CHECKPOINT_FILE_BYTES,
+        sanitize_path_for_backup,
+    };
     use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn make_history(tmp: &TempDir) -> FileHistory {

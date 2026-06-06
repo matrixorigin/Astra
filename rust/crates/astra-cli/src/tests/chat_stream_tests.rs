@@ -1,5 +1,12 @@
-use super::*;
+use super::spawn_mock;
+use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+use crate::cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
+use crate::cli::permission_manager::PermissionManager;
+use crate::cli::session::session_state::{ExplainMode, SessionState};
+use crate::edge_tools;
+use astra_runtime::tool_registry;
 use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
+use axum::{Router, routing::post};
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
@@ -55,7 +62,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -170,7 +177,7 @@ async fn stream_chat_sse_simple_text_response() {
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -278,7 +285,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -390,7 +397,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             history: &[],
             perm_manager: &mut pm,
             verbose_mode: false,
-            render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+            render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
             cli_context: None,
             recent_tools: &[],
             resume_restricted_tools: &[],
@@ -494,7 +501,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -626,7 +633,7 @@ async fn stream_chat_sse_api_error_propagated() {
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -734,7 +741,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -865,7 +872,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -1039,7 +1046,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],
@@ -1196,7 +1203,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         history: &[],
         perm_manager: &mut pm,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         recent_tools: &[],
         resume_restricted_tools: &[],

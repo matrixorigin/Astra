@@ -36,7 +36,9 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 
-use crate::{ExplainMode, StreamResult, cli::cli_utils::terminal_width_usize, edge_tools};
+use crate::{
+    ExplainMode, StreamResult, cli::cli_config::cli_utils::terminal_width_usize, edge_tools,
+};
 
 use crate::cli::chat_stream::ChatTurnParams;
 use crate::cli::chat_stream::explain_reports;
@@ -532,7 +534,7 @@ pub(crate) async fn stream_chat_sse(
         plan_review_request_tx: p.plan_review_request_tx,
         root_send_message_context,
         chat_turn_index: p.turn_index,
-        tool_cache: crate::cli::stream_render::EdgeToolCache::new(
+        tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
         prefix_store: prefix_store_for_host,

@@ -1,5 +1,6 @@
-use super::*;
 use crate::cli::project_instructions::format_project_instructions;
+use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
+use astra_runtime::prompts;
 use astra_turn_core::input_classifier;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,8 +208,13 @@ pub(crate) fn is_low_information_followup(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        apply_resume_context, build_effective_line, clear_pending_recovery_for_ordinary_chat_input,
+        detect_correction_signal, finalize_effective_line, is_low_information_followup,
+    };
+    use crate::cli::session::session_state::SessionState;
     use crate::cli::session::session_state::SkillDevState;
+    use astra_runtime::prompts;
 
     #[test]
     fn detect_correction_signal_handles_english_and_chinese_redirects() {

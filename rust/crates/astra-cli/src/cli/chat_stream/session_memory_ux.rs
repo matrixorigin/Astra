@@ -213,12 +213,21 @@ fn handle_event(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_runtime::session_memory::{BackgroundActivityBroker, ConstSelectorResolver};
+    use super::SessionMemoryUxBridge;
+    use astra_runtime::session_memory::{
+        BackgroundActivity, BackgroundActivityBroker, ConstSelectorResolver,
+        MemoryExtractionService,
+    };
     use astra_runtime::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
     use astra_services::event_ingestion::IngestionSender;
-    use astra_services::session_journal::SessionMemoryExtractionErrorReason;
+    use astra_services::session_journal::{
+        SessionMemoryExtractionErrorReason, SessionMemoryExtractionSource,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
+
+    use crate::cli::chat_stream::params::StreamEvent;
 
     /// Minimal no-op Memoria client for UX-level tests: never stores,
     /// never retrieves — the UX bridge doesn't observe Memoria anyway.

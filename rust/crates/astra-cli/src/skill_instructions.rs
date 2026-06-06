@@ -193,7 +193,7 @@ pub fn parse_skill_md(content: &str) -> Result<SkillInstruction, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::skill_search_paths;
 
     #[test]
     fn skill_search_paths_returns_non_empty() {

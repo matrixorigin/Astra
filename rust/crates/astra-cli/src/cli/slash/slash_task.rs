@@ -1,16 +1,17 @@
-use super::*;
+use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+use crate::cli::permission_manager::PermissionManager;
+use crate::cli::session::session_state::{ExplainMode, SessionState};
 use crate::cli::surface::task_checkpoint_surface::{
     encode_task_failure_message, task_list_item_claimability_icon,
     task_list_item_claimability_label, task_list_item_outcome, task_list_item_status_icon,
     task_list_item_status_label,
 };
-#[cfg(test)]
-use crate::cli::surface::task_checkpoint_surface::{
-    task_checkpoint_surface, task_status_icon, task_status_label,
-};
 use crate::cli::surface::task_result_surface::{
     load_task_result_read_surface, render_task_result_header_value, task_result_header_fields,
 };
+use crate::cli::task::task_result_artifact::load_task_result_artifact;
+use crate::cli::theme;
+use crossterm::style::Stylize;
 
 async fn mark_background_task_failed(
     svc: &dyn astra_services::TaskService,
@@ -33,7 +34,7 @@ async fn persist_background_task_result(
     session_id: Option<String>,
     sr: &crate::StreamResult,
 ) -> Result<astra_services::TaskOutcome, String> {
-    let exit_code = crate::cli::task_result_projection::stream_result_exit_code(sr);
+    let exit_code = crate::cli::task::task_result_projection::stream_result_exit_code(sr);
     if let Err(error) = svc
         .save_checkpoint(
             task_id,
@@ -41,7 +42,7 @@ async fn persist_background_task_result(
                 active_subtask_id: None,
                 turn: 0,
                 session_id,
-                state: crate::cli::task_result_projection::task_checkpoint_state_from_result(
+                state: crate::cli::task::task_result_projection::task_checkpoint_state_from_result(
                     sr, None, exit_code,
                 ),
             },
@@ -58,7 +59,7 @@ async fn persist_background_task_result(
     }
 
     match exit_code {
-        crate::cli::command_router::ExitCode::Success => {
+        crate::cli::exit_code::ExitCode::Success => {
             if let Err(error) = svc.complete_task(task_id).await {
                 return Err(mark_background_task_failed(
                     svc,
@@ -70,8 +71,9 @@ async fn persist_background_task_result(
             }
             Ok(astra_services::TaskOutcome::Success)
         }
-        crate::cli::command_router::ExitCode::Partial => {
-            let outcome = crate::cli::task_result_projection::stream_result_completion_outcome(sr);
+        crate::cli::exit_code::ExitCode::Partial => {
+            let outcome =
+                crate::cli::task::task_result_projection::stream_result_completion_outcome(sr);
             if let Err(error) = svc.complete_task_with_outcome(task_id, outcome).await {
                 return Err(mark_background_task_failed(
                     svc,
@@ -86,9 +88,9 @@ async fn persist_background_task_result(
         _ => Err(mark_background_task_failed(
             svc,
             task_id,
-            crate::cli::task_result_projection::error_kind_for_exit_code(exit_code)
+            crate::cli::command_router::error_kind_for_exit_code(exit_code)
                 .unwrap_or("tool_failure"),
-            crate::cli::task_result_projection::stream_result_failure_reason(exit_code, sr),
+            crate::cli::task::task_result_projection::stream_result_failure_reason(exit_code, sr),
         )
         .await),
     }
@@ -408,8 +410,9 @@ pub(crate) async fn handle_task_command(
                 );
                 let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
-                let _modules =
-                    crate::cli::session_runtime::create_pipeline_modules_quiet(&api_clone, None);
+                let _modules = crate::cli::session::session_runtime::create_pipeline_modules_quiet(
+                    &api_clone, None,
+                );
 
                 let result = stream_chat_sse(ChatTurnParams {
                     api: &api_clone,
@@ -425,7 +428,7 @@ pub(crate) async fn handle_task_command(
                     history: &bg_history,
                     perm_manager: &mut perm_manager,
                     verbose_mode: false,
-                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                    render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
                     cli_context: Some(&bg_cli_context),
                     recent_tools: &[],
                     tool_health_entries: &[],
@@ -557,7 +560,7 @@ pub(crate) async fn handle_task_command(
                                 render_task_result_header_value(&field)
                             );
                         }
-                        match read.load_artifact() {
+                        match load_task_result_artifact(&t) {
                             Ok(Some(artifact)) => {
                                 eprintln!();
                                 eprintln!("{}", artifact.full_text);
@@ -628,8 +631,12 @@ pub(crate) async fn find_task_by_query(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{find_task_by_query, persist_background_task_result};
+    use crate::cli::surface::task_checkpoint_surface::{
+        task_checkpoint_surface, task_status_icon, task_status_label,
+    };
     use crate::lock_recovery::LockRecovery;
+    use crate::tests::stub_stream_result;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -1034,13 +1041,9 @@ mod tests {
             fail_task_error: None,
             state: state.clone(),
         };
-        let sr = crate::StreamResult {
-            full_text: "answer".into(),
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            tool_calls_count: 0,
-            ..Default::default()
-        };
+        let mut sr = stub_stream_result("answer");
+        sr.prompt_tokens = 10;
+        sr.completion_tokens = 20;
 
         let err = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
             .await
@@ -1050,7 +1053,7 @@ mod tests {
         assert!(snapshot.failed_error.is_some());
         assert!(!snapshot.completed);
         assert_eq!(
-            crate::cli::task_checkpoint_surface::parse_task_failure_message(
+            crate::cli::surface::task_checkpoint_surface::parse_task_failure_message(
                 snapshot.failed_error.as_deref().unwrap()
             ),
             (
@@ -1070,13 +1073,10 @@ mod tests {
             fail_task_error: None,
             state: state.clone(),
         };
-        let sr = crate::StreamResult {
-            full_text: "answer".into(),
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            tool_calls_count: 1,
-            ..Default::default()
-        };
+        let mut sr = stub_stream_result("answer");
+        sr.prompt_tokens = 10;
+        sr.completion_tokens = 20;
+        sr.tool_calls_count = 1;
 
         let outcome = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
             .await
@@ -1101,15 +1101,12 @@ mod tests {
             fail_task_error: None,
             state: state.clone(),
         };
-        let sr = crate::StreamResult {
-            full_text: "partial answer".into(),
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            tool_calls_count: 1,
-            final_state: "interrupted".into(),
-            interruption_kind: Some("budget_exhausted".into()),
-            ..Default::default()
-        };
+        let mut sr = stub_stream_result("partial answer");
+        sr.prompt_tokens = 10;
+        sr.completion_tokens = 20;
+        sr.tool_calls_count = 1;
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("budget_exhausted".into());
 
         let outcome = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
             .await
@@ -1137,14 +1134,11 @@ mod tests {
             fail_task_error: None,
             state: state.clone(),
         };
-        let sr = crate::StreamResult {
-            full_text: "answer".into(),
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            tool_calls_count: 1,
-            session_persistence_error: Some("failed to append turn event".into()),
-            ..Default::default()
-        };
+        let mut sr = stub_stream_result("answer");
+        sr.prompt_tokens = 10;
+        sr.completion_tokens = 20;
+        sr.tool_calls_count = 1;
+        sr.session_persistence_error = Some("failed to append turn event".into());
 
         let err = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
             .await
@@ -1155,7 +1149,7 @@ mod tests {
         assert!(!snapshot.completed);
         assert!(snapshot.completed_outcome.is_none());
         assert_eq!(
-            crate::cli::task_checkpoint_surface::parse_task_failure_message(
+            crate::cli::surface::task_checkpoint_surface::parse_task_failure_message(
                 snapshot.failed_error.as_deref().unwrap()
             ),
             (Some("persistence_error"), "failed to append turn event")

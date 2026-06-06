@@ -1,13 +1,18 @@
-use super::*;
 use crate::cli::agent_runtime::initialize_multi_agent_runtime;
+use crate::cli::auth_flow::{do_login, do_register};
+use crate::cli::cli_config::cli_utils::{
+    load_credentials, persist_profile_memoria_api_key, profile_name, prompt_or,
+    prompt_password_masked,
+};
 use crate::cli::session::session_runtime::current_access_token;
+use crate::cli::session::session_state::SessionState;
 use crate::post_auth_cloud_resync;
 use crate::{cli_dim, cli_err, cli_ok, cli_section};
 
 async fn refresh_auth_runtime(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut crate::SessionState,
+    state: &mut SessionState,
 ) {
     if let Some(token) = current_access_token(profile) {
         clear_auth_runtime(state);
@@ -15,14 +20,14 @@ async fn refresh_auth_runtime(
     }
 }
 
-fn clear_auth_runtime(state: &mut crate::SessionState) {
+fn clear_auth_runtime(state: &mut SessionState) {
     state.delegation_engine = None;
     state.agent_spawner = None;
     state.root_mailbox = None;
     state.pending_idle_agent_messages.clear();
 }
 
-fn clear_local_auth_state(profile: Option<&str>, state: &mut crate::SessionState) {
+fn clear_local_auth_state(profile: Option<&str>, state: &mut SessionState) {
     let _ = crate::cli::auth_flow::clear_profile_auth(profile);
     clear_auth_runtime(state);
 }
@@ -32,7 +37,7 @@ pub(crate) async fn handle_account_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut crate::SessionState,
+    state: &mut SessionState,
 ) -> Result<(), String> {
     match cmd {
         "/register" => {
@@ -99,8 +104,10 @@ pub(crate) async fn handle_account_command(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use super::{clear_auth_runtime, clear_local_auth_state, refresh_auth_runtime};
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
 
     #[serial_test::serial]
     #[tokio::test]
@@ -118,7 +125,7 @@ mod tests {
         save_credentials(&creds).unwrap();
 
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
             std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
             std::sync::Arc::new(
@@ -152,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_auth_runtime_drops_multi_agent_runtime() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
             astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
                 std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -222,7 +229,7 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
             astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
                 std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -250,7 +257,7 @@ mod tests {
 
         clear_local_auth_state(None, &mut state);
 
-        let creds = crate::load_credentials();
+        let creds = load_credentials();
         let profile = creds.profiles.get("default").unwrap();
         assert!(profile.access_token.is_none());
         assert!(profile.refresh_token.is_none());

@@ -1,4 +1,4 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
 
 /// Run the auto-invoke handler once per turn: compute signals, fire the gate,
 /// and stash the first diagnosis in `state.latest_skill_diagnosis`.
@@ -75,7 +75,8 @@ pub(crate) async fn maybe_run_auto_invoke(state: &mut SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::maybe_run_auto_invoke;
+    use crate::cli::session::session_state::SessionState;
 
     #[tokio::test]
     async fn auto_invoke_noop_when_signals_are_zero() {

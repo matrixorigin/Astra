@@ -6,7 +6,6 @@ use astra_services::{ForkSessionOptions, fork_local_session, session_journal, se
 use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
-use super::*;
 use crate::cli::session::session_restore_client;
 use crate::cli::session::session_runtime;
 use crate::cli::surface::agent_journal_event_surface::{
@@ -19,6 +18,21 @@ use crate::cli::surface::delegation_event_surface::{
 use crate::cli::surface::session_source_surface::session_source_surface;
 use crate::cli::surface::session_workspace_status_surface::session_workspace_status_surface;
 use crate::cli::tool_call_groups;
+use crate::cli::{
+    cli_config::cli_utils::{
+        SessionResumePreflight, clear_profile_last_session_if_matches_or_warn,
+        get_profile_and_token, normalize_model_override, persist_profile_last_session_or_warn,
+        preflight_remote_resume_session,
+    },
+    durable_bridge,
+    session::session_state::{ContinuationAnchor, SessionState},
+    session::{session_continuation, session_projection, session_startup, session_state},
+    slash::slash_stats,
+    stream::stream_render,
+    theme,
+};
+use astra_runtime::prompts;
+use crossterm::style::Stylize;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
 fn tilde_path(abs: &str) -> String {
@@ -1215,7 +1229,7 @@ pub(crate) async fn handle_session_command(
                     apply_prepared_fork_restore(fork_guard.state(), &new_sid, restored_child);
 
                     if let Err(error) =
-                        crate::cli::session_recovery::sync_recovery_snapshot_after_history_edit(
+                        crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
                             fork_guard.state(),
                         )
                         .await
@@ -1318,7 +1332,7 @@ pub(crate) async fn handle_session_command(
                                             .calls
                                             .iter()
                                             .map(|tc| {
-                                                super::stream_render::format_tool_display_from_preview(
+                                                stream_render::format_tool_display_from_preview(
                                                     &tc.name,
                                                     tc.args_preview.as_deref(),
                                                 )
@@ -1355,7 +1369,7 @@ pub(crate) async fn handle_session_command(
                                             eprintln!(
                                                 "      {} {} ({}ms) {}",
                                                 theme::icon_err(),
-                                                super::stream_render::format_tool_display_from_preview(
+                                                stream_render::format_tool_display_from_preview(
                                                     &tc.name,
                                                     tc.args_preview.as_deref(),
                                                 ),
@@ -1888,7 +1902,7 @@ pub(crate) async fn handle_session_command(
                             session_journal::JournalEventType::DelegationSubRunCompleted => {
                                 let projection =
                                     project_delegation_sub_run_completed(evt.metadata.as_ref());
-                                let icon = crate::cli::run_status_surface::run_status_icon(
+                                let icon = crate::cli::surface::run_status_surface::run_status_icon(
                                     &projection.status,
                                 );
                                 eprintln!(
@@ -2901,7 +2915,7 @@ fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
         out.push_str(&format!("- **{header}**\n"));
         for tc in &group.calls {
             let status = if tc.ok { "✓" } else { "✗" };
-            let display = super::stream_render::format_tool_display_from_preview(
+            let display = stream_render::format_tool_display_from_preview(
                 &tc.name,
                 tc.args_preview.as_deref(),
             );
@@ -3864,7 +3878,7 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
     // errored picker flow cannot leak into a later invocation and
     // silently analyze the wrong session.  When `arg` is supplied
     // the caller's value wins.
-    let stashed = crate::cli::slash_config::take_deep_analyze_arg();
+    let stashed = crate::cli::slash::slash_config::take_deep_analyze_arg();
     let arg_owned: String;
     let effective_arg: &str = if arg.trim().is_empty() {
         match stashed {
@@ -4462,8 +4476,9 @@ mod session_display_tests {
 
 #[cfg(test)]
 mod export_tests {
-    use super::*;
+    use super::{build_export_markdown, format_tool_calls_md};
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+    use astra_services::session_workspace;
 
     /// Construct a JournalEvent from a JSON value — avoids listing all fields.
     fn evt_from_json(json: serde_json::Value) -> JournalEvent {
@@ -4777,7 +4792,7 @@ struct PreparedWorkspaceRestore {
     session_persistence_error: Option<String>,
     pinned_skills: std::collections::HashSet<String>,
     discovered_skills: std::collections::HashSet<String>,
-    pending_adaptive_state: Option<super::session_state::PersistedAdaptiveState>,
+    pending_adaptive_state: Option<session_state::PersistedAdaptiveState>,
 }
 
 fn prepared_workspace_restore_from_workspace(
@@ -4787,7 +4802,7 @@ fn prepared_workspace_restore_from_workspace(
         || ws.last_token_budget_direction != 0
         || ws.active_experiment_id.is_some()
         || ws.tuned_config_json.is_some())
-    .then(|| super::session_state::PersistedAdaptiveState {
+    .then(|| session_state::PersistedAdaptiveState {
         last_scenario_change_turn: ws.last_scenario_change_turn,
         last_token_budget_direction: ws.last_token_budget_direction,
         last_token_budget_change_turn: ws.last_token_budget_change_turn,
@@ -4814,6 +4829,28 @@ fn load_prepared_workspace_restore(
         Ok(ws) => Ok(prepared_workspace_restore_from_workspace(ws)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Ok(PreparedWorkspaceRestore::default())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let backup = session_workspace::backup_invalid_workspace_file(&restored.session_id)
+                .map_err(|backup_error| {
+                    format!(
+                        "read workspace state for session {}: {e}; failed to move invalid workspace aside: {backup_error}",
+                        restored.session_id
+                    )
+                })?;
+            tracing::warn!(
+                session_id = %restored.session_id,
+                error = %e,
+                backup_path = ?backup,
+                "workspace metadata unreadable during resume; rebuilding from restored session"
+            );
+            let model_for_new = restored.model.as_deref().unwrap_or("default");
+            let mut workspace =
+                session_workspace::WorkspaceMetadata::new(&restored.session_id, model_for_new);
+            workspace.last_persistence_error = Some(format!(
+                "workspace metadata unreadable during resume; rebuilt from journal/checkpoint ({e})"
+            ));
+            Ok(prepared_workspace_restore_from_workspace(workspace))
         }
         Err(e) => Err(format!(
             "read workspace state for session {}: {e}",
@@ -4946,8 +4983,8 @@ fn apply_heavy_state_fallback(
         state.recent_tools = recent_tools.to_vec();
     }
     if state.history.is_empty() {
-        let pairs = super::session_continuation::history_pairs_from_messages(
-            &super::session_continuation::sanitize_continuation_messages(messages.to_vec()),
+        let pairs = session_continuation::history_pairs_from_messages(
+            &session_continuation::sanitize_continuation_messages(messages.to_vec()),
         );
         if !pairs.is_empty() {
             state.history = pairs;
@@ -5089,7 +5126,7 @@ fn materialize_prepared_fork_restore(
     let mut history = restored_journal.session.history.clone();
     let mut recent_tools = restored_journal.session.recent_tools.clone();
     if let Some(ref materialized) = mat {
-        history = super::session_continuation::history_pairs_from_messages(&materialized.messages);
+        history = session_continuation::history_pairs_from_messages(&materialized.messages);
         if !materialized.session_state.recent_tools.is_empty() {
             recent_tools = materialized.session_state.recent_tools.clone();
         }
@@ -5904,8 +5941,19 @@ pub(crate) async fn handle_resume_command(
 
 #[cfg(test)]
 mod resume_tests {
-    use super::*;
+    use super::{
+        ForkStateGuard, ForkStateSnapshot, PreparedForkRestore, SessionListFilterOptions,
+        SessionListFilterOutcome, apply_heavy_checkpoint_fallback, apply_prepared_fork_restore,
+        apply_restored_session, apply_resume_recovery_state, build_session_list_entries,
+        build_step_resume_guidance, filter_session_list_entries, load_prepared_fork_restore,
+        load_resumable_session_candidates, restore_journal_history_if_available,
+        restore_session_into_state, resume_persistence_warning, session_restore_client,
+        session_runtime, session_startup, switch_session_into_state, workspace_summary_line,
+    };
+    use crate::cli::session::session_state::SessionState;
     use astra_services::session_journal::{self, JournalDirGuard};
+    use astra_services::session_restore::RestoredSession;
+    use astra_services::session_workspace;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5935,14 +5983,6 @@ mod resume_tests {
                 },
             }
         }
-    }
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
     }
 
     fn write_local_resumable_session(session_id: &str, turn_count: u32) {
@@ -6117,16 +6157,16 @@ mod resume_tests {
     }
 
     fn write_profile_with_token(session_id: &str) {
-        let mut creds = crate::cli::cli_utils::CredentialsFile::default();
+        let mut creds = crate::cli::cli_config::cli_utils::CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
-            crate::cli::cli_utils::Profile {
+            crate::cli::cli_config::cli_utils::Profile {
                 access_token: Some("test-token".into()),
                 last_session_id: Some(session_id.to_string()),
                 ..Default::default()
             },
         );
-        crate::cli::cli_utils::save_credentials(&creds).unwrap();
+        crate::cli::cli_config::cli_utils::save_credentials(&creds).unwrap();
     }
 
     fn write_local_step_checkpoint_with_compaction_state(session_id: &str, turn_count: u32) {
@@ -6237,7 +6277,7 @@ mod resume_tests {
     #[tokio::test]
     async fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing()
     {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "still-here".to_string())];
 
@@ -6295,7 +6335,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_uses_checkpoint_compaction_state_for_resume_guidance() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-compact-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
@@ -6322,7 +6362,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_rebinds_root_mailbox_and_replaces_live_session_overrides() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-overrides-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
@@ -6388,8 +6428,8 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn apply_restored_session_rejects_corrupt_workspace_without_mutating_live_state() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+    async fn apply_restored_session_rebuilds_corrupt_workspace_and_resumes() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-workspace-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
@@ -6413,24 +6453,53 @@ mod resume_tests {
             ..Default::default()
         };
 
-        let error = apply_restored_session(None, &api, &mut state, restored)
+        apply_restored_session(None, &api, &mut state, restored)
             .await
-            .expect_err("corrupt workspace should abort restore");
+            .expect("corrupt workspace should be rebuilt, not block resume");
 
-        assert!(error.contains("read workspace state"), "{error}");
-        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
-        assert_eq!(state.turn, 7);
-        assert_eq!(
-            state.history,
-            vec![("old".to_string(), "state".to_string())]
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 2);
+        assert!(
+            !state.pinned_skills.contains("keep-me"),
+            "resume must not leak live-session workspace state into the restored session"
         );
-        assert!(state.pinned_skills.contains("keep-me"));
+        let warning = state
+            .session_persistence_error
+            .as_deref()
+            .expect("rebuilt workspace should surface a degradation warning");
+        assert!(
+            warning.contains("workspace metadata unreadable during resume"),
+            "{warning}"
+        );
+
+        let rebuilt = session_workspace::read_workspace(&session_id)
+            .expect("resume should rewrite readable workspace metadata");
+        assert_eq!(rebuilt.session_id, session_id);
+        assert_eq!(rebuilt.turn_count, 2);
+        assert!(
+            rebuilt
+                .last_persistence_error
+                .as_deref()
+                .is_some_and(|error| error.contains("workspace metadata unreadable during resume")),
+            "{rebuilt:?}"
+        );
+        let backup_count = std::fs::read_dir(workspace_path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("workspace.yaml.corrupt-")
+            })
+            .count();
+        assert_eq!(backup_count, 1, "corrupt workspace should be preserved");
     }
 
     #[test]
     #[serial_test::serial]
     fn workspace_summary_line_marks_invalid_workspace() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-summary-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 1);
         let workspace_path =
@@ -6449,7 +6518,7 @@ mod resume_tests {
     #[test]
     #[serial_test::serial]
     fn workspace_summary_line_journal_only_includes_turn_count() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-journal-only-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
         let workspace_path =
@@ -6478,7 +6547,7 @@ mod resume_tests {
     #[test]
     #[serial_test::serial]
     fn workspace_summary_line_marks_persistence_degraded() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-degraded-summary-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
         let mut workspace = session_workspace::read_workspace(&session_id).unwrap();
@@ -6493,7 +6562,7 @@ mod resume_tests {
     #[test]
     #[serial_test::serial]
     fn filter_session_list_entries_tracks_missing_and_invalid_workspace_skips() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let valid_session = format!("session-list-valid-{}", uuid::Uuid::new_v4());
         let invalid_session = format!("session-list-invalid-{}", uuid::Uuid::new_v4());
         let missing_session = format!("session-list-missing-{}", uuid::Uuid::new_v4());
@@ -6550,7 +6619,7 @@ mod resume_tests {
     #[test]
     #[serial_test::serial]
     fn filter_session_list_entries_searches_invalid_workspace_hint() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let invalid_session = format!("session-list-search-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&invalid_session, 1);
         let workspace_path =
@@ -6576,7 +6645,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_fails_when_local_step_checkpoint_is_invalid_without_fallback() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-step-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
@@ -6615,7 +6684,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_surfaces_unreadable_local_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-journal-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
@@ -6640,7 +6709,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn load_prepared_fork_restore_requires_existing_child_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
 
         let error =
             match load_prepared_fork_restore("parent-session", "missing-child-session", 1).await {
@@ -6654,7 +6723,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_uses_cloud_fallback_when_local_step_checkpoint_is_invalid() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-cloud-fallback-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
@@ -6697,7 +6766,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn cloud_heavy_fallback_sanitizes_runtime_scaffolding_messages() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-cloud-sanitize-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
@@ -6729,7 +6798,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-history-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 1);
 
@@ -6751,7 +6820,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_journal_history_if_available_prefers_local_when_more_entries() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-more-{}", uuid::Uuid::new_v4());
         // Write a journal with multiple turn events so local has more history entries.
         let writer = session_journal::JournalWriter::new(&session_id).unwrap();
@@ -6800,7 +6869,7 @@ mod resume_tests {
         use astra_turn_core::conversation_log::{
             AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
         };
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("csl-resume-{}", uuid::Uuid::new_v4());
 
         let store = FileCslStore::new(session_journal::local_sessions_dir());
@@ -6856,7 +6925,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_without_csl_falls_back_to_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("no-csl-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 3);
 
@@ -6878,7 +6947,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_without_csl_restores_recent_tools_from_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("no-csl-tools-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&session_id).unwrap();
         writer
@@ -6923,7 +6992,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_from_corrupt_csl_returns_error_instead_of_falling_back() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("corrupt-csl-{}", uuid::Uuid::new_v4());
         let session_dir = session_journal::local_sessions_dir().join(&session_id);
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -6956,7 +7025,8 @@ mod resume_tests {
             serde_json::json!({"role": "user", "content": "q2"}),
             serde_json::json!({"role": "assistant", "content": "a2"}),
         ];
-        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
+        let pairs =
+            crate::cli::session::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("q1".into(), "a1".into()));
         assert_eq!(pairs[1], ("q2".into(), "a2".into()));
@@ -6972,7 +7042,8 @@ mod resume_tests {
             serde_json::json!({"role": "user", "content": "thanks"}),
             serde_json::json!({"role": "assistant", "content": "you're welcome"}),
         ];
-        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
+        let pairs =
+            crate::cli::session::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "fix the bug");
         assert_eq!(pairs[0].1, "I'll read the file\n\ndone, fixed it");
@@ -6982,14 +7053,15 @@ mod resume_tests {
 
     #[test]
     fn derive_history_pairs_empty_messages() {
-        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&[]);
+        let pairs = crate::cli::session::session_continuation::history_pairs_from_messages(&[]);
         assert!(pairs.is_empty());
     }
 
     #[test]
     fn derive_history_pairs_user_only_no_assistant() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
+        let pairs =
+            crate::cli::session::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0], ("hello".into(), String::new()));
     }
@@ -7000,7 +7072,8 @@ mod resume_tests {
             serde_json::json!({"role": "user", "content": "question"}),
             serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "answer"}]}),
         ];
-        let pairs = crate::cli::session_continuation::history_pairs_from_messages(&messages);
+        let pairs =
+            crate::cli::session::session_continuation::history_pairs_from_messages(&messages);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "question");
         assert_eq!(pairs[0].1, "answer");
@@ -7009,7 +7082,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_prefers_local_state_over_stale_remote_preflight() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-stale-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 3);
@@ -7036,7 +7109,7 @@ mod resume_tests {
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(state.turn, 3);
         assert_eq!(
-            crate::cli::cli_utils::load_credentials()
+            crate::cli::cli_config::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
@@ -7047,7 +7120,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_clears_cloud_only_stale_pointer() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-cloud-stale-{}", uuid::Uuid::new_v4());
         write_profile_with_token(&session_id);
@@ -7079,7 +7152,7 @@ mod resume_tests {
         assert!(err.contains("has no local resumable state"), "got: {err}");
         assert_eq!(state.session_id, None);
         assert_eq!(
-            crate::cli::cli_utils::load_credentials()
+            crate::cli::cli_config::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
@@ -7206,7 +7279,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn switch_session_into_state_restores_workspace_scoped_state() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
 
@@ -7253,7 +7326,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_restores_cloud_only_session_and_workspace_metadata() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-cloud-only-{}", uuid::Uuid::new_v4());
         write_profile_with_token(&session_id);
@@ -7357,7 +7430,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_restores_live_remote_session_from_local_workspace() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-live-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
@@ -7391,7 +7464,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_uses_remote_cache_totals_without_local_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
         let session_id = format!("resume-remote-cache-{}", uuid::Uuid::new_v4());
@@ -7428,7 +7501,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_merges_session_memory_into_anchor() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-memory-anchor-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
@@ -7492,7 +7565,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_treats_default_model_as_server_default() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-default-model-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
@@ -7528,7 +7601,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_surfaces_interrupted_plan_and_durable_lifecycle_summary() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-lifecycle-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
@@ -7587,7 +7660,7 @@ mod resume_tests {
             AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
             manager::CslManager,
         };
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let parent_id = format!("fork-parent-{}", uuid::Uuid::new_v4());
         let child_id = format!("fork-child-{}", uuid::Uuid::new_v4());
 
@@ -7648,7 +7721,7 @@ mod resume_tests {
             AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
             manager::CslManager,
         };
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let parent_id = format!("fork-resume-parent-{}", uuid::Uuid::new_v4());
         let child_id = format!("fork-resume-child-{}", uuid::Uuid::new_v4());
 
@@ -7698,7 +7771,7 @@ mod resume_tests {
     #[tokio::test]
     async fn session_fork_no_parent_csl_gracefully_skips() {
         use astra_turn_core::conversation_log::{file_store::FileCslStore, manager::CslManager};
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let parent_id = format!("fork-no-csl-{}", uuid::Uuid::new_v4());
         let child_id = format!("fork-no-csl-child-{}", uuid::Uuid::new_v4());
 
@@ -7734,7 +7807,7 @@ mod resume_tests {
             SessionStateCompact, file_store::FileCslStore, manager::CslManager,
         };
 
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("fork-snapshot-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(FileCslStore::new(session_journal::local_sessions_dir()));
         let mut mgr = CslManager::new(store, sid.clone(), Default::default()).unwrap();

@@ -8,6 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+pub(crate) fn saturating_decrement(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        cur.checked_sub(1)
+    });
+}
+
 // ─── Latency Tracker ───────────────────────────────────────────────────────
 
 /// Lightweight latency tracker — records min/max/sum/count.
@@ -91,6 +97,12 @@ pub struct MultiAgentMetrics {
     pub registry_retry_total: AtomicU64,
     /// Task lease claim latency.
     pub lease_claim_latency: LatencyTracker,
+    /// Total successful task lease renewals.
+    pub lease_renewal_success_total: AtomicU64,
+    /// Total failed task lease renewals.
+    pub lease_renewal_failure_total: AtomicU64,
+    /// Number of active lease renewal loops.
+    pub active_lease_renewals: AtomicU64,
     /// Total event ingestion overflow / skipped events.
     pub event_overflow_total: AtomicU64,
 }
@@ -102,6 +114,9 @@ impl MultiAgentMetrics {
             dispatch_latency: LatencyTracker::new(),
             registry_retry_total: AtomicU64::new(0),
             lease_claim_latency: LatencyTracker::new(),
+            lease_renewal_success_total: AtomicU64::new(0),
+            lease_renewal_failure_total: AtomicU64::new(0),
+            active_lease_renewals: AtomicU64::new(0),
             event_overflow_total: AtomicU64::new(0),
         }
     }
@@ -146,6 +161,18 @@ impl MultiAgentMetrics {
             "Number of task lease claim operations completed",
         );
         target.register_counter(
+            "lease_renewal_success_total",
+            "Total successful task lease renewal attempts",
+        );
+        target.register_counter(
+            "lease_renewal_failure_total",
+            "Total failed task lease renewal attempts",
+        );
+        target.register_gauge(
+            "active_lease_renewals",
+            "Number of active task lease renewal loops",
+        );
+        target.register_counter(
             "event_overflow_total",
             "Total event ingestion overflow/skipped events",
         );
@@ -175,6 +202,19 @@ impl MultiAgentMetrics {
         let lc = self.lease_claim_latency.snapshot();
         target.set_counter("lease_claim_duration_us_total", lc.sum_us);
         target.set_gauge("lease_claim_count", lc.count as f64);
+
+        target.set_counter(
+            "lease_renewal_success_total",
+            self.lease_renewal_success_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "lease_renewal_failure_total",
+            self.lease_renewal_failure_total.load(Ordering::Relaxed),
+        );
+        target.set_gauge(
+            "active_lease_renewals",
+            self.active_lease_renewals.load(Ordering::Relaxed) as f64,
+        );
 
         target.set_counter(
             "event_overflow_total",
@@ -446,5 +486,16 @@ mod tests {
         let lc = m.lease_claim_latency.snapshot();
         assert_eq!(lc.count, 0);
         assert_eq!(lc.sum_us, 0);
+    }
+
+    #[test]
+    fn saturating_decrement_clamps_at_zero() {
+        let counter = AtomicU64::new(0);
+        saturating_decrement(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        counter.store(2, Ordering::Relaxed);
+        saturating_decrement(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 }

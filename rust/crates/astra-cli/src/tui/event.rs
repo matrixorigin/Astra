@@ -133,8 +133,8 @@ impl Stream for TuiEventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crossterm::event::KeyEvent;
+    use super::{TuiEvent, map_crossterm_event};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn raw_ctrl_c_char_is_normalized_to_ctrl_c_key() {

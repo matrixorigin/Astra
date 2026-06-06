@@ -10,19 +10,20 @@
 //! - `/agent logs <id>`: Show recent progress events from an agent
 //! - `/agent help`: Show help
 
-use super::*;
 use crate::cli::surface::delegation_event_surface::{
     delegation_event_id, delegation_sub_run_detail, project_delegation_completed,
     project_delegation_retry, project_delegation_started, project_delegation_sub_run_completed,
     project_delegation_sub_run_started,
 };
 use crate::cli::surface::run_status_surface::{
-    RunStatusKind, run_status_icon, run_status_is_active, run_status_is_done, run_status_is_failed,
-    run_status_kind,
+    RunStatusKind, run_status_icon, run_status_is_active, run_status_is_completed,
+    run_status_is_done, run_status_is_failed, run_status_kind,
 };
+use crate::cli::theme;
 use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
 use astra_services::session_journal::{self, JournalEventType};
 use astra_turn_core::delegation_tree::{AgentTreeNode, render_agent_forest};
+use crossterm::style::Stylize;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1791,7 +1792,7 @@ fn delegation_final_preview(entry: &DelegationHistoryEntry) -> Option<String> {
     let successful_outputs: Vec<_> = entry
         .sub_runs
         .iter()
-        .filter(|sub_run| run_status_surface::run_status_is_completed(&sub_run.status))
+        .filter(|sub_run| run_status_is_completed(&sub_run.status))
         .filter_map(|sub_run| sub_run.output_preview.as_ref())
         .collect();
     if successful_outputs.len() == 1 {
@@ -1803,24 +1804,24 @@ fn delegation_final_preview(entry: &DelegationHistoryEntry) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AgentCommandContext, DelegationHistoryEntry, DelegationRetrySummary,
+        DelegationSubRunSummary, build_watch_snapshot, build_watch_snapshot_for_session,
+        delegation_parent_lifecycle_note, format_delegation_event_brief, format_duration,
+        format_status, handle_agent_command, load_delegation_events, load_recent_delegations,
+        progress_event_ends_log_stream, progress_event_should_refresh_watch_snapshot,
+        render_delegation_status_lines, render_delegation_tree, wait_for_watch_snapshot_change,
+    };
     use astra_messaging::{AgentMailboxRouter, InProcessTransport};
     use astra_runtime::orchestration::{
-        SpawnAgentInput, SpawnContext, SpawnedAgentInfo, SpawnedAgentMetrics,
+        AgentStatus, DynamicAgentSpawner, SpawnAgentInput, SpawnContext, SpawnedAgentInfo,
+        SpawnedAgentMetrics,
     };
     use astra_runtime::server::delegation::engine::DelegationTracker;
-    use astra_services::session_journal::{JournalDirGuard, JournalEvent};
+    use astra_services::session_journal::{self, JournalEvent, JournalEventType};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::SystemTime;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
 
     fn make_agent(agent_id: &str, run_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
         SpawnedAgentInfo {
@@ -2039,7 +2040,7 @@ mod tests {
 
     #[test]
     fn load_recent_delegations_surfaces_unreadable_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
@@ -2051,7 +2052,7 @@ mod tests {
 
     #[test]
     fn load_delegation_events_surfaces_unreadable_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-events-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
@@ -2165,7 +2166,7 @@ mod tests {
 
     #[test]
     fn build_watch_snapshot_for_session_surfaces_unreadable_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-watch-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 

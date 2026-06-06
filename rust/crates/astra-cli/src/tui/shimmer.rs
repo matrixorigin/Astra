@@ -110,7 +110,7 @@ fn hue_to_rgb(h: f32) -> (u8, u8, u8) {
 
 #[cfg(test)]
 mod gradient_tests {
-    use super::*;
+    use super::gradient_color_at_t;
 
     /// `gradient_color_at_t` is periodic in `t` with period
     /// `period_seconds`. Pinning this prevents future "optimisations"

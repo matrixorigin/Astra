@@ -279,7 +279,8 @@ fn runtime_config_from_json(tuned_config_json: Option<&str>) -> Result<RuntimeCo
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::merge_workspace_with_restored;
+    use astra_services::session_workspace;
 
     #[test]
     fn merge_workspace_with_restored_adopts_restored_persistence_error() {

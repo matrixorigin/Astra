@@ -1,5 +1,6 @@
-#![allow(unused_imports)]
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use astra_services::session_journal;
+use crossterm::style::Stylize;
 
 // ═══════════════════════════════════════════════════════ Stats ════════════
 
@@ -23,13 +24,14 @@ pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
         }
         "history" => {
             // Show stats across recent sessions
-            let scan = match crate::cli::session_stats_scan::collect_recent_session_stats(10) {
-                Ok(scan) => scan,
-                Err(error) => {
-                    eprintln!("  {}", error.red());
-                    return;
-                }
-            };
+            let scan =
+                match crate::cli::session::session_stats_scan::collect_recent_session_stats(10) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        eprintln!("  {}", error.red());
+                        return;
+                    }
+                };
             if scan.stats.is_empty() && scan.unreadable.is_empty() {
                 eprintln!("{}", "  No sessions found.".dim());
                 return;
@@ -114,14 +116,15 @@ pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
                     return;
                 }
             };
-            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
-            {
-                Ok(events) => events,
-                Err(error) => {
-                    eprintln!("  {}", error.red());
-                    return;
-                }
-            };
+            let events =
+                match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        eprintln!("  {}", error.red());
+                        return;
+                    }
+                };
             let stats = session_analytics::compute_session_stats(&sid, &events);
 
             eprintln!(
@@ -223,8 +226,6 @@ struct TurnCostEntry {
 ///   /cost detail    — per-turn breakdown
 ///   /cost history   — across recent sessions
 pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
-    use astra_services::session_analytics;
-
     match arg {
         "detail" | "breakdown" => {
             // Per-turn breakdown from journal
@@ -235,14 +236,15 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     return;
                 }
             };
-            let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid)
-            {
-                Ok(events) => events,
-                Err(error) => {
-                    eprintln!("  {}", error.red());
-                    return;
-                }
-            };
+            let events =
+                match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        eprintln!("  {}", error.red());
+                        return;
+                    }
+                };
             let pricing = &state.cached_pricing;
 
             eprintln!(
@@ -310,13 +312,14 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
 
         "history" => {
             // Across recent sessions
-            let scan = match crate::cli::session_stats_scan::collect_recent_session_stats(10) {
-                Ok(scan) => scan,
-                Err(error) => {
-                    eprintln!("  {}", error.red());
-                    return;
-                }
-            };
+            let scan =
+                match crate::cli::session::session_stats_scan::collect_recent_session_stats(10) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        eprintln!("  {}", error.red());
+                        return;
+                    }
+                };
             if scan.stats.is_empty() && scan.unreadable.is_empty() {
                 eprintln!("{}", "  No sessions found.".dim());
                 return;

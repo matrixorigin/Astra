@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::{
     ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
-    cli::stream_render::RenderPolicy,
+    cli::stream::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
 };
 
@@ -105,23 +105,23 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub plan_subtask_id: Option<&'a str>,
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
-    pub stream_event_tx: Option<crate::cli::StreamEventTx>,
+    pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
-    pub approval_request_tx: Option<crate::cli::ApprovalRequestTx>,
+    pub approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
-    pub ask_user_request_tx: Option<crate::cli::AskUserRequestTx>,
+    pub ask_user_request_tx: Option<crate::cli::chat_stream::AskUserRequestTx>,
     /// Per-turn channel into the dedicated plan-review overlay used
     /// by `exit_plan_mode`. Lives next to `ask_user_request_tx` but
     /// stays separate so plan markdown does not have to be smuggled
     /// through the question/option layout `ask_user` expects.
-    pub plan_review_request_tx: Option<crate::cli::PlanReviewRequestTx>,
+    pub plan_review_request_tx: Option<crate::cli::chat_stream::PlanReviewRequestTx>,
     /// Root-level messaging context used when the current turn has no mailbox.
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
     pub chat_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
-    pub tool_cache: crate::cli::stream_render::EdgeToolCache,
+    pub tool_cache: crate::cli::stream::stream_render::EdgeToolCache,
     /// Extra context appended to the system prompt via edge_profile.system_prompt_override.
     pub append_system_prompt: Option<String>,
     /// Optional fork-prefix store: when set + fork flag enabled,
@@ -755,48 +755,61 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
-        // Forward to stream event channel (even in suppress mode)
-        if let Some(tx) = &self.stream_event_tx {
-            if let Some((tool, reason)) =
-                astra_turn_core::permission::notice::parse_auto_approved_permission(&line)
-            {
-                let _ = tx.send(crate::cli::StreamEvent::PermissionAutoApproved { tool, reason });
-            } else {
-                let _ = tx.send(crate::cli::StreamEvent::StatusLine(line.clone()));
-            }
-        }
+        let permission_event =
+            astra_turn_core::permission::notice::parse_auto_approved_permission(&line);
         if self.render_policy.suppress_headless() {
+            if let Some(tx) = &self.stream_event_tx {
+                let stream_event = permission_event.map_or_else(
+                    || crate::cli::chat_stream::StreamEvent::StatusLine(line),
+                    |(tool, reason)| crate::cli::chat_stream::StreamEvent::PermissionAutoApproved {
+                        tool,
+                        reason,
+                    },
+                );
+                let _ = tx.send(stream_event);
+            }
             return;
         }
+        let line_ref = line.as_str();
         match style {
-            HeadlessStderrStyle::Dim => eprintln!("{}", line.dim()),
-            HeadlessStderrStyle::Red => eprintln!("{}", line.red()),
-            HeadlessStderrStyle::Green => eprintln!("{}", line.green()),
-            HeadlessStderrStyle::Yellow => eprintln!("{}", line.yellow()),
-            HeadlessStderrStyle::CyanBold => eprintln!("{}", line.cyan().bold()),
+            HeadlessStderrStyle::Dim => eprintln!("{}", line_ref.dim()),
+            HeadlessStderrStyle::Red => eprintln!("{}", line_ref.red()),
+            HeadlessStderrStyle::Green => eprintln!("{}", line_ref.green()),
+            HeadlessStderrStyle::Yellow => eprintln!("{}", line_ref.yellow()),
+            HeadlessStderrStyle::CyanBold => eprintln!("{}", line_ref.cyan().bold()),
             HeadlessStderrStyle::Magenta => {
                 eprint!("{}", "│ ".dim());
-                eprintln!("{}", line.magenta());
+                eprintln!("{}", line_ref.magenta());
             }
             HeadlessStderrStyle::DiffAdd => {
-                let body = line.strip_prefix('+').unwrap_or(line.as_str());
+                let body = line_ref.strip_prefix('+').unwrap_or(line_ref);
                 eprint!("{}", "│ ".dim());
                 eprint!("{}", "+".green().bold());
                 eprintln!("{}", body.green());
             }
             HeadlessStderrStyle::DiffRemove => {
-                let body = line.strip_prefix('-').unwrap_or(line.as_str());
+                let body = line_ref.strip_prefix('-').unwrap_or(line_ref);
                 eprint!("{}", "│ ".dim());
                 eprint!("{}", "-".red().bold());
                 eprintln!("{}", body.red());
             }
             HeadlessStderrStyle::DiffContext => {
                 eprint!("{}", "│ ".dim());
-                eprintln!("{}", line.dim());
+                eprintln!("{}", line_ref.dim());
             }
-            HeadlessStderrStyle::Normal => eprintln!("{}", line),
+            HeadlessStderrStyle::Normal => eprintln!("{}", line_ref),
         }
         self.pending_clear_lines += 1;
+        if let Some(tx) = &self.stream_event_tx {
+            let stream_event = permission_event.map_or_else(
+                || crate::cli::chat_stream::StreamEvent::StatusLine(line),
+                |(tool, reason)| crate::cli::chat_stream::StreamEvent::PermissionAutoApproved {
+                    tool,
+                    reason,
+                },
+            );
+            let _ = tx.send(stream_event);
+        }
     }
 
     fn on_compaction(&mut self, event: CompactionEvent) {
@@ -804,7 +817,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
         // Structured event for TUI / stream consumers.
         if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(crate::cli::StreamEvent::Compaction(event));
+            let _ = tx.send(crate::cli::chat_stream::StreamEvent::Compaction(event));
         }
     }
 
@@ -876,7 +889,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return;
         }
         if self.render_md {
-            let mut md = crate::cli::streaming_md::StreamingMarkdown::new(self.term_width);
+            let mut md = crate::cli::stream::streaming_md::StreamingMarkdown::new(self.term_width);
             md.push(text);
             md.finish();
         } else {
@@ -1151,8 +1164,15 @@ fn looks_plan_shaped(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        derive_turn_interaction_mode, permission_mode_change_audit_event,
+        plan_mode_missed_exit_reminder, plan_mode_restriction_names,
+        request_allowlist_restriction_names,
+    };
+    use crate::cli::permission_manager::PermissionMode;
+    use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
     use astra_services::session_journal::JournalEventType;
+    use std::collections::HashSet;
 
     #[test]
     fn permission_mode_change_audit_event_carries_source_and_modes() {

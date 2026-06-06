@@ -1,6 +1,6 @@
 //! Idle agent mailbox draining and prompt-safe rendering.
 
-use crate::SessionState;
+use crate::cli::session::session_state::SessionState;
 use crossterm::style::Stylize;
 
 pub(crate) fn drain_root_mailbox_into_idle_queue(state: &mut SessionState) {

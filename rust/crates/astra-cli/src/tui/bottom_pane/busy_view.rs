@@ -122,8 +122,12 @@ impl BottomPaneView for BusyView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::BusyView;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
 
     struct W<'a>(&'a BusyView);
     impl ratatui::widgets::Widget for W<'_> {
@@ -153,10 +157,7 @@ mod tests {
     #[test]
     fn esc_marks_cancel() {
         let mut v = BusyView::new("hi");
-        v.handle_key(KeyEvent::new(
-            KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        ));
+        v.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(v.is_complete());
         assert!(v.completion().unwrap().result.is_none());
     }

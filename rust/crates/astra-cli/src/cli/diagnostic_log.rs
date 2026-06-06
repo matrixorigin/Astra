@@ -1,6 +1,6 @@
 //! Optional structured logging for the CLI (does not replace REPL / user-facing stderr).
 //!
-//! See [`crate::cli::cli_args::Cli`] (`--diagnostic-log`, `--log-file`).
+//! See [`crate::cli::cli_config::cli_args::Cli`] (`--diagnostic-log`, `--log-file`).
 
 use std::sync::OnceLock;
 

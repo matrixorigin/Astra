@@ -1,7 +1,10 @@
 //! Run a turn stream and collect the raw stream result.
 
 use super::turn_cancellation::drain_after_cancel;
-use super::*;
+use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::streaming_types::StreamResult;
+use crossterm::style::Stylize;
 use std::sync::Arc;
 
 struct PreparedTurnStreamState {
@@ -100,7 +103,7 @@ fn build_turn_stream_params<'a>(
         verbose_mode: state.verbose_mode,
         render_policy: state
             .tui_render_policy
-            .unwrap_or(crate::cli::stream_render::RenderPolicy::Stream),
+            .unwrap_or(crate::cli::stream::stream_render::RenderPolicy::Stream),
         cli_context: Some(&state.cli_context),
         recent_tools: &state.recent_tools,
         tool_health_entries: &state.tool_health_entries,
@@ -252,7 +255,9 @@ fn notify_server_to_cancel_run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{PreparedTurnStreamState, build_turn_stream_params, prepare_turn_stream_state};
+    use crate::cli::session::session_state::SessionState;
+    use std::sync::Arc;
 
     /// Source-level guard: cancellation paths in `await_stream_with_interrupts`
     /// MUST notify the server so the durable run does not keep running on the
@@ -300,7 +305,7 @@ mod tests {
     #[test]
     fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
         let mut state = SessionState {
-            tui_render_policy: Some(crate::cli::stream_render::RenderPolicy::Silent),
+            tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             current_plan_subtask_id: Some("subtask-1".into()),
             resume_restricted_tools: vec!["read_file".into()],
             ..SessionState::default()
@@ -330,7 +335,7 @@ mod tests {
 
         assert_eq!(
             params.render_policy,
-            crate::cli::stream_render::RenderPolicy::Silent
+            crate::cli::stream::stream_render::RenderPolicy::Silent
         );
         assert!(params.is_plan_subtask);
         assert_eq!(params.plan_subtask_id, Some("subtask-1"));

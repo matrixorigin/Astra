@@ -1,6 +1,9 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::slash::slash_agent::format_duration;
+use crate::cli::theme;
 use crate::manifest_loader::project_mcp_json_path;
 use crate::mcp_client::{ConnectionState, McpClientManager};
+use crossterm::style::Stylize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParsedMcpCommand<'a> {
@@ -1625,8 +1628,6 @@ fn format_state(state: ConnectionState) -> String {
     }
 }
 
-use super::slash_agent::format_duration;
-
 /// Handle `/mcp complete <server>:<ref_type>:<name> <arg_name> [partial_value]`
 ///
 /// ref_type is "prompt" or "resource".
@@ -1725,7 +1726,9 @@ async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ParsedMcpCommand, extract_prompt_message_text, format_state, parse_mcp_command};
+    use crate::cli::slash::slash_agent::format_duration;
+    use crate::mcp_client::ConnectionState;
 
     #[test]
     fn parse_mcp_command_defaults_to_help() {

@@ -16,10 +16,9 @@
 
 use std::process::Command;
 
-use super::*;
+use super::{ToolExecutionOutcome, ToolExecutor};
 use crate::tool_safety_guard::check_sql_safety;
-#[cfg(test)]
-use crate::tool_safety_guard::strip_sql_comments;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
@@ -815,7 +814,14 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::ToolExecutor;
+    use super::{
+        DatabaseSnapshotRollbackJournal, extract_table_from_sql, is_valid_snapshot_name,
+        mo_create_snapshot_sql, mo_execute_sql, mo_mysql_cmd, mo_pre_state_snapshot_name,
+        mo_query_requires_pre_state_snapshot,
+    };
+    use crate::tool_safety_guard::{check_sql_safety, strip_sql_comments};
+    use serde_json::Value;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn env_guard() -> MutexGuard<'static, ()> {

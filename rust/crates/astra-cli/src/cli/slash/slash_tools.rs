@@ -1,6 +1,6 @@
-#![allow(unused_imports)]
-use super::*;
+use crate::cli::session::session_state::SessionState;
 use crate::{cli_dim, cli_section, cli_warn};
+use crossterm::style::Stylize;
 
 // ═══════════════════════════════════════════════ Tool Profile ═════════════
 
@@ -14,7 +14,8 @@ pub(crate) fn handle_tools_command(state: &SessionState) {
             return;
         }
     };
-    let events = match crate::cli::session_stats_scan::read_session_journal_for_stats(&sid) {
+    let events = match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
+    {
         Ok(events) => events,
         Err(error) => {
             eprintln!("  {}", error.red());

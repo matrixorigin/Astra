@@ -179,7 +179,9 @@ fn requires_shell_evaluation(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        edit_in_external_editor_with_command, first_available_editor, requires_shell_evaluation,
+    };
 
     #[test]
     fn external_editor_roundtrips_updated_text() {

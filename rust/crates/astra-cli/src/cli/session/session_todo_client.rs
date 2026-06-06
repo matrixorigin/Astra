@@ -251,11 +251,11 @@ impl TaskStore for HttpTaskStore {
 
 #[cfg(test)]
 mod wiring_e2e {
-    use super::*;
+    use super::{HttpTaskStore, execute_todo_action};
     use crate::lock_recovery::LockRecovery;
     use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
     use astra_tools::task_mgmt::{SessionTask, TaskStore};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};

@@ -1,4 +1,13 @@
-use super::*;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use super::{
+    SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
+    sandbox_command, validate_path, wrap_command_with_limits,
+};
+use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy};
+use serde_json::Value;
 
 pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -583,7 +592,7 @@ fn check_powershell_path_boundary(
                 return Some(format!(
                     "{}The command references '{}' which is outside the project directory '{}'. \
                      Ask the user for permission before accessing files outside the project.",
-                    super::SANDBOX_DENIED_PREFIX,
+                    SANDBOX_DENIED_PREFIX,
                     trimmed,
                     policy.project_root.display(),
                 ));
@@ -896,7 +905,7 @@ fn validate_plain_command_path_arg(
     if let Some(kind) = unresolved_static_dir_reference_kind(policy, arg, oldpwd) {
         return Some(format!(
             "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
-            super::SANDBOX_DENIED_PREFIX,
+            SANDBOX_DENIED_PREFIX,
             literal_arg,
             kind,
             policy.project_root.display(),
@@ -917,7 +926,7 @@ fn validate_plain_command_path_arg(
         return Some(format!(
             "{}The command references '{}' which is outside the project directory '{}'. \
              Ask the user for permission before accessing files outside the project.",
-            super::SANDBOX_DENIED_PREFIX,
+            SANDBOX_DENIED_PREFIX,
             literal_arg,
             policy.project_root.display(),
         ));
@@ -951,7 +960,7 @@ fn brace_expansion_boundary_review_message(
 ) -> String {
     format!(
         "{}The command references '{}' using shell brace expansion, which may fan out to multiple paths that cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
-        super::SANDBOX_DENIED_PREFIX,
+        SANDBOX_DENIED_PREFIX,
         arg,
         policy.project_root.display(),
     )
@@ -1988,7 +1997,7 @@ fn shell_loop_fanout_review_message(
 ) -> String {
     format!(
         "{}The command uses `{loop_kind} {subcommand}` so file paths may be supplied from shell loop iterations and cannot be statically validated against the project directory '{}'. Ask the user for permission before using shell loop fan-out with file-access or shell commands.",
-        super::SANDBOX_DENIED_PREFIX,
+        SANDBOX_DENIED_PREFIX,
         policy.project_root.display(),
     )
 }
@@ -2594,7 +2603,7 @@ fn check_single_command_path_boundary(
         if let Some(subcommand) = xargs_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `xargs {subcommand}` so file paths may be supplied from stdin and cannot be statically validated against the project directory '{}'. Ask the user for permission before using xargs to fan out file-access or shell commands.",
-                super::SANDBOX_DENIED_PREFIX,
+                SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
         }
@@ -2604,7 +2613,7 @@ fn check_single_command_path_boundary(
         if let Some((action, subcommand)) = find_exec_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `find {action} {subcommand}` so file paths may be supplied from find matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using find fan-out with file-access or shell commands.",
-                super::SANDBOX_DENIED_PREFIX,
+                SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
         }
@@ -2614,7 +2623,7 @@ fn check_single_command_path_boundary(
         if let Some((action, subcommand)) = fd_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `fd {action} {subcommand}` so file paths may be supplied from search matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using fd fan-out with file-access or shell commands.",
-                super::SANDBOX_DENIED_PREFIX,
+                SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
         }
@@ -2624,7 +2633,7 @@ fn check_single_command_path_boundary(
         if let Some(subcommand) = parallel_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `parallel {subcommand}` so file paths may be supplied from batch inputs and cannot be statically validated against the project directory '{}'. Ask the user for permission before using parallel fan-out with file-access or shell commands.",
-                super::SANDBOX_DENIED_PREFIX,
+                SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
         }
@@ -2954,7 +2963,7 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         .stderr(Stdio::piped());
 
     // Pass env overlay vars to child process so env_set values are visible.
-    super::apply_env_overlay(&mut child_cmd);
+    apply_env_overlay(&mut child_cmd);
 
     // Create a new process group so we can kill the entire tree on timeout.
     // This prevents orphaned git/curl/etc. child processes.
@@ -3972,8 +3981,8 @@ impl ToolExecutor {
         }
 
         // For build/test commands, provide structured output with iteration tracking
-        if super::build_test::is_build_test_command(command) {
-            let mut parsed = super::build_test::parse_build_test_output(&result, out.status.code());
+        if build_test::is_build_test_command(command) {
+            let mut parsed = build_test::parse_build_test_output(&result, out.status.code());
             if !parsed.error_locations.is_empty() {
                 parsed.enrich_with_scope(&self.project_root);
             }
@@ -4434,12 +4443,11 @@ fn glob_path_traversal_error() -> String {
 /// Only annotates matches in files with supported languages.
 /// File contents are cached to avoid re-reading the same file for multiple matches.
 fn annotate_grep_with_scope(grep_output: &str, project_root: &std::path::Path) -> String {
-    use super::code_intel::{detect_language, scope_at_line};
+    use code_intel::{detect_language, scope_at_line};
     use std::collections::HashMap;
 
     // Cache: file path → (source, language)
-    let mut file_cache: HashMap<String, Option<(String, super::code_intel::Language)>> =
-        HashMap::new();
+    let mut file_cache: HashMap<String, Option<(String, code_intel::Language)>> = HashMap::new();
 
     let mut result = String::with_capacity(grep_output.len() + grep_output.len() / 10);
 
@@ -4630,7 +4638,17 @@ fn html_to_text(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::ToolExecutor;
+    use super::{
+        TEST_BASH_PIPE_READ_TIMEOUT_MS, annotate_grep_with_scope, check_bash_path_boundary,
+        check_bash_path_boundary_with_oldpwd, check_dangerous_command,
+        check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
+        destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
+        html_to_text, interpret_exit_code, is_ssrf_target, looks_like_html,
+        run_command_with_cleanup, shell_escape,
+    };
+    use std::process::Command;
+    use std::time::Duration;
 
     fn test_executor() -> ToolExecutor {
         ToolExecutor::new(std::env::temp_dir())

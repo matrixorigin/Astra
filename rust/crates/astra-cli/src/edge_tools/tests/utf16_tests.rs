@@ -1,4 +1,4 @@
-use super::*;
+use super::utf16_col_to_char_idx;
 
 // ── UTF-16 conversion tests ───────────────────────────────────────────────
 

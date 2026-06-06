@@ -157,7 +157,7 @@ pub(crate) async fn prepare_plan_execution(
     }
 
     let plan_id = if from_authoring {
-        crate::cli::plan_lifecycle::exit_remote_plan_mode(api, token, state, true).await?
+        crate::cli::plan::plan_lifecycle::exit_remote_plan_mode(api, token, state, true).await?
     } else {
         state.executing_plan_id.clone()
     };
@@ -199,8 +199,10 @@ pub(crate) async fn rewind_plan(
                     .as_deref()
                     .filter(|sid| !sid.trim().is_empty()),
             ) {
-                crate::cli::plan_lifecycle::active_remote_planning_plan_id(api, token, session_id)
-                    .await?
+                crate::cli::plan::plan_lifecycle::active_remote_planning_plan_id(
+                    api, token, session_id,
+                )
+                .await?
             } else {
                 None
             }
@@ -213,7 +215,7 @@ pub(crate) async fn rewind_plan(
             let response = api
                 .post_plan_rewind_json(token, plan_id, &serde_json::json!({ "anchor": anchor }))
                 .await
-                .map_err(crate::map_thin_err)?;
+                .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?;
             let plan_value = response
                 .get("plan")
                 .cloned()
@@ -261,7 +263,7 @@ pub(crate) fn abandon_plan_execution(state: &mut SessionState) -> bool {
         return false;
     }
 
-    let _ = crate::cli::plan_runtime::shutdown_plan_executor(state);
+    let _ = crate::cli::plan::plan_runtime::shutdown_plan_executor(state);
     reset_plan_runtime_metadata(state);
     state.executing_plan = None;
     state.executing_plan_goal = None;
@@ -441,7 +443,7 @@ fn apply_rewound_plan(
 }
 
 fn reset_plan_runtime_metadata(state: &mut SessionState) {
-    let _ = crate::cli::plan_runtime::shutdown_plan_executor(state);
+    let _ = crate::cli::plan::plan_runtime::shutdown_plan_executor(state);
     state.current_plan_subtask_id = None;
     state.plan_run_task_id = None;
     state.plan_run_task_last_progress = None;
@@ -455,9 +457,13 @@ fn reset_plan_runtime_metadata(state: &mut SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ParsedPlanCommand, abandon_plan_execution, apply_plan_correction,
+        is_plan_command_available, parse_plan_command, prepare_plan_execution,
+        render_plan_snapshot, rewind_plan,
+    };
     use astra_runtime::plan::PlanModeState;
-    use astra_services::task_orchestrator::SubtaskPlan;
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -522,7 +528,7 @@ mod tests {
 
     #[test]
     fn correction_commands_only_intercept_paused_execution() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
         assert!(is_plan_command_available(&state, &ParsedPlanCommand::Go));
         assert!(!is_plan_command_available(
@@ -543,7 +549,7 @@ mod tests {
 
     #[test]
     fn stale_authoring_mirror_blocks_plan_commands_that_read_or_run_it() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
         state.plan_mode_sync_error = Some("server returned 409".into());
 
@@ -565,7 +571,7 @@ mod tests {
 
     #[test]
     fn transient_sync_failure_blocks_commands_until_recovery() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
 
         assert!(is_plan_command_available(&state, &ParsedPlanCommand::Show));
@@ -593,7 +599,7 @@ mod tests {
 
     #[test]
     fn apply_plan_correction_adds_and_clears_notes() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.executing_plan = Some(sample_plan());
 
         let added = apply_plan_correction(
@@ -617,7 +623,7 @@ mod tests {
 
     #[test]
     fn render_plan_snapshot_includes_goal_statuses_and_corrections() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.executing_plan = Some(sample_plan());
         state.executing_plan_goal = Some("Ship auth".into());
         state.plan_execution_corrections = vec!["add regression coverage".into()];
@@ -655,7 +661,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.session_id = Some("sess-1".into());
         state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
 
@@ -678,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn rewind_plan_resets_paused_execution_and_clears_runtime_metadata() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.executing_plan = Some(sample_plan());
         state.executing_plan_goal = Some("Ship auth".into());
         state.current_plan_subtask_id = Some("s2".into());
@@ -707,7 +713,7 @@ mod tests {
 
     #[test]
     fn abandon_plan_execution_clears_active_plan_state() {
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.executing_plan = Some(sample_plan());
         state.executing_plan_goal = Some("Ship auth".into());
         state.executing_plan_id = Some("plan-7".into());

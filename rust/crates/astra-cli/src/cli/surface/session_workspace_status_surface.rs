@@ -56,7 +56,9 @@ impl SessionWorkspaceStatusSurface<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        SessionWorkspaceStatusKind, session_workspace_status_kind, session_workspace_status_surface,
+    };
 
     #[test]
     fn workspace_status_helpers_classify_known_statuses() {

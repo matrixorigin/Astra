@@ -1,7 +1,13 @@
-use super::*;
-#[cfg(test)]
-use astra_text_utils::str_preview::truncate_str;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use super::{
+    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadDedupKey, SANDBOX_DENIED_PREFIX,
+    ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
+};
+use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
 use astra_tools::fs_ops::{check_anchor_vs_replacement_size, str_replace_fail};
+use serde_json::{Value, json};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
@@ -112,7 +118,7 @@ impl ToolExecutor {
                         format!(
                             "{}Path '{}' is outside the project directory '{}'. \
                              Ask the user for permission before accessing files outside the project.",
-                            super::SANDBOX_DENIED_PREFIX,
+                            SANDBOX_DENIED_PREFIX,
                             path,
                             policy.project_root.display(),
                         )
@@ -297,8 +303,8 @@ impl ToolExecutor {
                     lines_in_cap
                 };
 
-                let outline_text = if let Some(lang) = super::code_intel::detect_language(&path) {
-                    let generated = super::code_intel::generate_outline(&content, lang);
+                let outline_text = if let Some(lang) = code_intel::detect_language(&path) {
+                    let generated = code_intel::generate_outline(&content, lang);
                     if generated.trim().is_empty() {
                         format!(
                             "(outline generation returned empty for this file — \
@@ -334,10 +340,10 @@ impl ToolExecutor {
             let agg = self
                 .aggregate_output_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
-            if agg > super::AGGREGATE_SOFT_LIMIT {
+            if agg > AGGREGATE_SOFT_LIMIT {
                 if let Ok(meta) = fs::metadata(&path) {
                     let size = meta.len() as usize;
-                    let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg);
+                    let remaining = AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg);
                     if size > remaining {
                         // Auto-downgrade: return outline instead of full content
                         let content_for_outline =
@@ -357,9 +363,9 @@ impl ToolExecutor {
                             content_for_outline.clone(),
                         );
 
-                        if let Some(ts_lang) = super::code_intel::detect_language(&path) {
+                        if let Some(ts_lang) = code_intel::detect_language(&path) {
                             let outline =
-                                super::code_intel::generate_outline(&content_for_outline, ts_lang);
+                                code_intel::generate_outline(&content_for_outline, ts_lang);
                             if !outline.is_empty() {
                                 let def_count = outline.lines().count();
                                 return format!(
@@ -445,8 +451,8 @@ impl ToolExecutor {
             self.record_read_cached(&path, true, ReadDedupKey::Outline, content.clone());
 
             // Try tree-sitter first for accurate AST-based extraction
-            if let Some(ts_lang) = super::code_intel::detect_language(&path) {
-                let outline = super::code_intel::generate_outline(&content, ts_lang);
+            if let Some(ts_lang) = code_intel::detect_language(&path) {
+                let outline = code_intel::generate_outline(&content, ts_lang);
                 if !outline.is_empty() {
                     let def_count = outline.lines().count();
                     return format!(
@@ -772,7 +778,7 @@ impl ToolExecutor {
         };
         let count = content.matches(old_str).count();
         if count == 0 {
-            let norm_count = super::fuzzy_replacer::quote_normalized_match_count(&content, old_str);
+            let norm_count = fuzzy_replacer::quote_normalized_match_count(&content, old_str);
             if norm_count > 1 && !replace_all {
                 self.record_fuzzy_match_event(
                     &path,
@@ -790,14 +796,10 @@ impl ToolExecutor {
 
             // Fuzzy cascade: try progressively looser matching strategies
             if let Some(fuzzy_match) =
-                super::fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
+                fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
             {
                 let replacement = if fuzzy_match.is_quote_normalized() {
-                    super::fuzzy_replacer::preserve_quote_style(
-                        old_str,
-                        fuzzy_match.actual,
-                        new_str,
-                    )
+                    fuzzy_replacer::preserve_quote_style(old_str, fuzzy_match.actual, new_str)
                 } else {
                     new_str.to_string()
                 };
@@ -987,12 +989,12 @@ impl ToolExecutor {
                 }
 
                 // Scope context: show where in the code structure this edit landed
-                if let Some(lang) = super::code_intel::detect_language(&path) {
+                if let Some(lang) = code_intel::detect_language(&path) {
                     let edit_line = content[..content.find(old_str).unwrap_or(0)]
                         .matches('\n')
                         .count()
                         + 1;
-                    let scope = super::code_intel::scope_at_line(&new_content, lang, edit_line);
+                    let scope = code_intel::scope_at_line(&new_content, lang, edit_line);
                     if !scope.breadcrumbs.is_empty() {
                         result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
                     }
@@ -1786,7 +1788,7 @@ impl ToolExecutor {
                 // Try the fuzzy cascade. If it returns a unique
                 // match, apply it at that location using the
                 // caller's new_str; record which strategy matched.
-                match super::fuzzy_replacer::fuzzy_find_replacement(
+                match fuzzy_replacer::fuzzy_find_replacement(
                     &working, old_str, /* replace_all */ false,
                 ) {
                     Some(fuzzy_match) => {
@@ -1903,11 +1905,11 @@ impl ToolExecutor {
                 }
 
                 // Scope context for the first edit location
-                if let Some(lang) = super::code_intel::detect_language(&path)
+                if let Some(lang) = code_intel::detect_language(&path)
                     && let Some(first_edit_start) = first_edit_start_byte
                 {
                     let edit_line = content[..first_edit_start].matches('\n').count() + 1;
-                    let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
+                    let scope = code_intel::scope_at_line(&working, lang, edit_line);
                     if !scope.breadcrumbs.is_empty() {
                         result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
                     }
@@ -2762,7 +2764,14 @@ fn add_line_numbers(content: &str, start_line: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::ToolExecutor;
+    use super::{
+        Language, add_line_numbers, auto_format_file, detect_language, extract_outline,
+        is_unc_path, normalize_ws, similarity_score, str_replace_ambiguous_hint,
+        str_replace_not_found_hint,
+    };
+    use astra_text_utils::str_preview::truncate_str;
+    use serde_json::{Value, json};
     use std::io::Write;
 
     fn test_executor_in(dir: &std::path::Path) -> ToolExecutor {

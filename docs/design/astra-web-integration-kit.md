@@ -1,7 +1,8 @@
 # Astra Web Integration Kit
 
-> **Status**: Draft v0.1  
-> **Date**: 2026-05-16  
+> **Status**: Draft v0.1
+>
+> **Date**: 2026-05-16
 > **Scope**: TypeScript SDK, React headless integration, optional UI components, and web backend adapters for embedding Astra into external web systems.
 
 ## Summary

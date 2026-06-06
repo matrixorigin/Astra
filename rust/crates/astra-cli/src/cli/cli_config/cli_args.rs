@@ -26,11 +26,13 @@ fn parse_permission_mode_arg(value: &str) -> Result<String, String> {
         .map(|mode| mode.to_string())
 }
 
-fn parse_explain_mode_arg(value: &str) -> Result<crate::ExplainMode, String> {
+fn parse_explain_mode_arg(
+    value: &str,
+) -> Result<crate::cli::session::session_state::ExplainMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" => Ok(crate::ExplainMode::On),
-        "off" | "false" => Ok(crate::ExplainMode::Off),
-        "verbose" => Ok(crate::ExplainMode::Verbose),
+        "on" | "true" => Ok(crate::cli::session::session_state::ExplainMode::On),
+        "off" | "false" => Ok(crate::cli::session::session_state::ExplainMode::Off),
+        "verbose" => Ok(crate::cli::session::session_state::ExplainMode::Verbose),
         other => Err(format!(
             "invalid explain mode `{other}` (expected on, off, or verbose)"
         )),
@@ -372,7 +374,7 @@ pub(crate) struct ChatArgs {
         value_name = "MODE",
         value_parser = parse_explain_mode_arg
     )]
-    pub explain: Option<crate::ExplainMode>,
+    pub explain: Option<crate::cli::session::session_state::ExplainMode>,
     /// Auto-approve tool calls
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,

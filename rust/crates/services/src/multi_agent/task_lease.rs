@@ -71,19 +71,39 @@ pub async fn push_tasks_pack_held_mysql(
         serde_json::from_str(pack_json).map_err(|e| format!("push_tasks_pack parse: {e}"))?;
     let mut applied = 0u32;
     let mut rejected = 0u32;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("push_tasks_pack tx begin: {e}"))?;
 
     for t in tasks {
         if t.user_id != user_id {
             rejected += 1;
             continue;
         }
+        let plan_json = t
+            .plan
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("push_tasks_pack plan_json: {e}"))?;
+        let ckpt_json = t
+            .checkpoint
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("push_tasks_pack checkpoint_json: {e}"))?;
+
+        // Lock task_leases before agent_tasks to match claim/release ordering
+        // and prevent a stale holder from updating after lease transfer.
         let holder: Option<String> = sqlx::query_scalar(
             "SELECT holder_agent_id FROM task_leases \
-             WHERE task_id = ? AND user_id = ? AND expires_at >= NOW(6)",
+             WHERE task_id = ? AND user_id = ? AND expires_at >= NOW(6) \
+             FOR UPDATE",
         )
         .bind(&t.task_id)
         .bind(user_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("push_tasks_pack lease: {e}"))?;
         match holder {
@@ -94,11 +114,12 @@ pub async fn push_tasks_pack_held_mysql(
             }
         }
 
-        let plan_json = t.plan.as_ref().and_then(|p| serde_json::to_string(p).ok());
-        let ckpt_json = t
-            .checkpoint
-            .as_ref()
-            .and_then(|c| serde_json::to_string(c).ok());
+        sqlx::query("SELECT task_id FROM agent_tasks WHERE task_id = ? AND user_id = ? FOR UPDATE")
+            .bind(&t.task_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("push_tasks_pack task lock: {e}"))?;
 
         let n = sqlx::query(
             "UPDATE agent_tasks SET \
@@ -130,7 +151,7 @@ pub async fn push_tasks_pack_held_mysql(
         .bind(t.agent_id.as_deref().unwrap_or(holder_agent_id))
         .bind(&t.task_id)
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("push_tasks_pack update: {e}"))?
         .rows_affected();
@@ -141,6 +162,10 @@ pub async fn push_tasks_pack_held_mysql(
             rejected += 1;
         }
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("push_tasks_pack commit: {e}"))?;
 
     Ok(TasksPackPushResult { applied, rejected })
 }
@@ -343,6 +368,55 @@ impl DatabaseTaskLeaseService {
         self.metrics = Some(metrics);
         self
     }
+
+    async fn renew_lease_update(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        edge_id: &str,
+        ttl_sec: i64,
+    ) -> Result<bool, String> {
+        let ttl = clamp_ttl_sec(ttl_sec);
+        let n = match sqlx::query(
+            "UPDATE task_leases SET \
+             holder_edge_id = ?, \
+             expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
+             lease_version = lease_version + 1, updated_at = NOW(6) \
+             WHERE task_id = ? AND user_id = ? AND holder_agent_id = ? AND expires_at >= NOW(6)",
+        )
+        .bind(edge_id)
+        .bind(ttl)
+        .bind(task_id)
+        .bind(user_id)
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(done) => done.rows_affected(),
+            Err(e) => {
+                if let Some(ref m) = self.metrics {
+                    m.lease_renewal_failure_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(format!("renew_lease: {e}"));
+            }
+        };
+
+        if n == 0 {
+            if let Some(ref m) = self.metrics {
+                m.lease_renewal_failure_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracing::debug!("task_lease: renew skipped (lease expired or not held)");
+            return Ok(false);
+        }
+        if let Some(ref m) = self.metrics {
+            m.lease_renewal_success_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -385,6 +459,19 @@ pub trait TaskLeaseService: Send + Sync {
         edge_id: &str,
         ttl_sec: i64,
     ) -> Result<Option<TaskLeaseView>, String>;
+
+    async fn renew_lease_held(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        edge_id: &str,
+        ttl_sec: i64,
+    ) -> Result<bool, String> {
+        self.renew_lease(user_id, task_id, agent_id, edge_id, ttl_sec)
+            .await
+            .map(|view| view.is_some())
+    }
 }
 
 #[async_trait]
@@ -677,29 +764,25 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         edge_id: &str,
         ttl_sec: i64,
     ) -> Result<Option<TaskLeaseView>, String> {
-        let ttl = clamp_ttl_sec(ttl_sec);
-        let n = sqlx::query(
-            "UPDATE task_leases SET \
-             holder_edge_id = ?, \
-             expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
-             lease_version = lease_version + 1, updated_at = NOW(6) \
-             WHERE task_id = ? AND user_id = ? AND holder_agent_id = ? AND expires_at >= NOW(6)",
-        )
-        .bind(edge_id)
-        .bind(ttl)
-        .bind(task_id)
-        .bind(user_id)
-        .bind(agent_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("renew_lease: {e}"))?
-        .rows_affected();
-
-        if n == 0 {
-            tracing::warn!("task_lease: renew failed (lease expired or not held)");
+        if !self
+            .renew_lease_update(user_id, task_id, agent_id, edge_id, ttl_sec)
+            .await?
+        {
             return Ok(None);
         }
         self.get_lease(user_id, task_id).await
+    }
+
+    async fn renew_lease_held(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        edge_id: &str,
+        ttl_sec: i64,
+    ) -> Result<bool, String> {
+        self.renew_lease_update(user_id, task_id, agent_id, edge_id, ttl_sec)
+            .await
     }
 }
 

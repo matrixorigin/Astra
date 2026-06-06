@@ -254,7 +254,7 @@ fn looks_like_build_or_test_failure(lower_output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CommandResultClass, ExitSemantics, classify_command_result, classify_exit};
 
     #[test]
     fn grep_no_match_is_informational_not_execution_error() {

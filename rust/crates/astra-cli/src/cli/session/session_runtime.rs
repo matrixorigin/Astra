@@ -1,5 +1,14 @@
-use super::*;
+use crate::cli::cli_config::cli_utils::{
+    credential_store, load_credentials, normalize_model_override, profile_name,
+};
+use crate::cli::permission_manager::PermissionManager;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::theme;
 use crate::{manifest_loader, mcp_client};
+use astra_services::session_journal;
+#[cfg(test)]
+use astra_text_utils::str_preview::prefix_chars;
+use crossterm::style::Stylize;
 
 pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
@@ -57,7 +66,7 @@ pub(crate) fn resolve_cloud_base() -> Option<String> {
 
 /// Task store for the Tier 1 session scratchpad (`session_todos`).
 ///
-/// When cloud is configured, returns an [`crate::cli::session_todo_client::HttpTaskStore`]
+/// When cloud is configured, returns an [`crate::cli::session::session_todo_client::HttpTaskStore`]
 /// that polls the server's `GET /sessions/{sid}/todos` endpoint and
 /// receives broadcast notifications from `route_task_action` after
 /// every successful mutation. The observer sees tasks within one poll
@@ -91,7 +100,7 @@ pub(crate) async fn resolve_task_store(
     if let Some(cloud_base) = cloud_base {
         let token = current_access_token(profile);
         let (store, notify_tx) =
-            crate::cli::session_todo_client::HttpTaskStore::new(cloud_base, token);
+            crate::cli::session::session_todo_client::HttpTaskStore::new(cloud_base, token);
         return (store, Some(notify_tx));
     }
     (
@@ -663,7 +672,7 @@ pub(crate) async fn fresh_access_token(
 pub(crate) fn initialize_session_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
-    cli_context: &crate::cli::cli_context::CliContext,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> SessionState {
     let mut state = SessionState::default();
     state.cli_context = cli_context.clone();
@@ -721,7 +730,7 @@ pub(crate) fn initialize_session_state(
 }
 
 fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> {
-    let session_id = crate::cli::cli_utils::stored_last_session_id(cli_profile)?;
+    let session_id = crate::cli::cli_config::cli_utils::stored_last_session_id(cli_profile)?;
     match astra_services::session_workspace::read_workspace_optional(&session_id) {
         Ok(Some(workspace)) => {
             if workspace.status.eq_ignore_ascii_case("completed") {
@@ -729,9 +738,8 @@ fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> 
             }
             workspace_matches_current_project(&workspace).then_some(session_id)
         }
-        Ok(None) => {
-            crate::cli::cli_utils::local_session_is_resumable(&session_id).then_some(session_id)
-        }
+        Ok(None) => crate::cli::cli_config::cli_utils::local_session_is_resumable(&session_id)
+            .then_some(session_id),
         Err(error) => {
             eprintln!(
                 "  ⚠ workspace read failed while checking pending recovery for {session_id}: {error}"
@@ -1270,9 +1278,20 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use super::{
+        ACCESS_TOKEN_REFRESH_SKEW_SECS, RestoredSessionState, SilentRefreshError,
+        access_token_needs_refresh, banner_session_display, banner_welcome_text,
+        current_access_token, current_git_root, fresh_access_token, initialize_session_state,
+        pending_recovery_status_line, restore_history_from_journal,
+        restore_session_state_from_journal, restored_journal_state,
+        should_keep_credentials_on_refresh_error,
+    };
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
+    use crate::cli::session::session_state::SessionState;
     use crate::tests::isolate_credentials;
+    use astra_services::session_journal;
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1305,14 +1324,6 @@ mod tests {
         }
     }
 
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
-
     fn jwt_with_exp(exp: i64) -> String {
         use base64::Engine;
 
@@ -1325,14 +1336,14 @@ mod tests {
 
     #[test]
     fn restore_history_empty_for_unknown_session() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let history = restore_history_from_journal("nonexistent-session-xyz-123").unwrap();
         assert!(history.is_empty());
     }
 
     #[test]
     fn restore_history_from_journal_roundtrip() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-restore-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -1372,7 +1383,7 @@ mod tests {
 
     #[test]
     fn restore_history_skips_non_turn_events() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-skip-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -1410,7 +1421,7 @@ mod tests {
 
     #[test]
     fn restore_session_state_recovers_turn_tools_and_tokens() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-state-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -1473,7 +1484,7 @@ mod tests {
 
     #[test]
     fn restore_session_state_uses_latest_session_segment() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-segment-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -1548,7 +1559,7 @@ mod tests {
 
     #[test]
     fn restore_session_state_keeps_recorded_turn_after_stray_session_start() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-stray-start-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -1622,7 +1633,7 @@ mod tests {
 
     #[test]
     fn restore_session_state_from_journal_surfaces_unreadable_journal() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
@@ -1634,7 +1645,7 @@ mod tests {
 
     #[test]
     fn restored_journal_state_tracks_existence_and_last_turn_event() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-restore-journal-state-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -1694,7 +1705,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_skips_cleanly_ended_session() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!("test-ended-init-{}", uuid::Uuid::new_v4());
@@ -1735,7 +1746,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
@@ -1746,13 +1757,13 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_treats_default_model_as_server_default() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let state = initialize_session_state(
             None,
             Some("default"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
 
         assert_eq!(state.model, None);
@@ -1761,7 +1772,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_records_project_scoped_pending_recovery() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!("test-pending-recovery-{}", uuid::Uuid::new_v4());
@@ -1823,7 +1834,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
@@ -1834,7 +1845,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_explicit_session_id_suppresses_pending_recovery() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = uuid::Uuid::new_v4().to_string();
@@ -1880,7 +1891,7 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let cli_context = crate::cli::cli_context::CliContext::from_launch_options(
+        let cli_context = crate::cli::cli_config::cli_context::CliContext::from_launch_options(
             false,
             None,
             &[],
@@ -1913,7 +1924,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn pending_recovery_status_line_surfaces_persistence_degradation() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("pending-recovery-{}", uuid::Uuid::new_v4());
         let mut workspace =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
@@ -1933,7 +1944,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_ignores_pending_recovery_from_other_project() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!("test-other-project-{}", uuid::Uuid::new_v4());
@@ -1981,7 +1992,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
@@ -1992,7 +2003,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_preserves_pending_recovery_when_workspace_is_corrupt() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!("test-corrupt-pending-recovery-{}", uuid::Uuid::new_v4());
@@ -2035,7 +2046,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
@@ -2044,7 +2055,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_preserves_pending_recovery_for_workspace_only_corrupt_session() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!(
@@ -2068,7 +2079,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
@@ -2077,7 +2088,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_preserves_pending_recovery_when_workspace_missing() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!("test-missing-pending-recovery-{}", uuid::Uuid::new_v4());
@@ -2116,7 +2127,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
@@ -2125,7 +2136,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_ignores_stale_pending_recovery_without_local_state() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
         let sid = format!("test-stale-pending-recovery-{}", uuid::Uuid::new_v4());
@@ -2142,7 +2153,7 @@ mod tests {
         let state = initialize_session_state(
             None,
             Some("gpt-5"),
-            &crate::cli::cli_context::CliContext::default(),
+            &crate::cli::cli_config::cli_context::CliContext::default(),
         );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
@@ -2151,7 +2162,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn pending_recovery_status_line_surfaces_workspace_unreadable() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("pending-recovery-corrupt-{}", uuid::Uuid::new_v4());
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
         std::fs::create_dir_all(&workspace_dir).unwrap();
@@ -2379,7 +2390,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let path = crate::cli::cli_utils::credentials_path();
+        let path = crate::cli::cli_config::cli_utils::credentials_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

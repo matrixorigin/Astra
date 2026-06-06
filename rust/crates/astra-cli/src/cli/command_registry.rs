@@ -1002,7 +1002,12 @@ pub fn get_arg_hint(command: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        COMMANDS, CommandGroup, TuiHandler, completion_candidates, fuzzy_completion_candidates,
+        get_arg_hint, resolve_command, resolve_command_meta, subcommand_completions,
+        suggest_commands,
+    };
+    use crate::cli::command_usage;
 
     #[test]
     fn all_commands_start_with_slash() {

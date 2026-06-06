@@ -1,4 +1,12 @@
-use super::*;
+use super::resolve_journal_target_session;
+use crate::cli::agent_runtime::initialize_multi_agent_runtime;
+use crate::cli::command_registry;
+use crate::cli::session::session_state::{ExplainMode, SessionState};
+use crate::cli::slash::slash_router::handle_slash_command;
+use crate::cli::stream::stream_render::{
+    RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block,
+};
+use astra_runtime::prompts;
 
 #[test]
 fn dispatch_turn_event_collects_explain_events() {
@@ -262,7 +270,7 @@ fn compacted_history_skips_empty_user_messages() {
 
 #[test]
 fn compact_assistant_message_optional_session_memory_anchor() {
-    let with_anchor = crate::cli::session_compaction::compact_assistant_message(
+    let with_anchor = crate::cli::session::session_compaction::compact_assistant_message(
         3,
         "Summary body",
         Some("- [fact] one\n- [fact] two"),
@@ -273,7 +281,7 @@ fn compact_assistant_message_optional_session_memory_anchor() {
     assert!(with_anchor.contains("Summary body"));
 
     let no_anchor =
-        crate::cli::session_compaction::compact_assistant_message(2, "Only summary", None);
+        crate::cli::session::session_compaction::compact_assistant_message(2, "Only summary", None);
     assert!(!no_anchor.contains("[Session memory anchor]"));
     assert!(no_anchor.contains("[Prior context — 2 turns compacted]"));
     assert!(no_anchor.contains("Only summary"));

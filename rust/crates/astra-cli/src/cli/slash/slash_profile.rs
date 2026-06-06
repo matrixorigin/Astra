@@ -10,11 +10,12 @@
 //! - `/profile reset`: Reset to defaults
 //! - `/profile help`: Show help
 
-use super::*;
+use crate::cli::theme;
 use astra_config::user_profile::{
     CodeCommentStyle, EmojiUsage, Formality, ResponseLength, Scenario, UserProfile,
     UserProfileManager, Verbosity,
 };
+use crossterm::style::Stylize;
 use std::sync::Arc;
 
 /// Profile command context — passed from main.

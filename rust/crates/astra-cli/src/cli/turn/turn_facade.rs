@@ -112,7 +112,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{BasicCliTurnOptions, retry_pre_loaded_messages, should_retry_without_session};
 
     #[test]
     fn first_attempt_consumes_preloaded_messages_once() {

@@ -1,7 +1,12 @@
-use super::chat_stream_tests::sse_text_response;
-use super::*;
+use super::{chat_stream_tests::sse_text_response, spawn_mock};
+use crate::cli::cli_config::cli_utils::prefix_chars;
 use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
-use axum::response::IntoResponse;
+use crate::cli::session::session_runtime;
+use crate::cli::slash::slash_task;
+use crate::cli::turn::turn_entry::{TurnContext, handle_chat_input};
+use crate::tests::isolate_credentials;
+use astra_services::session_journal;
+use axum::{Router, response::IntoResponse, routing::post};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn env_lock() -> &'static Mutex<()> {
@@ -321,7 +326,7 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     let state = session_runtime::initialize_session_state(
         None,
         None,
-        &crate::cli::cli_context::CliContext::default(),
+        &crate::cli::cli_config::cli_context::CliContext::default(),
     );
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
@@ -329,6 +334,7 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     assert_eq!(state.turn, 0);
 }
 
+#[serial_test::serial]
 #[tokio::test(flavor = "current_thread")]
 async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore() {
     let _creds = isolate_credentials();
@@ -456,7 +462,7 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     let mut state = session_runtime::initialize_session_state(
         None,
         Some("gpt-4o"),
-        &crate::cli::cli_context::CliContext::default(),
+        &crate::cli::cli_config::cli_context::CliContext::default(),
     );
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
@@ -603,7 +609,7 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
     let mut state = session_runtime::initialize_session_state(
         None,
         Some("qwen3.6-plus"),
-        &crate::cli::cli_context::CliContext::default(),
+        &crate::cli::cli_config::cli_context::CliContext::default(),
     );
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 

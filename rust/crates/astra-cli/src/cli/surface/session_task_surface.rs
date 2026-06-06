@@ -1,4 +1,4 @@
-pub(crate) use astra_tools::task_mgmt::SessionTaskStatusKind;
+use astra_tools::task_mgmt::SessionTaskStatusKind;
 
 pub(crate) fn session_task_status_marker(status: SessionTaskStatusKind) -> &'static str {
     match status {
@@ -28,7 +28,8 @@ pub(crate) fn session_task_active_priority(status: SessionTaskStatusKind) -> u8 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::session_task_active_priority;
+    use astra_tools::task_mgmt::SessionTaskStatusKind;
 
     #[test]
     fn session_task_status_helpers_keep_active_vs_terminal_split() {

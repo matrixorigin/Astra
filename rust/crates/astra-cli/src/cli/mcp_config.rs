@@ -553,7 +553,7 @@ async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod mcp_cli_tests {
-    use super::*;
+    use super::{mcp_add, mcp_get, mcp_json_path_for_scope, read_mcp_config, write_mcp_config};
     use serial_test::serial;
 
     struct CurrentDirGuard(std::path::PathBuf);

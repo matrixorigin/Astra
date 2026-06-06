@@ -138,8 +138,10 @@ fn diagnostic_message(content: String) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
+    use super::{should_schedule_passive_cargo, take_passive_cargo_messages};
+    use crate::env_tools;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     #[serial_test::serial]

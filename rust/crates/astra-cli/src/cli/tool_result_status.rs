@@ -13,7 +13,8 @@ pub(crate) fn tool_result_status_icon(status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::tool_result_status_icon;
+    use crate::cli::theme;
 
     #[test]
     fn icon_uses_failure_semantics_for_non_success_status() {

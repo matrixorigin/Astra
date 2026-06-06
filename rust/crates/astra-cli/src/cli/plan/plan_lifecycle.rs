@@ -41,7 +41,11 @@ fn build_plan_mode_state(
     state
 }
 
-fn bind_state_to_session(state: &mut crate::SessionState, profile: Option<&str>, session_id: &str) {
+fn bind_state_to_session(
+    state: &mut crate::cli::session::session_state::SessionState,
+    profile: Option<&str>,
+    session_id: &str,
+) {
     if state.session_id.as_deref() == Some(session_id) {
         return;
     }
@@ -69,7 +73,7 @@ async fn ensure_cloud_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     token: &str,
-    state: &mut crate::SessionState,
+    state: &mut crate::cli::session::session_state::SessionState,
 ) -> Result<String, String> {
     if let Some(session_id) = state
         .session_id
@@ -81,7 +85,7 @@ async fn ensure_cloud_session(
     let value = serde_json::from_str::<Value>(
         &api.post_sessions_json(token, &serde_json::json!({}))
             .await
-            .map_err(crate::map_thin_err)?,
+            .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?,
     )
     .unwrap_or_default();
     let session_id = parse_session_id(&value)
@@ -94,7 +98,7 @@ pub(crate) async fn enter_remote_plan_mode(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     token: &str,
-    state: &mut crate::SessionState,
+    state: &mut crate::cli::session::session_state::SessionState,
     goal: &str,
 ) -> Result<String, String> {
     let goal = goal.trim();
@@ -111,7 +115,7 @@ pub(crate) async fn enter_remote_plan_mode(
             }),
         )
         .await
-        .map_err(crate::map_thin_err)?;
+        .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?;
     let plan_id =
         parse_plan_id(&value).ok_or_else(|| "create plan response missing plan_id".to_string())?;
     state.cloud_plan_mirror = Some(build_plan_mode_state(
@@ -138,7 +142,7 @@ pub(crate) async fn active_remote_planning_plan_id(
             ],
         )
         .await
-        .map_err(crate::map_thin_err)?;
+        .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?;
 
     Ok(plans
         .get("plans")
@@ -150,7 +154,7 @@ pub(crate) async fn active_remote_planning_plan_id(
 pub(crate) async fn exit_remote_plan_mode(
     api: &astra_thin_client::ThinClient,
     token: &str,
-    state: &mut crate::SessionState,
+    state: &mut crate::cli::session::session_state::SessionState,
     approved: bool,
 ) -> Result<Option<String>, String> {
     let Some(session_id) = state
@@ -176,7 +180,7 @@ pub(crate) async fn exit_remote_plan_mode(
             &serde_json::json!({ "approved": approved }),
         )
         .await
-        .map_err(crate::map_thin_err)?;
+        .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?;
 
     if approved {
         state.cloud_plan_mirror = None;
@@ -195,7 +199,7 @@ pub(crate) async fn exit_remote_plan_mode(
 pub(crate) async fn sync_remote_plan_mode_state(
     api: &astra_thin_client::ThinClient,
     token: &str,
-    state: &mut crate::SessionState,
+    state: &mut crate::cli::session::session_state::SessionState,
 ) -> Result<(), String> {
     let Some(session_id) = state
         .session_id
@@ -216,7 +220,7 @@ pub(crate) async fn sync_remote_plan_mode_state(
     let plan_state = api
         .get_plan_json(token, &plan_id)
         .await
-        .map_err(crate::map_thin_err)?;
+        .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?;
     let goal = plan_state
         .get("goal")
         .and_then(Value::as_str)
@@ -238,7 +242,9 @@ pub(crate) async fn fresh_token_for_plan(
     session_runtime::fresh_access_token(api, profile).await
 }
 
-pub(crate) fn looks_like_pending_local_plan_entry(state: &crate::SessionState) -> bool {
+pub(crate) fn looks_like_pending_local_plan_entry(
+    state: &crate::cli::session::session_state::SessionState,
+) -> bool {
     state
         .cloud_plan_mirror
         .as_ref()
@@ -248,7 +254,8 @@ pub(crate) fn looks_like_pending_local_plan_entry(state: &crate::SessionState) -
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{enter_remote_plan_mode, exit_remote_plan_mode, sync_remote_plan_mode_state};
+    use astra_runtime::plan;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -286,7 +293,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         let plan_id = enter_remote_plan_mode(&api, None, "token", &mut state, "Ship auth")
             .await
             .unwrap();
@@ -331,7 +338,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
 
         let error = enter_remote_plan_mode(&api, None, "token", &mut state, "Ship auth")
             .await
@@ -362,7 +369,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.session_id = Some("sess-1".to_string());
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("stale".to_string()));
 
@@ -418,7 +425,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.session_id = Some("sess-1".to_string());
 
         sync_remote_plan_mode_state(&api, "token", &mut state)
@@ -459,7 +466,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.session_id = Some("sess-1".to_string());
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("stale goal".to_string()));
 
@@ -508,7 +515,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.session_id = Some("sess-1".to_string());
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
@@ -555,7 +562,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
         state.session_id = Some("sess-1".to_string());
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
 

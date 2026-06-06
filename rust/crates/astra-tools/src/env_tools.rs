@@ -306,7 +306,7 @@ pub fn is_sensitive_var(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{env_list, env_search, overlay_remove, overlay_set};
     use serde_json::json;
 
     #[test]

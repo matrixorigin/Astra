@@ -1,5 +1,4 @@
-use super::*;
-
+use crate::cli::cli_config::cli_utils::truncate_str;
 #[cfg(test)]
 use crate::cli::workspace_trust::evaluate_workspace_trust_from_path;
 use crate::cli::workspace_trust::{
@@ -25,6 +24,12 @@ use astra_turn_core::permission::match_target::{
 use astra_turn_core::permission::memory_profile::resolved_write_path;
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
+};
+use crossterm::style::Stylize;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
 };
 
 /// Classify a permission-denial reason and emit a short, actionable
@@ -3666,8 +3671,20 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ApprovalPromptKind, ExecuteDecision, ModifyError, PermissionDecision, PermissionLoadPolicy,
+        PermissionManager, PermissionMode, PermissionRule, PermissionSettings,
+        PermissionSettingsLoadError, SideEffect, cloud_always_feedback_message,
+        content_aware_fingerprint, decode_mode_for_mirror, encode_mode_for_mirror,
+        format_denied_message, is_read_only_allowlisted, safe_alternative_for,
+    };
+    use crate::cli::workspace_trust::{
+        TrustState, WorkspaceTrustLedger, WorkspaceTrustReason, project_permissions_hash,
+    };
     use crate::lock_recovery::LockRecovery;
+    use astra_thin_client::ApprovalKind;
+    use astra_turn_core::permission::match_target::AllowMatchTarget;
+    use std::fs;
 
     fn bare_fp(tool: &str) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
         astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool)

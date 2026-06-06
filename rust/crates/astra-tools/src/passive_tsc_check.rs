@@ -149,8 +149,10 @@ fn tsc_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
+    use super::{should_schedule_passive_tsc, take_passive_tsc_messages, tsc_available};
+    use crate::env_tools;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     #[serial_test::serial]

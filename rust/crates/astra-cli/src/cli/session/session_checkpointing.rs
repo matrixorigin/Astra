@@ -1,6 +1,7 @@
-use super::*;
 use crate::cli::session::session_recovery;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_state::SessionState;
+use astra_services::session_journal;
 
 /// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,
 /// journal, and workspace — avoids workspace/checkpoint markdown ahead of failed heavy writes.
@@ -175,16 +176,14 @@ pub(crate) fn create_manual_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        create_manual_checkpoint, persist_manual_session_checkpoint_layer,
+        spawn_manual_checkpoint_cloud_uploads,
+    };
+    use crate::cli::session::session_recovery;
+    use crate::cli::session::session_state::SessionState;
     use astra_pipeline::step_protocol::StepCheckpoint;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
+    use astra_services::session_journal;
 
     fn workspace_backup_path_for(session_id: &str) -> Option<std::path::PathBuf> {
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(session_id);
@@ -201,7 +200,7 @@ mod tests {
 
     #[test]
     fn persist_manual_session_checkpoint_layer_writes_md_journal_workspace() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
 
         let mut workspace =
@@ -271,7 +270,7 @@ mod tests {
 
     #[test]
     fn create_manual_checkpoint_returns_compact_summary() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -297,7 +296,7 @@ mod tests {
 
     #[test]
     fn create_manual_checkpoint_returns_error_when_step_checkpoint_path_is_invalid() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -326,7 +325,7 @@ mod tests {
     #[test]
     fn create_manual_checkpoint_recovers_from_corrupt_workspace_and_preserves_checkpoint_numbering()
     {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -373,7 +372,7 @@ mod tests {
 
     #[test]
     fn create_manual_checkpoint_preserves_previous_heavy_recovery_state() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
 

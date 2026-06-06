@@ -1,4 +1,7 @@
-use super::*;
+use super::ToolExecutor;
+use chrono::{DateTime, Utc};
+use reqwest::{Method, StatusCode};
+use serde_json::{Value, json};
 
 const GITHUB_MISSING_REPO_ERROR: &str = "Error: missing 'repo' — infer repo from current user text or recent conversation; bare names like 'memoria' are allowed";
 
@@ -1732,7 +1735,15 @@ fn github_issue_list_item(issue: &Value, detail: GithubDetail) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::edge_tools::extract_github_owner_repo;
+
+    use super::{
+        GITHUB_MISSING_REPO_ERROR, GithubDetail, GithubRepoResolution, github_duration_seconds,
+        github_error_response, github_excerpt, github_issue_list_item, github_normalize_conclusion,
+        github_normalize_name, github_pick_resolved_repo, github_pr_list_item, github_pr_state,
+        github_requested_limit, github_timestamp,
+    };
+    use serde_json::{Value, json};
 
     #[test]
     pub(crate) fn github_detail_defaults_to_brief() {
@@ -1812,7 +1823,7 @@ mod tests {
     fn extract_github_owner_repo_ssh() {
         let line = "origin\tgit@github.com:MatrixOrigin/Memoria.git (fetch)";
         assert_eq!(
-            super::extract_github_owner_repo(line),
+            extract_github_owner_repo(line),
             Some("MatrixOrigin/Memoria".to_string())
         );
     }
@@ -1821,7 +1832,7 @@ mod tests {
     fn extract_github_owner_repo_https() {
         let line = "origin\thttps://github.com/matrixorigin/mo-dev-agent.git (push)";
         assert_eq!(
-            super::extract_github_owner_repo(line),
+            extract_github_owner_repo(line),
             Some("matrixorigin/mo-dev-agent".to_string())
         );
     }
@@ -1829,7 +1840,7 @@ mod tests {
     #[test]
     fn extract_github_owner_repo_non_github() {
         let line = "origin\thttps://gitlab.com/someone/project.git (fetch)";
-        assert_eq!(super::extract_github_owner_repo(line), None);
+        assert_eq!(extract_github_owner_repo(line), None);
     }
 
     // ── github_pick_resolved_repo edge cases ──

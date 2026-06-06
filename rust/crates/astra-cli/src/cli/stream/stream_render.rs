@@ -1,7 +1,8 @@
-use super::*;
+use crate::cli::stream::streaming_md;
 use crate::cli::tool_result_status::{
     tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_success,
 };
+use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
 use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
 use astra_services::session_journal::JournalEvent;
 use astra_tools::git_gix::{git_worktree_is_clean, head_short};
@@ -20,14 +21,13 @@ use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 use astra_turn_core::tool_result_semantics::{
     cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
 };
-use crossterm::execute;
-use crossterm::style::Stylize;
+use crossterm::{cursor, execute, style::Stylize, terminal};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use serde_json::{Map, Value};
 use std::future::Future;
-use std::io::{IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -324,7 +324,7 @@ enum ApprovalMemoryAction {
 }
 
 fn approval_memory_action(
-    response: &super::chat_stream::ApprovalResponse,
+    response: &chat_stream::ApprovalResponse,
     always_scope: astra_turn_core::permission::scope::AllowScope,
     stale_revalidation_passed: bool,
 ) -> ApprovalMemoryAction {
@@ -357,7 +357,7 @@ fn persist_scoped_allow_rule(
     tool: &str,
     args: &Value,
     match_target: Option<&astra_turn_core::permission::match_target::AllowMatchTarget>,
-    save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
+    save_warning_tx: Option<&chat_stream::StreamEventTx>,
 ) {
     let default_target =
         astra_turn_core::permission::match_target::default_match_target(tool, args);
@@ -388,7 +388,7 @@ fn persist_scoped_allow_rule(
             "Always allow for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
         );
         if let Some(tx) = save_warning_tx {
-            let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(format!(
+            let _ = tx.send(chat_stream::StreamEvent::StatusLine(format!(
                 "Failed to save Always allow for {remember_preview} to {target_label}: {err}"
             )));
         }
@@ -401,7 +401,7 @@ fn apply_approval_memory_action(
     tool: &str,
     args: &Value,
     match_target: Option<&astra_turn_core::permission::match_target::AllowMatchTarget>,
-    save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
+    save_warning_tx: Option<&chat_stream::StreamEventTx>,
 ) {
     let default_target =
         astra_turn_core::permission::match_target::default_match_target(tool, args);
@@ -582,14 +582,14 @@ pub(crate) struct EdgeSseContext<'a> {
     /// Optional cancellation token to abort SSE stream on auth failure.
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
-    pub stream_event_tx: Option<super::chat_stream::StreamEventTx>,
+    pub stream_event_tx: Option<chat_stream::StreamEventTx>,
     /// Optional direct stream sink. Used by spawned child agents to
     /// avoid an unbounded intermediate channel in the live-output path.
-    pub stream_event_sink: Option<super::chat_stream::SharedStreamEventSink>,
+    pub stream_event_sink: Option<chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
-    pub approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
+    pub approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
-    pub ask_user_request_tx: Option<super::chat_stream::AskUserRequestTx>,
+    pub ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// When true, this is a continuation turn after a skill has already produced output.
@@ -646,13 +646,13 @@ struct CliSseStreamHost<'a> {
     /// Optional cancellation token to abort SSE stream on auth failure.
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
-    stream_event_tx: Option<super::chat_stream::StreamEventTx>,
+    stream_event_tx: Option<chat_stream::StreamEventTx>,
     /// Optional direct stream sink for bounded/live paths.
-    stream_event_sink: Option<super::chat_stream::SharedStreamEventSink>,
+    stream_event_sink: Option<chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
-    approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
+    approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
-    ask_user_request_tx: Option<super::chat_stream::AskUserRequestTx>,
+    ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Skills already invoked during this SSE stream (for edge-path dedup).
@@ -765,7 +765,7 @@ struct BashProgressGuard {
     /// Cloned observer tx so the `Drop` impl can emit one last
     /// `ToolOutput` snapshot after the pipe's final drain ran.
     /// Populated only when an observer was present at install time.
-    final_event_tx: Option<super::chat_stream::StreamEventTx>,
+    final_event_tx: Option<chat_stream::StreamEventTx>,
     /// Tool name for the final `ToolOutput` snapshot.
     tool_name: String,
 }
@@ -774,9 +774,9 @@ impl BashProgressGuard {
     fn install(
         executor: &std::sync::Arc<crate::edge_tools::ToolExecutor>,
         tool_name: &str,
-        stream_event_tx: Option<&super::chat_stream::StreamEventTx>,
+        stream_event_tx: Option<&chat_stream::StreamEventTx>,
     ) -> Self {
-        let sink = std::sync::Arc::new(super::chat_stream::ToolProgressSink::new());
+        let sink = std::sync::Arc::new(chat_stream::ToolProgressSink::new());
         executor.set_bash_progress_sink(Some(sink.clone()));
 
         // Spawn the ticker only when there's an observer listening —
@@ -799,7 +799,7 @@ impl BashProgressGuard {
                     }
                     last = (lines, bytes);
                     if tx
-                        .send(super::chat_stream::StreamEvent::ToolOutput {
+                        .send(chat_stream::StreamEvent::ToolOutput {
                             name: name.clone(),
                             lines,
                             bytes,
@@ -838,7 +838,7 @@ impl Drop for BashProgressGuard {
             self.final_event_tx.as_ref(),
         ) {
             let (lines, bytes) = sink.snapshot();
-            let _ = tx.send(super::chat_stream::StreamEvent::ToolOutput {
+            let _ = tx.send(chat_stream::StreamEvent::ToolOutput {
                 name: self.tool_name.clone(),
                 lines,
                 bytes,
@@ -992,10 +992,10 @@ impl<'a> CliSseStreamHost<'a> {
         if !self.render_policy.is_silent() {
             eprintln!("{}", "  Token expired, attempting refresh…".yellow());
         }
-        if !super::session_runtime::attempt_token_refresh(self.api, Some(profile)).await {
+        if !session_runtime::attempt_token_refresh(self.api, Some(profile)).await {
             return false;
         }
-        let Some(new_token) = super::session_runtime::current_access_token(Some(profile)) else {
+        let Some(new_token) = session_runtime::current_access_token(Some(profile)) else {
             return false;
         };
         self.token = new_token;
@@ -1137,7 +1137,7 @@ impl<'a> CliSseStreamHost<'a> {
         }
 
         // Check if there's an open thinking tag.
-        if super::streaming_md::has_open_xml_tag(&self.xml_tag_buffer) {
+        if streaming_md::has_open_xml_tag(&self.xml_tag_buffer) {
             // Still inside a tag — keep buffering, don't render.
             return;
         }
@@ -1146,14 +1146,14 @@ impl<'a> CliSseStreamHost<'a> {
         // Only hold back if the tail could plausibly become one of our known tags.
         if let Some(last_lt) = self.xml_tag_buffer.rfind('<') {
             let tail = &self.xml_tag_buffer[last_lt..];
-            if !tail.contains('>') && super::streaming_md::could_become_suppressed_tag(tail) {
+            if !tail.contains('>') && streaming_md::could_become_suppressed_tag(tail) {
                 // Potential partial tag — split: flush before, hold tail.
                 let before = self.xml_tag_buffer[..last_lt].to_string();
                 let held = self.xml_tag_buffer[last_lt..].to_string();
                 self.xml_tag_buffer = held;
                 if !before.is_empty() {
                     let mut buf = before;
-                    super::streaming_md::strip_xml_tags_inplace(&mut buf);
+                    streaming_md::strip_xml_tags_inplace(&mut buf);
                     if !buf.is_empty() {
                         self.render_text(&buf);
                     }
@@ -1164,7 +1164,7 @@ impl<'a> CliSseStreamHost<'a> {
 
         // Tag is closed (or there was never one).  Strip and flush.
         let mut buf = std::mem::take(&mut self.xml_tag_buffer);
-        super::streaming_md::strip_xml_tags_inplace(&mut buf);
+        streaming_md::strip_xml_tags_inplace(&mut buf);
         if !buf.is_empty() {
             self.render_text(&buf);
         }
@@ -1518,7 +1518,7 @@ impl<'a> CliSseStreamHost<'a> {
         let Some(session_id) = self.executor.active_session_id() else {
             return;
         };
-        crate::cli::cli_utils::append_session_journal_event_or_warn(
+        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
             &session_id,
             &event,
             "stream_render:append_session_journal_event",
@@ -1746,7 +1746,7 @@ impl<'a> CliSseStreamHost<'a> {
             if req.tool == "agent"
                 && let Some(action) = agent_control_action(&req.args)
             {
-                self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlCompleted {
+                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
                     action: action.to_string(),
                     label: agent_control_label(&req.args, tool_description.clone()),
                     status: status.to_string(),
@@ -1757,7 +1757,7 @@ impl<'a> CliSseStreamHost<'a> {
                         .or_else(|| agent_id_from_args(&req.args)),
                 });
             }
-            self.emit_stream_event(super::chat_stream::StreamEvent::ToolCompleted {
+            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                 name: req.tool.clone(),
                 description: tool_description,
                 status: status.to_string(),
@@ -2116,7 +2116,7 @@ pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<S
 }
 
 impl CliSseStreamHost<'_> {
-    fn emit_stream_event(&self, event: super::chat_stream::StreamEvent) {
+    fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
         if let Some(tx) = &self.stream_event_tx {
             let _ = tx.send(event.clone());
         }
@@ -2228,7 +2228,7 @@ impl CliSseStreamHost<'_> {
             "Cloud approval required before this tool can run.".to_string()
         };
         if tx
-            .send(super::chat_stream::ApprovalRequest::bare(
+            .send(chat_stream::ApprovalRequest::bare(
                 tool.to_string(),
                 header,
                 display_label.or(detail).map(ToString::to_string),
@@ -2323,7 +2323,7 @@ impl CliSseStreamHost<'_> {
         {
             return "Error: ask_user prompt sink is closed".to_string();
         }
-        self.emit_stream_event(super::chat_stream::StreamEvent::AskUserPrompted {
+        self.emit_stream_event(chat_stream::StreamEvent::AskUserPrompted {
             request_id: request_id.clone(),
             prompt: serde_json::json!({
                 "source": "tui",
@@ -2343,7 +2343,7 @@ impl CliSseStreamHost<'_> {
 
         match response {
             AskUserResponse::Submitted(answers) => {
-                self.emit_stream_event(super::chat_stream::StreamEvent::AskUserResolved {
+                self.emit_stream_event(chat_stream::StreamEvent::AskUserResolved {
                     request_id,
                     resolution: serde_json::json!({
                         "source": "tui",
@@ -2359,7 +2359,7 @@ impl CliSseStreamHost<'_> {
             }
             AskUserResponse::Cancelled => {
                 let error = "Error: ask_user was cancelled by the user";
-                self.emit_stream_event(super::chat_stream::StreamEvent::AskUserResolved {
+                self.emit_stream_event(chat_stream::StreamEvent::AskUserResolved {
                     request_id,
                     resolution: serde_json::json!({
                         "source": "tui",
@@ -2417,7 +2417,7 @@ fn sync_incremental_tool_result_state(
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_before_sse_read_loop(&mut self) {
-        self.emit_stream_event(super::chat_stream::StreamEvent::WaitingForModel);
+        self.emit_stream_event(chat_stream::StreamEvent::WaitingForModel);
         if self.render_policy.is_silent() {
             return;
         }
@@ -2425,7 +2425,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_first_sse_frame(&mut self) {
-        self.emit_stream_event(super::chat_stream::StreamEvent::ModelResponding);
+        self.emit_stream_event(chat_stream::StreamEvent::ModelResponding);
         // Don't stop the TTFT spinner here — the first SSE frame is often
         // metadata (session_info, usage) not visible content.  Let the
         // spinner run until actual thinking/text arrives, which will
@@ -2567,14 +2567,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
-                self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlStarted {
+                self.emit_stream_event(chat_stream::StreamEvent::AgentControlStarted {
                     action: action.to_string(),
                     label: agent_control_label(args, tool_description.clone()),
                     tool_use_id: request_id.to_string(),
                     agent_id: agent_id_from_args(args),
                 });
             }
-            self.emit_stream_event(super::chat_stream::StreamEvent::ToolStarted {
+            self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {
                 name: tool.to_string(),
                 description: tool_description.clone(),
                 tool_use_id: request_id.to_string(),
@@ -2883,7 +2883,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     }
                     let stale_revalidation = approval_stale_revalidation_target(&t, args)
                         .map(|path| (path, metadata.base_digest.clone()));
-                    let _ = tx.send(super::chat_stream::ApprovalRequest {
+                    let _ = tx.send(chat_stream::ApprovalRequest {
                         tool: t.clone(),
                         header,
                         detail,
@@ -3133,7 +3133,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     // prompts; header/detail/reason otherwise
                                     // come straight from the permission manager
                                     // so we don't echo the same text thrice.
-                                    let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
+                                    let _ = tx.send(chat_stream::ApprovalRequest::bare(
                                         sandbox_tool_key.clone(),
                                         format!("🔒 {header}"),
                                         detail,
@@ -3171,7 +3171,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                     "Always allow for {remember_preview} is session-only; failed to save rule {rule}: {err}"
                                                 );
                                                 if let Some(tx) = &self.stream_event_tx {
-                                                    let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(
+                                                    let _ = tx.send(chat_stream::StreamEvent::StatusLine(
                                                         format!(
                                                             "Failed to save Always allow for {remember_preview}: {err}"
                                                         ),
@@ -3202,7 +3202,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                     "Always allow for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
                                                 );
                                                 if let Some(tx) = &self.stream_event_tx {
-                                                    let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(
+                                                    let _ = tx.send(chat_stream::StreamEvent::StatusLine(
                                                         format!(
                                                             "Failed to save Always allow for {remember_preview}: {err}"
                                                         ),
@@ -3363,7 +3363,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
-                self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlCompleted {
+                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
                     action: action.to_string(),
                     label: agent_control_label(args, tool_description.clone()),
                     status: status.clone(),
@@ -3373,7 +3373,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
                 });
             }
-            self.emit_stream_event(super::chat_stream::StreamEvent::ToolCompleted {
+            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                 name: tool.to_string(),
                 description: tool_description,
                 status: status.clone(),
@@ -3716,14 +3716,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if req.tool == "agent"
                     && let Some(action) = agent_control_action(&req.args)
                 {
-                    self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlStarted {
+                    self.emit_stream_event(chat_stream::StreamEvent::AgentControlStarted {
                         action: action.to_string(),
                         label: agent_control_label(&req.args, desc.clone()),
                         tool_use_id: req.request_id.clone(),
                         agent_id: agent_id_from_args(&req.args),
                     });
                 }
-                self.emit_stream_event(super::chat_stream::StreamEvent::ToolStarted {
+                self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {
                     name: req.tool.clone(),
                     description: desc,
                     tool_use_id: req.request_id.clone(),
@@ -3979,7 +3979,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     use crate::cli::chat_stream::ApprovalResponse;
                     if let Some(tx) = &self.approval_request_tx {
                         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                        let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
+                        let _ = tx.send(chat_stream::ApprovalRequest::bare(
                             approval_tool.clone(),
                             header,
                             detail,
@@ -4074,20 +4074,18 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if req.tool == "agent"
                     && let Some(action) = agent_control_action(&req.args)
                 {
-                    self.emit_stream_event(
-                        super::chat_stream::StreamEvent::AgentControlCompleted {
-                            action: action.to_string(),
-                            label: agent_control_label(&req.args, desc.clone()),
-                            status: status.to_string(),
-                            duration_ms,
-                            output: Some(tool_output_event_text(&req.tool, &output)),
-                            tool_use_id: req.request_id.clone(),
-                            agent_id: agent_id_from_output(&output)
-                                .or_else(|| agent_id_from_args(&req.args)),
-                        },
-                    );
+                    self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
+                        action: action.to_string(),
+                        label: agent_control_label(&req.args, desc.clone()),
+                        status: status.to_string(),
+                        duration_ms,
+                        output: Some(tool_output_event_text(&req.tool, &output)),
+                        tool_use_id: req.request_id.clone(),
+                        agent_id: agent_id_from_output(&output)
+                            .or_else(|| agent_id_from_args(&req.args)),
+                    });
                 }
-                self.emit_stream_event(super::chat_stream::StreamEvent::ToolCompleted {
+                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                     name: req.tool.clone(),
                     description: desc,
                     status: status.to_string(),
@@ -4319,7 +4317,7 @@ pub(crate) struct StreamRenderState {
     /// Terminal width for wrap calculation.
     term_width: usize,
     /// Incremental markdown renderer — `None` when `render_md` is false.
-    md: Option<super::streaming_md::StreamingMarkdown>,
+    md: Option<streaming_md::StreamingMarkdown>,
     /// Stderr lines written between tool calls (thinking duration, tool notices).
     #[allow(dead_code)]
     stderr_lines: usize,
@@ -4473,13 +4471,13 @@ impl StreamRenderState {
             col: 0,
             term_width: w,
             md: if render_md {
-                Some(super::streaming_md::StreamingMarkdown::new(w))
+                Some(streaming_md::StreamingMarkdown::new(w))
             } else {
                 None
             },
             stderr_lines: 0,
             tool_ui: Arc::new(Mutex::new(ToolRegionState {
-                region: super::terminal_region::TerminalRegion::new(),
+                region: terminal_region::TerminalRegion::new(),
                 lines: Vec::new(),
             })),
             tool_stderr_running: None,
@@ -6681,7 +6679,7 @@ pub(crate) async fn consume_turn_sse(
         edge_tool_round,
         refreshed_token,
     };
-    super::streaming_md::strip_xml_tags_inplace(&mut result.full_text);
+    streaming_md::strip_xml_tags_inplace(&mut result.full_text);
     // When the model emits both native tool calls AND <invoke> XML text in the
     // same turn (degraded mixed output), strip the XML from full_text. We only
     // do this when tool calls are present — if there are no tool calls, the text
@@ -6690,7 +6688,7 @@ pub(crate) async fn consume_turn_sse(
         result.full_text =
             astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&result.full_text);
     }
-    super::streaming_md::strip_leading_narration(&mut result.full_text);
+    streaming_md::strip_leading_narration(&mut result.full_text);
 
     if render_policy.suppress_text() {
         // Silent / FinalOnly / PlanDecompose: text rendering is deferred to the
@@ -6820,10 +6818,28 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
+        EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
+        EdgeToolExecResult, PostToolResultError, RenderPolicy, StreamRenderState, ToolBatchRequest,
+        ToolOutputSummaryKind, TurnResult, append_skill_loaded_marker,
+        apply_edge_auth_failure_result, approval_batch_group_key, approval_default_always_scope,
+        approval_memory_action, approval_memory_preview, approval_scope_context_for_tool,
+        approval_stale_revalidation_error, catch_tool_execution_panic, dispatch_turn_event_block,
+        execute_with_metadata_responsive, extract_cli_diff_block, format_tool_display_from_preview,
+        is_edge_auth_failure, merge_edge_tool_rounds, path_mtime_ms, reusable_speculative_output,
+        style_tool_description, sync_incremental_accum_state, sync_incremental_tool_result_state,
+        theme, tool_completion_icon, tool_dedup_signature,
+    };
+    use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use crate::cli::stream::streaming_md;
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
+    use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
+    use astra_turn_core::sse_stream_host::SseStreamHost;
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
+    use serde_json::Value;
+    use std::path::PathBuf;
     use tempfile::tempdir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -7253,7 +7269,7 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -7290,7 +7306,7 @@ mod tests {
             assert!(request.header.contains("Cloud approval required"));
             request
                 .response_tx
-                .send(super::chat_stream::ApprovalResponse::AllowOnce)
+                .send(chat_stream::ApprovalResponse::AllowOnce)
                 .expect("send response");
         };
 
@@ -7384,7 +7400,7 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
 
         let decision = {
             let mut host = CliSseStreamHost::from_edge_ctx(
@@ -7420,7 +7436,7 @@ mod tests {
                 let request = approval_rx.recv().await.expect("approval request");
                 request
                     .response_tx
-                    .send(super::chat_stream::ApprovalResponse::AlwaysAllow)
+                    .send(chat_stream::ApprovalResponse::AlwaysAllow)
                     .expect("send response");
             };
             let (decision, ()) = tokio::join!(decision_fut, responder);
@@ -7449,7 +7465,7 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
 
         let decision = {
             let mut host = CliSseStreamHost::from_edge_ctx(
@@ -7485,7 +7501,7 @@ mod tests {
                 let request = approval_rx.recv().await.expect("approval request");
                 request
                     .response_tx
-                    .send(super::chat_stream::ApprovalResponse::AlwaysAllow)
+                    .send(chat_stream::ApprovalResponse::AlwaysAllow)
                     .expect("send response");
             };
             let (decision, ()) = tokio::join!(decision_fut, responder);
@@ -7929,14 +7945,14 @@ mod tests {
     #[test]
     fn final_text_cleanup_strips_reflect_tags() {
         let mut text = "before\n<reflect>hidden</reflect>\nafter".to_string();
-        super::streaming_md::strip_xml_tags_inplace(&mut text);
+        streaming_md::strip_xml_tags_inplace(&mut text);
         assert_eq!(text, "before\nafter");
     }
 
     #[test]
     fn final_text_cleanup_strips_think_tags() {
         let mut text = "before\n<think>\nlong thinking block\n</think>\nafter".to_string();
-        super::streaming_md::strip_xml_tags_inplace(&mut text);
+        streaming_md::strip_xml_tags_inplace(&mut text);
         assert_eq!(text, "before\nafter");
     }
 
@@ -8739,8 +8755,8 @@ diff --git a/src/a.rs b/src/a.rs\n\
             panic!("Non-tool turn should render text");
         } else {
             let mut buf = pending_xml_buffer;
-            super::streaming_md::strip_xml_tags_inplace(&mut buf);
-            super::streaming_md::strip_leading_narration(&mut buf);
+            streaming_md::strip_xml_tags_inplace(&mut buf);
+            streaming_md::strip_leading_narration(&mut buf);
             buf
         };
         assert_eq!(rendered, "Here is my final answer");
@@ -8751,7 +8767,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         // Text that was buffered may contain thinking tags from the LLM.
         // At finalization, strip_xml_tags_inplace removes them.
         let mut buf = "intro\n<think>internal reasoning</think>\nconclusion".to_string();
-        super::streaming_md::strip_xml_tags_inplace(&mut buf);
+        streaming_md::strip_xml_tags_inplace(&mut buf);
         assert_eq!(buf, "intro\nconclusion");
     }
 

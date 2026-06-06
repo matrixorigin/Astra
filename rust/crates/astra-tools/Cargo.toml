@@ -49,6 +49,7 @@ tempfile = "3"
 [dev-dependencies]
 serde_json.workspace = true
 serial_test = "3"
+tracing-subscriber.workspace = true
 
 [features]
 default = []

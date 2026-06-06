@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::turn_failure_reporting::report_turn_failure;
 use super::turn_success::apply_turn_success_async;
-use super::*;
 use crate::StreamResult;
+use crate::cli::session::session_state::SessionState;
+use crossterm::style::Stylize;
 
 #[allow(clippy::result_large_err)]
 fn fabricate_user_cancel_failure(
@@ -124,58 +125,17 @@ impl crate::cli::ui_adapter::ReplUiAdapter for SilentUi {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
-
-    fn stub_stream_result(full_text: &str) -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: full_text.to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls_count: 0,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: Vec::new(),
-            tool_call_records: Vec::new(),
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
-    }
+    use super::{apply_user_cancelled_turn, drain_after_cancel, fabricate_user_cancel_failure};
+    use crate::StreamResult;
+    use crate::cli::session::session_state::SessionState;
+    use astra_services::session_journal;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[serial_test::serial]
     #[tokio::test]
     async fn user_cancelled_turn_with_partial_text_preserves_user_line_in_history() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-user-cancel-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
@@ -222,7 +182,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn user_cancelled_turn_with_ok_outcome_persists_history_and_clears_interrupted() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-user-cancel-ok-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
@@ -231,7 +191,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut stream_result = stub_stream_result("The first half of the answer");
+        let mut stream_result = crate::tests::stub_stream_result("The first half of the answer");
         stream_result.interruption = Some(serde_json::json!({
             "kind": "UserCancelled",
             "reason": null
@@ -261,7 +221,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn user_cancelled_turn_without_partial_text_still_pushes_user_line_to_history() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-user-cancel-empty-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
@@ -316,7 +276,8 @@ mod tests {
     async fn drain_after_cancel_returns_completed_future_result() {
         let incremental_state =
             Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
-        let mut stream_fut = std::pin::pin!(async { Ok(stub_stream_result("drained")) });
+        let mut stream_fut =
+            std::pin::pin!(async { Ok(crate::tests::stub_stream_result("drained")) });
 
         let result = drain_after_cancel(
             &mut stream_fut,

@@ -29,8 +29,8 @@ impl<T> LockRecovery<T> for Mutex<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
+    use super::LockRecovery;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     #[test]

@@ -1,8 +1,14 @@
-use super::*;
+use crate::cli::theme;
 use astra_services::session_journal;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    style::Stylize,
+    terminal,
+};
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 pub(crate) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
-use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 pub(crate) fn credential_store() -> CredentialStore {
     CredentialStore::new()
@@ -333,7 +339,8 @@ pub(crate) async fn preflight_remote_resume_session(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> SessionResumePreflight {
-    let Some(token) = crate::cli::session_runtime::current_access_token(cli_profile) else {
+    let Some(token) = crate::cli::session::session_runtime::current_access_token(cli_profile)
+    else {
         return SessionResumePreflight::NoAuth;
     };
 
@@ -637,7 +644,7 @@ pub(crate) fn interactive_select(
 
             // Clear previous render
             for _ in 0..prev_rendered_lines {
-                eprint!("{}", super::theme::CURSOR_UP_CLEAR);
+                eprint!("{}", theme::CURSOR_UP_CLEAR);
             }
             let _ = io::stderr().flush();
 
@@ -765,7 +772,7 @@ pub(crate) fn interactive_select(
 
     // Clean up: clear the picker display and restore terminal
     for _ in 0..prev_rendered_lines {
-        eprint!("{}", super::theme::CURSOR_UP_CLEAR);
+        eprint!("{}", theme::CURSOR_UP_CLEAR);
     }
     let _ = io::stderr().flush();
     terminal::disable_raw_mode().ok();
@@ -831,8 +838,16 @@ pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_services::session_journal::{self, JournalDirGuard};
+    use super::{
+        CredentialsFile, Profile, clear_profile_last_session_if_matches, compact_or_raw,
+        credentials_path, format_error_with_context, git_snapshot, is_astra_session_auth_error,
+        load_credentials, local_resumable_last_session_id, local_session_is_resumable,
+        mutate_credentials, normalize_model_override, persist_profile_last_session,
+        persist_profile_memoria_api_key, profile_name, read_api_error, save_credentials,
+        session_is_resumable, status_hint, status_hint_for, urlencoding,
+        validated_resumable_last_session_id,
+    };
+    use astra_services::session_journal;
     use std::sync::{Mutex, OnceLock};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -885,14 +900,6 @@ mod tests {
         fn drop(&mut self) {
             astra_config::runtime_config::set_cli_overlay(None);
         }
-    }
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
     }
 
     fn write_resumable_session(session_id: &str) {
@@ -1236,7 +1243,7 @@ mod tests {
 
     #[test]
     fn session_is_not_resumable_after_clean_end() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-ended-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -1255,7 +1262,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn local_resumable_last_session_id_ignores_stale_pointer_without_local_state() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
 
@@ -1276,7 +1283,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn local_resumable_last_session_id_keeps_workspace_only_active_session() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
 
@@ -1303,7 +1310,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn local_resumable_last_session_id_ignores_workspace_only_completed_session() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
 
@@ -1328,7 +1335,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn local_resumable_last_session_id_ignores_unreadable_workspace_without_replay_state() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
 
@@ -1357,7 +1364,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn local_resumable_last_session_id_keeps_checkpoint_backed_session_without_terminal_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
 
@@ -1429,7 +1436,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn local_resumable_last_session_id_clears_invalid_pointer_without_panicking() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
 
@@ -1456,7 +1463,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_keeps_live_session() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("live-session-{}", uuid::Uuid::new_v4());
         write_resumable_session(&session_id);
@@ -1488,7 +1495,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_keeps_local_state_when_remote_404s() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("stale-session-{}", uuid::Uuid::new_v4());
         write_resumable_session(&session_id);
@@ -1519,7 +1526,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_keeps_session_on_transient_server_error() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("transient-session-{}", uuid::Uuid::new_v4());
         write_resumable_session(&session_id);
@@ -1550,7 +1557,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_uses_env_token_when_credentials_token_missing() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("env-token-session-{}", uuid::Uuid::new_v4());
         write_resumable_session(&session_id);
@@ -1584,7 +1591,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_keeps_live_remote_session_without_local_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("remote-only-session-{}", uuid::Uuid::new_v4());
         write_profile_with_token(&session_id);
@@ -1617,7 +1624,7 @@ mod tests {
     #[tokio::test]
     async fn validated_resumable_last_session_id_ignores_remote_pointer_without_auth_or_local_state()
      {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
         let session_id = format!("unauthed-remote-only-{}", uuid::Uuid::new_v4());

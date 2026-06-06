@@ -1,4 +1,4 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
 
 /// Run the lesson checkpointer against the current session signals.
 /// If new lessons are produced, fire-and-forget write them to Memoria.
@@ -164,7 +164,8 @@ pub(crate) async fn ensure_bootstrapped_lessons(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::should_bootstrap_lessons;
+    use crate::cli::session::session_state::SessionState;
 
     #[test]
     fn should_bootstrap_lessons_true_on_fresh_state() {

@@ -13,7 +13,6 @@
 pub(crate) mod menu;
 pub(crate) mod popup;
 
-#[allow(unused_imports)]
 pub(crate) use menu::{SlashItem, SlashMenu, is_open_for, score_token};
 
 #[cfg(test)]

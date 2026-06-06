@@ -95,7 +95,7 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::edge_tools::ToolExecutor;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 

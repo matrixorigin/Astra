@@ -429,7 +429,7 @@ async fn run_turn(
         explain: explain_mode,
         render_md: false,
         verbose_mode: false,
-        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         unified_skill_registry,
         skill_search: &skill_search,
@@ -453,13 +453,13 @@ async fn run_turn(
         .map(str::to_string)
         .or(developer_instructions)
         .or(ctx.system_prompt.clone());
-    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+    let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         append_system_prompt,
         cancel_token: Some(cancel),
         approval_request_tx: Some(approval_tx.clone()),
         ..Default::default()
     };
-    let result = crate::cli::turn_facade::execute_basic_cli_turn(
+    let result = crate::cli::turn::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         Some(&thread_id),
@@ -881,7 +881,16 @@ async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        approval_response_from_params, explain_mode_from_params, extract_turn_message,
+        join_or_abort_app_server_task, next_thread_id_after_turn, permission_mode_from_params,
+        requested_thread_id, stream_event_notification, thread_started_params,
+        turn_completed_params,
+    };
+    use crate::ExplainMode;
+    use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
+    use crate::cli::permission_manager::PermissionMode;
+    use std::time::Duration;
 
     #[test]
     fn extract_turn_message_collects_text_items() {

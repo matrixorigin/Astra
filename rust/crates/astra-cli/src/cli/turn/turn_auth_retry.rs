@@ -32,24 +32,7 @@ pub(crate) async fn prepare_auth_refresh_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    struct CollectingUi {
-        warnings: Vec<String>,
-        infos: Vec<String>,
-    }
-
-    impl crate::cli::ui_adapter::ReplUiAdapter for CollectingUi {
-        fn show_error(&mut self, _msg: &str) {}
-        fn show_warning(&mut self, msg: &str) {
-            self.warnings.push(msg.to_string());
-        }
-        fn show_info(&mut self, msg: &str) {
-            self.infos.push(msg.to_string());
-        }
-        fn show_status(&mut self, _msg: &str) {}
-        fn blank_line(&mut self) {}
-    }
+    use super::{prepare_auth_refresh_retry, should_retry_after_auth_refresh};
 
     #[test]
     fn should_retry_after_auth_refresh_matches_session_auth_only() {
@@ -69,10 +52,7 @@ mod tests {
             error: "rate limited".into(),
             partial: crate::PartialTurnData::default(),
         };
-        let mut ui = CollectingUi {
-            warnings: Vec::new(),
-            infos: Vec::new(),
-        };
+        let mut ui = crate::tests::TestUi::default();
 
         let token = prepare_auth_refresh_retry(&api, None, &failure, &mut ui).await;
 

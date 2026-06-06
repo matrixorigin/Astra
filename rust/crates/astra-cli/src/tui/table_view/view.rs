@@ -156,8 +156,12 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::parser::parse;
-    use super::*;
+    use super::{desired_height, render, truncate};
+    use crate::tui::table_view::{MysqlTable, TableNav};
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     const SAMPLE: &str = "\
 +----+--------+--------------+

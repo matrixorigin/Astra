@@ -1,4 +1,10 @@
-use super::*;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CommandUsageStore {
@@ -105,7 +111,8 @@ pub(crate) fn clear_test_dir() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{clear_test_dir, record_command_use, reset_for_tests, set_test_dir, usage_count};
+    use std::fs;
 
     #[test]
     #[serial_test::serial]

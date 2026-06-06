@@ -1,9 +1,15 @@
-use super::*;
 use crate::cli::surface::run_status_surface::run_status_icon;
+use crate::cli::{
+    agent_loader,
+    cli_config::cli_utils::{map_thin_err, truncate_str},
+    delegate_subrun, mock_llm,
+    session::session_state::SessionState,
+    skill_subrun, theme,
+};
 use astra_runtime::server::team::orchestrator::ExecutionPhase;
-#[allow(unused_imports)]
-use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
+use astra_services::team_persistence::WorktreeMode;
 use astra_turn_core::chat_turn_heuristics::is_session_not_found_error;
+use crossterm::style::Stylize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -344,7 +350,7 @@ fn cli_team_to_definition(
     team: &Team,
     user_id: &str,
 ) -> astra_services::team_persistence::TeamDefinition {
-    use astra_services::team_persistence::*;
+    use astra_services::team_persistence::{TeamDefinition, TeamMemberDef};
 
     let coordination = team
         .coordination
@@ -426,9 +432,9 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
 async fn ensure_team_run_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut crate::SessionState,
+    state: &mut SessionState,
 ) -> Result<String, String> {
-    let token = crate::cli::session_runtime::fresh_access_token(api, profile)
+    let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
         .await
         .ok_or_else(|| "Not logged in".to_string())?;
     if let Some(session_id) = state.session_id.clone() {
@@ -439,7 +445,7 @@ async fn ensure_team_run_session(
                 if !is_session_not_found_error(&err) {
                     return Ok(session_id);
                 }
-                crate::cli::cli_utils::clear_profile_last_session_if_matches_or_warn(
+                crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn(
                     profile,
                     &session_id,
                     "slash_team:ensure_team_run_session",
@@ -465,8 +471,8 @@ async fn ensure_team_run_session(
         .ok_or_else(|| "session create response missing session_id".to_string())?
         .to_string();
 
-    crate::cli::session_startup::initialize_journal_pub(state, &session_id);
-    crate::cli::cli_utils::persist_profile_last_session_or_warn(
+    crate::cli::session::session_startup::initialize_journal_pub(state, &session_id);
+    crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn(
         profile,
         &session_id,
         "slash_team:ensure_team_run_session",
@@ -479,7 +485,7 @@ pub(crate) async fn handle_team_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut crate::SessionState,
+    state: &mut SessionState,
 ) {
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
@@ -824,19 +830,19 @@ pub(crate) async fn handle_team_command(
                 if let Some(pos) = words.iter().position(|&w| w == "--mock") {
                     let task_part = words[..pos].join(" ");
                     let scenario_name = words.get(pos + 1).copied().unwrap_or("complete");
-                    let scenario = super::mock_llm::MockScenario::parse(scenario_name)
-                        .unwrap_or_else(|| {
+                    let scenario =
+                        mock_llm::MockScenario::parse(scenario_name).unwrap_or_else(|| {
                             eprintln!(
                                 "  {} Unknown mock scenario '{}'. Available: {}",
                                 theme::icon_warn(),
                                 scenario_name,
-                                super::mock_llm::MockScenario::all()
+                                mock_llm::MockScenario::all()
                                     .iter()
                                     .map(|(n, _)| *n)
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             );
-                            super::mock_llm::MockScenario::Complete
+                            mock_llm::MockScenario::Complete
                         });
                     (task_part, Some(scenario))
                 } else {
@@ -855,7 +861,7 @@ pub(crate) async fn handle_team_command(
                     "  Executes a team task through the delegation engine.".dim()
                 );
                 eprintln!("  Mock scenarios (bypass LLM, test orchestration only):");
-                for (name, desc) in super::mock_llm::MockScenario::all() {
+                for (name, desc) in mock_llm::MockScenario::all() {
                     eprintln!("    --mock {:<20} {}", name, desc);
                 }
                 return;
@@ -913,7 +919,9 @@ pub(crate) async fn handle_team_command(
                     return;
                 }
             };
-            let token = match crate::cli::session_runtime::fresh_access_token(api, profile).await {
+            let token = match crate::cli::session::session_runtime::fresh_access_token(api, profile)
+                .await
+            {
                 Some(t) => t,
                 None => {
                     eprintln!("  {} Not logged in", theme::icon_err());
@@ -921,12 +929,12 @@ pub(crate) async fn handle_team_command(
                 }
             };
             let (progress_tx, mut progress_rx) =
-                tokio::sync::mpsc::unbounded_channel::<super::skill_subrun::SubRunProgressEvent>();
+                tokio::sync::mpsc::unbounded_channel::<skill_subrun::SubRunProgressEvent>();
 
             // Start mock LLM server if --mock was requested
             let _mock_server;
             let effective_api = if let Some(scenario) = mock_scenario {
-                match super::mock_llm::MockLlmServer::start(scenario).await {
+                match mock_llm::MockLlmServer::start(scenario).await {
                     Ok(srv) => {
                         let mock_api = match astra_thin_client::ThinClient::new(&srv.base_url, None)
                         {
@@ -952,7 +960,7 @@ pub(crate) async fn handle_team_command(
                 api.clone()
             };
 
-            let executor = super::delegate_subrun::CliDelegateSubRunExecutor::new(
+            let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
                 effective_api,
                 token,
                 state.model.clone(),
@@ -962,8 +970,8 @@ pub(crate) async fn handle_team_command(
             )
             .with_progress_tx(progress_tx);
             let mut profile_registry = astra_services::coordination::AgentProfileRegistry::new();
-            super::delegate_subrun::register_default_agents(&mut profile_registry);
-            let _ = super::agent_loader::load_and_merge(&project_root, &mut profile_registry);
+            delegate_subrun::register_default_agents(&mut profile_registry);
+            let _ = agent_loader::load_and_merge(&project_root, &mut profile_registry);
             let profile_registry = Arc::new(tokio::sync::RwLock::new(profile_registry));
             let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
             let run_engine = Arc::new(astra_runtime::server::run::engine::RunEngine::new(
@@ -1174,7 +1182,7 @@ pub(crate) async fn handle_team_command(
                 .map(|c| format!("{c:?}"))
                 .unwrap_or_else(|| "auto".to_string());
             if let Some(ref j) = state.journal {
-                crate::cli::cli_utils::append_journal_event_or_warn(
+                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                     j,
                     state.session_id.as_deref(),
                     &astra_services::session_journal::JournalEvent::delegation_started(
@@ -1200,7 +1208,7 @@ pub(crate) async fn handle_team_command(
                     progress_renderer.abort();
                     // Journal: record interrupted execution
                     if let Some(ref j) = state.journal {
-                        crate::cli::cli_utils::append_journal_event_or_warn(
+                        crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                             j,
                             state.session_id.as_deref(),
                             &astra_services::session_journal::JournalEvent::delegation_completed(
@@ -1412,7 +1420,7 @@ pub(crate) async fn handle_team_command(
                         (s, dr.agent_results.len() - s)
                     })
                     .unwrap_or((0, 0));
-                crate::cli::cli_utils::append_journal_event_or_warn(
+                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                     j,
                     state.session_id.as_deref(),
                     &astra_services::session_journal::JournalEvent::delegation_completed(
@@ -1906,9 +1914,20 @@ fn format_tokens(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use super::{
+        Team, TeamHistoryEntry, TeamMember, TeamRegistry, TeamSnapshotEntry,
+        cli_team_to_definition, ensure_team_run_session, format_duration, format_tokens,
+        git_head_sha, infer_coordination, team_subcommands_hint,
+    };
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
+    use crate::cli::session::session_state::SessionState;
+    use astra_runtime::server::team::orchestrator::ExecutionPhase;
+    use astra_services::session_journal;
+    use astra_services::team_persistence::WorktreeMode;
     use axum::{Router, routing::get, routing::post};
+    use std::collections::HashMap;
 
     async fn spawn_mock(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2437,7 +2456,9 @@ mod tests {
 
     #[test]
     fn merge_from_store_skips_existing() {
-        use astra_services::team_persistence::*;
+        use astra_services::team_persistence::{
+            TeamCoordination, TeamDefinition, TeamMemberDef, WorktreeMode,
+        };
         let mut reg = TeamRegistry::new();
         assert!(reg.get("review").is_some()); // builtin
 

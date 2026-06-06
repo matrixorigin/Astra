@@ -154,8 +154,9 @@ impl HttpTeamStore {
     }
 
     fn authed_client(&self) -> Result<(reqwest::Client, String), TeamHttpError> {
-        let token = crate::cli::session_runtime::current_access_token(self.profile.as_deref())
-            .ok_or(TeamHttpError::AuthenticationRequired)?;
+        let token =
+            crate::cli::session::session_runtime::current_access_token(self.profile.as_deref())
+                .ok_or(TeamHttpError::AuthenticationRequired)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS))
@@ -455,8 +456,9 @@ impl TeamPersistenceService for HttpTeamStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::HttpTeamStore;
     use astra_credentials::{CredentialsFile, Profile};
+    use astra_services::team_persistence::TeamPersistenceService;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -469,7 +471,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::cli::cli_utils::save_credentials(&creds).unwrap();
+        crate::cli::cli_config::cli_utils::save_credentials(&creds).unwrap();
     }
 
     #[serial_test::serial]

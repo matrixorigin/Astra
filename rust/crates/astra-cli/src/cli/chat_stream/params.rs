@@ -320,7 +320,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) history: &'a [(String, String)],
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
-    pub(crate) render_policy: crate::cli::stream_render::RenderPolicy,
+    pub(crate) render_policy: crate::cli::stream::stream_render::RenderPolicy,
     pub(crate) cli_context: Option<&'a CliContext>,
 
     pub(crate) recent_tools: &'a [String],
@@ -483,7 +483,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub explain: ExplainMode,
     pub render_md: bool,
     pub verbose_mode: bool,
-    pub render_policy: crate::cli::stream_render::RenderPolicy,
+    pub render_policy: crate::cli::stream::stream_render::RenderPolicy,
     pub cli_context: Option<&'a CliContext>,
 
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,

@@ -1,8 +1,12 @@
-use super::*;
-use astra_services::session_journal;
-use cloud_sync::{
-    CloudPullResult, cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal,
+use crate::cli::cloud_sync::{
+    self, CloudPullResult, append_cloud_pull_sync_journal, cloud_pull_warrants_sync_marker,
+    should_append_cloud_pull_journal, try_cloud_pull, try_cloud_pull_preferences,
+    try_cloud_push_preferences,
 };
+use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
+use crate::cli::session::session_state::SessionState;
+use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
+use astra_services::session_journal;
 
 // ── slash_health::format_sync_age tests ────────────────────────────────────────────
 
@@ -144,7 +148,7 @@ fn should_append_cloud_pull_journal_post_login_reachable_empty() {
 #[test]
 fn should_append_cloud_pull_journal_session_startup_empty_without_env() {
     unsafe {
-        std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
+        std::env::remove_var(cloud_sync::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
     }
     let pull = CloudPullResult {
         cloud_reachable: true,
@@ -163,7 +167,7 @@ fn should_append_session_startup_when_empty_ack_env_set() {
         cloud_reachable: true,
     };
     unsafe {
-        std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
+        std::env::remove_var(cloud_sync::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
     }
     assert!(!should_append_cloud_pull_journal(
         &pull,
@@ -171,7 +175,7 @@ fn should_append_session_startup_when_empty_ack_env_set() {
         "session_startup"
     ));
     unsafe {
-        std::env::set_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK, "1");
+        std::env::set_var(cloud_sync::ASTRA_JOURNAL_CLOUD_EMPTY_ACK, "1");
     }
     assert!(should_append_cloud_pull_journal(
         &pull,
@@ -179,7 +183,7 @@ fn should_append_session_startup_when_empty_ack_env_set() {
         "session_startup"
     ));
     unsafe {
-        std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
+        std::env::remove_var(cloud_sync::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
     }
 }
 

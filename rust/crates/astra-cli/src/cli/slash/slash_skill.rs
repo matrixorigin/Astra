@@ -1,5 +1,15 @@
-use super::*;
 use crate::cli::surface::skill_install_status_surface::skill_install_status_surface;
+use crate::cli::{
+    cli_config::{
+        cli_output,
+        cli_utils::{prefix_chars, truncate_str},
+    },
+    session::session_state::SessionState,
+    theme,
+};
+use astra_runtime::prompts;
+use crossterm::style::Stylize;
+use std::io::Write;
 
 pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category
@@ -497,7 +507,7 @@ pub(crate) async fn handle_skill_command(
             let (message, changed) = apply_skill_surfacing(state, command);
             eprintln!("  {}", message.green());
             if changed && let Some(ref j) = state.journal {
-                crate::cli::cli_utils::append_journal_event_or_warn(
+                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                     j,
                     state.session_id.as_deref(),
                     &astra_services::session_journal::JournalEvent::config_change(
@@ -1030,12 +1040,14 @@ Follow these steps:
                 );
                 eprintln!("{}", "\u{2500}".repeat(72).dim());
                 for m in &manifests {
-                    use astra_skills::SkillSourceKind::*;
                     let (disk_col, check_col): (String, String) = match m.source {
-                        Mcp | Database | Plugin => {
+                        astra_skills::SkillSourceKind::Mcp
+                        | astra_skills::SkillSourceKind::Database
+                        | astra_skills::SkillSourceKind::Plugin => {
                             ("—".dim().to_string(), "(remote)".dim().to_string())
                         }
-                        Local | Bundled => {
+                        astra_skills::SkillSourceKind::Local
+                        | astra_skills::SkillSourceKind::Bundled => {
                             let disk = resolve_skill_dir_on_disk(m.name.as_str());
                             let disk_mark = if disk.is_some() {
                                 "\u{2713}".green().to_string()
@@ -1778,10 +1790,7 @@ fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
 // ═══════════════════════════════════════════════ Skill Auto-Generation ════
 
 /// Analyze the current session and generate a SKILL.md from observed patterns.
-async fn create_skill_from_session(
-    arg: &str,
-    state: &mut crate::SessionState,
-) -> Result<(), String> {
+async fn create_skill_from_session(arg: &str, state: &mut SessionState) -> Result<(), String> {
     use astra_services::session_journal;
     use std::collections::HashMap;
 
@@ -2041,7 +2050,11 @@ Skill auto-generated from session {session_short}.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        SkillSurfacingCmd, apply_skill_surfacing, matches_skill_filter, parse_list_filters,
+        parse_skill_surfacing, skill_relevance_score, truncate_desc,
+    };
+    use crate::cli::session::session_state::SessionState;
 
     // ── truncate_desc tests ────────────────────────────────────────────
 

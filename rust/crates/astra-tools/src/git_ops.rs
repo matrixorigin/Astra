@@ -292,7 +292,8 @@ pub fn revert_commit(workspace_root: &Path, args: &Value) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{commit, push, revert_commit, status};
+    use serde_json::Value;
     use serde_json::json;
     use tempfile::TempDir;
 

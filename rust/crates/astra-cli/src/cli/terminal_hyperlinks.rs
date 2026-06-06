@@ -203,7 +203,7 @@ fn file_uri_for_path(path: &str, cwd: Option<&Path>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{hyperlink_text_file_paths, split_surrounding_punctuation};
 
     #[test]
     fn split_surrounding_punctuation_handles_empty_core() {

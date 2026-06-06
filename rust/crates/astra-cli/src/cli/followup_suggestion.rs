@@ -1,7 +1,5 @@
 use crate::{SessionState, StreamResult};
 pub(crate) use astra_turn_core::followup_suggestion::FollowupSuggestion;
-#[cfg(test)]
-use astra_turn_core::followup_suggestion::FollowupSuggestionKind;
 
 pub(crate) fn suggest_followup(
     line: &str,
@@ -30,47 +28,21 @@ pub(crate) fn suggest_followup(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::suggest_followup;
+    use crate::{SessionState, StreamResult};
+    use astra_turn_core::followup_suggestion::FollowupSuggestionKind;
 
     fn base_state() -> SessionState {
         SessionState::default()
     }
 
     fn base_result(tools_used: Vec<&str>, full_text: &str) -> StreamResult {
+        let tools_used: Vec<String> = tools_used.into_iter().map(str::to_string).collect();
         StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
             full_text: full_text.to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
             tool_calls_count: tools_used.len() as u32,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: tools_used.into_iter().map(|s| s.to_string()).collect(),
-            tool_call_records: Vec::new(),
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
+            tools_used,
+            ..Default::default()
         }
     }
 

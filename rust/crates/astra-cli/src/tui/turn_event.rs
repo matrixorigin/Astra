@@ -162,7 +162,7 @@ pub(crate) enum SystemLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SystemLevel, ToolStatus, TurnEvent};
 
     fn assert_roundtrip(ev: &TurnEvent) {
         let j = serde_json::to_string(ev).expect("serialize");

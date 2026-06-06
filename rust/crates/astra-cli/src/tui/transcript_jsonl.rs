@@ -127,8 +127,9 @@ pub(crate) fn load(session_id: &str) -> Vec<TurnEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{append_to_path, load, load_from_path, transcript_path, transcript_path_in};
     use crate::tui::turn_event::{SystemLevel, ToolStatus, TurnEvent};
+    use std::io::Write;
 
     #[test]
     fn empty_session_id_returns_none_path() {

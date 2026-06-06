@@ -90,7 +90,7 @@ pub(crate) struct SubRunHost {
     /// child output through an unbounded channel.
     pub(crate) stream_event_sink: Option<crate::cli::chat_stream::SharedStreamEventSink>,
     /// Cross-turn tool output cache for edge-path dedup within this sub-run.
-    pub(crate) tool_cache: super::stream_render::EdgeToolCache,
+    pub(crate) tool_cache: crate::cli::stream::stream_render::EdgeToolCache,
     /// Captured parent prefix, if the spawner resolved one. Consumed
     /// by `on_turn_completed` on the first successful ingested turn
     /// to emit a single [`ForkCacheEvent`]. `None` means the child
@@ -429,7 +429,7 @@ impl AgenticLoopHost for SubRunHost {
                     ..Default::default()
                 });
                 let events = buf.drain();
-                crate::cli::cli_utils::append_bulk_journal_events_no_sync_or_warn(
+                crate::cli::cli_config::cli_utils::append_bulk_journal_events_no_sync_or_warn(
                     journal,
                     state.current_session_id.as_deref(),
                     &events,
@@ -578,7 +578,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             agent_id: String::new(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: super::stream_render::EdgeToolCache::new(
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
             // Skill sub-runs don't participate in fork-prefix cache
@@ -817,8 +817,22 @@ fn resolve_subrun_schemas(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        CliSkillSubRunExecutor, SUBRUN_MAX_CUMULATIVE_TOKENS, SUBRUN_MAX_TURNS, SubRunHost,
+        resolve_subrun_schemas,
+    };
     use astra_runtime::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
+    use astra_runtime::turn::agentic_loop::host::{
+        AgenticLoopHost, TurnInteractionMode, interaction_scoped_tool_restrictions,
+    };
+    use astra_skills::executor::isolated::SkillSubRunExecutor;
+    use serde_json::{Value, json};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
+    use crate::cli::permission_manager::{PermissionManager, PermissionMode};
+    use crate::edge_tools;
 
     fn schema(name: &str) -> Value {
         json!({
@@ -852,7 +866,7 @@ mod tests {
             agent_id: String::new(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: crate::cli::stream_render::EdgeToolCache::new(3),
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
@@ -883,7 +897,7 @@ mod tests {
             agent_id: "test-agent".to_string(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: crate::cli::stream_render::EdgeToolCache::new(3),
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
@@ -913,7 +927,7 @@ mod tests {
             agent_id: String::new(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: crate::cli::stream_render::EdgeToolCache::new(3),
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),

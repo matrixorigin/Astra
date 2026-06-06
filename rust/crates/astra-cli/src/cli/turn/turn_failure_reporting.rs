@@ -2,9 +2,12 @@
 
 use std::time::Instant;
 
-use super::*;
+use crate::cli::auth_flow::{is_auth_error, is_llm_provider_auth_error};
+use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_startup;
+use crate::cli::session::session_state::SessionState;
+use astra_services::session_journal;
 
 pub(crate) fn report_turn_failure(
     state: &mut SessionState,
@@ -52,7 +55,7 @@ pub(crate) fn report_turn_failure(
             turn_start.elapsed().as_millis() as u64,
         );
 
-        crate::cli::streaming_types::apply_partial_turn_data_to_error_event(
+        crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
             &mut err_event,
             &failure.partial,
         );
@@ -74,7 +77,7 @@ pub(crate) fn report_turn_failure(
         }
         err_event = err_event.with_run_id(failure.partial.run_id.as_deref());
 
-        crate::cli::cli_utils::append_journal_event_or_warn(
+        crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
             journal,
             state.session_id.as_deref(),
             &err_event,
@@ -96,15 +99,10 @@ pub(crate) fn report_turn_failure(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = session_journal::JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
+    use super::report_turn_failure;
+    use crate::cli::session::session_state::SessionState;
+    use astra_services::session_journal;
+    use std::time::Instant;
 
     fn tool_call_record(
         name: &str,
@@ -129,7 +127,7 @@ mod tests {
 
     #[test]
     fn report_turn_failure_persists_filtered_partial_metrics() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
@@ -190,7 +188,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn report_turn_failure_bootstraps_missing_journal_from_partial_session_id() {
-        let (_tmp, _g) = isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("bootstrap-turn-failure-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
             model: Some("gpt-5".into()),

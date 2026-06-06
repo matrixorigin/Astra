@@ -1,3 +1,4 @@
+use crate::cli::journal_digest::is_effective_failure;
 use astra_services::session_journal::ToolCallRecord;
 
 #[derive(Debug, Clone)]
@@ -12,7 +13,7 @@ impl ToolCallGroup<'_> {
     pub(crate) fn ok_count(&self) -> usize {
         self.calls
             .iter()
-            .filter(|c| !super::journal_digest::is_effective_failure(c))
+            .filter(|c| !is_effective_failure(c))
             .count()
     }
 
@@ -61,7 +62,7 @@ pub(crate) fn group_tool_calls(calls: &[ToolCallRecord]) -> Vec<ToolCallGroup<'_
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ToolCallRecord, group_tool_calls};
 
     fn make_call(name: &str) -> ToolCallRecord {
         ToolCallRecord {

@@ -7,8 +7,7 @@
 
 pub(crate) mod line;
 
-#[allow(unused_imports)]
-pub(crate) use line::{PermissionMode, Segment, StatusContext, StatusLine};
+pub(crate) use line::{StatusContext, StatusLine};
 
 #[cfg(test)]
 mod snapshot_tests;

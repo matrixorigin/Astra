@@ -14,8 +14,7 @@
 pub(crate) mod discovery;
 pub(crate) mod view;
 
-#[allow(unused_imports)]
-pub(crate) use discovery::{FsSessionSource, SessionDiscovery, SessionEntry, SessionSource};
+pub(crate) use discovery::{FsSessionSource, SessionDiscovery};
 
 #[cfg(test)]
 mod tests;

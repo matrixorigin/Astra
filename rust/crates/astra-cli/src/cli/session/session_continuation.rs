@@ -164,7 +164,6 @@ fn has_tool_use_content(msg: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use serde_json::json;
 
     #[test]

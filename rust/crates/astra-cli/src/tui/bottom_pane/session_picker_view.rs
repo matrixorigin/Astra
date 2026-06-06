@@ -172,8 +172,11 @@ impl BottomPaneView for SessionPickerView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::SessionPickerView;
+    use crate::tui::session_picker::SessionDiscovery;
     use crate::tui::session_picker::discovery::{SessionEntry, StaticSessionSource};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn entry(id: &str, summary: &str) -> SessionEntry {
         SessionEntry {

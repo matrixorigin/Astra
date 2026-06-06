@@ -53,11 +53,9 @@ use rmcp::{
 use tokio::sync::RwLock;
 
 // ── Re-exports from the shared astra-mcp crate ──────────────────────────
-#[allow(unused_imports)]
 pub use astra_mcp::{
-    ConnectionState, MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, McpError, McpServerConfig,
-    RetryConfig, Transport, extract_result_text, extract_result_text_with_limit,
-    is_dangerous_env_var, mcp_tool_to_schema, sanitize_tool_name,
+    ConnectionState, MAX_RESULT_CONTENT_LENGTH, McpError, McpServerConfig, RetryConfig, Transport,
+    extract_result_text_with_limit, is_dangerous_env_var, mcp_tool_to_schema, sanitize_tool_name,
 };
 
 /// Configuration for MCP sampling — allows the handler to forward
@@ -2499,6 +2497,7 @@ pub(crate) fn ensure_mock_mcp_server_binary() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_mcp::{MAX_DESCRIPTION_LENGTH, extract_result_text};
 
     #[test]
     fn transport_serialization() {

@@ -132,7 +132,8 @@ fn canonicalize_dirs(values: &[String]) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CliContext, canonicalize_dirs};
+    use std::path::PathBuf;
 
     #[test]
     fn from_launch_options_normalizes_tool_lists() {
@@ -216,7 +217,15 @@ mod tests {
                     assert_eq!(ctx.max_turns, Some(27));
                     assert_eq!(ctx.allowed_tools, vec!["bash", "view", "rg"]);
                     assert_eq!(ctx.disallowed_tools, vec!["write_file", "edit_file"]);
-                    assert_eq!(ctx.add_dirs, vec![add_dir.path().to_path_buf()]);
+                    assert_eq!(
+                        ctx.add_dirs,
+                        vec![
+                            add_dir
+                                .path()
+                                .canonicalize()
+                                .expect("canonicalize temp dir path")
+                        ]
+                    );
                     assert_eq!(
                         ctx.session_id.as_deref(),
                         Some("123e4567-e89b-12d3-a456-426614174000")

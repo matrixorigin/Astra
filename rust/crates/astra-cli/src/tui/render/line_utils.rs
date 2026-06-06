@@ -161,9 +161,10 @@ pub(crate) fn prefix_lines<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::{sanitize_line_for_terminal, sanitize_terminal_text};
+    use ratatui::layout::Alignment;
     use ratatui::style::{Color, Style};
-
-    use super::*;
+    use ratatui::text::{Line, Span};
 
     #[test]
     fn sanitize_terminal_text_strips_control_sequences_but_keeps_newlines_and_tabs() {
@@ -178,7 +179,7 @@ mod tests {
             Span::raw("\tb\t"),
         ]);
         line.style = Style::default().bg(Color::Black);
-        line.alignment = Some(ratatui::layout::Alignment::Center);
+        line.alignment = Some(Alignment::Center);
 
         let sanitized = sanitize_line_for_terminal(&line);
         assert_eq!(sanitized.spans.len(), 2);
@@ -186,10 +187,7 @@ mod tests {
         assert_eq!(sanitized.spans[1].content.as_ref(), "\tb\t");
         assert_eq!(sanitized.spans[0].style, Style::default().fg(Color::Green));
         assert_eq!(sanitized.style, Style::default().bg(Color::Black));
-        assert_eq!(
-            sanitized.alignment,
-            Some(ratatui::layout::Alignment::Center)
-        );
+        assert_eq!(sanitized.alignment, Some(Alignment::Center));
     }
 
     #[test]

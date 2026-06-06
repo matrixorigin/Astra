@@ -481,7 +481,11 @@ impl MockLlmServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        MockScenario, body_complete, body_fail, body_malformed_json, body_multi_turn,
+        body_rate_limited, body_sse_chunk_split, body_text_only, body_tool_then_complete,
+    };
+    use serde_json::Value;
 
     // Test the SSE body generators directly (no HTTP server needed)
 

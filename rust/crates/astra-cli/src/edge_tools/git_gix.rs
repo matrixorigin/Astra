@@ -7,9 +7,17 @@ use serde_json::Value;
 
 use super::ToolExecutor;
 
-// Re-export all public git functions from astra-tools.
-// This eliminates ~2200 lines of duplicate standalone function definitions.
-pub use astra_tools::git_gix::*;
+// Standalone git operations live in astra-tools; the CLI layer re-exports only
+// the API it intentionally wraps or dispatches.
+#[cfg(test)]
+use astra_tools::git_gix::git_commit;
+pub use astra_tools::git_gix::{
+    GitCommitRollbackEntry, GitCommitRollbackJournal, GitStashRollbackEntry,
+    GitStashRollbackJournal, current_branch, git_blame, git_commit_with_metadata, git_contributors,
+    git_diff, git_file_history, git_log, git_log_search, git_push, git_revert_commit_with_metadata,
+    git_show, git_stash, git_stash_with_metadata, git_status, git_worktree_is_clean,
+    head_first_parent_tail, head_short, short_commit_sha,
+};
 
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
@@ -943,9 +951,16 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::ToolExecutor;
+    use super::{
+        current_branch, git_blame, git_checkout_file, git_commit, git_commit_with_metadata,
+        git_contributors, git_diff, git_file_history, git_log, git_log_search,
+        git_revert_commit_with_metadata, git_show, git_stash, git_status, git_worktree, head_short,
+        short_commit_sha, worktree_add_with_metadata, worktree_remove,
+    };
     use astra_text_utils::str_preview::prefix_chars;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn repo_root() -> std::path::PathBuf {

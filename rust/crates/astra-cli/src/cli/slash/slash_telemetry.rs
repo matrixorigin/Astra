@@ -1,4 +1,6 @@
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::theme;
+use crossterm::style::Stylize;
 
 /// Handle `/telemetry` command — display observability session metrics.
 ///
@@ -1986,7 +1988,7 @@ fn format_trace_decision_type(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ascii_sparkline, format_pressure, mini_bar, proportional_bar, resolve_turn_index};
 
     // ─── proportional_bar ────────────────────────────────────────────────────
 

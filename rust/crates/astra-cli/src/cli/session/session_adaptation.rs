@@ -1,6 +1,6 @@
 use super::session_diagnosis::maybe_run_auto_invoke;
 use super::session_lessons::{checkpoint_lessons_from_runtime, ensure_bootstrapped_lessons};
-use super::*;
+use crate::cli::session::session_state::SessionState;
 
 pub(crate) async fn prepare_turn_adaptation(
     state: &mut SessionState,
@@ -14,7 +14,7 @@ pub(crate) async fn prepare_turn_adaptation(
 
     ensure_bootstrapped_lessons(state, api, token, message).await;
 
-    if crate::cli::session_input::detect_correction_signal(message) {
+    if crate::cli::session::session_input::detect_correction_signal(message) {
         let correction_turn = state.history.len() as u32;
         state.drift_user_corrections.push(correction_turn);
         checkpoint_lessons_from_runtime(state);
@@ -29,7 +29,8 @@ pub(crate) async fn finalize_turn_adaptation(state: &mut SessionState, interrupt
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{finalize_turn_adaptation, prepare_turn_adaptation};
+    use crate::cli::session::session_state::SessionState;
 
     #[tokio::test]
     async fn prepare_turn_adaptation_sets_original_query_and_correction_turn() {

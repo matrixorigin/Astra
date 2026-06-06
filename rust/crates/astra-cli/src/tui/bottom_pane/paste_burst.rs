@@ -129,8 +129,8 @@ impl PasteBurstDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time::Duration;
+    use super::{BurstDecision, PasteBurstDetector};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn slow_typing_is_not_burst() {

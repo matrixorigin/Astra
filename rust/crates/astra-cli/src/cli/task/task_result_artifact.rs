@@ -1,5 +1,4 @@
-use crate::cli::surface::task_checkpoint_surface::task_checkpoint_surface;
-use astra_services::TaskRecord;
+use astra_services::{TaskCheckpoint, TaskRecord};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
@@ -10,6 +9,20 @@ pub(crate) struct TaskResultArtifact {
     pub(crate) completion_tokens: u64,
     pub(crate) tool_calls_count: u64,
     pub(crate) output_file: Option<String>,
+}
+
+impl TaskResultArtifact {
+    pub(crate) fn as_surface(
+        &self,
+    ) -> crate::cli::surface::task_result_surface::TaskResultArtifactSurface<'_> {
+        crate::cli::surface::task_result_surface::TaskResultArtifactSurface {
+            full_text: &self.full_text,
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            tool_calls_count: self.tool_calls_count,
+            output_file: self.output_file.as_deref(),
+        }
+    }
 }
 
 fn task_output_dir() -> Result<PathBuf, String> {
@@ -64,19 +77,41 @@ pub(crate) fn write_task_output(task_id: &str, text: &str) -> Result<PathBuf, St
     Ok(path)
 }
 
+fn checkpoint_result_artifact(checkpoint: &TaskCheckpoint) -> Option<TaskResultArtifact> {
+    let full_text = checkpoint
+        .state
+        .get("full_text")
+        .and_then(|value| value.as_str())?;
+    Some(TaskResultArtifact {
+        full_text: full_text.to_string(),
+        prompt_tokens: checkpoint
+            .state
+            .get("prompt_tokens")
+            .and_then(|value| value.as_u64()),
+        completion_tokens: checkpoint
+            .state
+            .get("completion_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        tool_calls_count: checkpoint
+            .state
+            .get("tool_calls_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        output_file: checkpoint
+            .state
+            .get("output_file")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+    })
+}
+
 pub(crate) fn load_task_result_artifact(
     task: &TaskRecord,
 ) -> Result<Option<TaskResultArtifact>, String> {
     if let Some(ref checkpoint) = task.checkpoint {
-        let checkpoint = task_checkpoint_surface(checkpoint);
-        if let Some(full_text) = checkpoint.full_text {
-            return Ok(Some(TaskResultArtifact {
-                full_text: full_text.to_string(),
-                prompt_tokens: checkpoint.prompt_tokens,
-                completion_tokens: checkpoint.completion_tokens,
-                tool_calls_count: checkpoint.tool_calls_count,
-                output_file: checkpoint.output_file.map(str::to_string),
-            }));
+        if let Some(artifact) = checkpoint_result_artifact(checkpoint) {
+            return Ok(Some(artifact));
         }
     }
 
@@ -97,7 +132,7 @@ pub(crate) fn load_task_result_artifact(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{load_task_result_artifact, task_output_path, write_task_output};
     use astra_services::{TaskCheckpoint, TaskRecord, TaskStatus};
     use serial_test::serial;
 

@@ -1,5 +1,6 @@
-#![allow(unused_imports)]
-use super::*;
+use crate::cli::cli_config::cli_utils::truncate_str;
+use crate::cli::session::session_state::SessionState;
+use crossterm::style::Stylize;
 
 /// Retention: fallback handler for `/health` — called from slash_router.rs.
 /// In TUI mode this is typically reached via `/stats health` or the `/health` alias.

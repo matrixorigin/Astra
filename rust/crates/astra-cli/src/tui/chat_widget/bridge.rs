@@ -139,7 +139,9 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::{AppEvent, WireEvent};
+    use super::{TurnContext, translate};
+    use crate::tui::app_event::TuiAppEvent;
 
     #[test]
     fn token_to_answer_delta() {

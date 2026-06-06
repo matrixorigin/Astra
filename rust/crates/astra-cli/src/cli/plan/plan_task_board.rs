@@ -174,7 +174,8 @@ pub(crate) fn plan_task_board_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::mirror_plan_to_task_board;
+    use crate::cli::session::session_state::SessionState;
     use astra_services::task_orchestrator::SubtaskPlan;
 
     #[tokio::test]

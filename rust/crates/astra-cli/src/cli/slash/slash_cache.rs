@@ -5,8 +5,9 @@ use astra_services::{
     session_journal::{self, JournalEvent, JournalEventType},
 };
 use astra_turn_core::introspect::cache_diagnosis::{self, RoundSnapshot};
+use crossterm::style::Stylize;
 
-use super::*;
+use crate::cli::session::session_state::SessionState;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct CacheTurnSummary {
@@ -273,16 +274,12 @@ fn render_cache_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use astra_services::session_journal::JournalDirGuard;
-
-    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let guard = JournalDirGuard::new(&sessions);
-        (tmp, guard)
-    }
+    use super::{
+        CacheTurnSummary, load_cache_events, observed_reuse_scope, render_cache_summary,
+        summarize_cache_turns,
+    };
+    use astra_services::{PromptCacheCapabilityData, PromptCacheReuseScopeData, session_journal};
+    use astra_turn_core::introspect::cache_diagnosis::RoundSnapshot;
 
     fn round(turn: u32, round: u32, cache_read_tokens: u64) -> RoundSnapshot {
         RoundSnapshot {
@@ -416,7 +413,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_cache_events_surfaces_unreadable_journal() {
-        let (_tmp, _guard) = isolated_sessions_dir();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("cache-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
 

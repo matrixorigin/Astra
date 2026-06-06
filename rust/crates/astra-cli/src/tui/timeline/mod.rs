@@ -11,8 +11,7 @@
 pub(crate) mod model;
 pub(crate) mod view;
 
-#[allow(unused_imports)]
-pub(crate) use model::{JournalTurnSource, Timeline, TimelineTurn, TurnSource};
+pub(crate) use model::{JournalTurnSource, Timeline};
 
 #[cfg(test)]
 mod tests;

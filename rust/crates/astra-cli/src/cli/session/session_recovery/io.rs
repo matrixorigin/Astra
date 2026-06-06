@@ -1,5 +1,5 @@
 //! I/O primitives for session recovery: atomic writes, file locks, path helpers.
-use crate::cli::*;
+use astra_services::session_journal;
 
 pub(crate) fn csl_log_path_for(session_id: &str) -> std::path::PathBuf {
     session_journal::local_sessions_dir()

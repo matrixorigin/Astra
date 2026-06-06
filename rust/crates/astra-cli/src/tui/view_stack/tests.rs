@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::{EventResult, View, ViewStack};
+use crate::tui::view_stack::stack::{EventResult, View, ViewStack};
 
 /// Journal of lifecycle calls made across all recorder views.
 type Journal = Rc<RefCell<Vec<String>>>;

@@ -267,7 +267,7 @@ pub async fn on_subtask_complete(
     } else {
         format!("Verifying (LLM): {subtask_id}")
     };
-    let spinner = super::stream_render::Spinner::start(label);
+    let spinner = crate::cli::stream::stream_render::Spinner::start(label);
     let result = durable.lifecycle.verify_subtask(&task_id, subtask_id).await;
     spinner.stop_clear();
     match result {
@@ -415,7 +415,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> Result<bool, St
         eprintln!("    {} {}", "▸".grey(), cmd_hint);
     }
 
-    let spinner = super::stream_render::Spinner::start("Running global checks".into());
+    let spinner = crate::cli::stream::stream_render::Spinner::start("Running global checks".into());
     let verify_result = durable.lifecycle.verify_global(&task_id).await;
     spinner.stop_clear();
 
@@ -941,7 +941,12 @@ impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DurableTaskState, ServerProxyLlmJudge, create_local_lifecycle, create_local_lifecycle_full,
+        display_contract_summary, display_delivery_report, display_verification_report,
+        generate_contract, on_plan_complete, on_subtask_begin, on_subtask_complete,
+        parse_judge_score,
+    };
     use crate::lock_recovery::LockRecovery;
     use astra_services::durable_task::VerifierKind;
     use astra_services::durable_task::{
@@ -949,9 +954,11 @@ mod tests {
     };
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     use astra_services::{
-        ContractAmendment, LlmJudge, SubtaskDeliverySummary, SubtaskVerificationReport,
-        TaskResumeContext, TaskScope, VerificationCriterion, VerificationResult,
+        ContractAmendment, ContractGenerator, DurableTaskLifecycle, LlmJudge,
+        SubtaskDeliverySummary, SubtaskVerificationReport, TaskDeliveryReport, TaskResumeContext,
+        TaskScope, VerificationCriterion, VerificationResult,
     };
+    use std::sync::Arc;
 
     fn make_test_plan() -> TaskPlan {
         TaskPlan {

@@ -1,7 +1,7 @@
 //! Learning and feedback snapshots captured around a turn.
 
-use super::*;
-use crate::StreamResult;
+use crate::cli::stream::streaming_types::StreamResult;
+use astra_services::session_journal;
 
 pub(crate) struct TurnLearningSnapshot {
     pub routing: astra_turn_core::routing_engine::RoutingDecision,
@@ -155,45 +155,8 @@ pub(crate) fn turn_quality_feedback_from_eval(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn stub_stream_result(full_text: &str) -> StreamResult {
-        StreamResult {
-            session_id: None,
-            run_id: None,
-            session_persistence_error: None,
-            full_text: full_text.to_string(),
-            tool_calls_count: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tools_selected: Vec::new(),
-            selected_skills: Vec::new(),
-            tools_used: Vec::new(),
-            tool_call_records: Vec::new(),
-            budget_used: 0,
-            budget_pressure: 0.0,
-            stall_events: Vec::new(),
-            verdict_events: Vec::new(),
-            step_recorder_summary: None,
-            tool_health_export: Vec::new(),
-            last_heavy_checkpoint: None,
-            ttft_ms: None,
-            context_ms: None,
-            memoria_ms: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            pending_context_assembly_trace: None,
-            turn_observability_events: Vec::new(),
-            llm_rounds: None,
-            interruption: None,
-            final_state: "completed".into(),
-            interruption_kind: None,
-            final_messages: Vec::new(),
-            background_agent_results: Vec::new(),
-        }
-    }
+    use super::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
+    use astra_services::session_journal;
 
     #[test]
     fn analyze_chat_turn_learning_flags_llm_round_churn() {
@@ -210,7 +173,7 @@ mod tests {
             }));
             event
         };
-        let mut result = stub_stream_result("");
+        let mut result = crate::tests::stub_stream_result("");
         result.tools_used = vec!["git_diff".into()];
         result.tool_calls_count = 1;
         result.prompt_tokens = 136_947;

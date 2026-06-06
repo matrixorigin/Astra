@@ -10,8 +10,7 @@
 pub(crate) mod model;
 pub(crate) mod view;
 
-#[allow(unused_imports)]
-pub(crate) use model::{WorktreeEntry, WorktreeList, parse};
+pub(crate) use model::{WorktreeList, parse};
 
 #[cfg(test)]
 mod tests;

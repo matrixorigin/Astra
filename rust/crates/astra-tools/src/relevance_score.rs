@@ -111,7 +111,7 @@ fn split_name_parts(name: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Scoreable, rank_by_relevance, relevance_score};
 
     struct TestItem {
         name: &'static str,

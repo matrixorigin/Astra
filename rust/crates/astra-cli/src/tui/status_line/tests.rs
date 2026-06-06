@@ -4,7 +4,8 @@
 
 use std::time::Duration;
 
-use super::{PermissionMode, StatusContext, StatusLine};
+use super::{StatusContext, StatusLine};
+use crate::tui::status_line::line::PermissionMode;
 
 fn ctx() -> StatusContext {
     StatusContext::default()

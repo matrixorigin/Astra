@@ -271,7 +271,7 @@ impl BottomPaneView for TranscriptView {
                 self.status = None;
             }
             KeyCode::Char('y') | KeyCode::Char('c') => {
-                self.copy_selection_with(crate::cli::slash_info::copy_to_clipboard);
+                self.copy_selection_with(crate::cli::slash::slash_info::copy_to_clipboard);
             }
             _ => {}
         }
@@ -318,7 +318,10 @@ impl BottomPaneView for TranscriptView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::view::BottomPaneView;
+    use super::{DEFAULT_VISIBLE_LINES, MIN_VISIBLE_LINES, TranscriptView};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::text::Line;
 
     fn lines(n: usize) -> Vec<Line<'static>> {
         (0..n).map(|i| Line::from(format!("line {i}"))).collect()
@@ -368,10 +371,7 @@ mod tests {
         // PageDown pages by max_visible, not by a fixed 16.
         let mut v = TranscriptView::new(lines(200), 50);
         v.move_cursor_to(0);
-        v.handle_key(KeyEvent::new(
-            KeyCode::PageDown,
-            crossterm::event::KeyModifiers::NONE,
-        ));
+        v.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(v.cursor, v.max_visible as usize);
     }
 
@@ -379,10 +379,7 @@ mod tests {
     fn selection_copies_full_range_text() {
         let mut v = TranscriptView::new(lines(6), 0);
         v.move_cursor_to(1);
-        v.handle_key(KeyEvent::new(
-            KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
+        v.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
         v.move_cursor_to(3);
 
         let copied = std::cell::RefCell::new(String::new());

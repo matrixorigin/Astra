@@ -143,7 +143,8 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::tool_search;
+    use serde_json::{Value, json};
 
     fn sample_schemas() -> Vec<Value> {
         vec![

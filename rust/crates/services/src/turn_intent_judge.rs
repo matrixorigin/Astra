@@ -22,11 +22,13 @@
 //!
 //! Usage pattern (host side):
 //!
-//!     let judged = match judge.judge(&ctx).await {
-//!         Ok(intent) => Some(intent),
-//!         Err(error) => { /* telemetry, then fall through */ None }
-//!     };
-//!     judged.or_else(|| keyword_fallback(message, profile))
+//! ```ignore
+//! let judged = match judge.judge(&ctx).await {
+//!     Ok(intent) => Some(intent),
+//!     Err(error) => { /* telemetry, then fall through */ None }
+//! };
+//! judged.or_else(|| keyword_fallback(message, profile))
+//! ```
 //!
 //! Falling back to the keyword classifier on judge failure means the loop
 //! is never blocked on an unavailable LLM — this is the same pattern

@@ -1,4 +1,5 @@
-use super::*;
+use crate::cli::cli_config::cli_args::{Cli, Command, SelfCmd, SelfMutateCmd};
+use clap::Parser;
 
 #[test]
 fn cli_self_snapshot_subcommand() {

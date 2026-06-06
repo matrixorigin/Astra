@@ -8,6 +8,7 @@
 pub mod edge_dispatch;
 pub mod edge_registry;
 pub mod hold_cache;
+pub mod lease_renewal;
 pub mod metrics;
 pub mod task_lease;
 
@@ -22,6 +23,7 @@ pub use edge_registry::{
     UnconfiguredEdgeRegistryService,
 };
 pub use hold_cache::TaskLeaseHoldCache;
+pub use lease_renewal::{LeaseRenewalConfig, LeaseRenewalTask};
 pub use metrics::{MetricTarget, MultiAgentMetrics, SharedMultiAgentMetrics, shared_metrics};
 pub use task_lease::{
     DEFAULT_TASKS_PACK_LIMIT, DatabaseTaskLeaseService, LeaseClaimResult,

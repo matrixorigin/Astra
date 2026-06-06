@@ -5,7 +5,8 @@
 //! - `/messaging dlq`: Show dead letter queue summary
 //! - `/messaging status`: Show mailbox status if available
 
-use super::*;
+use crate::cli::session::session_state::SessionState;
+use crossterm::style::Stylize;
 
 /// Handle `/messaging [subcommand]` command.
 pub(crate) fn handle_messaging_command(arg: &str, state: &SessionState) {
@@ -259,7 +260,7 @@ fn show_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::show_help;
 
     #[test]
     fn help_does_not_panic() {

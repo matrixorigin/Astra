@@ -1,6 +1,13 @@
-use super::*;
 use crate::cli::surface::health_status_surface::health_status_icon;
+use crate::cli::{
+    cli_config::cli_utils::{prefix_chars, print_json_or_raw},
+    session::session_runtime,
+    session::session_state::SessionState,
+    theme,
+};
+use astra_runtime::prompts;
 use astra_services::session_artifact_store::SessionArtifactStore;
+use crossterm::style::Stylize;
 
 pub(crate) const MEMORY_BROWSE_QUERY: &str = "memory knowledge fact preference plan task note";
 pub(crate) const MEMORY_BROWSE_TOP_K: usize = 50;
@@ -2054,7 +2061,16 @@ fn collect_dismiss_candidates(arr: &[serde_json::Value]) -> Vec<DismissCandidate
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DismissCandidate, SECTION_NAMES, SessionMemorySurfaceStatus, collect_dismiss_candidates,
+        extract_md_section, format_session_memory_display, format_session_memory_response,
+        is_session_proto, load_current_session_memory, load_local_session_memory,
+        memory_health_lines, memory_result_id, parse_memory_forget_args,
+        parse_session_memory_status_hint_from_journal_text, replace_md_section,
+        sanitize_md_section_content, select_session_memory_record,
+        session_memory_headline_from_body, store_current_session_memory,
+    };
+    use astra_services::SessionArtifactStore;
     use regex::Regex;
 
     fn strip_ansi(input: &str) -> String {
