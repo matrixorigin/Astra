@@ -51,7 +51,8 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor  · Ctrl+C interrupt";
+const IDLE_COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor";
+const ACTIVE_TURN_PLACEHOLDER: &str = "Enter queues for next tool call  · Ctrl+C interrupts";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -415,7 +416,7 @@ impl ChatComposer {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, task_active: bool) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -442,8 +443,12 @@ impl ChatComposer {
         );
 
         if self.textarea.is_empty() {
-            let placeholder =
-                Span::styled(COMPOSER_PLACEHOLDER, Style::default().fg(Color::DarkGray));
+            let placeholder_text = if task_active {
+                ACTIVE_TURN_PLACEHOLDER
+            } else {
+                IDLE_COMPOSER_PLACEHOLDER
+            };
+            let placeholder = Span::styled(placeholder_text, Style::default().fg(Color::DarkGray));
             Widget::render(Line::from(placeholder), text_area, buf);
         } else {
             self.textarea.render(text_area, buf);
@@ -621,7 +626,13 @@ mod paste_tests {
 
     #[test]
     fn placeholder_mentions_external_editor_shortcut() {
-        assert!(COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
-        assert!(COMPOSER_PLACEHOLDER.contains("editor"));
+        assert!(IDLE_COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
+        assert!(IDLE_COMPOSER_PLACEHOLDER.contains("editor"));
+    }
+
+    #[test]
+    fn active_turn_placeholder_mentions_queue_and_interrupt() {
+        assert!(ACTIVE_TURN_PLACEHOLDER.contains("next tool call"));
+        assert!(ACTIVE_TURN_PLACEHOLDER.contains("Ctrl+C"));
     }
 }

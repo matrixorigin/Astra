@@ -37,6 +37,8 @@ mod mention_integration_tests;
 #[cfg(test)]
 mod plan_review_integration_tests;
 #[cfg(test)]
+mod queue_preview_tests;
+#[cfg(test)]
 mod slash_integration_tests;
 
 use chat_composer::{ChatComposer, ComposerAction};
@@ -1045,9 +1047,9 @@ impl BottomPane {
         // Header
         if y < area.bottom() {
             let hint = if self.queued_messages.len() == 1 {
-                "  ⏳ Queued (↑ to edit):"
+                "  ⏳ Queued for next tool call (↑ to edit):"
             } else {
-                "  ⏳ Queued (↑ to edit last):"
+                "  ⏳ Queued for next tool call (↑ to edit last):"
             };
             ratatui::widgets::Widget::render(
                 ratatui::text::Line::from(ratatui::text::Span::styled(hint, dim)),
@@ -1117,7 +1119,8 @@ impl BottomPane {
             .split(area);
 
             self.render_focused_approval(chunks[0], buf);
-            self.composer.render(chunks[1], buf);
+            self.composer
+                .render(chunks[1], buf, self.task_status.is_active());
             self.render_queue_preview(chunks[2], buf);
             if let Some(ref menu) = self.slash_menu {
                 slash_popup_render::render(menu, chunks[4], buf);
@@ -1137,7 +1140,8 @@ impl BottomPane {
             .split(area);
 
             self.render_focused_approval(chunks[0], buf);
-            self.composer.render(chunks[1], buf);
+            self.composer
+                .render(chunks[1], buf, self.task_status.is_active());
             self.render_queue_preview(chunks[2], buf);
             self.footer.render(chunks[4], buf);
         }
