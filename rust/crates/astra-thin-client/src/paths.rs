@@ -127,6 +127,11 @@ pub fn chat_run_stream(run_id: &str) -> String {
 }
 
 #[inline]
+pub fn chat_run_input(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/input")
+}
+
+#[inline]
 pub fn chat_run_pause(run_id: &str) -> String {
     format!("/chat/runs/{run_id}/pause")
 }
@@ -507,6 +512,11 @@ mod tests {
     #[test]
     fn chat_run_pause_path() {
         assert_eq!(chat_run_pause("r1"), "/chat/runs/r1/pause");
+    }
+
+    #[test]
+    fn chat_run_input_path() {
+        assert_eq!(chat_run_input("r1"), "/chat/runs/r1/input");
     }
 
     #[test]

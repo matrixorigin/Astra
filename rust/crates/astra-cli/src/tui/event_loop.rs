@@ -86,6 +86,45 @@ fn flush_chat_widget(
     guard.queue_history_lines(batch);
 }
 
+fn deferred_input_preview(text: &str) -> String {
+    let single_line = text.trim().replace('\n', " ↩ ");
+    let mut preview: String = single_line.chars().take(120).collect();
+    if single_line.chars().count() > 120 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+async fn submit_deferred_tui_input(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    run_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    if run_id.trim().is_empty() {
+        return Err("Current run is not ready to accept deferred input yet.".to_string());
+    }
+
+    let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+        .await
+        .ok_or_else(|| "Sign in is required to queue input for the active run.".to_string())?;
+
+    api.submit_run_input(
+        Some(&token),
+        run_id,
+        &astra_thin_client::RunInputRequest {
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            input: serde_json::json!({
+                "content": text,
+            }),
+        },
+    )
+    .await
+    .map_err(|error| format!("Failed to queue input for the active run: {error}"))?;
+
+    Ok(())
+}
+
 fn render_history_batch_lines(
     cells: &[Arc<dyn history_cell::HistoryCell>],
     width: u16,
@@ -1778,6 +1817,8 @@ pub(crate) async fn run_tui_session(
                                         // inner select.
                                         let task_service_for_cancel = state.task_service.clone();
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
+                                        let active_turn_incremental_state =
+                                            state.active_turn_incremental_state.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
@@ -1982,7 +2023,7 @@ pub(crate) async fn run_tui_session(
                                                                 continue;
                                                             }
                                                             // During turn: composer stays usable.
-                                                            // Enter queues message (shown as preview, not in scrollback).
+                                                            // Enter queues a deferred input against the active run.
                                                             // Up edits last queued. Ctrl+C interrupts.
                                                             // Up arrow with queued messages → edit last
                                                             if k.code == crossterm::event::KeyCode::Up
@@ -2023,7 +2064,54 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        bottom_pane.queued_messages.push(queued_text);
+                                                                        let active_run_id = {
+                                                                            let guard = astra_core::sync_poison::recover_mutex_lock(
+                                                                                &active_turn_incremental_state,
+                                                                            );
+                                                                            guard
+                                                                                .as_ref()
+                                                                                .and_then(|incremental_state| {
+                                                                                    incremental_state.snapshot().run_id
+                                                                                })
+                                                                        };
+                                                                        match active_run_id {
+                                                                            Some(run_id) => {
+                                                                                match submit_deferred_tui_input(
+                                                                                    api,
+                                                                                    profile,
+                                                                                    &run_id,
+                                                                                    &queued_text,
+                                                                                )
+                                                                                .await
+                                                                                {
+                                                                                    Ok(()) => {
+                                                                                        chat_widget.commit_system(
+                                                                                            history_cell::system::SystemCell::info(
+                                                                                                format!(
+                                                                                                    "Queued for next tool call: {}",
+                                                                                                    deferred_input_preview(&queued_text)
+                                                                                                ),
+                                                                                            ),
+                                                                                        );
+                                                                                    }
+                                                                                    Err(error) => {
+                                                                                        bottom_pane.composer.set_text(&queued_text);
+                                                                                        chat_widget.commit_system(
+                                                                                            history_cell::system::SystemCell::error(error),
+                                                                                        );
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            None => {
+                                                                                bottom_pane.composer.set_text(&queued_text);
+                                                                                chat_widget.commit_system(
+                                                                                    history_cell::system::SystemCell::error(
+                                                                                        "Current run is not ready to accept deferred input yet. Press Ctrl+C to interrupt immediately."
+                                                                                            .to_string(),
+                                                                                    ),
+                                                                                );
+                                                                            }
+                                                                        }
                                                                     }
                                                                     BottomPaneAction::ViewSideEffect { result } => {
                                                                         let _ = try_dispatch_agent_kill_sentinel(
@@ -3341,6 +3429,36 @@ fn handle_app_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
 
     /// REGRESSION (reviewer L3 — Architecture): the
     /// `ReopenTarget::as_str() ↔ ReopenTarget::parse()` round-trip
@@ -3359,6 +3477,86 @@ mod tests {
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
             assert_eq!(decoded, target, "variant {encoded} did not round-trip");
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn submit_deferred_tui_input_posts_to_active_run_input_route() {
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/input"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-1",
+                "accepted": true,
+                "duplicate": false
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        submit_deferred_tui_input(&api, None, "run-1", "先停下来吧")
+            .await
+            .expect("deferred input should be accepted");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock should expose received requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "helper should send exactly one deferred-input POST"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
+        assert_eq!(body["input"]["content"], "先停下来吧");
+        assert!(
+            body["idempotency_key"]
+                .as_str()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+            "helper must send a non-empty idempotency key"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_deferred_tui_input_rejects_missing_run_id_before_network() {
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
+        let error = submit_deferred_tui_input(&api, None, "   ", "先停下来吧")
+            .await
+            .expect_err("blank run ids must be rejected locally");
+        assert!(
+            error.contains("not ready to accept deferred input"),
+            "missing run_id should surface a local readiness error"
+        );
+    }
+
+    #[test]
+    fn active_turn_submit_routes_to_run_input_api_not_local_queue() {
+        let source = include_str!("event_loop.rs");
+        let arm_start = source
+            .find("BottomPaneAction::SubmitInput(queued_text) => {")
+            .expect("active-turn SubmitInput arm must exist");
+        let arm_end = source[arm_start..]
+            .find("BottomPaneAction::ViewSideEffect { result } => {")
+            .expect("active-turn SubmitInput arm must end before ViewSideEffect");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("submit_deferred_tui_input("),
+            "active-turn Enter must queue against the durable run via submit_deferred_tui_input"
+        );
+        assert!(
+            !arm.contains("queued_messages.push(queued_text)"),
+            "active-turn Enter must not fall back to the old local queue that waited until turn end"
+        );
+        assert!(
+            !arm.contains("state.run_id.clone()"),
+            "active-turn Enter must not read the stale per-session run_id; it should use live incremental turn state"
+        );
     }
 
     #[test]

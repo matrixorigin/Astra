@@ -17,8 +17,8 @@ use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
     ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeRegisterRequest,
-    SessionCreateRequest, SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest,
-    ToolResultRequest,
+    RunInputRequest, RunInputResponse, SessionCreateRequest, SessionUpdateRequest, StreamEvent,
+    TaskLeaseMutationRequest, ToolResultRequest,
 };
 use crate::sse::SseParser;
 
@@ -1124,6 +1124,24 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// `POST /chat/runs/{run_id}/input` — queue deferred user input for the active durable run.
+    pub async fn submit_run_input(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &RunInputRequest,
+    ) -> Result<RunInputResponse, ThinClientError> {
+        let url = self.url(&paths::chat_run_input(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
     /// `DELETE /chat/runs/{run_id}` — cancel a durable run.
     pub async fn cancel_run(
         &self,
@@ -1567,7 +1585,7 @@ fn attachment_filename(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Override `sleep_between_attempts` to `ms` for the duration of a test,
@@ -1847,6 +1865,45 @@ mod tests {
         let v = client.get_run(Some("tok"), "run-1").await.unwrap();
         assert_eq!(v["run_id"], "run-1");
         assert_eq!(v["status"], "running");
+    }
+
+    #[tokio::test]
+    async fn wiremock_submit_run_input() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/input"))
+            .and(header("authorization", "Bearer tok"))
+            .and(body_json(serde_json::json!({
+                "idempotency_key": "ik-1",
+                "input": {
+                    "content": "stop after next tool call"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-1",
+                "accepted": true,
+                "duplicate": false
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client
+            .submit_run_input(
+                Some("tok"),
+                "run-1",
+                &RunInputRequest {
+                    idempotency_key: "ik-1".into(),
+                    input: serde_json::json!({
+                        "content": "stop after next tool call"
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.run_id, "run-1");
+        assert!(response.accepted);
+        assert!(!response.duplicate);
     }
 
     #[tokio::test]

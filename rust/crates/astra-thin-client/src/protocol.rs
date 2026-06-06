@@ -87,6 +87,22 @@ pub struct SessionUpdateRequest {
     pub status: Option<String>,
 }
 
+/// `POST /chat/runs/{run_id}/input` body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunInputRequest {
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub input: Value,
+}
+
+/// `POST /chat/runs/{run_id}/input` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunInputResponse {
+    pub run_id: String,
+    pub accepted: bool,
+    pub duplicate: bool,
+}
+
 /// `POST /tools/result` (§5.5 — forward-compatible).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResultRequest {

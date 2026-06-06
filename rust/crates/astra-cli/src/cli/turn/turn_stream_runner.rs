@@ -38,6 +38,8 @@ pub(crate) async fn execute_stream_turn(
     semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
     let prepared = prepare_turn_stream_state(state).await;
+    *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_incremental_state) =
+        Some(prepared.incremental_state.clone());
     let params = build_turn_stream_params(
         state,
         api,
@@ -50,6 +52,7 @@ pub(crate) async fn execute_stream_turn(
     );
     let (result, was_user_cancel) =
         await_stream_with_interrupts(params, &prepared, api, token).await;
+    *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_incremental_state) = None;
 
     if was_user_cancel {
         TurnAttempt::Interrupted(Box::new(result))
