@@ -106,7 +106,11 @@ fn render_deferred_user_input(content: &str) -> String {
     )
 }
 
-async fn poll_deferred_user_inputs(state: &mut AgenticLoopState, queued_at_tool_generation: u64) {
+async fn poll_deferred_user_inputs(
+    state: &mut AgenticLoopState,
+    queued_at_tool_generation: u64,
+) -> Vec<serde_json::Value> {
+    let mut polled_inputs = Vec::new();
     if let (Some(run_control), Some(run_id)) =
         (state.run_control.as_ref(), state.current_run_id.as_deref())
     {
@@ -115,6 +119,7 @@ async fn poll_deferred_user_inputs(state: &mut AgenticLoopState, queued_at_tool_
             .await;
         state.messaging.deferred_user_input_cursor = poll.next_cursor;
         for event in poll.inputs {
+            polled_inputs.push(event.input.clone());
             let Some(content) = deferred_user_input_text(&event.input) else {
                 continue;
             };
@@ -127,6 +132,7 @@ async fn poll_deferred_user_inputs(state: &mut AgenticLoopState, queued_at_tool_
                 });
         }
     }
+    polled_inputs
 }
 
 fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
@@ -398,7 +404,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     let tool_call_generation = state.messaging.tool_call_generation;
-    poll_deferred_user_inputs(state, tool_call_generation).await;
+    let polled_inputs = poll_deferred_user_inputs(state, tool_call_generation).await;
+    for input in &polled_inputs {
+        host.on_deferred_user_input(input);
+    }
     release_ready_deferred_user_inputs(state);
 
     // ── Nudge suppression gate ──────────────────────────────────────────
@@ -923,7 +932,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         turn_result.accum.has_tool_calls || !turn_result.edge_tool_round.is_empty();
     if completed_tool_round {
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(state, tool_call_generation).await;
+        let polled_inputs = poll_deferred_user_inputs(state, tool_call_generation).await;
+        for input in &polled_inputs {
+            host.on_deferred_user_input(input);
+        }
         state.messaging.tool_call_generation =
             state.messaging.tool_call_generation.saturating_add(1);
     }
@@ -4713,7 +4725,7 @@ mod tests {
         ])));
 
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
         assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
@@ -4721,7 +4733,7 @@ mod tests {
 
         state.messaging.tool_call_generation = 1;
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
 
         assert!(state.messaging.deferred_user_inputs.is_empty());
@@ -4755,20 +4767,20 @@ mod tests {
         ])));
 
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
         assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
 
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
         assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
 
         state.messaging.tool_call_generation = 2;
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.messaging.deferred_user_inputs.is_empty());
         assert!(state.volatile_pending.iter().any(|entry| {
@@ -4800,12 +4812,12 @@ mod tests {
         ])));
 
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.messaging.deferred_user_inputs.is_empty());
 
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         assert_eq!(state.messaging.deferred_user_inputs.len(), 1);
         assert_eq!(
             state.messaging.deferred_user_inputs[0].queued_at_tool_generation,
@@ -4814,7 +4826,7 @@ mod tests {
 
         state.messaging.tool_call_generation = 1;
         let tool_call_generation = state.messaging.tool_call_generation;
-        poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.messaging.deferred_user_inputs.is_empty());
         assert!(state.volatile_pending.iter().any(|entry| {

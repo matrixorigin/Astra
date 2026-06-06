@@ -185,6 +185,15 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Observe a deferred `user_input` event that was appended to the active
+    /// run while execution was already in progress.
+    ///
+    /// Hosts that carry mutable request context, such as the server host's
+    /// `edge_profile`, can use this hook to keep the next LLM round aligned
+    /// with any per-input runtime hints before the deferred user message is
+    /// surfaced to the model.
+    fn on_deferred_user_input(&mut self, _input: &Value) {}
+
     /// Headless round terminal output.
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String);
 

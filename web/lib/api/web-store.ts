@@ -581,7 +581,7 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
     idempotencyKey: crypto.randomUUID(),
     input: {
       content: payload.content,
-      active_skills: activeSkills.length ? activeSkills : undefined,
+      active_skills: activeSkills,
     },
   });
 
