@@ -1960,7 +1960,7 @@ mod tests {
     #[test]
     fn render_reflect_diff_reports_no_delta_on_fresh_session() {
         let state = crate::cli::session_state::SessionState::default();
-        let out = crate::render_reflect_diff(&state);
+        let out = render_reflect_diff(&state);
         assert!(out.contains("reflect diff"), "header present: {out}");
         assert!(
             out.contains("no delta since last sync"),
@@ -2000,7 +2000,7 @@ mod tests {
                 recent_outcomes: vec![],
             },
         ];
-        let out = crate::render_reflect_diff(&state);
+        let out = render_reflect_diff(&state);
         assert!(out.contains("grep"), "drifting tool shown: {out}");
         assert!(out.contains("glob"), "new tool shown: {out}");
         assert!(out.contains("new"), "new marker: {out}");

@@ -7009,7 +7009,10 @@ mod tests {
             assert_eq!(calls.len(), 1, "judge must be called exactly once");
             let call = &calls[0];
             assert_eq!(call.message, "可以了，按你刚才说的方向继续往下走");
-            assert_eq!(call.turn_count, 5, "turn count should be llm_rounds_completed+1");
+            assert_eq!(
+                call.turn_count, 5,
+                "turn count should be llm_rounds_completed+1"
+            );
             assert_eq!(call.recent_tools, vec!["read_file".to_string()]);
             assert!(
                 call.has_prior_assistant_turn,
@@ -7029,9 +7032,7 @@ mod tests {
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
             state.task_profile =
-                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-                    &state.message,
-                );
+                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
 
             let intent = host
                 .judge_turn_intent(&state)
@@ -7058,9 +7059,7 @@ mod tests {
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
             state.task_profile =
-                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-                    &state.message,
-                );
+                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
 
             let intent = host.judge_turn_intent(&state).await.expect("intent");
             assert_eq!(intent.requested_scenario, Some(Scenario::CodeReview));

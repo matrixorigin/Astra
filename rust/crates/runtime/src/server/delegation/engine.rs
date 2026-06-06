@@ -929,18 +929,18 @@ impl DelegationTracker {
                 .push(child.as_str());
         }
         let mut visited = std::collections::HashSet::new();
-        let mut frontier: Vec<String> = by_parent
+        let mut frontier: std::collections::VecDeque<String> = by_parent
             .get(root)
             .map(|v| v.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
         let mut out = Vec::new();
-        while let Some(rid) = frontier.pop() {
+        while let Some(rid) = frontier.pop_front() {
             if !visited.insert(rid.clone()) {
                 continue;
             }
             if let Some(grand) = by_parent.get(rid.as_str()) {
                 for g in grand {
-                    frontier.push((*g).to_string());
+                    frontier.push_back((*g).to_string());
                 }
             }
             out.push(rid);
@@ -6797,8 +6797,7 @@ mod tests {
         use crate::orchestration::{ProgressBroadcaster, ProgressEventType};
         let broadcaster = Arc::new(ProgressBroadcaster::new(16));
         let mut rx = broadcaster.subscribe();
-        let tracker =
-            DelegationTracker::new().with_progress_broadcaster(broadcaster.clone());
+        let tracker = DelegationTracker::new().with_progress_broadcaster(broadcaster.clone());
 
         tracker
             .record_sub_run(SubRunRecord {
@@ -6824,13 +6823,10 @@ mod tests {
         // Drain events until we see the terminal Failed (record_sub_run
         // emits a Started/Spawned event which we don't care about here).
         let error_text = loop {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                rx.recv(),
-            )
-            .await
-            .expect("event should arrive within timeout")
-            .expect("broadcast must deliver");
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event should arrive within timeout")
+                .expect("broadcast must deliver");
             match event.event_type {
                 ProgressEventType::Failed { error } => break error,
                 ProgressEventType::Completed { .. }
@@ -6867,10 +6863,7 @@ mod tests {
         let child = "child-run";
         let grandchild = "grandchild-run";
 
-        for (rid, prid, did) in [
-            (child, parent, "deleg-1"),
-            (grandchild, child, "deleg-2"),
-        ] {
+        for (rid, prid, did) in [(child, parent, "deleg-1"), (grandchild, child, "deleg-2")] {
             tracker
                 .record_sub_run(SubRunRecord {
                     run_id: rid.into(),
@@ -6894,15 +6887,49 @@ mod tests {
             .await;
 
         let count = tracker.cancel_children_of(parent).await;
-        assert!(
-            token_child.is_cancelled(),
-            "direct child must be cancelled"
-        );
+        assert!(token_child.is_cancelled(), "direct child must be cancelled");
         assert!(
             token_grand.is_cancelled(),
             "grandchild MUST be cancelled (subtree, not just first level)"
         );
         assert_eq!(count, 2, "count must include all descendants");
+    }
+
+    #[tokio::test]
+    async fn collect_descendants_visits_siblings_before_grandchildren() {
+        let tracker = DelegationTracker::new();
+        for (rid, prid) in [
+            ("child-a", "parent-run"),
+            ("child-b", "parent-run"),
+            ("grandchild-a", "child-a"),
+        ] {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: rid.into(),
+                    parent_run_id: prid.into(),
+                    delegation_id: format!("deleg-{rid}"),
+                    agent_id: "agent".into(),
+                    depth: 0,
+                    state: SubRunState::Running,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        let descendants = tracker.collect_descendants("parent-run").await;
+        let child_b = descendants
+            .iter()
+            .position(|run_id| run_id == "child-b")
+            .expect("child-b should be collected");
+        let grandchild_a = descendants
+            .iter()
+            .position(|run_id| run_id == "grandchild-a")
+            .expect("grandchild-a should be collected");
+
+        assert!(
+            child_b < grandchild_a,
+            "BFS must visit direct siblings before grandchildren: {descendants:?}"
+        );
     }
 
     /// Lock-order regression: cancel_children_of and cleanup_delegation
@@ -6970,10 +6997,7 @@ mod tests {
                         // Force completion so cleanup can proceed.
                         for c in 0..CHILDREN_PER {
                             tracker
-                                .complete_sub_run(
-                                    &format!("child-{p}-{c}"),
-                                    SubRunState::Completed,
-                                )
+                                .complete_sub_run(&format!("child-{p}-{c}"), SubRunState::Completed)
                                 .await;
                         }
                         let _ = tracker.cleanup_delegation(&format!("deleg-{p}")).await;

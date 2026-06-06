@@ -434,6 +434,19 @@ mod tests {
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Completed);
         assert!(projection.has_result);
 
+        let empty_success = json!({
+            "agent_id": "reviewer@abc"
+        });
+        let projection = project_agent_tool_wire("get_result", true, Some(&empty_success));
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
+
+        let unknown_status = json!({
+            "status": "mystery",
+            "agent_id": "reviewer@abc"
+        });
+        let projection = project_agent_tool_wire("get_result", true, Some(&unknown_status));
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
+
         let tool_failed = project_agent_tool_wire("spawn", false, None);
         assert_eq!(tool_failed.outcome, AgentToolWireOutcomeKind::Failed);
     }

@@ -83,10 +83,8 @@ pub trait TurnIntentJudge: Send + Sync {
     /// Implementations MUST honor a reasonable timeout internally — the
     /// agentic loop awaits this call before each turn, so blocking
     /// indefinitely freezes the user's session.
-    async fn judge(
-        &self,
-        ctx: &TurnIntentJudgeContext,
-    ) -> Result<TurnIntent, TurnIntentJudgeError>;
+    async fn judge(&self, ctx: &TurnIntentJudgeContext)
+    -> Result<TurnIntent, TurnIntentJudgeError>;
 }
 
 // ─── Prompt construction ────────────────────────────────────────────────────
@@ -204,9 +202,11 @@ pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJud
     if let Some(req) = value.get("requested_scenario")
         && !req.is_null()
     {
-        let s = req.as_str().ok_or_else(|| TurnIntentJudgeError::Malformed {
-            raw: format!("requested_scenario not a string: {req}"),
-        })?;
+        let s = req
+            .as_str()
+            .ok_or_else(|| TurnIntentJudgeError::Malformed {
+                raw: format!("requested_scenario not a string: {req}"),
+            })?;
         let scenario = parse_scenario(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
             raw: format!("unknown scenario: '{s}'"),
         })?;
@@ -223,9 +223,11 @@ pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJud
                 raw: format!("prohibited_scenarios not an array: {prohibited}"),
             })?;
         for entry in arr {
-            let s = entry.as_str().ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("prohibited_scenarios entry not a string: {entry}"),
-            })?;
+            let s = entry
+                .as_str()
+                .ok_or_else(|| TurnIntentJudgeError::Malformed {
+                    raw: format!("prohibited_scenarios entry not a string: {entry}"),
+                })?;
             let scenario = parse_scenario(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
                 raw: format!("unknown prohibited scenario: '{s}'"),
             })?;
@@ -239,9 +241,11 @@ pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJud
     if let Some(mode) = value.get("continuation_mode")
         && !mode.is_null()
     {
-        let s = mode.as_str().ok_or_else(|| TurnIntentJudgeError::Malformed {
-            raw: format!("continuation_mode not a string: {mode}"),
-        })?;
+        let s = mode
+            .as_str()
+            .ok_or_else(|| TurnIntentJudgeError::Malformed {
+                raw: format!("continuation_mode not a string: {mode}"),
+            })?;
         intent.continuation_mode =
             parse_continuation_mode(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
                 raw: format!("unknown continuation_mode: '{s}'"),
@@ -279,12 +283,11 @@ fn parse_continuation_mode(s: &str) -> Option<TurnContinuationMode> {
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        let mut out = String::with_capacity(n + 3);
-        out.push_str(&s[..s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(n)]);
+        let mut out: String = s.chars().take(max_chars).collect();
         out.push_str("...");
         out
     }
@@ -408,6 +411,28 @@ mod tests {
     fn malformed_json_returns_malformed_error() {
         let err = parse_turn_intent_response("not json at all").unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
+    }
+
+    #[test]
+    fn malformed_unicode_response_is_truncated_without_panicking() {
+        let raw = "坏".repeat(100);
+        let err = parse_turn_intent_response(&raw).unwrap_err();
+        match err {
+            TurnIntentJudgeError::Malformed { raw } => {
+                assert_eq!(raw, "坏".repeat(100));
+            }
+            other => panic!("expected malformed, got {other:?}"),
+        }
+
+        let raw = "坏".repeat(300);
+        let err = parse_turn_intent_response(&raw).unwrap_err();
+        match err {
+            TurnIntentJudgeError::Malformed { raw } => {
+                assert!(raw.ends_with("..."));
+                assert_eq!(raw.trim_end_matches("...").chars().count(), 256);
+            }
+            other => panic!("expected malformed, got {other:?}"),
+        }
     }
 
     #[test]

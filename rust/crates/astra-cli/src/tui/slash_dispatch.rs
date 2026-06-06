@@ -2986,17 +2986,16 @@ fn tilde_session_path(abs: &str) -> String {
 async fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
     use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-    let disco = match tokio::task::spawn_blocking(|| {
-        SessionDiscovery::new(FsSessionSource::new(), 50)
-    })
-    .await
-    {
-        Ok(d) => d,
-        Err(error) => {
-            ctx.show_info(format!("session discovery failed: {error}"));
-            return SlashResult::Handled;
-        }
-    };
+    let disco =
+        match tokio::task::spawn_blocking(|| SessionDiscovery::new(FsSessionSource::new(), 50))
+            .await
+        {
+            Ok(d) => d,
+            Err(error) => {
+                ctx.show_info(format!("session discovery failed: {error}"));
+                return SlashResult::Handled;
+            }
+        };
     if disco.total() == 0 {
         ctx.show_info("No previous sessions found.".into());
         return SlashResult::Handled;
@@ -3034,17 +3033,16 @@ fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
 async fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
     use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-    let disco = match tokio::task::spawn_blocking(|| {
-        SessionDiscovery::new(FsSessionSource::new(), 50)
-    })
-    .await
-    {
-        Ok(d) => d,
-        Err(error) => {
-            ctx.show_info(format!("session discovery failed: {error}"));
-            return SlashResult::Handled;
-        }
-    };
+    let disco =
+        match tokio::task::spawn_blocking(|| SessionDiscovery::new(FsSessionSource::new(), 50))
+            .await
+        {
+            Ok(d) => d,
+            Err(error) => {
+                ctx.show_info(format!("session discovery failed: {error}"));
+                return SlashResult::Handled;
+            }
+        };
     if disco.total() == 0 {
         ctx.show_info("No previous sessions to fork from.".into());
         return SlashResult::Handled;

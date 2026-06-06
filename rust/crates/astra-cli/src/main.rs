@@ -38,11 +38,11 @@ mod tui;
 
 pub(crate) use cli::*;
 
+use cli::cli_config::cli_args::Cli;
 #[cfg(test)]
 use cli::cli_utils::save_credentials;
 use cli::cli_utils::{
     local_resumable_last_session_id, map_thin_err, normalize_model_override_owned,
-    persist_profile_last_session,
 };
 use cli::command_router::{ExitCode, execute_cli_command, run_print_mode};
 #[cfg(test)]
@@ -471,11 +471,21 @@ mod tests {
 
     use super::*;
     use axum::{Router, routing::get, routing::post};
+    use cli::cli_config::cli_args::{
+        AgentSubcommand, AuditCmd, AuditShowArgs, AuditToolsArgs, BugSubcommand, Command,
+        ConfigCmd, DiffSubcommand, McpCmd, MemorySubcommand, MessagingArgs, MessagingSubcommand,
+        PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SelfCmd, SelfMutateCmd, ServeMode,
+        SessionCaptureCmd, SessionCmd, SessionShowArgs, TaskSubcommand, TeamSubcommand,
+    };
+    use cli::cli_config::cli_utils::{CredentialsFile, Profile};
     use cli::cloud_sync::{
         ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, cloud_pull_warrants_sync_marker,
         should_append_cloud_pull_journal,
     };
     use cli::project_instructions::discover_instructions_from_paths;
+    use cli::session_runtime::initialize_session_state;
+    use cli::slash::{slash_health, slash_tools};
+    use cli::slash_memory::handle_memory_domain_command;
 
     async fn spawn_mock(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

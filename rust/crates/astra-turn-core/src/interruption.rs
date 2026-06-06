@@ -881,10 +881,8 @@ mod tests {
     fn from_json_value_explicit_value_wins_over_kind_default() {
         // An explicit "continue" must beat the kind default (e.g. an
         // EmptyCompletion record whose author wants to resume normally).
-        let mode = ResumeMode::from_json_value(
-            Some(&serde_json::json!("continue")),
-            "empty_completion",
-        );
+        let mode =
+            ResumeMode::from_json_value(Some(&serde_json::json!("continue")), "empty_completion");
         assert_eq!(mode, ResumeMode::Continue);
     }
 

@@ -1907,7 +1907,7 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use axum::{Router, routing::get, routing::post};
 
     async fn spawn_mock(app: Router) -> String {

@@ -1,3 +1,6 @@
+//! Turn execution pipeline: auth retry, stream running, settlement, commit,
+//! reporting, and post-commit side effects.
+
 pub(crate) use super::*;
 pub mod turn_auth_retry;
 pub mod turn_cancellation;
@@ -13,5 +16,3 @@ pub mod turn_session_retry;
 pub mod turn_settlement;
 pub mod turn_stream_runner;
 pub mod turn_success;
-
-pub use astra_services::session_journal;

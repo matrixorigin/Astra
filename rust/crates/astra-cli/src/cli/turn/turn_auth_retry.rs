@@ -1,3 +1,5 @@
+//! Authentication retry handling for a failed turn.
+
 use crate::cli::auth_flow::is_auth_error;
 use crate::cli::session::session_runtime;
 

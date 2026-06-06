@@ -1148,7 +1148,6 @@ mod multi_agent_strip_tests {
         );
     }
 
-
     #[test]
     fn elapsed_under_a_second_renders_in_milliseconds() {
         assert_eq!(format_short_elapsed(0), "0ms");

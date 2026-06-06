@@ -248,7 +248,8 @@ async fn prune_stale_pending_recovery(
     if matches!(
         preflight_remote_resume_session(api, profile, &session_id).await,
         SessionResumePreflight::Missing
-    ) {
+    ) && !crate::cli::cli_utils::local_session_is_resumable(&session_id)
+    {
         clear_profile_last_session_if_matches_or_warn(
             profile,
             &session_id,
@@ -942,7 +943,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn prune_stale_pending_recovery_clears_stale_last_session() {
+    async fn prune_stale_pending_recovery_keeps_local_state_when_remote_is_stale() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("pending-stale-{}", uuid::Uuid::new_v4());
@@ -966,13 +967,13 @@ mod tests {
         };
         prune_stale_pending_recovery(&api, None, &mut state).await;
 
-        assert_eq!(state.pending_recovery, None);
+        assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
         assert_eq!(
             crate::cli::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
-            None
+            Some(session_id.as_str())
         );
     }
 

@@ -1,3 +1,5 @@
+//! Top-level turn entrypoint and pre-turn routing.
+
 use std::time::Instant;
 
 use super::turn_retry::settle_turn_attempt;
@@ -63,9 +65,9 @@ pub(crate) fn classify_shell_passthrough(line: &str) -> Option<ShellPassthroughD
     // tools). The chat shell pass-through is exactly the surface where a
     // pasted `! rm -rf ~` is most dangerous — close that gap explicitly.
     if looks_like_recursive_rm(cmd) {
-        risks.push(astra_runtime::tool_sandbox::CommandRisk::DestructiveCommand(
-            "rm -rf".to_string(),
-        ));
+        risks.push(
+            astra_runtime::tool_sandbox::CommandRisk::DestructiveCommand("rm -rf".to_string()),
+        );
     }
 
     let high_risk = risks.iter().any(is_high_severity_risk);
@@ -104,7 +106,8 @@ fn looks_like_recursive_rm(cmd: &str) -> bool {
         }
         if let Some(flags) = tok.strip_prefix('-') {
             // -r / -R / -rf / -fr / -Rf / etc.
-            !flags.is_empty() && !flags.starts_with('-')
+            !flags.is_empty()
+                && !flags.starts_with('-')
                 && (flags.contains('r') || flags.contains('R'))
         } else {
             false
@@ -212,13 +215,14 @@ pub(crate) async fn handle_chat_input_with_ui(
             }
             ShellPassthroughDecision::Allow { cmd, risks } => {
                 if !risks.is_empty() {
-                    ui.show_warning(&format!(
-                        "  ⚠ shell risk(s): {}",
-                        risks.join(", ")
-                    ));
+                    ui.show_warning(&format!("  ⚠ shell risk(s): {}", risks.join(", ")));
                 }
                 println!("! {cmd}");
-                match std::process::Command::new("sh").arg("-c").arg(&cmd).status() {
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .status()
+                {
                     Ok(status) if status.success() => {}
                     Ok(status) => {
                         eprintln!("! {cmd}: exit {}", status.code().unwrap_or(-1));
@@ -371,8 +375,7 @@ mod tests {
     #[test]
     fn shell_passthrough_credential_access_rejected() {
         // Reading well-known secret stores triggers high-risk gating.
-        let decision =
-            classify_shell_passthrough("! cat ~/.ssh/id_rsa").expect("decision");
+        let decision = classify_shell_passthrough("! cat ~/.ssh/id_rsa").expect("decision");
         assert!(
             matches!(decision, ShellPassthroughDecision::DenyHighRisk { .. }),
             "credential access must be DenyHighRisk: {decision:?}"

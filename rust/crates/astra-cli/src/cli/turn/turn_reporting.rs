@@ -1,3 +1,5 @@
+//! Final turn reporting, status lines, and summary rendering.
+
 use std::time::Instant;
 
 use super::*;

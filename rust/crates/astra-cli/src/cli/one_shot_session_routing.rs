@@ -1,5 +1,5 @@
 use crate::cli::cli_config::cli_utils::{
-    local_resumable_last_session_id, local_session_is_resumable, preflight_remote_resume_session,
+    local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::load_session_messages_for_continuation;
 use crate::cli::session::session_restore_client::list_cloud_resumable_sessions;
@@ -20,11 +20,6 @@ impl OneShotSessionRouting {
     pub(crate) fn task_scope_session_id(&self) -> Option<&str> {
         self.server_session_id.as_deref()
     }
-}
-
-fn local_continuation_available(session_id: &str) -> bool {
-    local_session_is_resumable(session_id)
-        || load_session_messages_for_continuation(session_id).is_some()
 }
 
 fn explicit_resume_preflight_error(
@@ -103,15 +98,12 @@ pub(crate) async fn resolve_one_shot_session_routing(
             .find(|session| session.turn_count > 0)
             .map(|session| session.session_id),
         Err(error) => {
-            if local_session_id.is_some() {
-                tracing::warn!(
-                    %error,
-                    "failed to list cloud resumable sessions; falling back to local continuation"
-                );
-                None
-            } else {
-                return Err(error);
-            }
+            tracing::warn!(
+                %error,
+                has_local_continuation = local_session_id.is_some(),
+                "failed to list cloud resumable sessions; starting without cloud continuation"
+            );
+            None
         }
     };
     Ok(select_one_shot_session_routing(
@@ -202,6 +194,15 @@ mod tests {
             .await;
     }
 
+    async fn mock_resumable_list_failure(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/sessions/resumable"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(server)
+            .await;
+    }
+
     #[test]
     fn select_one_shot_session_routing_uses_active_session_for_server_and_history() {
         let routing = select_one_shot_session_routing(
@@ -251,6 +252,7 @@ mod tests {
     async fn resolve_one_shot_session_routing_keeps_local_continuation_when_cloud_has_no_session() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
         let session_id = uuid::Uuid::new_v4().to_string();
         write_local_resumable_session_with_checkpoint(&session_id);
 
@@ -289,6 +291,36 @@ mod tests {
         assert_eq!(continuation.len(), 2);
         assert_eq!(continuation[0]["content"], "previous question");
         assert_eq!(continuation[1]["content"], "previous answer");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_does_not_fail_when_auto_cloud_listing_fails() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_resumable_list_failure(&server).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
+            .await
+            .expect("automatic cloud resume discovery must not block a fresh one-shot turn");
+
+        assert_eq!(routing.server_session_id, None);
+        assert_eq!(routing.history_source_session_id, None);
+        assert_eq!(routing.task_scope_session_id(), None);
+        assert!(routing.continuation_messages().is_none());
     }
 
     #[serial_test::serial]

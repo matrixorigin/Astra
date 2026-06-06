@@ -209,9 +209,7 @@ fn try_dispatch_agent_kill_sentinel(
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) -> bool {
-    let Some(agent_id) =
-        bottom_pane::in_flight_agents_view::parse_kill_sentinel(sentinel)
-    else {
+    let Some(agent_id) = bottom_pane::in_flight_agents_view::parse_kill_sentinel(sentinel) else {
         return false;
     };
     let agent_id_owned = agent_id.to_string();
@@ -227,7 +225,9 @@ fn try_dispatch_agent_kill_sentinel(
             // The spawner ignores unknown ids, so this is safe even if
             // the agent already finished between the user pressing x
             // and us dispatching. Reason text shows up in the journal.
-            let _ = spawner.cancel_agent(&aid, "user-requested via Ctrl+G x").await;
+            let _ = spawner
+                .cancel_agent(&aid, "user-requested via Ctrl+G x")
+                .await;
         });
         dispatched = true;
     }

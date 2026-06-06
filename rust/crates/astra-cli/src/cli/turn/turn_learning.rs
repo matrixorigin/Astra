@@ -1,3 +1,5 @@
+//! Learning and feedback snapshots captured around a turn.
+
 use super::*;
 use crate::StreamResult;
 

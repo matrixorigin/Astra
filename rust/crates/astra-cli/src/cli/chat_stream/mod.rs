@@ -14,8 +14,6 @@ mod sse_loop;
 
 #[cfg(test)]
 mod tests;
-#[allow(unused_imports)]
-pub use astra_services::session_journal;
 
 pub(crate) use edge_executor::edge_executor_instance_id;
 #[cfg(test)]

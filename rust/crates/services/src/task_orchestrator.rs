@@ -989,7 +989,9 @@ impl TaskService for MatrixOneTaskService {
         .await
         .map_err(|e| format!("update_progress: {e}"))?;
         if result.rows_affected() == 0 {
-            return self.report_terminal_guard_violation(task_id, "progress").await;
+            return self
+                .report_terminal_guard_violation(task_id, "progress")
+                .await;
         }
         Ok(())
     }
@@ -1001,14 +1003,20 @@ impl TaskService for MatrixOneTaskService {
     ) -> Result<(), String> {
         let ckpt_json =
             serde_json::to_string(checkpoint).map_err(|e| format!("serialize ckpt: {e}"))?;
-        sqlx::query(
-            "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&ckpt_json)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_checkpoint: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self
+                .report_terminal_guard_violation(task_id, "checkpoint")
+                .await;
+        }
         Ok(())
     }
 
@@ -1018,8 +1026,9 @@ impl TaskService for MatrixOneTaskService {
         let done = plan.items_done();
         let total = plan.subtasks.len() as i32;
 
-        sqlx::query(
-            "UPDATE agent_tasks SET plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&plan_json)
         .bind(progress as i32)
@@ -1029,6 +1038,9 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("update_plan: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self.report_terminal_guard_violation(task_id, "plan").await;
+        }
         Ok(())
     }
 
@@ -1044,7 +1056,9 @@ impl TaskService for MatrixOneTaskService {
         .await
         .map_err(|e| format!("fail_task: {e}"))?;
         if result.rows_affected() == 0 {
-            return self.report_terminal_guard_violation(task_id, "failed").await;
+            return self
+                .report_terminal_guard_violation(task_id, "failed")
+                .await;
         }
         let preview: String = error.chars().take(200).collect();
         tracing::warn!(
@@ -1078,7 +1092,9 @@ impl TaskService for MatrixOneTaskService {
         .await
         .map_err(|e| format!("complete_task_with_outcome: {e}"))?;
         if result.rows_affected() == 0 {
-            return self.report_terminal_guard_violation(task_id, "completed").await;
+            return self
+                .report_terminal_guard_violation(task_id, "completed")
+                .await;
         }
         tracing::info!(
             target: "astra_services::task_orchestrator",
@@ -1112,7 +1128,9 @@ impl TaskService for MatrixOneTaskService {
         .await
         .map_err(|e| format!("complete_plan_run: {e}"))?;
         if result.rows_affected() == 0 {
-            return self.report_terminal_guard_violation(task_id, "completed").await;
+            return self
+                .report_terminal_guard_violation(task_id, "completed")
+                .await;
         }
         tracing::info!(
             target: "astra_services::task_orchestrator",
@@ -1656,6 +1674,13 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() && record.status != status {
+            return Err(format!(
+                "invalid task status transition: {} → {} (terminal states are immutable)",
+                record.status.as_str(),
+                status.as_str()
+            ));
+        }
         record.status = status;
         record.updated_at = chrono::Utc::now().to_rfc3339();
         if status.is_terminal() {
@@ -1695,6 +1720,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "cannot save checkpoint on terminal task {task_id} (status={})",
+                record.status.as_str()
+            ));
+        }
         record.checkpoint = Some(checkpoint.clone());
         record.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_task(&record)
@@ -1704,6 +1735,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "cannot update plan on terminal task {task_id} (status={})",
+                record.status.as_str()
+            ));
+        }
         record.progress_pct = plan.progress_pct();
         record.items_done = plan.items_done();
         record.items_total = plan.subtasks.len() as u32;
@@ -2619,7 +2656,10 @@ mod tests {
         let err = svc
             .complete_task_with_outcome(&tid, TaskOutcome::Success)
             .await;
-        assert!(err.is_err(), "complete_task_with_outcome on failed must error");
+        assert!(
+            err.is_err(),
+            "complete_task_with_outcome on failed must error"
+        );
         let err = svc
             .complete_plan_run(&tid, 100, 1, 1, TaskOutcome::Success)
             .await;
@@ -2671,14 +2711,51 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.update_status(&tid, TaskStatus::Cancelled).await.unwrap();
+        svc.update_status(&tid, TaskStatus::Cancelled)
+            .await
+            .unwrap();
 
         assert!(svc.fail_task(&tid, "late").await.is_err());
         assert!(svc.complete_task(&tid).await.is_err());
         assert!(svc.update_progress(&tid, 1, 1, 1).await.is_err());
+        assert!(
+            svc.update_status(&tid, TaskStatus::InProgress)
+                .await
+                .is_err()
+        );
+        assert!(
+            svc.save_checkpoint(
+                &tid,
+                &TaskCheckpoint {
+                    active_subtask_id: Some("late".into()),
+                    turn: 99,
+                    session_id: Some("s".into()),
+                    state: serde_json::Map::new(),
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            svc.update_plan(
+                &tid,
+                &TaskPlan {
+                    subtasks: vec![SubtaskPlan {
+                        id: "late".into(),
+                        title: "late mutation".into(),
+                        ..Default::default()
+                    }],
+                    notes: Some("late".into()),
+                },
+            )
+            .await
+            .is_err()
+        );
 
         let after = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(after.status, TaskStatus::Cancelled);
+        assert!(after.checkpoint.is_none());
+        assert!(after.plan.is_none());
     }
 
     #[tokio::test]
@@ -3703,6 +3780,37 @@ mod tests {
             fn_body.contains("invalid task status transition"),
             "update_status must reject invalid transitions with descriptive error"
         );
+    }
+
+    fn matrixone_task_service_method_source<'a>(source: &'a str, name: &str) -> &'a str {
+        let impl_start = source
+            .find("impl TaskService for MatrixOneTaskService")
+            .expect("MatrixOneTaskService impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find(&format!("async fn {name}"))
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        let fn_end = impl_source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        &impl_source[fn_start..fn_end]
+    }
+
+    #[test]
+    fn matrixone_checkpoint_and_plan_updates_use_terminal_guards() {
+        let source = include_str!("task_orchestrator.rs");
+        for method in ["save_checkpoint", "update_plan"] {
+            let fn_body = matrixone_task_service_method_source(source, method);
+            assert!(
+                fn_body.contains("status NOT IN ('completed', 'failed', 'cancelled')"),
+                "{method} must use atomic terminal-state guard"
+            );
+            assert!(
+                fn_body.contains("report_terminal_guard_violation"),
+                "{method} must surface terminal-state guard violations"
+            );
+        }
     }
 
     /// P2-C: progress_pct must only count Completed subtasks, not Failed/Cancelled.

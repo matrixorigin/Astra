@@ -1,3 +1,5 @@
+//! Cancellation drain helpers for interrupted turn streams.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

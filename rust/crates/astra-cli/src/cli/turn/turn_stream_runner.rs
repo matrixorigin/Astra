@@ -1,3 +1,5 @@
+//! Run a turn stream and collect the raw stream result.
+
 use super::turn_cancellation::drain_after_cancel;
 use super::*;
 use std::sync::Arc;

@@ -721,10 +721,17 @@ pub(crate) fn initialize_session_state(
 }
 
 fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> {
-    let session_id = crate::cli::cli_utils::local_resumable_last_session_id(cli_profile)?;
+    let session_id = crate::cli::cli_utils::stored_last_session_id(cli_profile)?;
     match astra_services::session_workspace::read_workspace_optional(&session_id) {
-        Ok(Some(workspace)) => workspace_matches_current_project(&workspace).then_some(session_id),
-        Ok(None) => Some(session_id),
+        Ok(Some(workspace)) => {
+            if workspace.status.eq_ignore_ascii_case("completed") {
+                return None;
+            }
+            workspace_matches_current_project(&workspace).then_some(session_id)
+        }
+        Ok(None) => {
+            crate::cli::cli_utils::local_session_is_resumable(&session_id).then_some(session_id)
+        }
         Err(error) => {
             eprintln!(
                 "  ⚠ workspace read failed while checking pending recovery for {session_id}: {error}"
@@ -1264,7 +1271,7 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::tests::isolate_credentials;
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};

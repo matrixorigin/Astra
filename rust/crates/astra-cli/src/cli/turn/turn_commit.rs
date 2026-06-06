@@ -1,3 +1,5 @@
+//! Durable turn commit: journal, workspace, checkpoint, and sidecar persistence.
+
 use std::time::Instant;
 
 use super::turn_learning::TurnLearningSnapshot;
@@ -19,12 +21,35 @@ fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &s
     }
 }
 
-pub(crate) fn stall_type_confidence(stall_type: &str) -> f64 {
-    match stall_type {
-        "sig_stall" => 1.0,
-        s if s == "skill_lockout" || s.starts_with("skill_lockout:") => 1.0,
-        _ => 0.0,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnStallType<'a> {
+    SignalStall,
+    SkillLockout { skill: Option<&'a str> },
+    Other,
+}
+
+impl<'a> TurnStallType<'a> {
+    fn parse(raw: &'a str) -> Self {
+        match raw {
+            "sig_stall" => Self::SignalStall,
+            "skill_lockout" => Self::SkillLockout { skill: None },
+            value => value
+                .strip_prefix("skill_lockout:")
+                .map(|skill| Self::SkillLockout { skill: Some(skill) })
+                .unwrap_or(Self::Other),
+        }
     }
+
+    fn confidence(self) -> f64 {
+        match self {
+            Self::SignalStall | Self::SkillLockout { .. } => 1.0,
+            Self::Other => 0.0,
+        }
+    }
+}
+
+pub(crate) fn stall_type_confidence(stall_type: &str) -> f64 {
+    TurnStallType::parse(stall_type).confidence()
 }
 
 fn rewrite_workspace_persistence_error(
@@ -371,7 +396,7 @@ fn merge_interruption_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::turn_learning::analyze_chat_turn_learning;
+    use crate::cli::turn::turn_learning::analyze_chat_turn_learning;
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();

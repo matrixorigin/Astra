@@ -1,3 +1,5 @@
+//! Session-not-found retry preparation and state cleanup.
+
 use astra_turn_core::chat_turn_heuristics::is_session_not_found_error;
 
 use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::project_instructions::format_project_instructions;
 use astra_turn_core::input_classifier;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +181,7 @@ pub(crate) fn build_effective_line_with_attachment(
     }
 
     if let Some(project_instructions) = state.project_instructions.as_ref() {
-        let block = crate::format_project_instructions(project_instructions);
+        let block = format_project_instructions(project_instructions);
         effective_line = format!("{block}\n\n{effective_line}");
     }
 
@@ -207,6 +208,7 @@ pub(crate) fn is_low_information_followup(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::session::session_state::SkillDevState;
 
     #[test]
     fn detect_correction_signal_handles_english_and_chinese_redirects() {
@@ -321,7 +323,7 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(crate::cli::SkillDevState {
+            skill_dev: Some(SkillDevState {
                 name: "test-skill".to_string(),
                 dir: skill_dir,
             }),
@@ -352,7 +354,7 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(crate::cli::SkillDevState {
+            skill_dev: Some(SkillDevState {
                 name: "evolving".to_string(),
                 dir: skill_dir.clone(),
             }),
@@ -384,7 +386,7 @@ mod tests {
     #[test]
     fn build_effective_line_skill_dev_missing_file_falls_through() {
         let state = SessionState {
-            skill_dev: Some(crate::cli::SkillDevState {
+            skill_dev: Some(SkillDevState {
                 name: "ghost".to_string(),
                 dir: std::path::PathBuf::from("/nonexistent/path/ghost"),
             }),
@@ -404,7 +406,7 @@ mod tests {
         std::fs::write(skill_dir.join("SKILL.md"), "").unwrap();
 
         let state = SessionState {
-            skill_dev: Some(crate::cli::SkillDevState {
+            skill_dev: Some(SkillDevState {
                 name: "empty-skill".to_string(),
                 dir: skill_dir,
             }),
@@ -428,7 +430,7 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(crate::cli::SkillDevState {
+            skill_dev: Some(SkillDevState {
                 name: "custom-loc".to_string(),
                 dir: skill_dir.clone(),
             }),
@@ -456,7 +458,7 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(crate::cli::SkillDevState {
+            skill_dev: Some(SkillDevState {
                 name: "combo".to_string(),
                 dir: skill_dir,
             }),

@@ -1,3 +1,5 @@
+//! Successful turn state application and persistence preparation.
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -314,6 +316,7 @@ fn apply_turn_success_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::session::session_state::PersistedAdaptiveState;
 
     #[derive(Default)]
     struct CollectingUi;

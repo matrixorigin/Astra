@@ -98,7 +98,7 @@ pub const AGENT_RESULT_INTERRUPTED_ERROR: &str =
     "Agent did not return a final result before it was interrupted.";
 
 pub fn project_agent_tool_wire<'a>(
-    action: &str,
+    _action: &str,
     outer_tool_success: bool,
     parsed: Option<&'a Value>,
 ) -> AgentToolWireProjection<'a> {
@@ -122,9 +122,8 @@ pub fn project_agent_tool_wire<'a>(
         Some(AgentToolResultStatusKind::StillRunning | AgentToolResultStatusKind::Launched) => {
             AgentToolWireOutcomeKind::Running
         }
-        _ if outer_tool_success && (has_result || action == "get_result" || action == "agent") => {
-            AgentToolWireOutcomeKind::Completed
-        }
+        Some(AgentToolResultStatusKind::Other) => AgentToolWireOutcomeKind::Failed,
+        _ if outer_tool_success && has_result => AgentToolWireOutcomeKind::Completed,
         _ if !outer_tool_success => AgentToolWireOutcomeKind::Failed,
         _ => AgentToolWireOutcomeKind::NoChange,
     };
@@ -488,6 +487,14 @@ mod tests {
         let legacy = json!({"agent_id": "a1", "result": "done"});
         let projection = project_agent_tool_wire("get_result", true, Some(&legacy));
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Completed);
+
+        let empty_success = json!({"agent_id": "a1"});
+        let projection = project_agent_tool_wire("get_result", true, Some(&empty_success));
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
+
+        let unknown_status = json!({"status": "mystery", "agent_id": "a1"});
+        let projection = project_agent_tool_wire("get_result", true, Some(&unknown_status));
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
 
         let tool_failed = project_agent_tool_wire("spawn", false, None);
         assert_eq!(tool_failed.outcome, AgentToolWireOutcomeKind::Failed);

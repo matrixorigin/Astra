@@ -1,3 +1,5 @@
+//! Convert stream outcomes into committed turn state transitions.
+
 use std::time::Instant;
 
 use super::turn_cancellation::apply_user_cancelled_turn;

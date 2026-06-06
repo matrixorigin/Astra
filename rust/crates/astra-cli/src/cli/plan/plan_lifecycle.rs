@@ -1,6 +1,7 @@
 use astra_runtime::plan;
 use serde_json::Value;
 
+use crate::cli::cli_config::cli_utils::persist_profile_last_session;
 use crate::cli::session::session_runtime;
 use astra_services::session_journal;
 
@@ -44,7 +45,7 @@ fn bind_state_to_session(state: &mut crate::SessionState, profile: Option<&str>,
     if state.session_id.as_deref() == Some(session_id) {
         return;
     }
-    if let Err(error) = crate::persist_profile_last_session(profile, session_id) {
+    if let Err(error) = persist_profile_last_session(profile, session_id) {
         tracing::warn!(
             session_id,
             error = %error,

@@ -68,7 +68,7 @@ pub struct SessionSubtask {
     pub owner: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionTaskStatusKind {
     InProgress,
@@ -79,7 +79,7 @@ pub enum SessionTaskStatusKind {
     Archived,
     Deleted,
     /// Unknown status from external sources (DB, API).
-    #[serde(other, skip_serializing)]
+    #[serde(skip_serializing)]
     Other,
 }
 
@@ -210,6 +210,16 @@ impl std::fmt::Display for SessionTaskStatusKind {
 impl From<&str> for SessionTaskStatusKind {
     fn from(s: &str) -> Self {
         Self::from_status_str(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SessionTaskStatusKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let status = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::from_status_str(&status))
     }
 }
 
@@ -1612,6 +1622,12 @@ mod tests {
             SessionTaskStatusKind::from_status_str("paused"),
             SessionTaskStatusKind::Other
         );
+    }
+
+    #[test]
+    fn session_task_status_deserialize_unknown_uses_warned_parser() {
+        let parsed: SessionTaskStatusKind = serde_json::from_str("\"paused\"").unwrap();
+        assert_eq!(parsed, SessionTaskStatusKind::Other);
     }
 
     #[test]

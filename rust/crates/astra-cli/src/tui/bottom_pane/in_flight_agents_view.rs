@@ -544,7 +544,10 @@ mod tests {
             v.handle_key(key(KeyCode::Char('x')));
             v.handle_key(key(KeyCode::Down));
         }
-        assert!(!v.is_complete(), "x on terminal rows must not complete view");
+        assert!(
+            !v.is_complete(),
+            "x on terminal rows must not complete view"
+        );
         assert!(v.take_pending_action().is_none());
     }
 

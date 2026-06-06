@@ -179,12 +179,9 @@ mod tests {
         let message = "please inspect the current changes";
         let task_profile = infer_task_execution_profile(message);
 
-        let judge = FixedJudge::err(TurnIntentJudgeError::Transport(
-            "connection reset".into(),
-        ));
+        let judge = FixedJudge::err(TurnIntentJudgeError::Transport("connection reset".into()));
         let out =
-            judge_turn_intent_with_llm_fallback(&judge, message, task_profile, 1, &[], false)
-                .await;
+            judge_turn_intent_with_llm_fallback(&judge, message, task_profile, 1, &[], false).await;
         let intent = out.expect("fallback must produce an intent");
         assert_eq!(
             intent.requested_scenario,
@@ -201,8 +198,7 @@ mod tests {
             raw: "garbled".into(),
         });
         let out =
-            judge_turn_intent_with_llm_fallback(&judge, message, task_profile, 2, &[], true)
-                .await;
+            judge_turn_intent_with_llm_fallback(&judge, message, task_profile, 2, &[], true).await;
         let intent = out.expect("fallback must produce an intent");
         assert_eq!(intent.requested_scenario, Some(Scenario::Debugging));
     }
@@ -216,14 +212,12 @@ mod tests {
         let task_profile = infer_task_execution_profile(message);
         let judge = FixedJudge::err(TurnIntentJudgeError::Rejected("no model".into()));
         let out =
-            judge_turn_intent_with_llm_fallback(&judge, message, task_profile, 1, &[], false)
-                .await;
+            judge_turn_intent_with_llm_fallback(&judge, message, task_profile, 1, &[], false).await;
         assert!(
             out.is_none(),
             "with no keyword signal, judge failure must return None, got {out:?}"
         );
     }
-
 
     #[test]
     fn infers_code_review_for_change_inspection() {

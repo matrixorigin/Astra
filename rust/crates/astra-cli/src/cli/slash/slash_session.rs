@@ -5482,28 +5482,27 @@ pub(crate) async fn restore_session_into_state(
     api: &astra_thin_client::ThinClient,
     state: &mut SessionState,
 ) -> Result<(), String> {
-    if matches!(
-        preflight_remote_resume_session(api, profile, session_id).await,
-        SessionResumePreflight::Missing
-    ) {
-        clear_profile_last_session_if_matches_or_warn(
-            profile,
-            session_id,
-            "slash_session:restore_session_snapshot",
-        );
-        return Err(format!(
-            "Session {session_id} no longer exists on the server and cannot be resumed for new chat turns."
-        ));
-    }
-
     let restored =
         session_restore_client::restore_session_snapshot_with_client(profile, api, session_id)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "Session {session_id} has no resumable workspace/checkpoint state. Use /resume to inspect available sessions."
-            )
-        })?;
+            .await?;
+    let Some(restored) = restored else {
+        if matches!(
+            preflight_remote_resume_session(api, profile, session_id).await,
+            SessionResumePreflight::Missing
+        ) {
+            clear_profile_last_session_if_matches_or_warn(
+                profile,
+                session_id,
+                "slash_session:restore_session_snapshot",
+            );
+            return Err(format!(
+                "Session {session_id} no longer exists on the server and has no local resumable state."
+            ));
+        }
+        return Err(format!(
+            "Session {session_id} has no resumable workspace/checkpoint state. Use /resume to inspect available sessions."
+        ));
+    };
     apply_restored_session(profile, api, state, restored).await
 }
 
@@ -7009,7 +7008,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_rejects_stale_remote_session_before_local_restore() {
+    async fn restore_session_into_state_prefers_local_state_over_stale_remote_preflight() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-stale-{}", uuid::Uuid::new_v4());
@@ -7028,13 +7027,57 @@ mod resume_tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState::default();
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .expect(
+                "local journal/workspace should restore even when cloud no longer has the session",
+            );
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 3);
+        assert_eq!(
+            crate::cli::cli_utils::load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(session_id.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_session_into_state_clears_cloud_only_stale_pointer() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-cloud-stale-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "Session not found"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "Session not found"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
         let err = restore_session_into_state(&session_id, None, &api, &mut state)
             .await
-            .unwrap_err();
+            .expect_err("cloud-only stale session should fail");
 
-        assert!(err.contains("no longer exists on the server"), "got: {err}");
+        assert!(err.contains("has no local resumable state"), "got: {err}");
         assert_eq!(state.session_id, None);
-        assert_eq!(state.turn, 0);
         assert_eq!(
             crate::cli::cli_utils::load_credentials()
                 .profiles

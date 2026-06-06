@@ -37,7 +37,6 @@ pub(crate) struct AgentControlSurface<'a> {
     display_name_hint: Option<&'a str>,
     cancelled_reason: Option<&'a str>,
     is_result_wait: bool,
-    has_result: bool,
     outcome: AgentControlOutcome,
 }
 
@@ -73,7 +72,6 @@ impl<'a> AgentControlSurface<'a> {
             display_name_hint: projection.display_name_hint,
             cancelled_reason: projection.cancelled_reason,
             is_result_wait,
-            has_result: projection.has_result,
             outcome,
         }
     }
@@ -136,11 +134,6 @@ impl<'a> AgentControlSurface<'a> {
     pub(crate) fn running_preview(&self) -> Option<String> {
         self.parsed.and_then(agent_control_running_preview)
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn has_result(&self) -> bool {
-        self.has_result
-    }
 }
 
 #[cfg(test)]
@@ -186,6 +179,29 @@ mod tests {
             surface.failure_message().as_deref(),
             Some("agent control tool failed")
         );
+    }
+
+    #[test]
+    fn empty_success_get_result_does_not_complete_agent() {
+        let parsed = parse(r#"{"agent_id":"reviewer@abc"}"#);
+        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        assert_eq!(surface.outcome(), AgentControlOutcome::NoChange);
+        assert!(!surface.is_terminal());
+        assert_eq!(
+            surface.cancelled_state_update(),
+            CancelledStateUpdate::Preserve
+        );
+    }
+
+    #[test]
+    fn unknown_wire_status_fails_closed() {
+        let parsed = parse(r#"{"status":"mystery","agent_id":"reviewer@abc"}"#);
+        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        assert_eq!(
+            surface.outcome(),
+            AgentControlOutcome::Failed(AgentControlFailureKind::AgentFailed)
+        );
+        assert!(surface.is_terminal());
     }
 
     #[test]

@@ -656,6 +656,24 @@ mod tests {
     }
 
     #[test]
+    fn csl_max_seq_reader_is_streaming_not_whole_file() {
+        let source = include_str!("csl.rs");
+        let fn_start = source
+            .find("fn read_max_seq_from_log")
+            .expect("read_max_seq_from_log should exist");
+        let fn_body: String = source[fn_start..].chars().take(500).collect();
+
+        assert!(
+            fn_body.contains("BufReader"),
+            "read_max_seq_from_log should scan incrementally"
+        );
+        assert!(
+            !fn_body.contains("read_to_string"),
+            "read_max_seq_from_log must not load the full CSL log"
+        );
+    }
+
+    #[test]
     fn with_workspace_lock_releases_lock_after_panic() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("workspace-lock-{}", uuid::Uuid::new_v4());

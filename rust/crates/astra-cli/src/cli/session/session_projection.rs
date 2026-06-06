@@ -410,7 +410,7 @@ mod tests {
     use super::*;
     use crate::StreamResult;
     use crate::cli::session_input::build_effective_line;
-    use crate::cli::turn_reporting::build_history_text;
+    use crate::cli::turn::turn_reporting::build_history_text;
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();

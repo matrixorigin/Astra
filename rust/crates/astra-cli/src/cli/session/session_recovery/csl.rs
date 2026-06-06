@@ -105,15 +105,17 @@ pub(crate) async fn rebuild_csl_from_history(
 /// to parse (corruption, partial writes) are skipped — they cannot constrain
 /// the new high-water mark anyway since they are unreadable.
 fn read_max_seq_from_log(path: &std::path::Path) -> u64 {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return 0;
     };
+    use std::io::BufRead;
     let mut max_seq = 0u64;
-    for line in text.lines() {
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str::<astra_turn_core::conversation_log::CslEntry>(line)
+        if let Ok(entry) =
+            serde_json::from_str::<astra_turn_core::conversation_log::CslEntry>(&line)
         {
             max_seq = max_seq.max(entry.seq());
         }

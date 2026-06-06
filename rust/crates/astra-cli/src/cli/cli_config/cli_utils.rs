@@ -141,14 +141,14 @@ pub(crate) fn local_session_is_resumable(session_id: &str) -> bool {
                 %error,
                 "failed to read workspace metadata while checking local resumability"
             );
-            if !journal_exists {
-                return true;
-            }
             None
         }
     };
 
     if !journal_exists {
+        if has_heavy_checkpoint {
+            return true;
+        }
         return workspace
             .as_ref()
             .is_some_and(|ws| !ws.status.eq_ignore_ascii_case("completed"));
@@ -168,7 +168,7 @@ pub(crate) fn local_resumable_last_session_id(cli_profile: Option<&str>) -> Opti
     stored_last_session_id(cli_profile).filter(|session_id| local_session_is_resumable(session_id))
 }
 
-fn stored_last_session_id(cli_profile: Option<&str>) -> Option<String> {
+pub(crate) fn stored_last_session_id(cli_profile: Option<&str>) -> Option<String> {
     let creds = load_credentials();
     let name = profile_name(cli_profile, &creds);
     let session_id = creds
@@ -355,6 +355,9 @@ pub(crate) async fn validated_resumable_last_session_id(
         SessionResumePreflight::Valid | SessionResumePreflight::Unknown => Some(session_id),
         SessionResumePreflight::NoAuth => {
             local_resumable_last_session_id(cli_profile).filter(|local| local == &session_id)
+        }
+        SessionResumePreflight::Missing if local_session_is_resumable(&session_id) => {
+            Some(session_id)
         }
         SessionResumePreflight::Missing => {
             clear_profile_last_session_if_matches_or_warn(
@@ -1064,12 +1067,12 @@ mod tests {
     fn astra_session_auth_error_matches_session_specific_failures() {
         let msg =
             "request failed (401): invalid token\n  Hint: Authentication required — try /login";
-        assert!(crate::is_astra_session_auth_error(msg));
+        assert!(is_astra_session_auth_error(msg));
     }
 
     #[test]
     fn astra_session_auth_error_ignores_generic_upstream_401s() {
-        assert!(!crate::is_astra_session_auth_error(
+        assert!(!is_astra_session_auth_error(
             "GitHub API Error: 401 Unauthorized"
         ));
     }
@@ -1324,7 +1327,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn local_resumable_last_session_id_keeps_workspace_only_corrupt_session() {
+    fn local_resumable_last_session_id_ignores_unreadable_workspace_without_replay_state() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
@@ -1344,9 +1347,10 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        assert_eq!(
-            local_resumable_last_session_id(None).as_deref(),
-            Some(sid.as_str())
+        assert_eq!(local_resumable_last_session_id(None), None);
+        assert!(
+            !local_session_is_resumable(&sid),
+            "corrupt workspace without journal/checkpoint must not create a fake resumable session"
         );
     }
 
@@ -1483,7 +1487,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn validated_resumable_last_session_id_drops_stale_404_session() {
+    async fn validated_resumable_last_session_id_keeps_local_state_when_remote_404s() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("stale-session-{}", uuid::Uuid::new_v4());
@@ -1502,13 +1506,13 @@ mod tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let resolved = validated_resumable_last_session_id(&api, None).await;
-        assert_eq!(resolved, None);
+        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
         assert_eq!(
             load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
-            None
+            Some(session_id.as_str())
         );
     }
 
@@ -1680,7 +1684,7 @@ mod tests {
     #[test]
     fn git_snapshot_returns_head_and_branch_in_git_repo() {
         // This test runs inside the astra git repo, so both should be Some.
-        let (head, _branch) = crate::git_snapshot(None);
+        let (head, _branch) = git_snapshot(None);
         assert!(
             head.is_some(),
             "git_snapshot must return Some(head) inside a git repo"
@@ -1702,8 +1706,8 @@ mod tests {
     fn git_snapshot_with_explicit_cwd_matches_none() {
         // Passing the current dir explicitly should give the same result as None.
         let cwd = std::env::current_dir().unwrap();
-        let (head_none, branch_none) = crate::git_snapshot(None);
-        let (head_cwd, branch_cwd) = crate::git_snapshot(Some(cwd.to_str().unwrap()));
+        let (head_none, branch_none) = git_snapshot(None);
+        let (head_cwd, branch_cwd) = git_snapshot(Some(cwd.to_str().unwrap()));
         assert_eq!(head_none, head_cwd, "explicit cwd must match implicit cwd");
         assert_eq!(
             branch_none, branch_cwd,
@@ -1714,7 +1718,7 @@ mod tests {
     #[test]
     fn git_snapshot_with_non_git_dir_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let (head, branch) = crate::git_snapshot(Some(tmp.path().to_str().unwrap()));
+        let (head, branch) = git_snapshot(Some(tmp.path().to_str().unwrap()));
         assert!(
             head.is_none(),
             "non-git dir must return None for head, got {head:?}"

@@ -2664,7 +2664,7 @@ mod tests {
         state.model = Some("gpt-5".to_string());
         state.turn = 3;
         state.history.push(("hi".into(), "hello".into()));
-        let out = crate::render_whoami(&state);
+        let out = render_whoami(&state);
         assert!(out.contains("session_id     : sess-abc"), "got: {out}");
         assert!(out.contains("model          : gpt-5"), "got: {out}");
         assert!(out.contains("turn           : 3"), "got: {out}");
@@ -2684,7 +2684,7 @@ mod tests {
                 skill_path: std::path::PathBuf::from("/tmp/git-flow"),
                 improvements: vec![],
             });
-        let out = crate::render_whoami(&state);
+        let out = render_whoami(&state);
         assert!(out.contains("pending_improve: git-flow"), "got: {out}");
     }
 
@@ -2692,7 +2692,7 @@ mod tests {
     fn render_cognition_reports_recent_tools_and_proposal_counts() {
         let mut state = SessionState::default();
         state.recent_tools = vec!["bash".into(), "read_file".into()];
-        let out = crate::render_cognition(&state);
+        let out = render_cognition(&state);
         assert!(
             out.contains("recent_tools     : bash, read_file"),
             "got: {out}"

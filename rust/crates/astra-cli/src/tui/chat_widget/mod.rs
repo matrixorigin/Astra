@@ -1475,6 +1475,11 @@ impl ChatWidget {
         if is_task_like_tool(&name) {
             self.in_flight_task_ids.retain(|s| s != &tool_use_id);
             self.cancelling_task_ids.remove(&tool_use_id);
+            if name == "agent"
+                && let Some(agent_cell) = self.agent_runs.get_mut(&tool_use_id)
+            {
+                agent_cell.complete(&status, duration_ms, output_summary.clone(), output.clone());
+            }
             // Multi-slot path: finalize and commit just THIS agent,
             // leaving other parallel agents live and undisturbed.
             if let Some(mut tc) = self.live_tasks.remove(&tool_use_id) {

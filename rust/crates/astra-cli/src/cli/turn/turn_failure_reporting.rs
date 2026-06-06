@@ -1,3 +1,5 @@
+//! User-facing and stateful failure reporting for failed turns.
+
 use std::time::Instant;
 
 use super::*;

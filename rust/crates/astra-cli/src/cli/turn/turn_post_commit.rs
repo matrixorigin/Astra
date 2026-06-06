@@ -1,3 +1,5 @@
+//! Post-commit side effects that run after the primary turn is durable.
+
 use std::time::Instant;
 
 use crate::StreamResult;

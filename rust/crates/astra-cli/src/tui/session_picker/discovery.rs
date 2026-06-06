@@ -64,17 +64,18 @@ impl SessionSource for FsSessionSource {
         ids.into_iter()
             .filter_map(|sid| {
                 let peek = session_journal::peek_session_meta(&sid);
-                let workspace = match session_workspace::read_workspace_optional(&sid) {
-                    Ok(workspace) => workspace,
-                    Err(error) => {
-                        tracing::warn!(
-                            "session picker failed to read workspace for {}: {}",
-                            sid,
-                            error
-                        );
-                        None
-                    }
-                };
+                let (workspace, workspace_fallback_cwd) =
+                    match session_workspace::read_workspace_optional(&sid) {
+                        Ok(workspace) => (workspace, "(journal only)"),
+                        Err(error) => {
+                            tracing::warn!(
+                                "session picker failed to read workspace for {}: {}",
+                                sid,
+                                error
+                            );
+                            (None, "(workspace metadata unreadable)")
+                        }
+                    };
                 let cost_usd = transcript_cost_usd(&sid);
                 workspace
                     .map(|ws| SessionEntry {
@@ -99,7 +100,7 @@ impl SessionSource for FsSessionSource {
                     .or_else(|| {
                         peek.map(|peek| SessionEntry {
                             id: sid.clone(),
-                            cwd: "(workspace unavailable)".to_string(),
+                            cwd: workspace_fallback_cwd.to_string(),
                             git_branch: None,
                             git_head: None,
                             turn_count: session_journal::count_turns(&sid),
@@ -490,7 +491,43 @@ mod tests {
             assert_eq!(entry.status, "journal_only");
             assert_eq!(entry.summary.as_deref(), Some("resume me"));
             assert_eq!(entry.turn_count, 1);
-            assert_eq!(entry.cwd, "(workspace unavailable)");
+            assert_eq!(entry.cwd, "(workspace metadata unreadable)");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fs_source_labels_missing_workspace_as_journal_only() {
+        with_tmp_sessions_dir(|sessions_dir| {
+            let _guard = JournalDirGuard::new(sessions_dir);
+            let sid = "sessmeta-journal-only";
+            JournalWriter::new(sid)
+                .unwrap()
+                .append(&JournalEvent::session_start(Some(sid), Some("gpt-5")))
+                .unwrap();
+            JournalWriter::new(sid)
+                .unwrap()
+                .append(&JournalEvent::turn(
+                    Some(sid),
+                    1,
+                    Some("gpt-5"),
+                    "resume from journal",
+                    "done",
+                    0,
+                    10,
+                    20,
+                    30,
+                ))
+                .unwrap();
+
+            let entries = FsSessionSource::new().list(10);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == sid)
+                .expect("journal-only session still listed");
+            assert_eq!(entry.status, "journal_only");
+            assert_eq!(entry.cwd, "(journal only)");
+            assert_eq!(entry.summary.as_deref(), Some("resume from journal"));
         });
     }
 

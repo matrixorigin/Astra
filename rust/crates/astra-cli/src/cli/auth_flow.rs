@@ -118,6 +118,7 @@ pub(crate) async fn do_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::cli_config::cli_utils::{load_credentials, save_credentials};
 
     #[test]
     fn auth_error_predicates_distinguish_provider_from_session() {
@@ -146,7 +147,7 @@ mod tests {
     #[test]
     fn clear_profile_auth_clears_tokens_and_last_session() {
         let _creds_guard = crate::tests::isolate_credentials();
-        let mut creds = crate::load_credentials();
+        let mut creds = load_credentials();
         creds.profiles.insert(
             "default".to_string(),
             Profile {
@@ -157,11 +158,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::save_credentials(&creds).unwrap();
+        save_credentials(&creds).unwrap();
 
         clear_profile_auth(None).unwrap();
 
-        let creds = crate::load_credentials();
+        let creds = load_credentials();
         let profile = &creds.profiles["default"];
         assert_eq!(profile.access_token, None);
         assert_eq!(profile.refresh_token, None);

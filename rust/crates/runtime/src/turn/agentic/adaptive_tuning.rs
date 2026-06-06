@@ -1108,7 +1108,9 @@ mod tests {
         // calibrated form. Verify the false-positive cases now correctly
         // emit acceptance (they are NOT corrections).
         assert!(should_emit_acceptance("the answer is not 5"));
-        assert!(should_emit_acceptance("this looks wrong-shaped, fix the layout"));
+        assert!(should_emit_acceptance(
+            "this looks wrong-shaped, fix the layout"
+        ));
     }
 
     use crate::pipeline::routing::TaskType;

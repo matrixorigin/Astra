@@ -219,19 +219,17 @@ fn agent_status_to_progress_event(
         AgentStatus::Failed { error, .. } => Some(ProgressEventType::Failed {
             error: error.clone(),
         }),
-        AgentStatus::Cancelled { by_user, reason } => {
-            Some(ProgressEventType::Cancelled {
-                reason: if reason.is_empty() {
-                    if *by_user {
-                        "cancelled by user".to_string()
-                    } else {
-                        "cancelled".to_string()
-                    }
+        AgentStatus::Cancelled { by_user, reason } => Some(ProgressEventType::Cancelled {
+            reason: if reason.is_empty() {
+                if *by_user {
+                    "cancelled by user".to_string()
                 } else {
-                    reason.clone()
-                },
-            })
-        }
+                    "cancelled".to_string()
+                }
+            } else {
+                reason.clone()
+            },
+        }),
         AgentStatus::Initializing => None,
     }
 }
@@ -653,7 +651,10 @@ impl DynamicAgentSpawner {
     /// archives don't count, so a long-lived session never accumulates a
     /// permanent block.
     pub fn with_max_concurrent_agents(mut self, cap: usize) -> Self {
-        debug_assert!(cap > 0, "max_concurrent_agents=0 disables all spawns; pass None to disable the cap entirely");
+        debug_assert!(
+            cap > 0,
+            "max_concurrent_agents=0 disables all spawns; pass None to disable the cap entirely"
+        );
         self.max_concurrent_agents = Some(cap.max(1));
         self
     }
@@ -823,17 +824,6 @@ impl DynamicAgentSpawner {
             return Err(SpawnError::NestedForkInheritanceRejected);
         }
 
-        // Concurrency cap: refuse before any side effects (mailbox,
-        // executor, journal write, prefix resolve). Validating before
-        // side effects so a rejected spawn never leaves half-built
-        // state behind.
-        if let Some(limit) = self.max_concurrent_agents {
-            let active = self.active_agents.read().await.len();
-            if active >= limit {
-                return Err(SpawnError::ConcurrencyLimitExceeded { active, limit });
-            }
-        }
-
         // 1. Validate agent type
         let agent_def = self
             .agent_registry
@@ -912,7 +902,39 @@ impl DynamicAgentSpawner {
             });
         }
 
-        // 4. Register mailbox if named
+        // 4. Reserve active-agent capacity under the same write lock that
+        // inserts the agent. This closes the read-check/write-insert TOCTOU
+        // gap when several named/background spawns all await mailbox setup.
+        let permission_summary = build_permission_summary(context);
+        let state = SpawnedAgentState {
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            parent_run_id: context.parent_run_id.clone(),
+            agent_type: input.agent_type.clone(),
+            description: input.description.clone(),
+            status: AgentStatus::Initializing,
+            messaging_address: None,
+            worktree_path: None,
+            started_at: SystemTime::now(),
+            metrics: Default::default(),
+            permission_summary,
+            parent_agent_id: context.parent_agent_id.clone(),
+            trace_context: context.trace_context.clone(),
+            spawn_tool_call_id: context.spawn_tool_call_id.clone(),
+            run_in_background: input.run_in_background,
+        };
+        {
+            let mut active_agents = self.active_agents.write().await;
+            if let Some(limit) = self.max_concurrent_agents {
+                let active = active_agents.len();
+                if active >= limit {
+                    return Err(SpawnError::ConcurrencyLimitExceeded { active, limit });
+                }
+            }
+            active_agents.insert(agent_id.clone(), state);
+        }
+
+        // 5. Register mailbox if named
         let mailbox = if input.name.is_some() {
             let addr = AgentAddress::new(&run_id, &agent_id);
             let delegation_id = Some(context.parent_run_id.clone());
@@ -923,6 +945,7 @@ impl DynamicAgentSpawner {
             {
                 Ok(mb) => Some(mb),
                 Err(e) => {
+                    self.active_agents.write().await.remove(&agent_id);
                     return Err(SpawnError::MailboxRegistration(e.to_string()));
                 }
             }
@@ -949,14 +972,15 @@ impl DynamicAgentSpawner {
                 .await;
         }
 
-        // 5. Build permission summary
-        let permission_summary = build_permission_summary(context);
-
         // 5b. Create isolated worktree if requested
         let worktree_path = if input.isolated {
             match create_agent_worktree(&context.working_dir, &run_id) {
                 Ok(path) => Some(path),
                 Err(e) => {
+                    self.active_agents.write().await.remove(&agent_id);
+                    if let Some(addr) = messaging_address.as_ref() {
+                        let _ = self.mailbox_router.unregister(addr).await;
+                    }
                     return Err(SpawnError::WorktreeCreation(format!(
                         "failed to create worktree for {agent_id}: {e}"
                     )));
@@ -966,30 +990,15 @@ impl DynamicAgentSpawner {
             None
         };
 
-        // 6. Register state
-        let state = SpawnedAgentState {
-            agent_id: agent_id.clone(),
-            run_id: run_id.clone(),
-            parent_run_id: context.parent_run_id.clone(),
-            agent_type: input.agent_type.clone(),
-            description: input.description.clone(),
-            status: AgentStatus::Initializing,
-            messaging_address: messaging_address.clone(),
-            worktree_path: worktree_path.clone(),
-            started_at: SystemTime::now(),
-            metrics: Default::default(),
-            permission_summary,
-            parent_agent_id: context.parent_agent_id.clone(),
-            trace_context: context.trace_context.clone(),
-            spawn_tool_call_id: context.spawn_tool_call_id.clone(),
-            run_in_background: input.run_in_background,
+        let spawned_state_for_trace = {
+            let mut active_agents = self.active_agents.write().await;
+            let state = active_agents
+                .get_mut(&agent_id)
+                .expect("agent reservation must exist after successful reservation");
+            state.messaging_address = messaging_address.clone();
+            state.worktree_path = worktree_path.clone();
+            state.clone()
         };
-        let spawned_state_for_trace = state.clone();
-
-        self.active_agents
-            .write()
-            .await
-            .insert(agent_id.clone(), state);
         self.emit_agent_spawned_trace(&spawned_state_for_trace)
             .await;
 
@@ -1330,6 +1339,7 @@ impl DynamicAgentSpawner {
         error: Option<&str>,
     ) -> bool {
         self.background_abort_handles.write().await.remove(agent_id);
+        self.remove_background_agent_id(agent_id);
         let (state, messaging_address) = {
             let mut active_agents = self.active_agents.write().await;
             let Some(mut state) = active_agents.remove(agent_id) else {
@@ -1367,6 +1377,14 @@ impl DynamicAgentSpawner {
         self.archive_state(state).await;
         self.notify_completion(agent_id).await;
         true
+    }
+
+    fn remove_background_agent_id(&self, agent_id: &str) {
+        let mut ids = self
+            .background_agent_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ids.retain(|id| id != agent_id);
     }
 
     /// Persist final agent state to session journal (best-effort).
@@ -1626,22 +1644,11 @@ impl DynamicAgentSpawner {
         self.background_abort_handles.write().await.clear();
         self.completion_notifiers.write().await.clear();
 
-        // Collect results for all background-spawned agents.
-        let bg_ids: std::collections::HashSet<String> = self
-            .background_agent_ids
-            .lock()
-            .map(|ids| ids.iter().cloned().collect())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().iter().cloned().collect());
-
-        if bg_ids.is_empty() {
-            return Vec::new();
-        }
-
         self.completed_agents
             .read()
             .await
             .iter()
-            .filter(|s| bg_ids.contains(&s.agent_id))
+            .filter(|s| s.run_in_background)
             .filter_map(|s| {
                 if let AgentStatus::Completed { ref result, .. } = s.status {
                     Some((s.agent_id.clone(), result.clone()))
@@ -2874,6 +2881,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_named_spawns_reserve_capacity_atomically() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_max_concurrent_agents(1);
+        let context = make_bg_context();
+
+        let mut first = make_bg_input();
+        first.name = Some("named-a".to_string());
+        let mut second = make_bg_input();
+        second.name = Some("named-b".to_string());
+
+        let (left, right) = tokio::join!(
+            spawner.spawn(first, &context),
+            spawner.spawn(second, &context)
+        );
+
+        let launched = [left.as_ref(), right.as_ref()]
+            .into_iter()
+            .filter(|result| matches!(result, Ok(SpawnAgentOutput::Launched { .. })))
+            .count();
+        let rejected = [left.as_ref(), right.as_ref()]
+            .into_iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(SpawnError::ConcurrencyLimitExceeded {
+                        active: 1,
+                        limit: 1
+                    })
+                )
+            })
+            .count();
+        assert_eq!(launched, 1, "exactly one spawn should reserve capacity");
+        assert_eq!(rejected, 1, "the contending spawn must see the cap");
+
+        assert_eq!(
+            spawner.active_agents.read().await.len(),
+            1,
+            "capacity reservation must not allow active_agents to exceed the cap"
+        );
+
+        factory2.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
     async fn spawn_unlimited_when_no_cap_configured() {
         // No cap configured (the historical default) → never errors.
         let factory = BlockingExecutorFactory::new();
@@ -2902,10 +2959,7 @@ mod tests {
         struct FailingExecutor;
         #[async_trait]
         impl SpawnAgentExecutor for FailingExecutor {
-            async fn execute(
-                &self,
-                _config: SpawnRunConfig,
-            ) -> Result<SpawnRunResult, String> {
+            async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
                 Err("kaboom".into())
             }
         }
@@ -3121,10 +3175,7 @@ mod tests {
             1,
             "sync-mode finalize must archive into completed_agents"
         );
-        assert!(matches!(
-            completed[0].status,
-            AgentStatus::Completed { .. }
-        ));
+        assert!(matches!(completed[0].status, AgentStatus::Completed { .. }));
     }
 
     #[tokio::test]
@@ -3132,10 +3183,7 @@ mod tests {
         struct FailingExecutor;
         #[async_trait]
         impl SpawnAgentExecutor for FailingExecutor {
-            async fn execute(
-                &self,
-                _config: SpawnRunConfig,
-            ) -> Result<SpawnRunResult, String> {
+            async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
                 Err("kaboom".to_string())
             }
         }
@@ -3535,7 +3583,10 @@ mod tests {
             .wait_for_agent_outcome(&agent_id, std::time::Duration::from_millis(50))
             .await;
         assert!(
-            matches!(outcome, WaitForAgentOutcome::Status(AgentStatus::Completed { .. })),
+            matches!(
+                outcome,
+                WaitForAgentOutcome::Status(AgentStatus::Completed { .. })
+            ),
             "late waiter must see Completed terminal status, got {outcome:?}"
         );
     }
@@ -3692,6 +3743,14 @@ mod tests {
         assert!(
             spawner.active_agents.read().await.is_empty(),
             "active_agents must be empty after agent completes and is archived"
+        );
+        assert!(
+            spawner
+                .background_agent_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "background_agent_ids must not retain finalized agents"
         );
 
         // Agent should be in completed_agents instead.

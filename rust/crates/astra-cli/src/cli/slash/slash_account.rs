@@ -100,7 +100,7 @@ pub(crate) async fn handle_account_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
 
     #[serial_test::serial]
     #[tokio::test]
@@ -115,7 +115,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::save_credentials(&creds).unwrap();
+        save_credentials(&creds).unwrap();
 
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let mut state = crate::SessionState::default();
@@ -220,7 +220,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::save_credentials(&creds).unwrap();
+        save_credentials(&creds).unwrap();
 
         let mut state = crate::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
