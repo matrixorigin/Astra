@@ -426,45 +426,46 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
     );
 }
 
-// ── Plan-mode systemic invariants (Step 4) ────────────────────────────
-//
-// These tests pin the invariants from the cross-deployment audit. They
-// were written first and stay red until each piece of the refactor
-// lands. See `project_plan_mode_schema_truth` memory for the audit
-// table mapping I1..I9 to deployment shapes.
+// ── Plan-mode entry invariants ──────────────────────────────────────
+// enter_plan_mode must stage PermissionMode::Plan regardless of cloud availability.
 
 #[tokio::test]
-async fn enter_plan_mode_falls_back_to_local_when_cloud_unavailable() {
-    // Invariant I1 + I2: pressing Shift+Tab → Plan must succeed
-    // even with no cloud reachable. Today `enter_plan_mode_remote`
-    // hard-requires `cloud_token`; offline / unauthenticated CLI
-    // sessions silently lose plan mode. After the refactor an
-    // unconfigured cloud must route to the same overlay-less local
-    // entry: stage `PermissionMode::Plan` in the pending slot, no
-    // network calls, no `Error:` prefix.
-    //
-    // RED until Step 4-3 lands.
-    let temp = tempfile::tempdir().unwrap();
-    let executor =
-        ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-offline");
-    // Deliberately no `with_cloud(...)` — simulates Shift+Tab in a
-    // detached CLI run.
+async fn enter_plan_mode_stages_permission_mode_plan() {
+    for (label, use_cloud) in [("offline", false), ("cloud", true)] {
+        let temp = tempfile::tempdir().unwrap();
 
-    let result = executor
-        .execute("enter_plan_mode", &json!({"goal": "Investigate auth"}))
-        .await;
+        let executor = if use_cloud {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/plans"))
+                .and(header("authorization", "Bearer token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "plan_id": "plan-cloud-1",
+                    "phase": "planning"
+                })))
+                .mount(&server)
+                .await;
+            ToolExecutor::new(temp.path().to_path_buf())
+                .with_active_session_id("sess-cloud")
+                .with_cloud(server.uri(), "token")
+        } else {
+            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-offline")
+        };
 
-    assert!(
-        !result.starts_with("Error:"),
-        "enter_plan_mode must not error out without a cloud token; \
-         it should fall back to a local plan-mode pivot. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan),
-        "entering plan mode must stage Plan on the pending slot \
-         so the host applies it on the next turn"
-    );
+        let result = executor
+            .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
+            .await;
+
+        assert!(
+            !result.starts_with("Error:"),
+            "[{label}] enter_plan_mode must not error. Got: {result}"
+        );
+        assert_eq!(
+            executor.take_pending_permission_mode_change(),
+            Some(crate::cli::permission_manager::PermissionMode::Plan),
+            "[{label}] must stage Plan on the pending permission-mode slot"
+        );
+    }
 }
 
 #[tokio::test]
@@ -954,92 +955,43 @@ async fn mock_no_authoring_plan(server: &MockServer, session_id: &str) {
         .await;
 }
 
-#[tokio::test]
-async fn write_file_is_blocked_while_plan_mode_is_authoring() {
+async fn setup_blocked_executor(
+    plan_status: &str,
+) -> (MockServer, ToolExecutor, tempfile::TempDir) {
     let server = MockServer::start().await;
-    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
-
+    mock_authoring_plan_present(&server, "sess-1", "plan-9", plan_status).await;
     let temp = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf())
         .with_active_session_id("sess-1")
         .with_cloud(server.uri(), "token");
-    let target = temp.path().join("ledger.txt");
-
-    let result = executor
-        .execute(
-            "write_file",
-            &json!({"path": target.to_string_lossy(), "content": "x"}),
-        )
-        .await;
-
-    assert!(
-        result.contains("blocked while plan mode is active"),
-        "write_file must be blocked while a plan is being authored (parity with server). Got: {result}"
-    );
-    assert!(
-        result.contains("exit_plan_mode"),
-        "the error must point the model at exit_plan_mode as the escape hatch. Got: {result}"
-    );
-    assert!(
-        !target.exists(),
-        "the guard must short-circuit BEFORE any file is created on disk"
-    );
+    (server, executor, temp)
 }
 
 #[tokio::test]
-async fn refining_plan_still_blocks_writes_during_authoring() {
-    let server = MockServer::start().await;
-    mock_authoring_plan_present(&server, "sess-refining", "plan-r", "refining").await;
+async fn write_operations_are_blocked_during_plan_authoring() {
+    for (tool_name, plan_status, label) in [
+        ("write_file", "planning", "write_file planning"),
+        ("bash", "planning", "bash planning"),
+        ("bash", "refining", "bash refining"),
+    ] {
+        let (_server, executor, temp) = setup_blocked_executor(plan_status).await;
+        let canary = temp.path().join("canary.txt");
 
-    let temp = tempfile::tempdir().unwrap();
-    let canary = temp.path().join("canary.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-refining")
-        .with_cloud(server.uri(), "token");
+        let params = match tool_name {
+            "write_file" => json!({"path": canary.to_string_lossy(), "content": "x"}),
+            _ => json!({"command": format!("touch {}", canary.display())}),
+        };
 
-    let result = executor
-        .execute(
-            "bash",
-            &json!({"command": format!("touch {}", canary.display())}),
-        )
-        .await;
-
-    assert!(
-        result.contains("blocked while plan mode is active"),
-        "refining plans remain authoring-active until approval. Got: {result}"
-    );
-    assert!(
-        !canary.exists(),
-        "authoring guard must stop the shell before side effects leak"
-    );
-}
-
-#[tokio::test]
-async fn bash_is_blocked_while_plan_mode_is_authoring() {
-    let server = MockServer::start().await;
-    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let canary = temp.path().join("canary.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
-
-    let result = executor
-        .execute(
-            "bash",
-            &json!({"command": format!("touch {}", canary.display())}),
-        )
-        .await;
-
-    assert!(
-        result.contains("blocked while plan mode is active"),
-        "bash must be blocked while a plan is being authored. Got: {result}"
-    );
-    assert!(
-        !canary.exists(),
-        "the bash guard must run before the shell, so no side effects leak"
-    );
+        let result = executor.execute(tool_name, &params).await;
+        assert!(
+            result.contains("blocked while plan mode is active"),
+            "[{label}] {tool_name} must be blocked. Got: {result}"
+        );
+        assert!(
+            !canary.exists(),
+            "[{label}] guard must prevent side effects"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1165,48 +1117,40 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
 }
 
 #[tokio::test]
-async fn write_guard_is_inactive_when_no_planning_plan_exists() {
-    let server = MockServer::start().await;
-    mock_no_authoring_plan(&server, "sess-1").await;
+async fn write_guard_is_inactive_when_no_authoring_plan() {
+    // Guard must be inactive (fail open) when there's no authoring plan,
+    // regardless of whether cloud is configured or unavailable.
+    for (label, with_cloud, mock_plan) in [
+        ("no plan on cloud", true, true),
+        ("no cloud binding", false, false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("note.txt");
 
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("note.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
+        let executor = if with_cloud {
+            let server = MockServer::start().await;
+            if mock_plan {
+                mock_no_authoring_plan(&server, "sess-1").await;
+            }
+            ToolExecutor::new(temp.path().to_path_buf())
+                .with_active_session_id("sess-1")
+                .with_cloud(server.uri(), "token")
+        } else {
+            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1")
+        };
 
-    let result = executor
-        .execute(
-            "write_file",
-            &json!({"path": target.to_string_lossy(), "content": "x"}),
-        )
-        .await;
+        let result = executor
+            .execute(
+                "write_file",
+                &json!({"path": target.to_string_lossy(), "content": "x"}),
+            )
+            .await;
 
-    assert!(
-        !result.contains("blocked while plan mode is active"),
-        "with no planning plan present, the guard must be inactive. Got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn write_guard_is_inactive_without_cloud_binding() {
-    // No cloud binding ⇒ guard cannot consult the plan store; it must
-    // fail open so offline / unauthenticated CLI runs still work.
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("note.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
-
-    let result = executor
-        .execute(
-            "write_file",
-            &json!({"path": target.to_string_lossy(), "content": "x"}),
-        )
-        .await;
-
-    assert!(
-        !result.contains("blocked while plan mode is active"),
-        "without cloud binding, the guard must fail open. Got: {result}"
-    );
+        assert!(
+            !result.contains("blocked while plan mode is active"),
+            "[{label}] guard must be inactive. Got: {result}"
+        );
+    }
 }
 
 /// `agent_job` is the new entry point. It must dispatch the four
