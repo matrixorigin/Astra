@@ -4,6 +4,12 @@ use super::*;
 // 128 tests → 16 table-driven tests + 2 integration tests (+3 composite)
 // 1400 lines → ~430 lines
 
+type BoolFlagCase<'a> = (&'a str, &'a [&'a str], fn(&Cli) -> bool);
+type StringFlagCase<'a> = (&'a str, &'a [&'a str], fn(&Cli) -> Option<&str>);
+type VecFlagCase<'a> = (&'a str, &'a [&'a str], fn(&Cli) -> &[String]);
+type SubcommandCase<'a> = (&'a [&'a str], fn(&Command) -> bool);
+type PermissionsCase<'a> = (&'a str, fn(&PermissionsSubcommand) -> bool);
+
 #[test]
 fn cli_no_args_gives_no_command() {
     let cli = Cli::try_parse_from(["astra"]).unwrap();
@@ -20,7 +26,7 @@ fn cli_no_args_gives_no_command() {
 
 #[test]
 fn cli_bool_flags_default_and_set() {
-    let cases: &[(&str, &[&str], fn(&Cli) -> bool)] = &[
+    let cases: &[BoolFlagCase] = &[
         ("print", &["-p"], |c| c.print),
         ("continue", &["-c"], |c| c.continue_last),
         ("no-journal-content", &["--no-journal-content"], |c| {
@@ -50,7 +56,7 @@ fn cli_bool_flags_default_and_set() {
 
 #[test]
 fn cli_string_flags() {
-    let cases: &[(&str, &[&str], fn(&Cli) -> Option<&str>)] = &[
+    let cases: &[StringFlagCase] = &[
         ("model long", &["--model", "gpt-4o"], |c| c.model.as_deref()),
         ("model equals", &["--model=claude-3-opus"], |c| {
             c.model.as_deref()
@@ -129,7 +135,7 @@ fn cli_numeric_flags() {
 
 #[test]
 fn cli_vec_flags() {
-    let cases: &[(&str, &[&str], fn(&Cli) -> &[String])] = &[
+    let cases: &[VecFlagCase] = &[
         ("allowed-tools single", &["--allowed-tools", "Bash"], |c| {
             &c.allowed_tools
         }),
@@ -192,7 +198,7 @@ fn cli_vec_flags() {
 
 #[test]
 fn cli_simple_subcommands() {
-    let cases: &[(&[&str], fn(&Command) -> bool)] = &[
+    let cases: &[SubcommandCase] = &[
         (&["doctor"], |c| matches!(c, Command::Doctor)),
         (&["interactive"], |c| matches!(c, Command::Interactive)),
         (&["health"], |c| matches!(c, Command::Health)),
@@ -428,7 +434,7 @@ fn cli_chat_subcommand() {
 
 #[test]
 fn cli_permissions_subcommand() {
-    let cases: &[(&str, fn(&PermissionsSubcommand) -> bool)] = &[
+    let cases: &[PermissionsCase] = &[
         ("accept_edits", |s| {
             matches!(s, PermissionsSubcommand::AcceptEdits)
         }),

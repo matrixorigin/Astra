@@ -887,7 +887,14 @@ fn setup_lsp_workspace(lib_rs: &str) -> (tempfile::TempDir, ToolExecutor, EnvGua
     (dir, exe, guard)
 }
 
-fn setup_lsp_workspace_with_file(lib_rs: &str) -> (tempfile::TempDir, ToolExecutor, EnvGuard, std::path::PathBuf) {
+fn setup_lsp_workspace_with_file(
+    lib_rs: &str,
+) -> (
+    tempfile::TempDir,
+    ToolExecutor,
+    EnvGuard,
+    std::path::PathBuf,
+) {
     let (dir, exe, guard) = setup_lsp_workspace(lib_rs);
     let file_path = dir.path().join("src/lib.rs");
     (dir, exe, guard, file_path)
@@ -911,12 +918,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "implementation",
             method: "textDocument/implementation",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["range"]["start"]["line"].as_u64(),
-            Some(0)
-        );
+                assert_eq!(
+                    parsed["result"][0]["range"]["start"]["line"].as_u64(),
+                    Some(0)
+                );
             },
         },
         TestCase {
@@ -924,12 +932,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "prepare_rename",
             method: "textDocument/prepareRename",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"]["placeholder"].as_str(),
-            Some("hello_from_lsp")
-        );
+                assert_eq!(
+                    parsed["result"]["placeholder"].as_str(),
+                    Some("hello_from_lsp")
+                );
             },
         },
         TestCase {
@@ -937,12 +946,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "declaration",
             method: "textDocument/declaration",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["range"]["start"]["character"].as_u64(),
-            Some(4)
-        );
+                assert_eq!(
+                    parsed["result"][0]["range"]["start"]["character"].as_u64(),
+                    Some(4)
+                );
             },
         },
         TestCase {
@@ -950,12 +960,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "type_definition",
             method: "textDocument/typeDefinition",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["range"]["end"]["character"].as_u64(),
-            Some(2)
-        );
+                assert_eq!(
+                    parsed["result"][0]["range"]["end"]["character"].as_u64(),
+                    Some(2)
+                );
             },
         },
         TestCase {
@@ -963,9 +974,10 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "document_highlight",
             method: "textDocument/documentHighlight",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["kind"].as_u64(), Some(1));
+                assert_eq!(parsed["result"][0]["kind"].as_u64(), Some(1));
             },
         },
         TestCase {
@@ -975,10 +987,10 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: DEFAULT_LIB_RS,
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["tooltip"].as_str(),
-            Some("fake document link")
-        );
+                assert_eq!(
+                    parsed["result"][0]["tooltip"].as_str(),
+                    Some("fake document link")
+                );
             },
         },
         TestCase {
@@ -988,7 +1000,7 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: DEFAULT_LIB_RS,
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["label"].as_str(), Some(": ()"));
+                assert_eq!(parsed["result"][0]["label"].as_str(), Some(": ()"));
             },
         },
         TestCase {
@@ -998,7 +1010,7 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: "pub fn hello_from_lsp() {\n    println!(\"hi\");\n}\n",
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["endLine"].as_u64(), Some(2));
+                assert_eq!(parsed["result"][0]["endLine"].as_u64(), Some(2));
             },
         },
         TestCase {
@@ -1008,7 +1020,7 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: "const RED: &str = \"#ff0000\";\n",
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["color"]["red"].as_f64(), Some(1.0));
+                assert_eq!(parsed["result"][0]["color"]["red"].as_f64(), Some(1.0));
             },
         },
         TestCase {
@@ -1016,9 +1028,10 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "color_presentations",
             method: "textDocument/colorPresentation",
             lib_rs: "const RED: &str = \"#ff0000\";\n",
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 22}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 22}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["label"].as_str(), Some("#ff0000"));
+                assert_eq!(parsed["result"][0]["label"].as_str(), Some("#ff0000"));
             },
         },
         TestCase {
@@ -1028,7 +1041,7 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: DEFAULT_LIB_RS,
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"]["data"][0].as_u64(), Some(0));
+                assert_eq!(parsed["result"]["data"][0].as_u64(), Some(0));
             },
         },
         TestCase {
@@ -1036,9 +1049,10 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "supertypes",
             method: "typeHierarchy/supertypes",
             lib_rs: "trait Greeting {}\nstruct HelloType;\nimpl Greeting for HelloType {}\n",
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 2, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 2, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["name"].as_str(), Some("Greeting"));
+                assert_eq!(parsed["result"][0]["name"].as_str(), Some("Greeting"));
             },
         },
         TestCase {
@@ -1046,12 +1060,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "subtypes",
             method: "typeHierarchy/subtypes",
             lib_rs: "trait Greeting {}\nstruct FriendlyGreeting;\nimpl Greeting for FriendlyGreeting {}\n",
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["name"].as_str(),
-            Some("FriendlyGreeting")
-        );
+                assert_eq!(
+                    parsed["result"][0]["name"].as_str(),
+                    Some("FriendlyGreeting")
+                );
             },
         },
         TestCase {
@@ -1061,10 +1076,10 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: DEFAULT_LIB_RS,
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["command"]["title"].as_str(),
-            Some("1 reference")
-        );
+                assert_eq!(
+                    parsed["result"][0]["command"]["title"].as_str(),
+                    Some("1 reference")
+                );
             },
         },
         TestCase {
@@ -1072,12 +1087,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "selection_ranges",
             method: "textDocument/selectionRange",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["parent"]["range"]["end"]["character"].as_u64(),
-            Some(25)
-        );
+                assert_eq!(
+                    parsed["result"][0]["parent"]["range"]["end"]["character"].as_u64(),
+                    Some(25)
+                );
             },
         },
         TestCase {
@@ -1085,12 +1101,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "linked_editing_range",
             method: "textDocument/linkedEditingRange",
             lib_rs: "pub fn hello_from_lsp(hello_from_lsp: i32) {}\n",
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"]["ranges"][1]["end"]["character"].as_u64(),
-            Some(38)
-        );
+                assert_eq!(
+                    parsed["result"]["ranges"][1]["end"]["character"].as_u64(),
+                    Some(38)
+                );
             },
         },
         TestCase {
@@ -1100,7 +1117,7 @@ fn lsp_operations_use_real_lsp_when_available() {
             lib_rs: "pub  fn hello_from_lsp() {}\n",
             params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
+                assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
             },
         },
         TestCase {
@@ -1108,9 +1125,12 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "format_range",
             method: "textDocument/rangeFormatting",
             lib_rs: "pub  fn hello_from_lsp() {}\n",
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 4, "end_line": 1, "end_column": 6}"#).unwrap(),
+            params: serde_json::from_str(
+                r#"{"file": "src/lib.rs", "line": 1, "column": 4, "end_line": 1, "end_column": 6}"#,
+            )
+            .unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
+                assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
             },
         },
         TestCase {
@@ -1118,9 +1138,12 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "format_on_type",
             method: "textDocument/onTypeFormatting",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 25, "trigger_character": ";"}"#).unwrap(),
+            params: serde_json::from_str(
+                r#"{"file": "src/lib.rs", "line": 1, "column": 25, "trigger_character": ";"}"#,
+            )
+            .unwrap(),
             verify: |parsed| {
-        assert_eq!(parsed["result"][0]["newText"].as_str(), Some("{\n}"));
+                assert_eq!(parsed["result"][0]["newText"].as_str(), Some("{\n}"));
             },
         },
         TestCase {
@@ -1128,16 +1151,17 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "code_actions",
             method: "textDocument/codeAction",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"][0]["title"].as_str(),
-            Some("Apply fake quick fix")
-        );
-        assert_eq!(
-            parsed["result"][0]["diagnostics"][0]["message"].as_str(),
-            Some("fake LSP diagnostic")
-        );
+                assert_eq!(
+                    parsed["result"][0]["title"].as_str(),
+                    Some("Apply fake quick fix")
+                );
+                assert_eq!(
+                    parsed["result"][0]["diagnostics"][0]["message"].as_str(),
+                    Some("fake LSP diagnostic")
+                );
             },
         },
         TestCase {
@@ -1145,12 +1169,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "completions",
             method: "textDocument/completion",
             lib_rs: DEFAULT_LIB_RS,
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"]["items"][0]["label"].as_str(),
-            Some("hello_completion")
-        );
+                assert_eq!(
+                    parsed["result"]["items"][0]["label"].as_str(),
+                    Some("hello_completion")
+                );
             },
         },
         TestCase {
@@ -1158,12 +1183,13 @@ fn lsp_operations_use_real_lsp_when_available() {
             operation: "signature_help",
             method: "textDocument/signatureHelp",
             lib_rs: "pub fn hello_from_lsp(name: &str) {}\n",
-            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#)
+                .unwrap(),
             verify: |parsed| {
-        assert_eq!(
-            parsed["result"]["signatures"][0]["label"].as_str(),
-            Some("hello_from_lsp(name: &str)")
-        );
+                assert_eq!(
+                    parsed["result"]["signatures"][0]["label"].as_str(),
+                    Some("hello_from_lsp(name: &str)")
+                );
             },
         },
     ];
@@ -1173,17 +1199,19 @@ fn lsp_operations_use_real_lsp_when_available() {
         let mut params = case.params.clone();
         params["operation"] = serde_json::json!(case.operation);
         let result = exe.lsp(&params);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result).unwrap_or_else(|e| panic!("{}: parse failed: {e}", case.name));
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .unwrap_or_else(|e| panic!("{}: parse failed: {e}", case.name));
         assert_eq!(
             parsed["backend"].as_str(),
             Some("lsp"),
-            "{}: backend", case.name
+            "{}: backend",
+            case.name
         );
         assert_eq!(
             parsed["method"].as_str(),
             Some(case.method),
-            "{}: method", case.name
+            "{}: method",
+            case.name
         );
         (case.verify)(&parsed);
     }
@@ -1233,20 +1261,29 @@ fn lsp_format_apply_edits_when_dry_run_false() {
             case.operation, case.extra_params
         );
         let result = exe.lsp(&serde_json::from_str::<serde_json::Value>(&params_json).unwrap());
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result).unwrap_or_else(|e| panic!("{}: parse failed: {e}", case.name));
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .unwrap_or_else(|e| panic!("{}: parse failed: {e}", case.name));
 
-        assert_eq!(parsed["applied"].as_bool(), Some(true), "{}: applied", case.name);
-        assert_eq!(parsed["files_changed"].as_u64(), Some(1), "{}: files_changed", case.name);
+        assert_eq!(
+            parsed["applied"].as_bool(),
+            Some(true),
+            "{}: applied",
+            case.name
+        );
+        assert_eq!(
+            parsed["files_changed"].as_u64(),
+            Some(1),
+            "{}: files_changed",
+            case.name
+        );
         assert_eq!(
             std::fs::read_to_string(&file_path).unwrap(),
             case.lib_rs_after,
-            "{}: file content", case.name
+            "{}: file content",
+            case.name
         );
     }
 }
-
-
 
 #[cfg(unix)]
 fn write_real_typescript_workspace(root: &std::path::Path) {
@@ -1858,7 +1895,8 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_apply_selected_workspace_edit_when_dry_run_false() {
-    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
+    let (_dir, exe, _guard, file_path) =
+        setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -1908,7 +1946,8 @@ fn lsp_code_actions_execute_selected_command_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_resolve_selected_action_when_dry_run_false() {
-    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
+    let (_dir, exe, _guard, file_path) =
+        setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -1933,7 +1972,8 @@ fn lsp_code_actions_resolve_selected_action_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_apply_selected_snippet_workspace_edit_when_dry_run_false() {
-    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
+    let (_dir, exe, _guard, file_path) =
+        setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -1982,7 +2022,8 @@ fn lsp_completions_resolve_selected_item_when_item_index_provided() {
 #[test]
 #[serial_test::serial]
 fn lsp_completions_apply_selected_item_when_dry_run_false() {
-    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
+    let (_dir, exe, _guard, file_path) =
+        setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "completions",
@@ -2306,7 +2347,8 @@ fn lsp_rename_uses_real_lsp_preview_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_rename_applies_real_lsp_workspace_edit_when_dry_run_false() {
-    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
+    let (_dir, exe, _guard, file_path) =
+        setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "rename",

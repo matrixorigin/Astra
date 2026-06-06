@@ -1766,16 +1766,14 @@ mod tests {
             dup.contains("Refused"),
             "second create should be refused with duplicate notice; got {dup}"
         );
-        let dup_parsed: Value =
-            serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
+        let dup_parsed: Value = serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
         assert_eq!(
             dup_parsed["duplicate_of"], "task-1",
             "response must name the existing task id; got {dup}"
         );
         // The store should still hold exactly one task (no second
         // row appended even though the closure ran).
-        let list: Value =
-            serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        let list: Value = serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
         assert_eq!(
             list["count"], 1,
             "duplicate must not be persisted; got {list}"
@@ -1820,14 +1818,12 @@ mod tests {
             .await;
         // Same title now should be allowed since the prior is closed.
         let dup = m.create(&json!({"title": "fix bug"})).await;
-        let dup_parsed: Value =
-            serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
+        let dup_parsed: Value = serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
         assert_eq!(
             dup_parsed["success"], true,
             "create after completion must succeed; got {dup}"
         );
-        let list: Value =
-            serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
+        let list: Value = serde_json::from_str(&m.list(&json!({"status": "all"})).await).unwrap();
         assert_eq!(
             list["count"], 2,
             "second instance must persist when prior is completed; got {list}"
@@ -1892,8 +1888,7 @@ mod tests {
             }))
             .await;
         let body = m.get(&json!({"task_id": "task-1"})).await;
-        let task: SessionTask =
-            serde_json::from_str(&body).expect("parse task");
+        let task: SessionTask = serde_json::from_str(&body).expect("parse task");
         assert!(
             task.owner.is_none() && task.subtasks.iter().all(|st| st.owner.is_none()),
             "without parent owner, subtask owner must stay absent; got {body}"
@@ -1927,8 +1922,7 @@ mod tests {
         let a = TaskManager::new("sess-1", store.clone());
         let b = TaskManager::new("sess-1", store.clone());
         a.create(&json!({"title": "from-a"})).await;
-        let list: Value =
-            serde_json::from_str(&b.list(&json!({"status": "all"})).await).unwrap();
+        let list: Value = serde_json::from_str(&b.list(&json!({"status": "all"})).await).unwrap();
         let titles: Vec<&str> = list["tasks"]
             .as_array()
             .unwrap()
@@ -2080,8 +2074,7 @@ mod tests {
                 "status": "completed"
             }))
             .await;
-        let first_parsed: Value =
-            serde_json::from_str(first.split_once('\n').unwrap().1).unwrap();
+        let first_parsed: Value = serde_json::from_str(first.split_once('\n').unwrap().1).unwrap();
         assert_eq!(first_parsed["success"], true, "{first}");
         let after_first = m.get(&json!({"task_id": "task-1"})).await;
         let after_first: SessionTask =
@@ -2123,11 +2116,11 @@ mod tests {
         .await;
 
         m.update(&json!({
-                "task_id": "task-1",
-                "subtask_id": "s1",
-                "status": "in_progress"
-            }))
-            .await;
+            "task_id": "task-1",
+            "subtask_id": "s1",
+            "status": "in_progress"
+        }))
+        .await;
 
         let after = m.get(&json!({"task_id": "task-1"})).await;
         let after: SessionTask =
@@ -2588,7 +2581,10 @@ mod tests {
         assert_eq!(a_titles, vec!["a1"], "sess-a must not leak sess-b data");
         let b_titles: Vec<&str> = sess_b.1.iter().map(|t| t.title.as_str()).collect();
         assert!(b_titles.contains(&"b1") && b_titles.contains(&"b2"));
-        assert!(!b_titles.contains(&"a1"), "sess-b must not leak sess-a data");
+        assert!(
+            !b_titles.contains(&"a1"),
+            "sess-b must not leak sess-a data"
+        );
     }
 
     // ── U-8: status_filter SQL pushdown ──────────────────────────────
@@ -2699,33 +2695,36 @@ mod tests {
         m.create(&json!({"title": "pending-1"})).await;
         m.create(&json!({"title": "pending-2"})).await;
         m.create(&json!({"title": "ip-1"})).await;
-        m.update(&json!({"task_id": "task-3", "new_status": "in_progress"})).await;
+        m.update(&json!({"task_id": "task-3", "new_status": "in_progress"}))
+            .await;
         m.create(&json!({"title": "done-1"})).await;
-        m.update(&json!({"task_id": "task-4", "new_status": "completed"})).await;
+        m.update(&json!({"task_id": "task-4", "new_status": "completed"}))
+            .await;
 
         // active filter: returns pending + in_progress only
-        let active: Value = serde_json::from_str(
-            &m.list(&json!({"status_filter": "active"})).await,
-        ).unwrap();
+        let active: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
         assert_eq!(active["count"], 3);
         let active_titles: Vec<&str> = active["tasks"]
-            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
         assert!(active_titles.contains(&"pending-1"));
         assert!(active_titles.contains(&"pending-2"));
         assert!(active_titles.contains(&"ip-1"));
         assert!(!active_titles.contains(&"done-1"));
 
         // completed filter: returns only completed
-        let completed: Value = serde_json::from_str(
-            &m.list(&json!({"status_filter": "completed"})).await,
-        ).unwrap();
+        let completed: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "completed"})).await).unwrap();
         assert_eq!(completed["count"], 1);
         assert_eq!(completed["tasks"][0]["title"], "done-1");
 
         // all filter: returns everything
-        let all: Value = serde_json::from_str(
-            &m.list(&json!({"status_filter": "all"})).await,
-        ).unwrap();
+        let all: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(all["count"], 4);
     }
 
@@ -2748,7 +2747,11 @@ mod tests {
         let archived_list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "archived"})).await).unwrap();
         let archived_titles: Vec<&str> = archived_list["tasks"]
-            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
         assert!(archived_titles.contains(&"alpha"), "{archived_list}");
         let active_out = m.list(&json!({"status_filter": "active"})).await;
         assert!(
@@ -2787,15 +2790,26 @@ mod tests {
         let archived_list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "archived"})).await).unwrap();
         let archived_titles: Vec<&str> = archived_list["tasks"]
-            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
         assert!(archived_titles.contains(&"old-done"), "{archived_list}");
         assert!(!archived_titles.contains(&"recent-done"), "{archived_list}");
 
         let completed_list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "completed"})).await).unwrap();
         let completed_titles: Vec<&str> = completed_list["tasks"]
-            .as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
-        assert!(completed_titles.contains(&"recent-done"), "{completed_list}");
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert!(
+            completed_titles.contains(&"recent-done"),
+            "{completed_list}"
+        );
         assert!(!completed_titles.contains(&"old-done"), "{completed_list}");
     }
 }

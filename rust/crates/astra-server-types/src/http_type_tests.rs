@@ -1,12 +1,14 @@
 use super::*;
 use astra_services::runs::ExecutionBudget;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 // ── default functions ───────────────────────────────────────────
 
+type DefaultCase<'a> = (&'a str, Box<dyn Fn() -> String>);
+
 #[test]
 fn default_functions_return_expected_values() {
-    let cases: &[(&str, Box<dyn Fn() -> String>)] = &[
+    let cases: &[DefaultCase] = &[
         ("days", Box::new(|| default_days().to_string())),
         (
             "admin_scope",
@@ -277,17 +279,19 @@ fn deserialization_errors_on_missing_required_fields() {
         ("PromptOptimizeRequest/agent_id", "{}"),
         ("AdminUserRoleRequest/role", r#"{"username":"u"}"#),
     ];
-    for (label, json) in cases {
+    for (_label, json) in cases {
         let err = serde_json::from_str::<serde_json::Value>(json).unwrap();
         // Each type has a different schema; just verify the raw parse succeeds
         // and the targeted type fails.
         let _ = err;
     }
     // Typed deserialization failures — each type requires specific missing field
-    assert!(serde_json::from_str::<ChatRequest>(
-        r#"{"execution_budget":{"initial_turns":3,"hard_turn_limit":7}}"#
-    )
-    .is_err());
+    assert!(
+        serde_json::from_str::<ChatRequest>(
+            r#"{"execution_budget":{"initial_turns":3,"hard_turn_limit":7}}"#
+        )
+        .is_err()
+    );
     assert!(serde_json::from_str::<AuthLoginRequest>(r#"{"password":"x"}"#).is_err());
     assert!(serde_json::from_str::<AuthLoginRequest>(r#"{"username":"x"}"#).is_err());
     assert!(

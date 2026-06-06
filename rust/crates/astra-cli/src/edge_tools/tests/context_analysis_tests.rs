@@ -160,10 +160,12 @@ fn context_analysis_no_session() {
     let result = executor.context_analysis(&json!({"mode": "turn"}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    assert!(parsed["error"]
-        .as_str()
-        .unwrap()
-        .contains("No observability session"));
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("No observability session")
+    );
 }
 
 // ─── Empty traces ────────────────────────────────────────────────────────────
@@ -175,10 +177,12 @@ fn context_analysis_empty_traces() {
     let result = executor.context_analysis(&json!({"mode": "turn"}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    assert!(parsed["error"]
-        .as_str()
-        .unwrap()
-        .contains("No context assembly traces"));
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("No context assembly traces")
+    );
 }
 
 // ─── Turn mode ───────────────────────────────────────────────────────────────

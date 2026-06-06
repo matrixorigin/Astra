@@ -46,7 +46,8 @@ async fn task_list_shows_created_tasks() {
 #[tokio::test]
 async fn task_get_returns_details() {
     let (_dir, exe) = setup();
-    exe.task_create(&json!({"title": "Detailed task", "description": "This is a test"})).await;
+    exe.task_create(&json!({"title": "Detailed task", "description": "This is a test"}))
+        .await;
     let details = exe.task_get(&json!({"task_id": "task-1"})).await;
     let parsed: serde_json::Value = serde_json::from_str(&details).unwrap();
     assert_eq!(parsed["id"], "task-1");
