@@ -41,6 +41,34 @@ function runtimeSessionList(sessions: unknown[]) {
   };
 }
 
+function runtimeRun(runId: string, sessionId: string, status: string, waitingFor?: string | null) {
+  return {
+    run_id: runId,
+    session_id: sessionId,
+    status,
+    waiting_for: waitingFor ?? null,
+    events_count: 0,
+  };
+}
+
+function runtimeRunList(runs: unknown[]) {
+  return {
+    runs,
+    total: runs.length,
+    limit: 200,
+    offset: 0,
+  };
+}
+
+function runtimeTranscript(items: unknown[] = []) {
+  return {
+    items,
+    total: items.length,
+    limit: 200,
+    offset: 0,
+  };
+}
+
 describe('web store user scoping', () => {
   beforeEach(() => {
     globalThis.__astraWebStores = undefined;
@@ -75,7 +103,9 @@ describe('web store user scoping', () => {
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
         runtimeSession('session-user-a', 'user-a', 'test'),
       ])))
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])));
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
 
     const result = await createChatWithMessage('user-a', {
       message: uniqueMessage,
@@ -100,8 +130,11 @@ describe('web store user scoping', () => {
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
         runtimeSession('session-stale-after-reset', 'user-a', 'stale'),
       ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])));
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
 
     const result = await createChatWithMessage('user-a', {
       message: 'this chat will disappear remotely',
@@ -119,5 +152,46 @@ describe('web store user scoping', () => {
 
     await expect(getChatHydrated('user-a', result.chatId)).resolves.toBeNull();
     expect((await listChats('user-a', { q: 'disappear remotely' })).items).toHaveLength(0);
+  });
+
+  it('prefers the most interactive active run when one chat has multiple non-terminal runs', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
+        runtimeSession('session-multi-run', 'user-a', 'multi'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
+        runtimeRun('run-paused', 'session-multi-run', 'paused'),
+        runtimeRun('run-running', 'session-multi-run', 'running'),
+        runtimeRun('run-waiting', 'session-multi-run', 'waiting', 'user_input'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+
+    const detail = await getChatHydrated('user-a', 'session-multi-run');
+    expect(detail?.activeRun).toEqual({
+      runId: 'run-waiting',
+      status: 'waiting',
+      waitingFor: 'user_input',
+    });
+  });
+
+  it('keeps the freshest backend run when competing active runs have the same priority', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
+        runtimeSession('session-running-race', 'user-a', 'race'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
+        runtimeRun('run-freshest', 'session-running-race', 'running'),
+        runtimeRun('run-stale', 'session-running-race', 'running'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+
+    const detail = await getChatHydrated('user-a', 'session-running-race');
+    expect(detail?.activeRun).toEqual({
+      runId: 'run-freshest',
+      status: 'running',
+      waitingFor: null,
+    });
   });
 });

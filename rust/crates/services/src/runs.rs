@@ -1048,7 +1048,12 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|r| r.user_id == user_id)
             .cloned()
             .collect();
-        user_runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        user_runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
         let total = user_runs.len() as i64;
         let page = user_runs
             .into_iter()

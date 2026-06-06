@@ -115,6 +115,23 @@ function runBlocksChatTurn(status?: string | null) {
   );
 }
 
+function activeRunPriority(run: {
+  status: string;
+  waitingFor?: string | null;
+}) {
+  const status = run.status.trim().toLowerCase();
+  if (status === 'waiting') {
+    return 3;
+  }
+  if (status === 'running') {
+    return 2;
+  }
+  if (status === 'paused') {
+    return 1;
+  }
+  return 0;
+}
+
 function seedStore(): Store {
   const now = nowIso();
   const projectId = 'project-web-agent';
@@ -984,14 +1001,18 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   const activeRunBySession = new Map<string, NonNullable<ChatRecord['activeRun']>>();
 
   for (const run of runs) {
-    if (!runBlocksChatTurn(run.status) || activeRunBySession.has(run.sessionId)) {
+    if (!runBlocksChatTurn(run.status)) {
       continue;
     }
-    activeRunBySession.set(run.sessionId, {
+    const candidate = {
       runId: run.runId,
       status: run.status,
       waitingFor: run.waitingFor ?? null,
-    });
+    };
+    const current = activeRunBySession.get(run.sessionId);
+    if (!current || activeRunPriority(candidate) > activeRunPriority(current)) {
+      activeRunBySession.set(run.sessionId, candidate);
+    }
   }
 
   for (const session of sessions) {

@@ -7704,6 +7704,24 @@ mod tests {
         assert_eq!(page3.runs.len(), 1);
     }
 
+    #[tokio::test]
+    async fn list_runs_orders_by_latest_update() {
+        let svc = test_service();
+        let older = ok(svc.create_run("user-1".into(), test_request("older")).await);
+        let newer = ok(svc.create_run("user-1".into(), test_request("newer")).await);
+
+        let initial = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(initial.runs[0].run_id, newer.run_id);
+
+        ok(svc.pause_run(older.run_id.clone(), "user-1".into()).await);
+
+        let after_update = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(
+            after_update.runs[0].run_id, older.run_id,
+            "list_runs should surface the most recently updated run first"
+        );
+    }
+
     /// P2-B: list_runs must clamp pagination params like other list endpoints.
     #[tokio::test]
     async fn list_runs_clamps_pagination() {
