@@ -90,9 +90,38 @@ pub(crate) async fn build_one_shot_spawner(
             progress_broadcaster,
         )
         .with_executor(std::sync::Arc::new(spawn_executor))
-        .with_prefix_store(prefix_store),
+        .with_prefix_store(prefix_store)
+        .with_max_concurrent_agents(resolved_spawn_concurrency_cap()),
         session_id.as_deref(),
     ))
+}
+
+/// Resolve the user-facing cap on concurrent live subagents.
+///
+/// Default 10 — matches the rough Claude Code parity used elsewhere
+/// (see workflow agent fan-out cap). A long-lived chat session that
+/// keeps spawning replacement agents on every transient failure can
+/// otherwise accumulate dozens of in-flight runs, all burning tokens.
+/// Override via `ASTRA_MAX_CONCURRENT_AGENTS=N` for users who genuinely
+/// need a different ceiling. Invalid values fall back to the default
+/// rather than panicking — this is a UX limit, not a security one.
+fn resolved_spawn_concurrency_cap() -> usize {
+    const DEFAULT_CAP: usize = 10;
+    match std::env::var("ASTRA_MAX_CONCURRENT_AGENTS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    target: "astra::spawner",
+                    raw = %raw,
+                    default = DEFAULT_CAP,
+                    "ASTRA_MAX_CONCURRENT_AGENTS unparseable; using default"
+                );
+                DEFAULT_CAP
+            }
+        },
+        Err(_) => DEFAULT_CAP,
+    }
 }
 
 async fn build_turn_skill_resolver(
@@ -258,7 +287,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
             progress_broadcaster,
         )
         .with_executor(std::sync::Arc::new(spawn_executor))
-        .with_prefix_store(prefix_store),
+        .with_prefix_store(prefix_store)
+        .with_max_concurrent_agents(resolved_spawn_concurrency_cap()),
         state.session_id.as_deref(),
     )));
 }

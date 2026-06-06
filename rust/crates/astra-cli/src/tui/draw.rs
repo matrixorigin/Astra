@@ -69,6 +69,42 @@ pub(crate) struct MultiAgentEntry {
     pub failed: bool,
 }
 
+/// Build the strip header.
+///
+/// Renders a per-status breakdown so the user sees `live` / `failed` /
+/// `done` at a glance, not just the total. Failures showed as silent
+/// rows pre-fix — the header advertised "3 parallel agents" while one
+/// was already dead, so users would spawn replacement agents on top of
+/// failures without realising. Splitting the count makes the failure
+/// surface immediately visible.
+///
+/// Hint advertises both `Ctrl+G` (open drill view) and `x` (kill from
+/// inside drill view) so the new affordance is discoverable.
+pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
+    let total = cells.len();
+    let live = cells.iter().filter(|c| c.live).count();
+    let failed = cells.iter().filter(|c| c.failed).count();
+    let done = total.saturating_sub(live + failed);
+
+    let mut breakdown = Vec::with_capacity(3);
+    if live > 0 {
+        breakdown.push(format!("{live} live"));
+    }
+    if failed > 0 {
+        breakdown.push(format!("{failed} failed"));
+    }
+    if done > 0 {
+        breakdown.push(format!("{done} done"));
+    }
+    let breakdown = if breakdown.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", breakdown.join(" · "))
+    };
+
+    format!("▶ {total} parallel agents{breakdown} · Ctrl+G drill · x kill")
+}
+
 /// Pair of (ActiveView, TaskBoard lines) produced by
 /// [`active_viewport`]. The task board is its OWN slot — not an
 /// `ActiveView` variant — so a streaming active cell (tool /
@@ -388,17 +424,22 @@ pub(crate) fn do_draw(
     // gradient-gutter frame containing a header and one short row
     // per live agent. Renders as e.g.:
     //
-    //   █ ▶ 3 parallel agents · Ctrl+G to drill in
+    //   █ ▶ 3 parallel agents · 1 live · 1 failed · 1 done · Ctrl+G drill · x kill
     //   █ ◦ review_tui      · 2 steps · 12s
-    //   █ ◦ review_fixes    · 0 steps · 8s
+    //   █ ✗ review_fixes    · 0 steps · 8s
     //   █ ✓ review_refactor · 4 steps · 18s
     //
     // (status: ◦ live / ✓ completed / ✗ failed)
     let multi_agent_renderable: Option<RenderableItem<'_>> = multi_agent.map(|cells| {
-        let count = cells.len();
         let theme = crate::tui::theme::current();
+        // Split live / failed / done so a 3-agent strip with one
+        // failure is visible at a glance — without this the user only
+        // sees "▶ 3 parallel agents" while one is silently dead.
+        // Hint mentions both drill (Ctrl+G to open the panel) and the
+        // kill key inside it (`x`) so the new affordance is
+        // discoverable from the strip itself.
         let header_line = Line::from(ratatui::text::Span::styled(
-            format!("▶ {count} parallel agents · Ctrl+G to drill in"),
+            multi_agent_strip_header(&cells),
             ratatui::style::Style::default()
                 .fg(theme.accent)
                 .add_modifier(ratatui::style::Modifier::BOLD),
@@ -944,7 +985,67 @@ mod multi_agent_strip_tests {
     //! Each row fits in one line and surfaces label, step count, and
     //! elapsed time, plus a status icon that distinguishes live
     //! agents from completed ones.
-    use super::{format_short_elapsed, truncate_label};
+    use super::{MultiAgentEntry, format_short_elapsed, multi_agent_strip_header, truncate_label};
+
+    fn entry(live: bool, failed: bool) -> MultiAgentEntry {
+        MultiAgentEntry {
+            agent_id: "a".into(),
+            label: "agent".into(),
+            child_count: 0,
+            elapsed_ms: 0,
+            live,
+            failed,
+        }
+    }
+
+    #[test]
+    fn header_only_shows_total_when_all_live() {
+        let cells = vec![entry(true, false), entry(true, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("2 parallel agents"));
+        assert!(header.contains("2 live"));
+        assert!(!header.contains("failed"));
+        assert!(!header.contains("done"));
+        assert!(header.contains("Ctrl+G drill"));
+        assert!(header.contains("x kill"));
+    }
+
+    #[test]
+    fn header_surfaces_failed_count_when_any_failure() {
+        // Regression: pre-fix the user only saw "▶ 3 parallel agents"
+        // even though one was already dead. The breakdown must call out
+        // failures so the user catches them at a glance.
+        let cells = vec![entry(true, false), entry(false, true), entry(false, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("3 parallel agents"));
+        assert!(header.contains("1 live"));
+        assert!(header.contains("1 failed"));
+        assert!(header.contains("1 done"));
+    }
+
+    #[test]
+    fn header_skips_zero_buckets() {
+        let cells = vec![entry(false, false), entry(false, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("2 parallel agents"));
+        assert!(header.contains("2 done"));
+        assert!(!header.contains("0 live"));
+        assert!(!header.contains("0 failed"));
+    }
+
+    #[test]
+    fn header_advertises_kill_affordance() {
+        // The new `x` shortcut on the drill view is hidden inside a
+        // sub-panel; the header is the only place the user sees the
+        // outer flow, so the hint MUST mention it.
+        let cells = vec![entry(true, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(
+            header.contains("x kill"),
+            "header must advertise the kill key: {header}"
+        );
+    }
+
 
     #[test]
     fn elapsed_under_a_second_renders_in_milliseconds() {

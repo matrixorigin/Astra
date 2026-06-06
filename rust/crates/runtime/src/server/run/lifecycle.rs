@@ -104,6 +104,29 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+/// Cap on concurrent live subagents per server-side run. Mirrors the
+/// CLI-side cap in `crate::cli::agent_runtime::resolved_spawn_concurrency_cap`
+/// so headless web sessions don't have a different ceiling than the
+/// terminal CLI. Override via `ASTRA_MAX_CONCURRENT_AGENTS=N`.
+fn resolved_server_spawn_concurrency_cap() -> usize {
+    const DEFAULT_CAP: usize = 10;
+    match std::env::var("ASTRA_MAX_CONCURRENT_AGENTS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    target: "astra::spawner",
+                    raw = %raw,
+                    default = DEFAULT_CAP,
+                    "ASTRA_MAX_CONCURRENT_AGENTS unparseable; using default"
+                );
+                DEFAULT_CAP
+            }
+        },
+        Err(_) => DEFAULT_CAP,
+    }
+}
+
 async fn run_agentic_loop_with_host_panic_safe<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -2642,7 +2665,12 @@ impl AgenticRunLifecycleService {
             self.dynamic_agent_progress_broadcaster(),
         )
         .with_executor(executor_for_spawner)
-        .with_session(session_id.to_string());
+        .with_session(session_id.to_string())
+        // Same cap as the CLI side. Web/headless sessions are no less
+        // susceptible to the runaway-spawn-on-failure pattern; without
+        // a cap, a misbehaving agent can fan out unbounded sub-agents
+        // and burn the parent's quota.
+        .with_max_concurrent_agents(resolved_server_spawn_concurrency_cap());
         if let Some(pool) = self.shared_pool.clone() {
             spawner = spawner.with_trace_writer(Arc::new(
                 DatabaseTraceEventWriter::new(self.matrixone.clone()).with_pool(pool),

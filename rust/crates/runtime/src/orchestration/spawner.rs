@@ -550,6 +550,18 @@ pub struct DynamicAgentSpawner {
     prefix_resolve_outcomes: Arc<RwLock<HashMap<String, PrefixResolveOutcome>>>,
     /// Optional DB-first trace writer for Web/server lifecycle events.
     trace_writer: Option<Arc<dyn TraceEventWriter>>,
+    /// Optional cap on the number of agents that may be active
+    /// concurrently. `None` (the default) preserves the historical
+    /// unlimited behavior. When `Some(n)`, the (n+1)-th spawn while n
+    /// are still active rejects with
+    /// [`SpawnError::ConcurrencyLimitExceeded`] before any side
+    /// effects (no mailbox, no executor, no journal write).
+    ///
+    /// Why a soft reject and not a queue: queueing would let a slow
+    /// child block the user's prompt indefinitely; the LLM is the
+    /// queue (it sees the rejection in the tool result and can retry
+    /// or re-plan).
+    max_concurrent_agents: Option<usize>,
 }
 
 impl DynamicAgentSpawner {
@@ -572,6 +584,7 @@ impl DynamicAgentSpawner {
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
             trace_writer: None,
+            max_concurrent_agents: None,
         }
     }
 
@@ -615,6 +628,19 @@ impl DynamicAgentSpawner {
 
     pub fn with_trace_writer(mut self, writer: Arc<dyn TraceEventWriter>) -> Self {
         self.trace_writer = Some(writer);
+        self
+    }
+
+    /// Cap the number of agents that may be active concurrently.
+    ///
+    /// `cap == 0` is rejected at the API boundary (no spawns would ever
+    /// succeed); pass `None` via the default state to disable the cap
+    /// entirely. The cap is on currently-active agents only — completed
+    /// archives don't count, so a long-lived session never accumulates a
+    /// permanent block.
+    pub fn with_max_concurrent_agents(mut self, cap: usize) -> Self {
+        debug_assert!(cap > 0, "max_concurrent_agents=0 disables all spawns; pass None to disable the cap entirely");
+        self.max_concurrent_agents = Some(cap.max(1));
         self
     }
 
@@ -781,6 +807,17 @@ impl DynamicAgentSpawner {
     ) -> Result<SpawnAgentOutput, SpawnError> {
         if context.parent_is_fork_child && input.inherit_prefix.is_some() {
             return Err(SpawnError::NestedForkInheritanceRejected);
+        }
+
+        // Concurrency cap: refuse before any side effects (mailbox,
+        // executor, journal write, prefix resolve). Validating before
+        // side effects so a rejected spawn never leaves half-built
+        // state behind.
+        if let Some(limit) = self.max_concurrent_agents {
+            let active = self.active_agents.read().await.len();
+            if active >= limit {
+                return Err(SpawnError::ConcurrencyLimitExceeded { active, limit });
+            }
         }
 
         // 1. Validate agent type
@@ -1523,6 +1560,7 @@ impl DynamicAgentSpawner {
             prefix_store: self.prefix_store.clone(),
             prefix_resolve_outcomes: Arc::clone(&self.prefix_resolve_outcomes),
             trace_writer: self.trace_writer.clone(),
+            max_concurrent_agents: self.max_concurrent_agents,
         }
     }
 
@@ -1748,6 +1786,16 @@ pub enum SpawnError {
     /// only visible via `last_prefix_resolve`.
     #[error("Required prefix inheritance failed: {reason}")]
     PrefixInheritanceRequired { reason: String },
+
+    /// Concurrency cap reached. The LLM (or human caller) should wait
+    /// for an outstanding agent to finish, cancel one explicitly, or
+    /// retry. Carries the live counts so the caller's error message
+    /// can be specific.
+    #[error(
+        "Concurrent agent cap reached: {active} active, limit {limit}. \
+         Wait for an existing agent to finish or cancel one before spawning more."
+    )]
+    ConcurrencyLimitExceeded { active: usize, limit: usize },
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -2757,6 +2805,72 @@ mod tests {
             agent_type: "explore".to_string(),
             run_in_background: false,
             ..Default::default()
+        }
+    }
+
+    /// Concurrency cap: when `with_max_concurrent_agents(n)` is set,
+    /// attempting to spawn an (n+1)-th agent while n are still active
+    /// must produce `SpawnError::ConcurrencyLimitExceeded` and NOT
+    /// silently exceed the cap.
+    #[tokio::test]
+    async fn spawn_rejects_when_concurrency_cap_reached() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_max_concurrent_agents(2);
+
+        // Two background spawns under the cap of 2 must succeed.
+        for i in 0..2 {
+            let mut input = make_bg_input();
+            input.description = format!("bg-{i}");
+            let result = spawner.spawn(input, &make_bg_context()).await;
+            assert!(
+                matches!(result, Ok(SpawnAgentOutput::Launched { .. })),
+                "spawn #{i} under the cap must succeed, got {result:?}"
+            );
+        }
+
+        // Third spawn while the first two are still in flight (executor
+        // is blocked) must hit the cap.
+        let result = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        match result {
+            Err(SpawnError::ConcurrencyLimitExceeded { active, limit }) => {
+                assert_eq!(active, 2);
+                assert_eq!(limit, 2);
+            }
+            other => panic!("expected ConcurrencyLimitExceeded, got {other:?}"),
+        }
+
+        // Once we let the first two finish + drain, a fresh spawn is
+        // again accepted — the cap is a live measurement, not a one-way
+        // counter.
+        factory2.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+        let after_drain = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        assert!(
+            after_drain.is_ok(),
+            "after drain the cap must accept new spawns again, got {after_drain:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_unlimited_when_no_cap_configured() {
+        // No cap configured (the historical default) → never errors.
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+
+        for i in 0..6 {
+            let mut input = make_bg_input();
+            input.description = format!("bg-{i}");
+            let result = spawner.spawn(input, &make_bg_context()).await;
+            assert!(
+                result.is_ok(),
+                "spawn #{i} must succeed when no cap is configured, got {result:?}"
+            );
         }
     }
 
