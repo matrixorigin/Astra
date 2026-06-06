@@ -870,6 +870,24 @@ fn real_rust_analyzer_available() -> bool {
 }
 
 #[cfg(unix)]
+const CARGO_TOML: &str = "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+
+#[cfg(unix)]
+const DEFAULT_LIB_RS: &str = "pub fn hello_from_lsp() {}\n";
+
+#[cfg(unix)]
+fn setup_lsp_workspace(lib_rs: &str) -> (tempfile::TempDir, ToolExecutor, EnvGuard) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), CARGO_TOML).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), lib_rs).unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+    (dir, exe, guard)
+}
+
+#[cfg(unix)]
 fn write_real_typescript_workspace(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
