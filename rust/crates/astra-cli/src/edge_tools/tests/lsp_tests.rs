@@ -887,6 +887,367 @@ fn setup_lsp_workspace(lib_rs: &str) -> (tempfile::TempDir, ToolExecutor, EnvGua
     (dir, exe, guard)
 }
 
+fn setup_lsp_workspace_with_file(lib_rs: &str) -> (tempfile::TempDir, ToolExecutor, EnvGuard, std::path::PathBuf) {
+    let (dir, exe, guard) = setup_lsp_workspace(lib_rs);
+    let file_path = dir.path().join("src/lib.rs");
+    (dir, exe, guard, file_path)
+}
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_operations_use_real_lsp_when_available() {
+    struct TestCase {
+        name: &'static str,
+        operation: &'static str,
+        method: &'static str,
+        lib_rs: &'static str,
+        params: serde_json::Value,
+        verify: fn(&serde_json::Value),
+    }
+
+    let cases: &[TestCase] = &[
+        TestCase {
+            name: "lsp_implementation_uses_real_lsp_when_available",
+            operation: "implementation",
+            method: "textDocument/implementation",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["range"]["start"]["line"].as_u64(),
+            Some(0)
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_prepare_rename_uses_real_lsp_when_available",
+            operation: "prepare_rename",
+            method: "textDocument/prepareRename",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"]["placeholder"].as_str(),
+            Some("hello_from_lsp")
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_declaration_uses_real_lsp_when_available",
+            operation: "declaration",
+            method: "textDocument/declaration",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["range"]["start"]["character"].as_u64(),
+            Some(4)
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_type_definition_uses_real_lsp_when_available",
+            operation: "type_definition",
+            method: "textDocument/typeDefinition",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["range"]["end"]["character"].as_u64(),
+            Some(2)
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_document_highlight_uses_real_lsp_when_available",
+            operation: "document_highlight",
+            method: "textDocument/documentHighlight",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["kind"].as_u64(), Some(1));
+            },
+        },
+        TestCase {
+            name: "lsp_document_links_uses_real_lsp_when_available",
+            operation: "document_links",
+            method: "textDocument/documentLink",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["tooltip"].as_str(),
+            Some("fake document link")
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_inlay_hints_use_real_lsp_when_available",
+            operation: "inlay_hints",
+            method: "textDocument/inlayHint",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["label"].as_str(), Some(": ()"));
+            },
+        },
+        TestCase {
+            name: "lsp_folding_ranges_use_real_lsp_when_available",
+            operation: "folding_ranges",
+            method: "textDocument/foldingRange",
+            lib_rs: "pub fn hello_from_lsp() {\n    println!(\"hi\");\n}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["endLine"].as_u64(), Some(2));
+            },
+        },
+        TestCase {
+            name: "lsp_document_colors_use_real_lsp_when_available",
+            operation: "document_colors",
+            method: "textDocument/documentColor",
+            lib_rs: "const RED: &str = \"#ff0000\";\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["color"]["red"].as_f64(), Some(1.0));
+            },
+        },
+        TestCase {
+            name: "lsp_color_presentations_use_real_lsp_when_available",
+            operation: "color_presentations",
+            method: "textDocument/colorPresentation",
+            lib_rs: "const RED: &str = \"#ff0000\";\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 22}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["label"].as_str(), Some("#ff0000"));
+            },
+        },
+        TestCase {
+            name: "lsp_semantic_tokens_use_real_lsp_when_available",
+            operation: "semantic_tokens",
+            method: "textDocument/semanticTokens/full",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"]["data"][0].as_u64(), Some(0));
+            },
+        },
+        TestCase {
+            name: "lsp_supertypes_use_real_lsp_when_available",
+            operation: "supertypes",
+            method: "typeHierarchy/supertypes",
+            lib_rs: "trait Greeting {}\nstruct HelloType;\nimpl Greeting for HelloType {}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 2, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["name"].as_str(), Some("Greeting"));
+            },
+        },
+        TestCase {
+            name: "lsp_subtypes_use_real_lsp_when_available",
+            operation: "subtypes",
+            method: "typeHierarchy/subtypes",
+            lib_rs: "trait Greeting {}\nstruct FriendlyGreeting;\nimpl Greeting for FriendlyGreeting {}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["name"].as_str(),
+            Some("FriendlyGreeting")
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_code_lenses_use_real_lsp_when_available",
+            operation: "code_lenses",
+            method: "textDocument/codeLens",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["command"]["title"].as_str(),
+            Some("1 reference")
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_selection_ranges_uses_real_lsp_when_available",
+            operation: "selection_ranges",
+            method: "textDocument/selectionRange",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["parent"]["range"]["end"]["character"].as_u64(),
+            Some(25)
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_linked_editing_range_uses_real_lsp_when_available",
+            operation: "linked_editing_range",
+            method: "textDocument/linkedEditingRange",
+            lib_rs: "pub fn hello_from_lsp(hello_from_lsp: i32) {}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"]["ranges"][1]["end"]["character"].as_u64(),
+            Some(38)
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_format_document_uses_real_lsp_when_available",
+            operation: "format_document",
+            method: "textDocument/formatting",
+            lib_rs: "pub  fn hello_from_lsp() {}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
+            },
+        },
+        TestCase {
+            name: "lsp_format_range_uses_real_lsp_when_available",
+            operation: "format_range",
+            method: "textDocument/rangeFormatting",
+            lib_rs: "pub  fn hello_from_lsp() {}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 4, "end_line": 1, "end_column": 6}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
+            },
+        },
+        TestCase {
+            name: "lsp_format_on_type_uses_real_lsp_when_available",
+            operation: "format_on_type",
+            method: "textDocument/onTypeFormatting",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 25, "trigger_character": ";"}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(parsed["result"][0]["newText"].as_str(), Some("{\n}"));
+            },
+        },
+        TestCase {
+            name: "lsp_code_actions_use_real_lsp_when_available",
+            operation: "code_actions",
+            method: "textDocument/codeAction",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"][0]["title"].as_str(),
+            Some("Apply fake quick fix")
+        );
+        assert_eq!(
+            parsed["result"][0]["diagnostics"][0]["message"].as_str(),
+            Some("fake LSP diagnostic")
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_completions_use_real_lsp_when_available",
+            operation: "completions",
+            method: "textDocument/completion",
+            lib_rs: DEFAULT_LIB_RS,
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"]["items"][0]["label"].as_str(),
+            Some("hello_completion")
+        );
+            },
+        },
+        TestCase {
+            name: "lsp_signature_help_uses_real_lsp_when_available",
+            operation: "signature_help",
+            method: "textDocument/signatureHelp",
+            lib_rs: "pub fn hello_from_lsp(name: &str) {}\n",
+            params: serde_json::from_str(r#"{"file": "src/lib.rs", "line": 1, "column": 8}"#).unwrap(),
+            verify: |parsed| {
+        assert_eq!(
+            parsed["result"]["signatures"][0]["label"].as_str(),
+            Some("hello_from_lsp(name: &str)")
+        );
+            },
+        },
+    ];
+
+    for case in cases {
+        let (_dir, exe, _guard) = setup_lsp_workspace(case.lib_rs);
+        let mut params = case.params.clone();
+        params["operation"] = serde_json::json!(case.operation);
+        let result = exe.lsp(&params);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).unwrap_or_else(|e| panic!("{}: parse failed: {e}", case.name));
+        assert_eq!(
+            parsed["backend"].as_str(),
+            Some("lsp"),
+            "{}: backend", case.name
+        );
+        assert_eq!(
+            parsed["method"].as_str(),
+            Some(case.method),
+            "{}: method", case.name
+        );
+        (case.verify)(&parsed);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_format_apply_edits_when_dry_run_false() {
+    struct TestCase {
+        name: &'static str,
+        operation: &'static str,
+        extra_params: &'static str,
+        lib_rs_before: &'static str,
+        lib_rs_after: &'static str,
+    }
+
+    let cases: &[TestCase] = &[
+        TestCase {
+            name: "lsp_format_document_applies_text_edits_when_dry_run_false",
+            operation: "format_document",
+            extra_params: r#""#,
+            lib_rs_before: "pub  fn hello_from_lsp() {}\n",
+            lib_rs_after: "pub fn hello_from_lsp() {}\n",
+        },
+        TestCase {
+            name: "lsp_format_range_applies_text_edits_when_dry_run_false",
+            operation: "format_range",
+            extra_params: r#", "line": 1, "column": 4, "end_line": 1, "end_column": 6"#,
+            lib_rs_before: "pub  fn hello_from_lsp() {}\n",
+            lib_rs_after: "pub fn hello_from_lsp() {}\n",
+        },
+        TestCase {
+            name: "lsp_format_on_type_applies_text_edits_when_dry_run_false",
+            operation: "format_on_type",
+            extra_params: r#", "line": 1, "column": 25, "trigger_character": ";""#,
+            lib_rs_before: "pub fn hello_from_lsp() {}\n",
+            lib_rs_after: "pub fn hello_from_lsp() {\n}\n",
+        },
+    ];
+
+    for case in cases {
+        let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file(case.lib_rs_before);
+
+        let params_json = format!(
+            r#"{{"operation": "{}", "file": "src/lib.rs", "dry_run": false{}}}"#,
+            case.operation, case.extra_params
+        );
+        let result = exe.lsp(&serde_json::from_str::<serde_json::Value>(&params_json).unwrap());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).unwrap_or_else(|e| panic!("{}: parse failed: {e}", case.name));
+
+        assert_eq!(parsed["applied"].as_bool(), Some(true), "{}: applied", case.name);
+        assert_eq!(parsed["files_changed"].as_u64(), Some(1), "{}: files_changed", case.name);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            case.lib_rs_after,
+            "{}: file content", case.name
+        );
+    }
+}
+
+
+
 #[cfg(unix)]
 fn write_real_typescript_workspace(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1322,343 +1683,19 @@ fn lsp_surfaces_rust_lsp_startup_errors_for_supported_workspaces() {
 }
 
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_implementation_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "implementation",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/implementation")
-    );
-    assert_eq!(
-        parsed["result"][0]["range"]["start"]["line"].as_u64(),
-        Some(0)
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_prepare_rename_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "prepare_rename",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/prepareRename")
-    );
-    assert_eq!(
-        parsed["result"]["placeholder"].as_str(),
-        Some("hello_from_lsp")
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_declaration_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "declaration",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/declaration"));
-    assert_eq!(
-        parsed["result"][0]["range"]["start"]["character"].as_u64(),
-        Some(4)
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_type_definition_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "type_definition",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/typeDefinition")
-    );
-    assert_eq!(
-        parsed["result"][0]["range"]["end"]["character"].as_u64(),
-        Some(2)
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_document_highlight_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "document_highlight",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/documentHighlight")
-    );
-    assert_eq!(parsed["result"][0]["kind"].as_u64(), Some(1));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_document_links_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "document_links",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/documentLink"));
-    assert_eq!(
-        parsed["result"][0]["tooltip"].as_str(),
-        Some("fake document link")
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_inlay_hints_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "inlay_hints",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/inlayHint"));
-    assert_eq!(parsed["result"][0]["label"].as_str(), Some(": ()"));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_folding_ranges_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {\n    println!(\"hi\");\n}\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.lsp(&json!({
-        "operation": "folding_ranges",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/foldingRange"));
-    assert_eq!(parsed["result"][0]["endLine"].as_u64(), Some(2));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_document_colors_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "const RED: &str = \"#ff0000\";\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.lsp(&json!({
-        "operation": "document_colors",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/documentColor")
-    );
-    assert_eq!(parsed["result"][0]["color"]["red"].as_f64(), Some(1.0));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_color_presentations_use_real_lsp_when_available() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "const RED: &str = \"#ff0000\";\n",
-    )
-    .unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.lsp(&json!({
-        "operation": "color_presentations",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 22
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/colorPresentation")
-    );
-    assert_eq!(parsed["result"][0]["label"].as_str(), Some("#ff0000"));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_semantic_tokens_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "semantic_tokens",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/semanticTokens/full")
-    );
-    assert_eq!(parsed["result"]["data"][0].as_u64(), Some(0));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_supertypes_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace("trait Greeting {}\nstruct HelloType;\nimpl Greeting for HelloType {}\n");
-
-    let result = exe.lsp(&json!({
-        "operation": "supertypes",
-        "file": "src/lib.rs",
-        "line": 2,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("typeHierarchy/supertypes"));
-    assert_eq!(parsed["result"][0]["name"].as_str(), Some("Greeting"));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_subtypes_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace("trait Greeting {}\nstruct FriendlyGreeting;\nimpl Greeting for FriendlyGreeting {}\n");
-
-    let result = exe.lsp(&json!({
-        "operation": "subtypes",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("typeHierarchy/subtypes"));
-    assert_eq!(
-        parsed["result"][0]["name"].as_str(),
-        Some("FriendlyGreeting")
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_code_lenses_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "code_lenses",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/codeLens"));
-    assert_eq!(
-        parsed["result"][0]["command"]["title"].as_str(),
-        Some("1 reference")
-    );
-}
-
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
@@ -1809,264 +1846,19 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
 }
 
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_selection_ranges_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "selection_ranges",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/selectionRange")
-    );
-    assert_eq!(
-        parsed["result"][0]["parent"]["range"]["end"]["character"].as_u64(),
-        Some(25)
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_linked_editing_range_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace("pub fn hello_from_lsp(hello_from_lsp: i32) {}\n");
-
-    let result = exe.lsp(&json!({
-        "operation": "linked_editing_range",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/linkedEditingRange")
-    );
-    assert_eq!(
-        parsed["result"]["ranges"][1]["end"]["character"].as_u64(),
-        Some(38)
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_format_document_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace("pub  fn hello_from_lsp() {}\n");
-
-    let result = exe.lsp(&json!({
-        "operation": "format_document",
-        "file": "src/lib.rs",
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/formatting"));
-    assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_format_document_applies_text_edits_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub  fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.lsp(&json!({
-        "operation": "format_document",
-        "file": "src/lib.rs",
-        "dry_run": false
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["applied"].as_bool(), Some(true));
-    assert_eq!(parsed["files_changed"].as_u64(), Some(1));
-    assert_eq!(
-        std::fs::read_to_string(file_path).unwrap(),
-        "pub fn hello_from_lsp() {}\n"
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_format_range_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace("pub  fn hello_from_lsp() {}\n");
-
-    let result = exe.lsp(&json!({
-        "operation": "format_range",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 4,
-        "end_line": 1,
-        "end_column": 6
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/rangeFormatting")
-    );
-    assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_format_range_applies_text_edits_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub  fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.lsp(&json!({
-        "operation": "format_range",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 4,
-        "end_line": 1,
-        "end_column": 6,
-        "dry_run": false
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["applied"].as_bool(), Some(true));
-    assert_eq!(parsed["files_changed"].as_u64(), Some(1));
-    assert_eq!(
-        std::fs::read_to_string(file_path).unwrap(),
-        "pub fn hello_from_lsp() {}\n"
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_format_on_type_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "format_on_type",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 25,
-        "trigger_character": ";"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/onTypeFormatting")
-    );
-    assert_eq!(parsed["result"][0]["newText"].as_str(), Some("{\n}"));
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_format_on_type_applies_text_edits_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
-
-    let result = exe.lsp(&json!({
-        "operation": "format_on_type",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 25,
-        "trigger_character": ";",
-        "dry_run": false
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["applied"].as_bool(), Some(true));
-    assert_eq!(parsed["files_changed"].as_u64(), Some(1));
-    assert_eq!(
-        std::fs::read_to_string(file_path).unwrap(),
-        "pub fn hello_from_lsp() {\n}\n"
-    );
-}
-
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_code_actions_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "code_actions",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/codeAction"));
-    assert_eq!(
-        parsed["result"][0]["title"].as_str(),
-        Some("Apply fake quick fix")
-    );
-    assert_eq!(
-        parsed["result"][0]["diagnostics"][0]["message"].as_str(),
-        Some("fake LSP diagnostic")
-    );
-}
-
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_apply_selected_workspace_edit_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -2116,18 +1908,7 @@ fn lsp_code_actions_execute_selected_command_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_resolve_selected_action_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -2152,18 +1933,7 @@ fn lsp_code_actions_resolve_selected_action_when_dry_run_false() {
 #[test]
 #[serial_test::serial]
 fn lsp_code_actions_apply_selected_snippet_workspace_edit_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "code_actions",
@@ -2184,27 +1954,6 @@ fn lsp_code_actions_apply_selected_snippet_workspace_edit_when_dry_run_false() {
 }
 
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_completions_use_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace(DEFAULT_LIB_RS);
-
-    let result = exe.lsp(&json!({
-        "operation": "completions",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(parsed["method"].as_str(), Some("textDocument/completion"));
-    assert_eq!(
-        parsed["result"]["items"][0]["label"].as_str(),
-        Some("hello_completion")
-    );
-}
-
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
@@ -2233,18 +1982,7 @@ fn lsp_completions_resolve_selected_item_when_item_index_provided() {
 #[test]
 #[serial_test::serial]
 fn lsp_completions_apply_selected_item_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "completions",
@@ -2266,30 +2004,6 @@ fn lsp_completions_apply_selected_item_when_dry_run_false() {
 }
 
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn lsp_signature_help_uses_real_lsp_when_available() {
-    let (_dir, exe, _guard) = setup_lsp_workspace("pub fn hello_from_lsp(name: &str) {}\n");
-
-    let result = exe.lsp(&json!({
-        "operation": "signature_help",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
-    assert_eq!(
-        parsed["method"].as_str(),
-        Some("textDocument/signatureHelp")
-    );
-    assert_eq!(
-        parsed["result"]["signatures"][0]["label"].as_str(),
-        Some("hello_from_lsp(name: &str)")
-    );
-}
-
 #[cfg(unix)]
 #[test]
 #[ignore = "manual validation with real rust-analyzer"]
@@ -2592,18 +2306,7 @@ fn lsp_rename_uses_real_lsp_preview_when_available() {
 #[test]
 #[serial_test::serial]
 fn lsp_rename_applies_real_lsp_workspace_edit_when_dry_run_false() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
-    let script = fake_lsp_server_script(dir.path());
-    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
-    let exe = ToolExecutor::new(dir.path());
+    let (_dir, exe, _guard, file_path) = setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
     let result = exe.lsp(&json!({
         "operation": "rename",
