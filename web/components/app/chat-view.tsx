@@ -16,6 +16,7 @@ import { getChat, queueChatRunInput, resumeChatRun, stopChatRun, streamChatMessa
 import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 import { deriveChatRunUiState } from '@/lib/chat-run-state';
+import { isChatScrolledToBottom, shouldAutoScrollChat } from '@/lib/chat-scroll-state';
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === 'AbortError';
@@ -443,7 +444,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   }, []);
 
   useEffect(() => {
-    if (pinnedRef.current) {
+    if (shouldAutoScrollChat({ pinnedToBottom: pinnedRef.current })) {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
     }
   }, [detail.messages.length, latestMessage?.content, latestMessage?.reasoning, latestMessage?.artifacts?.length]);
@@ -551,7 +552,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         ref={scrollRef}
         onScroll={(event) => {
           const target = event.currentTarget;
-          pinnedRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 80;
+          pinnedRef.current = isChatScrolledToBottom(target);
         }}
         className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
       >
