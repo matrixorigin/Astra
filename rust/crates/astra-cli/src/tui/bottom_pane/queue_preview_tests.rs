@@ -34,6 +34,7 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
     pane.set_task_status(TaskStatus::TurnRunning {
         started_at: Instant::now(),
     });
+    seed_footer(&mut pane);
 
     let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
     assert!(
