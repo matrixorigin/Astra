@@ -15,13 +15,11 @@ import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
 import { getChat, queueChatRunInput, resumeChatRun, stopChatRun, streamChatMessage, streamExistingChatRun, updateChatModel } from '@/lib/api/chats';
 import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
+import { deriveChatRunUiState } from '@/lib/chat-run-state';
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === 'AbortError';
 }
-
-const QUEUEABLE_RUN_STATUSES = new Set(['running', 'input-queued', 'waiting']);
-const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
   const router = useRouter();
@@ -41,57 +39,24 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const latestMessage = detail.messages[detail.messages.length - 1];
   const isArchived = Boolean(detail.chat.archivedAt);
   const chatListHref = detail.chat.projectId ? `/projects/${detail.chat.projectId}` : '/chats';
-  const activeRunStatus = detail.activeRun?.status.trim().toLowerCase() ?? null;
-  const canQueueDeferredInput = Boolean(
-    detail.activeRun?.runId
-      && activeRunStatus
-      && QUEUEABLE_RUN_STATUSES.has(activeRunStatus),
-  );
-  const canResumeRun = Boolean(
-    detail.activeRun?.runId
-      && activeRunStatus === 'paused',
-  );
-  const canStopRun = Boolean(
-    detail.activeRun?.runId
-      && activeRunStatus
-      && activeRunStatus !== 'cancelling',
-  );
-  const activeRunBlocksNewInput = Boolean(
-    detail.activeRun?.runId
-      && activeRunStatus
-      && !TERMINAL_RUN_STATUSES.has(activeRunStatus)
-      && !canQueueDeferredInput
-      && !canResumeRun
-      && activeRunStatus !== 'cancelling',
-  );
-  const runControlBusy = queueingDeferredInput || resumingRun || stoppingRun;
-  const composerDisabled = startingRun
-    || queueingDeferredInput
-    || resumingRun
-    || stoppingRun
-    || activeRunStatus === 'paused'
-    || activeRunStatus === 'cancelling'
-    || activeRunBlocksNewInput;
-  const composerPlaceholder = activeRunStatus === 'paused'
-    ? 'Run paused. Resume or stop it to continue.'
-    : activeRunStatus === 'cancelling'
-      ? 'Stopping current run...'
-      : activeRunBlocksNewInput
-        ? `Run status is ${detail.activeRun?.status ?? 'unknown'}. Stop it or refresh before sending.`
-        : canQueueDeferredInput
-          ? 'Queue a follow-up for the next tool call...'
-          : 'Reply to Astra...';
-  const activeRunLabel = activeRunStatus === 'cancelling'
-    ? 'Stopping current run'
-    : activeRunStatus === 'input-queued'
-      ? 'Input queued for next tool call'
-    : detail.activeRun?.waitingFor
-      ? `Waiting for ${detail.activeRun.waitingFor}`
-      : detail.activeRun?.runId
-        ? `Run ${detail.activeRun.status}`
-        : isArchived
-          ? 'Archived'
-        : 'Active';
+  const {
+    activeRunStatus,
+    canQueueDeferredInput,
+    canResumeRun,
+    canStopRun,
+    activeRunBlocksNewInput,
+    runControlBusy,
+    composerDisabled,
+    composerPlaceholder,
+    activeRunLabel,
+  } = deriveChatRunUiState({
+    activeRun: detail.activeRun,
+    archived: isArchived,
+    startingRun,
+    queueingDeferredInput,
+    resumingRun,
+    stoppingRun,
+  });
 
   const nextStreamAbortSignal = useCallback(() => {
     streamAbortRef.current?.abort();
