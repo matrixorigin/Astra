@@ -291,6 +291,24 @@ describe('ChatView deferred-input unhappy paths', () => {
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
+  it('blocks new input for unknown non-terminal active-run statuses', async () => {
+    const user = userEvent.setup();
+
+    render(<ChatView initial={makeDetail({
+      runId: 'run-123',
+      status: 'initializing-provider',
+      waitingFor: null,
+    })} />);
+
+    expect(screen.getByText('Run status is initializing-provider. Stop it or refresh before sending new input.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Submit composer' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+
+    expect(mockQueueChatRunInput).not.toHaveBeenCalled();
+    expect(mockStreamChatMessage).not.toHaveBeenCalled();
+  });
+
   it('lets the web user resume a paused run instead of trapping the composer', async () => {
     const user = userEvent.setup();
     mockResumeChatRun.mockResolvedValue({

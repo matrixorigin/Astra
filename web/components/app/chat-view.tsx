@@ -21,6 +21,7 @@ function isAbortError(error: unknown) {
 }
 
 const QUEUEABLE_RUN_STATUSES = new Set(['running', 'input-queued', 'waiting']);
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
   const router = useRouter();
@@ -53,14 +54,29 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       && activeRunStatus
       && activeRunStatus !== 'cancelling',
   );
-  const composerDisabled = startingRun || resumingRun || stoppingRun || activeRunStatus === 'paused' || activeRunStatus === 'cancelling';
+  const activeRunBlocksNewInput = Boolean(
+    detail.activeRun?.runId
+      && activeRunStatus
+      && !TERMINAL_RUN_STATUSES.has(activeRunStatus)
+      && !canQueueDeferredInput
+      && !canResumeRun
+      && activeRunStatus !== 'cancelling',
+  );
+  const composerDisabled = startingRun
+    || resumingRun
+    || stoppingRun
+    || activeRunStatus === 'paused'
+    || activeRunStatus === 'cancelling'
+    || activeRunBlocksNewInput;
   const composerPlaceholder = activeRunStatus === 'paused'
     ? 'Run paused. Resume or stop it to continue.'
     : activeRunStatus === 'cancelling'
       ? 'Stopping current run...'
-      : canQueueDeferredInput
-        ? 'Queue a follow-up for the next tool call...'
-        : 'Reply to Astra...';
+      : activeRunBlocksNewInput
+        ? `Run status is ${detail.activeRun?.status ?? 'unknown'}. Stop it or refresh before sending.`
+        : canQueueDeferredInput
+          ? 'Queue a follow-up for the next tool call...'
+          : 'Reply to Astra...';
   const activeRunLabel = activeRunStatus === 'cancelling'
     ? 'Stopping current run'
     : activeRunStatus === 'input-queued'
@@ -589,7 +605,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                       ? 'New messages are queued after the next tool call. Use Stop to interrupt now.'
                       : activeRunStatus === 'paused'
                         ? 'This run is paused. Resume to continue or Stop to cancel it.'
-                        : 'Stopping the current run. New input stays disabled until cancellation completes.'}
+                        : activeRunBlocksNewInput
+                          ? `Run status is ${detail.activeRun.status}. Stop it or refresh before sending new input.`
+                          : 'Stopping the current run. New input stays disabled until cancellation completes.'}
                   </p>
                   <div className="flex shrink-0 items-center gap-2">
                     {canResumeRun ? (
