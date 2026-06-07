@@ -13,13 +13,13 @@
 //!   accent), `□` (pending, dim).
 //! - **Subject style**: bold for in_progress, strikethrough for
 //!   completed, dim for completed or blocked.
-//! - **Blocked-by badge**: appended `› blocked by #1, #3` when the task
+//! - **Blocked-by badge**: appended `· waiting on #1, #3` when the task
 //!   has any unresolved blockers.
-//! - **Standalone header**: optional `N tasks (K done, M in progress, J
-//!   open)` line above the list.
+//! - **Standalone header**: optional `Tasks · K working · M queued
+//!   · J done` line above the list.
 //! - **Truncation** when `tasks.len() > maxDisplay`: prioritize
 //!   in-progress → pending (blocked last within pending) → completed;
-//!   append `… +N in progress, M pending, K completed` when any tasks
+//!   append `· N more: M working, K queued, J done` when any tasks
 //!   are hidden. Recent-completed 30s TTL tracking is Phase 4.2.
 //! - **Responsive subject truncation** gated behind available columns.
 //!
@@ -79,32 +79,13 @@ impl TaskBoardColors {
 /// Per-status palette. Glyphs mirror the reference TUI's `figures`
 /// library (tick / squareSmallFilled / squareSmall) so users coming
 /// from that interface read the list the same way.
-/// Spinner frames for in_progress tasks. Cycles every 100ms.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn spinner_frame() -> &'static str {
-    #[cfg(test)]
-    {
-        SPINNER_FRAMES[0] // deterministic in tests
-    }
-    #[cfg(not(test))]
-    {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let idx = (ms / 100) as usize % SPINNER_FRAMES.len();
-        SPINNER_FRAMES[idx]
-    }
-}
-
 fn status_icon_and_color(
     status: &SessionTaskStatusKind,
     colors: TaskBoardColors,
 ) -> (&'static str, Color) {
     match status {
         SessionTaskStatusKind::Completed => ("✔", colors.success),
-        SessionTaskStatusKind::InProgress => (spinner_frame(), colors.accent),
+        SessionTaskStatusKind::InProgress => ("•", colors.accent),
         SessionTaskStatusKind::Pending
         | SessionTaskStatusKind::Archived
         | SessionTaskStatusKind::Deleted
@@ -308,8 +289,8 @@ fn render_task_line(
             .collect::<Vec<_>>()
             .join(", ");
         spans.push(Span::styled(
-            format!(" › blocked by {}", rendered),
-            Style::default().add_modifier(Modifier::DIM),
+            format!(" · waiting on {}", rendered),
+            Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
         ));
     }
 
@@ -398,16 +379,21 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
     };
     let mut parts: Vec<String> = Vec::new();
     if in_progress > 0 {
-        parts.push(format!("{} in progress", in_progress));
+        parts.push(format!("{} working", in_progress));
     }
     if pending > 0 {
-        parts.push(format!("{} pending", pending));
+        parts.push(format!("{} queued", pending));
     }
     if completed > 0 {
-        parts.push(format!("{} completed", completed));
+        parts.push(format!("{} done", completed));
     }
+    let text = if parts.len() == 1 {
+        format!("… {} more {}", hidden.len(), parts[0])
+    } else {
+        format!("… {} more: {}", hidden.len(), parts.join(", "))
+    };
     Some(Line::from(Span::styled(
-        format!(" … +{}", parts.join(", ")),
+        text,
         Style::default().add_modifier(Modifier::DIM),
     )))
 }
@@ -498,11 +484,11 @@ where
             // tasks (K done, …)") which also contains titles later.
             let first_text = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             let is_task_row = first_text == "✔ "
+                || first_text == "• "
                 || first_text == "◻ "
                 || first_text == "· "
-                || (first_text.ends_with(' ')
-                    && first_text.trim().len() <= 4
-                    && SPINNER_FRAMES.iter().any(|f| first_text.starts_with(f)));
+                || first_text == "✖ "
+                || first_text == "■ ";
             if !is_task_row {
                 continue;
             }
@@ -571,16 +557,16 @@ pub fn render_multi_with_colors(
             continue;
         }
 
-        // Header row: dim short session id + active count.
+        // Header row: calm session label + working count.
         let short: String = session_id.chars().take(8).collect();
         let header = Line::from(vec![
             Span::styled(
-                format!("▸ {short}"),
+                format!("Session {short}"),
                 Style::default().fg(colors.dim).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  ({} active)", active.len()),
-                Style::default().fg(colors.dim),
+                format!(" · {} working", active.len()),
+                Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
             ),
         ]);
         if rows_used >= total_cap {
@@ -601,8 +587,10 @@ pub fn render_multi_with_colors(
             let subject = truncate_to_width(&task.title, subject_w);
             out.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(icon.to_string(), Style::default().fg(icon_color)),
-                Span::raw(" "),
+                Span::styled(
+                    format!("{icon} "),
+                    Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(subject),
             ]));
             rows_used += 1;
@@ -620,10 +608,13 @@ pub fn render_multi_with_colors(
         if out.len() >= total_cap
             && let Some(last) = out.last_mut()
         {
-            *last = Line::from(vec![Span::styled("  …", Style::default().fg(colors.dim))]);
+            *last = Line::from(vec![Span::styled(
+                "  … more sessions",
+                Style::default().fg(colors.dim),
+            )]);
         } else {
             out.push(Line::from(vec![Span::styled(
-                "  …",
+                "  … more sessions",
                 Style::default().fg(colors.dim),
             )]));
         }
@@ -667,65 +658,35 @@ pub fn render_with_colors(
     if standalone {
         let mut header_spans: Vec<Span<'static>> = Vec::new();
         header_spans.push(Span::styled(
-            format!("{}", tasks.len()),
+            "Tasks",
             Style::default().add_modifier(Modifier::BOLD),
         ));
+
+        let header_variants = [
+            format!(" · {in_progress} working · {pending} queued · {completed} done"),
+            format!(" · {in_progress} working · {pending} queued"),
+            format!(" · {pending} queued · {completed} done"),
+            format!(" · {in_progress} working"),
+            format!(" · {pending} queued"),
+        ];
+        let prefix_width = "Tasks".width();
+        let suffix = header_variants
+            .iter()
+            .find(|variant| prefix_width + variant.width() <= columns as usize)
+            .cloned()
+            .unwrap_or_default();
         header_spans.push(Span::styled(
-            " tasks (".to_string(),
+            suffix,
             Style::default().add_modifier(Modifier::DIM),
         ));
-        header_spans.push(Span::styled(
-            format!("{}", completed),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        header_spans.push(Span::styled(
-            " done".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        if in_progress > 0 {
-            header_spans.push(Span::styled(
-                ", ".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            header_spans.push(Span::styled(
-                format!("{}", in_progress),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            header_spans.push(Span::styled(
-                " in progress".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        header_spans.push(Span::styled(
-            ", ".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        header_spans.push(Span::styled(
-            format!("{}", pending),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        header_spans.push(Span::styled(
-            " open)".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+
         // Subtask roll-up: when any task fans out into subtasks, show
         // aggregate progress so a "1 task in progress" header doesn't
         // hide the 2/5 subtasks that already shipped.
         let (sub_done, sub_total) = subtask_counts(tasks);
         if sub_total > 0 {
             header_spans.push(Span::styled(
-                format!(" · {sub_done}/{sub_total} subtasks done"),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        // Ctrl+T collapse hint. Reference TUI appends this to the
-        // standalone header so new users discover the toggle without
-        // hunting help. Drop when columns are too narrow to fit it.
-        let hint = "  Ctrl+T to collapse";
-        let header_w: usize = header_spans.iter().map(|s| s.content.width()).sum();
-        if header_w + hint.width() < columns as usize {
-            header_spans.push(Span::styled(
-                hint.to_string(),
+                format!(" · {sub_done}/{sub_total} done"),
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
@@ -781,9 +742,9 @@ pub fn render_with_colors(
 /// user hasn't pressed Ctrl+T. Replaces the full panel during running
 /// turns so the spinner / streaming region stays uncluttered.
 ///
-/// Format: `⠋ N tasks · current: <title> · K/M subtasks · Ctrl+T expand`
-/// (the "current" segment shows the in-progress task title, falling
-/// back to "next" when nothing is in progress yet; subtask roll-up
+/// Format: `• Tasks · K working · J done · <title>`
+/// (the title segment shows the in-progress task title, falling
+/// back to the next pending item when nothing is in progress yet; subtask roll-up
 /// only appears when any subtask exists).
 ///
 /// Returns `None` for empty task lists — caller renders nothing in
@@ -802,7 +763,7 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
 
     let theme = crate::tui::theme::current();
     let icon = if in_progress > 0 {
-        spinner_frame()
+        "•"
     } else if completed == total {
         "✔"
     } else {
@@ -822,27 +783,23 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
-        format!("{total} task{}", if total == 1 { "" } else { "s" }),
+        "Tasks",
         Style::default().add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        format!(" ({completed} done"),
-        Style::default().add_modifier(Modifier::DIM),
     ));
     if in_progress > 0 {
         spans.push(Span::styled(
-            format!(", {in_progress} running"),
+            format!(" · {in_progress} working"),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
     spans.push(Span::styled(
-        ")".to_string(),
+        format!(" · {completed} done"),
         Style::default().add_modifier(Modifier::DIM),
     ));
 
     if sub_total > 0 {
         spans.push(Span::styled(
-            format!(" · {sub_done}/{sub_total} subtasks"),
+            format!(" · {sub_done}/{sub_total} done"),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
@@ -851,8 +808,7 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         // Trim the title to whatever space is left after the rest of
         // the line so we don't blow past `columns`.
         let used: usize = spans.iter().map(|s| s.content.width()).sum();
-        let hint = "  Ctrl+T expand";
-        let reserved = used + " · ".width() + hint.width();
+        let reserved = used + " · ".width();
         let title_budget = (columns as usize).saturating_sub(reserved).max(8);
         let title = truncate_to_width(&task.title, title_budget);
         spans.push(Span::styled(
@@ -862,19 +818,10 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         spans.push(Span::styled(title, Style::default()));
     }
 
-    let hint = "  Ctrl+T expand";
-    let used: usize = spans.iter().map(|s| s.content.width()).sum();
-    if used + hint.width() < columns as usize {
-        spans.push(Span::styled(
-            hint.to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
-
     Some(Line::from(spans))
 }
 
-/// One-line "Next: <subject>" nudge for use when `expanded_view` is not
+/// One-line "Up next · <subject>" nudge for use when `expanded_view` is not
 /// `Tasks` but a task is in flight. Matches the reference TUI's Spinner
 /// fallback at `components/Spinner.tsx:296`.
 pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
@@ -885,10 +832,10 @@ pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'sta
         .or_else(|| tasks.iter().find(|t| t.status.is_pending()))?;
     let subject = truncate_to_width(
         &candidate.title,
-        max_subject_width(columns).saturating_sub(6), // "Next: "
+        max_subject_width(columns).saturating_sub(11), // "Up next · "
     );
     Some(Line::from(Span::styled(
-        format!("Next: {}", subject),
+        format!("Up next · {}", subject),
         Style::default().add_modifier(Modifier::DIM),
     )))
 }
@@ -968,10 +915,10 @@ mod tests {
         let lines = render(&tasks, 80, 40, true);
         assert!(!lines.is_empty());
         let header = spans_text(&lines[0]);
-        assert!(header.contains("3 tasks"), "header: {header}");
+        assert!(header.contains("Tasks"), "header: {header}");
         assert!(header.contains("1 done"));
-        assert!(header.contains("1 in progress"));
-        assert!(header.contains("1 open"));
+        assert!(header.contains("1 working"));
+        assert!(header.contains("1 queued"));
     }
 
     #[test]
@@ -1010,8 +957,8 @@ mod tests {
         // cap=10 for rows=24 → 10 visible + 1 hidden-summary
         assert_eq!(lines.len(), 11);
         let summary = spans_text(&lines[10]);
-        assert!(summary.contains("+"), "summary: {summary}");
-        assert!(summary.contains("5 pending"), "summary: {summary}");
+        assert!(summary.contains("more"), "summary: {summary}");
+        assert!(summary.contains("5 queued"), "summary: {summary}");
     }
 
     #[test]
@@ -1050,7 +997,7 @@ mod tests {
             .find(|l| spans_text(l).contains("blocked"))
             .expect("blocked line present");
         let text = spans_text(blocked_line);
-        assert!(text.contains("› blocked by"), "{text}");
+        assert!(text.contains("waiting on"), "{text}");
         assert!(text.contains("#1"), "{text}");
         assert!(text.contains("#3"), "{text}");
     }
@@ -1065,7 +1012,7 @@ mod tests {
         let hint = render_next_hint(&tasks, 80).expect("some");
         let text = spans_text(&hint);
         assert!(text.contains("running-thing"), "{text}");
-        assert!(text.starts_with("Next: "), "{text}");
+        assert!(text.starts_with("Up next · "), "{text}");
     }
 
     #[test]
@@ -1075,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_summary_shows_counts_current_and_hint() {
+    fn collapsed_summary_shows_counts_and_current_task() {
         let tasks = vec![
             mk_task("task-1", "alpha-done", "completed"),
             mk_task("task-2", "beta-running", "in_progress"),
@@ -1083,14 +1030,15 @@ mod tests {
         ];
         let line = render_collapsed_summary(&tasks, 100).expect("non-empty");
         let text = spans_text(&line);
-        assert!(text.contains("3 tasks"), "{text}");
+        assert!(text.contains("Tasks"), "{text}");
         assert!(text.contains("1 done"), "{text}");
-        assert!(text.contains("1 running"), "{text}");
+        assert!(text.contains("1 working"), "{text}");
+        assert!(!text.contains("total"), "{text}");
         // The current-task title should be the in_progress one, not
         // the completed one.
         assert!(text.contains("beta-running"), "{text}");
         assert!(!text.contains("alpha-done"), "{text}");
-        assert!(text.contains("Ctrl+T expand"), "{text}");
+        assert!(!text.contains("Ctrl+T"), "{text}");
     }
 
     #[test]
@@ -1117,7 +1065,7 @@ mod tests {
         ];
         let line = render_collapsed_summary(&[parent], 100).expect("non-empty");
         let text = spans_text(&line);
-        assert!(text.contains("1/2 subtasks"), "{text}");
+        assert!(text.contains("1/2 done"), "{text}");
     }
 
     #[test]
@@ -1165,7 +1113,7 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(spans_text).collect();
         // Header carries the subtask roll-up.
         assert!(
-            texts[0].contains("1/3 subtasks done"),
+            texts[0].contains("1/3 done"),
             "header missing subtask aggregate: {}",
             texts[0]
         );
@@ -1244,7 +1192,7 @@ mod tests {
         ];
         let light = TaskBoardColors::from_preset(&Theme::light());
         let lines = render_with_colors(&tasks, 80, 24, false, light);
-        // Find the in_progress line (bolded "running") and confirm its
+        // Find the in_progress line and confirm its
         // icon span carries the light-theme accent (deep blue) rather
         // than dark's Cyan.
         let running = lines
@@ -1306,8 +1254,8 @@ mod tests {
             "short session id header missing: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("2 active")),
-            "active count missing from header: {texts:?}"
+            texts.iter().any(|t| t.contains("2 working")),
+            "working count missing from header: {texts:?}"
         );
         assert!(texts.iter().any(|t| t.contains("open one")));
         assert!(texts.iter().any(|t| t.contains("busy one")));

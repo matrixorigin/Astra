@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
-assertion_line: 115
 expression: "render_ctx(&ctx, 40)"
 ---
-  Ask           sonnet-4.6 · 20% (40k)
+  sonnet-4.6 · ~/proje… · 20% (40k)

@@ -314,6 +314,10 @@ impl BottomPaneView for TranscriptView {
             None
         }
     }
+
+    fn is_transcript_view(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

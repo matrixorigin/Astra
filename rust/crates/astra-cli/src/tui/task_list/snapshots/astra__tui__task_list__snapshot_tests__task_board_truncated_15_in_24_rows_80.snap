@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
-assertion_line: 155
+assertion_line: 167
 expression: "draw(&tasks, 80, 24, false)"
 ---
 ◻ task number 1
@@ -13,4 +13,4 @@ expression: "draw(&tasks, 80, 24, false)"
 ◻ task number 8
 ◻ task number 9
 ◻ task number 10
- … +5 pending
+… 5 more 5 queued

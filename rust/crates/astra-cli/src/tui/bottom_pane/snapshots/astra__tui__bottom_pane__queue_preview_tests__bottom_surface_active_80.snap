@@ -1,8 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/bottom_pane/queue_preview_tests.rs
-assertion_line: 103
-expression: "snapshot_text(&pane, Rect::new(0, 0, 80, 4))"
+expression: "snapshot_text(&pane, Rect::new(0, 0, 80, 5))"
 ---
-· Send follow-up                                                                
-  Queued for next tool call · Ctrl+C stops                                      
-  Ask                     sonnet-4.6 · ~/github/astra · ⎇ enqueue_n…_next_call
+· Message astra                                                                 
+  Queued for next tool · Ctrl+C stops                                           
+  sonnet-4.6 · ~/github/astra · ⎇ enqueue…ext_call

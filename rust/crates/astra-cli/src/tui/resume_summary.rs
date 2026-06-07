@@ -58,8 +58,12 @@ impl ResumeSummary {
             parts.push(format!("{} cancelled", self.cancelled));
         }
         let breakdown = parts.join(", ");
-        let plural = if total == 1 { "task" } else { "tasks" };
-        format!("{total} background {plural} finished while you were away ({breakdown}).")
+        let noun = if total == 1 {
+            "background job"
+        } else {
+            "background jobs"
+        };
+        format!("While you were away: {total} {noun} finished ({breakdown}).")
     }
 }
 
@@ -244,9 +248,10 @@ mod tests {
         };
         let out = s.render();
         assert!(
-            out.contains("1 background task") && !out.contains("1 background tasks"),
+            out.contains("1 background job") && !out.contains("1 background jobs"),
             "singular copy required: {out}"
         );
+        assert!(out.starts_with("While you were away:"));
         assert!(out.contains("1 ok"));
     }
 
@@ -260,7 +265,7 @@ mod tests {
         };
         let out = s.render();
         assert!(
-            out.contains("5 background tasks"),
+            out.contains("5 background jobs"),
             "plural copy missing: {out}"
         );
         assert!(

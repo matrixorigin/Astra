@@ -1,14 +1,14 @@
 ---
 source: crates/astra-cli/src/tui/chat_widget/turn_driver.rs
-assertion_line: 163
 expression: "render_history(&w, 80)"
 ---
+
 › run ls
 
-• Ran bash (42ms)
-  │ ls /tmp
+• Ran Bash · 42ms
+  ├ ls /tmp
   └ 3 entries
 
 █ There are 3 files.
 
-  ─ ⏱ 1.2s (ttft 400ms) │ ⚡  240 ↑200 ↓40 │ 🛠 1 │ Σ 240 ─
+  1.2s total · ttft 400ms · 240 tokens · 1 tool · (240 overall)

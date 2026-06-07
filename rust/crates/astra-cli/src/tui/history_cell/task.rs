@@ -221,10 +221,13 @@ impl HistoryCell for TaskCell {
         let task_label = "Task";
         let desc = trimmed_desc(&self.description, max_child_w);
         let header = if self.status == TaskStatus::Running {
-            let text = format!("{task_label} · {desc} · {}", self.elapsed_str());
-            let mut spans = vec![self.arrow()];
-            spans.extend(crate::tui::shimmer::shimmer_spans(&text));
-            Line::from(spans)
+            Line::from(vec![
+                self.arrow(),
+                Span::styled(task_label, Style::default().bold()),
+                Span::styled(" · ", dim),
+                Span::raw(desc),
+                Span::styled(format!(" · {}", self.elapsed_str()), dim),
+            ])
         } else {
             let meta = format!("{} · {}", self.title_text(), self.elapsed_str());
             Line::from(vec![
@@ -244,7 +247,7 @@ impl HistoryCell for TaskCell {
             self.status != TaskStatus::Running && self.children.len() > COLLAPSE_THRESHOLD;
 
         if should_collapse {
-            // Collapsed summary: "  └ 12 tools · 10 succeeded, 2 failed"
+            // Collapsed summary: "  └ 12 steps · 10 done, 2 failed"
             let succeeded = self
                 .children
                 .iter()
@@ -257,52 +260,62 @@ impl HistoryCell for TaskCell {
                 .count();
             let total = self.children.len();
             let summary = if failed > 0 {
-                format!("{total} tools · {succeeded} succeeded, {failed} failed")
+                format!("{total} steps · {succeeded} done, {failed} failed")
             } else {
-                format!("{total} tools · all succeeded")
+                format!("{total} steps · all done")
             };
             lines.push(Line::from(vec![
                 Span::styled("  └ ", dim),
                 Span::styled(summary, dim),
             ]));
         } else {
-            // Inline children — each as `  ├ Bash · 20ms · ls`.
+            // Inline children — calmer "action + object" phrasing:
+            // `  ├ Read src/main.rs · 20ms`.
             let total = self.children.len();
             for (i, child) in self.children.iter().enumerate() {
                 let is_last = i + 1 == total && self.status != TaskStatus::Running;
                 let connector = if is_last { "  └ " } else { "  ├ " };
                 let name_style = match child.status {
-                    ChildStatus::Running => Style::default().fg(Color::DarkGray).bold(),
+                    ChildStatus::Running => Style::default().fg(Color::Gray).bold(),
                     ChildStatus::Success => Style::default().fg(Color::Green).bold(),
                     ChildStatus::Failed => Style::default().fg(Color::Red).bold(),
                 };
                 let meta = match child.status {
-                    ChildStatus::Running => "running".to_string(),
-                    ChildStatus::Success => child
-                        .duration_ms
-                        .map(format_duration_ms)
-                        .unwrap_or_else(|| "done".into()),
+                    ChildStatus::Running => None,
+                    ChildStatus::Success => child.duration_ms.map(format_duration_ms),
                     ChildStatus::Failed => child
                         .duration_ms
                         .map(|ms| format!("failed · {}", format_duration_ms(ms)))
-                        .unwrap_or_else(|| "failed".into()),
+                        .or_else(|| Some("failed".into())),
                 };
                 let name = child_display_name(&child.name);
-                let name_width = name.width();
-                lines.push(Line::from(vec![
+                let desc = truncate_by_width(
+                    &child.description,
+                    max_child_w.saturating_sub(
+                        name.width()
+                            + meta.as_deref().map(UnicodeWidthStr::width).unwrap_or(0)
+                            + if child.description.is_empty() { 0 } else { 1 }
+                            + if meta.is_some() { 3 } else { 0 },
+                    ),
+                );
+                let mut spans = vec![
                     Span::styled(connector.to_string(), dim),
                     Span::styled(name, name_style),
-                    Span::styled(format!(" · {meta}"), dim),
-                    Span::styled(" · ", dim),
-                    Span::raw(truncate_by_width(
-                        &child.description,
-                        max_child_w.saturating_sub(name_width + meta.width() + 7),
-                    )),
-                ]));
+                ];
+                if !desc.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::raw(desc));
+                }
+                if let Some(meta) = meta {
+                    spans.push(Span::styled(format!(" · {meta}"), dim));
+                }
+                lines.push(Line::from(spans));
             }
         }
 
         // Output summary (post-complete only, collapsed = just line count).
+        // Keep it in the same tree language as the child rows rather than
+        // switching to a different arrow glyph mid-cell.
         if let Some(ref summary) = self.output_summary
             && self.status != TaskStatus::Running
         {
@@ -310,20 +323,19 @@ impl HistoryCell for TaskCell {
                 let lc = summary.lines().count();
                 if lc > 0 {
                     lines.push(Line::from(vec![
-                        Span::styled("  ⤷ ", dim),
+                        Span::raw("    "),
                         Span::styled(format!("{lc} lines of output"), dim),
                     ]));
                 }
             } else {
                 let max_w = w.saturating_sub(4);
                 for (i, sl) in summary.lines().take(4).enumerate() {
-                    let prefix = if i == 0 {
-                        Span::styled("  ⤷ ", dim)
-                    } else {
-                        Span::raw("    ")
-                    };
                     lines.push(Line::from(vec![
-                        prefix,
+                        if i == 0 {
+                            Span::styled("  └ ", dim)
+                        } else {
+                            Span::raw("    ")
+                        },
                         Span::raw(truncate_by_width(sl, max_w)),
                     ]));
                 }
@@ -350,7 +362,7 @@ impl HistoryCell for TaskCell {
                 )
             };
             lines.push(Line::from(vec![
-                Span::styled("  ⚠ ", icon_style),
+                Span::styled("  · Error ", icon_style),
                 Span::styled(err.clone(), text_style),
             ]));
         }
@@ -535,7 +547,7 @@ mod tests {
     // ── Render golden paths ────────────────────────────────────────
 
     #[test]
-    fn running_header_has_shimmer_and_task_label() {
+    fn running_header_has_task_label_without_shimmer_noise() {
         let t = TaskCell::new_running("tu_parent", "audit cache correctness");
         let out = render(&t, 80, 2);
         assert!(out.contains("▶"), "missing arrow: {out}");
@@ -543,6 +555,10 @@ mod tests {
         assert!(
             out.contains("audit cache correctness"),
             "missing desc: {out}"
+        );
+        assert!(
+            !out.contains("✶") && !out.contains("✷") && !out.contains("✹") && !out.contains("✺"),
+            "running task header should be calmer than the old shimmer treatment: {out}"
         );
     }
 
@@ -575,7 +591,7 @@ mod tests {
             out.contains("Task · risky · failed"),
             "missing failed label: {out}"
         );
-        assert!(out.contains("⚠"), "missing error marker: {out}");
+        assert!(out.contains("· Error"), "missing error label: {out}");
         assert!(out.contains("timeout"), "missing error text: {out}");
     }
 
@@ -587,11 +603,29 @@ mod tests {
         t.push_child_completed("tu_a", "success", 20);
         let out = render(&t, 80, 5);
         assert!(out.contains("├"), "missing mid-connector: {out}");
-        assert!(out.contains("Bash · 20ms"), "missing first child: {out}");
+        assert!(out.contains("Bash ls · 20ms"), "missing first child: {out}");
         assert!(
-            out.contains("Read · running"),
-            "missing second child: {out}"
+            out.contains("Read src/main.rs"),
+            "missing calmer running child row: {out}"
         );
+    }
+
+    #[test]
+    fn collapsed_summary_uses_steps_language() {
+        let mut t = TaskCell::new_running("tu_parent", "wrap");
+        t.push_child_started("a", "bash", "ls");
+        t.push_child_completed("a", "success", 20);
+        t.push_child_started("b", "read_file", "src/main.rs");
+        t.push_child_completed("b", "success", 20);
+        t.push_child_started("c", "grep", "TODO");
+        t.push_child_completed("c", "success", 20);
+        t.push_child_started("d", "write_file", "notes.md");
+        t.push_child_completed("d", "success", 20);
+        t.complete("success", 100, None, None);
+
+        let out = render(&t, 80, 4);
+        assert!(out.contains("4 steps · all done"), "{out}");
+        assert!(!out.contains("4 tools"), "{out}");
     }
 
     #[test]

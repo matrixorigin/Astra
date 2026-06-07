@@ -3,7 +3,7 @@
 //! Shape:
 //!
 //! ```text
-//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools · 145.0k session · $0.014 cost
+//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools (145.0k overall · $0.014 spent)
 //! ```
 //!
 //! The summary intentionally stays in product language rather than
@@ -107,30 +107,31 @@ impl HistoryCell for TurnSummaryCell {
 }
 
 impl TurnSummaryCell {
-    fn sections(&self, label: Style, value: Style) -> Vec<Vec<Span<'static>>> {
-        let mut sections: Vec<Vec<Span<'static>>> = Vec::new();
+    fn sections(&self, label: Style, value: Style) -> Vec<Section> {
+        let mut sections: Vec<Section> = Vec::new();
+        let mut secondary_parts: Vec<Vec<Span<'static>>> = Vec::new();
 
         if let Some(elapsed) = self.elapsed_ms {
-            sections.push(vec![
+            sections.push(Section::primary(vec![
                 Span::styled(fmt_duration_ms(elapsed), value),
                 Span::styled(" total", label),
-            ]);
+            ]));
         }
 
         if let Some(ttft) = self.ttft_ms
             && ttft > 0
         {
-            sections.push(vec![
+            sections.push(Section::primary(vec![
                 Span::styled("ttft ", label),
                 Span::styled(fmt_ms(ttft), value),
-            ]);
+            ]));
         }
 
         if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
-            sections.push(vec![
+            sections.push(Section::primary(vec![
                 Span::styled(fmt_tokens(tin + tout), value),
                 Span::styled(" tokens", label),
-            ]);
+            ]));
         }
 
         if let (Some(cache_read), Some(tin)) = (self.cache_read_tokens, self.tokens_in)
@@ -138,35 +139,48 @@ impl TurnSummaryCell {
             && tin > 0
         {
             let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
-            sections.push(vec![
+            sections.push(Section::primary(vec![
                 Span::styled(format!("{pct}%"), value),
-                Span::styled(" cache", label),
-            ]);
+                Span::styled(" cached", label),
+            ]));
         }
 
         if self.tools > 0 {
-            sections.push(vec![
+            sections.push(Section::primary(vec![
                 Span::styled(self.tools.to_string(), value),
                 Span::styled(if self.tools == 1 { " tool" } else { " tools" }, label),
-            ]);
+            ]));
         }
 
-        if let Some(c) = self.cumulative_tokens
-            && c > 0
-        {
-            sections.push(vec![
-                Span::styled(fmt_tokens(c), value),
-                Span::styled(" session", label),
-            ]);
-        }
+        let cumulative_tokens = self
+            .cumulative_tokens
+            .filter(|c| *c > 0)
+            .map(|c| Span::styled(fmt_tokens(c), value));
 
         if let Some(cost) = self.cumulative_cost_usd
             && cost > 0.0
         {
-            sections.push(vec![
+            secondary_parts.push(vec![
                 Span::styled(fmt_cost(cost), value),
-                Span::styled(" cost", label),
+                Span::styled(" spent", label),
             ]);
+        }
+
+        if cumulative_tokens.is_some() || !secondary_parts.is_empty() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled("(", label));
+            if let Some(tokens) = cumulative_tokens {
+                spans.push(tokens);
+                spans.push(Span::styled(" overall", label));
+            } else {
+                spans.push(Span::styled("Overall", label));
+            }
+            for part in secondary_parts {
+                spans.push(Span::styled(" · ", label));
+                spans.extend(part);
+            }
+            spans.push(Span::styled(")", label));
+            sections.push(Section::secondary(spans));
         }
 
         sections
@@ -232,7 +246,29 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
         .sum()
 }
 
-fn pack_sections_into_lines(sections: Vec<Vec<Span<'static>>>, width: u16) -> Vec<Line<'static>> {
+#[derive(Debug, Clone)]
+struct Section {
+    spans: Vec<Span<'static>>,
+    secondary: bool,
+}
+
+impl Section {
+    fn primary(spans: Vec<Span<'static>>) -> Self {
+        Self {
+            spans,
+            secondary: false,
+        }
+    }
+
+    fn secondary(spans: Vec<Span<'static>>) -> Self {
+        Self {
+            spans,
+            secondary: true,
+        }
+    }
+}
+
+fn pack_sections_into_lines(sections: Vec<Section>, width: u16) -> Vec<Line<'static>> {
     let available = usize::from(width.max(24));
     let indent = Span::styled("  ", Style::default().fg(crate::tui::theme::current().dim));
     let indent_width = unicode_width::UnicodeWidthStr::width(indent.content.as_ref());
@@ -243,7 +279,7 @@ fn pack_sections_into_lines(sections: Vec<Vec<Span<'static>>>, width: u16) -> Ve
     let mut current_width = indent_width;
 
     for section in sections {
-        let section_width = spans_width(&section);
+        let section_width = spans_width(&section.spans);
         let extra = if current_width == indent_width {
             0
         } else {
@@ -259,7 +295,7 @@ fn pack_sections_into_lines(sections: Vec<Vec<Span<'static>>>, width: u16) -> Ve
             current_width += sep_width;
         }
         current_width += section_width;
-        current.extend(section);
+        current.extend(section.spans);
     }
 
     if current_width > indent_width {
@@ -300,7 +336,14 @@ mod tests {
     #[test]
     fn full_summary_contains_all_sections() {
         let out = render(&mk_full(), 120);
-        for seg in ["total", "ttft", "tokens", "tools", "session", "cost"] {
+        for seg in [
+            "total",
+            "ttft",
+            "tokens",
+            "tools",
+            "overall",
+            "spent",
+        ] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
         assert!(out.contains("145.0k"));
@@ -319,7 +362,10 @@ mod tests {
         let mut c = mk_full();
         c.ttft_ms = Some(0);
         let out = render(&c, 120);
-        assert!(!out.contains("ttft"), "ttft=0 must not render: {out}");
+        assert!(
+            !out.contains("ttft"),
+            "ttft=0 must not render: {out}"
+        );
         assert!(out.contains("total"));
     }
 
@@ -329,7 +375,7 @@ mod tests {
         // 23.2k tokens in, 18k cache read → ~78%
         c.cache_read_tokens = Some(18_000);
         let out = render(&c, 120);
-        assert!(out.contains("cache"), "cache label missing: {out}");
+        assert!(out.contains("cached"), "cache label missing: {out}");
         assert!(out.contains("78%"), "expected ~78% hit rate in: {out}");
     }
 
@@ -341,7 +387,7 @@ mod tests {
         let mut c = mk_full();
         c.cache_read_tokens = None;
         let out = render(&c, 120);
-        assert!(!out.contains("cache"), "cache chip must be elided: {out}");
+        assert!(!out.contains("cached"), "cache chip must be elided: {out}");
     }
 
     #[test]
@@ -352,7 +398,7 @@ mod tests {
         c.cache_read_tokens = Some(0);
         let out = render(&c, 120);
         assert!(
-            !out.contains("cache"),
+            !out.contains("cached"),
             "zero-hit cache chip must elide: {out}"
         );
     }
@@ -363,8 +409,8 @@ mod tests {
         c.cumulative_tokens = Some(0);
         c.cumulative_cost_usd = Some(0.0);
         let out = render(&c, 120);
-        assert!(!out.contains("session"));
-        assert!(!out.contains("cost"));
+        assert!(!out.contains("overall"));
+        assert!(!out.contains("spent"));
     }
 
     #[test]

@@ -18,8 +18,8 @@ fn idle_shows_mode_chip_without_tutorial_legend() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        plain.contains("default"),
-        "idle footer should still show the current mode; got {plain:?}"
+        !plain.contains("Ask"),
+        "default prompt mode should stay implicit; got {plain:?}"
     );
     assert!(
         !plain.contains("/commands"),
@@ -50,25 +50,26 @@ fn active_turn_without_objective_renders_no_interrupt_prompt() {
 }
 
 #[test]
-fn active_turn_surfaces_objective_and_elapsed() {
+fn active_turn_keeps_footer_calm_even_with_objective_and_elapsed() {
     let c = StatusContext {
         turn_active: true,
         current_objective: Some("Running bash".into()),
         turn_elapsed: Some(Duration::from_secs(16)),
+        model: Some("sonnet-4.6".into()),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("Running bash"),
-        "active objective should render; got {plain:?}"
-    );
-    assert!(
-        plain.contains("16s"),
-        "elapsed time should render; got {plain:?}"
+        !plain.contains("Running bash") && !plain.contains("16s"),
+        "footer should not duplicate live objective/elapsed; got {plain:?}"
     );
     assert!(
         !plain.contains("Ctrl+C interrupt"),
         "interrupt hint should NOT appear in status line; got {plain:?}"
+    );
+    assert!(
+        plain.contains("sonnet-4.6"),
+        "model should remain visible after footer de-noising; got {plain:?}"
     );
 }
 
@@ -110,12 +111,8 @@ fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
         "footer should not degrade into a key legend; got {rendered:?}"
     );
     assert!(
-        rendered.contains("default"),
-        "mode chip should survive on narrow widths; got {rendered:?}"
-    );
-    assert!(
         rendered.contains("sonnet-4.6"),
-        "model must survive the degradation; got {rendered:?}"
+        "model should carry the footer when default mode is hidden; got {rendered:?}"
     );
 }
 
@@ -138,35 +135,30 @@ fn very_long_model_is_truncated_before_it_crowds_the_footer() {
 }
 
 #[test]
-fn active_objective_truncates_to_preserve_right_side_context() {
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
+fn model_stays_first_when_auto_mode_is_visible() {
     let c = StatusContext {
-        turn_active: true,
-        current_objective: Some(
-            "Reviewing a very large diff with a long explanation that should not eat the footer"
-                .into(),
-        ),
-        turn_elapsed: Some(Duration::from_secs(16)),
         model: Some("sonnet-4.6".into()),
-        token_budget: Some((40_000, 200_000)),
+        permission_mode: PermissionMode::Auto,
         ..ctx()
     };
-    let s = StatusLine::from_context(&c);
-    let area = Rect::new(0, 0, 64, 1);
-    let mut buf = Buffer::empty(area);
-    s.render(area, &mut buf);
-    let rendered: String = (0..area.width)
-        .map(|x| buf[(x, 0)].symbol().to_string())
-        .collect();
+    let plain = StatusLine::from_context(&c).plain();
     assert!(
-        rendered.contains("…"),
-        "long objective should truncate rather than swallow the footer; got {rendered:?}"
+        plain.starts_with("sonnet-4.6 · Auto"),
+        "model should anchor the left cluster before mode chips; got {plain:?}"
     );
+}
+
+#[test]
+fn thinking_suffix_is_compacted_before_model_identity_is_lost() {
+    let c = StatusContext {
+        model: Some("deepseek-reasoner(thinking:high)".into()),
+        permission_mode: PermissionMode::Auto,
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
     assert!(
-        rendered.contains("sonnet-4.6"),
-        "right-side context should survive long objectives; got {rendered:?}"
+        plain.starts_with("deepseek-reasoner(high) · Auto"),
+        "thinking suffix should compact cleanly without ugly middle truncation; got {plain:?}"
     );
 }
 
@@ -175,7 +167,7 @@ fn active_objective_truncates_to_preserve_right_side_context() {
 #[test]
 fn ask_mode_renders_default_chip() {
     let s = StatusLine::from_context(&ctx());
-    assert!(s.plain().contains("default"));
+    assert!(!s.plain().contains("Ask"));
 }
 
 #[test]
@@ -185,12 +177,12 @@ fn auto_mode_renders_yellow_chip() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert!(s.plain().contains("auto"));
+    assert!(s.plain().contains("Auto"));
     // The chip should carry a yellow style to draw the eye.
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "auto")
+        .find(|seg| seg.text == "Auto")
         .expect("auto chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
     assert!(
@@ -210,7 +202,7 @@ fn accept_edits_mode_renders_cyan_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "edit")
+        .find(|seg| seg.text == "Edits")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
     assert!(
@@ -230,7 +222,7 @@ fn plan_mode_renders_blue_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "plan")
+        .find(|seg| seg.text == "Plan")
         .expect("plan chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
     assert!(
@@ -250,7 +242,7 @@ fn deny_mode_renders_red_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "deny")
+        .find(|seg| seg.text == "Deny")
         .expect("deny chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
     assert!(
@@ -292,8 +284,39 @@ fn long_cwd_truncates_with_leading_ellipsis() {
         plain.contains("…"),
         "truncation marker expected; got {plain:?}"
     );
+    assert!(
+        plain.contains("~/…/"),
+        "path truncation should preserve a home-style prefix; got {plain:?}"
+    );
     // Last segment should still mirror the tail of the original path.
     assert!(plain.contains("budget"));
+}
+
+#[test]
+fn narrow_footer_drops_mode_before_model_identity() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("sonnet-4.6".into()),
+        permission_mode: PermissionMode::Auto,
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 16, 1);
+    let mut buf = Buffer::empty(area);
+    s.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(
+        rendered.contains("sonnet-4.6"),
+        "model should survive narrow layouts; got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("Auto"),
+        "mode chip should yield before the model on narrow widths; got {rendered:?}"
+    );
 }
 
 #[test]
@@ -387,13 +410,13 @@ fn right_segments_joined_with_middle_dot() {
     };
     let s = StatusLine::from_context(&c);
     assert!(
-        s.right.len() >= 3,
-        "three fields should yield >= 3 segments"
+        s.left.len() + s.right.len() >= 3,
+        "three fields should still yield multiple context segments"
     );
     let plain = s.plain();
     assert!(
         plain.contains(" · "),
-        "right segments should be joined with ' · '; got {plain:?}"
+        "status segments should be joined with ' · '; got {plain:?}"
     );
 }
 
@@ -401,10 +424,10 @@ fn right_segments_joined_with_middle_dot() {
 
 #[test]
 fn empty_context_produces_some_left_content() {
-    // We always render *something* on the left so the status line
-    // doesn't look broken — at minimum the mode chip.
+    // Default prompt mode stays implicit, so an empty context should
+    // remain visually quiet rather than inventing filler.
     let s = StatusLine::from_context(&ctx());
-    assert!(!s.left.is_empty());
+    assert!(s.left.is_empty());
 }
 
 #[test]
@@ -471,7 +494,7 @@ fn pending_chip_is_yellow_without_extra_bold() {
 // ── Phase 3b.2: background task chip ────────────────────────────────
 //
 // When the BackgroundTaskRegistry has any non-terminal tasks, the
-// status line shows a `BG: N running` (and `· M stalled` if any) chip
+// status line shows a compact `N jobs` (and `· M waiting` if any) chip
 // so the user can see at a glance how many fire-and-poll jobs are in
 // flight without opening a separate view. Hidden when all bg tasks
 // are terminal (or none exist) so the chip doesn't waste space.
@@ -481,7 +504,7 @@ fn no_bg_tasks_renders_no_chip() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        !plain.contains("BG:"),
+        !plain.contains("jobs"),
         "no bg tasks must render no chip; got {plain:?}"
     );
 }
@@ -494,12 +517,12 @@ fn bg_running_only_renders_count() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("BG: 2 running"),
+        plain.contains("2 background jobs"),
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
-        !plain.contains("stalled"),
-        "stalled segment must hide when 0; got {plain:?}"
+        !plain.contains("waiting"),
+        "waiting segment must hide when 0; got {plain:?}"
     );
 }
 
@@ -511,26 +534,26 @@ fn bg_running_and_stalled_appends_stalled_segment() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("BG: 3 running"),
+        plain.contains("3 background jobs"),
         "must show running count; got {plain:?}"
     );
     assert!(
-        plain.contains("1 stalled"),
-        "must show stalled count when > 0; got {plain:?}"
+        plain.contains("1 waiting"),
+        "must show waiting count when > 0; got {plain:?}"
     );
 }
 
 #[test]
 fn bg_zero_running_zero_stalled_hides_chip() {
     // (0, 0) — registry exists but no live tasks. Hide the chip
-    // rather than render `BG: 0 running` noise.
+    // rather than render `0 jobs` noise.
     let c = StatusContext {
         bg_task_counts: Some((0, 0)),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        !plain.contains("BG:"),
+        !plain.contains("jobs"),
         "zero counts must hide the chip; got {plain:?}"
     );
 }
@@ -546,7 +569,7 @@ fn bg_stalled_only_chip_uses_yellow_for_attention() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text.contains("BG:"))
+        .find(|seg| seg.text.contains("waiting"))
         .expect("bg chip must render even when only stalled (the model needs to know)");
     assert_eq!(
         chip.style.fg,

@@ -1,9 +1,8 @@
 ---
 source: crates/astra-cli/src/tui/session_picker/view.rs
-assertion_line: 448
 expression: "render_picker(&d, 80, 4)"
 ---
-┌ Resume session (0) filter: zzz_nope ─────────────────────────────────────────┐
+┌ Recent sessions · 0 Filter · zzz_nope ───────────────────────────────────────┐
 │  no sessions match the filter                                                │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘

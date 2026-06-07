@@ -1,15 +1,14 @@
 ---
 source: crates/astra-cli/src/tui/session_picker/view.rs
-assertion_line: 425
 expression: "render_picker(&d, 100, 10)"
 ---
-┌ Resume session (1) filter: auth ─────────────────────────────────────────────────────────────────┐
-│▌ 845d ago · 20t · $3.10 · ~/other · ⎇ feat/login          sess_xyz789                            │
-│    add auth flow with OAuth                               status completed                       │
-│                                                           model  sonnet-4.6                      │
-│                                                           branch feat/login @ 616d4cf            │
-│                                                           tokens 42.0k in · 18.0k out            │
-│                                                           cost   $3.10                           │
-│                                                           turns  20                              │
-│                                                           ckpts  2                               │
+┌ Recent sessions · 1 Filter · auth ───────────────────────────────────────────────────────────────┐
+│▌ add auth flow with OAuth                                 sonnet-4.6                             │
+│    845d ago · 20 turns · ~/other                          feat/login @ 616d4cf                   │
+│                                                           Completed · 845d ago                   │
+│                                                           ~/other                                │
+│                                                           20 turns · 60.0k tokens                │
+│                                                           sess_xyz789 · $3.10 spent · 2 saved    │
+│                                                                                                  │
+│                                                           add auth flow with OAuth               │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘

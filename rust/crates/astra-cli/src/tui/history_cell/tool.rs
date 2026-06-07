@@ -1,13 +1,13 @@
-//! Tool-invocation history cell — the `• Bash · 42ms` block.
+//! Tool-invocation history cell — the `• Ran Bash · 42ms` block.
 //!
 //! Three visual states:
 //! - **Running** — accent bullet, shimmer title, elapsed from
 //!   construction `Instant`, optional Braille spinner+progress bar
 //!   if the tool has been running more than 3 s. Not persisted
 //!   until the final `complete()` call.
-//! - **Success** — green bullet, `<name> · Xms` title, optional
+//! - **Success** — green bullet, `Ran <name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
-//! - **Failed** — red bullet, `<name> failed · Xms`, otherwise identical
+//! - **Failed** — red bullet, `Ran <name> · Xms · failed`, otherwise identical
 //!   to Success.
 //!
 //! Diff-looking output summaries (lines starting with `+` or `-`)
@@ -21,6 +21,7 @@
 //! live log.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::time::Instant;
 
 use ratatui::style::{Color, Style, Stylize};
@@ -28,9 +29,11 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;
+use crate::cli::cli_config::cli_formatting::extract_cli_diff_block;
 use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
+use crate::tui::wrapping::{RtOptions, word_wrap_lines};
 
 /// Live status. `Running` is intentionally separate from the
 /// persisted `TurnEvent::Tool.status` enum — a still-running tool
@@ -219,6 +222,79 @@ impl ToolCell {
         }
     }
 
+    fn preview_text(&self) -> Option<&str> {
+        match (self.output_summary.as_deref(), self.output.as_deref()) {
+            (Some(summary), Some(output))
+                if !output.trim().is_empty() && is_placeholder_capture_summary(summary) =>
+            {
+                Some(output)
+            }
+            (Some(summary), _) => Some(summary),
+            (None, Some(output)) => Some(output),
+            (None, None) => None,
+        }
+    }
+
+    fn has_transcript(&self) -> bool {
+        self.output.is_some() || self.output_summary.is_some()
+    }
+
+    fn edited_diff_preview(&self) -> Option<EditedDiffPreview<'_>> {
+        if !matches!(
+            self.name.as_str(),
+            "write_file" | "str_replace" | "multi_edit"
+        ) {
+            return None;
+        }
+
+        let diff = self
+            .output
+            .as_deref()
+            .and_then(extract_cli_diff_block)
+            .or_else(|| {
+                self.preview_text().and_then(|text| {
+                    let has_diff = text.lines().any(|line| {
+                        line.starts_with("@@")
+                            || line.starts_with("--- ")
+                            || line.starts_with("+++ ")
+                            || line.starts_with('+')
+                            || line.starts_with('-')
+                    });
+                    has_diff.then(|| Cow::Borrowed(text))
+                })
+            })?;
+
+        let additions = diff
+            .lines()
+            .filter(|line| line.starts_with('+') && !line.starts_with("+++ "))
+            .count();
+        let deletions = diff
+            .lines()
+            .filter(|line| line.starts_with('-') && !line.starts_with("--- "))
+            .count();
+        let files: Vec<&str> = diff
+            .lines()
+            .filter_map(|line| line.strip_prefix("+++ b/"))
+            .filter(|path| !path.is_empty() && *path != "/dev/null")
+            .collect();
+        let label = if files.len() == 1 {
+            files[0].to_string()
+        } else if files.len() > 1 {
+            format!("{} files", files.len())
+        } else if !self.description.trim().is_empty() {
+            self.description.trim().to_string()
+        } else {
+            self.display_name()
+        };
+
+        Some(EditedDiffPreview {
+            label,
+            additions,
+            deletions,
+            diff,
+        })
+    }
+
     /// Sub-line rendered under the header for tools that are still
     /// running past the 3 s grace window.
     ///
@@ -316,25 +392,59 @@ impl HistoryCell for ToolCell {
         let w = width as usize;
 
         let label = self.display_name();
-        let header = if self.status == ToolStatus::Running {
-            let text = format!("{label} · {}", self.elapsed_str());
+        let meta_style = Style::default().fg(Color::DarkGray);
+        let edited_diff = if self.status == ToolStatus::Running {
+            None
+        } else {
+            self.edited_diff_preview()
+        };
+        let header = if let Some(edited) = edited_diff.as_ref() {
+            let mut spans = vec![
+                self.bullet(),
+                Span::styled("Edited ", Style::default().bold()),
+            ];
+            spans.push(Span::styled(
+                truncate_by_width(&edited.label, w.saturating_sub(24).max(12)),
+                Style::default(),
+            ));
+            if edited.additions > 0 || edited.deletions > 0 {
+                spans.push(Span::styled(" · ", meta_style));
+                spans.push(Span::styled(
+                    format!("+{}", edited.additions),
+                    Style::default().fg(Color::Green),
+                ));
+                spans.push(Span::styled(" ", meta_style));
+                spans.push(Span::styled(
+                    format!("-{}", edited.deletions),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            Line::from(spans)
+        } else if self.status == ToolStatus::Running {
+            let text = format!("Ran {label} ({})", self.elapsed_str());
             let mut spans = vec![self.bullet()];
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
-            let status_meta = if self.status == ToolStatus::Failed {
-                format!("{} · {}", self.title_text(), self.elapsed_str())
-            } else {
-                self.elapsed_str()
-            };
-            Line::from(vec![
+            let mut spans = vec![
                 self.bullet(),
-                Span::styled(label, Style::default().bold()),
-                Span::styled(format!(" · {status_meta}"), dim),
-            ])
+                Span::styled(format!("Ran {label}"), Style::default().bold()),
+                Span::styled(" · ", meta_style),
+                Span::styled(self.elapsed_str(), meta_style),
+            ];
+            if self.status == ToolStatus::Failed {
+                spans.push(Span::styled(" · ", meta_style));
+                spans.push(Span::styled(self.title_text(), Style::default().fg(Color::Red)));
+            }
+            Line::from(spans)
         };
 
         let mut lines = vec![header];
+
+        let has_error_label = self.status == ToolStatus::Failed
+            && (self.has_transcript() || self.preview_text().is_none());
+        let has_preview_block = edited_diff.is_some() || self.preview_text().is_some();
+        let description_has_children = has_error_label || has_preview_block;
 
         // Spinner + progress bar for long-running tools.
         if self.status == ToolStatus::Running {
@@ -344,55 +454,106 @@ impl HistoryCell for ToolCell {
             }
         }
 
-        // `│ <description>` — the command, path, or summary line.
-        if !self.description.is_empty() {
-            let max_w = w.saturating_sub(4);
+        // Command/path line with a light structural guide.
+        if edited_diff.is_none() && !self.description.is_empty() {
             let description = sanitize_terminal_text(&self.description);
+            let theme = crate::tui::theme::current();
+            let command_style = Style::default().fg(theme.selected_fg);
+            let desc_prefix = if description_has_children {
+                "  ├ "
+            } else {
+                "  └ "
+            };
+            let desc_indent = if description_has_children {
+                "  │ "
+            } else {
+                "    "
+            };
             for dl in description.lines().take(2) {
-                lines.push(Line::from(vec![
-                    Span::styled("  │ ", dim),
-                    Span::raw(truncate_by_width(dl, max_w)),
-                ]));
+                let mut spans = vec![Span::styled(desc_prefix, dim)];
+                if self.name == "bash" {
+                    if let Some(cmd) = dl.strip_prefix("$ ") {
+                        spans.push(Span::styled("$ ".to_string(), dim));
+                        spans.push(Span::styled(cmd.to_string(), command_style));
+                    } else {
+                        spans.push(Span::styled(dl.to_string(), command_style));
+                    }
+                } else {
+                    spans.push(Span::raw(dl.to_string()));
+                }
+                lines.extend(wrap_prefixed_line(
+                    Line::from(spans),
+                    width,
+                    Line::from(vec![Span::styled(desc_indent, dim)]),
+                ));
             }
         }
 
-        // `└ <output summary>` — diff renderer for +/- content,
+        // Output summary — diff renderer for +/- content,
         // plain truncated preview otherwise.
-        if let Some(ref summary) = self.output_summary {
+        if self.status == ToolStatus::Failed && self.has_transcript() {
+            lines.push(Line::from(vec![
+                Span::styled("  └ ", dim),
+                Span::styled("Details in transcript", Style::default().fg(Color::Red)),
+                Span::styled(" · Ctrl+O transcript", dim),
+            ]));
+        } else if self.status == ToolStatus::Failed && self.preview_text().is_none() {
+            lines.push(Line::from(vec![
+                Span::styled("  └ ", dim),
+                Span::styled("No details returned", Style::default().fg(Color::Red)),
+            ]));
+        }
+
+        if let Some(edited) = edited_diff {
+            let diff_lines = crate::tui::diff_render::render_diff_lines(&edited.diff, 12);
+            for (i, dl) in diff_lines.into_iter().enumerate() {
+                let prefix = if i == 0 { "  └ " } else { "    " };
+                let prefixed = prefix_tool_output_line(prefix, dl, dim);
+                lines.extend(
+                    wrap_prefixed_diff_line(prefixed, width)
+                        .into_iter()
+                        .map(|line| pad_line_background(line, width)),
+                );
+            }
+        } else if let Some(summary) = self.preview_text() {
             let summary = sanitize_terminal_text(summary);
-            let has_diff = summary
-                .lines()
-                .any(|l| l.starts_with('+') || l.starts_with('-'));
+            let has_diff = looks_like_unified_diff_preview(&summary);
             if has_diff {
                 let diff_lines = crate::tui::diff_render::render_diff_lines(&summary, 10);
                 for (i, dl) in diff_lines.into_iter().enumerate() {
-                    if i == 0 {
-                        let mut spans = vec![Span::styled("  └ ", dim)];
-                        spans.extend(dl.spans);
-                        lines.push(Line::from(spans));
-                    } else {
-                        lines.push(dl);
-                    }
+                    let prefix = if i == 0 { "  └ " } else { "    " };
+                    let prefixed = prefix_tool_output_line(prefix, dl, dim);
+                    lines.extend(
+                        wrap_prefixed_diff_line(prefixed, width)
+                            .into_iter()
+                            .map(|line| pad_line_background(line, width)),
+                    );
                 }
             } else {
-                let max_w = w.saturating_sub(4);
                 let out_lines: Vec<&str> = summary.lines().take(5).collect();
+                let has_more = summary.lines().count() > 5;
+                let visible_count = out_lines.len();
                 for (i, ol) in out_lines.iter().enumerate() {
-                    let prefix = if i == 0 {
-                        Span::styled("  └ ", dim)
+                    let is_last_visible = i + 1 == visible_count;
+                    let gutter = if is_last_visible && !has_more {
+                        "  └ ".to_string()
                     } else {
-                        Span::raw("    ")
+                        "  ├ ".to_string()
                     };
-                    lines.push(Line::from(vec![
-                        prefix,
-                        Span::raw(truncate_by_width(ol, max_w)),
-                    ]));
+                    lines.extend(wrap_prefixed_line(
+                        Line::from(vec![
+                            Span::styled(gutter.clone(), dim),
+                            Span::raw((*ol).to_string()),
+                        ]),
+                        width,
+                        Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
+                    ));
                 }
-                if summary.lines().count() > 5 {
+                if has_more {
                     let remaining = summary.lines().count() - 5;
                     lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(format!("… +{remaining} lines"), dim),
+                        Span::styled("  └ ".to_string(), dim),
+                        Span::styled(format!("… +{remaining} lines · Ctrl+O transcript"), dim),
                     ]));
                 }
             }
@@ -452,6 +613,86 @@ impl HistoryCell for ToolCell {
     }
 }
 
+fn prefix_tool_output_line(prefix: &str, line: Line<'static>, fallback: Style) -> Line<'static> {
+    let bg = line
+        .spans
+        .iter()
+        .find_map(|span| span.style.bg)
+        .unwrap_or(Color::Reset);
+    let mut spans = vec![Span::styled(prefix.to_string(), fallback.bg(bg))];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+fn wrap_prefixed_line(
+    line: Line<'static>,
+    width: u16,
+    subsequent_indent: Line<'static>,
+) -> Vec<Line<'static>> {
+    wrap_prefixed_line_hard(line, width, subsequent_indent)
+}
+
+fn wrap_prefixed_diff_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let indent = if line.spans.len() >= 3 {
+        Line::from(vec![
+            blank_span_like(&line.spans[0]),
+            blank_span_like(&line.spans[1]),
+            blank_span_like(&line.spans[2]),
+        ])
+    } else if let Some(first) = line.spans.first() {
+        Line::from(vec![blank_span_like(first)])
+    } else {
+        Line::from("    ")
+    };
+    wrap_prefixed_line_hard(line, width, indent)
+}
+
+fn wrap_prefixed_line_hard(
+    line: Line<'static>,
+    width: u16,
+    subsequent_indent: Line<'static>,
+) -> Vec<Line<'static>> {
+    word_wrap_lines(
+        [line],
+        RtOptions::new(width as usize)
+            .subsequent_indent(subsequent_indent)
+            .word_separator(textwrap::WordSeparator::AsciiSpace)
+            .word_splitter(textwrap::WordSplitter::Custom(split_every_char))
+            .break_words(false),
+    )
+}
+
+fn split_every_char(word: &str) -> Vec<usize> {
+    word.char_indices().skip(1).map(|(idx, _)| idx).collect()
+}
+
+fn blank_span_like(span: &Span<'_>) -> Span<'static> {
+    Span::styled(
+        " ".repeat(UnicodeWidthStr::width(span.content.as_ref())),
+        span.style,
+    )
+}
+
+fn pad_line_background(mut line: Line<'static>, width: u16) -> Line<'static> {
+    let Some(bg) = line.spans.iter().find_map(|span| span.style.bg) else {
+        return line;
+    };
+    let used = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let target = width as usize;
+    if used >= target {
+        return line;
+    }
+    line.spans.push(Span::styled(
+        " ".repeat(target - used),
+        Style::default().bg(bg),
+    ));
+    line
+}
+
 fn truncate_by_width(s: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(s) <= max_width {
         return s.to_string();
@@ -467,6 +708,55 @@ fn truncate_by_width(s: &str, max_width: usize) -> String {
         end = i + c.len_utf8();
     }
     format!("{}…", &s[..end])
+}
+
+fn is_placeholder_capture_summary(summary: &str) -> bool {
+    let normalized = summary.trim().to_ascii_lowercase();
+    normalized.ends_with("lines captured")
+        || normalized.ends_with("output lines captured")
+        || normalized.ends_with("file lines read")
+}
+
+fn looks_like_unified_diff_preview(text: &str) -> bool {
+    let mut saw_hunk = false;
+    let mut saw_file_headers = false;
+    let mut saw_change = false;
+    let mut saw_inline_headers_only = true;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if line.starts_with("@@") {
+            saw_hunk = true;
+            continue;
+        }
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            saw_file_headers = true;
+            continue;
+        }
+        if (line.starts_with('+') && !line.starts_with("+++ "))
+            || (line.starts_with('-') && !line.starts_with("--- "))
+        {
+            saw_change = true;
+            continue;
+        }
+        if line.starts_with("… +") && line.contains("more changed lines") {
+            continue;
+        }
+        if !looks_like_inline_diff_header(trimmed) {
+            saw_inline_headers_only = false;
+        }
+    }
+
+    saw_change && (saw_hunk || saw_file_headers || saw_inline_headers_only)
+}
+
+fn looks_like_inline_diff_header(line: &str) -> bool {
+    !line.contains(char::is_whitespace)
+        && !line.contains(':')
+        && (line.contains('.') || line.contains('/') || line.contains('\\'))
 }
 
 pub(super) fn humanize_tool_name(name: &str) -> String {
@@ -486,6 +776,13 @@ pub(super) fn humanize_tool_name(name: &str) -> String {
     } else {
         out
     }
+}
+
+struct EditedDiffPreview<'a> {
+    label: String,
+    additions: usize,
+    deletions: usize,
+    diff: Cow<'a, str>,
 }
 
 #[cfg(test)]
@@ -591,16 +888,47 @@ mod tests {
     fn success_header_uses_compact_title_and_meta() {
         let t = ok_tool("bash", "ls /tmp", 42);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Bash"), "unexpected header: {out}");
-        assert!(out.contains("· 42ms"));
-        assert!(out.contains("│ ls /tmp"));
+        assert!(
+            out.contains("• Ran Bash · 42ms"),
+            "unexpected header: {out}"
+        );
+        assert!(out.contains("└ ls /tmp"));
     }
 
     #[test]
     fn failed_header_is_red_and_says_failed() {
         let t = err_tool("bash", "false", 10);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Bash · failed · 10ms"));
+        assert!(out.contains("• Ran Bash · 10ms · failed"));
+    }
+
+    #[test]
+    fn bash_description_promotes_command_text() {
+        let t = ok_tool("bash", "$ git diff --stat", 42);
+        let lines = t.display_lines(80);
+        let desc = &lines[1];
+        assert_eq!(desc.spans[1].content.as_ref(), "$ ");
+        assert_eq!(
+            desc.spans[2].style.fg,
+            Some(crate::tui::theme::current().selected_fg)
+        );
+    }
+
+    #[test]
+    fn failed_tool_without_summary_falls_back_to_output_preview() {
+        let mut t = err_tool("bash", "cat missing.txt", 10);
+        t.output = Some("cat: missing.txt: No such file or directory".into());
+        let out = render(&t, 80, 5);
+        assert!(out.contains("Details in transcript"), "{out}");
+        assert!(out.contains("No such file or directory"), "{out}");
+        assert!(out.contains("Ctrl+O transcript"), "{out}");
+    }
+
+    #[test]
+    fn failed_tool_without_any_details_says_so_explicitly() {
+        let t = err_tool("read", "Reading: missing.txt", 10);
+        let out = render(&t, 80, 4);
+        assert!(out.contains("No details returned"), "{out}");
     }
 
     #[test]
@@ -624,6 +952,7 @@ mod tests {
         assert!(out.contains("file-5"));
         assert!(!out.contains("file-6"), "row 6 should have been trimmed");
         assert!(out.contains("… +3 lines"));
+        assert!(out.contains("Ctrl+O transcript"));
     }
 
     #[test]
@@ -682,6 +1011,184 @@ mod tests {
         assert!(out.contains("   1 + print(\"new1\")"), "{out}");
         assert!(out.contains("   5 + print(\"new5\")"), "{out}");
         assert!(out.contains("… +1 more changed lines"), "{out}");
+        assert!(out.contains("Ctrl+O transcript"), "{out}");
+    }
+
+    #[test]
+    fn diff_preview_prefix_uses_same_background_as_changed_line() {
+        let mut t = ok_tool("str_replace", "src/main.rs", 120);
+        t.output_summary = Some("@@ -1,1 +1,1 @@\n-fn old_name() {}\n+fn new_name() {}".into());
+
+        let lines = t.display_lines(80);
+        let diff_line = lines
+            .iter()
+            .find(|line| {
+                let rendered: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                rendered.contains("old_name")
+            })
+            .expect("expected diff line");
+
+        let prefix_bg = diff_line.spans[0].style.bg;
+        let number_bg = diff_line.spans[1].style.bg;
+        assert_eq!(prefix_bg, number_bg);
+        assert!(prefix_bg.is_some());
+    }
+
+    #[test]
+    fn placeholder_capture_summary_prefers_real_output_preview() {
+        let mut t = ok_tool("bash", "$ head -300 /tmp/review.code.diff", 54);
+        t.output_summary = Some("286 lines captured".into());
+        t.output = Some("line 1\nline 2\nline 3\nline 4\nline 5\nline 6".into());
+        let out = render(&t, 80, 9);
+        assert!(out.contains("line 1"), "{out}");
+        assert!(out.contains("line 5"), "{out}");
+        assert!(!out.contains("286 lines captured"), "{out}");
+        assert!(out.contains("Ctrl+O transcript"), "{out}");
+    }
+
+    #[test]
+    fn long_plain_output_wraps_with_hanging_indent() {
+        let mut t = ok_tool("bash", "$ head -300 /tmp/review.code.diff", 54);
+        t.output = Some("rust/crates/astra-cli/src/tui/bottom_pane/snapshots/astra__tui__bottom_pane__queue_preview_tests__bottom_surface_active_42.snap:6: trailing whitespace.".into());
+        let out = render(&t, 56, 6);
+        let rows: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert!(rows.len() >= 3, "{out}");
+        assert!(
+            rows.iter().skip(3).any(|row| row.starts_with("  │ ")),
+            "wrapped tool output should keep a hanging indent: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn long_diff_rows_wrap_without_losing_diff_indent() {
+        let mut t = ok_tool("str_replace", "src/main.rs", 120);
+        t.output_summary = Some(
+            "@@ -1,1 +1,1 @@\n-fn old_name_with_a_very_long_signature(argument_one: usize, argument_two: usize) {}\n+fn new_name_with_a_very_long_signature(argument_one: usize, argument_two: usize) {}"
+                .into(),
+        );
+        let out = render(&t, 72, 8);
+        let rows: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert!(rows.len() >= 4, "{out}");
+        assert!(
+            rows.iter()
+                .skip(3)
+                .any(|row| row.starts_with("           ")),
+            "wrapped diff continuation should stay indented under the diff gutter: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn edit_tools_render_as_edited_cards_with_counts() {
+        let mut t = ok_tool("write_file", "src/main.rs", 120);
+        t.output = Some(
+            r#"{"success":true,"_cli_unified_diff":"--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1,2 @@\n-fn old_name() {}\n+fn new_name() {}\n+fn helper() {}\n"}"#
+                .into(),
+        );
+
+        let out = render(&t, 100, 10);
+        assert!(out.contains("• Edited src/main.rs · +2 -1"), "{out}");
+        assert!(!out.contains("Ran Write file"), "{out}");
+        assert!(out.contains("   1 - fn old_name() {}"), "{out}");
+        assert!(out.contains("   2 + fn helper() {}"), "{out}");
+    }
+
+    #[test]
+    fn diff_check_style_output_stays_plain_text() {
+        let mut t = ok_tool("bash", "git diff --check", 173);
+        t.output = Some(
+            "rust/crates/astra-cli/src/tui/bottom_pane/snapshots/astra__tui__bottom_pane__queue_preview_tests__bottom_surface_active_42.snap:6: trailing whitespace.\n+\nrust/crates/astra-cli/src/tui/bottom_pane/snapshots/astra__tui__bottom_pane__queue_preview_tests__bottom_surface_active_42.snap:8: trailing whitespace.\n+"
+                .into(),
+        );
+
+        let lines = t.display_lines(56);
+        assert!(lines.iter().any(|line| {
+            let rendered: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            rendered.starts_with("  ├ ")
+        }));
+        assert!(lines.iter().any(|line| {
+            let rendered: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            rendered.contains("espace.")
+        }));
+        assert!(
+            !lines.iter().any(|line| {
+                let rendered: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                rendered.contains("   1 + ")
+            }),
+            "diff-check output should not be rendered as a unified diff"
+        );
+    }
+
+    #[test]
+    fn diff_rows_pad_background_through_full_width() {
+        let mut t = ok_tool("str_replace", "src/main.rs", 120);
+        t.output_summary = Some("@@ -1,1 +1,1 @@\n-fn old_name() {}\n+fn new_name() {}".into());
+
+        let lines = t.display_lines(80);
+        let diff_line = lines
+            .iter()
+            .find(|line| {
+                let rendered: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                rendered.contains("new_name")
+            })
+            .expect("expected added diff line");
+
+        let last = diff_line.spans.last().expect("line should have spans");
+        assert!(
+            last.content.as_ref().ends_with(' '),
+            "diff row should pad to full width: {:?}",
+            diff_line.spans
+        );
+        assert_eq!(last.style.bg, diff_line.spans[1].style.bg);
+    }
+
+    #[test]
+    fn wrapped_diff_rows_keep_gutter_structure_and_background() {
+        let mut t = ok_tool("str_replace", "src/main.rs", 120);
+        t.output_summary = Some(
+            "@@ -1 +1 @@\n-println!(\"old\");\n+println!(\"this_is_a_very_long_replacement_line_without_spaces_to_force_wrapping\");".into(),
+        );
+
+        let lines = t.display_lines(48);
+        let first_idx = lines
+            .iter()
+            .position(|line| {
+                line.spans.len() >= 3
+                    && line.spans[2].content.as_ref() == "+ "
+                    && line
+                        .spans
+                        .iter()
+                        .skip(3)
+                        .any(|span| span.content.as_ref().contains("println!("))
+            })
+            .expect("expected first added diff row");
+        let continuation = &lines[first_idx + 1];
+        assert_eq!(continuation.spans[0].content.as_ref(), "    ");
+        assert_eq!(continuation.spans[1].content.as_ref(), "     ");
+        assert_eq!(continuation.spans[2].content.as_ref(), "  ");
+        let bg = continuation.spans[1].style.bg;
+        assert!(bg.is_some(), "expected wrapped diff background");
+        assert_eq!(continuation.spans[0].style.bg, bg);
+        assert_eq!(continuation.spans[2].style.bg, bg);
     }
 
     // ── Progress signals ─────────────────────────────────────────

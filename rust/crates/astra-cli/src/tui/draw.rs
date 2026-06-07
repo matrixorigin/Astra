@@ -8,7 +8,8 @@
 //!
 //! See `ARCHITECTURE.md` for the visual-hierarchy grammar.
 
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::bottom_pane::{BottomPane, footer::Footer};
@@ -546,9 +547,10 @@ pub(crate) fn do_draw(
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
 
-    // Soft rule between scrollback and the bottom surface. Keep the
-    // break visible, but avoid a heavy console-style bar that competes
-    // with the actual content and input chrome.
+    // Breathing room between scrollback and the bottom surface.
+    // Earlier versions used a full-width rule here, but the extra line
+    // made the composer feel boxed off rather than integrated with the
+    // rest of the screen.
     let sep_line = separator_line(width);
     let sep_renderable = RenderableItem::Owned(Box::new(sep_line));
 
@@ -615,17 +617,8 @@ pub(crate) fn do_draw(
 }
 
 fn separator_line(width: u16) -> Line<'static> {
-    let theme = super::theme::current();
-    let inner = width.saturating_sub(4) as usize;
-    let spans = vec![
-        ratatui::text::Span::raw("  "),
-        ratatui::text::Span::styled(
-            "─".repeat(inner),
-            ratatui::style::Style::default().fg(theme.dim),
-        ),
-        ratatui::text::Span::raw("  "),
-    ];
-    Line::from(spans)
+    let dim = Style::default().fg(crate::tui::theme::current().dim);
+    Line::from(Span::styled("─".repeat(width as usize), dim))
 }
 
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
@@ -944,7 +937,7 @@ mod task_board_draw_tests {
                     .map(|s| s.content.as_ref())
                     .collect::<String>();
                 assert!(
-                    text.contains("Next:") && text.contains("fit me somewhere"),
+                    text.contains("Focus") && text.contains("fit me somewhere"),
                     "short expanded board should fall back to a useful next hint, got: {text}"
                 );
             }

@@ -144,6 +144,16 @@ fn snapshot_very_long_cwd_truncates() {
 }
 
 #[test]
+fn snapshot_long_model_and_cwd_share_space() {
+    let ctx = StatusContext {
+        model: Some("claude-sonnet-4.6-super-long-preview-build".into()),
+        cwd: Some("~/a/very/very/very/deep/project/path/that/exceeds/limit".into()),
+        ..StatusContext::default()
+    };
+    crate::tui::testing::assert_tui_snapshot!("status_long_model_and_cwd_80", render_ctx(&ctx, 80));
+}
+
+#[test]
 fn snapshot_task_chip_collapsed_mixed() {
     let ctx = StatusContext {
         task_counts: Some((2, 5)),

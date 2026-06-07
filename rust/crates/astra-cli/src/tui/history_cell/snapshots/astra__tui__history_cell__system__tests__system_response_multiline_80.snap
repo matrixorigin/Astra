@@ -1,7 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/system.rs
-assertion_line: 383
 expression: "render(&cell, 80, 2)"
 ---
-  Result · Set model to Opus 4.6
-            (1M context, thinking enabled)
+Result · Set model to Opus 4.6
+  (1M context, thinking enabled)

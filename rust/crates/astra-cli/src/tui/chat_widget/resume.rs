@@ -66,11 +66,11 @@ mod tests {
 
     fn render_history(w: &ChatWidget, width: u16) -> String {
         let mut all_lines: Vec<Line<'static>> = Vec::new();
-        for (i, cell) in w.history().iter().enumerate() {
-            if i > 0 {
+        for cell in w.history() {
+            all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
+            for _ in 0..crate::tui::history_cell::trailing_blank_rows(cell.as_ref()) {
                 all_lines.push(Line::default());
             }
-            all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
         }
         let height = (all_lines.len() as u16).max(1);
         let p = ratatui::widgets::Paragraph::new(all_lines)
@@ -210,7 +210,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                summary_text.contains("▓░ 75%"),
+                summary_text.contains("75% cache"),
                 "cache-read stats must remain user-visible after resume"
             );
         });

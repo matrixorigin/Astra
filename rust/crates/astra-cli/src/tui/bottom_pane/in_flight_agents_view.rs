@@ -79,16 +79,6 @@ pub(crate) enum AgentRowStatus {
 }
 
 impl AgentRowStatus {
-    fn icon(self) -> &'static str {
-        match self {
-            AgentRowStatus::Live => "◦",
-            AgentRowStatus::Cancelling => "⊘",
-            AgentRowStatus::Completed => "✓",
-            AgentRowStatus::Failed => "✗",
-            AgentRowStatus::Cancelled => "■",
-        }
-    }
-
     fn color(self) -> Color {
         match self {
             AgentRowStatus::Live | AgentRowStatus::Cancelling => Color::Yellow,
@@ -104,6 +94,16 @@ impl AgentRowStatus {
 
     fn is_failed(self) -> bool {
         matches!(self, AgentRowStatus::Failed)
+    }
+
+    fn phrase(self) -> Option<&'static str> {
+        match self {
+            AgentRowStatus::Live => None,
+            AgentRowStatus::Cancelling => Some("stopping"),
+            AgentRowStatus::Completed => Some("done"),
+            AgentRowStatus::Failed => Some("failed"),
+            AgentRowStatus::Cancelled => Some("stopped"),
+        }
     }
 }
 
@@ -266,21 +266,19 @@ impl BottomPaneView for InFlightAgentsView {
         let failed = self.failed_count;
         let done = self.rows.len().saturating_sub(live + failed);
         let header_text = if self.rows.is_empty() {
-            "  Agents (none)".to_string()
+            "  Agents".to_string()
+        } else if failed > 0 {
+            format!("  Agents · {live} working · {done} done · {failed} failed")
+        } else if done > 0 {
+            format!("  Agents · {live} working · {done} done")
         } else {
-            format!(
-                "  SUBAGENTS {}  · live {} · done {} · failed {}",
-                self.rows.len(),
-                live,
-                done,
-                failed
-            )
+            format!("  Agents · {live} working")
         };
         let header = Line::from(Span::styled(header_text, title_style));
         buf.set_line(area.x, area.y, &header, area.width);
 
         if self.rows.is_empty() {
-            let empty = Line::from(Span::styled("  No agents to inspect.".to_string(), dim));
+            let empty = Line::from(Span::styled("  No agents working.".to_string(), dim));
             if area.height >= 2 {
                 buf.set_line(area.x, area.y + 1, &empty, area.width);
             }
@@ -299,9 +297,9 @@ impl BottomPaneView for InFlightAgentsView {
             .enumerate()
         {
             let selected = row_idx == self.selected;
-            let marker = if selected { "▶ " } else { "  " };
-            let status_icon = row.status.icon();
+            let marker = if selected { "› " } else { "  " };
             let status_color = row.status.color();
+            let meta = row_meta(row);
             let line = Line::from(vec![
                 Span::styled(
                     marker.to_string(),
@@ -313,29 +311,17 @@ impl BottomPaneView for InFlightAgentsView {
                         dim
                     },
                 ),
-                Span::styled(status_icon.to_string(), Style::default().fg(status_color)),
-                Span::raw(" "),
                 Span::styled(
-                    format!("{} {}", row_idx + 1, truncate(&row.name, 38)),
+                    format!("{}. {}", row_idx + 1, truncate(&row.name, 38)),
                     if selected {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
                         Style::default()
+                            .fg(status_color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(status_color)
                     },
                 ),
-                Span::styled(
-                    format!(
-                        "  · {} steps · {}{}",
-                        row.child_count,
-                        format_elapsed(row.elapsed_ms),
-                        if row.status == AgentRowStatus::Cancelling {
-                            " · Cancelling…"
-                        } else {
-                            ""
-                        }
-                    ),
-                    dim,
-                ),
+                Span::styled(format!("  · {meta}"), dim),
             ]);
             buf.set_line(area.x, body_y + i as u16, &line, area.width);
         }
@@ -406,7 +392,7 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("↑↓/Pg select · 1-9 jump · Enter open · x/Del kill · Esc/←/q back".into())
+        Some("↑↓ move · Enter open · X stop · Esc close".into())
     }
 }
 
@@ -421,10 +407,35 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn step_label(child_count: usize) -> String {
+    if child_count == 0 {
+        String::new()
+    } else if child_count == 1 {
+        "1 step · ".to_string()
+    } else {
+        format!("{child_count} steps · ")
+    }
+}
+
+fn row_meta(row: &AgentRow) -> String {
+    let mut parts = Vec::new();
+    if let Some(status) = row.status.phrase() {
+        parts.push(status.to_string());
+    }
+    let steps = step_label(row.child_count);
+    if !steps.is_empty() {
+        parts.push(steps.trim_end_matches(" · ").to_string());
+    }
+    parts.push(format_elapsed(row.elapsed_ms));
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::widgets::Widget;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -445,6 +456,16 @@ mod tests {
                 status: AgentRowStatus::Live,
             })
             .collect()
+    }
+
+    fn render(view: &InFlightAgentsView, width: u16, height: u16) -> String {
+        struct ViewWidget<'a>(&'a InFlightAgentsView);
+        impl Widget for ViewWidget<'_> {
+            fn render(self, area: Rect, buf: &mut Buffer) {
+                self.0.render(area, buf);
+            }
+        }
+        buffer_to_string(&draw_widget(ViewWidget(view), width, height))
     }
 
     /// Empty agent list: must not panic, must not select anything.
@@ -717,5 +738,32 @@ mod tests {
     fn parse_drilldown_sentinel_rejects_empty_id() {
         let s = AGENT_DRILLDOWN_SENTINEL.to_string();
         assert_eq!(parse_drilldown_sentinel(&s), None);
+    }
+
+    #[test]
+    fn render_uses_calmer_agents_header_and_hint_copy() {
+        let v = InFlightAgentsView::new(rows(2));
+        let out = render(&v, 80, 4);
+        assert!(out.contains("Agents · 2 working"), "{out}");
+        assert!(!out.contains("SUBAGENTS"), "{out}");
+        assert!(!out.contains("0 steps"), "{out}");
+        assert_eq!(
+            v.hint_keys().as_deref(),
+            Some("↑↓ move · Enter open · X stop · Esc close")
+        );
+    }
+
+    #[test]
+    fn render_uses_meta_words_for_terminal_and_cancelling_rows() {
+        let mut rows = rows(4);
+        rows[0].status = AgentRowStatus::Cancelling;
+        rows[1].status = AgentRowStatus::Completed;
+        rows[2].status = AgentRowStatus::Failed;
+        rows[3].status = AgentRowStatus::Cancelled;
+        let out = render(&InFlightAgentsView::new(rows), 80, 6);
+        assert!(out.contains("stopping"), "{out}");
+        assert!(out.contains("done"), "{out}");
+        assert!(out.contains("failed"), "{out}");
+        assert!(out.contains("stopped"), "{out}");
     }
 }

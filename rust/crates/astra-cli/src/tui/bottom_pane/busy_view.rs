@@ -18,9 +18,8 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
 use crate::tui::shimmer::shimmer_spans;
@@ -51,30 +50,39 @@ impl BottomPaneView for BusyView {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let outer = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Line::from(Span::styled(
-                self.title.clone(),
-                Style::default().fg(crate::tui::theme::current().accent),
-            )));
-        let inner = outer.inner(area);
-        outer.render(area, buf);
+        let surface = crate::tui::style::composer_surface_style();
+        let dim = Style::default().fg(Color::DarkGray);
+        let title_style = Style::default()
+            .fg(crate::tui::theme::current().accent)
+            .add_modifier(Modifier::BOLD);
+        for y in area.y..area.y + area.height {
+            buf.set_string(area.x, y, " ".repeat(area.width as usize), surface);
+        }
 
-        // A shimmer-animated "⏳ message…" line.
-        let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-        spans.push(Span::styled("⏳ ", Style::default().fg(Color::Yellow)));
-        spans.extend(shimmer_spans(&self.message));
-        let hint = Line::from(Span::styled(
-            "  (Esc to cancel)".to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
-        Paragraph::new(vec![Line::from(spans), Line::default(), hint]).render(inner, buf);
+        if area.height >= 1 {
+            let title = Line::from(vec![
+                Span::raw("  "),
+                Span::styled(self.title.trim().to_string(), title_style),
+            ]);
+            buf.set_line(area.x, area.y, &title, area.width);
+        }
+        if area.height >= 2 {
+            let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+            spans.extend(shimmer_spans(&self.message));
+            let body = Line::from(spans);
+            buf.set_line(area.x, area.y + 1, &body, area.width);
+        }
+        if area.height >= 4 {
+            let hint = Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Esc to cancel".to_string(), dim),
+            ]);
+            buf.set_line(area.x, area.y + 3, &hint, area.width);
+        }
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        // border(2) + spinner line + blank + hint = 5
-        5
+        4
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -139,17 +147,19 @@ mod tests {
     #[test]
     fn renders_title_and_message() {
         let v = BusyView::new("Running SQL…");
-        let buf = draw_widget(W(&v), 40, 5);
+        let buf = draw_widget(W(&v), 40, 4);
         let s = buffer_to_string(&buf);
         assert!(s.contains("Working"));
         assert!(s.contains("Running"));
         assert!(s.contains("Esc"));
+        assert!(!s.contains("⏳"));
+        assert!(!s.contains("┌"));
     }
 
     #[test]
     fn custom_title_sticks() {
         let v = BusyView::new("hi").with_title(" Resume ");
-        let buf = draw_widget(W(&v), 40, 5);
+        let buf = draw_widget(W(&v), 40, 4);
         let s = buffer_to_string(&buf);
         assert!(s.contains("Resume"));
     }

@@ -100,4 +100,8 @@ pub(crate) trait BottomPaneView: Send {
     fn reserve_status_footer(&self) -> bool {
         false
     }
+
+    fn is_transcript_view(&self) -> bool {
+        false
+    }
 }

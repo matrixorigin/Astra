@@ -1,8 +1,8 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
-assertion_line: 107
+assertion_line: 116
 expression: "draw(&tasks, 80, 24, false)"
 ---
-⠋ first-in-progress
+• first-in-progress
 ◻ first-pending
 ✔ first-completed

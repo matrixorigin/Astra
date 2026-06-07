@@ -110,7 +110,7 @@ impl Footer {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let panel = crate::tui::style::composer_surface_style();
+        let panel = crate::tui::style::footer_surface_style();
         for y in area.y..area.y + area.height {
             buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
         }

@@ -3,13 +3,13 @@
 //! Rendered as a quoted input block:
 //!
 //! ```text
-//! > first line of the user's message
-//! > second line (if any)
-//! > ...
+//! › first line of the user's message
+//! › second line (if any)
+//! › ...
 //! ```
 //!
 //! A soft tinted background spans the whole block and every content
-//! row gets the same `> ` quote prefix so the message reads as one
+//! row gets the same `› ` quote prefix so the message reads as one
 //! visual unit rather than a prompt/continuation pair.
 //!
 //! Persists as [`TurnEvent::User`]. Never enters a live state —
@@ -70,18 +70,18 @@ impl HistoryCell for UserCell {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
         let prefix_style = Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD);
+            .fg(theme.accent_dim())
+            .add_modifier(Modifier::DIM);
         let pad = Line::from(Span::raw("")).style(bg);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(pad.clone());
 
         if self.text.is_empty() {
-            lines.push(Line::from(Span::styled("> ", prefix_style)).style(bg));
+            lines.push(Line::from(Span::styled("› ", prefix_style)).style(bg));
         } else {
             for row in self.text.lines() {
-                let prefix = Span::styled("> ", prefix_style);
+                let prefix = Span::styled("› ", prefix_style);
                 lines.push(Line::from(vec![prefix, Span::raw(row.to_string())]).style(bg));
             }
         }
@@ -124,8 +124,8 @@ mod tests {
         let rows: Vec<&str> = out.lines().collect();
         let first = rows.get(1).copied().unwrap_or_default();
         assert!(
-            first.trim_start().starts_with('>'),
-            "missing > prefix: {first:?}"
+            first.trim_start().starts_with('›'),
+            "missing › prefix: {first:?}"
         );
         assert!(
             first.contains("rebuild the index"),
@@ -139,15 +139,15 @@ mod tests {
         let out = render_cell(&cell, 40, 7);
         let rows: Vec<&str> = out.lines().collect();
         assert!(
-            rows[1].trim_start().starts_with('>'),
+            rows[1].trim_start().starts_with('›'),
             "row 1 missing prefix"
         );
         assert!(
-            rows[2].trim_start().starts_with('>'),
+            rows[2].trim_start().starts_with('›'),
             "row 2 missing prefix"
         );
         assert!(
-            rows[3].trim_start().starts_with('>'),
+            rows[3].trim_start().starts_with('›'),
             "row 3 missing prefix"
         );
         assert!(rows[2].contains("line two"));
@@ -165,7 +165,7 @@ mod tests {
                 .nth(1)
                 .unwrap_or_default()
                 .trim_start()
-                .starts_with('>')
+                .starts_with('›')
         );
     }
 
@@ -190,8 +190,6 @@ mod tests {
 
     #[test]
     fn slash_command_user_cell_is_tight_one_content_line() {
-        // Quoted block adds top/bottom padding, so one content line
-        // becomes three rendered rows.
         let cell = UserCell::new("/model glm-5.1");
         let lines = cell.display_lines(60);
         assert_eq!(
@@ -204,8 +202,6 @@ mod tests {
 
     #[test]
     fn prose_user_cell_is_tight_one_content_line() {
-        // A single-line prose message renders as one quoted content
-        // row bracketed by top/bottom padding.
         let cell = UserCell::new("just a prose question");
         let lines = cell.display_lines(60);
         assert_eq!(

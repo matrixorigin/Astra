@@ -1,16 +1,16 @@
 //! Two-pane session picker widget: list on the left, detail on the right.
 //!
 //! ```text
-//! ┌ Resume session ────────────────────────────── filter: tui ──┐
-//! │  1h ago · 12 turns · $0.42 · ~/astra · enhance_tui          │
-//! │    refactor tui approval                                     │
-//! │  2h ago ·  3 turns · $0.05 · ~/astra · main                  │
-//! │    initial setup                                             │
+//! ┌ Recent sessions · 2 ───────────────────────── Filter · tui ─┐
+//! │▌ refactor tui approval                                      │
+//! │    1h ago · 12 turns · ~/astra · enhance_tui                │
+//! │  initial setup                                              │
+//! │    2h ago · 3 turns · ~/astra · main                        │
 //! │                                                              │
-//! │  ├ sess_abc123  (completed)                                  │
-//! │  │ sonnet-4.6 · ⎇ enhance_tui @ 616d4cf                       │
-//! │  │ 1.2k in + 0.8k out · 2 checkpoints                         │
-//! │  │ refactor tui approval                                      │
+//! │  refactor tui approval                                       │
+//! │  Session · sess_abc123                                       │
+//! │  Updated · 1h ago                                            │
+//! │  Model · sonnet-4.6                                          │
 //! └──────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -78,7 +78,7 @@ pub(crate) fn render(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer) {
 }
 
 fn title_line(disco: &SessionDiscovery) -> Line<'static> {
-    let total = format!(" Resume session ({}) ", disco.len());
+    let total = format!(" Recent sessions · {} ", disco.len());
     let mut spans = vec![Span::styled(
         total,
         Style::default()
@@ -87,7 +87,7 @@ fn title_line(disco: &SessionDiscovery) -> Line<'static> {
     )];
     if !disco.filter().is_empty() {
         spans.push(Span::styled(
-            format!("filter: {} ", disco.filter()),
+            format!("Filter · {} ", disco.filter()),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -117,56 +117,41 @@ fn render_list(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer, _two_pane
             Span::raw("  ")
         };
 
-        let name_style = if is_selected {
+        let primary_style = if is_selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
+        let summary_style = if is_selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
 
         let age = short_age(&entry.updated_at);
-        let turns = format!("{}t", entry.turn_count);
-        let cost = entry
-            .cost_usd
-            .map(|c| format!("${c:.2}"))
-            .unwrap_or_default();
-        let branch = entry.git_branch.as_deref().unwrap_or("");
+        let turns = format!("{} turns", entry.turn_count);
         let cwd = shorten_path(&entry.cwd, 30);
+        let summary = entry
+            .summary
+            .as_deref()
+            .unwrap_or("(no summary)")
+            .to_string();
 
-        // Header row: gutter + age · turns · cost · cwd · branch
         let mut header_spans: Vec<Span<'static>> = vec![gutter];
-        header_spans.push(Span::styled(
+        header_spans.push(Span::styled(summary, summary_style));
+        let mut meta_spans: Vec<Span<'static>> = vec![Span::raw("    ")];
+        meta_spans.push(Span::styled(
             format!("{age:>7}"),
             Style::default().fg(Color::Yellow),
         ));
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(turns.clone(), name_style));
-        if !cost.is_empty() {
-            header_spans.push(Span::styled(" · ", dim));
-            header_spans.push(Span::styled(cost, name_style));
-        }
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(cwd, name_style));
-        if !branch.is_empty() {
-            header_spans.push(Span::styled(" · ", dim));
-            header_spans.push(Span::styled(
-                format!("⎇ {branch}"),
-                Style::default().fg(Color::Blue),
-            ));
-        }
+        meta_spans.push(Span::styled(" · ", dim));
+        meta_spans.push(Span::styled(turns, primary_style));
+        meta_spans.push(Span::styled(" · ", dim));
+        meta_spans.push(Span::styled(cwd, primary_style));
         let mut header_line = Line::from(header_spans);
-        let mut summary_line = Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                entry
-                    .summary
-                    .as_deref()
-                    .unwrap_or("(no summary)")
-                    .to_string(),
-                dim,
-            ),
-        ]);
+        let mut summary_line = Line::from(meta_spans);
         if is_selected {
             let bg = Style::default().bg(theme.selected_bg);
             header_line = header_line.style(bg);
@@ -187,73 +172,73 @@ fn render_detail(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer) {
     };
 
     let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(crate::tui::theme::current().accent);
+    let accent = Style::default().fg(crate::tui::theme::current().accent);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("{} ", entry.id),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("status ", label),
-        Span::styled(entry.status.clone(), dim),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("model  ", label),
-        Span::styled(entry.model.clone(), dim),
-    ]));
+    lines.push(Line::from(Span::styled(entry.model.clone(), bold)));
     if let Some(b) = entry.git_branch.as_deref() {
         let head = entry
             .git_head
             .as_deref()
             .map(|h| format!(" @ {}", &h[..7.min(h.len())]))
             .unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::styled("branch ", label),
-            Span::styled(format!("{b}{head}"), dim),
-        ]));
+        lines.push(Line::from(Span::styled(format!("{b}{head}"), dim)));
     }
+
     lines.push(Line::from(vec![
-        Span::styled("tokens ", label),
+        Span::styled(capitalise_status(&entry.status), accent),
+        Span::styled(" · ", dim),
+        Span::styled(short_age(&entry.updated_at), dim),
+    ]));
+    lines.push(Line::from(Span::styled(shorten_path(&entry.cwd, 34), dim)));
+
+    let stats = vec![
+        Span::styled(format!("{} turns", entry.turn_count), dim),
+        Span::styled(" · ", dim),
         Span::styled(
-            format!(
-                "{} in · {} out",
-                fmt_tokens(entry.tokens_in),
-                fmt_tokens(entry.tokens_out)
-            ),
+            format!("{} tokens", fmt_tokens(entry.tokens_in + entry.tokens_out)),
             dim,
         ),
-    ]));
+    ];
+    lines.push(Line::from(stats));
+    let mut tail = vec![Span::styled(entry.id.clone(), dim)];
     if let Some(c) = entry.cost_usd {
-        lines.push(Line::from(vec![
-            Span::styled("cost   ", label),
-            Span::styled(format!("${c:.2}"), dim),
-        ]));
+        tail.push(Span::styled(" · ", dim));
+        tail.push(Span::styled(format!("${c:.2} spent"), dim));
     }
-    lines.push(Line::from(vec![
-        Span::styled("turns  ", label),
-        Span::styled(entry.turn_count.to_string(), dim),
-    ]));
     if entry.checkpoints > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("ckpts  ", label),
-            Span::styled(entry.checkpoints.to_string(), dim),
-        ]));
+        tail.push(Span::styled(" · ", dim));
+        tail.push(Span::styled(format!("{} saved", entry.checkpoints), dim));
     }
+    lines.push(Line::from(tail));
+
     if let Some(goal) = entry.plan_goal.as_deref() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("plan goal", label)));
-        lines.push(Line::from(Span::styled(goal.to_string(), dim)));
+        lines.push(Line::from(vec![
+            Span::styled("Goal · ", accent),
+            Span::styled(goal.to_string(), dim),
+        ]));
     }
     if let Some(sum) = entry.summary.as_deref() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("summary", label)));
         lines.push(Line::from(Span::styled(sum.to_string(), dim)));
     }
 
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .render(area, buf);
+}
+
+fn capitalise_status(status: &str) -> String {
+    let mut chars = status.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.push(first.to_ascii_uppercase());
+    out.extend(chars);
+    out
 }
 
 fn window_around(selected: usize, total: usize, visible: usize) -> (usize, usize) {

@@ -24,7 +24,7 @@ pub(crate) struct TaskDetailView {
 
 impl TaskDetailView {
     pub fn from_task_cell(cell: &TaskCell) -> Self {
-        let title = format!("Task: {}", truncate(&cell.description, 50));
+        let title = format!("Task details · {}", truncate(&cell.description, 50));
         let lines = build_detail_lines(cell);
         Self {
             title,
@@ -37,7 +37,7 @@ impl TaskDetailView {
     }
 
     pub fn from_session_task(task: &SessionTask) -> Self {
-        let title = format!("#{} — {}", task.id, truncate(&task.title, 50));
+        let title = format!("Task details · {}", truncate(&task.title, 50));
         let lines = build_session_task_lines(task);
         Self {
             title,
@@ -62,7 +62,7 @@ impl TaskDetailView {
     fn refresh_from_task_cell(&mut self, cell: &TaskCell) {
         let old_max_scroll = self.lines.len().saturating_sub(MAX_VISIBLE);
         let was_pinned_to_bottom = self.scroll >= old_max_scroll;
-        self.title = format!("Task: {}", truncate(&cell.description, 50));
+        self.title = format!("Task details · {}", truncate(&cell.description, 50));
         self.lines = build_detail_lines(cell);
         let new_max_scroll = self.lines.len().saturating_sub(MAX_VISIBLE);
         self.scroll = if was_pinned_to_bottom {
@@ -86,42 +86,41 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
         _ => Color::White,
     };
     out.push(Line::from(vec![
-        Span::styled("  Status: ", dim),
         Span::styled(task.status.as_str(), Style::default().fg(status_color)),
+        Span::styled(" · ".to_string(), dim),
+        Span::styled(task.id.clone(), dim),
     ]));
 
     if let Some(ref owner) = task.owner {
         out.push(Line::from(vec![
-            Span::styled("  Owner: ", dim),
-            Span::raw(owner.clone()),
+            Span::styled("Owner · ".to_string(), dim),
+            Span::styled(owner.clone(), dim),
         ]));
     }
 
     if let Some(ref desc) = task.description {
         out.push(Line::default());
-        out.push(Line::from(Span::styled("  Description:", bold)));
+        out.push(Line::from(Span::styled("Description", bold)));
         for line in desc.lines().take(10) {
-            out.push(Line::from(Span::styled(format!("    {line}"), dim)));
+            out.push(Line::from(Span::styled(format!("  {line}"), dim)));
         }
     }
 
     if !task.blocked_by.is_empty() {
         out.push(Line::default());
         out.push(Line::from(vec![
-            Span::styled("  Blocked by: ", dim),
-            Span::raw(task.blocked_by.join(", ")),
+            Span::styled("Waiting on · ".to_string(), dim),
+            Span::styled(task.blocked_by.join(", "), dim),
         ]));
     }
 
     if !task.subtasks.is_empty() {
         out.push(Line::default());
         out.push(Line::from(Span::styled(
-            format!("  Subtasks ({}):", task.subtasks.len()),
+            format!("Checklist · {}", task.subtasks.len()),
             bold,
         )));
-        for (i, sub) in task.subtasks.iter().enumerate() {
-            let is_last = i + 1 == task.subtasks.len();
-            let connector = if is_last { "└" } else { "├" };
+        for sub in &task.subtasks {
             let (icon, icon_color) = match sub.status {
                 SessionTaskStatusKind::Completed => ("✓", Color::Green),
                 SessionTaskStatusKind::InProgress => ("◦", Color::Yellow),
@@ -133,7 +132,7 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
                 | SessionTaskStatusKind::Other => ("·", Color::DarkGray),
             };
             out.push(Line::from(vec![
-                Span::styled(format!("  {connector}─ "), dim),
+                Span::raw("  "),
                 Span::styled(icon, Style::default().fg(icon_color)),
                 Span::raw(format!(" {}", sub.title)),
             ]));
@@ -142,12 +141,12 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
 
     out.push(Line::default());
     out.push(Line::from(vec![
-        Span::styled("  Created: ", dim),
-        Span::raw(task.created_at.clone()),
+        Span::styled("Created · ".to_string(), dim),
+        Span::styled(task.created_at.clone(), dim),
     ]));
     out.push(Line::from(vec![
-        Span::styled("  Updated: ", dim),
-        Span::raw(task.updated_at.clone()),
+        Span::styled("Updated · ".to_string(), dim),
+        Span::styled(task.updated_at.clone(), dim),
     ]));
 
     out
@@ -208,20 +207,28 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
         status_style(&cell.status)
     };
     out.push(Line::from(vec![
-        Span::styled("  Status: ", dim),
         Span::styled(status_text, status_style),
+        Span::styled(" · ".to_string(), dim),
+        Span::styled(
+            if matches!(cell.status, TaskStatus::Running) {
+                "live"
+            } else {
+                "snapshot"
+            },
+            dim,
+        ),
     ]));
     if !matches!(cell.status, TaskStatus::Running) {
         out.push(Line::from(Span::styled(
-            "  Snapshot: frozen at completion",
+            "  Frozen at completion",
             dim,
         )));
     }
 
     if let Some(ms) = cell.duration_ms {
         out.push(Line::from(vec![
-            Span::styled("  Duration: ", dim),
-            Span::raw(format_duration(ms)),
+            Span::styled("Duration · ".to_string(), dim),
+            Span::styled(format_duration(ms), dim),
         ]));
     }
 
@@ -232,8 +239,8 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
             Style::default().fg(Color::Red)
         };
         out.push(Line::from(vec![
-            Span::styled("  Error: ", err_style),
-            Span::raw(err.clone()),
+            Span::styled("Error · ".to_string(), err_style),
+            Span::styled(err.clone(), dim),
         ]));
     }
 
@@ -241,60 +248,51 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
 
     // Children
     if cell.children.is_empty() {
-        out.push(Line::from(Span::styled("  No sub-operations.", dim)));
+        out.push(Line::from(Span::styled("No steps yet.", dim)));
     } else {
         out.push(Line::from(Span::styled(
-            format!("  Operations ({}):", cell.children.len()),
+            format!("Steps · {}", cell.children.len()),
             bold,
         )));
         out.push(Line::default());
 
-        for (i, child) in cell.children.iter().enumerate() {
-            let is_last = i + 1 == cell.children.len();
-            let connector = if is_last { "└" } else { "├" };
-            let icon = child_status_icon(&child.status);
-
-            out.push(Line::from(vec![
-                Span::styled(format!("  {connector}─ "), dim),
-                Span::styled(icon, child_status_style(&child.status)),
+        for child in &cell.children {
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(
+                    child_status_icon(&child.status),
+                    child_status_style(&child.status),
+                ),
                 Span::raw(" "),
                 Span::styled(child.name.clone(), bold),
-            ]));
-
-            // Description line
+            ];
             if !child.description.is_empty() {
-                let indent = if is_last { "   " } else { "│  " };
-                out.push(Line::from(vec![
-                    Span::styled(format!("  {indent}  "), dim),
-                    Span::styled(truncate(&child.description, 70), dim),
-                ]));
+                spans.push(Span::styled(
+                    format!(" · {}", truncate(&child.description, 54)),
+                    dim,
+                ));
             }
-
-            // Duration
             if let Some(ms) = child.duration_ms {
-                let indent = if is_last { "   " } else { "│  " };
-                out.push(Line::from(vec![
-                    Span::styled(format!("  {indent}  "), dim),
-                    Span::styled(format_duration(ms), dim),
-                ]));
+                spans.push(Span::styled(format!(" · {}", format_duration(ms)), dim));
             }
+            out.push(Line::from(spans));
         }
     }
 
     if let Some(ref summary) = cell.output_summary {
         out.push(Line::default());
-        out.push(Line::from(Span::styled("  Output:", bold)));
+        out.push(Line::from(Span::styled("Output", bold)));
         let mut truncated = false;
         for (idx, line) in summary.lines().enumerate() {
             if idx >= MAX_OUTPUT_LINES {
                 truncated = true;
                 break;
             }
-            out.push(Line::from(Span::styled(format!("    {line}"), dim)));
+            out.push(Line::from(Span::styled(format!("  {line}"), dim)));
         }
         if truncated {
             out.push(Line::from(Span::styled(
-                "    ... output truncated in detail view",
+                "  ... output truncated in detail view",
                 dim,
             )));
         }
@@ -412,7 +410,7 @@ impl BottomPaneView for TaskDetailView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("↑↓/Pg scroll · Esc/←/q back".into())
+        Some("↑↓/Pg scroll · Esc close".into())
     }
 }
 
@@ -456,7 +454,7 @@ mod tests {
     fn from_task_cell_with_emoji_description_does_not_panic() {
         let cell = TaskCell::new_running("tool-1", "🚀🔥💥".repeat(20));
         let view = TaskDetailView::from_task_cell(&cell);
-        assert!(view.title.starts_with("Task:"));
+        assert!(view.title.starts_with("Task details ·"));
     }
 
     #[test]
@@ -589,7 +587,8 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Snapshot: frozen at completion"));
+        assert!(rendered.contains("Completed · snapshot"));
+        assert!(rendered.contains("Frozen at completion"));
         assert!(rendered.contains("5m0s"));
     }
 
@@ -655,5 +654,40 @@ mod tests {
         assert!(view.refresh_task_cell("agent-1", &cell));
 
         assert_eq!(view.scroll, view.lines.len().saturating_sub(MAX_VISIBLE));
+    }
+
+    #[test]
+    fn child_steps_render_as_single_compact_rows() {
+        let mut cell = TaskCell::new_running("agent-1", "reviewer");
+        cell.push_child_started("a", "Read", "src/main.rs");
+        cell.push_child_completed("a", "success", 20);
+
+        let view = TaskDetailView::from_task_cell(&cell);
+        let rendered = view
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Read · src/main.rs · 20ms"),
+            "child rows should render as one compact summary line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn empty_steps_use_calm_copy() {
+        let cell = TaskCell::new_running("agent-1", "reviewer");
+        let view = TaskDetailView::from_task_cell(&cell);
+        let rendered = view
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("No steps yet."), "{rendered}");
+        assert!(!rendered.contains("No sub-operations."), "{rendered}");
     }
 }

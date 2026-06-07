@@ -149,6 +149,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_ctrl_o_char_is_normalized_to_ctrl_o_key() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{f}'), KeyModifiers::NONE));
+
+        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+            panic!("expected mapped key event");
+        };
+
+        assert_eq!(mapped.code, KeyCode::Char('o'));
+        assert!(mapped.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
     fn raw_escape_char_is_normalized_to_escape_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{1b}'), KeyModifiers::NONE));
 

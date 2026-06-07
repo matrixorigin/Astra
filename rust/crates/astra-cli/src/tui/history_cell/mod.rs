@@ -119,6 +119,36 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
     }
 }
 
+/// How many blank rows should follow this cell in the transcript.
+///
+/// The transcript uses tighter spacing for compact system pairs
+/// (`> /cmd` + `Result · ...`) and slightly roomier spacing after
+/// primary content blocks like tool results and assistant replies.
+pub(crate) fn trailing_blank_rows(cell: &dyn HistoryCell) -> usize {
+    if cell.as_any_ref().is::<user::UserCell>() {
+        // User cells already carry their own top/bottom breathing
+        // room inside the tinted panel; adding another transcript
+        // separator after them makes the scrollback feel double-spaced.
+        return 0;
+    }
+
+    if cell.as_any_ref().is::<system::SystemCell>() {
+        return 1;
+    }
+
+    if cell.as_any_ref().is::<assistant::AssistantCell>()
+        || cell.as_any_ref().is::<reasoning::ReasoningCell>()
+        || cell.as_any_ref().is::<tool::ToolCell>()
+        || cell.as_any_ref().is::<task::TaskCell>()
+        || cell.as_any_ref().is::<approval::ApprovalCell>()
+        || cell.as_any_ref().is::<turn_summary::TurnSummaryCell>()
+    {
+        return 1;
+    }
+
+    1
+}
+
 /// Tracks the moment a live cell freezes so the gradient gutter can
 /// pin its phase. Centralised here so all `HistoryCell` impls share
 /// one stamping discipline:

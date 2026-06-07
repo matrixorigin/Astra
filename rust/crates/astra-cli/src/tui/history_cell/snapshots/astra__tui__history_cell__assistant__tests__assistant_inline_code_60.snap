@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
-assertion_line: 930
 expression: "render(&c, 60, 2)"
 ---
 █ Use cargo build to compile the project.

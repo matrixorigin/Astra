@@ -35,18 +35,20 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
         started_at: Instant::now(),
     });
 
-    let rendered = render_text(&pane, Rect::new(0, 0, 80, 4));
+    let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
     assert!(
-        rendered.contains("Send follow-up"),
-        "active composer should use a short primary prompt; got {rendered:?}"
+        rendered.contains("Message astra"),
+        "active composer should keep the same primary prompt as idle; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Queued for next tool call"),
-        "active composer should explain queued delivery boundary in the helper row; got {rendered:?}"
+        rendered.contains("Queued until next tool call") || rendered.contains("Ctrl+C stops"),
+        "active composer should keep an in-panel helper hint; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Ctrl+C stops"),
-        "active composer should advertise the real interrupt gesture; got {rendered:?}"
+        rendered.contains("sonnet-4.6")
+            || rendered.contains("github/astra")
+            || rendered.contains("enqueue"),
+        "status footer should remain visible under the composer; got {rendered:?}"
     );
 }
 
@@ -54,14 +56,14 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
 fn idle_composer_uses_clean_prompt_and_editor_hint() {
     let pane = BottomPane::new();
 
-    let rendered = render_text(&pane, Rect::new(0, 0, 80, 4));
+    let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
     assert!(
         rendered.contains("Message astra"),
         "idle composer should render a short prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Ctrl+E opens editor"),
-        "idle helper row should carry editor guidance; got {rendered:?}"
+        rendered.contains("Ctrl+E opens editor") || rendered.contains("Shift+Enter newline"),
+        "idle composer should keep an in-panel helper hint; got {rendered:?}"
     );
 }
 
@@ -72,14 +74,39 @@ fn narrow_active_composer_degrades_helper_without_losing_stop_hint() {
         started_at: Instant::now(),
     });
 
-    let rendered = render_text(&pane, Rect::new(0, 0, 42, 4));
+    let rendered = render_text(&pane, Rect::new(0, 0, 42, 5));
     assert!(
-        rendered.contains("Send follow-up"),
+        rendered.contains("Message astra"),
         "narrow composer should keep the primary prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Ctrl+C stops"),
-        "narrow helper should preserve the stop gesture; got {rendered:?}"
+        rendered.contains("Ctrl+C stops") || rendered.contains("next tool"),
+        "narrow composer should keep a compressed helper hint; got {rendered:?}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.contains("~/") || line.contains("sonnet-4.6")),
+        "narrow footer should stay visible under the composer; got {rendered:?}"
+    );
+}
+
+#[test]
+fn helper_row_stays_visible_after_typing_begins() {
+    let mut pane = BottomPane::new();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    pane.composer.set_text("review the latest diff");
+
+    let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
+    assert!(
+        rendered.contains("review the latest diff"),
+        "typed text should remain visible inside the composer; got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Queued until next tool call") || rendered.contains("Ctrl+C stops"),
+        "the helper row should stay visible after typing begins; got {rendered:?}"
     );
 }
 
@@ -89,7 +116,7 @@ fn snapshot_idle_bottom_surface_80() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_idle_80",
-        snapshot_text(&pane, Rect::new(0, 0, 80, 4))
+        snapshot_text(&pane, Rect::new(0, 0, 80, 5))
     );
 }
 
@@ -102,7 +129,7 @@ fn snapshot_active_bottom_surface_80() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_active_80",
-        snapshot_text(&pane, Rect::new(0, 0, 80, 4))
+        snapshot_text(&pane, Rect::new(0, 0, 80, 5))
     );
 }
 
@@ -115,6 +142,6 @@ fn snapshot_active_bottom_surface_narrow_42() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_active_42",
-        snapshot_text(&pane, Rect::new(0, 0, 42, 4))
+        snapshot_text(&pane, Rect::new(0, 0, 42, 5))
     );
 }

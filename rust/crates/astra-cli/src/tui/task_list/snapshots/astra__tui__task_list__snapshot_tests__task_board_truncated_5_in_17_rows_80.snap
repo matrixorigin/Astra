@@ -1,9 +1,9 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
-assertion_line: 172
+assertion_line: 184
 expression: "draw(&tasks, 80, 17, false)"
 ---
-⠋ one
+• one
 ◻ two
 ◻ three
- … +1 pending, 1 completed
+… 2 more: 1 queued, 1 done

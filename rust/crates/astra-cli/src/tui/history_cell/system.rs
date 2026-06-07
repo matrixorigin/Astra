@@ -10,7 +10,7 @@
 
 use std::any::Any;
 
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
@@ -107,18 +107,14 @@ impl HistoryCell for SystemCell {
                 Style::default()
                     .fg(crate::tui::theme::current().dim)
                     .add_modifier(ratatui::style::Modifier::DIM),
-                Style::default()
-                    .fg(crate::tui::theme::current().dim)
-                    .add_modifier(ratatui::style::Modifier::DIM),
+                Style::default().fg(Color::Gray),
             ),
             SystemLevel::Response => (
                 "Result",
                 Style::default()
                     .fg(crate::tui::theme::current().dim)
                     .add_modifier(ratatui::style::Modifier::DIM),
-                Style::default()
-                    .fg(crate::tui::theme::current().dim)
-                    .add_modifier(ratatui::style::Modifier::DIM),
+                Style::default().fg(Color::White),
             ),
             SystemLevel::Warning => (
                 "Warning",
@@ -131,8 +127,8 @@ impl HistoryCell for SystemCell {
                 Style::default().red(),
             ),
         };
-        let prefix = format!("  {label} · ");
-        let continuation = " ".repeat(prefix.len());
+        let prefix = format!("{label} · ");
+        let continuation = "  ".to_string();
         self.message
             .lines()
             .enumerate()
@@ -144,7 +140,7 @@ impl HistoryCell for SystemCell {
                     ])
                 } else {
                     Line::from(vec![
-                        Span::raw(continuation.clone()),
+                        Span::styled(continuation.clone(), label_style),
                         Span::styled(line.to_string(), body_style),
                     ])
                 }
@@ -225,21 +221,21 @@ mod tests {
     // ── Render ───────────────────────────────────────────────────
 
     #[test]
-    fn info_renders_indented() {
+    fn info_renders_compact_feedback_row() {
         let cell = SystemCell::info("session resumed");
         let out = render(&cell, 40, 1);
         assert!(out.contains("session resumed"));
-        assert!(out.starts_with("  Note · "), "label missing: {out:?}");
+        assert!(out.starts_with("Note · "), "label missing: {out:?}");
     }
 
     #[test]
     fn response_gets_result_label_on_first_line() {
         // Slash-command response must visually pair with the `>
-        // /cmd` prompt above it, with a stable `Result ·` label.
+        // /cmd` prompt above it, with a stable `· Result` label.
         let cell = SystemCell::response("Set model to Opus 4.6");
         let out = render(&cell, 60, 1);
         assert!(
-            out.contains("Result ·"),
+            out.contains("Result · "),
             "result label missing on response: {out:?}"
         );
         assert!(
@@ -257,28 +253,28 @@ mod tests {
         let out = render(&cell, 80, 2);
         let rows: Vec<&str> = out.lines().collect();
         assert!(
-            rows[0].contains("Result ·"),
+            rows[0].contains("Result · "),
             "first row should have Result label: {rows:?}"
         );
         assert!(
-            !rows[1].contains("Result ·"),
+            !rows[1].contains("Result · "),
             "continuation must NOT repeat label: {rows:?}"
         );
-        // Continuation indent should match the depth of content
-        // after `  Result · ` so the eye reads them as aligned.
+        // Continuation rows should stay visually attached to the
+        // response without drifting into a giant hanging indent.
         assert!(
-            rows[1].starts_with("           "),
-            "continuation row should hang-indent under body: {rows:?}"
+            rows[1].starts_with("  "),
+            "continuation row should use the compact follow-up indent: {rows:?}"
         );
     }
 
     #[test]
-    fn multiline_rows_all_indent() {
+    fn multiline_rows_use_compact_follow_up_indent() {
         let cell = SystemCell::error("first line\nsecond line");
         let out = render(&cell, 40, 2);
-        for row in out.lines() {
-            assert!(row.starts_with("  "), "row not indented: {row:?}");
-        }
+        let rows: Vec<&str> = out.lines().collect();
+        assert!(rows[0].starts_with("Error · "), "{rows:?}");
+        assert!(rows[1].starts_with("  "), "{rows:?}");
     }
 
     // ── Persistence ──────────────────────────────────────────────

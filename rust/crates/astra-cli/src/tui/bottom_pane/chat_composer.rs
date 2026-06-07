@@ -51,8 +51,9 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const IDLE_COMPOSER_PLACEHOLDER: &str = "Message astra";
-const ACTIVE_TURN_PLACEHOLDER: &str = "Send follow-up";
+const COMPOSER_PLACEHOLDER: &str = "Message astra";
+const IDLE_COMPOSER_HELPER: &str = "Ctrl+E editor · Shift+Enter newline";
+const ACTIVE_TURN_HELPER: &str = "Queued for next tool · Ctrl+C stops";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -338,7 +339,8 @@ impl ChatComposer {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         let inner_w = width.saturating_sub(self.prefix_display_width());
-        self.textarea.desired_height(inner_w)
+        let helper_rows = u16::from(text_area_can_show_helper(2));
+        (self.textarea.desired_height(inner_w) + helper_rows).clamp(2, 4)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
@@ -425,6 +427,11 @@ impl ChatComposer {
         let panel = crate::tui::style::composer_surface_style();
         fill_area(buf, area, panel);
 
+        let top_inset = 0;
+        let content_y = area.y.saturating_add(top_inset);
+        let content_h = area.height.saturating_sub(top_inset);
+        let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
+
         // Keep the composer prompt visible without shouting. The
         // submit flash still upgrades it to the full accent to signal
         // that the input was accepted.
@@ -437,44 +444,80 @@ impl ChatComposer {
         }
         let prefix = Span::styled(&self.prompt_prefix, prefix_style);
         let prefix_width = self.prefix_display_width();
-        let prefix_area = Rect::new(area.x, area.y, prefix_width.min(area.width), 1);
+        let prefix_area = Rect::new(
+            content_area.x,
+            content_area.y,
+            prefix_width.min(content_area.width),
+            1,
+        );
         Widget::render(Line::from(prefix), prefix_area, buf);
 
+        let helper_h = u16::from(text_area_can_show_helper(content_area.height));
         let text_area = Rect::new(
-            area.x + prefix_width.min(area.width),
-            area.y,
-            area.width.saturating_sub(prefix_width),
-            area.height,
+            content_area.x + prefix_width.min(content_area.width),
+            content_area.y,
+            content_area.width.saturating_sub(prefix_width),
+            content_area.height.saturating_sub(helper_h).max(1),
+        );
+        let helper_area = Rect::new(
+            text_area.x,
+            text_area.y + text_area.height.min(content_area.height.saturating_sub(1)),
+            text_area.width,
+            helper_h,
         );
 
         if self.textarea.is_empty() {
-            let placeholder_text = if task_active {
-                ACTIVE_TURN_PLACEHOLDER
-            } else {
-                IDLE_COMPOSER_PLACEHOLDER
-            };
             let placeholder = Span::styled(
-                truncate_end(placeholder_text, text_area.width as usize),
+                truncate_end(COMPOSER_PLACEHOLDER, text_area.width as usize),
                 Style::default()
-                    .fg(theme.dim)
+                    .fg(theme.selected_fg)
                     .bg(panel.bg.unwrap_or(Color::Reset)),
             );
-            Widget::render(Line::from(placeholder), text_area, buf);
+            Widget::render(
+                Line::from(placeholder),
+                Rect::new(text_area.x, text_area.y, text_area.width, 1),
+                buf,
+            );
         } else {
             self.textarea.render(text_area, buf);
+        }
+
+        if helper_area.height > 0 {
+            let helper_text = if task_active {
+                ACTIVE_TURN_HELPER
+            } else {
+                IDLE_COMPOSER_HELPER
+            };
+            let helper = Span::styled(
+                truncate_end(helper_text, helper_area.width as usize),
+                Style::default()
+                    .fg(theme.dim)
+                    .bg(panel.bg.unwrap_or(Color::Reset))
+                    .add_modifier(ratatui::style::Modifier::DIM),
+            );
+            Widget::render(Line::from(helper), helper_area, buf);
         }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
+        let top_inset = 0;
+        let content_y = area.y.saturating_add(top_inset);
+        let content_h = area.height.saturating_sub(top_inset);
+        let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
         let prefix_width = self.prefix_display_width();
+        let helper_h = u16::from(text_area_can_show_helper(content_area.height));
         let text_area = Rect::new(
-            area.x + prefix_width.min(area.width),
-            area.y,
-            area.width.saturating_sub(prefix_width),
-            area.height,
+            content_area.x + prefix_width.min(content_area.width),
+            content_area.y,
+            content_area.width.saturating_sub(prefix_width),
+            content_area.height.saturating_sub(helper_h).max(1),
         );
         self.textarea.cursor_position(text_area)
     }
+}
+
+fn text_area_can_show_helper(content_h: u16) -> bool {
+    content_h >= 2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,13 +708,13 @@ mod paste_tests {
 
     #[test]
     fn idle_placeholder_is_clean_primary_prompt() {
-        assert!(IDLE_COMPOSER_PLACEHOLDER.contains("Message"));
-        assert!(!IDLE_COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
+        assert!(COMPOSER_PLACEHOLDER.contains("Message"));
+        assert!(!COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
     }
 
     #[test]
-    fn active_turn_placeholder_is_short_follow_up_prompt() {
-        assert!(ACTIVE_TURN_PLACEHOLDER.contains("follow-up"));
-        assert!(!ACTIVE_TURN_PLACEHOLDER.contains("Ctrl+C"));
+    fn active_turn_helper_surfaces_queue_semantics() {
+        assert!(ACTIVE_TURN_HELPER.contains("Queued"));
+        assert!(ACTIVE_TURN_HELPER.contains("Ctrl+C"));
     }
 }

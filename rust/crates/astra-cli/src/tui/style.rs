@@ -24,6 +24,13 @@ pub(crate) fn composer_surface_style() -> Style {
     Style::default().bg(theme.selected_bg)
 }
 
+pub(crate) fn footer_surface_style() -> Style {
+    if let Some(bg) = default_bg() {
+        return Style::default().bg(footer_surface_bg(bg));
+    }
+    Style::default()
+}
+
 #[allow(dead_code)]
 pub(crate) fn proposed_plan_style() -> Style {
     proposed_plan_style_for(default_bg())
@@ -56,9 +63,18 @@ fn user_message_bg(terminal_bg: (u8, u8, u8)) -> Color {
 
 fn composer_surface_bg(terminal_bg: (u8, u8, u8)) -> Color {
     let (top, alpha) = if is_light(terminal_bg) {
-        ((0, 0, 0), 0.03)
+        ((0, 0, 0), 0.06)
     } else {
-        ((255, 255, 255), 0.18)
+        ((255, 255, 255), 0.34)
+    };
+    best_color(blend(top, terminal_bg, alpha))
+}
+
+fn footer_surface_bg(terminal_bg: (u8, u8, u8)) -> Color {
+    let (top, alpha) = if is_light(terminal_bg) {
+        ((0, 0, 0), 0.015)
+    } else {
+        ((255, 255, 255), 0.04)
     };
     best_color(blend(top, terminal_bg, alpha))
 }

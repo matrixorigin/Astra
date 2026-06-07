@@ -12,8 +12,12 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Reply body is rendered with a `█ ` accent-gutter block-style,
-//! matching existing visual grammar. A trailing blinking cursor
+//! Reply body keeps a stable left accent gutter once settled in
+//! scrollback, so long numbered answers still scan like one unified
+//! assistant block. Live cells still use the active-slot wrapper for
+//! structure, but committed replies retain the visual anchor the old
+//! TUI had. A
+//! trailing blinking cursor
 //! block (`▎`) is appended to the final rendered line while the
 //! cell is still live, as a "more is coming" cue.
 //!
@@ -30,7 +34,7 @@
 //!   demonstrated the failure mode without this: 60-second-long
 //!   thinks would show as raw `<think>The user is asking…` text.
 //! - **After `</think>`** — collapsed to a one-line
-//!   `Thought · N lines` dim header; the body markdown starts
+//!   `Thought (N lines)` dim header; the body markdown starts
 //!   immediately under it.
 //!
 //! Thinking content stays in `source` and is persisted unchanged
@@ -259,7 +263,7 @@ impl HistoryCell for AssistantCell {
         }
 
         // Branch 3: <think> closed. Collapse to a one-line
-        // `Thought · N lines` header, then render the body.
+        // `Thought (N lines)` header, then render the body.
         let think_lines = think.trim().lines().count().max(1);
         let mut out = thought_header_lines(think_lines);
         out.extend(render_body_with_gutter(body, width, self.live, rate_suffix));
@@ -380,10 +384,7 @@ fn render_body_with_gutter(
     // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
     // already receive `width - 2` from `active_viewport` (the
     // `LiveFramedCell` wrapper paints its own gutter column) — so the
-    // asymmetry below is intentional. Do *not* "unify" the arms by
-    // adding `saturating_sub(2)` to both: that double-subtracts on
-    // the live path and re-introduces a one-column re-wrap when a
-    // cell transitions live → settled near the floor boundary.
+    // asymmetry below is intentional.
     let prepend_gutter = !live;
     let inner_w = if prepend_gutter {
         (width as usize).saturating_sub(2).max(20)
@@ -430,7 +431,7 @@ fn render_body_with_gutter(
 /// Collapsed one-line header shown in place of a `<think>` block
 /// once the closing tag has arrived.
 ///
-/// Example: `  Thought · 12 lines`
+/// Example: `• Thought · 12 lines`
 fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
     let dim = Style::default()
         .fg(crate::tui::theme::current().dim)
@@ -441,7 +442,7 @@ fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
         format!("{line_count} lines")
     };
     vec![Line::from(vec![
-        Span::raw("  "),
+        Span::styled("• ", dim),
         Span::styled("Thought", dim),
         Span::styled(" · ", dim),
         Span::styled(label, dim),
@@ -454,26 +455,36 @@ fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
 /// `⋯ +N more` counter takes the top slot, so the preview stays
 /// fixed-height instead of pushing the composer off-screen on a
 /// long internal monologue.
-const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 6;
+const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 4;
 
 /// While `<think>` is open and the model is still streaming, show a
-/// shimmering `Thinking` header plus a fixed-height scrolling
+/// calm `Thought preview` header plus a fixed-height scrolling
 /// preview of the latest thinking content. Matches `ReasoningCell`'s
 /// live-preview grammar so the two paths (inline `<think>` vs.
 /// provider reasoning channel) feel consistent to the user. Full
 /// thinking body stays hidden — once `</think>` arrives this whole
-/// block collapses to a one-line `Thought · N lines` header.
+/// block collapses to a one-line `Thought (N lines)` header.
 fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     let dim_italic = Style::default()
         .fg(crate::tui::theme::current().dim)
         .add_modifier(Modifier::DIM)
         .add_modifier(Modifier::ITALIC);
 
-    // Header line — shimmered so there's a visible "still working"
-    // cue even if the preview body happens to be empty for a tick.
-    let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-    header_spans.extend(crate::tui::shimmer::shimmer_spans("Thinking"));
-    let mut out = vec![Line::from(header_spans)];
+    // Header line — intentionally calm and dim. The dedicated live
+    // status indicator already surfaces "working" above the composer;
+    // duplicating that energy inside scrollback made the transcript
+    // feel more like a debug view than a product surface.
+    let bullet = Style::default()
+        .fg(crate::tui::theme::current().dim)
+        .add_modifier(Modifier::DIM);
+    let label = Style::default()
+        .fg(crate::tui::theme::current().dim)
+        .add_modifier(Modifier::DIM)
+        .add_modifier(Modifier::ITALIC);
+    let mut out = vec![Line::from(vec![
+        Span::styled("• ", bullet),
+        Span::styled("Thought preview", label),
+    ])];
 
     // Soft-wrap the partial thinking content, then render the most
     // recent N rows, with a `⋯ +M more` counter in the first slot
@@ -591,13 +602,13 @@ mod tests {
     // ── Render ───────────────────────────────────────────────────
 
     #[test]
-    fn renders_gutter_on_every_line() {
+    fn settled_replies_render_as_plain_body_text() {
         let c = AssistantCell::from_markdown("first\n\nsecond");
         let out = render(&c, 60, 4);
         for row in out.lines().filter(|l| !l.is_empty()) {
             assert!(
-                row.starts_with('█'),
-                "every rendered row needs the █ gutter: {row:?}"
+                !row.starts_with('│'),
+                "settled reply rows should read as plain body text: {row:?}"
             );
         }
     }
@@ -730,7 +741,7 @@ mod tests {
             "think INNER content must be hidden once closed: {out}"
         );
         assert!(
-            out.contains("Thought · 2 lines"),
+            out.contains("Thought") && out.contains("2 lines"),
             "collapsed header missing: {out}"
         );
         assert!(out.contains("I am Astra"), "body missing: {out}");
@@ -741,7 +752,7 @@ mod tests {
         let c = AssistantCell::from_markdown("<think>just one</think>\n\nbody");
         let out = render(&c, 60, 3);
         assert!(
-            out.contains("Thought · 1 line"),
+            out.contains("Thought") && out.contains("1 line"),
             "singular form for one-line think: {out}"
         );
     }
@@ -762,7 +773,7 @@ mod tests {
     #[test]
     fn streaming_think_shows_indicator_and_recent_lines() {
         // While the `<think>` block is still open we show
-        // `Thinking` plus a scrolling preview of the latest
+        // `Thought preview` plus a scrolling preview of the latest
         // rows of internal monologue (see `LIVE_THINK_PREVIEW_MAX_ROWS`).
         // With only two lines of content, the whole body fits in
         // the preview window — no overflow counter, both rows
@@ -770,7 +781,10 @@ mod tests {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("<think>\nstep one\nstep two in progres");
         let out = render(&c, 80, 5);
-        assert!(out.contains("Thinking"), "live indicator missing: {out}");
+        assert!(
+            out.contains("Thought preview"),
+            "live indicator missing: {out}"
+        );
         assert!(
             out.contains("step two in progres"),
             "latest thinking line missing: {out}"
@@ -779,9 +793,9 @@ mod tests {
             out.contains("step one"),
             "earlier line must stay visible under the window cap: {out}"
         );
-        // Body hasn't arrived yet — no `█ ` gutter.
+        // Body hasn't arrived yet — no settled-body guide gutter.
         assert!(
-            !out.contains('█'),
+            !out.contains('│'),
             "body gutter shouldn't render while still thinking: {out}"
         );
     }
@@ -817,7 +831,7 @@ mod tests {
         c.push_delta("<think>one\ntwo\nthree</think>\n\nanswer");
         let out = render(&c, 60, 5);
         assert!(
-            out.contains("Thought · 3 lines"),
+            out.contains("Thought") && out.contains("3 lines"),
             "collapsed header with line count: {out}"
         );
         assert!(out.contains("answer"), "body still visible: {out}");

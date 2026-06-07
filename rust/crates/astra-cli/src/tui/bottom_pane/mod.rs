@@ -251,6 +251,14 @@ impl BottomPane {
         !self.view_stack.is_empty()
     }
 
+    pub fn transcript_view_is_open(&self) -> bool {
+        self.active_view().is_some_and(|view| view.is_transcript_view())
+    }
+
+    pub fn close_active_view(&mut self) -> bool {
+        self.view_stack.pop().is_some()
+    }
+
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
         self.view_stack.last().map(|v| &**v)
     }
@@ -614,11 +622,7 @@ impl BottomPane {
         let content_h = self.composer.desired_height(width);
         let approval_h = self.focused_approval_height(width);
         let popup_h = self.popup_height();
-        if popup_h > 0 {
-            content_h + approval_h + 1 + popup_h
-        } else {
-            content_h + approval_h + 1 + 1
-        }
+        content_h + approval_h + popup_h + 1
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -983,8 +987,18 @@ impl BottomPane {
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }
-        self.footer.current_objective = self.task_status.objective_label();
-        self.footer.turn_elapsed = self.task_status.elapsed();
+        if self.task_status.is_active() {
+            // The live status indicator already owns the "Thinking /
+            // Running / Waiting" narrative above the composer. Duplicating
+            // that same label + timer in the footer makes the bottom stack
+            // feel cramped, so the footer stays focused on mode + context
+            // while a turn is active.
+            self.footer.current_objective = None;
+            self.footer.turn_elapsed = None;
+        } else {
+            self.footer.current_objective = self.task_status.objective_label();
+            self.footer.turn_elapsed = self.task_status.elapsed();
+        }
         // Flush paste burst buffer when idle timeout expires.
         if self.composer.flush_paste_burst() {
             self.sync_popups();
@@ -1039,36 +1053,34 @@ impl BottomPane {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
                 Constraint::Length(content_h),
-                Constraint::Length(1),
                 Constraint::Length(popup_h),
+                Constraint::Length(1),
             ])
             .split(area);
 
             self.render_focused_approval(chunks[0], buf);
             self.composer
                 .render(chunks[1], buf, self.task_status.is_active());
-            render_composer_hint_bar(chunks[2], buf, self.task_status.is_active());
             if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render(menu, chunks[3], buf);
+                slash_popup_render::render(menu, chunks[2], buf);
             } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[3], buf);
+                mention_popup_render::render(menu, chunks[2], buf);
             } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[3], buf);
+                popup.render(chunks[2], buf);
             }
+            self.footer.render(chunks[3], buf);
         } else {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
                 Constraint::Length(content_h),
                 Constraint::Length(1),
-                Constraint::Length(1),
             ])
             .split(area);
 
             self.render_focused_approval(chunks[0], buf);
             self.composer
                 .render(chunks[1], buf, self.task_status.is_active());
-            render_composer_hint_bar(chunks[2], buf, self.task_status.is_active());
-            self.footer.render(chunks[3], buf);
+            self.footer.render(chunks[2], buf);
         }
     }
 
@@ -1114,68 +1126,6 @@ fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
         Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
     ]);
     Widget::render(styled, area, buf);
-}
-
-fn render_composer_hint_bar(area: Rect, buf: &mut Buffer, task_active: bool) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    use ratatui::style::Style;
-    use ratatui::text::{Line, Span};
-    use ratatui::widgets::Widget;
-    use unicode_width::UnicodeWidthStr;
-
-    let theme = crate::tui::theme::current();
-    let panel = crate::tui::style::composer_surface_style();
-    let rule_style = Style::default()
-        .fg(theme.dim)
-        .bg(panel.bg.unwrap_or(ratatui::style::Color::Reset));
-
-    for y in area.y..area.y + area.height {
-        buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
-    }
-
-    let hint = if task_active {
-        choose_hint(
-            area.width,
-            &[
-                "Queued for next tool call · Ctrl+C stops",
-                "Next tool call · Ctrl+C stops",
-                "Queued · Ctrl+C",
-            ],
-        )
-    } else {
-        choose_hint(
-            area.width,
-            &[
-                "Ctrl+E opens editor · Shift+Enter newline",
-                "Ctrl+E editor · Shift+Enter",
-                "Ctrl+E",
-            ],
-        )
-    };
-
-    let hint_width = UnicodeWidthStr::width(hint);
-    let mut spans = vec![
-        Span::styled("  ", rule_style),
-        Span::styled(hint.to_string(), rule_style),
-    ];
-    let used = 2 + hint_width;
-    let remaining = area.width as usize;
-    if remaining > used {
-        spans.push(Span::styled(" ".repeat(remaining - used), rule_style));
-    }
-    Widget::render(Line::from(spans), area, buf);
-}
-
-fn choose_hint<'a>(width: u16, options: &'a [&'a str]) -> &'a str {
-    let available = width.saturating_sub(2) as usize;
-    for option in options {
-        if unicode_width::UnicodeWidthStr::width(*option) <= available {
-            return option;
-        }
-    }
-    options.last().copied().unwrap_or("")
 }
 
 /// Summary of what happened when the user activates a button on the

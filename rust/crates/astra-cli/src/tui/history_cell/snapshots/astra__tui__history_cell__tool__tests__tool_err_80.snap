@@ -1,7 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/tool.rs
-assertion_line: 731
 expression: "render(&err_tool(\"bash\", \"false\", 10), 80, 3)"
 ---
-• Bash · failed · 10ms
-  │ false
+• Ran Bash · 10ms · failed
+  ├ false
+  └ No details returned
