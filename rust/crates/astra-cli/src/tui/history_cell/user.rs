@@ -1,17 +1,16 @@
 //! User-turn history cell — what the user typed, as they typed it.
 //!
-//! Rendered as a Cursor-style block:
+//! Rendered as a quoted input block:
 //!
 //! ```text
-//! › first line of the user's message
-//!   second line (if any)
-//!   ...
+//! > first line of the user's message
+//! > second line (if any)
+//! > ...
 //! ```
 //!
-//! The `› ` prefix is painted in the theme accent (bold) so user
-//! turns anchor the eye when scanning scrollback. A soft tinted
-//! background spans the whole block as a secondary signal on
-//! terminals that support it (see [`user_message_style`]).
+//! A soft tinted background spans the whole block and every content
+//! row gets the same `> ` quote prefix so the message reads as one
+//! visual unit rather than a prompt/continuation pair.
 //!
 //! Persists as [`TurnEvent::User`]. Never enters a live state —
 //! the text is fully known at construction time.
@@ -73,32 +72,21 @@ impl HistoryCell for UserCell {
         let prefix_style = Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD);
+        let pad = Line::from(Span::raw("")).style(bg);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(pad.clone());
 
         if self.text.is_empty() {
-            lines.push(Line::from(Span::styled("› ", prefix_style)).style(bg));
+            lines.push(Line::from(Span::styled("> ", prefix_style)).style(bg));
         } else {
-            for (i, row) in self.text.lines().enumerate() {
-                let prefix = if i == 0 {
-                    Span::styled("› ", prefix_style)
-                } else {
-                    Span::raw("  ")
-                };
+            for row in self.text.lines() {
+                let prefix = Span::styled("> ", prefix_style);
                 lines.push(Line::from(vec![prefix, Span::raw(row.to_string())]).style(bg));
             }
         }
+        lines.push(pad);
 
-        // No cell-local trailing blanks: `flush_chat_widget` adds
-        // exactly one blank row between committed cells — one visible
-        // gap between `› prose` and the next cell, zero between
-        // `› /cmd` and its `⎿ response` pair. The earlier
-        // `tinted-blank + plain-blank` pair over-indented every
-        // prose turn by ~2 rows of dead air before the model
-        // response, which pushed tool output off the fold.
-        //
-        // Slash commands continue to suppress even the batch-level
-        // separator — see `flush_chat_widget`.
         lines
     }
 
@@ -132,10 +120,13 @@ mod tests {
     #[test]
     fn single_line_renders_prefix_and_text() {
         let cell = UserCell::new("rebuild the index");
-        let out = render_cell(&cell, 40, 3);
-        // First row should start with the `›` marker and contain the text.
-        let first = out.lines().next().unwrap_or_default();
-        assert!(first.starts_with('›'), "missing › prefix: {first:?}");
+        let out = render_cell(&cell, 40, 5);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows.get(1).copied().unwrap_or_default();
+        assert!(
+            first.trim_start().starts_with('>'),
+            "missing > prefix: {first:?}"
+        );
         assert!(
             first.contains("rebuild the index"),
             "text missing: {first:?}"
@@ -145,16 +136,22 @@ mod tests {
     #[test]
     fn multiline_renders_prefix_only_on_first_row() {
         let cell = UserCell::new("line one\nline two\nline three");
-        let out = render_cell(&cell, 40, 6);
+        let out = render_cell(&cell, 40, 7);
         let rows: Vec<&str> = out.lines().collect();
-        assert!(rows[0].starts_with('›'), "row 0 missing prefix");
         assert!(
-            !rows[1].starts_with('›'),
-            "row 1 should indent, not repeat prefix: {:?}",
-            rows[1]
+            rows[1].trim_start().starts_with('>'),
+            "row 1 missing prefix"
         );
-        assert!(rows[1].contains("line two"));
-        assert!(rows[2].contains("line three"));
+        assert!(
+            rows[2].trim_start().starts_with('>'),
+            "row 2 missing prefix"
+        );
+        assert!(
+            rows[3].trim_start().starts_with('>'),
+            "row 3 missing prefix"
+        );
+        assert!(rows[2].contains("line two"));
+        assert!(rows[3].contains("line three"));
     }
 
     #[test]
@@ -162,8 +159,14 @@ mod tests {
         // Shouldn't normally happen — BottomPane filters empty
         // submits — but the cell must degrade gracefully.
         let cell = UserCell::new("");
-        let out = render_cell(&cell, 20, 3);
-        assert!(out.lines().next().unwrap_or_default().starts_with('›'));
+        let out = render_cell(&cell, 20, 5);
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap_or_default()
+                .trim_start()
+                .starts_with('>')
+        );
     }
 
     #[test]
@@ -187,34 +190,28 @@ mod tests {
 
     #[test]
     fn slash_command_user_cell_is_tight_one_content_line() {
-        // Same contract as prose now — no trailing blanks. The
-        // distinction between prose and slash lives in
-        // `flush_chat_widget`, which suppresses even the batch
-        // separator for the `/cmd → ⎿ response` pair.
+        // Quoted block adds top/bottom padding, so one content line
+        // becomes three rendered rows.
         let cell = UserCell::new("/model glm-5.1");
         let lines = cell.display_lines(60);
         assert_eq!(
             lines.len(),
-            1,
-            "slash UserCell is exactly one line: {:?}",
+            3,
+            "slash UserCell should render top pad, content, bottom pad: {:?}",
             lines
         );
     }
 
     #[test]
     fn prose_user_cell_is_tight_one_content_line() {
-        // Prose used to emit 2 trailing blanks on top of the batch
-        // separator added by `flush_chat_widget` (3 blanks total
-        // between `› prose` and the next cell). That pushed the
-        // model's reply / tool output off-screen. Both prose and
-        // slash now render exactly the content rows; `flush_chat_widget`
-        // owns the single blank separator between committed cells.
+        // A single-line prose message renders as one quoted content
+        // row bracketed by top/bottom padding.
         let cell = UserCell::new("just a prose question");
         let lines = cell.display_lines(60);
         assert_eq!(
             lines.len(),
-            1,
-            "UserCell should emit exactly its content rows, no trailing blanks; got {:?}",
+            3,
+            "UserCell should emit pad + content + pad; got {:?}",
             lines
         );
     }
