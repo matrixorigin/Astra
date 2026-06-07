@@ -7,7 +7,13 @@ jest.mock('@/lib/runtime-client', () => ({
   runtimeErrorDetail: jest.fn((error: unknown) => (error instanceof Error ? error.message : String(error))),
 }));
 
-import { getStore, queueDeferredRunInput, resumeActiveRun, stopActiveRun } from '@/lib/api/web-store';
+import {
+  getChatHydrated,
+  getStore,
+  queueDeferredRunInput,
+  resumeActiveRun,
+  stopActiveRun,
+} from '@/lib/api/web-store';
 import { getRuntimeClient, requireRuntimeClient } from '@/lib/runtime-client';
 
 const mockGetRuntimeClient = getRuntimeClient as jest.MockedFunction<typeof getRuntimeClient>;
@@ -151,6 +157,64 @@ describe('queueDeferredRunInput', () => {
     });
     expect(result?.activeRun).toEqual({
       runId: 'run-recovered',
+      status: 'input-queued',
+      waitingFor: 'user_input',
+    });
+  });
+
+  it('hydrates active runs when opening chat detail after in-memory store loss', async () => {
+    const listRuntimeSessions = jest.fn().mockResolvedValue({
+      sessions: [{
+        session_id: 'chat-open',
+        user_id: 'user-a',
+        title: 'Open test',
+        metadata: {
+          source: 'web_v1',
+          current_model: 'sonnet-4.6-adaptive',
+        },
+        status: 'active',
+        created_at: '2026-06-07T00:00:00.000Z',
+        updated_at: '2026-06-07T00:00:01.000Z',
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const listRuns = jest.fn().mockResolvedValue({
+      runs: [{
+        runId: 'run-open',
+        sessionId: 'chat-open',
+        status: 'input-queued',
+        waitingFor: 'user_input',
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const getSessionTranscript = jest.fn().mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 200,
+      offset: 0,
+    });
+
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: {
+        listRuntimeSessions,
+        listRuns,
+        getSessionTranscript,
+      },
+    } as never);
+
+    const result = await getChatHydrated('user-a', 'chat-open');
+
+    expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', { limit: 200 });
+    expect(result?.chat.id).toBe('chat-open');
+    expect(result?.chat.model).toBe('sonnet-4.6-adaptive');
+    expect(result?.activeRun).toEqual({
+      runId: 'run-open',
       status: 'input-queued',
       waitingFor: 'user_input',
     });
