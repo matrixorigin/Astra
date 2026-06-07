@@ -336,7 +336,8 @@ impl InterruptionRecord {
         let cause_note = match kind {
             InterruptionKind::BudgetExhausted
             | InterruptionKind::TokenBudgetExceeded
-            | InterruptionKind::CumulativeBudgetExceeded => summary
+            | InterruptionKind::CumulativeBudgetExceeded
+            | InterruptionKind::HarnessPaused => summary
                 .stall_signal
                 .as_deref()
                 .and_then(summarize_stall_signal_for_user)
@@ -347,6 +348,10 @@ impl InterruptionRecord {
         match kind {
             InterruptionKind::EmptyCompletion => format!(
                 "[{}] The run ended without a final answer.{tool_note}{checkpoint_note}{action_note}",
+                kind.label()
+            ),
+            InterruptionKind::HarnessPaused => format!(
+                "[{}] The run paused after a read-heavy stall.{tool_note}{checkpoint_note}{cause_note}{action_note}",
                 kind.label()
             ),
             _ => format!(
@@ -1023,6 +1028,31 @@ mod tests {
             record
                 .user_message
                 .contains("re-read overlapping file ranges 5 time(s)")
+        );
+        assert!(record.user_message.contains("You can continue"));
+    }
+
+    #[test]
+    fn harness_paused_user_message_is_actionable() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::HarnessPaused,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 28,
+                turns_completed: 16,
+                remaining_turns: 134,
+                error_detail: None,
+                stall_signal: Some("redundant_reads=6".to_string()),
+                resume_restricted_tools: Vec::new(),
+            },
+        );
+        assert!(record.user_message.contains("read-heavy stall"));
+        assert!(record.user_message.contains("Cause:"));
+        assert!(
+            record
+                .user_message
+                .contains("re-read overlapping file ranges 6 time(s)")
         );
         assert!(record.user_message.contains("You can continue"));
     }
