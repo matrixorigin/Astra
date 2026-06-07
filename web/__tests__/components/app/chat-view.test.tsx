@@ -263,6 +263,78 @@ describe('ChatView deferred-input unhappy paths', () => {
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
   });
 
+  it('does not send stop while deferred input queueing is in flight', async () => {
+    const user = userEvent.setup();
+    let resolveQueue: (value: Awaited<ReturnType<typeof queueChatRunInput>>) => void = () => {};
+    mockQueueChatRunInput.mockReturnValue(new Promise((resolve) => {
+      resolveQueue = resolve;
+    }));
+
+    render(<ChatView initial={makeDetail()} />);
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+    await waitFor(() => {
+      expect(mockQueueChatRunInput).toHaveBeenCalledWith('chat-123', {
+        content: 'queue this follow-up',
+        options: composerPayload.options,
+      });
+    });
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Stop' }));
+
+    expect(mockStopChatRun).not.toHaveBeenCalled();
+
+    resolveQueue({
+      userMessage: {
+        id: 'queued-user-1',
+        role: 'user',
+        content: 'queue this follow-up',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      },
+      activeRun: {
+        runId: 'run-123',
+        status: 'input-queued',
+        waitingFor: 'user_input',
+      },
+    });
+    await waitFor(() => {
+      expect(screen.getByText('queue this follow-up')).toBeInTheDocument();
+    });
+  });
+
+  it('does not queue deferred input while stop is in flight', async () => {
+    const user = userEvent.setup();
+    let resolveStop: (value: Awaited<ReturnType<typeof stopChatRun>>) => void = () => {};
+    mockStopChatRun.mockReturnValue(new Promise((resolve) => {
+      resolveStop = resolve;
+    }));
+
+    render(<ChatView initial={makeDetail()} />);
+
+    await user.click(screen.getByRole('button', { name: 'Stop' }));
+    await waitFor(() => {
+      expect(mockStopChatRun).toHaveBeenCalledWith('chat-123');
+    });
+    expect(screen.getByRole('button', { name: 'Submit composer' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+
+    expect(mockQueueChatRunInput).not.toHaveBeenCalled();
+
+    resolveStop({
+      activeRun: {
+        runId: 'run-123',
+        status: 'cancelling',
+        waitingFor: null,
+      },
+    });
+    await waitFor(() => {
+      expect(screen.getByText('Stopping the current run. New input stays disabled until cancellation completes.')).toBeInTheDocument();
+    });
+  });
+
   it('does not queue input for terminal active-run statuses', async () => {
     const user = userEvent.setup();
     mockStreamChatMessage.mockResolvedValue('new answer');

@@ -28,12 +28,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [detail, setDetail] = useState(initial);
   const [moveOpen, setMoveOpen] = useState(false);
   const [startingRun, setStartingRun] = useState(false);
+  const [queueingDeferredInput, setQueueingDeferredInput] = useState(false);
   const [resumingRun, setResumingRun] = useState(false);
   const [stoppingRun, setStoppingRun] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const runControlMutationRef = useRef(false);
   const lifecycle = useChatLifecycleActions({ onChatUpdated: setDetail });
 
   const latestMessage = detail.messages[detail.messages.length - 1];
@@ -62,7 +64,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       && !canResumeRun
       && activeRunStatus !== 'cancelling',
   );
+  const runControlBusy = queueingDeferredInput || resumingRun || stoppingRun;
   const composerDisabled = startingRun
+    || queueingDeferredInput
     || resumingRun
     || stoppingRun
     || activeRunStatus === 'paused'
@@ -259,6 +263,11 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     if (detail.chat.archivedAt) {
       return;
     }
+    if (runControlMutationRef.current) {
+      return;
+    }
+    runControlMutationRef.current = true;
+    setQueueingDeferredInput(true);
 
     try {
       const result = await queueChatRunInput(detail.chat.id, {
@@ -295,6 +304,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         }
       }
       window.alert(error instanceof Error ? error.message : 'Failed to queue input for the active run.');
+    } finally {
+      runControlMutationRef.current = false;
+      setQueueingDeferredInput(false);
     }
   }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router, startStream]);
 
@@ -302,6 +314,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     if (!detail.activeRun?.runId || !canStopRun) {
       return;
     }
+    if (runControlMutationRef.current) {
+      return;
+    }
+    runControlMutationRef.current = true;
     setStoppingRun(true);
     try {
       const result = await stopChatRun(detail.chat.id);
@@ -319,6 +335,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         return;
       }
       window.alert(error instanceof Error ? error.message : 'Failed to stop the active run.');
+    } finally {
+      runControlMutationRef.current = false;
       setStoppingRun(false);
     }
   }, [canStopRun, chatListHref, detail.activeRun?.runId, detail.chat.id, router]);
@@ -327,6 +345,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     if (!detail.activeRun?.runId || !canResumeRun) {
       return;
     }
+    if (runControlMutationRef.current) {
+      return;
+    }
+    runControlMutationRef.current = true;
     const assistantMessageId = [...detail.messages]
       .reverse()
       .find((message) => message.role === 'assistant')?.id;
@@ -431,6 +453,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       }
       window.alert(error instanceof Error ? error.message : 'Failed to resume the paused run.');
     } finally {
+      runControlMutationRef.current = false;
       setResumingRun(false);
     }
   }, [canResumeRun, chatListHref, detail.activeRun?.runId, detail.chat.id, detail.messages, nextStreamAbortSignal, router]);
@@ -614,7 +637,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                       <button
                         type="button"
                         onClick={() => { void resumeActiveRun(); }}
-                        disabled={resumingRun || stoppingRun}
+                        disabled={runControlBusy}
                         className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {resumingRun ? 'Resuming...' : 'Resume'}
@@ -624,7 +647,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                       <button
                         type="button"
                         onClick={() => { void stopActiveRun(); }}
-                        disabled={stoppingRun || resumingRun}
+                        disabled={runControlBusy}
                         className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {stoppingRun ? 'Stopping...' : 'Stop'}
