@@ -663,11 +663,11 @@ pub struct DeferredInputState {
     /// Deferred user-input events submitted while the run is still active.
     /// The execution phase releases entries only after a later tool-call round
     /// completes.
-    pub deferred_user_inputs: Vec<DeferredUserInput>,
+    deferred_user_inputs: Vec<DeferredUserInput>,
     /// Durable event cursor for deferred user-input polling.
-    pub deferred_user_input_cursor: usize,
+    deferred_user_input_cursor: usize,
     /// Monotonic count of completed tool-call rounds observed by this run.
-    pub tool_call_generation: u64,
+    tool_call_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -688,6 +688,10 @@ impl DeferredInputState {
 
     pub fn tool_call_generation(&self) -> u64 {
         self.tool_call_generation
+    }
+
+    pub fn pending_deferred_user_input_count(&self) -> usize {
+        self.deferred_user_inputs.len()
     }
 
     pub fn record_tool_boundary(&mut self) {
@@ -722,6 +726,16 @@ impl DeferredInputState {
 
         self.deferred_user_inputs = pending;
         ready
+    }
+
+    #[cfg(test)]
+    pub fn pending_deferred_user_inputs_for_test(&self) -> &[DeferredUserInput] {
+        &self.deferred_user_inputs
+    }
+
+    #[cfg(test)]
+    pub fn set_tool_call_generation_for_test(&mut self, generation: u64) {
+        self.tool_call_generation = generation;
     }
 }
 

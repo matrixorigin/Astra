@@ -3020,7 +3020,10 @@ mod tests {
         state.session_turn = 6;
         state.max_turns = 20;
         state.remaining_turns = 4;
-        state.messaging.deferred_input.tool_call_generation = 41;
+        state
+            .messaging
+            .deferred_input
+            .set_tool_call_generation_for_test(41);
         let hub = ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         state.telemetry.observability_hub = Some(Arc::new(hub));
@@ -4763,21 +4766,30 @@ mod tests {
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
-        assert_eq!(state.messaging.deferred_input.deferred_user_inputs.len(), 1);
+        assert_eq!(
+            state
+                .messaging
+                .deferred_input
+                .pending_deferred_user_input_count(),
+            1
+        );
         assert_eq!(state.messaging.deferred_user_input_cursor(), 2);
 
-        state.messaging.deferred_input.tool_call_generation = 1;
+        state
+            .messaging
+            .deferred_input
+            .set_tool_call_generation_for_test(1);
         let tool_call_generation = state.messaging.tool_call_generation();
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         let released = release_ready_deferred_user_inputs(&mut state);
         mark_released_deferred_user_inputs(&state, released).await;
 
-        assert!(
+        assert_eq!(
             state
                 .messaging
                 .deferred_input
-                .deferred_user_inputs
-                .is_empty()
+                .pending_deferred_user_input_count(),
+            0
         );
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(state.message, "Switch to writing tests first.");
@@ -4799,7 +4811,10 @@ mod tests {
     async fn deferred_user_input_submitted_after_tool_round_waits_for_future_tool_round() {
         let mut state = make_state();
         state.current_run_id = Some("run-late-queued".into());
-        state.messaging.deferred_input.tool_call_generation = 1;
+        state
+            .messaging
+            .deferred_input
+            .set_tool_call_generation_for_test(1);
         state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
             RunQueuedInputPoll {
                 next_cursor: 4,
@@ -4825,24 +4840,39 @@ mod tests {
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
-        assert_eq!(state.messaging.deferred_input.deferred_user_inputs.len(), 1);
+        assert_eq!(
+            state
+                .messaging
+                .deferred_input
+                .pending_deferred_user_input_count(),
+            1
+        );
 
         let tool_call_generation = state.messaging.tool_call_generation();
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
-        assert_eq!(state.messaging.deferred_input.deferred_user_inputs.len(), 1);
-
-        state.messaging.deferred_input.tool_call_generation = 2;
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
-        let _ = release_ready_deferred_user_inputs(&mut state);
-        assert!(
+        assert_eq!(
             state
                 .messaging
                 .deferred_input
-                .deferred_user_inputs
-                .is_empty()
+                .pending_deferred_user_input_count(),
+            1
+        );
+
+        state
+            .messaging
+            .deferred_input
+            .set_tool_call_generation_for_test(2);
+        let tool_call_generation = state.messaging.tool_call_generation();
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = release_ready_deferred_user_inputs(&mut state);
+        assert_eq!(
+            state
+                .messaging
+                .deferred_input
+                .pending_deferred_user_input_count(),
+            0
         );
         assert_eq!(state.message, "Stop reading and patch the code.");
         assert_eq!(
@@ -4887,32 +4917,45 @@ mod tests {
         let tool_call_generation = state.messaging.tool_call_generation();
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
-        assert!(
+        assert_eq!(
             state
                 .messaging
                 .deferred_input
-                .deferred_user_inputs
-                .is_empty()
-        );
-
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
-        assert_eq!(state.messaging.deferred_input.deferred_user_inputs.len(), 1);
-        assert_eq!(
-            state.messaging.deferred_input.deferred_user_inputs[0].queued_at_tool_generation,
+                .pending_deferred_user_input_count(),
             0
         );
 
-        state.messaging.deferred_input.tool_call_generation = 1;
         let tool_call_generation = state.messaging.tool_call_generation();
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
-        let _ = release_ready_deferred_user_inputs(&mut state);
-        assert!(
+        assert_eq!(
             state
                 .messaging
                 .deferred_input
-                .deferred_user_inputs
-                .is_empty()
+                .pending_deferred_user_input_count(),
+            1
+        );
+        assert_eq!(
+            state
+                .messaging
+                .deferred_input
+                .pending_deferred_user_inputs_for_test()[0]
+                .queued_at_tool_generation,
+            0
+        );
+
+        state
+            .messaging
+            .deferred_input
+            .set_tool_call_generation_for_test(1);
+        let tool_call_generation = state.messaging.tool_call_generation();
+        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let _ = release_ready_deferred_user_inputs(&mut state);
+        assert_eq!(
+            state
+                .messaging
+                .deferred_input
+                .pending_deferred_user_input_count(),
+            0
         );
         assert_eq!(state.message, "Stop and respond to the user first.");
         assert_eq!(
@@ -4934,13 +4977,14 @@ mod tests {
     #[test]
     fn deferred_user_input_releases_after_text_only_turn_boundary() {
         let mut state = make_state();
-        state.messaging.deferred_input.tool_call_generation = 7;
-        state.messaging.deferred_input.deferred_user_inputs.push(
-            crate::turn::agentic_loop::host::DeferredUserInput {
-                event_index: 9,
-                content: "Stop tool work and answer directly.".to_string(),
-                queued_at_tool_generation: 7,
-            },
+        state
+            .messaging
+            .deferred_input
+            .set_tool_call_generation_for_test(7);
+        state.messaging.push_deferred_user_input(
+            9,
+            "Stop tool work and answer directly.".to_string(),
+            7,
         );
 
         observe_turn_end_without_tools(&mut state, 0, Instant::now(), None);
@@ -4948,12 +4992,12 @@ mod tests {
 
         assert_eq!(state.messaging.tool_call_generation(), 8);
         assert_eq!(released, vec![9]);
-        assert!(
+        assert_eq!(
             state
                 .messaging
                 .deferred_input
-                .deferred_user_inputs
-                .is_empty()
+                .pending_deferred_user_input_count(),
+            0
         );
         assert_eq!(state.message, "Stop tool work and answer directly.");
         assert_eq!(
