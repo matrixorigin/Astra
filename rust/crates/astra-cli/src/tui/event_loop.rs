@@ -45,6 +45,7 @@ use super::{
 
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
+const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
@@ -136,12 +137,22 @@ fn render_history_batch_lines(
 }
 
 fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
-    if let TuiAppEvent::PermissionAutoApproved { tool, reason } = event {
-        chat_widget.commit_system(history_cell::system::SystemCell::info(
-            astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
-                .trim()
-                .to_string(),
-        ));
+    match event {
+        TuiAppEvent::PermissionAutoApproved { tool, reason } => {
+            chat_widget.commit_system(history_cell::system::SystemCell::info(
+                astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
+                    .trim()
+                    .to_string(),
+            ));
+        }
+        TuiAppEvent::StatusLine(text) => {
+            if let Some(message) = text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX) {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    message.trim().to_string(),
+                ));
+            }
+        }
+        _ => {}
     };
 }
 
@@ -3456,6 +3467,19 @@ mod tests {
         assert!(
             arm.contains("active_turn_local_run_control"),
             "active-turn Enter should use the live local run-control slot for the current turn"
+        );
+    }
+
+    #[test]
+    fn deferred_input_status_lines_are_committed_to_chat_history() {
+        let source = include_str!("event_loop.rs");
+        assert!(
+            source.contains("DEFERRED_INPUT_APPLIED_PREFIX"),
+            "deferred-input feedback should have a dedicated status-line prefix"
+        );
+        assert!(
+            source.contains("text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX)"),
+            "TUI should surface deferred-input-applied status lines into chat history"
         );
     }
 

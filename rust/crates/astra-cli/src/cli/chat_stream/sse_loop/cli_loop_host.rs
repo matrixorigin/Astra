@@ -234,6 +234,23 @@ impl CliAgenticLoopHost<'_> {
     }
 }
 
+fn deferred_input_status_line(input: &Value) -> Option<String> {
+    let text = input
+        .get("content")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("text").and_then(Value::as_str))
+        .or_else(|| input.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    let mut preview: String = text.replace('\n', " ↩ ").chars().take(80).collect();
+    if text.replace('\n', " ↩ ").chars().count() > 80 {
+        preview.push_str("...");
+    }
+    Some(format!(
+        "__deferred_input_applied__:Queued input reached the model after a tool boundary: {preview}"
+    ))
+}
+
 fn permission_mode_change_audit_event(
     session_id: Option<&str>,
     turn: u32,
@@ -840,6 +857,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         &self.valid_tool_names
     }
 
+    fn on_deferred_user_input(&mut self, input: &Value) {
+        let Some(tx) = &self.stream_event_tx else {
+            return;
+        };
+        if let Some(line) = deferred_input_status_line(input) {
+            let _ = tx.send(crate::cli::chat_stream::StreamEvent::StatusLine(line));
+        }
+    }
+
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
         self.capabilities.clone()
     }
@@ -1165,13 +1191,14 @@ fn looks_plan_shaped(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_turn_interaction_mode, permission_mode_change_audit_event,
+        deferred_input_status_line, derive_turn_interaction_mode, permission_mode_change_audit_event,
         plan_mode_missed_exit_reminder, plan_mode_restriction_names,
         request_allowlist_restriction_names,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
     use astra_services::session_journal::JournalEventType;
+    use serde_json::json;
     use std::collections::HashSet;
 
     #[test]
@@ -1232,6 +1259,16 @@ mod tests {
             derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, true, true),
             TurnInteractionMode::NonInteractive
         );
+    }
+
+    #[test]
+    fn deferred_input_status_line_renders_feedback_prefix_and_preview() {
+        let line = deferred_input_status_line(&json!({
+            "content": "先停啊！"
+        }))
+        .expect("deferred input feedback should be rendered");
+        assert!(line.starts_with("__deferred_input_applied__:"));
+        assert!(line.contains("先停啊"));
     }
 
     #[test]
