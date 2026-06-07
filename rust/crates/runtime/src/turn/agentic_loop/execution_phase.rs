@@ -100,12 +100,6 @@ pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<Stri
     }
 }
 
-fn render_deferred_user_input(content: &str) -> String {
-    format!(
-        "A newer user message arrived during execution and now supersedes the previous plan.\n\nLatest user message:\n{content}\n\nRequired behavior:\n- Treat this as the newest user instruction.\n- Address it before making more tool calls.\n- Do not continue the previous plan blindly.\n- Only make another tool call if it is directly necessary to satisfy this newest user message."
-    )
-}
-
 fn render_deferred_user_input_text_reply_gate(content: &str) -> String {
     format!(
         "The user interrupted active execution with a newer message.\n\nNewest user message:\n{content}\n\nRequired behavior for your very next response:\n- Do not make any tool calls.\n- Reply directly to this newest user message in plain text first.\n- If it changes or stops the previous task, say so explicitly.\n- Only consider more tool calls after that direct response, and only if the user still wants more work."
@@ -142,13 +136,11 @@ pub(crate) async fn poll_deferred_user_inputs(
 }
 
 pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
-    let mut ready = Vec::new();
     let mut ready_contents = Vec::new();
     let current_generation = state.messaging.tool_call_generation;
     state.messaging.deferred_user_inputs.retain(|entry| {
         if current_generation > entry.queued_at_tool_generation {
             ready_contents.push(entry.content.clone());
-            ready.push(render_deferred_user_input(&entry.content));
             false
         } else {
             true
@@ -156,12 +148,14 @@ pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
     });
 
     if !ready_contents.is_empty() {
+        let combined = ready_contents.join("\n\n");
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": combined.clone(),
+        }));
+        state.message = combined.clone();
         state.messaging.deferred_user_input_ack_pending = true;
-        state.messaging.deferred_user_input_ack_content = Some(ready_contents.join("\n\n"));
-    }
-
-    for message in ready {
-        state.push_volatile(super::host::VolatileKind::DeferredUserInput, message);
+        state.messaging.deferred_user_input_ack_content = Some(combined);
     }
 }
 
@@ -4783,10 +4777,16 @@ mod tests {
             state.messaging.deferred_user_input_ack_content.as_deref(),
             Some("Switch to writing tests first.")
         );
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.kind == VolatileKind::DeferredUserInput
-                && entry.content.contains("Switch to writing tests first.")
-        }));
+        assert_eq!(state.message, "Switch to writing tests first.");
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str()),
+            Some("Switch to writing tests first.")
+        );
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[tokio::test]
@@ -4829,10 +4829,16 @@ mod tests {
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.messaging.deferred_user_inputs.is_empty());
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.kind == VolatileKind::DeferredUserInput
-                && entry.content.contains("Stop reading and patch the code.")
-        }));
+        assert_eq!(state.message, "Stop reading and patch the code.");
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str()),
+            Some("Stop reading and patch the code.")
+        );
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[tokio::test]
@@ -4876,12 +4882,16 @@ mod tests {
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.messaging.deferred_user_inputs.is_empty());
         assert!(state.messaging.deferred_user_input_ack_pending);
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.kind == VolatileKind::DeferredUserInput
-                && entry
-                    .content
-                    .contains("Stop and respond to the user first.")
-        }));
+        assert_eq!(state.message, "Stop and respond to the user first.");
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str()),
+            Some("Stop and respond to the user first.")
+        );
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[test]
