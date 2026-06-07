@@ -34,7 +34,7 @@
 //!   demonstrated the failure mode without this: 60-second-long
 //!   thinks would show as raw `<think>The user is asking…` text.
 //! - **After `</think>`** — collapsed to a one-line
-//!   `Thought (N lines)` dim header; the body markdown starts
+//!   `Thought · N lines · N tokens` dim header; the body markdown starts
 //!   immediately under it.
 //!
 //! Thinking content stays in `source` and is persisted unchanged
@@ -263,9 +263,10 @@ impl HistoryCell for AssistantCell {
         }
 
         // Branch 3: <think> closed. Collapse to a one-line
-        // `Thought (N lines)` header, then render the body.
+        // `Thought · N lines · N tokens` header, then render the body.
         let think_lines = think.trim().lines().count().max(1);
-        let mut out = thought_header_lines(think_lines);
+        let think_tokens = approx_tokens(think.chars().count() as u64);
+        let mut out = thought_header_lines(think_lines, think_tokens);
         out.extend(render_body_with_gutter(body, width, self.live, rate_suffix));
         out
     }
@@ -431,8 +432,8 @@ fn render_body_with_gutter(
 /// Collapsed one-line header shown in place of a `<think>` block
 /// once the closing tag has arrived.
 ///
-/// Example: `• Thought · 12 lines`
-fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
+/// Example: `• Thought · 12 lines · 50 tokens`
+fn thought_header_lines(line_count: usize, token_count: u64) -> Vec<Line<'static>> {
     let dim = Style::default()
         .fg(crate::tui::theme::current().dim)
         .add_modifier(Modifier::DIM);
@@ -441,11 +442,18 @@ fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
     } else {
         format!("{line_count} lines")
     };
+    let tok_label = if token_count == 1 {
+        "1 token".to_string()
+    } else {
+        format!("{token_count} tokens")
+    };
     vec![Line::from(vec![
         Span::styled("• ", dim),
         Span::styled("Thought", dim),
         Span::styled(" · ", dim),
         Span::styled(label, dim),
+        Span::styled(" · ", dim),
+        Span::styled(tok_label, dim),
     ])]
 }
 
@@ -458,32 +466,38 @@ fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
 const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 4;
 
 /// While `<think>` is open and the model is still streaming, show a
-/// calm `Thought preview` header plus a fixed-height scrolling
+/// calm `Thought · N lines · N tokens` header plus a fixed-height scrolling
 /// preview of the latest thinking content. Matches `ReasoningCell`'s
 /// live-preview grammar so the two paths (inline `<think>` vs.
 /// provider reasoning channel) feel consistent to the user. Full
 /// thinking body stays hidden — once `</think>` arrives this whole
-/// block collapses to a one-line `Thought (N lines)` header.
+/// block collapses to a one-line `Thought · N lines · N tokens` header.
 fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
-    let dim_italic = Style::default()
+    let dim = Style::default()
         .fg(crate::tui::theme::current().dim)
-        .add_modifier(Modifier::DIM)
-        .add_modifier(Modifier::ITALIC);
+        .add_modifier(Modifier::DIM);
+
+    let line_count = think_partial.trim().lines().count().max(1);
+    let token_count = approx_tokens(think_partial.chars().count() as u64);
+    let line_label = if line_count == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{line_count} lines")
+    };
+    let tok_label = if token_count == 1 {
+        "1 token".to_string()
+    } else {
+        format!("{token_count} tokens")
+    };
+    let header_text = format!("Thought · {line_label} · {tok_label}");
 
     // Header line — intentionally calm and dim. The dedicated live
     // status indicator already surfaces "working" above the composer;
     // duplicating that energy inside scrollback made the transcript
     // feel more like a debug view than a product surface.
-    let bullet = Style::default()
-        .fg(crate::tui::theme::current().dim)
-        .add_modifier(Modifier::DIM);
-    let label = Style::default()
-        .fg(crate::tui::theme::current().dim)
-        .add_modifier(Modifier::DIM)
-        .add_modifier(Modifier::ITALIC);
     let mut out = vec![Line::from(vec![
-        Span::styled("• ", bullet),
-        Span::styled("Thought preview", label),
+        Span::styled("• ", dim),
+        Span::styled(header_text, dim),
     ])];
 
     // Soft-wrap the partial thinking content, then render the most
@@ -510,17 +524,14 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
         let hidden = total - tail;
         out.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(format!("⋯ +{hidden} more"), dim_italic),
+            Span::styled(format!("⋯ +{hidden} more"), dim),
         ]));
         total - tail
     } else {
         0
     };
     for row in body_rows.into_iter().skip(visible_start) {
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(row, dim_italic),
-        ]));
+        out.push(Line::from(vec![Span::raw("    "), Span::styled(row, dim)]));
     }
     out
 }
@@ -553,6 +564,12 @@ fn soft_wrap_preview(input: &str, width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+/// Approximate token count from characters: chars / 4, ceiling.
+/// Mirrors [`crate::tui::status_indicator::approx_tokens`].
+fn approx_tokens(chars: u64) -> u64 {
+    chars.div_ceil(4)
 }
 
 #[cfg(test)]
@@ -741,7 +758,7 @@ mod tests {
             "think INNER content must be hidden once closed: {out}"
         );
         assert!(
-            out.contains("Thought") && out.contains("2 lines"),
+            out.contains("Thought") && out.contains("2 lines") && out.contains("token"),
             "collapsed header missing: {out}"
         );
         assert!(out.contains("I am Astra"), "body missing: {out}");
@@ -752,7 +769,7 @@ mod tests {
         let c = AssistantCell::from_markdown("<think>just one</think>\n\nbody");
         let out = render(&c, 60, 3);
         assert!(
-            out.contains("Thought") && out.contains("1 line"),
+            out.contains("Thought") && out.contains("1 line") && out.contains("token"),
             "singular form for one-line think: {out}"
         );
     }
@@ -773,7 +790,7 @@ mod tests {
     #[test]
     fn streaming_think_shows_indicator_and_recent_lines() {
         // While the `<think>` block is still open we show
-        // `Thought preview` plus a scrolling preview of the latest
+        // `Thought · N lines · N tokens` plus a scrolling preview of the latest
         // rows of internal monologue (see `LIVE_THINK_PREVIEW_MAX_ROWS`).
         // With only two lines of content, the whole body fits in
         // the preview window — no overflow counter, both rows
@@ -781,10 +798,9 @@ mod tests {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("<think>\nstep one\nstep two in progres");
         let out = render(&c, 80, 5);
-        assert!(
-            out.contains("Thought preview"),
-            "live indicator missing: {out}"
-        );
+        assert!(out.contains("Thought"), "live indicator missing: {out}");
+        assert!(out.contains("2 lines"), "line count missing: {out}");
+        assert!(out.contains("token"), "token count missing: {out}");
         assert!(
             out.contains("step two in progres"),
             "latest thinking line missing: {out}"
@@ -831,7 +847,7 @@ mod tests {
         c.push_delta("<think>one\ntwo\nthree</think>\n\nanswer");
         let out = render(&c, 60, 5);
         assert!(
-            out.contains("Thought") && out.contains("3 lines"),
+            out.contains("Thought") && out.contains("3 lines") && out.contains("token"),
             "collapsed header with line count: {out}"
         );
         assert!(out.contains("answer"), "body still visible: {out}");
