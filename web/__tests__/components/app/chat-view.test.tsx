@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import { ChatView } from '@/components/app/chat-view';
 import { WebApiError } from '@/lib/api/errors';
 import type { ChatDetail, ComposerOptions } from '@/lib/api/types';
-import { getChat, queueChatRunInput, stopChatRun, streamChatMessage, updateChatModel } from '@/lib/api/chats';
+import { getChat, queueChatRunInput, resumeChatRun, stopChatRun, streamChatMessage, streamExistingChatRun, updateChatModel } from '@/lib/api/chats';
 
 const pushMock = jest.fn();
 const replaceMock = jest.fn();
@@ -96,15 +96,19 @@ jest.mock('@/components/app/composer', () => ({
 jest.mock('@/lib/api/chats', () => ({
   getChat: jest.fn(),
   queueChatRunInput: jest.fn(),
+  resumeChatRun: jest.fn(),
   stopChatRun: jest.fn(),
   streamChatMessage: jest.fn(),
+  streamExistingChatRun: jest.fn(),
   updateChatModel: jest.fn(),
 }));
 
 const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
 const mockQueueChatRunInput = queueChatRunInput as jest.MockedFunction<typeof queueChatRunInput>;
+const mockResumeChatRun = resumeChatRun as jest.MockedFunction<typeof resumeChatRun>;
 const mockStopChatRun = stopChatRun as jest.MockedFunction<typeof stopChatRun>;
 const mockStreamChatMessage = streamChatMessage as jest.MockedFunction<typeof streamChatMessage>;
+const mockStreamExistingChatRun = streamExistingChatRun as jest.MockedFunction<typeof streamExistingChatRun>;
 const mockUpdateChatModel = updateChatModel as jest.MockedFunction<typeof updateChatModel>;
 
 const defaultActiveRun: NonNullable<ChatDetail['activeRun']> = {
@@ -145,8 +149,10 @@ describe('ChatView deferred-input unhappy paths', () => {
     refreshMock.mockReset();
     mockGetChat.mockReset();
     mockQueueChatRunInput.mockReset();
+    mockResumeChatRun.mockReset();
     mockStopChatRun.mockReset();
     mockStreamChatMessage.mockReset();
+    mockStreamExistingChatRun.mockReset();
     mockUpdateChatModel.mockReset();
     window.alert = jest.fn();
     HTMLElement.prototype.scrollTo = jest.fn();
@@ -219,5 +225,53 @@ describe('ChatView deferred-input unhappy paths', () => {
     });
     expect(screen.getByText('Stopping the current run. New input stays disabled until cancellation completes.')).toBeInTheDocument();
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
+  });
+
+  it('lets the web user resume a paused run instead of trapping the composer', async () => {
+    const user = userEvent.setup();
+    mockResumeChatRun.mockResolvedValue({
+      activeRun: {
+        runId: 'run-123',
+        status: 'running',
+        waitingFor: null,
+      },
+    });
+    mockStreamExistingChatRun.mockResolvedValue('resumed assistant text');
+
+    render(<ChatView initial={{
+      ...makeDetail({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: null,
+      }),
+      messages: [{
+        id: 'assistant-1',
+        role: 'assistant',
+        content: 'Partial reply',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'streaming',
+      }],
+    }} />);
+
+    expect(screen.getByText('This run is paused. Resume to continue or Stop to cancel it.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+
+    await waitFor(() => {
+      expect(mockResumeChatRun).toHaveBeenCalledWith('chat-123');
+    });
+    await waitFor(() => {
+      expect(mockStreamExistingChatRun).toHaveBeenCalledWith(
+        'chat-123',
+        'run-123',
+        expect.objectContaining({
+          onRunUpdated: expect.any(Function),
+          onDone: expect.any(Function),
+          onPaused: expect.any(Function),
+        }),
+      );
+    });
   });
 });

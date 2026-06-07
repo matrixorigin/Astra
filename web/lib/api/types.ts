@@ -149,7 +149,7 @@ export type QueueRunInputResponse = {
   };
 };
 
-export type StopRunResponse = {
+export type ActiveRunMutationResponse = {
   activeRun: {
     runId: string;
     status: string;

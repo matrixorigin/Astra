@@ -12,7 +12,7 @@ import { MoveChatModal } from '@/components/app/move-chat-modal';
 import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
-import { getChat, queueChatRunInput, stopChatRun, streamChatMessage, updateChatModel } from '@/lib/api/chats';
+import { getChat, queueChatRunInput, resumeChatRun, stopChatRun, streamChatMessage, streamExistingChatRun, updateChatModel } from '@/lib/api/chats';
 import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
@@ -21,6 +21,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [detail, setDetail] = useState(initial);
   const [moveOpen, setMoveOpen] = useState(false);
   const [startingRun, setStartingRun] = useState(false);
+  const [resumingRun, setResumingRun] = useState(false);
   const [stoppingRun, setStoppingRun] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
@@ -37,15 +38,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       && activeRunStatus !== 'paused'
       && activeRunStatus !== 'cancelling',
   );
+  const canResumeRun = Boolean(
+    detail.activeRun?.runId
+      && activeRunStatus === 'paused',
+  );
   const canStopRun = Boolean(
     detail.activeRun?.runId
       && activeRunStatus
-      && activeRunStatus !== 'paused'
       && activeRunStatus !== 'cancelling',
   );
-  const composerDisabled = startingRun || stoppingRun || activeRunStatus === 'paused' || activeRunStatus === 'cancelling';
+  const composerDisabled = startingRun || resumingRun || stoppingRun || activeRunStatus === 'paused' || activeRunStatus === 'cancelling';
   const composerPlaceholder = activeRunStatus === 'paused'
-    ? 'Run paused. Resume is not available in this UI yet.'
+    ? 'Run paused. Resume or stop it to continue.'
     : activeRunStatus === 'cancelling'
       ? 'Stopping current run...'
       : canQueueDeferredInput
@@ -178,6 +182,12 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             status: 'complete',
           });
         },
+        onPaused: (content) => {
+          patchAssistant({
+            content,
+            status: 'streaming',
+          });
+        },
       });
     } catch (error) {
       if (isAuthRequiredError(error)) {
@@ -272,6 +282,97 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       setStoppingRun(false);
     }
   }, [canStopRun, chatListHref, detail.activeRun?.runId, detail.chat.id, router]);
+
+  const resumeActiveRun = useCallback(async () => {
+    if (!detail.activeRun?.runId || !canResumeRun) {
+      return;
+    }
+    const assistantMessageId = [...detail.messages]
+      .reverse()
+      .find((message) => message.role === 'assistant')?.id;
+    setResumingRun(true);
+    try {
+      const result = await resumeChatRun(detail.chat.id);
+      setDetail((current) => ({
+        ...current,
+        activeRun: result.activeRun,
+      }));
+      if (!assistantMessageId) {
+        return;
+      }
+      const patchAssistant = (patch: Partial<ChatMessage>) => {
+        setDetail((current) => ({
+          ...current,
+          messages: current.messages.map((message) => (
+            message.id === assistantMessageId ? { ...message, ...patch } : message
+          )),
+        }));
+      };
+      await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+        onRunUpdated: (run) => {
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId: run.runId,
+              status: run.status,
+              waitingFor: run.waitingFor ?? null,
+            },
+          }));
+        },
+        onRunFinished: () => {
+          setStoppingRun(false);
+          setDetail((current) => ({
+            ...current,
+            activeRun: undefined,
+          }));
+        },
+        onReasoning: (reasoning) => {
+          patchAssistant({ reasoning, reasoningStatus: 'streaming', status: 'streaming' });
+        },
+        onReasoningDone: (reasoning) => {
+          patchAssistant({ reasoning, reasoningStatus: 'complete', status: 'streaming' });
+        },
+        onText: (content) => {
+          patchAssistant({ content, status: 'streaming' });
+        },
+        onArtifacts: (artifacts) => {
+          patchAssistant({ artifacts });
+        },
+        onDone: (content) => {
+          patchAssistant({
+            content: content || 'Astra completed the run without returning visible text.',
+            reasoningStatus: 'complete',
+            status: 'complete',
+          });
+        },
+        onCancelled: (content) => {
+          patchAssistant({
+            content: content || 'Stopped.',
+            reasoningStatus: 'complete',
+            status: 'complete',
+          });
+        },
+        onPaused: (content) => {
+          patchAssistant({
+            content,
+            status: 'streaming',
+          });
+        },
+      });
+    } catch (error) {
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+        return;
+      }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      window.alert(error instanceof Error ? error.message : 'Failed to resume the paused run.');
+    } finally {
+      setResumingRun(false);
+    }
+  }, [canResumeRun, chatListHref, detail.activeRun?.runId, detail.chat.id, detail.messages, router]);
 
   useEffect(() => {
     if (pinnedRef.current) {
@@ -438,19 +539,31 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                     {canQueueDeferredInput
                       ? 'New messages are queued after the next tool call. Use Stop to interrupt now.'
                       : activeRunStatus === 'paused'
-                        ? 'This run is paused. New input is disabled until it resumes or finishes.'
+                        ? 'This run is paused. Resume to continue or Stop to cancel it.'
                         : 'Stopping the current run. New input stays disabled until cancellation completes.'}
                   </p>
-                  {canStopRun ? (
-                    <button
-                      type="button"
-                      onClick={() => { void stopActiveRun(); }}
-                      disabled={stoppingRun}
-                      className="shrink-0 rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {stoppingRun ? 'Stopping...' : 'Stop'}
-                    </button>
-                  ) : null}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {canResumeRun ? (
+                      <button
+                        type="button"
+                        onClick={() => { void resumeActiveRun(); }}
+                        disabled={resumingRun || stoppingRun}
+                        className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {resumingRun ? 'Resuming...' : 'Resume'}
+                      </button>
+                    ) : null}
+                    {canStopRun ? (
+                      <button
+                        type="button"
+                        onClick={() => { void stopActiveRun(); }}
+                        disabled={stoppingRun || resumingRun}
+                        className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {stoppingRun ? 'Stopping...' : 'Stop'}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
               ) : null}
             </>

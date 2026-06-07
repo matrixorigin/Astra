@@ -9,7 +9,7 @@ import type {
   QueueRunInputResponse,
   SendMessageRequest,
   SendMessageResponse,
-  StopRunResponse,
+  ActiveRunMutationResponse,
 } from '@/lib/api/types';
 
 export function listChats(params: {
@@ -74,7 +74,13 @@ export function queueChatRunInput(chatId: string, payload: SendMessageRequest) {
 }
 
 export function stopChatRun(chatId: string) {
-  return requestJson<StopRunResponse>(`/api/chats/${encodeURIComponent(chatId)}/stop`, {
+  return requestJson<ActiveRunMutationResponse>(`/api/chats/${encodeURIComponent(chatId)}/stop`, {
+    method: 'POST',
+  });
+}
+
+export function resumeChatRun(chatId: string) {
+  return requestJson<ActiveRunMutationResponse>(`/api/chats/${encodeURIComponent(chatId)}/resume`, {
     method: 'POST',
   });
 }
@@ -89,6 +95,7 @@ export type ChatStreamHandlers = {
   onRunUpdated?: (run: { runId: string; status: string; waitingFor?: string | null }) => void;
   onRunFinished?: (run: { runId?: string; status: string; error?: string | null }) => void;
   onCancelled?: (text: string) => void;
+  onPaused?: (text: string) => void;
   onDone?: (text: string) => void;
 };
 
@@ -97,6 +104,7 @@ type ChatStreamState = {
   text: string;
   reasoning: string;
   cancelled?: boolean;
+  paused?: boolean;
   error?: string;
 };
 
@@ -248,11 +256,13 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
   }
 
   if (type === 'run_paused' && typeof event.run_id === 'string') {
+    state.paused = true;
     handlers.onRunUpdated?.({ runId: event.run_id, status: 'paused', waitingFor: null });
     return;
   }
 
   if (type === 'run_resumed' && typeof event.run_id === 'string') {
+    state.paused = false;
     handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
     return;
   }
@@ -307,20 +317,11 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
     if (status === 'failed') {
       state.error = typeof event.error === 'string' ? event.error : state.error ?? 'Astra run failed.';
     }
+    state.paused = false;
   }
 }
 
-export async function streamChatMessage(
-  chatId: string,
-  payload: SendMessageRequest,
-  handlers: ChatStreamHandlers,
-) {
-  const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-
+async function consumeChatStream(response: Response, handlers: ChatStreamHandlers) {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
@@ -375,8 +376,37 @@ export async function streamChatMessage(
     handlers.onCancelled?.(state.text);
     return state.text;
   }
+  if (state.paused) {
+    handlers.onPaused?.(state.text);
+    return state.text;
+  }
   handlers.onDone?.(state.text);
   return state.text;
+}
+
+export async function streamChatMessage(
+  chatId: string,
+  payload: SendMessageRequest,
+  handlers: ChatStreamHandlers,
+) {
+  const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return consumeChatStream(response, handlers);
+}
+
+export async function streamExistingChatRun(
+  chatId: string,
+  runId: string,
+  handlers: ChatStreamHandlers,
+) {
+  const response = await fetch(
+    `/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`,
+    { method: 'GET' },
+  );
+  return consumeChatStream(response, handlers);
 }
 
 export function updateChatProject(chatId: string, projectId: string | null) {

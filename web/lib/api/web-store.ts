@@ -652,6 +652,36 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
   };
 }
 
+export async function resumeActiveRun(ownerUserId: string, chatId: string) {
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  if (!chat.activeRun?.runId) {
+    throw new Error('No paused run is available to resume.');
+  }
+  if (chat.activeRun.status.trim().toLowerCase() !== 'paused') {
+    throw new Error('Only paused runs can be resumed.');
+  }
+
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `resume active run ${chat.activeRun.runId}`,
+  });
+
+  await client.sdk.resumeRun(chat.activeRun.runId);
+  chat.activeRun = {
+    runId: chat.activeRun.runId,
+    status: 'running',
+    waitingFor: null,
+  };
+
+  return {
+    activeRun: chat.activeRun,
+  };
+}
+
 export function updateStreamingAssistantMessage(ownerUserId: string, chatId: string, messageId: string, patch: {
   content?: string;
   reasoning?: string;
