@@ -67,8 +67,8 @@ use astra_turn_core::contracts::{
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
-    STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING,
 };
 
 use crate::orchestration::spawner::project_subrun_status_to_spawn;
@@ -2143,6 +2143,7 @@ fn build_run_turn_complete_event_with_interruption(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Running,
+    InputQueued,
     Paused,
     Waiting,
     Completed,
@@ -2154,6 +2155,7 @@ impl RunStatus {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Running => STATUS_RUNNING,
+            Self::InputQueued => STATUS_INPUT_QUEUED,
             Self::Paused => STATUS_PAUSED,
             Self::Waiting => STATUS_WAITING,
             Self::Completed => STATUS_COMPLETED,
@@ -2165,6 +2167,7 @@ impl RunStatus {
     fn from_durable_status(status: &str) -> Option<Self> {
         match durable_run_status_kind(status) {
             DurableRunStatusKind::Running => Some(Self::Running),
+            DurableRunStatusKind::InputQueued => Some(Self::InputQueued),
             DurableRunStatusKind::Paused => Some(Self::Paused),
             DurableRunStatusKind::Waiting => Some(Self::Waiting),
             DurableRunStatusKind::Completed => Some(Self::Completed),
@@ -2180,7 +2183,7 @@ impl RunStatus {
 
     fn blocks_session(&self, waiting_for: Option<&str>) -> bool {
         match self {
-            Self::Running | Self::Waiting => true,
+            Self::Running | Self::InputQueued | Self::Waiting => true,
             Self::Paused => waiting_for.is_some(),
             Self::Completed | Self::Failed | Self::Cancelled => false,
         }
@@ -2190,17 +2193,35 @@ impl RunStatus {
     ///
     /// Rules:
     /// - Terminal states (Completed, Failed, Cancelled) cannot transition to anything.
-    /// - Running → Paused, Waiting, Completed, Failed, Cancelled
+    /// - Running → InputQueued, Paused, Waiting, Completed, Failed, Cancelled
+    /// - InputQueued → Running, Paused, Waiting, Completed, Failed, Cancelled
     /// - Paused → Running, Cancelled, Failed
-    /// - Waiting → Running, Cancelled, Failed (external input resumes to Running)
+    /// - Waiting → InputQueued, Running, Cancelled, Failed (external input resumes to Running)
     pub fn try_transition(&self, next: &RunStatus) -> Result<(), String> {
         let allowed = match self {
             Self::Running => matches!(
                 next,
-                Self::Paused | Self::Waiting | Self::Completed | Self::Failed | Self::Cancelled
+                Self::InputQueued
+                    | Self::Paused
+                    | Self::Waiting
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Cancelled
+            ),
+            Self::InputQueued => matches!(
+                next,
+                Self::Running
+                    | Self::Paused
+                    | Self::Waiting
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Cancelled
             ),
             Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
-            Self::Waiting => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Waiting => matches!(
+                next,
+                Self::InputQueued | Self::Running | Self::Cancelled | Self::Failed
+            ),
             Self::Completed | Self::Failed | Self::Cancelled => false,
         };
         if allowed {
@@ -5172,7 +5193,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable_status = Self::run_status_from_durable(&durable.status)?;
         if matches!(
             durable_status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
         ) {
             return Err(Self::run_state_conflict("submit input to", &durable.status));
         }
@@ -5193,8 +5214,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|error| Self::durable_persist_error("input", error))?;
 
+        durable_status
+            .try_transition(&RunStatus::InputQueued)
+            .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
+        self.run_engine
+            .persist_status(&run_id, STATUS_INPUT_QUEUED, Some("user_input"), None)
+            .await
+            .map_err(|error| Self::durable_persist_error("input status", error))?;
+
         if let Some(run) = self.runs.write().await.get_mut(&run_id) {
             run.events.push(event);
+            run.status = RunStatus::InputQueued;
+            run.waiting_for = Some("user_input".to_string());
         }
 
         Ok(RunInputRecord {
@@ -8091,6 +8122,7 @@ mod tests {
     #[test]
     fn run_status_as_str() {
         assert_eq!(RunStatus::Running.as_str(), "running");
+        assert_eq!(RunStatus::InputQueued.as_str(), "input-queued");
         assert_eq!(RunStatus::Completed.as_str(), "completed");
         assert_eq!(RunStatus::Failed.as_str(), "failed");
         assert_eq!(RunStatus::Cancelled.as_str(), "cancelled");
@@ -8627,6 +8659,8 @@ mod tests {
         assert!(!first.duplicate);
         assert!(duplicate.duplicate);
         assert_eq!(matching_inputs, 1);
+        assert_eq!(durable.status, STATUS_INPUT_QUEUED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
     }
 
     #[tokio::test]
@@ -8645,6 +8679,32 @@ mod tests {
         let e = err(svc
             .submit_run_input(
                 "run-terminal-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-1".into(),
+                    input: json!({"answer": "late"}),
+                },
+            )
+            .await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_rejects_paused_durable_run() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-paused-input", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-paused-input", STATUS_PAUSED, None, None)
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .submit_run_input(
+                "run-paused-input".into(),
                 "user-1".into(),
                 RunInputData {
                     idempotency_key: "key-1".into(),
@@ -8958,13 +9018,21 @@ mod tests {
         use super::RunStatus::*;
 
         // Valid transitions
+        assert!(Running.try_transition(&InputQueued).is_ok());
         assert!(Running.try_transition(&Paused).is_ok());
         assert!(Running.try_transition(&Completed).is_ok());
         assert!(Running.try_transition(&Failed).is_ok());
         assert!(Running.try_transition(&Cancelled).is_ok());
+        assert!(InputQueued.try_transition(&Running).is_ok());
+        assert!(InputQueued.try_transition(&Paused).is_ok());
+        assert!(InputQueued.try_transition(&Waiting).is_ok());
+        assert!(InputQueued.try_transition(&Completed).is_ok());
+        assert!(InputQueued.try_transition(&Failed).is_ok());
+        assert!(InputQueued.try_transition(&Cancelled).is_ok());
         assert!(Paused.try_transition(&Running).is_ok());
         assert!(Paused.try_transition(&Cancelled).is_ok());
         assert!(Paused.try_transition(&Failed).is_ok());
+        assert!(Waiting.try_transition(&InputQueued).is_ok());
 
         // Terminal states cannot transition
         let err = Completed.try_transition(&Running);
@@ -8983,6 +9051,9 @@ mod tests {
         // Running cannot go back to Running
         let err = Running.try_transition(&Running);
         assert!(err.is_err(), "Running → Running must be rejected");
+
+        let err = InputQueued.try_transition(&InputQueued);
+        assert!(err.is_err(), "InputQueued → InputQueued must be rejected");
     }
 
     /// P1-F: list_runs pagination must be deterministic — all runs appear
@@ -9047,6 +9118,12 @@ mod tests {
         );
         // Waiting serializes as "waiting"
         assert_eq!(RunStatus::Waiting.as_str(), "waiting");
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::InputQueued)
+                .is_ok(),
+            "Waiting → InputQueued must be allowed when user input arrives"
+        );
     }
 
     #[test]
@@ -9054,6 +9131,10 @@ mod tests {
         assert_eq!(
             RunStatus::from_durable_status(STATUS_RUNNING),
             Some(RunStatus::Running)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_INPUT_QUEUED),
+            Some(RunStatus::InputQueued)
         );
         assert_eq!(
             RunStatus::from_durable_status(STATUS_WAITING),

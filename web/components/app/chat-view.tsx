@@ -20,7 +20,7 @@ function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === 'AbortError';
 }
 
-const QUEUEABLE_RUN_STATUSES = new Set(['running', 'waiting']);
+const QUEUEABLE_RUN_STATUSES = new Set(['running', 'input-queued', 'waiting']);
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
   const router = useRouter();
@@ -63,6 +63,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         : 'Reply to Astra...';
   const activeRunLabel = activeRunStatus === 'cancelling'
     ? 'Stopping current run'
+    : activeRunStatus === 'input-queued'
+      ? 'Input queued for next tool call'
     : detail.activeRun?.waitingFor
       ? `Waiting for ${detail.activeRun.waitingFor}`
       : detail.activeRun?.runId

@@ -688,6 +688,7 @@ pub struct MessagingState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredUserInput {
+    pub event_index: usize,
     pub content: String,
     pub queued_at_tool_generation: u64,
 }

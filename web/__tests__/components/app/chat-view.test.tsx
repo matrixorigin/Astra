@@ -227,6 +227,42 @@ describe('ChatView deferred-input unhappy paths', () => {
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
+  it('continues queueing follow-up input while the active run is input-queued', async () => {
+    const user = userEvent.setup();
+    mockQueueChatRunInput.mockResolvedValue({
+      userMessage: {
+        id: 'queued-user-1',
+        role: 'user',
+        content: 'queue this follow-up',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      },
+      activeRun: {
+        runId: 'run-123',
+        status: 'input-queued',
+        waitingFor: 'user_input',
+      },
+    });
+
+    render(<ChatView initial={makeDetail({
+      runId: 'run-123',
+      status: 'input-queued',
+      waitingFor: 'user_input',
+    })} />);
+
+    expect(screen.getByText(/Input queued for next tool call/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+
+    await waitFor(() => {
+      expect(mockQueueChatRunInput).toHaveBeenCalledWith('chat-123', {
+        content: 'queue this follow-up',
+        options: composerPayload.options,
+      });
+    });
+    expect(mockStreamChatMessage).not.toHaveBeenCalled();
+  });
+
   it('does not queue input for terminal active-run statuses', async () => {
     const user = userEvent.setup();
     mockStreamChatMessage.mockResolvedValue('new answer');

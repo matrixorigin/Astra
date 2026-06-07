@@ -72,6 +72,8 @@ impl RunInputProvider for LocalDeferredInputRunControl {
             inputs,
         }
     }
+
+    async fn mark_user_inputs_released(&self, _run_id: &str, _event_indices: &[usize]) {}
 }
 
 #[cfg(test)]

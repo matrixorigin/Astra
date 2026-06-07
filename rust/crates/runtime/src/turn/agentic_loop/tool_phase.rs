@@ -69,6 +69,7 @@ impl DeferredToolBoundaryTracker<'_> {
             };
             self.deferred_user_inputs
                 .push(super::host::DeferredUserInput {
+                    event_index: event.event_index,
                     content,
                     queued_at_tool_generation,
                 });
@@ -1790,6 +1791,8 @@ mod tests {
                     inputs: Vec::new(),
                 })
         }
+
+        async fn mark_user_inputs_released(&self, _run_id: &str, _event_indices: &[usize]) {}
     }
 
     fn summary_tool_record(
@@ -1827,6 +1830,7 @@ mod tests {
             inputs: Vec::new(),
         }]);
         let mut deferred_user_inputs = vec![super::super::host::DeferredUserInput {
+            event_index: 0,
             content: "already queued before this tool phase".to_string(),
             queued_at_tool_generation: 0,
         }];

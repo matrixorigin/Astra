@@ -47,7 +47,7 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    await queueDeferredRunInput('user-a', 'chat-1', {
+    const result = await queueDeferredRunInput('user-a', 'chat-1', {
       content: 'clear previous skill constraints',
       options: {
         webSearch: false,
@@ -63,6 +63,11 @@ describe('queueDeferredRunInput', () => {
         content: 'clear previous skill constraints',
         active_skills: [],
       },
+    });
+    expect(result?.activeRun).toEqual({
+      runId: 'run-1',
+      status: 'input-queued',
+      waitingFor: 'user_input',
     });
   });
 });

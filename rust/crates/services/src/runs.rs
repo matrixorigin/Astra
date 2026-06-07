@@ -1,6 +1,7 @@
 use astra_core::{
-    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response, error_response_coded,
+    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
+    error_response_coded,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -462,6 +463,7 @@ pub struct DurableRunRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurableRunStatusKind {
     Running,
+    InputQueued,
     Waiting,
     Paused,
     Completed,
@@ -473,6 +475,7 @@ pub enum DurableRunStatusKind {
 pub fn durable_run_status_kind(status: &str) -> DurableRunStatusKind {
     match status {
         STATUS_RUNNING => DurableRunStatusKind::Running,
+        STATUS_INPUT_QUEUED => DurableRunStatusKind::InputQueued,
         STATUS_WAITING => DurableRunStatusKind::Waiting,
         STATUS_PAUSED => DurableRunStatusKind::Paused,
         STATUS_COMPLETED => DurableRunStatusKind::Completed,
@@ -494,13 +497,15 @@ pub fn durable_run_status_is_terminal(status: &str) -> bool {
 pub fn durable_run_status_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
     matches!(
         durable_run_status_kind(status),
-        DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
+        DurableRunStatusKind::Running
+            | DurableRunStatusKind::InputQueued
+            | DurableRunStatusKind::Waiting
     ) || (durable_run_status_kind(status) == DurableRunStatusKind::Paused && waiting_for.is_some())
 }
 
 pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
     match durable_run_status_kind(status) {
-        DurableRunStatusKind::Running => SubRunState::Running,
+        DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued => SubRunState::Running,
         DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
         DurableRunStatusKind::Completed => SubRunState::Completed,
         DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
@@ -1076,7 +1081,12 @@ impl RunStateStore for InMemoryRunStateStore {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
-            .filter(|r| durable_run_status_kind(&r.status) == DurableRunStatusKind::Running)
+            .filter(|r| {
+                matches!(
+                    durable_run_status_kind(&r.status),
+                    DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued
+                )
+            })
             .cloned()
             .collect())
     }
@@ -2270,7 +2280,17 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        self.find_runs_by_status(STATUS_RUNNING).await
+        let rows =
+            sqlx::query("SELECT * FROM agent_runs WHERE status IN (?, ?) ORDER BY updated_at ASC")
+                .bind(STATUS_RUNNING)
+                .bind(STATUS_INPUT_QUEUED)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
     }
 
     async fn find_blocking_session_run(
@@ -2281,13 +2301,14 @@ impl RunStateStore for DatabaseRunStateStore {
         let row = sqlx::query(
             "SELECT * FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
-               AND (status IN (?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
+               AND (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
              ORDER BY updated_at DESC \
              LIMIT 1",
         )
         .bind(user_id)
         .bind(session_id)
         .bind(STATUS_RUNNING)
+        .bind(STATUS_INPUT_QUEUED)
         .bind(STATUS_WAITING)
         .bind(STATUS_PAUSED)
         .fetch_optional(self.pool.get())
@@ -2949,6 +2970,10 @@ mod tests {
             DurableRunStatusKind::Running
         );
         assert_eq!(
+            durable_run_status_kind(STATUS_INPUT_QUEUED),
+            DurableRunStatusKind::InputQueued
+        );
+        assert_eq!(
             durable_run_status_kind(STATUS_WAITING),
             DurableRunStatusKind::Waiting
         );
@@ -2977,10 +3002,12 @@ mod tests {
         assert!(durable_run_status_is_terminal(STATUS_FAILED));
         assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
         assert!(!durable_run_status_is_terminal(STATUS_RUNNING));
+        assert!(!durable_run_status_is_terminal(STATUS_INPUT_QUEUED));
         assert!(!durable_run_status_is_terminal(STATUS_WAITING));
         assert!(!durable_run_status_is_terminal(STATUS_PAUSED));
 
         assert!(durable_run_status_blocks_session(STATUS_RUNNING, None));
+        assert!(durable_run_status_blocks_session(STATUS_INPUT_QUEUED, None));
         assert!(durable_run_status_blocks_session(STATUS_WAITING, None));
         assert!(durable_run_status_blocks_session(
             STATUS_PAUSED,
@@ -2994,6 +3021,10 @@ mod tests {
         );
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_RUNNING),
+            SubRunState::Running
+        );
+        assert_eq!(
+            durable_run_status_to_subrun_state(STATUS_INPUT_QUEUED),
             SubRunState::Running
         );
         assert_eq!(

@@ -123,6 +123,9 @@ function activeRunPriority(run: {
   if (status === 'waiting') {
     return 3;
   }
+  if (status === 'input-queued') {
+    return 3;
+  }
   if (status === 'running') {
     return 2;
   }
@@ -618,6 +621,11 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
   }
+  chat.activeRun = {
+    runId: chat.activeRun.runId,
+    status: 'input-queued',
+    waitingFor: 'user_input',
+  };
 
   return {
     userMessage,

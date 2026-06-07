@@ -41,7 +41,9 @@ use astra_services::{
     },
 };
 
-use astra_core::{STATUS_CANCELLED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING};
+use astra_core::{
+    STATUS_CANCELLED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
+};
 
 /// Durable run execution engine.
 ///
@@ -551,6 +553,30 @@ impl RunInputProvider for RunEngine {
             inputs,
         }
     }
+
+    async fn mark_user_inputs_released(&self, run_id: &str, event_indices: &[usize]) {
+        if event_indices.is_empty() {
+            return;
+        }
+        let Ok(Some(run)) = self.store.load_run(run_id).await else {
+            return;
+        };
+        if run.status != STATUS_INPUT_QUEUED {
+            return;
+        }
+        if let Err(error) = self
+            .persist_status(run_id, STATUS_RUNNING, None, None)
+            .await
+        {
+            tracing::warn!(
+                target: "astra_runtime::run_engine",
+                %run_id,
+                ?event_indices,
+                error = %error,
+                "failed to clear input-queued status after releasing deferred input"
+            );
+        }
+    }
 }
 
 async fn has_graceful_resume_checkpoint(engine: &RunEngine, run: &DurableRunRecord) -> bool {
@@ -1004,6 +1030,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_user_inputs_released_clears_input_queued_status() {
+        let engine = test_engine();
+        engine
+            .start_run("run-queued", "user-1", "sess-queued")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-queued", STATUS_INPUT_QUEUED, Some("user_input"), None)
+            .await
+            .unwrap();
+
+        engine.mark_user_inputs_released("run-queued", &[1]).await;
+
+        let run = engine.load_run("run-queued").await.unwrap().unwrap();
+        assert_eq!(run.status, STATUS_RUNNING);
+        assert_eq!(run.waiting_for, None);
+    }
+
+    #[tokio::test]
     async fn list_user_runs_pagination() {
         let engine = test_engine();
         for i in 0..5 {
@@ -1251,6 +1296,37 @@ mod tests {
         assert_eq!(
             waiting.status, "waiting",
             "waiting run must remain waiting for resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_includes_input_queued_runs() {
+        let engine = test_engine();
+        engine
+            .start_run("run-input-queued", "user-1", "sess-queued")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-input-queued",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert!(
+            recovered.iter().any(|run| run.run_id == "run-input-queued"),
+            "input-queued runs must be part of active crash recovery"
+        );
+        let durable = engine.load_run("run-input-queued").await.unwrap().unwrap();
+        assert_eq!(durable.status, "failed");
+        assert_eq!(
+            durable.error_message.as_deref(),
+            Some("recovered from crash")
         );
     }
 }

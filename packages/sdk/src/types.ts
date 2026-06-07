@@ -435,7 +435,14 @@ export type ChatRequest = {
 export type RunStatus = {
   runId: string;
   sessionId: string;
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | string;
+  status:
+    | 'running'
+    | 'input-queued'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'paused'
+    | string;
   eventsCount: number;
   waitingFor?: string | null;
 };
