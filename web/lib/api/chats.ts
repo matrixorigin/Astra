@@ -12,13 +12,7 @@ import type {
   ActiveRunMutationResponse,
 } from '@/lib/api/types';
 
-export function listChats(params: {
-  projectId?: string | null;
-  q?: string;
-  cursor?: string | null;
-  limit?: number;
-  archived?: boolean;
-}) {
+export function listChats(params: { projectId?: string | null; q?: string; cursor?: string | null; limit?: number; archived?: boolean }) {
   return requestJson<ChatListResponse>(`/api/chats${toQuery(params)}`);
 }
 
@@ -92,6 +86,7 @@ export type ChatStreamHandlers = {
   onReasoning?: (reasoning: string) => void;
   onReasoningDone?: (reasoning: string) => void;
   onText?: (text: string) => void;
+  onSessionBound?: (session: { chatId?: string; sessionId: string }) => void;
   onRunStarted?: (runId: string) => void;
   onRunUpdated?: (run: { runId: string; status: string; waitingFor?: string | null }) => void;
   onRunFinished?: (run: { runId?: string; status: string; error?: string | null }) => void;
@@ -226,11 +221,7 @@ function applyAssistantText(rawText: string, state: ChatStreamState, handlers: C
 function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState, handlers: ChatStreamHandlers) {
   const type = typeof event.type === 'string' ? event.type : '';
 
-  if (
-    type === 'local_messages' &&
-    event.user_message &&
-    event.assistant_message
-  ) {
+  if (type === 'local_messages' && event.user_message && event.assistant_message) {
     handlers.onLocalMessages?.({
       userMessage: event.user_message as ChatMessage,
       assistantMessage: event.assistant_message as ChatMessage,
@@ -239,8 +230,19 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
   }
 
   if (type === 'session_info' && typeof event.run_id === 'string') {
+    if (typeof event.session_id === 'string') {
+      handlers.onSessionBound?.({ sessionId: event.session_id });
+    }
     handlers.onRunStarted?.(event.run_id);
     handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
+    return;
+  }
+
+  if (type === 'session_bound' && typeof event.session_id === 'string') {
+    handlers.onSessionBound?.({
+      chatId: typeof event.chat_id === 'string' ? event.chat_id : undefined,
+      sessionId: event.session_id,
+    });
     return;
   }
 
@@ -273,10 +275,7 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
     return;
   }
 
-  if (
-    (type === 'reasoning_delta' || type === 'thinking_delta' || type === 'reasoning_message_content') &&
-    typeof event.content === 'string'
-  ) {
+  if ((type === 'reasoning_delta' || type === 'thinking_delta' || type === 'reasoning_message_content') && typeof event.content === 'string') {
     state.reasoning = mergeTextDelta(state.reasoning, event.content);
     handlers.onReasoning?.(state.reasoning);
     return;
@@ -316,7 +315,7 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
       return;
     }
     if (status === 'failed') {
-      state.error = typeof event.error === 'string' ? event.error : state.error ?? 'Astra run failed.';
+      state.error = typeof event.error === 'string' ? event.error : (state.error ?? 'Astra run failed.');
     }
     state.paused = false;
   }
@@ -406,11 +405,7 @@ async function consumeChatStream(response: Response, handlers: ChatStreamHandler
   return state.text;
 }
 
-export async function streamChatMessage(
-  chatId: string,
-  payload: SendMessageRequest,
-  handlers: ChatStreamHandlers,
-) {
+export async function streamChatMessage(chatId: string, payload: SendMessageRequest, handlers: ChatStreamHandlers) {
   const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -420,15 +415,8 @@ export async function streamChatMessage(
   return consumeChatStream(response, handlers);
 }
 
-export async function streamExistingChatRun(
-  chatId: string,
-  runId: string,
-  handlers: ChatStreamHandlers,
-) {
-  const response = await fetch(
-    `/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`,
-    { method: 'GET', signal: handlers.signal },
-  );
+export async function streamExistingChatRun(chatId: string, runId: string, handlers: ChatStreamHandlers) {
+  const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`, { method: 'GET', signal: handlers.signal });
   return consumeChatStream(response, handlers);
 }
 

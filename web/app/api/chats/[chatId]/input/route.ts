@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
-import { getChat, queueDeferredRunInput } from "@/lib/api/web-store";
+import {
+  StaleDeferredRunError,
+  getChat,
+  queueDeferredRunInput,
+} from "@/lib/api/web-store";
 import type { SendMessageRequest } from "@/lib/api/types";
 import { RuntimeClientError } from "@/lib/runtime-client";
 
@@ -51,6 +55,9 @@ export async function POST(
     }
     return NextResponse.json(result);
   } catch (error) {
+    if (error instanceof StaleDeferredRunError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
     if (error instanceof RuntimeClientError && error.status) {
       return NextResponse.json(
         { error: error.detail },

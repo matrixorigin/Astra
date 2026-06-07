@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  AstraApiError,
   PATH_CHAT_STREAM,
   chatRunStreamPath,
   type RuntimeArtifactResponse,
@@ -8,6 +7,7 @@ import {
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   beginStreamingMessage,
+  ensureChatBackendSession,
   getChat,
   resolveBackendModelName,
   setChatActiveRun,
@@ -51,6 +51,28 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
     (left, right) => left.localeCompare(right),
   );
+}
+
+async function readSendMessageRequest(
+  request: NextRequest,
+  chat: ReturnType<typeof getChat>,
+) {
+  const rawBody = await request.text();
+  if (rawBody.trim()) {
+    try {
+      return JSON.parse(rawBody) as SendMessageRequest;
+    } catch {
+      return null;
+    }
+  }
+  if (!chat?.pendingTurn) {
+    return null;
+  }
+  return {
+    content: chat.pendingTurn.content,
+    options: chat.pendingTurn.options,
+    pendingMessageId: chat.pendingTurn.messageId,
+  } satisfies SendMessageRequest;
 }
 
 function stringField(value: unknown) {
@@ -222,8 +244,11 @@ async function readErrorDetail(response: Response) {
   return readRuntimeErrorDetail(response);
 }
 
-function isRuntimeSessionNotFound(error: unknown) {
-  return error instanceof AstraApiError && error.status === 404;
+function hasMessagesBeforePendingTurn(
+  chat: NonNullable<ReturnType<typeof getChat>>,
+) {
+  const pendingMessageId = chat.pendingTurn?.messageId;
+  return chat.messages.some((message) => message.id !== pendingMessageId);
 }
 
 function lastAssistantMessageId(messages: Array<{ id: string; role: string }>) {
@@ -236,12 +261,14 @@ function lastAssistantMessageId(messages: Array<{ id: string; role: string }>) {
 }
 
 function proxyRunStream(params: {
-  backendResponse: Response;
+  backendResponse:
+    | Response
+    | ((emit: (event: unknown) => void) => Promise<Response>);
   backendAbortController: AbortController;
   ownerUserId: string;
   chatId: string;
-  sessionId: string;
-  runtime: WebRuntimeClient;
+  sessionId: string | (() => string);
+  runtime: WebRuntimeClient | (() => Promise<WebRuntimeClient>);
   assistantMessageId: string;
   knownArtifactIds: Set<string>;
   localMessages?: {
@@ -260,6 +287,10 @@ function proxyRunStream(params: {
     knownArtifactIds,
     localMessages,
   } = params;
+  const currentSessionId =
+    typeof sessionId === "function" ? sessionId : () => sessionId;
+  const currentRuntime =
+    typeof runtime === "function" ? runtime : () => Promise.resolve(runtime);
 
   let assistantText = "";
   let assistantRawText = "";
@@ -271,20 +302,7 @@ function proxyRunStream(params: {
   let clientCancelled = false;
 
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const reader = backendResponse.body?.getReader();
-      if (!reader) {
-        controller.enqueue(
-          sseFrame({
-            type: "error",
-            message: "Astra stream body is unavailable.",
-          }),
-        );
-        controller.close();
-        return;
-      }
-      backendReader = reader;
-
+    start(controller) {
       if (localMessages) {
         controller.enqueue(
           sseFrame({
@@ -295,250 +313,79 @@ function proxyRunStream(params: {
         );
       }
 
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      const applyEvent = (event: Record<string, unknown>) => {
-        const type = typeof event.type === "string" ? event.type : "";
-        if (protocolError) {
-          return;
-        }
-
-        const applyAssistantText = (
-          rawText: string,
-          status: "streaming" | "complete" | "failed",
-        ) => {
-          const split = splitThinkingTags(rawText);
-          assistantText = split.visibleText;
-          if (split.hasThinking) {
-            reasoningText = split.reasoning;
-          }
-          updateStreamingAssistantMessage(
-            ownerUserId,
-            chatId,
-            assistantMessageId,
-            {
-              content: assistantText,
-              reasoning: reasoningText || undefined,
-              reasoningStatus: reasoningText
-                ? split.reasoningOpen
-                  ? "streaming"
-                  : "complete"
-                : status === "streaming"
-                  ? "streaming"
-                  : status === "complete"
-                    ? "complete"
-                    : undefined,
-              status,
-            },
-          );
-        };
-
-        if (type === "session_info" && typeof event.session_id === "string") {
-          if (event.session_id !== sessionId) {
-            const message = `Runtime returned session_id ${event.session_id}, but Web chat is bound to ${sessionId}.`;
-            protocolError = true;
-            assistantText = message;
-            lastStatus = "failed";
-            updateStreamingAssistantMessage(
-              ownerUserId,
-              chatId,
-              assistantMessageId,
-              {
-                content: message,
-                status: "failed",
-              },
-            );
-            controller.enqueue(sseFrame({ type: "error", message }));
-          }
-          if (typeof event.run_id === "string") {
-            setChatActiveRun(ownerUserId, chatId, {
-              runId: event.run_id,
-              status: "running",
-              waitingFor: null,
-            });
-          }
-          return;
-        }
-
-        if (type === "run_started" && typeof event.run_id === "string") {
-          runLifecycle = "running";
-          setChatActiveRun(ownerUserId, chatId, {
-            runId: event.run_id,
-            status: "running",
-            waitingFor: null,
-          });
-          return;
-        }
-
-        if (type === "run_paused" && typeof event.run_id === "string") {
-          runLifecycle = "paused";
-          setChatActiveRun(ownerUserId, chatId, {
-            runId: event.run_id,
-            status: "paused",
-            waitingFor: null,
-          });
-          return;
-        }
-
-        if (type === "run_resumed" && typeof event.run_id === "string") {
-          runLifecycle = "running";
-          setChatActiveRun(ownerUserId, chatId, {
-            runId: event.run_id,
-            status: "running",
-            waitingFor: null,
-          });
-          return;
-        }
-
-        if (type === "text_delta" && typeof event.content === "string") {
-          assistantRawText = mergeTextDelta(assistantRawText, event.content);
-          applyAssistantText(assistantRawText, "streaming");
-          return;
-        }
-
-        if (
-          (type === "reasoning_delta" ||
-            type === "thinking_delta" ||
-            type === "reasoning_message_content") &&
-          typeof event.content === "string"
-        ) {
-          reasoningText = mergeTextDelta(reasoningText, event.content);
-          updateStreamingAssistantMessage(
-            ownerUserId,
-            chatId,
-            assistantMessageId,
-            {
-              reasoning: reasoningText,
-              reasoningStatus: "streaming",
-              status: "streaming",
-            },
-          );
-          return;
-        }
-
-        if (type === "reasoning_done" || type === "thinking_done") {
-          updateStreamingAssistantMessage(
-            ownerUserId,
-            chatId,
-            assistantMessageId,
-            {
-              reasoning: reasoningText,
-              reasoningStatus: "complete",
-              status: "streaming",
-            },
-          );
-          return;
-        }
-
-        if (type === "text_done" && typeof event.full_text === "string") {
-          assistantRawText = event.full_text;
-          applyAssistantText(assistantRawText, "streaming");
-          return;
-        }
-
-        if (
-          type === "turn_complete" &&
-          typeof event.assistant_text === "string"
-        ) {
-          assistantRawText = event.assistant_text;
-          applyAssistantText(assistantRawText, lastStatus);
-          return;
-        }
-
-        if (type === "error") {
+      void (async () => {
+        let resolvedBackendResponse: Response;
+        try {
+          resolvedBackendResponse =
+            typeof backendResponse === "function"
+              ? await backendResponse((event) => {
+                  controller.enqueue(sseFrame(event));
+                })
+              : backendResponse;
+        } catch (error) {
           const message =
-            typeof event.message === "string"
-              ? event.message
-              : "Astra stream failed.";
-          assistantText = assistantText || message;
-          lastStatus = "failed";
+            error instanceof Error ? error.message : "Astra stream failed.";
           updateStreamingAssistantMessage(
             ownerUserId,
             chatId,
             assistantMessageId,
             {
-              content: assistantText,
+              content: message,
               status: "failed",
             },
           );
+          controller.enqueue(sseFrame({ type: "error", message }));
+          controller.close();
           return;
         }
-
-        if (type === "run_finished") {
-          const status =
-            typeof event.status === "string" ? event.status : "completed";
-          runLifecycle = "finished";
-          setChatActiveRun(ownerUserId, chatId, undefined);
-          if (status === "cancelled") {
-            assistantText = assistantText || "Stopped.";
-            lastStatus = "complete";
-          } else if (status === "failed") {
-            const message =
-              typeof event.error === "string" ? event.error : assistantText;
-            assistantText = message || assistantText;
-            lastStatus = "failed";
-          } else {
-            lastStatus = "complete";
-          }
+        if (!resolvedBackendResponse.ok || !resolvedBackendResponse.body) {
+          const detail = await readErrorDetail(resolvedBackendResponse);
           updateStreamingAssistantMessage(
             ownerUserId,
             chatId,
             assistantMessageId,
             {
-              content: assistantText,
-              reasoning: reasoningText || undefined,
-              reasoningStatus:
-                lastStatus === "complete"
-                  ? "complete"
-                  : reasoningText
-                    ? "complete"
-                    : undefined,
-              status: lastStatus,
+              content: detail,
+              status: "failed",
             },
           );
-        }
-      };
-
-      try {
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (clientCancelled) {
-            return;
-          }
-          if (done) {
-            break;
-          }
-          controller.enqueue(value);
-          buffer += decoder.decode(value, { stream: true });
-
-          const frames = buffer.split(/\r?\n\r?\n/);
-          buffer = frames.pop() ?? "";
-          for (const frame of frames) {
-            const event = eventFromSseFrame(frame);
-            if (event) {
-              applyEvent(event);
-            }
-          }
-        }
-
-        const tail = decoder.decode();
-        if (tail) {
-          buffer += tail;
-        }
-        if (buffer.trim()) {
-          const event = eventFromSseFrame(buffer);
-          if (event) {
-            applyEvent(event);
-          }
-        }
-
-        if (clientCancelled) {
+          controller.enqueue(sseFrame({ type: "error", message: detail }));
+          controller.close();
           return;
         }
 
-        if (lastStatus === "streaming") {
-          if (runLifecycle === "paused") {
+        const reader = resolvedBackendResponse.body.getReader();
+        if (!reader) {
+          controller.enqueue(
+            sseFrame({
+              type: "error",
+              message: "Astra stream body is unavailable.",
+            }),
+          );
+          controller.close();
+          return;
+        }
+        backendReader = reader;
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        const applyEvent = (event: Record<string, unknown>) => {
+          const type = typeof event.type === "string" ? event.type : "";
+          const expectedSessionId = currentSessionId();
+          if (protocolError) {
+            return;
+          }
+
+          const applyAssistantText = (
+            rawText: string,
+            status: "streaming" | "complete" | "failed",
+          ) => {
+            const split = splitThinkingTags(rawText);
+            assistantText = split.visibleText;
+            if (split.hasThinking) {
+              reasoningText = split.reasoning;
+            }
             updateStreamingAssistantMessage(
               ownerUserId,
               chatId,
@@ -546,70 +393,298 @@ function proxyRunStream(params: {
               {
                 content: assistantText,
                 reasoning: reasoningText || undefined,
-                reasoningStatus: reasoningText ? "streaming" : undefined,
-                status: "streaming",
+                reasoningStatus: reasoningText
+                  ? split.reasoningOpen
+                    ? "streaming"
+                    : "complete"
+                  : status === "streaming"
+                    ? "streaming"
+                    : status === "complete"
+                      ? "complete"
+                      : undefined,
+                status,
               },
             );
-          } else {
-            lastStatus = assistantText ? "complete" : "failed";
-            setChatActiveRun(ownerUserId, chatId, undefined);
+          };
+
+          if (type === "session_info" && typeof event.session_id === "string") {
+            if (event.session_id !== expectedSessionId) {
+              const message = `Runtime returned session_id ${event.session_id}, but Web chat is bound to ${expectedSessionId}.`;
+              protocolError = true;
+              assistantText = message;
+              lastStatus = "failed";
+              updateStreamingAssistantMessage(
+                ownerUserId,
+                chatId,
+                assistantMessageId,
+                {
+                  content: message,
+                  status: "failed",
+                },
+              );
+              controller.enqueue(sseFrame({ type: "error", message }));
+            }
+            if (typeof event.run_id === "string") {
+              setChatActiveRun(ownerUserId, chatId, {
+                runId: event.run_id,
+                status: "running",
+                waitingFor: null,
+              });
+            }
+            return;
+          }
+
+          if (type === "run_started" && typeof event.run_id === "string") {
+            runLifecycle = "running";
+            setChatActiveRun(ownerUserId, chatId, {
+              runId: event.run_id,
+              status: "running",
+              waitingFor: null,
+            });
+            return;
+          }
+
+          if (type === "run_paused" && typeof event.run_id === "string") {
+            runLifecycle = "paused";
+            setChatActiveRun(ownerUserId, chatId, {
+              runId: event.run_id,
+              status: "paused",
+              waitingFor: null,
+            });
+            return;
+          }
+
+          if (type === "run_resumed" && typeof event.run_id === "string") {
+            runLifecycle = "running";
+            setChatActiveRun(ownerUserId, chatId, {
+              runId: event.run_id,
+              status: "running",
+              waitingFor: null,
+            });
+            return;
+          }
+
+          if (type === "text_delta" && typeof event.content === "string") {
+            assistantRawText = mergeTextDelta(assistantRawText, event.content);
+            applyAssistantText(assistantRawText, "streaming");
+            return;
+          }
+
+          if (
+            (type === "reasoning_delta" ||
+              type === "thinking_delta" ||
+              type === "reasoning_message_content") &&
+            typeof event.content === "string"
+          ) {
+            reasoningText = mergeTextDelta(reasoningText, event.content);
             updateStreamingAssistantMessage(
               ownerUserId,
               chatId,
               assistantMessageId,
               {
-                content:
-                  assistantText ||
-                  "Astra completed the run without returning visible text.",
+                reasoning: reasoningText,
+                reasoningStatus: "streaming",
+                status: "streaming",
+              },
+            );
+            return;
+          }
+
+          if (type === "reasoning_done" || type === "thinking_done") {
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              {
+                reasoning: reasoningText,
+                reasoningStatus: "complete",
+                status: "streaming",
+              },
+            );
+            return;
+          }
+
+          if (type === "text_done" && typeof event.full_text === "string") {
+            assistantRawText = event.full_text;
+            applyAssistantText(assistantRawText, "streaming");
+            return;
+          }
+
+          if (
+            type === "turn_complete" &&
+            typeof event.assistant_text === "string"
+          ) {
+            assistantRawText = event.assistant_text;
+            applyAssistantText(assistantRawText, lastStatus);
+            return;
+          }
+
+          if (type === "error") {
+            const message =
+              typeof event.message === "string"
+                ? event.message
+                : "Astra stream failed.";
+            assistantText = assistantText || message;
+            lastStatus = "failed";
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              {
+                content: assistantText,
+                status: "failed",
+              },
+            );
+            return;
+          }
+
+          if (type === "run_finished") {
+            const status =
+              typeof event.status === "string" ? event.status : "completed";
+            runLifecycle = "finished";
+            setChatActiveRun(ownerUserId, chatId, undefined);
+            if (status === "cancelled") {
+              assistantText = assistantText || "Stopped.";
+              lastStatus = "complete";
+            } else if (status === "failed") {
+              const message =
+                typeof event.error === "string" ? event.error : assistantText;
+              assistantText = message || assistantText;
+              lastStatus = "failed";
+            } else {
+              lastStatus = "complete";
+            }
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              {
+                content: assistantText,
                 reasoning: reasoningText || undefined,
                 reasoningStatus:
-                  lastStatus === "complete" ? "complete" : undefined,
+                  lastStatus === "complete"
+                    ? "complete"
+                    : reasoningText
+                      ? "complete"
+                      : undefined,
                 status: lastStatus,
               },
             );
           }
-        }
+        };
 
-        if (lastStatus === "complete") {
-          const artifacts = (
-            await fetchSessionArtifacts(runtime, sessionId)
-          ).filter((artifact) => !knownArtifactIds.has(artifact.id));
-          if (artifacts.length > 0) {
-            updateStreamingAssistantMessage(
-              ownerUserId,
-              chatId,
-              assistantMessageId,
-              {
-                artifacts,
-              },
-            );
-            controller.enqueue(sseFrame({ type: "artifacts", artifacts }));
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (clientCancelled) {
+              return;
+            }
+            if (done) {
+              break;
+            }
+            controller.enqueue(value);
+            buffer += decoder.decode(value, { stream: true });
+
+            const frames = buffer.split(/\r?\n\r?\n/);
+            buffer = frames.pop() ?? "";
+            for (const frame of frames) {
+              const event = eventFromSseFrame(frame);
+              if (event) {
+                applyEvent(event);
+              }
+            }
+          }
+
+          const tail = decoder.decode();
+          if (tail) {
+            buffer += tail;
+          }
+          if (buffer.trim()) {
+            const event = eventFromSseFrame(buffer);
+            if (event) {
+              applyEvent(event);
+            }
+          }
+
+          if (clientCancelled) {
+            return;
+          }
+
+          if (lastStatus === "streaming") {
+            if (runLifecycle === "paused") {
+              updateStreamingAssistantMessage(
+                ownerUserId,
+                chatId,
+                assistantMessageId,
+                {
+                  content: assistantText,
+                  reasoning: reasoningText || undefined,
+                  reasoningStatus: reasoningText ? "streaming" : undefined,
+                  status: "streaming",
+                },
+              );
+            } else {
+              lastStatus = assistantText ? "complete" : "failed";
+              setChatActiveRun(ownerUserId, chatId, undefined);
+              updateStreamingAssistantMessage(
+                ownerUserId,
+                chatId,
+                assistantMessageId,
+                {
+                  content:
+                    assistantText ||
+                    "Astra completed the run without returning visible text.",
+                  reasoning: reasoningText || undefined,
+                  reasoningStatus:
+                    lastStatus === "complete" ? "complete" : undefined,
+                  status: lastStatus,
+                },
+              );
+            }
+          }
+
+          if (lastStatus === "complete") {
+            const runtimeClient = await currentRuntime();
+            const artifacts = (
+              await fetchSessionArtifacts(runtimeClient, currentSessionId())
+            ).filter((artifact) => !knownArtifactIds.has(artifact.id));
+            if (artifacts.length > 0) {
+              updateStreamingAssistantMessage(
+                ownerUserId,
+                chatId,
+                assistantMessageId,
+                {
+                  artifacts,
+                },
+              );
+              controller.enqueue(sseFrame({ type: "artifacts", artifacts }));
+            }
+          }
+        } catch (error) {
+          if (clientCancelled) {
+            return;
+          }
+          const message =
+            error instanceof Error ? error.message : "Astra stream failed.";
+          setChatActiveRun(ownerUserId, chatId, undefined);
+          updateStreamingAssistantMessage(
+            ownerUserId,
+            chatId,
+            assistantMessageId,
+            {
+              content: assistantText || message,
+              status: "failed",
+            },
+          );
+          controller.enqueue(sseFrame({ type: "error", message }));
+        } finally {
+          backendReader = null;
+          reader.releaseLock();
+          if (!clientCancelled) {
+            controller.close();
           }
         }
-      } catch (error) {
-        if (clientCancelled) {
-          return;
-        }
-        const message =
-          error instanceof Error ? error.message : "Astra stream failed.";
-        setChatActiveRun(ownerUserId, chatId, undefined);
-        updateStreamingAssistantMessage(
-          ownerUserId,
-          chatId,
-          assistantMessageId,
-          {
-            content: assistantText || message,
-            status: "failed",
-          },
-        );
-        controller.enqueue(sseFrame({ type: "error", message }));
-      } finally {
-        backendReader = null;
-        reader.releaseLock();
-        if (!clientCancelled) {
-          controller.close();
-        }
-      }
+      })();
     },
     async cancel() {
       clientCancelled = true;
@@ -637,11 +712,6 @@ export async function POST(
   }
   const ownerUserId = auth.user.user_id;
   const { chatId } = await context.params;
-  const body = (await request.json()) as SendMessageRequest;
-  if (!body.content?.trim()) {
-    return NextResponse.json({ error: "content is required" }, { status: 400 });
-  }
-
   const chat = getChat(ownerUserId, chatId);
   if (!chat) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
@@ -653,105 +723,89 @@ export async function POST(
     );
   }
 
-  let runtime: WebRuntimeClient;
-  try {
-    runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "stream web chat turn",
-    });
-  } catch {
-    return NextResponse.json({ error: "AUTH_REQUIRED" }, { status: 401 });
+  const body = await readSendMessageRequest(request, chat);
+  if (!body) {
+    return NextResponse.json(
+      { error: "invalid request body" },
+      { status: 400 },
+    );
+  }
+  if (!body.content?.trim()) {
+    return NextResponse.json({ error: "content is required" }, { status: 400 });
   }
 
-  // Run session validation and model resolution in parallel.
-  // Both are independent network calls that would otherwise serialize.
-  const [sessionResult, model] = await Promise.all([
-    runtime.sdk.getRuntimeSession(chatId).catch((error) => error),
-    resolveBackendModelName(runtime, body.options?.model),
-  ]);
-
-  if (sessionResult instanceof Error) {
-    const error = sessionResult;
-    if (isRuntimeSessionNotFound(error)) {
-      return NextResponse.json(
-        { error: `session not found: ${chatId}` },
-        { status: 404 },
-      );
-    }
-    const message =
-      error instanceof Error
-        ? error.message
-        : "Failed to verify runtime session.";
-    return NextResponse.json({ error: message }, { status: 502 });
-  }
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
-  const sessionId = chatId;
-  const hasPriorMessages = chat.messages.length > 0;
-  const knownArtifactIds = new Set<string>();
-  if (hasPriorMessages) {
-    try {
-      const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
-      for (const artifact of existingArtifacts) {
-        knownArtifactIds.add(artifact.id);
-      }
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to load artifacts.";
-      return NextResponse.json({ error: message }, { status: 502 });
-    }
-  }
+  let runtimeSessionId = chatId;
+  const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
 
   const started = beginStreamingMessage(ownerUserId, chatId, body);
   if (!started) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
   const backendAbortController = new AbortController();
-  const backendResponse = await runtime.fetchResponse(PATH_CHAT_STREAM, {
-    method: "POST",
-    auth: "required",
-    operation: "stream web chat turn",
-    signal: backendAbortController.signal,
-    json: {
-      message: body.content,
-      session_id: sessionId,
-      model,
-      allow_skills: activeSkills.length ? activeSkills : undefined,
-      context: {
-        source: "web_v1",
-        transport: "next_sse_proxy",
-        edge_profile: activeSkills.length
-          ? { active_skills: activeSkills }
-          : undefined,
-        thinking: body.options?.thinking
-          ? { mode: "adaptive", effort: "high" }
-          : { mode: "off" },
-      },
-    },
-  });
+  const knownArtifactIds = new Set<string>();
+  let runtimePromise: Promise<WebRuntimeClient> | undefined;
+  const getStreamRuntime = () => {
+    runtimePromise ??= requireRuntimeClient({
+      auth: "required",
+      operation: "stream web chat turn",
+    });
+    return runtimePromise;
+  };
 
-  if (!backendResponse.ok || !backendResponse.body) {
-    const detail = await readErrorDetail(backendResponse);
-    updateStreamingAssistantMessage(
-      ownerUserId,
-      chatId,
-      started.assistantMessage.id,
-      {
-        content: detail,
-        status: "failed",
-      },
-    );
-    return NextResponse.json(
-      { error: detail },
-      { status: backendResponse.status || 502 },
-    );
-  }
   return proxyRunStream({
-    backendResponse,
+    backendResponse: async (emit) => {
+      const runtime = await getStreamRuntime();
+      const [ensuredSessionId, model] = await Promise.all([
+        ensureChatBackendSession(ownerUserId, chatId, {
+          model: body.options?.model ?? chat.chat.model,
+          runtime,
+        }),
+        resolveBackendModelName(runtime, body.options?.model),
+      ]);
+      runtimeSessionId = ensuredSessionId;
+      emit({
+        type: "session_bound",
+        chat_id: chatId,
+        session_id: runtimeSessionId,
+      });
+      if (hasPriorMessages) {
+        const existingArtifacts = await fetchSessionArtifacts(
+          runtime,
+          runtimeSessionId,
+        );
+        for (const artifact of existingArtifacts) {
+          knownArtifactIds.add(artifact.id);
+        }
+      }
+      return runtime.fetchResponse(PATH_CHAT_STREAM, {
+        method: "POST",
+        auth: "required",
+        operation: "stream web chat turn",
+        signal: backendAbortController.signal,
+        json: {
+          message: body.content,
+          session_id: runtimeSessionId,
+          model,
+          allow_skills: activeSkills.length ? activeSkills : undefined,
+          context: {
+            source: "web_v1",
+            transport: "next_sse_proxy",
+            edge_profile: activeSkills.length
+              ? { active_skills: activeSkills }
+              : undefined,
+            thinking: body.options?.thinking
+              ? { mode: "adaptive", effort: "high" }
+              : { mode: "off" },
+          },
+        },
+      });
+    },
     backendAbortController,
     ownerUserId,
     chatId,
-    sessionId,
-    runtime,
+    sessionId: () => runtimeSessionId,
+    runtime: getStreamRuntime,
     assistantMessageId: started.assistantMessage.id,
     knownArtifactIds,
     localMessages: {
@@ -799,7 +853,7 @@ export async function GET(
     return NextResponse.json({ error: "AUTH_REQUIRED" }, { status: 401 });
   }
 
-  const sessionId = chatId;
+  const sessionId = chat.session?.backendSessionId ?? chatId;
   const knownArtifactIds = new Set<string>();
   try {
     const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
