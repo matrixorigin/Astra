@@ -677,13 +677,14 @@ pub struct DeferredUserInput {
     pub queued_at_tool_generation: u64,
 }
 
+pub(crate) struct StagedDeferredUserInputs {
+    pub(crate) inputs: Vec<Value>,
+    pub(crate) staged_count: usize,
+}
+
 impl DeferredInputState {
     pub fn deferred_user_input_cursor(&self) -> usize {
         self.deferred_user_input_cursor
-    }
-
-    pub fn set_deferred_user_input_cursor(&mut self, cursor: usize) {
-        self.deferred_user_input_cursor = cursor;
     }
 
     pub fn tool_call_generation(&self) -> u64 {
@@ -698,17 +699,36 @@ impl DeferredInputState {
         self.tool_call_generation = self.tool_call_generation.saturating_add(1);
     }
 
-    pub fn push_deferred_user_input(
+    pub(crate) fn stage_polled_user_inputs<F>(
         &mut self,
-        event_index: usize,
-        content: String,
+        poll: crate::turn::run_control::RunQueuedInputPoll,
         queued_at_tool_generation: u64,
-    ) {
-        self.deferred_user_inputs.push(DeferredUserInput {
-            event_index,
-            content,
-            queued_at_tool_generation,
-        });
+        mut content_from_input: F,
+    ) -> StagedDeferredUserInputs
+    where
+        F: FnMut(&Value) -> Option<String>,
+    {
+        self.deferred_user_input_cursor = poll.next_cursor;
+
+        let mut polled_inputs = Vec::new();
+        let mut staged_count = 0;
+        for event in poll.inputs {
+            polled_inputs.push(event.input.clone());
+            let Some(content) = content_from_input(&event.input) else {
+                continue;
+            };
+            self.deferred_user_inputs.push(DeferredUserInput {
+                event_index: event.event_index,
+                content,
+                queued_at_tool_generation,
+            });
+            staged_count += 1;
+        }
+
+        StagedDeferredUserInputs {
+            inputs: polled_inputs,
+            staged_count,
+        }
     }
 
     pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {
@@ -736,6 +756,20 @@ impl DeferredInputState {
     #[cfg(test)]
     pub fn set_tool_call_generation_for_test(&mut self, generation: u64) {
         self.tool_call_generation = generation;
+    }
+
+    #[cfg(test)]
+    pub fn push_deferred_user_input_for_test(
+        &mut self,
+        event_index: usize,
+        content: String,
+        queued_at_tool_generation: u64,
+    ) {
+        self.deferred_user_inputs.push(DeferredUserInput {
+            event_index,
+            content,
+            queued_at_tool_generation,
+        });
     }
 }
 
@@ -765,29 +799,12 @@ impl MessagingState {
         self.deferred_input.deferred_user_input_cursor()
     }
 
-    pub fn set_deferred_user_input_cursor(&mut self, cursor: usize) {
-        self.deferred_input.set_deferred_user_input_cursor(cursor);
-    }
-
     pub fn tool_call_generation(&self) -> u64 {
         self.deferred_input.tool_call_generation()
     }
 
     pub fn record_tool_boundary(&mut self) {
         self.deferred_input.record_tool_boundary();
-    }
-
-    pub fn push_deferred_user_input(
-        &mut self,
-        event_index: usize,
-        content: String,
-        queued_at_tool_generation: u64,
-    ) {
-        self.deferred_input.push_deferred_user_input(
-            event_index,
-            content,
-            queued_at_tool_generation,
-        );
     }
 
     pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {

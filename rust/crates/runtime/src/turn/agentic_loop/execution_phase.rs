@@ -149,25 +149,13 @@ pub(crate) async fn poll_and_stage_deferred_inputs(
             "deferred user input poll failed"
         );
     }
-    deferred_input.set_deferred_user_input_cursor(poll.next_cursor);
-
-    let mut polled_inputs = Vec::new();
-    let mut staged_count = 0;
-    for event in poll.inputs {
-        polled_inputs.push(event.input.clone());
-        let Some(content) = deferred_user_input_text(&event.input) else {
-            continue;
-        };
-        deferred_input.push_deferred_user_input(
-            event.event_index,
-            content,
-            queued_at_tool_generation,
-        );
-        staged_count += 1;
-    }
+    let staged =
+        deferred_input.stage_polled_user_inputs(poll, queued_at_tool_generation, |input| {
+            deferred_user_input_text(input)
+        });
     DeferredInputPollResult {
-        inputs: polled_inputs,
-        staged_count,
+        inputs: staged.inputs,
+        staged_count: staged.staged_count,
     }
 }
 
@@ -5010,11 +4998,14 @@ mod tests {
             .messaging
             .deferred_input
             .set_tool_call_generation_for_test(7);
-        state.messaging.push_deferred_user_input(
-            9,
-            "Stop tool work and answer directly.".to_string(),
-            7,
-        );
+        state
+            .messaging
+            .deferred_input
+            .push_deferred_user_input_for_test(
+                9,
+                "Stop tool work and answer directly.".to_string(),
+                7,
+            );
 
         observe_turn_end_without_tools(&mut state, 0, Instant::now(), None);
         let released = release_ready_deferred_user_inputs(&mut state);

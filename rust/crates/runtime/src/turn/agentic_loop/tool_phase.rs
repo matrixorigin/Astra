@@ -1820,7 +1820,7 @@ mod tests {
         }]);
         let mut deferred_input = DeferredInputState::default();
         deferred_input.set_tool_call_generation_for_test(1);
-        deferred_input.push_deferred_user_input(
+        deferred_input.push_deferred_user_input_for_test(
             0,
             "already queued before this tool phase".to_string(),
             0,
