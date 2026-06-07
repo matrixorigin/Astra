@@ -95,10 +95,10 @@ impl Footer {
             turn_active: self.is_turn_active,
             session_id: self.session_id.clone(),
             cost_usd: None,
-            // Use the cached lookup directly so the branch chip
-            // auto-refreshes every ~2 s — no need to wait for the
-            // next idle→active transition.
-            git_branch: detect_git_branch(),
+            // Prefer the cached field refreshed by `refresh_env()`,
+            // but fall back to a direct probe if the footer has not
+            // been initialized yet (useful for early renders/tests).
+            git_branch: self.git_branch.clone().or_else(detect_git_branch),
             pending_approvals: self.pending_approvals,
             task_counts: self.task_counts,
             task_board_expanded: self.task_board_expanded,
@@ -107,6 +107,13 @@ impl Footer {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let panel = crate::tui::style::composer_surface_style();
+        for y in area.y..area.y + area.height {
+            buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
+        }
         StatusLine::from_context(&self.to_context()).render(area, buf);
     }
 }

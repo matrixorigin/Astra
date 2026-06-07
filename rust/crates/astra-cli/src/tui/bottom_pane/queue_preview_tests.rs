@@ -18,6 +18,16 @@ fn render_text(pane: &BottomPane, area: Rect) -> String {
     out
 }
 
+fn snapshot_text(pane: &BottomPane, area: Rect) -> String {
+    render_text(pane, area)
+}
+
+fn seed_footer(pane: &mut BottomPane) {
+    pane.footer.model = Some("sonnet-4.6".into());
+    pane.footer.cwd = Some("~/github/astra".into());
+    pane.footer.git_branch = Some("enqueue_new_after_next_call".into());
+}
+
 #[test]
 fn active_turn_placeholder_explains_queue_vs_interrupt() {
     let mut pane = BottomPane::new();
@@ -70,5 +80,41 @@ fn narrow_active_composer_degrades_helper_without_losing_stop_hint() {
     assert!(
         rendered.contains("Ctrl+C stops"),
         "narrow helper should preserve the stop gesture; got {rendered:?}"
+    );
+}
+
+#[test]
+fn snapshot_idle_bottom_surface_80() {
+    let mut pane = BottomPane::new();
+    seed_footer(&mut pane);
+    crate::tui::testing::assert_tui_snapshot!(
+        "bottom_surface_idle_80",
+        snapshot_text(&pane, Rect::new(0, 0, 80, 4))
+    );
+}
+
+#[test]
+fn snapshot_active_bottom_surface_80() {
+    let mut pane = BottomPane::new();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    seed_footer(&mut pane);
+    crate::tui::testing::assert_tui_snapshot!(
+        "bottom_surface_active_80",
+        snapshot_text(&pane, Rect::new(0, 0, 80, 4))
+    );
+}
+
+#[test]
+fn snapshot_active_bottom_surface_narrow_42() {
+    let mut pane = BottomPane::new();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    seed_footer(&mut pane);
+    crate::tui::testing::assert_tui_snapshot!(
+        "bottom_surface_active_42",
+        snapshot_text(&pane, Rect::new(0, 0, 42, 4))
     );
 }

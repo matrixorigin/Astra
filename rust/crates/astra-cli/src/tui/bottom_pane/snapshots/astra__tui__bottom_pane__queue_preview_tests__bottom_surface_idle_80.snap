@@ -1,0 +1,8 @@
+---
+source: crates/astra-cli/src/tui/bottom_pane/queue_preview_tests.rs
+assertion_line: 90
+expression: "snapshot_text(&pane, Rect::new(0, 0, 80, 4))"
+---
+› Message astra                                                                 
+  Ctrl+E editor · Shift+Enter newline ──────────────────────────────────────────
+  default                 sonnet-4.6 · ~/github/astra · ⎇ enqueue_n…_next_call

@@ -275,28 +275,30 @@ impl StatusLine {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let sep = Span::styled(" · ", Style::default().fg(Color::Gray));
+        let surface = crate::tui::style::composer_surface_style();
+        let bg = surface.bg.unwrap_or(Color::Reset);
+        let sep = Span::styled(" · ", Style::default().fg(Color::Gray).bg(bg));
 
         let mut right_segments: &[Segment] = &self.right;
-        let mut right_spans = join_segments(right_segments, &sep, 0);
+        let mut right_spans = join_segments(right_segments, &sep, 0, bg);
 
         loop {
             let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
             let left_segments = truncate_left_segments_to_fit(&self.left, right_w, area.width);
-            let left_spans = join_segments(&left_segments, &sep, 2 /* leading indent */);
+            let left_spans = join_segments(&left_segments, &sep, 2 /* leading indent */, bg);
             let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
             let total = left_w + right_w + 2; // 2-char trailing margin
             if total <= area.width as usize || right_segments.is_empty() {
                 let padding = (area.width as usize).saturating_sub(left_w + right_w + 2);
                 let mut all = left_spans;
-                all.push(Span::raw(" ".repeat(padding)));
+                all.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
                 all.extend(right_spans);
                 Widget::render(Line::from(all), area, buf);
                 break;
             }
             // Drop the trailing right segment and retry.
             right_segments = &right_segments[..right_segments.len() - 1];
-            right_spans = join_segments(right_segments, &sep, 0);
+            right_spans = join_segments(right_segments, &sep, 0, bg);
         }
     }
 }
@@ -305,16 +307,20 @@ fn join_segments(
     segments: &[Segment],
     sep: &Span<'_>,
     leading_spaces: usize,
+    bg: Color,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2 + 1);
     if leading_spaces > 0 {
-        spans.push(Span::raw(" ".repeat(leading_spaces)));
+        spans.push(Span::styled(
+            " ".repeat(leading_spaces),
+            Style::default().bg(bg),
+        ));
     }
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(sep.content.to_string(), sep.style));
         }
-        spans.push(Span::styled(seg.text.clone(), seg.style));
+        spans.push(Span::styled(seg.text.clone(), seg.style.bg(bg)));
     }
     spans
 }
