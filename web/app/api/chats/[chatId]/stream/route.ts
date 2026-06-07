@@ -239,6 +239,8 @@ function proxyRunStream(params: {
   let lastStatus: 'streaming' | 'complete' | 'failed' = 'streaming';
   let protocolError = false;
   let runLifecycle: 'running' | 'paused' | 'finished' = 'running';
+  let backendReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let clientCancelled = false;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -248,6 +250,7 @@ function proxyRunStream(params: {
         controller.close();
         return;
       }
+      backendReader = reader;
 
       if (localMessages) {
         controller.enqueue(sseFrame({
@@ -408,6 +411,9 @@ function proxyRunStream(params: {
       try {
         for (;;) {
           const { value, done } = await reader.read();
+          if (clientCancelled) {
+            return;
+          }
           if (done) {
             break;
           }
@@ -433,6 +439,10 @@ function proxyRunStream(params: {
           if (event) {
             applyEvent(event);
           }
+        }
+
+        if (clientCancelled) {
+          return;
         }
 
         if (lastStatus === 'streaming') {
@@ -466,6 +476,9 @@ function proxyRunStream(params: {
           }
         }
       } catch (error) {
+        if (clientCancelled) {
+          return;
+        }
         const message = error instanceof Error ? error.message : 'Astra stream failed.';
         setChatActiveRun(ownerUserId, chatId, undefined);
         updateStreamingAssistantMessage(ownerUserId, chatId, assistantMessageId, {
@@ -474,9 +487,16 @@ function proxyRunStream(params: {
         });
         controller.enqueue(sseFrame({ type: 'error', message }));
       } finally {
+        backendReader = null;
         reader.releaseLock();
-        controller.close();
+        if (!clientCancelled) {
+          controller.close();
+        }
       }
+    },
+    async cancel() {
+      clientCancelled = true;
+      await backendReader?.cancel();
     },
   });
 
