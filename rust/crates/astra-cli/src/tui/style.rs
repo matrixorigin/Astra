@@ -49,7 +49,7 @@ fn user_message_bg(terminal_bg: (u8, u8, u8)) -> Color {
     } else {
         // Keep the panel visibly lighter than the terminal surface so
         // user turns read as deliberate cards rather than faint bands.
-        ((255, 255, 255), 0.30)
+        ((255, 255, 255), 0.42)
     };
     best_color(blend(top, terminal_bg, alpha))
 }

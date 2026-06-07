@@ -1,13 +1,13 @@
-//! Tool-invocation history cell — the `• Ran bash (42ms)` block.
+//! Tool-invocation history cell — the `• Bash · 42ms` block.
 //!
 //! Three visual states:
 //! - **Running** — accent bullet, shimmer title, elapsed from
 //!   construction `Instant`, optional Braille spinner+progress bar
 //!   if the tool has been running more than 3 s. Not persisted
 //!   until the final `complete()` call.
-//! - **Success** — green bullet, `Ran <name> (Xms)` title, optional
+//! - **Success** — green bullet, `<name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
-//! - **Failed** — red bullet, `Failed <name>`, otherwise identical
+//! - **Failed** — red bullet, `<name> failed · Xms`, otherwise identical
 //!   to Success.
 //!
 //! Diff-looking output summaries (lines starting with `+` or `-`)
@@ -198,9 +198,24 @@ impl ToolCell {
 
     fn title_text(&self) -> &'static str {
         match self.status {
-            ToolStatus::Running => "Running",
-            ToolStatus::Success => "Ran",
-            ToolStatus::Failed => "Failed",
+            ToolStatus::Running => "running",
+            ToolStatus::Success => "done",
+            ToolStatus::Failed => "failed",
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self.name.as_str() {
+            "bash" => "Bash".into(),
+            "read" | "read_file" => "Read".into(),
+            "write_file" => "Write file".into(),
+            "str_replace" => "Replace text".into(),
+            "grep" | "glob" => "Search".into(),
+            "list_dir" => "List directory".into(),
+            "task" => "Task".into(),
+            "memory" => "Memory".into(),
+            "tool_search" => "Tool search".into(),
+            _ => humanize_tool_name(&self.name),
         }
     }
 
@@ -300,22 +315,22 @@ impl HistoryCell for ToolCell {
         let dim = Style::default().dim();
         let w = width as usize;
 
+        let label = self.display_name();
         let header = if self.status == ToolStatus::Running {
-            let text = format!(
-                "{} {} ({})",
-                self.title_text(),
-                self.name,
-                self.elapsed_str()
-            );
+            let text = format!("{label} · {}", self.elapsed_str());
             let mut spans = vec![self.bullet()];
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
+            let status_meta = if self.status == ToolStatus::Failed {
+                format!("{} · {}", self.title_text(), self.elapsed_str())
+            } else {
+                self.elapsed_str()
+            };
             Line::from(vec![
                 self.bullet(),
-                Span::styled(format!("{} ", self.title_text()), Style::default().bold()),
-                Span::raw(self.name.clone()),
-                Span::styled(format!(" ({})", self.elapsed_str()), dim),
+                Span::styled(label, Style::default().bold()),
+                Span::styled(format!(" · {status_meta}"), dim),
             ])
         };
 
@@ -454,6 +469,25 @@ fn truncate_by_width(s: &str, max_width: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+fn humanize_tool_name(name: &str) -> String {
+    let mut out = String::new();
+    for (i, part) in name.split('_').filter(|part| !part.is_empty()).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            out.extend(chars);
+        }
+    }
+    if out.is_empty() {
+        name.to_string()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,11 +588,11 @@ mod tests {
     // ── Render ───────────────────────────────────────────────────
 
     #[test]
-    fn success_header_has_ran_prefix() {
+    fn success_header_uses_compact_title_and_meta() {
         let t = ok_tool("bash", "ls /tmp", 42);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Ran bash"), "unexpected header: {out}");
-        assert!(out.contains("(42ms)"));
+        assert!(out.contains("• Bash"), "unexpected header: {out}");
+        assert!(out.contains("· 42ms"));
         assert!(out.contains("│ ls /tmp"));
     }
 
@@ -566,14 +600,14 @@ mod tests {
     fn failed_header_is_red_and_says_failed() {
         let t = err_tool("bash", "false", 10);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Failed bash"));
+        assert!(out.contains("• Bash · failed · 10ms"));
     }
 
     #[test]
     fn seconds_formatting_kicks_in_above_1s() {
         let t = ok_tool("build", "cargo build", 2500);
         let out = render(&t, 80, 2);
-        assert!(out.contains("(2.5s)"), "sub-second boundary wrong: {out}");
+        assert!(out.contains("· 2.5s"), "sub-second boundary wrong: {out}");
     }
 
     #[test]
@@ -598,7 +632,7 @@ mod tests {
         t.output_summary = Some("line-1\x1b[2J\nline-2\u{009b}1m".into());
 
         let out = render(&t, 100, 6);
-        assert!(out.contains("bash"));
+        assert!(out.contains("Bash"));
         assert!(out.contains("boom\tok"));
         assert!(out.contains("line-1"));
         assert!(out.contains("line-2"));

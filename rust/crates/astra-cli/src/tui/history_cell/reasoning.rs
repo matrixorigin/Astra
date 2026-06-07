@@ -3,12 +3,12 @@
 //!
 //! While streaming: a fixed-height scrolling preview window so the
 //! composer stays visible. After completion: collapses to a one-line
-//! header (`💭 Thought for Xs (N lines)`) — not a framed window or
+//! header (`Thought · 3s · 2 lines`) — not a framed window or
 //! expanding pill. A reasoning cell is just another cell in the
 //! scrollback; toggle visibility lives in ChatWidget, not here.
 //!
 //! Duration is captured at `finalize()` and rendered in the
-//! header (`(3s)`). Persists as [`TurnEvent::Thinking`].
+//! header (`· 3s`). Persists as [`TurnEvent::Thinking`].
 
 use std::any::Any;
 use std::time::{Duration, Instant};
@@ -129,11 +129,12 @@ impl HistoryCell for ReasoningCell {
         }
 
         let dim_italic = Style::default()
+            .fg(crate::tui::theme::current().dim)
             .add_modifier(Modifier::DIM)
             .add_modifier(Modifier::ITALIC);
 
-        // Done thinking → collapse to header only (`💭 Thought for
-        // 22s (45 lines)`). A 20-second reasoning blob is ~40+
+        // Done thinking → collapse to header only (`Thought ·
+        // 22s · 45 lines`). A 20-second reasoning blob is ~40+
         // wrapped rows of dim prose; scrollback-dumping all of it
         // crowds out the actual answer below. Collapse to a one-line
         // header; users who want the detail can inspect the persisted
@@ -143,8 +144,8 @@ impl HistoryCell for ReasoningCell {
         let line_count = self.text.lines().count();
         let header_text = if self.live {
             match self.duration_label() {
-                Some(d) => format!("💭 Thinking ({d})"),
-                None => "💭 Thinking…".to_string(),
+                Some(d) => format!("Thinking · {d}"),
+                None => "Thinking".to_string(),
             }
         } else {
             let count_label = if line_count == 1 {
@@ -153,8 +154,8 @@ impl HistoryCell for ReasoningCell {
                 format!("{line_count} lines")
             };
             match self.duration_label() {
-                Some(d) => format!("💭 Thought for {d} ({count_label})"),
-                None => format!("💭 Thought ({count_label})"),
+                Some(d) => format!("Thought · {d} · {count_label}"),
+                None => format!("Thought · {count_label}"),
             }
         };
 
@@ -311,15 +312,10 @@ mod tests {
 
     #[test]
     fn live_header_says_thinking() {
-        // Note: the `💭` emoji is a 2-display-cell grapheme; the
-        // test backend shows it with a trailing space cell, so the
-        // visible text is `💭  Thinking` (two spaces). Match the
-        // informative substring rather than the exact glyph layout.
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("draft");
         let out = render(&c, 60, 3);
         assert!(out.contains("Thinking"), "missing Thinking header: {out}");
-        assert!(out.contains("💭"), "missing emoji: {out}");
     }
 
     #[test]
@@ -329,7 +325,7 @@ mod tests {
         c.started_at = Some(Instant::now() - Duration::from_secs(3));
         c.finalize();
         let out = render(&c, 60, 3);
-        assert!(out.contains("Thought for"), "missing header: {out}");
+        assert!(out.contains("Thought ·"), "missing header: {out}");
         assert!(out.contains("3s"), "missing duration: {out}");
     }
 
@@ -347,7 +343,7 @@ mod tests {
     fn live_body_rows_are_indented_under_bullet() {
         // Live cells render their body so the user sees progress
         // during long thinks. Each body row is indented under the
-        // `💭 ` bullet for visual alignment. Finalised cells collapse
+        // header for visual alignment. Finalised cells collapse
         // and have no body rows at all — see `finalised_cell_hides_body`.
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("first thought\nsecond thought");
@@ -438,7 +434,7 @@ mod tests {
     #[test]
     fn finalised_cell_hides_body_and_shows_line_count() {
         // Once thinking is done, scrollback shows only the compact
-        // header `💭 Thought for Xs (N lines)` — not the 20-40 row
+        // header `Thought · Xs · N lines` — not the 20-40 row
         // dim-italic wall. The count cues the user that there's
         // substance behind the header without dumping it on-screen.
         // (The full text stays in the JSONL transcript for later.)
@@ -447,7 +443,7 @@ mod tests {
         c.started_at = Some(Instant::now() - Duration::from_secs(3));
         c.finalize();
         let out = render(&c, 60, 4);
-        assert!(out.contains("Thought for"), "header missing: {out}");
+        assert!(out.contains("Thought ·"), "header missing: {out}");
         assert!(out.contains("3 lines"), "line count missing: {out}");
         assert!(
             !out.contains("line one"),

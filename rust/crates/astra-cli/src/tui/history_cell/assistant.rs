@@ -30,7 +30,7 @@
 //!   demonstrated the failure mode without this: 60-second-long
 //!   thinks would show as raw `<think>The user is asking…` text.
 //! - **After `</think>`** — collapsed to a one-line
-//!   `✻ Thought (N lines)` dim header; the body markdown starts
+//!   `Thought · N lines` dim header; the body markdown starts
 //!   immediately under it.
 //!
 //! Thinking content stays in `source` and is persisted unchanged
@@ -259,7 +259,7 @@ impl HistoryCell for AssistantCell {
         }
 
         // Branch 3: <think> closed. Collapse to a one-line
-        // `✻ Thought (N lines)` header, then render the body.
+        // `Thought · N lines` header, then render the body.
         let think_lines = think.trim().lines().count().max(1);
         let mut out = thought_header_lines(think_lines);
         out.extend(render_body_with_gutter(body, width, self.live, rate_suffix));
@@ -430,22 +430,25 @@ fn render_body_with_gutter(
 /// Collapsed one-line header shown in place of a `<think>` block
 /// once the closing tag has arrived.
 ///
-/// Example: `  ✻ Thought (12 lines)`
+/// Example: `  Thought · 12 lines`
 fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let dim = Style::default()
+        .fg(crate::tui::theme::current().dim)
+        .add_modifier(Modifier::DIM);
     let label = if line_count == 1 {
-        "Thought (1 line)".to_string()
+        "1 line".to_string()
     } else {
-        format!("Thought ({line_count} lines)")
+        format!("{line_count} lines")
     };
     vec![Line::from(vec![
         Span::raw("  "),
-        Span::styled("✻ ", dim),
+        Span::styled("Thought", dim),
+        Span::styled(" · ", dim),
         Span::styled(label, dim),
     ])]
 }
 
-/// Max body rows shown beneath the `✻ Thinking…` header while the
+/// Max body rows shown beneath the `Thinking` header while the
 /// `<think>` block is open. Mirrors `ReasoningCell::LIVE_PREVIEW_MAX_ROWS`:
 /// once the window fills, the oldest row scrolls off and a
 /// `⋯ +N more` counter takes the top slot, so the preview stays
@@ -454,22 +457,22 @@ fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
 const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 6;
 
 /// While `<think>` is open and the model is still streaming, show a
-/// shimmering "Thinking…" header plus a fixed-height scrolling
+/// shimmering `Thinking` header plus a fixed-height scrolling
 /// preview of the latest thinking content. Matches `ReasoningCell`'s
 /// live-preview grammar so the two paths (inline `<think>` vs.
 /// provider reasoning channel) feel consistent to the user. Full
 /// thinking body stays hidden — once `</think>` arrives this whole
-/// block collapses to a one-line `✻ Thought (N lines)` header.
+/// block collapses to a one-line `Thought · N lines` header.
 fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     let dim_italic = Style::default()
+        .fg(crate::tui::theme::current().dim)
         .add_modifier(Modifier::DIM)
         .add_modifier(Modifier::ITALIC);
 
     // Header line — shimmered so there's a visible "still working"
     // cue even if the preview body happens to be empty for a tick.
     let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-    header_spans.push(Span::styled("✻ ", dim_italic));
-    header_spans.extend(crate::tui::shimmer::shimmer_spans("Thinking…"));
+    header_spans.extend(crate::tui::shimmer::shimmer_spans("Thinking"));
     let mut out = vec![Line::from(header_spans)];
 
     // Soft-wrap the partial thinking content, then render the most
@@ -727,7 +730,7 @@ mod tests {
             "think INNER content must be hidden once closed: {out}"
         );
         assert!(
-            out.contains("Thought (2 lines)"),
+            out.contains("Thought · 2 lines"),
             "collapsed header missing: {out}"
         );
         assert!(out.contains("I am Astra"), "body missing: {out}");
@@ -738,7 +741,7 @@ mod tests {
         let c = AssistantCell::from_markdown("<think>just one</think>\n\nbody");
         let out = render(&c, 60, 3);
         assert!(
-            out.contains("Thought (1 line)"),
+            out.contains("Thought · 1 line"),
             "singular form for one-line think: {out}"
         );
     }
@@ -759,7 +762,7 @@ mod tests {
     #[test]
     fn streaming_think_shows_indicator_and_recent_lines() {
         // While the `<think>` block is still open we show
-        // `✻ Thinking…` plus a scrolling preview of the latest
+        // `Thinking` plus a scrolling preview of the latest
         // rows of internal monologue (see `LIVE_THINK_PREVIEW_MAX_ROWS`).
         // With only two lines of content, the whole body fits in
         // the preview window — no overflow counter, both rows
@@ -767,7 +770,7 @@ mod tests {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("<think>\nstep one\nstep two in progres");
         let out = render(&c, 80, 5);
-        assert!(out.contains("Thinking…"), "live indicator missing: {out}");
+        assert!(out.contains("Thinking"), "live indicator missing: {out}");
         assert!(
             out.contains("step two in progres"),
             "latest thinking line missing: {out}"
@@ -814,7 +817,7 @@ mod tests {
         c.push_delta("<think>one\ntwo\nthree</think>\n\nanswer");
         let out = render(&c, 60, 5);
         assert!(
-            out.contains("Thought (3 lines)"),
+            out.contains("Thought · 3 lines"),
             "collapsed header with line count: {out}"
         );
         assert!(out.contains("answer"), "body still visible: {out}");

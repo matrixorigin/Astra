@@ -1,6 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/user.rs
-assertion_line: 239
+assertion_line: 236
 expression: "render_cell(&cell, 40, 3)"
 ---
-› rebuild the index
+
+> rebuild the index
