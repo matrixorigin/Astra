@@ -658,6 +658,73 @@ pub struct StallTrackingState {
     pub guardrail_tuner_records_cursor: usize,
 }
 
+#[derive(Default)]
+pub struct DeferredInputState {
+    /// Deferred user-input events submitted while the run is still active.
+    /// The execution phase releases entries only after a later tool-call round
+    /// completes.
+    pub deferred_user_inputs: Vec<DeferredUserInput>,
+    /// Durable event cursor for deferred user-input polling.
+    pub deferred_user_input_cursor: usize,
+    /// Monotonic count of completed tool-call rounds observed by this run.
+    pub tool_call_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredUserInput {
+    pub event_index: usize,
+    pub content: String,
+    pub queued_at_tool_generation: u64,
+}
+
+impl DeferredInputState {
+    pub fn deferred_user_input_cursor(&self) -> usize {
+        self.deferred_user_input_cursor
+    }
+
+    pub fn set_deferred_user_input_cursor(&mut self, cursor: usize) {
+        self.deferred_user_input_cursor = cursor;
+    }
+
+    pub fn tool_call_generation(&self) -> u64 {
+        self.tool_call_generation
+    }
+
+    pub fn record_tool_boundary(&mut self) {
+        self.tool_call_generation = self.tool_call_generation.saturating_add(1);
+    }
+
+    pub fn push_deferred_user_input(
+        &mut self,
+        event_index: usize,
+        content: String,
+        queued_at_tool_generation: u64,
+    ) {
+        self.deferred_user_inputs.push(DeferredUserInput {
+            event_index,
+            content,
+            queued_at_tool_generation,
+        });
+    }
+
+    pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {
+        let current_generation = self.tool_call_generation;
+        let mut pending = Vec::new();
+        let mut ready = Vec::new();
+
+        for entry in std::mem::take(&mut self.deferred_user_inputs) {
+            if current_generation > entry.queued_at_tool_generation {
+                ready.push(entry);
+            } else {
+                pending.push(entry);
+            }
+        }
+
+        self.deferred_user_inputs = pending;
+        ready
+    }
+}
+
 /// Inter-agent messaging state for the agentic loop.
 #[derive(Default)]
 pub struct MessagingState {
@@ -676,21 +743,42 @@ pub struct MessagingState {
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
-    /// Deferred user-input events submitted while the run is still active.
-    /// The execution phase releases entries only after a later tool-call round
-    /// completes.
-    pub deferred_user_inputs: Vec<DeferredUserInput>,
-    /// Durable event cursor for deferred user-input polling.
-    pub deferred_user_input_cursor: usize,
-    /// Monotonic count of completed tool-call rounds observed by this run.
-    pub tool_call_generation: u64,
+    pub deferred_input: DeferredInputState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeferredUserInput {
-    pub event_index: usize,
-    pub content: String,
-    pub queued_at_tool_generation: u64,
+impl MessagingState {
+    pub fn deferred_user_input_cursor(&self) -> usize {
+        self.deferred_input.deferred_user_input_cursor()
+    }
+
+    pub fn set_deferred_user_input_cursor(&mut self, cursor: usize) {
+        self.deferred_input.set_deferred_user_input_cursor(cursor);
+    }
+
+    pub fn tool_call_generation(&self) -> u64 {
+        self.deferred_input.tool_call_generation()
+    }
+
+    pub fn record_tool_boundary(&mut self) {
+        self.deferred_input.record_tool_boundary();
+    }
+
+    pub fn push_deferred_user_input(
+        &mut self,
+        event_index: usize,
+        content: String,
+        queued_at_tool_generation: u64,
+    ) {
+        self.deferred_input.push_deferred_user_input(
+            event_index,
+            content,
+            queued_at_tool_generation,
+        );
+    }
+
+    pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {
+        self.deferred_input.release_ready_deferred_user_inputs()
+    }
 }
 
 /// Point-in-time summary of the active session task board.

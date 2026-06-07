@@ -25,8 +25,8 @@ use super::execution_phase::{
 };
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
-    record_edge_tool_observability,
+    DeferredInputState, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
+    finalize_turn_trace, record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use astra_turn_core::agentic_post_tool_policy::{
@@ -46,20 +46,21 @@ pub(crate) enum TurnToolPhaseControl {
 struct DeferredToolBoundaryTracker<'a> {
     run_control: &'a dyn crate::turn::run_control::RunControlProvider,
     run_id: &'a str,
-    deferred_user_inputs: &'a mut Vec<super::host::DeferredUserInput>,
-    deferred_user_input_cursor: &'a mut usize,
-    tool_call_generation: &'a mut u64,
+    deferred_input: &'a mut DeferredInputState,
     collected_inputs: Vec<Value>,
     should_yield_to_deferred_input: bool,
 }
 
 impl DeferredToolBoundaryTracker<'_> {
     async fn on_completed_tool_boundary(&mut self) -> bool {
-        let queued_at_tool_generation = *self.tool_call_generation;
+        let queued_at_tool_generation = self.deferred_input.tool_call_generation();
         let mut ready_new_input_seen = false;
         let poll = self
             .run_control
-            .poll_user_inputs(self.run_id, *self.deferred_user_input_cursor)
+            .poll_user_inputs(
+                self.run_id,
+                self.deferred_input.deferred_user_input_cursor(),
+            )
             .await;
         if let Some(error) = &poll.error {
             tracing::warn!(
@@ -68,21 +69,21 @@ impl DeferredToolBoundaryTracker<'_> {
                 "deferred user input poll failed during tool boundary"
             );
         }
-        *self.deferred_user_input_cursor = poll.next_cursor;
+        self.deferred_input
+            .set_deferred_user_input_cursor(poll.next_cursor);
         for event in poll.inputs {
             self.collected_inputs.push(event.input.clone());
             let Some(content) = deferred_user_input_text(&event.input) else {
                 continue;
             };
-            self.deferred_user_inputs
-                .push(super::host::DeferredUserInput {
-                    event_index: event.event_index,
-                    content,
-                    queued_at_tool_generation,
-                });
+            self.deferred_input.push_deferred_user_input(
+                event.event_index,
+                content,
+                queued_at_tool_generation,
+            );
             ready_new_input_seen = true;
         }
-        *self.tool_call_generation = self.tool_call_generation.saturating_add(1);
+        self.deferred_input.record_tool_boundary();
         if ready_new_input_seen {
             self.should_yield_to_deferred_input = true;
         }
@@ -1063,9 +1064,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         (Some(run_control), Some(run_id)) => Some(DeferredToolBoundaryTracker {
             run_control,
             run_id,
-            deferred_user_inputs: &mut state.messaging.deferred_user_inputs,
-            deferred_user_input_cursor: &mut state.messaging.deferred_user_input_cursor,
-            tool_call_generation: &mut state.messaging.tool_call_generation,
+            deferred_input: &mut state.messaging.deferred_input,
             collected_inputs: Vec::new(),
             should_yield_to_deferred_input: false,
         }),
@@ -1838,26 +1837,27 @@ mod tests {
             inputs: Vec::new(),
             error: None,
         }]);
-        let mut deferred_user_inputs = vec![super::super::host::DeferredUserInput {
-            event_index: 0,
-            content: "already queued before this tool phase".to_string(),
-            queued_at_tool_generation: 0,
-        }];
-        let mut cursor = 0;
-        let mut generation = 1;
+        let mut deferred_input = DeferredInputState {
+            deferred_user_inputs: vec![super::super::host::DeferredUserInput {
+                event_index: 0,
+                content: "already queued before this tool phase".to_string(),
+                queued_at_tool_generation: 0,
+            }],
+            deferred_user_input_cursor: 0,
+            tool_call_generation: 1,
+            ..Default::default()
+        };
         let mut tracker = DeferredToolBoundaryTracker {
             run_control: &provider,
             run_id: "run-1",
-            deferred_user_inputs: &mut deferred_user_inputs,
-            deferred_user_input_cursor: &mut cursor,
-            tool_call_generation: &mut generation,
+            deferred_input: &mut deferred_input,
             collected_inputs: Vec::new(),
             should_yield_to_deferred_input: false,
         };
 
         assert!(tracker.on_completed_tool_boundary().await);
         assert!(!tracker.should_yield_to_deferred_input);
-        assert_eq!(*tracker.tool_call_generation, 2);
+        assert_eq!(tracker.deferred_input.tool_call_generation(), 2);
     }
 
     #[tokio::test]
@@ -1870,24 +1870,24 @@ mod tests {
             }],
             error: None,
         }]);
-        let mut deferred_user_inputs = Vec::new();
-        let mut cursor = 0;
-        let mut generation = 1;
+        let mut deferred_input = DeferredInputState {
+            deferred_user_input_cursor: 0,
+            tool_call_generation: 1,
+            ..Default::default()
+        };
         let mut tracker = DeferredToolBoundaryTracker {
             run_control: &provider,
             run_id: "run-1",
-            deferred_user_inputs: &mut deferred_user_inputs,
-            deferred_user_input_cursor: &mut cursor,
-            tool_call_generation: &mut generation,
+            deferred_input: &mut deferred_input,
             collected_inputs: Vec::new(),
             should_yield_to_deferred_input: false,
         };
 
         assert!(!tracker.on_completed_tool_boundary().await);
         assert!(tracker.should_yield_to_deferred_input);
-        assert_eq!(*tracker.tool_call_generation, 2);
+        assert_eq!(tracker.deferred_input.tool_call_generation(), 2);
         assert_eq!(tracker.collected_inputs.len(), 1);
-        assert_eq!(tracker.deferred_user_inputs.len(), 1);
+        assert_eq!(tracker.deferred_input.deferred_user_inputs.len(), 1);
     }
 
     #[test]
