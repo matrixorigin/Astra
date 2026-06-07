@@ -1,7 +1,7 @@
-import { notFound } from 'next/navigation';
-import { ChatView } from '@/components/app/chat-view';
-import { getCurrentUser } from '@/lib/auth/actions';
-import { getChatHydrated } from '@/lib/api/web-store';
+import { notFound } from "next/navigation";
+import { ChatView } from "@/components/app/chat-view";
+import { getCurrentUser } from "@/lib/auth/actions";
+import { getChat } from "@/lib/api/web-store";
 
 export default async function ChatPage({
   params,
@@ -13,7 +13,7 @@ export default async function ChatPage({
     notFound();
   }
   const { chatId } = await params;
-  const detail = await getChatHydrated(user.user_id, chatId);
+  const detail = getChat(user.user_id, chatId);
   if (!detail) {
     notFound();
   }

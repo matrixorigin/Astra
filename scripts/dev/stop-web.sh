@@ -5,6 +5,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
+# shellcheck source=scripts/dev/web-config.sh
+source "$ROOT_DIR/scripts/dev/web-config.sh"
 
 PID_FILE="${ASTRA_WEB_PID_FILE:-web_server.pid}"
 if [[ "$PID_FILE" != /* ]]; then
@@ -30,6 +32,8 @@ kill_and_wait() {
 
 echo "Stopping web UI..."
 
+PORT="${ASTRA_WEB_PORT:-${WEB_PORT:-3536}}"
+
 if [ -f "$PID_FILE" ]; then
     PID="$(cat "$PID_FILE")"
     rm -f "$PID_FILE"
@@ -37,13 +41,21 @@ if [ -f "$PID_FILE" ]; then
         if is_web_process "$PID"; then
             kill_and_wait "$PID"
             echo "✅ Web UI stopped"
-            exit 0
+        else
+            echo "⚠️  PID $PID is not an Astra web UI process; leaving it untouched"
         fi
-        echo "⚠️  PID $PID is not an Astra web UI process; leaving it untouched"
-        exit 1
+    else
+        echo "✅ Web UI stopped"
     fi
-    echo "✅ Web UI stopped"
-    exit 0
+fi
+
+# Kill any remaining listeners on the web port (e.g. orphaned next-server children).
+LISTENERS="$(web_port_listener_pids "$PORT")"
+if [ -n "$LISTENERS" ]; then
+    for p in $LISTENERS; do
+        echo "⚠️  Killing leftover listener on port $PORT (PID: $p)"
+        kill_and_wait "$p"
+    done
 fi
 
 echo "✅ Web UI stopped"
