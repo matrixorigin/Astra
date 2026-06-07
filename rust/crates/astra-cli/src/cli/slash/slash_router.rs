@@ -434,7 +434,10 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} Permission mode → {} (all tools auto-approved)",
                         "⚡".yellow(),
-                        "auto".magenta()
+                        crate::cli::command_router::permission_mode_display_label(
+                            PermissionMode::Auto
+                        )
+                        .magenta()
                     );
                 }
                 "plan" => {
@@ -442,7 +445,10 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} Permission mode → {} (read-only investigation mode)",
                         theme::icon_info(),
-                        "plan".magenta()
+                        crate::cli::command_router::permission_mode_display_label(
+                            PermissionMode::Plan
+                        )
+                        .magenta()
                     );
                 }
                 "accept_edits" | "accept-edits" => {
@@ -501,6 +507,17 @@ pub(crate) async fn handle_slash_command(
                             ),
                         }
                     }
+                }
+                "prompt" | "default" | "ask" => {
+                    state.perm_manager.set_mode(PermissionMode::Prompt);
+                    eprintln!(
+                        "  {} Permission mode → {}",
+                        theme::icon_info(),
+                        crate::cli::command_router::permission_mode_display_label(
+                            PermissionMode::Prompt
+                        )
+                        .magenta()
+                    );
                 }
                 _ => match arg.parse::<PermissionMode>() {
                     Ok(mode) => {

@@ -998,7 +998,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             eprintln!(
                 "  {} Permission mode → {} (all tools auto-approved)",
                 "⚡".yellow(),
-                "auto".magenta()
+                permission_mode_display_label(PermissionMode::Auto).magenta()
             );
         }
         "plan" => {
@@ -1006,7 +1006,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             eprintln!(
                 "  {} Permission mode → {} (read-only investigation mode)",
                 theme::icon_info(),
-                "plan".magenta()
+                permission_mode_display_label(PermissionMode::Plan).magenta()
             );
         }
         "accept_edits" | "accept-edits" => {
@@ -1060,6 +1060,14 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 ),
             }
         }
+        "prompt" | "default" | "ask" => {
+            state.perm_manager.set_mode(PermissionMode::Prompt);
+            eprintln!(
+                "  {} Permission mode → {}",
+                theme::icon_info(),
+                permission_mode_display_label(PermissionMode::Prompt).magenta()
+            );
+        }
         _ => match arg.parse::<PermissionMode>() {
             Ok(mode) => {
                 state.perm_manager.set_mode(mode);
@@ -1082,24 +1090,39 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
 
 pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static str {
     match mode {
-        PermissionMode::Prompt => "prompt",
-        PermissionMode::Auto => "auto",
-        PermissionMode::AcceptEdits => "accept-edits",
-        PermissionMode::Plan => "plan",
-        PermissionMode::Deny => "deny",
+        PermissionMode::Prompt => "Ask",
+        PermissionMode::Auto => "Auto",
+        PermissionMode::AcceptEdits => "Edits",
+        PermissionMode::Plan => "Plan",
+        PermissionMode::Deny => "Deny",
     }
 }
 
 #[cfg(test)]
 mod permission_mode_display_tests {
-    use super::{PermissionMode, permission_mode_display_label};
+    use super::{PermissionMode, handle_permission_command, permission_mode_display_label};
+    use crate::cli::session::session_state::SessionState;
 
     #[test]
-    fn accept_edits_displays_as_kebab_case() {
+    fn labels_match_tui_status_chips() {
+        assert_eq!(permission_mode_display_label(PermissionMode::Prompt), "Ask");
+        assert_eq!(permission_mode_display_label(PermissionMode::Auto), "Auto");
         assert_eq!(
             permission_mode_display_label(PermissionMode::AcceptEdits),
-            "accept-edits"
+            "Edits"
         );
+        assert_eq!(permission_mode_display_label(PermissionMode::Plan), "Plan");
+        assert_eq!(permission_mode_display_label(PermissionMode::Deny), "Deny");
+    }
+
+    #[test]
+    fn default_alias_restores_ask_mode() {
+        let mut state = SessionState::default();
+        state.perm_manager.set_mode(PermissionMode::Auto);
+
+        handle_permission_command("default", &mut state);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
     }
 }
 

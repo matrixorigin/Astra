@@ -332,6 +332,8 @@ const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     ),
     ("deny", "Deny all tool use"),
     ("prompt", "Prompt before tool use"),
+    ("default", "Alias for ask/prompt mode"),
+    ("ask", "Ask before tool use"),
     ("rules", "Show current permission rules"),
 ];
 
@@ -792,11 +794,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|plan|accept-edits|prompt|deny|all|rules|trust|untrust|trace]",
+        "Permission mode: /allow [auto|plan|accept-edits|prompt|default|ask|deny|all|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|accept-edits|plan|prompt|deny|all|rules]")
+    .with_arg_hint("[auto|accept-edits|plan|prompt|default|ask|deny|all|rules]")
     .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/instructions",
@@ -1109,11 +1111,13 @@ mod tests {
         assert!(allow.description.contains("plan"));
         assert_eq!(
             allow.arg_hint,
-            Some("[auto|accept-edits|plan|prompt|deny|all|rules]")
+            Some("[auto|accept-edits|plan|prompt|default|ask|deny|all|rules]")
         );
 
         let subs = subcommand_completions("/allow").expect("/allow subcommands");
         assert!(subs.iter().any(|(tok, _)| *tok == "accept-edits"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "default"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "ask"));
         assert!(subs.iter().any(|(tok, _)| *tok == "plan"));
     }
 
