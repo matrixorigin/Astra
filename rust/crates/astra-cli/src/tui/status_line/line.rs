@@ -280,9 +280,9 @@ impl StatusLine {
             right_segments.remove(1);
         }
 
+        tighten_primary_right_segment(&self.left, &mut right_segments, area.width);
         let mut ordered = ordered_render_segments(&self.left, &right_segments);
         loop {
-            tighten_ordered_cwd_segment(&mut ordered, area.width);
             let spans = join_segments(&ordered, &sep, 2 /* leading indent */, bg);
             let used: usize = spans.iter().map(|s| s.content.width()).sum();
             let total = used + 2; // trailing margin
@@ -340,14 +340,8 @@ fn join_segments(
 
 fn ordered_render_segments(left: &[Segment], right: &[Segment]) -> Vec<Segment> {
     let mut ordered = Vec::with_capacity(left.len() + right.len());
-    if let Some(model) = left.first() {
-        ordered.push(model.clone());
-    }
-    if let Some(cwd) = right.first() {
-        ordered.push(cwd.clone());
-    }
-    ordered.extend(left.iter().skip(1).cloned());
-    ordered.extend(right.iter().skip(1).cloned());
+    ordered.extend(left.iter().cloned());
+    ordered.extend(right.iter().cloned());
     ordered
 }
 

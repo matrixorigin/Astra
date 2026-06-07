@@ -331,6 +331,37 @@ fn narrow_footer_drops_mode_before_model_identity() {
 }
 
 #[test]
+fn dense_footer_preserves_mode_before_budget_and_branch() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("deepseek-v4-pro-official(thinking:high)".into()),
+        cwd: Some("~/github/astra".into()),
+        token_budget: Some((138_000, 200_000)),
+        git_branch: Some("enqueue_new_after_next_call".into()),
+        permission_mode: PermissionMode::Auto,
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 82, 1);
+    let mut buf = Buffer::empty(area);
+    s.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+
+    assert!(
+        rendered.contains("Auto"),
+        "permission mode is higher priority than budget/branch; got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("deepseek"),
+        "model identity should remain visible; got {rendered:?}"
+    );
+}
+
+#[test]
 fn token_budget_renders_as_percent_and_absolute() {
     let c = StatusContext {
         turn_active: true,

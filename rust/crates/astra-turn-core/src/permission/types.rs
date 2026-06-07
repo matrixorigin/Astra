@@ -41,11 +41,11 @@ impl PermissionMode {
     /// Human label for the status-line mode chip.
     pub fn chip_text(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
-            Self::Plan => "plan",
-            Self::AcceptEdits => "edit",
-            Self::Prompt => "default",
-            Self::Deny => "deny",
+            Self::Auto => "Auto",
+            Self::Plan => "Plan",
+            Self::AcceptEdits => "Edits",
+            Self::Prompt => "Ask",
+            Self::Deny => "Deny",
         }
     }
 
