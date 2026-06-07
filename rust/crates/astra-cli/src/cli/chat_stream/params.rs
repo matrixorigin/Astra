@@ -353,6 +353,9 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Optional run-control provider for the active turn. CLI/TUI uses this
+    /// to feed in-process deferred user input into the runtime loop.
+    pub(crate) run_control: Option<Arc<dyn astra_runtime::turn::run_control::RunControlProvider>>,
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
@@ -564,6 +567,7 @@ impl<'a> ChatTurnParams<'a> {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            run_control: None,
             incremental_state: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),

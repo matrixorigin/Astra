@@ -441,6 +441,7 @@ pub(crate) async fn handle_task_command(
                     plan_subtask_id: None,
                     delegation_engine: bg_delegation_engine.clone(),
                     cancel_token: None,
+                    run_control: None,
                     incremental_state: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: None,

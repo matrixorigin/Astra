@@ -4,12 +4,14 @@ use super::turn_cancellation::drain_after_cancel;
 use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
+use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
 use crossterm::style::Stylize;
 use std::sync::Arc;
 
 struct PreparedTurnStreamState {
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
     incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
+    run_control: Arc<LocalDeferredInputRunControl>,
     tui_cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     observability_session: Option<
@@ -38,8 +40,8 @@ pub(crate) async fn execute_stream_turn(
     semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
     let prepared = prepare_turn_stream_state(state).await;
-    *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_incremental_state) =
-        Some(prepared.incremental_state.clone());
+    *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
+        Some(prepared.run_control.clone());
     let params = build_turn_stream_params(
         state,
         api,
@@ -52,7 +54,7 @@ pub(crate) async fn execute_stream_turn(
     );
     let (result, was_user_cancel) =
         await_stream_with_interrupts(params, &prepared, api, token).await;
-    *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_incremental_state) = None;
+    *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) = None;
 
     if was_user_cancel {
         TurnAttempt::Interrupted(Box::new(result))
@@ -72,6 +74,7 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
         incremental_state: Arc::new(
             astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
         ),
+        run_control: LocalDeferredInputRunControl::shared(),
         tui_cancel_token: state.tui_cancel_token.clone(),
         observability_hub: state.observability_hub.clone(),
         observability_session: state.observability_session.clone(),
@@ -119,6 +122,7 @@ fn build_turn_stream_params<'a>(
         plan_subtask_id: state.current_plan_subtask_id.as_deref(),
         delegation_engine: state.delegation_engine.clone(),
         cancel_token: Some(prepared.cancel_token.clone()),
+        run_control: Some(prepared.run_control.clone()),
         incremental_state: Some(prepared.incremental_state.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: state.tui_stream_event_tx.clone(),
@@ -260,6 +264,7 @@ fn notify_server_to_cancel_run(
 mod tests {
     use super::{PreparedTurnStreamState, build_turn_stream_params, prepare_turn_stream_state};
     use crate::cli::session::session_state::SessionState;
+    use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
     use std::sync::Arc;
 
     /// Source-level guard: cancellation paths in `await_stream_with_interrupts`
@@ -319,6 +324,7 @@ mod tests {
             incremental_state: Arc::new(
                 astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
             ),
+            run_control: LocalDeferredInputRunControl::shared(),
             tui_cancel_token: None,
             observability_hub: None,
             observability_session: None,

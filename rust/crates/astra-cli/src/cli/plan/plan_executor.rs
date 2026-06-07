@@ -1555,6 +1555,7 @@ async fn plan_executor_task(
                     plan_subtask_id: Some(next_id),
                     delegation_engine: ctx.delegation_engine.clone(),
                     cancel_token: Some(cancel_token),
+                    run_control: None,
                     incremental_state: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: Some(stream_tx),
