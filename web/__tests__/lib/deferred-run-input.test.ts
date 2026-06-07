@@ -7,14 +7,16 @@ jest.mock('@/lib/runtime-client', () => ({
   runtimeErrorDetail: jest.fn((error: unknown) => (error instanceof Error ? error.message : String(error))),
 }));
 
-import { getStore, queueDeferredRunInput } from '@/lib/api/web-store';
-import { requireRuntimeClient } from '@/lib/runtime-client';
+import { getStore, queueDeferredRunInput, resumeActiveRun, stopActiveRun } from '@/lib/api/web-store';
+import { getRuntimeClient, requireRuntimeClient } from '@/lib/runtime-client';
 
+const mockGetRuntimeClient = getRuntimeClient as jest.MockedFunction<typeof getRuntimeClient>;
 const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<typeof requireRuntimeClient>;
 
 describe('queueDeferredRunInput', () => {
   beforeEach(() => {
     globalThis.__astraWebStores = undefined;
+    mockGetRuntimeClient.mockReset();
     mockRequireRuntimeClient.mockReset();
   });
 
@@ -68,6 +70,203 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-1',
       status: 'input-queued',
       waitingFor: 'user_input',
+    });
+  });
+
+  it('hydrates a lost in-memory active run before submitting deferred input', async () => {
+    const listRuntimeSessions = jest.fn().mockResolvedValue({
+      sessions: [{
+        session_id: 'chat-1',
+        user_id: 'user-a',
+        title: 'Deferred test',
+        metadata: { source: 'web_v1' },
+        status: 'active',
+        created_at: '2026-06-07T00:00:00.000Z',
+        updated_at: '2026-06-07T00:00:00.000Z',
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const listRuns = jest.fn().mockResolvedValue({
+      runs: [{
+        runId: 'run-recovered',
+        sessionId: 'chat-1',
+        status: 'running',
+        waitingFor: null,
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const submitRunInput = jest.fn().mockResolvedValue({
+      runId: 'run-recovered',
+      accepted: true,
+      duplicate: false,
+    });
+
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: {
+        listRuntimeSessions,
+        listRuns,
+      },
+    } as never);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        submitRunInput,
+      },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-1',
+      title: 'Deferred test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: undefined,
+    });
+
+    const result = await queueDeferredRunInput('user-a', 'chat-1', {
+      content: 'recover before queueing',
+      options: {
+        webSearch: false,
+        thinking: true,
+        model: 'sonnet-4.6-adaptive',
+        activeSkills: [],
+      },
+    });
+
+    expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(submitRunInput).toHaveBeenCalledWith('run-recovered', {
+      idempotencyKey: expect.any(String),
+      input: {
+        content: 'recover before queueing',
+        active_skills: [],
+      },
+    });
+    expect(result?.activeRun).toEqual({
+      runId: 'run-recovered',
+      status: 'input-queued',
+      waitingFor: 'user_input',
+    });
+  });
+
+  it('hydrates a lost active run before stopping it', async () => {
+    const listRuntimeSessions = jest.fn().mockResolvedValue({
+      sessions: [{
+        session_id: 'chat-stop',
+        user_id: 'user-a',
+        title: 'Stop test',
+        metadata: { source: 'web_v1' },
+        status: 'active',
+        created_at: '2026-06-07T00:00:00.000Z',
+        updated_at: '2026-06-07T00:00:00.000Z',
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const listRuns = jest.fn().mockResolvedValue({
+      runs: [{
+        runId: 'run-stop',
+        sessionId: 'chat-stop',
+        status: 'running',
+        waitingFor: null,
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const cancelRun = jest.fn().mockResolvedValue(undefined);
+
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: { listRuntimeSessions, listRuns },
+    } as never);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+
+    getStore('user-a').chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: undefined,
+    });
+
+    const result = await stopActiveRun('user-a', 'chat-stop');
+
+    expect(cancelRun).toHaveBeenCalledWith('run-stop');
+    expect(result?.activeRun).toEqual({
+      runId: 'run-stop',
+      status: 'cancelling',
+      waitingFor: null,
+    });
+  });
+
+  it('hydrates a lost paused run before resuming it', async () => {
+    const listRuntimeSessions = jest.fn().mockResolvedValue({
+      sessions: [{
+        session_id: 'chat-resume',
+        user_id: 'user-a',
+        title: 'Resume test',
+        metadata: { source: 'web_v1' },
+        status: 'active',
+        created_at: '2026-06-07T00:00:00.000Z',
+        updated_at: '2026-06-07T00:00:00.000Z',
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const listRuns = jest.fn().mockResolvedValue({
+      runs: [{
+        runId: 'run-resume',
+        sessionId: 'chat-resume',
+        status: 'paused',
+        waitingFor: null,
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const resumeRun = jest.fn().mockResolvedValue(undefined);
+
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: { listRuntimeSessions, listRuns },
+    } as never);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { resumeRun },
+    } as never);
+
+    getStore('user-a').chats.push({
+      id: 'chat-resume',
+      title: 'Resume test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: undefined,
+    });
+
+    const result = await resumeActiveRun('user-a', 'chat-resume');
+
+    expect(resumeRun).toHaveBeenCalledWith('run-resume');
+    expect(result?.activeRun).toEqual({
+      runId: 'run-resume',
+      status: 'running',
+      waitingFor: null,
     });
   });
 });

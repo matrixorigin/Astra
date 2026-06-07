@@ -582,6 +582,7 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
   content: string;
   options?: ComposerOptions;
 }) {
+  await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
@@ -634,6 +635,7 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
 }
 
 export async function stopActiveRun(ownerUserId: string, chatId: string) {
+  await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
@@ -661,6 +663,7 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
 }
 
 export async function resumeActiveRun(ownerUserId: string, chatId: string) {
+  await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
