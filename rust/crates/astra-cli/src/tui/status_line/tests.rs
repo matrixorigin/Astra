@@ -11,45 +11,32 @@ fn ctx() -> StatusContext {
     StatusContext::default()
 }
 
-// ─── Left-side hints ──────────────────────────────────────────────
+// ─── Left-side state ──────────────────────────────────────────────
 
 #[test]
-fn idle_shows_command_hints_on_left() {
+fn idle_shows_mode_chip_without_tutorial_legend() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        plain.contains("/commands"),
-        "left hint should label the slash trigger; got {plain:?}"
+        plain.contains("default"),
+        "idle footer should still show the current mode; got {plain:?}"
     );
     assert!(
-        plain.contains("@mention"),
-        "should label the @ mention trigger; got {plain:?}"
+        !plain.contains("/commands"),
+        "tutorial legend should stay in the composer, not the footer; got {plain:?}"
     );
     assert!(
-        plain.contains("$shell"),
-        "should label the shell trigger; got {plain:?}"
+        !plain.contains("@mention"),
+        "footer should not duplicate mention legend; got {plain:?}"
+    );
+    assert!(
+        !plain.contains("$shell"),
+        "footer should not duplicate shell legend; got {plain:?}"
     );
 }
 
 #[test]
-fn turn_active_replaces_hints_with_interrupt_prompt() {
-    let c = StatusContext {
-        turn_active: true,
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(
-        !plain.contains("Ctrl+C interrupt"),
-        "active turn should NOT show Ctrl+C interrupt; got {plain:?}"
-    );
-    assert!(
-        !plain.contains("Ctrl+O transcript"),
-        "idle transcript hint should be suppressed when active; got {plain:?}"
-    );
-}
-
-#[test]
-fn active_turn_without_objective_renders_no_interrupt() {
+fn active_turn_without_objective_renders_no_interrupt_prompt() {
     let c = StatusContext {
         turn_active: true,
         ..ctx()
@@ -100,10 +87,9 @@ fn idle_turn_does_not_render_elapsed_chip() {
 
 #[test]
 fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
-    // At 40 cols with model + git branch on the right, the full hint
-    // won't fit; renderer must fall back to `/ @ $` so the right side
-    // stays visible. Verified via rendered ratatui buffer rather than
-    // `.plain()` because the degradation lives in `render()`.
+    // At 40 cols we no longer render a tutorial legend. The footer
+    // should preserve high-value status chips instead of inventing a
+    // cramped shorthand.
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -113,7 +99,6 @@ fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert!(s.plain().contains("/commands"));
     let area = Rect::new(0, 0, 40, 1);
     let mut buf = Buffer::empty(area);
     s.render(area, &mut buf);
@@ -121,16 +106,67 @@ fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
         .map(|x| buf[(x, 0)].symbol().to_string())
         .collect();
     assert!(
-        rendered.contains("/ @ $"),
-        "tiny hint should still show trigger keys; got {rendered:?}"
+        !rendered.contains("/ @ $"),
+        "footer should not degrade into a key legend; got {rendered:?}"
     );
     assert!(
-        !rendered.contains("Ctrl+O transcript"),
-        "full hint must degrade at 40 cols; got {rendered:?}"
+        rendered.contains("default"),
+        "mode chip should survive on narrow widths; got {rendered:?}"
     );
     assert!(
         rendered.contains("sonnet-4.6"),
         "model must survive the degradation; got {rendered:?}"
+    );
+}
+
+#[test]
+fn very_long_model_is_truncated_before_it_crowds_the_footer() {
+    let c = StatusContext {
+        model: Some("claude-sonnet-4.6-super-long-preview-build".into()),
+        cwd: Some("~/projects/astra".into()),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("claude"),
+        "model prefix should remain visible; got {plain:?}"
+    );
+    assert!(
+        plain.contains('…'),
+        "long model names should be truncated instead of crowding peers; got {plain:?}"
+    );
+}
+
+#[test]
+fn active_objective_truncates_to_preserve_right_side_context() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        turn_active: true,
+        current_objective: Some(
+            "Reviewing a very large diff with a long explanation that should not eat the footer"
+                .into(),
+        ),
+        turn_elapsed: Some(Duration::from_secs(16)),
+        model: Some("sonnet-4.6".into()),
+        token_budget: Some((40_000, 200_000)),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 64, 1);
+    let mut buf = Buffer::empty(area);
+    s.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(
+        rendered.contains("…"),
+        "long objective should truncate rather than swallow the footer; got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("sonnet-4.6"),
+        "right-side context should survive long objectives; got {rendered:?}"
     );
 }
 
@@ -366,7 +402,7 @@ fn right_segments_joined_with_middle_dot() {
 #[test]
 fn empty_context_produces_some_left_content() {
     // We always render *something* on the left so the status line
-    // doesn't look broken — at minimum the hint set.
+    // doesn't look broken — at minimum the mode chip.
     let s = StatusLine::from_context(&ctx());
     assert!(!s.left.is_empty());
 }

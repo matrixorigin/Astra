@@ -77,58 +77,30 @@ pub(crate) struct StatusLine {
     pub right: Vec<Segment>,
 }
 
-/// Idle hint: make each prefix legible instead of showing raw symbols.
-/// These prefixes change the meaning of the next keystroke, so the
-/// footer should label them directly rather than expecting the user to
-/// remember `/ @ $` by heart.
-pub(crate) const IDLE_HINT_FULL: &str = "/commands @mention $shell";
-/// Same hint, but compressed enough to preserve the right-side model/cwd
-/// chips on 80-column terminals.
-pub(crate) const IDLE_HINT_SHORT: &str = "/cmd @mention $sh";
-/// Same hint collapsed for narrow terminals so the model chip still fits.
-pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
-
 /// Threshold below which the budget chip is dim, above which it warns.
 const BUDGET_WARN_PERCENT: f32 = 75.0;
 const BUDGET_ERROR_PERCENT: f32 = 90.0;
 /// Max cwd segment width before the middle is elided.
-const CWD_MAX_WIDTH: usize = 28;
+const MODEL_MAX_WIDTH: usize = 22;
+const BRANCH_MAX_WIDTH: usize = 20;
+const CWD_MAX_WIDTH: usize = 24;
 
 impl StatusLine {
     /// Build a status line from context.
     pub fn from_context(ctx: &StatusContext) -> Self {
         let muted = Style::default().fg(Color::Gray);
-        let hint = Style::default().fg(Color::White);
         let mut out = Self::default();
 
-        // ── Left: short hint, then permission chip if non-default ─
-        //
-        // Idle hint is built in two forms so the renderer can swap to the
-        // short form when the terminal is too narrow for the full one.
-        // `render()` picks between them based on remaining width.
+        // ── Left: objective when active, otherwise just concise state ─
         let active_objective = ctx
             .turn_active
             .then(|| ctx.current_objective.clone())
             .flatten();
-        let hint_text = if let Some(objective) = active_objective.clone() {
-            objective
-        } else if ctx.turn_active {
-            String::new()
-        } else {
-            IDLE_HINT_FULL.to_string()
-        };
         let active_hint_style = Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-        if !hint_text.is_empty() {
-            out.left.push(Segment::styled(
-                hint_text,
-                if ctx.turn_active {
-                    active_hint_style
-                } else {
-                    hint
-                },
-            ));
+        if let Some(objective) = active_objective {
+            out.left.push(Segment::styled(objective, active_hint_style));
         }
 
         if ctx.turn_active
@@ -178,13 +150,6 @@ impl StatusLine {
                 ));
             }
         }
-
-        // Hint that the chip itself is the cycle anchor — without
-        // this the user has no surface clue that ⇧Tab moves between
-        // modes (the previous global "⇧Tab mode" hint was deleted
-        // for being repetitive and unanchored). Dim so it reads as
-        // metadata of the chip, not an action of its own.
-        out.left.push(Segment::styled("⇧Tab", muted));
 
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {
@@ -241,22 +206,12 @@ impl StatusLine {
             }
         }
 
-        // ── Right: model · branch · cwd · tokens · cost ───────────
+        // ── Right: model · budget · cwd · branch · cost ───────────
         if let Some(model) = ctx.model.as_deref() {
             out.right.push(Segment::styled(
-                model.to_string(),
+                truncate_middle(model, MODEL_MAX_WIDTH),
                 Style::default().fg(Color::White),
             ));
-        }
-
-        if let Some(branch) = ctx.git_branch.as_deref() {
-            out.right
-                .push(Segment::styled(format!("⎇ {branch}"), muted));
-        }
-
-        if let Some(cwd) = ctx.cwd.as_deref() {
-            out.right
-                .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), muted));
         }
 
         if let Some((used, limit)) = ctx.token_budget {
@@ -274,6 +229,18 @@ impl StatusLine {
                     style,
                 ));
             }
+        }
+
+        if let Some(cwd) = ctx.cwd.as_deref() {
+            out.right
+                .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), muted));
+        }
+
+        if let Some(branch) = ctx.git_branch.as_deref() {
+            out.right.push(Segment::styled(
+                format!("⎇ {}", truncate_middle(branch, BRANCH_MAX_WIDTH)),
+                muted,
+            ));
         }
 
         if let Some(cost) = ctx.cost_usd {
@@ -310,88 +277,27 @@ impl StatusLine {
         }
         let sep = Span::styled(" · ", Style::default().fg(Color::Gray));
 
-        // Narrow-width degradation of the idle hint. When the full hint
-        // won't leave room for the model name / key stats on the right,
-        // swap to the short form, and ultimately to the tiny form. Only
-        // triggers if segment 0 is one of our known hint strings, so we
-        // never mutate user-supplied content.
-        let left_segments = self.narrowed_left_segments(area.width);
-
-        let left_spans = join_segments(&left_segments, &sep, 2 /* leading indent */);
         let mut right_segments: &[Segment] = &self.right;
-        let mut right_spans;
-        let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
+        let mut right_spans = join_segments(right_segments, &sep, 0);
 
         loop {
-            right_spans = join_segments(right_segments, &sep, 0);
             let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
+            let left_segments = truncate_left_segments_to_fit(&self.left, right_w, area.width);
+            let left_spans = join_segments(&left_segments, &sep, 2 /* leading indent */);
+            let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
             let total = left_w + right_w + 2; // 2-char trailing margin
             if total <= area.width as usize || right_segments.is_empty() {
+                let padding = (area.width as usize).saturating_sub(left_w + right_w + 2);
+                let mut all = left_spans;
+                all.push(Span::raw(" ".repeat(padding)));
+                all.extend(right_spans);
+                Widget::render(Line::from(all), area, buf);
                 break;
             }
             // Drop the trailing right segment and retry.
             right_segments = &right_segments[..right_segments.len() - 1];
+            right_spans = join_segments(right_segments, &sep, 0);
         }
-
-        let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
-        let padding = (area.width as usize).saturating_sub(left_w + right_w + 2);
-
-        let mut all = left_spans;
-        all.push(Span::raw(" ".repeat(padding)));
-        all.extend(right_spans);
-
-        Widget::render(Line::from(all), area, buf);
-    }
-
-    /// Return `self.left` with the lead hint swapped for a shorter
-    /// variant if the full form plus non-droppable right segments
-    /// wouldn't fit. The "floor" right width is the first right segment
-    /// only (typically the model name) — we want to protect that above
-    /// the nice-to-have hint detail.
-    fn narrowed_left_segments(&self, width: u16) -> Vec<Segment> {
-        let Some(first) = self.left.first() else {
-            return self.left.clone();
-        };
-        // Only degrade the known idle-hint strings.
-        if first.text != IDLE_HINT_FULL {
-            return self.left.clone();
-        }
-        // Width of everything except the lead hint: rest of left segs +
-        // separators, all of right (floor) + margins. The lead hint
-        // itself is what we're shrinking, so exclude it from this sum.
-        let sep_w = " · ".chars().count();
-        let lead_indent = 2;
-        let trailing_margin = 2;
-
-        let other_left_w: usize = self
-            .left
-            .iter()
-            .skip(1)
-            .map(|s| s.text.chars().count() + sep_w)
-            .sum();
-        // Prefer preserving the current right-side context (model, branch,
-        // cwd, budget) before spending width on a verbose legend.
-        let right_desired: usize = self
-            .right
-            .iter()
-            .enumerate()
-            .map(|(idx, s)| s.text.chars().count() + if idx > 0 { sep_w } else { 0 })
-            .sum();
-
-        let overhead = lead_indent + other_left_w + right_desired + trailing_margin;
-        let available = (width as usize).saturating_sub(overhead);
-
-        let chosen = if IDLE_HINT_FULL.chars().count() <= available {
-            IDLE_HINT_FULL
-        } else if IDLE_HINT_SHORT.chars().count() <= available {
-            IDLE_HINT_SHORT
-        } else {
-            IDLE_HINT_TINY
-        };
-
-        let mut out = self.left.clone();
-        out[0] = Segment::styled(chosen, first.style);
-        out
     }
 }
 
@@ -423,6 +329,64 @@ fn truncate_cwd(cwd: &str, max_width: usize) -> String {
     // Keep the last `max_width - 1` characters, prefixed with "…".
     let tail: String = cwd.chars().skip(count - (max_width - 1)).collect();
     format!("…{tail}")
+}
+
+fn truncate_middle(text: &str, max_width: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let head_len = (max_width - 1) / 2;
+    let tail_len = max_width - 1 - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(count - tail_len).collect();
+    format!("{head}…{tail}")
+}
+
+fn truncate_end(text: &str, max_width: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let head: String = text.chars().take(max_width - 1).collect();
+    format!("{head}…")
+}
+
+fn truncate_left_segments_to_fit(
+    segments: &[Segment],
+    right_width: usize,
+    total_width: u16,
+) -> Vec<Segment> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let sep_w = " · ".width();
+    let lead_indent = 2usize;
+    let trailing_margin = 2usize;
+    let other_width: usize = segments
+        .iter()
+        .skip(1)
+        .map(|seg| seg.text.width() + sep_w)
+        .sum();
+    let available = usize::from(total_width)
+        .saturating_sub(right_width + lead_indent + trailing_margin + other_width);
+
+    if segments[0].text.width() <= available || available >= segments[0].text.width() {
+        return segments.to_vec();
+    }
+
+    let mut out = segments.to_vec();
+    let floor = if segments.len() == 1 { 10 } else { 14 };
+    let target = available.max(floor);
+    out[0].text = truncate_end(&out[0].text, target);
+    out
 }
 
 /// "25000" → "25k"; preserves exact count under 1k.
