@@ -663,9 +663,15 @@ export async function POST(
     return NextResponse.json({ error: "AUTH_REQUIRED" }, { status: 401 });
   }
 
-  try {
-    await runtime.sdk.getRuntimeSession(chatId);
-  } catch (error) {
+  // Run session validation and model resolution in parallel.
+  // Both are independent network calls that would otherwise serialize.
+  const [sessionResult, model] = await Promise.all([
+    runtime.sdk.getRuntimeSession(chatId).catch((error) => error),
+    resolveBackendModelName(runtime, body.options?.model),
+  ]);
+
+  if (sessionResult instanceof Error) {
+    const error = sessionResult;
     if (isRuntimeSessionNotFound(error)) {
       return NextResponse.json(
         { error: `session not found: ${chatId}` },
@@ -678,20 +684,21 @@ export async function POST(
         : "Failed to verify runtime session.";
     return NextResponse.json({ error: message }, { status: 502 });
   }
-
-  const model = await resolveBackendModelName(runtime, body.options?.model);
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
   const sessionId = chatId;
+  const hasPriorMessages = chat.messages.length > 0;
   const knownArtifactIds = new Set<string>();
-  try {
-    const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
-    for (const artifact of existingArtifacts) {
-      knownArtifactIds.add(artifact.id);
+  if (hasPriorMessages) {
+    try {
+      const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
+      for (const artifact of existingArtifacts) {
+        knownArtifactIds.add(artifact.id);
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to load artifacts.";
+      return NextResponse.json({ error: message }, { status: 502 });
     }
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to load artifacts.";
-    return NextResponse.json({ error: message }, { status: 502 });
   }
 
   const started = beginStreamingMessage(ownerUserId, chatId, body);

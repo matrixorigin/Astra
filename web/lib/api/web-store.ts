@@ -71,6 +71,13 @@ const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
+// Cache for listModels() results; keyed by accessToken — different users have different model lists.
+// NOTE: no TTL-triggered eviction; grows by user count (single-user dev is fine).
+const modelListCache = new Map<
+  string,
+  { promise: Promise<Array<{ model_id?: string; name?: string }>>; expiresAt: number }
+>();
+const MODEL_LIST_CACHE_TTL_MS = 60_000;
 
 type StreamResult = {
   assistantText: string;
@@ -1563,10 +1570,28 @@ export async function resolveBackendModelName(runtime: RuntimeConfig | WebRuntim
     const client = runtime instanceof WebRuntimeClient
       ? runtime
       : new WebRuntimeClient(runtime);
-    if (!client.config.accessToken) {
+    const accessToken = client.config.accessToken;
+    if (!accessToken) {
       return model;
     }
-    const models = await client.sdk.listModels();
+
+    const now = Date.now();
+    const cached = modelListCache.get(accessToken);
+    let modelsPromise: Promise<Array<{ model_id?: string; name?: string }>>;
+    if (cached && cached.expiresAt > now) {
+      modelsPromise = cached.promise;
+    } else {
+      modelsPromise = client.sdk.listModels();
+      modelListCache.set(accessToken, {
+        promise: modelsPromise,
+        expiresAt: now + MODEL_LIST_CACHE_TTL_MS,
+      });
+    }
+
+    const models = await modelsPromise.catch((err) => {
+      modelListCache.delete(accessToken);
+      throw err;
+    });
     const matched = models.find((item) => item.model_id === model || item.name === model);
     return matched?.name ?? model;
   } catch {
