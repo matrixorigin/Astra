@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/turn_summary.rs
-assertion_line: 446
+assertion_line: 443
 expression: "render(&mk_full(), 120)"
 ---
-  16s total  ttft 1.8s·   23.6k tokens  23.2k in  408 out·   2 tools·   145.0k session  $0.014 cost
+  16s total · ttft 1.8s · 23.6k tokens · 2 tools · 145.0k session · $0.014 cost

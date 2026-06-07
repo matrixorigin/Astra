@@ -1,15 +1,16 @@
-//! Turn-summary history cell — the single-line metrics band
-//! after every completed turn.
+//! Turn-summary history cell — the compact post-turn metrics band.
 //!
 //! Shape:
 //!
 //! ```text
-//! ⏱ 16.6s (ttft 1.7s) │ ⚡ 23.7k ↑23.2k ↓408 │ 🛠 2 │ Σ 145k · $0.014
+//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools · 145.0k session · $0.014 cost
 //! ```
 //!
-//! Icons encode the section type so the reader can locate
-//! elapsed / tokens / tools / session totals at a glance. Sections
-//! that don't apply to this turn are elided.
+//! The summary intentionally stays in product language rather than
+//! exposing raw telemetry grammar. Lower-value details such as
+//! per-direction token arrows are omitted so the band reads like a
+//! calm recap instead of an engineering dashboard. Sections that
+//! don't apply to this turn are elided.
 //!
 //! Persists as [`TurnEvent::TurnSummary`]. Never live.
 
@@ -110,39 +111,25 @@ impl TurnSummaryCell {
         let mut sections: Vec<Vec<Span<'static>>> = Vec::new();
 
         if let Some(elapsed) = self.elapsed_ms {
-            let mut parts = vec![
-                Span::styled("  ", label),
+            sections.push(vec![
                 Span::styled(fmt_duration_ms(elapsed), value),
                 Span::styled(" total", label),
-            ];
-            if let Some(ttft) = self.ttft_ms
-                && ttft > 0
-            {
-                parts.push(Span::styled("  ttft ", label));
-                parts.push(Span::styled(fmt_ms(ttft), value));
-            }
-            sections.push(parts);
+            ]);
+        }
+
+        if let Some(ttft) = self.ttft_ms
+            && ttft > 0
+        {
+            sections.push(vec![
+                Span::styled("ttft ", label),
+                Span::styled(fmt_ms(ttft), value),
+            ]);
         }
 
         if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
             sections.push(vec![
-                Span::styled("  ", label),
                 Span::styled(fmt_tokens(tin + tout), value),
                 Span::styled(" tokens", label),
-                Span::styled("  ", label),
-                Span::styled(fmt_tokens(tin), value),
-                Span::styled(" in", label),
-                Span::styled("  ", label),
-                Span::styled(fmt_tokens(tout), value),
-                Span::styled(" out", label),
-            ]);
-        }
-
-        if self.tools > 0 {
-            sections.push(vec![
-                Span::styled("  ", label),
-                Span::styled(self.tools.to_string(), value),
-                Span::styled(if self.tools == 1 { " tool" } else { " tools" }, label),
             ]);
         }
 
@@ -152,33 +139,34 @@ impl TurnSummaryCell {
         {
             let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
             sections.push(vec![
-                Span::styled("  ", label),
                 Span::styled(format!("{pct}%"), value),
                 Span::styled(" cache", label),
             ]);
         }
 
-        let mut sigma_parts: Vec<Span<'static>> = vec![Span::styled("  ", label)];
-        let mut has_session = false;
+        if self.tools > 0 {
+            sections.push(vec![
+                Span::styled(self.tools.to_string(), value),
+                Span::styled(if self.tools == 1 { " tool" } else { " tools" }, label),
+            ]);
+        }
+
         if let Some(c) = self.cumulative_tokens
             && c > 0
         {
-            sigma_parts.push(Span::styled(fmt_tokens(c), value));
-            sigma_parts.push(Span::styled(" session", label));
-            has_session = true;
+            sections.push(vec![
+                Span::styled(fmt_tokens(c), value),
+                Span::styled(" session", label),
+            ]);
         }
+
         if let Some(cost) = self.cumulative_cost_usd
             && cost > 0.0
         {
-            if has_session {
-                sigma_parts.push(Span::styled("  ", label));
-            }
-            sigma_parts.push(Span::styled(fmt_cost(cost), value));
-            sigma_parts.push(Span::styled(" cost", label));
-            has_session = true;
-        }
-        if has_session {
-            sections.push(sigma_parts);
+            sections.push(vec![
+                Span::styled(fmt_cost(cost), value),
+                Span::styled(" cost", label),
+            ]);
         }
 
         sections
@@ -192,7 +180,7 @@ impl TurnSummaryCell {
 // themselves be rewritten in Phase 3.
 
 /// Elapsed duration in ms. Whole seconds below a minute, `Nm Ss`
-/// above — matches the coarse format we use in the orbiter so the
+/// above — matches the coarse format we use elsewhere so the
 /// band doesn't jitter sub-second.
 fn fmt_duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
@@ -246,21 +234,27 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 
 fn pack_sections_into_lines(sections: Vec<Vec<Span<'static>>>, width: u16) -> Vec<Line<'static>> {
     let available = usize::from(width.max(24));
-    let sep = Span::styled("· ", Style::default().fg(crate::tui::theme::current().dim));
+    let indent = Span::styled("  ", Style::default().fg(crate::tui::theme::current().dim));
+    let indent_width = unicode_width::UnicodeWidthStr::width(indent.content.as_ref());
+    let sep = Span::styled(" · ", Style::default().fg(crate::tui::theme::current().dim));
     let sep_width = unicode_width::UnicodeWidthStr::width(sep.content.as_ref());
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut current_width = 0usize;
+    let mut current: Vec<Span<'static>> = vec![indent.clone()];
+    let mut current_width = indent_width;
 
     for section in sections {
         let section_width = spans_width(&section);
-        let extra = if current.is_empty() { 0 } else { sep_width };
-        if !current.is_empty() && current_width + extra + section_width > available {
+        let extra = if current_width == indent_width {
+            0
+        } else {
+            sep_width
+        };
+        if current_width > indent_width && current_width + extra + section_width > available {
             lines.push(Line::from(current));
-            current = Vec::new();
-            current_width = 0;
+            current = vec![indent.clone()];
+            current_width = indent_width;
         }
-        if !current.is_empty() {
+        if current_width > indent_width {
             current.push(sep.clone());
             current_width += sep_width;
         }
@@ -268,7 +262,7 @@ fn pack_sections_into_lines(sections: Vec<Vec<Span<'static>>>, width: u16) -> Ve
         current.extend(section);
     }
 
-    if !current.is_empty() {
+    if current_width > indent_width {
         lines.push(Line::from(current));
     }
 
