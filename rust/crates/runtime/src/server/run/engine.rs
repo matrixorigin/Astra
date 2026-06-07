@@ -512,8 +512,8 @@ use crate::turn::run_control::{
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
     #[allow(clippy::blocks_in_conditions)]
-    async fn control_status(&self, run_id: &str) -> Option<RunControlStatus> {
-        self.check_control_status(run_id).await.ok().flatten()
+    async fn control_status(&self, run_id: &str) -> Result<Option<RunControlStatus>, String> {
+        self.check_control_status(run_id).await
     }
 }
 

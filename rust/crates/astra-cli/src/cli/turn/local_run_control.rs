@@ -48,8 +48,8 @@ impl LocalDeferredInputRunControl {
 
 #[async_trait::async_trait]
 impl RunStatusProvider for LocalDeferredInputRunControl {
-    async fn control_status(&self, _run_id: &str) -> Option<RunControlStatus> {
-        None
+    async fn control_status(&self, _run_id: &str) -> Result<Option<RunControlStatus>, String> {
+        Ok(None)
     }
 }
 

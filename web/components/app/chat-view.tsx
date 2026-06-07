@@ -416,6 +416,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           router.replace(chatListHref);
           return;
         }
+        try {
+          const refreshed = await getChat(detail.chat.id);
+          setDetail(refreshed);
+        } catch {
+          // Keep the local running state if refresh also fails; the alert still
+          // tells the user that stream reconnection did not attach.
+        }
         window.alert(streamError instanceof Error
           ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
           : 'The run resumed, but the web UI could not reconnect to its stream.');

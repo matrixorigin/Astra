@@ -1109,7 +1109,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 if let Some(ref rc) = state.run_control {
                     if let Some(run_id) = state.current_run_id.as_deref() {
                         match rc.control_status(run_id).await {
-                            Some(RunControlStatus::Cancelled) => {
+                            Ok(Some(RunControlStatus::Cancelled)) => {
                                 if let Some(ref flag) = state.cancellation.flag {
                                     flag.store(true, Ordering::SeqCst);
                                 }
@@ -1126,18 +1126,25 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                                     AgenticLoopOutcome::Cancelled,
                                 ));
                             }
-                            Some(RunControlStatus::Paused) => {
+                            Ok(Some(RunControlStatus::Paused)) => {
                                 // DB says paused, keep waiting — sync in-memory flag
                                 if let Some(ref flag) = state.cancellation.pause_flag {
                                     flag.store(true, Ordering::SeqCst);
                                 }
                             }
-                            _ => {
+                            Ok(None) => {
                                 // Run is no longer paused — clear in-memory flag and break
                                 if let Some(ref flag) = state.cancellation.pause_flag {
                                     flag.store(false, Ordering::SeqCst);
                                 }
                                 break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id,
+                                    error = %error,
+                                    "failed to poll run control status while paused"
+                                );
                             }
                         }
                     }
@@ -1163,10 +1170,17 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         let db_cancelled = if !in_memory_cancelled {
             if let Some(ref rc) = state.run_control {
                 if let Some(run_id) = state.current_run_id.as_deref() {
-                    matches!(
-                        rc.control_status(run_id).await,
-                        Some(RunControlStatus::Cancelled)
-                    )
+                    match rc.control_status(run_id).await {
+                        Ok(status) => matches!(status, Some(RunControlStatus::Cancelled)),
+                        Err(error) => {
+                            tracing::warn!(
+                                run_id,
+                                error = %error,
+                                "failed to poll run control status for cancellation"
+                            );
+                            false
+                        }
+                    }
                 } else {
                     false
                 }
@@ -1201,16 +1215,23 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         if state.run_control.is_some() {
             if let Some(run_id) = state.current_run_id.as_deref() {
                 if let Some(ref rc) = state.run_control {
-                    if matches!(
-                        rc.control_status(run_id).await,
-                        Some(RunControlStatus::Paused)
-                    ) {
-                        if let Some(ref flag) = state.cancellation.pause_flag {
-                            flag.store(true, Ordering::SeqCst);
+                    match rc.control_status(run_id).await {
+                        Ok(Some(RunControlStatus::Paused)) => {
+                            if let Some(ref flag) = state.cancellation.pause_flag {
+                                flag.store(true, Ordering::SeqCst);
+                            }
+                            // Loop back to top and re-enter the while-pause loop
+                            // instead of recursing (prevents stack overflow).
+                            continue;
                         }
-                        // Loop back to top and re-enter the while-pause loop
-                        // instead of recursing (prevents stack overflow).
-                        continue;
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                run_id,
+                                error = %error,
+                                "failed to poll run control status for pause"
+                            );
+                        }
                     }
                 }
             }
@@ -2718,8 +2739,38 @@ mod tests {
     // These tests exercise every combination of (1) and (2), plus
     // verify checkpoint and interruption record invariants.
 
+    use crate::turn::run_control::{
+        QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll,
+        RunStatusProvider,
+    };
     use std::sync::atomic::AtomicBool;
     use tokio_util::sync::CancellationToken;
+
+    struct FailingStatusRunControl;
+
+    #[async_trait::async_trait]
+    impl RunStatusProvider for FailingStatusRunControl {
+        async fn control_status(&self, _run_id: &str) -> Result<Option<RunControlStatus>, String> {
+            Err("transient db timeout".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RunInputProvider for FailingStatusRunControl {
+        async fn poll_user_inputs(
+            &self,
+            _run_id: &str,
+            after_event_index: usize,
+        ) -> RunQueuedInputPoll {
+            RunQueuedInputPoll {
+                next_cursor: after_event_index,
+                inputs: Vec::<QueuedRunInputEvent>::new(),
+                error: None,
+            }
+        }
+
+        async fn mark_user_inputs_released(&self, _run_id: &str, _event_indices: &[usize]) {}
+    }
 
     /// In-memory AtomicBool flag set → immediate cancel, no DB poll needed.
     #[tokio::test]
@@ -2894,6 +2945,27 @@ mod tests {
         assert!(
             matches!(prepared, PreparedTurnIteration::Ready(_)),
             "flag=false and token not cancelled must proceed normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_control_status_error_does_not_cancel_run() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_run_id = Some("run-control-error".to_string());
+        state.run_control = Some(Arc::new(FailingStatusRunControl));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("control-plane lookup failure should fail open");
+
+        assert!(
+            matches!(prepared, PreparedTurnIteration::Ready(_)),
+            "transient control status errors must not be treated as cancellation"
+        );
+        assert!(
+            state.interruption.is_none(),
+            "no cancellation interruption should be recorded for control-plane errors"
         );
     }
 

@@ -79,6 +79,47 @@ describe('queueDeferredRunInput', () => {
     });
   });
 
+  it('does not orphan a local queued message when submitRunInput fails', async () => {
+    const submitRunInput = jest.fn().mockRejectedValue(new Error('runtime unavailable'));
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        submitRunInput,
+      },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-1',
+      title: 'Deferred test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-1',
+        status: 'running',
+        waitingFor: null,
+      },
+    });
+
+    await expect(queueDeferredRunInput('user-a', 'chat-1', {
+      content: 'do not orphan this',
+      options: {
+        activeSkills: [],
+      },
+    })).rejects.toThrow('runtime unavailable');
+
+    expect(store.chats[0].messages).toEqual([]);
+    expect(store.chats[0].lastMessagePreview).toBe('hello');
+    expect(store.chats[0].activeRun).toEqual({
+      runId: 'run-1',
+      status: 'running',
+      waitingFor: null,
+    });
+  });
+
   it('hydrates a lost in-memory active run before submitting deferred input', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
       sessions: [{

@@ -524,4 +524,57 @@ describe('ChatView deferred-input unhappy paths', () => {
     });
     expect(screen.getByText('Previous complete answer')).toBeInTheDocument();
   });
+
+  it('refreshes chat detail when a resumed run cannot reconnect to the stream', async () => {
+    const user = userEvent.setup();
+    mockResumeChatRun.mockResolvedValue({
+      activeRun: {
+        runId: 'run-123',
+        status: 'running',
+        waitingFor: null,
+      },
+    });
+    mockStreamExistingChatRun.mockRejectedValue(new Error('stream socket closed'));
+    mockGetChat.mockResolvedValue({
+      ...makeDetail({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: 'user_resume',
+      }),
+      messages: [{
+        id: 'assistant-refreshed',
+        role: 'assistant',
+        content: 'Refreshed paused transcript',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'streaming',
+      }],
+    });
+
+    render(<ChatView initial={{
+      ...makeDetail({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: null,
+      }),
+      messages: [{
+        id: 'assistant-paused',
+        role: 'assistant',
+        content: 'Partial paused reply',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'streaming',
+      }],
+    }} />);
+
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+
+    await waitFor(() => {
+      expect(mockGetChat).toHaveBeenCalledWith('chat-123');
+    });
+    await waitFor(() => {
+      expect(screen.getByText('Refreshed paused transcript')).toBeInTheDocument();
+    });
+    expect(window.alert).toHaveBeenCalledWith(
+      'The run resumed, but the web UI could not reconnect to its stream. (stream socket closed)',
+    );
+  });
 });

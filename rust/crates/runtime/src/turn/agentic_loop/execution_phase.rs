@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, TaskBoardSnapshot,
-    finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
+    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -110,36 +110,65 @@ pub(crate) async fn poll_deferred_user_inputs(
     state: &mut AgenticLoopState,
     queued_at_tool_generation: u64,
 ) -> Vec<serde_json::Value> {
-    let mut polled_inputs = Vec::new();
     if let (Some(run_control), Some(run_id)) =
         (state.run_control.as_ref(), state.current_run_id.as_deref())
     {
-        let poll = run_control
-            .poll_user_inputs(run_id, state.messaging.deferred_user_input_cursor())
-            .await;
-        if let Some(error) = &poll.error {
-            tracing::warn!(
-                run_id,
-                error = %error,
-                "deferred user input poll failed during execution phase"
-            );
-        }
-        state
-            .messaging
-            .set_deferred_user_input_cursor(poll.next_cursor);
-        for event in poll.inputs {
-            polled_inputs.push(event.input.clone());
-            let Some(content) = deferred_user_input_text(&event.input) else {
-                continue;
-            };
-            state.messaging.push_deferred_user_input(
-                event.event_index,
-                content,
-                queued_at_tool_generation,
-            );
-        }
+        return poll_and_stage_deferred_inputs(
+            run_control.as_ref(),
+            run_id,
+            &mut state.messaging.deferred_input,
+            queued_at_tool_generation,
+            "execution phase",
+        )
+        .await
+        .inputs;
     }
-    polled_inputs
+    Vec::new()
+}
+
+pub(crate) struct DeferredInputPollResult {
+    pub inputs: Vec<serde_json::Value>,
+    pub staged_count: usize,
+}
+
+pub(crate) async fn poll_and_stage_deferred_inputs(
+    run_control: &dyn crate::turn::run_control::RunControlProvider,
+    run_id: &str,
+    deferred_input: &mut DeferredInputState,
+    queued_at_tool_generation: u64,
+    phase: &'static str,
+) -> DeferredInputPollResult {
+    let poll = run_control
+        .poll_user_inputs(run_id, deferred_input.deferred_user_input_cursor())
+        .await;
+    if let Some(error) = &poll.error {
+        tracing::warn!(
+            run_id,
+            phase,
+            error = %error,
+            "deferred user input poll failed"
+        );
+    }
+    deferred_input.set_deferred_user_input_cursor(poll.next_cursor);
+
+    let mut polled_inputs = Vec::new();
+    let mut staged_count = 0;
+    for event in poll.inputs {
+        polled_inputs.push(event.input.clone());
+        let Some(content) = deferred_user_input_text(&event.input) else {
+            continue;
+        };
+        deferred_input.push_deferred_user_input(
+            event.event_index,
+            content,
+            queued_at_tool_generation,
+        );
+        staged_count += 1;
+    }
+    DeferredInputPollResult {
+        inputs: polled_inputs,
+        staged_count,
+    }
 }
 
 pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) -> Vec<usize> {
@@ -2935,8 +2964,8 @@ mod tests {
         async fn control_status(
             &self,
             _run_id: &str,
-        ) -> Option<crate::turn::run_control::RunControlStatus> {
-            None
+        ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
+            Ok(None)
         }
     }
 

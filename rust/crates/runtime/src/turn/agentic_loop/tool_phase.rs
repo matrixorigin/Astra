@@ -21,7 +21,7 @@ use super::super::agentic::headless_round::{
 };
 use super::super::agentic::tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
 use super::execution_phase::{
-    TurnExecutionPhase, deferred_user_input_text, observe_turn_end_without_tools,
+    TurnExecutionPhase, observe_turn_end_without_tools, poll_and_stage_deferred_inputs,
 };
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
@@ -54,35 +54,16 @@ struct DeferredToolBoundaryTracker<'a> {
 impl DeferredToolBoundaryTracker<'_> {
     async fn on_completed_tool_boundary(&mut self) -> bool {
         let queued_at_tool_generation = self.deferred_input.tool_call_generation();
-        let mut ready_new_input_seen = false;
-        let poll = self
-            .run_control
-            .poll_user_inputs(
-                self.run_id,
-                self.deferred_input.deferred_user_input_cursor(),
-            )
-            .await;
-        if let Some(error) = &poll.error {
-            tracing::warn!(
-                run_id = self.run_id,
-                error = %error,
-                "deferred user input poll failed during tool boundary"
-            );
-        }
-        self.deferred_input
-            .set_deferred_user_input_cursor(poll.next_cursor);
-        for event in poll.inputs {
-            self.collected_inputs.push(event.input.clone());
-            let Some(content) = deferred_user_input_text(&event.input) else {
-                continue;
-            };
-            self.deferred_input.push_deferred_user_input(
-                event.event_index,
-                content,
-                queued_at_tool_generation,
-            );
-            ready_new_input_seen = true;
-        }
+        let poll_result = poll_and_stage_deferred_inputs(
+            self.run_control,
+            self.run_id,
+            self.deferred_input,
+            queued_at_tool_generation,
+            "tool boundary",
+        )
+        .await;
+        let ready_new_input_seen = poll_result.staged_count > 0;
+        self.collected_inputs.extend(poll_result.inputs);
         self.deferred_input.record_tool_boundary();
         if ready_new_input_seen {
             self.should_yield_to_deferred_input = true;
@@ -1776,8 +1757,8 @@ mod tests {
         async fn control_status(
             &self,
             _run_id: &str,
-        ) -> Option<crate::turn::run_control::RunControlStatus> {
-            None
+        ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
+            Ok(None)
         }
     }
 

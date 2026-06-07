@@ -26,8 +26,10 @@ pub struct RunQueuedInputPoll {
 #[async_trait]
 pub trait RunStatusProvider: Send + Sync {
     /// Returns `Some(Cancelled)`, `Some(Paused)`, or `None` if the run is
-    /// still active (or doesn't exist).
-    async fn control_status(&self, run_id: &str) -> Option<RunControlStatus>;
+    /// still active (or doesn't exist). Transient lookup failures must be
+    /// surfaced so callers do not confuse control-plane unavailability with a
+    /// durable cancel/pause signal.
+    async fn control_status(&self, run_id: &str) -> Result<Option<RunControlStatus>, String>;
 }
 
 /// Polls durable user input appended to a run while the agent is executing.
