@@ -385,7 +385,7 @@ fn color_to_rgb_approx(color: Color) -> Option<(u8, u8, u8)> {
 fn star_frame(now: Instant) -> &'static str {
     const FRAMES: [&str; 4] = ["·", "•", "●", "•"];
     let bucket = (crate::tui::shimmer::time_at(now).max(0.0) * 2.0).floor() as usize;
-    FRAMES[(bucket as usize) % FRAMES.len()]
+    FRAMES[bucket % FRAMES.len()]
 }
 
 #[cfg(test)]

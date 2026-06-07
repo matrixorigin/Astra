@@ -149,6 +149,24 @@ pub(crate) fn trailing_blank_rows(cell: &dyn HistoryCell) -> usize {
     1
 }
 
+/// Separator rows after `cell`, optionally taking the following cell
+/// into account for layout pairings. Most cells just use the generic
+/// trailing spacing above. User cards are special: they carry their
+/// own internal top/bottom breathing room, but consecutive user cards
+/// still need one plain separator row so they don't visually merge
+/// into one large tinted slab.
+pub(crate) fn separator_rows_after(
+    cell: &dyn HistoryCell,
+    next: Option<&dyn HistoryCell>,
+) -> usize {
+    if cell.as_any_ref().is::<user::UserCell>()
+        && next.is_some_and(|next| next.as_any_ref().is::<user::UserCell>())
+    {
+        return 1;
+    }
+    trailing_blank_rows(cell)
+}
+
 /// Tracks the moment a live cell freezes so the gradient gutter can
 /// pin its phase. Centralised here so all `HistoryCell` impls share
 /// one stamping discipline:

@@ -3,7 +3,7 @@ source: crates/astra-cli/src/tui/chat_widget/turn_driver.rs
 expression: "render_history(&w, 80)"
 ---
 
-› run ls
+ › run ls
 
 • Ran Bash · 42ms
   ├ ls /tmp

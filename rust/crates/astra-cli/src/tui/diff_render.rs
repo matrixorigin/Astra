@@ -245,10 +245,7 @@ mod tests {
         let added = &lines[3];
         let expected_bg = add_style().bg;
         assert!(
-            added
-                .spans
-                .iter()
-                .all(|span| span.style.bg == expected_bg),
+            added.spans.iter().all(|span| span.style.bg == expected_bg),
             "every span in an added line should carry the diff background: {added:?}"
         );
     }

@@ -252,7 +252,8 @@ impl BottomPane {
     }
 
     pub fn transcript_view_is_open(&self) -> bool {
-        self.active_view().is_some_and(|view| view.is_transcript_view())
+        self.active_view()
+            .is_some_and(|view| view.is_transcript_view())
     }
 
     pub fn close_active_view(&mut self) -> bool {

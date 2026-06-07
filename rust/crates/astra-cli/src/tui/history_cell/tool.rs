@@ -260,7 +260,7 @@ impl ToolCell {
                             || line.starts_with('+')
                             || line.starts_with('-')
                     });
-                    has_diff.then(|| Cow::Borrowed(text))
+                    has_diff.then_some(Cow::Borrowed(text))
                 })
             })?;
 
@@ -434,7 +434,10 @@ impl HistoryCell for ToolCell {
             ];
             if self.status == ToolStatus::Failed {
                 spans.push(Span::styled(" · ", meta_style));
-                spans.push(Span::styled(self.title_text(), Style::default().fg(Color::Red)));
+                spans.push(Span::styled(
+                    self.title_text(),
+                    Style::default().fg(Color::Red),
+                ));
             }
             Line::from(spans)
         };

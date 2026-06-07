@@ -17,7 +17,7 @@
 
 use std::any::Any;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
@@ -69,20 +69,36 @@ impl HistoryCell for UserCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
-        let prefix_style = Style::default()
-            .fg(theme.accent_dim())
-            .add_modifier(Modifier::DIM);
+        let prefix_style = Style::default().fg(if theme.is_light {
+            Color::DarkGray
+        } else {
+            Color::Gray
+        });
         let pad = Line::from(Span::raw("")).style(bg);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(pad.clone());
 
         if self.text.is_empty() {
-            lines.push(Line::from(Span::styled("› ", prefix_style)).style(bg));
+            lines.push(
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("›", prefix_style),
+                    Span::raw(" "),
+                ])
+                .style(bg),
+            );
         } else {
             for row in self.text.lines() {
-                let prefix = Span::styled("› ", prefix_style);
-                lines.push(Line::from(vec![prefix, Span::raw(row.to_string())]).style(bg));
+                lines.push(
+                    Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("›", prefix_style),
+                        Span::raw(" "),
+                        Span::raw(row.to_string()),
+                    ])
+                    .style(bg),
+                );
             }
         }
         lines.push(pad);

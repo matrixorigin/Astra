@@ -821,7 +821,7 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     Some(Line::from(spans))
 }
 
-/// One-line "Up next · <subject>" nudge for use when `expanded_view` is not
+/// One-line "Focus · <subject>" nudge for use when `expanded_view` is not
 /// `Tasks` but a task is in flight. Matches the reference TUI's Spinner
 /// fallback at `components/Spinner.tsx:296`.
 pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
@@ -832,10 +832,10 @@ pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'sta
         .or_else(|| tasks.iter().find(|t| t.status.is_pending()))?;
     let subject = truncate_to_width(
         &candidate.title,
-        max_subject_width(columns).saturating_sub(11), // "Up next · "
+        max_subject_width(columns).saturating_sub(9), // "Focus · "
     );
     Some(Line::from(Span::styled(
-        format!("Up next · {}", subject),
+        format!("Focus · {}", subject),
         Style::default().add_modifier(Modifier::DIM),
     )))
 }
@@ -1012,7 +1012,7 @@ mod tests {
         let hint = render_next_hint(&tasks, 80).expect("some");
         let text = spans_text(&hint);
         assert!(text.contains("running-thing"), "{text}");
-        assert!(text.starts_with("Up next · "), "{text}");
+        assert!(text.starts_with("Focus · "), "{text}");
     }
 
     #[test]

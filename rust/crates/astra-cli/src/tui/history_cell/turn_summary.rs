@@ -336,14 +336,7 @@ mod tests {
     #[test]
     fn full_summary_contains_all_sections() {
         let out = render(&mk_full(), 120);
-        for seg in [
-            "total",
-            "ttft",
-            "tokens",
-            "tools",
-            "overall",
-            "spent",
-        ] {
+        for seg in ["total", "ttft", "tokens", "tools", "overall", "spent"] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
         assert!(out.contains("145.0k"));
@@ -362,10 +355,7 @@ mod tests {
         let mut c = mk_full();
         c.ttft_ms = Some(0);
         let out = render(&c, 120);
-        assert!(
-            !out.contains("ttft"),
-            "ttft=0 must not render: {out}"
-        );
+        assert!(!out.contains("ttft"), "ttft=0 must not render: {out}");
         assert!(out.contains("total"));
     }
 

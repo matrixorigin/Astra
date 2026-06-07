@@ -3,6 +3,6 @@ source: crates/astra-cli/src/tui/history_cell/user.rs
 expression: "render_cell(&cell, 60, 5)"
 ---
 
-› first line
-› second line with more words
-› third line
+ › first line
+ › second line with more words
+ › third line

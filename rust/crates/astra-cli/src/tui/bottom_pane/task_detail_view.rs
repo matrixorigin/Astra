@@ -219,10 +219,7 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
         ),
     ]));
     if !matches!(cell.status, TaskStatus::Running) {
-        out.push(Line::from(Span::styled(
-            "  Frozen at completion",
-            dim,
-        )));
+        out.push(Line::from(Span::styled("  Frozen at completion", dim)));
     }
 
     if let Some(ms) = cell.duration_ms {

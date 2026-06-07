@@ -11,6 +11,7 @@ use crate::cli::session::session_state::ExplainMode;
 use crate::cli::session::session_state::SessionState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+use crate::tui::bottom_pane::view::BottomPaneView;
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -58,6 +59,16 @@ impl<'a> DispatchContext<'a> {
 
     fn show_error(&mut self, msg: String) {
         self.chat_widget.commit_system(SystemCell::error(msg));
+    }
+
+    fn open_view(&mut self, msg: impl Into<String>, view: Box<dyn BottomPaneView>) {
+        self.show_response(msg.into());
+        self.bottom_pane.push_view(view);
+    }
+
+    fn open_deferred_view(&mut self, msg: impl Into<String>, view: Box<dyn BottomPaneView>) {
+        self.show_response(msg.into());
+        self.bottom_pane.push_view(view);
     }
 }
 
@@ -111,7 +122,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Help ────────────────────────────────────────────────────
         "/help" | "/commands" => {
             use crate::tui::bottom_pane::help_view::HelpView;
-            ctx.bottom_pane.push_view(Box::new(HelpView::new()));
+            ctx.open_view("Opened command help", Box::new(HelpView::new()));
             SlashResult::Handled
         }
 
@@ -119,14 +130,15 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //    bare-terminal prompts that looked disjoint and stole keys) ─
         "/login" => {
             use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.bottom_pane
-                .push_view(Box::new(LoginView::new(LoginMode::Login)));
+            ctx.open_deferred_view("Opened login", Box::new(LoginView::new(LoginMode::Login)));
             SlashResult::Deferred
         }
         "/register" => {
             use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.bottom_pane
-                .push_view(Box::new(LoginView::new(LoginMode::Register)));
+            ctx.open_deferred_view(
+                "Opened registration",
+                Box::new(LoginView::new(LoginMode::Register)),
+            );
             SlashResult::Deferred
         }
 
@@ -245,7 +257,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 },
             ];
             let view = ListSelectionView::new(items, Some("Stats — choose a view:".into()));
-            ctx.bottom_pane.push_view(Box::new(view));
+            ctx.open_view("Opened stats picker", Box::new(view));
             SlashResult::Handled
         }
 
@@ -273,7 +285,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 },
             ];
             let view = ListSelectionView::new(items, Some("Skills — choose an action:".into()));
-            ctx.bottom_pane.push_view(Box::new(view));
+            ctx.open_view("Opened skills picker", Box::new(view));
             SlashResult::Handled
         }
 
@@ -282,10 +294,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::cli::permission_manager::PermissionMode;
             match args {
                 "" => {
-                    ctx.bottom_pane
-                        .push_view(Box::new(build_permission_mode_picker(
-                            ctx.state.perm_manager.mode(),
-                        )));
+                    ctx.open_view(
+                        "Opened permission mode picker",
+                        Box::new(build_permission_mode_picker(ctx.state.perm_manager.mode())),
+                    );
                     SlashResult::Handled
                 }
                 "all" | "auto" => {
@@ -316,10 +328,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "rules" | "status" => {
                     use crate::tui::bottom_pane::info_view::InfoView;
                     let summary = ctx.state.perm_manager.rules_summary();
-                    ctx.bottom_pane.push_view(Box::new(InfoView::from_plain(
-                        "Permission Rules",
-                        summary.lines().map(|l| l.to_string()).collect(),
-                    )));
+                    ctx.open_view(
+                        "Opened permission rules",
+                        Box::new(InfoView::from_plain(
+                            "Permission Rules",
+                            summary.lines().map(|l| l.to_string()).collect(),
+                        )),
+                    );
                     SlashResult::Handled
                 }
                 "trust" => {
@@ -343,8 +358,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "trace" => {
                     use crate::tui::bottom_pane::info_view::InfoView;
                     let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
-                    ctx.bottom_pane
-                        .push_view(Box::new(InfoView::from_plain("Permission Trace", lines)));
+                    ctx.open_view(
+                        "Opened permission trace",
+                        Box::new(InfoView::from_plain("Permission Trace", lines)),
+                    );
                     SlashResult::Handled
                 }
                 arg if arg.starts_with("trace --export ") => {
@@ -517,8 +534,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 None => ContextBreakdown::empty(),
             };
-            ctx.bottom_pane
-                .push_view(Box::new(ContextPanelView::new(breakdown)));
+            ctx.open_view(
+                "Opened context panel",
+                Box::new(ContextPanelView::new(breakdown)),
+            );
             SlashResult::Handled
         }
 
@@ -527,8 +546,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             Ok(ConfigCommandRoute::Panel) => {
                 use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
                 let cfg = astra_config::runtime_config::RuntimeConfig::load();
-                ctx.bottom_pane
-                    .push_view(Box::new(ConfigEditView::new(cfg)));
+                ctx.open_view("Opened config editor", Box::new(ConfigEditView::new(cfg)));
                 SlashResult::Handled
             }
             Ok(ConfigCommandRoute::Fallback) => SlashResult::Fallback,
@@ -589,8 +607,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::tui::table_view::parse;
             match parse(&output) {
                 Some(table) => {
-                    ctx.bottom_pane
-                        .push_view(Box::new(TablePanelView::new(table)));
+                    ctx.open_view("Opened table results", Box::new(TablePanelView::new(table)));
                 }
                 None => {
                     // Parser rejected — show raw output to scrollback so
@@ -605,9 +622,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/panels" => {
             use crate::tui::bottom_pane::info_view::InfoView;
             let body = build_panels_cheat_sheet_lines();
-            ctx.bottom_pane.push_view(Box::new(
-                InfoView::from_plain("TUI panels", body).with_reopen("/panels"),
-            ));
+            ctx.open_view(
+                "Opened panels cheat sheet",
+                Box::new(InfoView::from_plain("TUI panels", body).with_reopen("/panels")),
+            );
             SlashResult::Handled
         }
 
@@ -650,8 +668,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             }
             let list = WorktreeList::new(entries);
-            ctx.bottom_pane
-                .push_view(Box::new(WorktreesView::new(list)));
+            ctx.open_view("Opened worktrees", Box::new(WorktreesView::new(list)));
             SlashResult::Handled
         }
 
@@ -686,8 +703,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.show_info(format!("No turns recorded yet for session {sid}."));
                 return SlashResult::Handled;
             }
-            ctx.bottom_pane
-                .push_view(Box::new(TimelineView::new(timeline)));
+            ctx.open_view("Opened timeline", Box::new(TimelineView::new(timeline)));
             SlashResult::Handled
         }
 
@@ -729,8 +745,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.show_info("No previous sessions found.".into());
                 return SlashResult::Handled;
             }
-            ctx.bottom_pane
-                .push_view(Box::new(SessionPickerView::new(disco)));
+            ctx.open_view("Opened session picker", Box::new(SessionPickerView::new(disco)));
             SlashResult::Handled
         }
 
@@ -830,9 +845,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ("context width", format!("{} cols", ctx.width)),
             ];
 
-            ctx.bottom_pane.push_view(Box::new(
-                InfoView::from_key_value("System Info", pairs).with_reopen("/info"),
-            ));
+            ctx.open_view(
+                "Opened system info",
+                Box::new(InfoView::from_key_value("System Info", pairs).with_reopen("/info")),
+            );
             SlashResult::Handled
         }
 
@@ -848,10 +864,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             } else {
                 ""
             };
-            ctx.bottom_pane.push_view(Box::new(HistoryView::new(
-                &ctx.state.history,
-                initial_query,
-            )));
+            ctx.open_view(
+                "Opened history search",
+                Box::new(HistoryView::new(&ctx.state.history, initial_query)),
+            );
             SlashResult::Handled
         }
 
@@ -910,23 +926,29 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             is_current: false,
                         },
                     ];
-                    ctx.bottom_pane.push_view(Box::new(ListSelectionView::new(
-                        items,
-                        Some("Project Instructions:".into()),
-                    )));
+                    ctx.open_view(
+                        "Opened project instructions",
+                        Box::new(ListSelectionView::new(
+                            items,
+                            Some("Project Instructions:".into()),
+                        )),
+                    );
                     SlashResult::Handled
                 }
                 "show" => {
                     if let Some(ref pi) = ctx.state.project_instructions {
                         let line_count = pi.lines().count();
                         let title = format!("Project Instructions ({line_count} lines)");
-                        ctx.bottom_pane.push_view(Box::new(
-                            InfoView::from_plain(
-                                &title,
-                                pi.lines().map(|l| format!("  {l}")).collect(),
-                            )
-                            .with_reopen("/instructions"),
-                        ));
+                        ctx.open_view(
+                            "Opened project instructions",
+                            Box::new(
+                                InfoView::from_plain(
+                                    &title,
+                                    pi.lines().map(|l| format!("  {l}")).collect(),
+                                )
+                                .with_reopen("/instructions"),
+                            ),
+                        );
                     } else {
                         ctx.show_info("No project instructions loaded. Create .astra/instructions.md in your project root.".into());
                     }
@@ -1022,10 +1044,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 match crate::edge_tools::memoria::memoria_health().await {
                     Ok(body) => {
                         let lines = crate::cli::slash::slash_memory::memory_health_lines(&body);
-                        ctx.bottom_pane.push_view(Box::new(
-                            InfoView::from_plain("Memory Health", lines)
-                                .with_reopen("/memory health"),
-                        ));
+                        ctx.open_view(
+                            "Opened memory health",
+                            Box::new(
+                                InfoView::from_plain("Memory Health", lines)
+                                    .with_reopen("/memory health"),
+                            ),
+                        );
                     }
                     Err(e) => ctx.show_error(format!("Memory health failed: {e}")),
                 }
@@ -1062,10 +1087,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
                                 let lines =
                                     crate::cli::slash::slash_memory::memory_stats_lines(&arr);
-                                ctx.bottom_pane.push_view(Box::new(
-                                    InfoView::from_plain("Memory Stats", lines)
-                                        .with_reopen("/memory stats"),
-                                ));
+                                ctx.open_view(
+                                    "Opened memory stats",
+                                    Box::new(
+                                        InfoView::from_plain("Memory Stats", lines)
+                                            .with_reopen("/memory stats"),
+                                    ),
+                                );
                                 return SlashResult::Handled;
                             }
                             let mut hidden_session_entries = 0usize;
@@ -1117,10 +1145,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                                     String::new()
                                 }
                             );
-                            ctx.bottom_pane.push_view(Box::new(
-                                ListSelectionView::new(items, Some(header))
-                                    .with_footer_hint("↑↓ navigate · q / Esc close"),
-                            ));
+                            ctx.open_view(
+                                "Opened memory browser",
+                                Box::new(
+                                    ListSelectionView::new(items, Some(header))
+                                        .with_footer_hint("↑↓ navigate · q / Esc close"),
+                                ),
+                            );
                             SlashResult::Handled
                         }
                         Ok(_) => {
@@ -2618,7 +2649,7 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_result_prefix(MODEL_PICK_SENTINEL);
-        ctx.bottom_pane.push_view(Box::new(view));
+        ctx.open_deferred_view("Opened model picker", Box::new(view));
         true
     }
 }
@@ -2800,10 +2831,10 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         ));
     }
 
-    ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value(
-        &format!("Model · {name}"),
-        pairs,
-    )));
+    ctx.open_view(
+        format!("Opened model info · {name}"),
+        Box::new(InfoView::from_key_value(&format!("Model · {name}"), pairs)),
+    );
     SlashResult::Handled
 }
 
@@ -2959,8 +2990,10 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
     } else {
         format!("Session · {sid_short}")
     };
-    ctx.bottom_pane
-        .push_view(Box::new(InfoView::from_key_value(&title, pairs)));
+    ctx.open_view(
+        format!("Opened {title}"),
+        Box::new(InfoView::from_key_value(&title, pairs)),
+    );
     SlashResult::Handled
 }
 
@@ -3017,8 +3050,7 @@ async fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult 
         ctx.show_info("No previous sessions found.".into());
         return SlashResult::Handled;
     }
-    ctx.bottom_pane
-        .push_view(Box::new(SessionPickerView::new(disco)));
+    ctx.open_view("Opened session list", Box::new(SessionPickerView::new(disco)));
     SlashResult::Handled
 }
 
@@ -3038,6 +3070,8 @@ fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
         ctx.show_info(format!("No journal events for session {sid}."));
         return SlashResult::Handled;
     }
+    let sid_short = if sid.len() > 8 { &sid[..8] } else { &sid };
+    ctx.show_response(format!("Opened session history · {sid_short}"));
     push_history_info(ctx, &sid, &events);
     SlashResult::Handled
 }
@@ -3064,9 +3098,10 @@ async fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult 
         ctx.show_info("No previous sessions to fork from.".into());
         return SlashResult::Handled;
     }
-    ctx.bottom_pane.push_view(Box::new(
-        SessionPickerView::new(disco).with_result_prefix(FORK_PICK_SENTINEL),
-    ));
+    ctx.open_view(
+        "Opened session fork picker",
+        Box::new(SessionPickerView::new(disco).with_result_prefix(FORK_PICK_SENTINEL)),
+    );
     SlashResult::Handled
 }
 
@@ -3185,10 +3220,13 @@ fn push_analyze_summary(ctx: &mut DispatchContext<'_>, sid: &str) {
     ));
 
     let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
-    ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value(
-        &format!("Session analyze · {sid_short}"),
-        pairs,
-    )));
+    ctx.open_view(
+        format!("Opened session analysis · {sid_short}"),
+        Box::new(InfoView::from_key_value(
+            &format!("Session analyze · {sid_short}"),
+            pairs,
+        )),
+    );
 }
 
 fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
@@ -3635,6 +3673,41 @@ mod panels_tests {
             );
         }
     }
+
+    #[test]
+    fn session_hub_view_emits_transcript_response() {
+        let source = include_str!("slash_dispatch.rs");
+        let start = source
+            .find("fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {")
+            .expect("handle_session_hub must exist");
+        let end = source[start..]
+            .find("fn session_hub_persistence_error(")
+            .map(|offset| start + offset)
+            .expect("session hub helper should end before session_hub_persistence_error");
+        let body = &source[start..end];
+        assert!(
+            body.contains("ctx.open_view("),
+            "/session should emit a transcript response before opening the hub"
+        );
+    }
+
+    #[test]
+    fn session_views_emit_transcript_responses() {
+        let source = include_str!("slash_dispatch.rs");
+        for needle in [
+            "ctx.open_view(\"Opened session list\", Box::new(SessionPickerView::new(disco)));",
+            "ctx.show_response(format!(\"Opened session history · {sid_short}\"));",
+            "ctx.open_view(",
+            "Opened session fork picker",
+            "Opened session analysis · {sid_short}",
+        ] {
+            assert!(
+                source.contains(needle),
+                "session view slash commands must emit transcript responses: missing {needle}"
+            );
+        }
+    }
+
 }
 
 #[cfg(test)]

@@ -124,9 +124,10 @@ fn render_history_batch_lines(
     // its transcript role. Slash command pairs stay tight, compact notes keep
     // a single blank, and primary content blocks get a little more air.
     let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for cell in cells {
+    for (idx, cell) in cells.iter().enumerate() {
         batch.extend(cell.display_lines(width));
-        for _ in 0..history_cell::trailing_blank_rows(cell.as_ref()) {
+        let next = cells.get(idx + 1).map(|next| next.as_ref());
+        for _ in 0..history_cell::separator_rows_after(cell.as_ref(), next) {
             batch.push(ratatui::text::Line::default());
         }
     }
@@ -138,9 +139,14 @@ fn render_transcript_view_lines(
     width: u16,
 ) -> Vec<ratatui::text::Line<'static>> {
     let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for cell in chat_widget.history() {
+    let history = chat_widget.history();
+    for (idx, cell) in history.iter().enumerate() {
         lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
-        for _ in 0..history_cell::trailing_blank_rows(cell.as_ref()) {
+        let next = history
+            .get(idx + 1)
+            .map(|next| next.as_ref())
+            .or_else(|| chat_widget.active_cell());
+        for _ in 0..history_cell::separator_rows_after(cell.as_ref(), next) {
             lines.push(ratatui::text::Line::default());
         }
     }
@@ -4017,8 +4023,7 @@ mod tests {
             .position(|line| line.contains("Mode → auto"))
             .expect("response row present");
         assert_eq!(
-            response_idx,
-            slash_rows,
+            response_idx, slash_rows,
             "slash response should start right after the slash card's own breathing room"
         );
     }
@@ -4029,9 +4034,9 @@ mod tests {
         w.handle_event(chat_widget::AppEvent::User(chat_widget::UserEvent::Submit(
             "review".into(),
         )));
-        w.handle_event(chat_widget::AppEvent::Wire(chat_widget::WireEvent::AnswerDelta(
-            "still working".into(),
-        )));
+        w.handle_event(chat_widget::AppEvent::Wire(
+            chat_widget::WireEvent::AnswerDelta("still working".into()),
+        ));
 
         let rendered = render_transcript_view_lines(&w, 80);
         let text: Vec<String> = rendered

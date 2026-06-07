@@ -31,9 +31,11 @@ use crate::tui::testing::render::{buffer_to_string, draw_widget};
 /// content regressions.
 fn render_history(w: &ChatWidget, width: u16) -> String {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
-    for cell in w.history() {
+    let history = w.history();
+    for (idx, cell) in history.iter().enumerate() {
         all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
-        for _ in 0..crate::tui::history_cell::trailing_blank_rows(cell.as_ref()) {
+        let next = history.get(idx + 1).map(|next| next.as_ref());
+        for _ in 0..crate::tui::history_cell::separator_rows_after(cell.as_ref(), next) {
             all_lines.push(Line::default());
         }
     }

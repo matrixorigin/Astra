@@ -3,4 +3,4 @@ source: crates/astra-cli/src/tui/history_cell/user.rs
 expression: "render_cell(&cell, 40, 3)"
 ---
 
-› rebuild the index
+ › rebuild the index
