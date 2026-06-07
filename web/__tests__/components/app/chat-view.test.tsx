@@ -428,4 +428,52 @@ describe('ChatView deferred-input unhappy paths', () => {
       );
     });
   });
+
+  it('patches the paused streaming assistant instead of the last completed assistant on resume', async () => {
+    const user = userEvent.setup();
+    mockResumeChatRun.mockResolvedValue({
+      activeRun: {
+        runId: 'run-123',
+        status: 'running',
+        waitingFor: null,
+      },
+    });
+    mockStreamExistingChatRun.mockImplementation(async (_chatId, _runId, handlers) => {
+      handlers.onText?.('Resumed patch');
+      handlers.onDone?.('Resumed final');
+      return 'Resumed final';
+    });
+
+    render(<ChatView initial={{
+      ...makeDetail({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: null,
+      }),
+      messages: [
+        {
+          id: 'assistant-paused',
+          role: 'assistant',
+          content: 'Partial paused reply',
+          createdAt: '2026-06-07T00:00:00.000Z',
+          status: 'streaming',
+        },
+        {
+          id: 'assistant-complete',
+          role: 'assistant',
+          content: 'Later completed note',
+          createdAt: '2026-06-07T00:00:01.000Z',
+          status: 'complete',
+        },
+      ],
+    }} />);
+
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Resumed final')).toBeInTheDocument();
+    });
+    expect(screen.getByText('Later completed note')).toBeInTheDocument();
+    expect(screen.queryByText('Partial paused reply')).not.toBeInTheDocument();
+  });
 });

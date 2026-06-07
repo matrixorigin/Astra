@@ -351,7 +351,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     runControlMutationRef.current = true;
     const assistantMessageId = [...detail.messages]
       .reverse()
-      .find((message) => message.role === 'assistant')?.id;
+      .find((message) => (
+        message.role === 'assistant'
+        && (message.status === 'streaming' || message.reasoningStatus === 'streaming')
+      ))?.id;
     setResumingRun(true);
     try {
       const result = await resumeChatRun(detail.chat.id);
