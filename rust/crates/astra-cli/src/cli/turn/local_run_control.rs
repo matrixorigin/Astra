@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use astra_core::sync_poison::recover_mutex_lock;
 use astra_runtime::turn::run_control::{
-    QueuedRunInputEvent, RunControlProvider, RunControlStatus, RunQueuedInputPoll,
+    QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll, RunStatusProvider,
 };
 use serde_json::Value;
 
@@ -47,11 +47,14 @@ impl LocalDeferredInputRunControl {
 }
 
 #[async_trait::async_trait]
-impl RunControlProvider for LocalDeferredInputRunControl {
+impl RunStatusProvider for LocalDeferredInputRunControl {
     async fn control_status(&self, _run_id: &str) -> Option<RunControlStatus> {
         None
     }
+}
 
+#[async_trait::async_trait]
+impl RunInputProvider for LocalDeferredInputRunControl {
     async fn poll_user_inputs(
         &self,
         _run_id: &str,

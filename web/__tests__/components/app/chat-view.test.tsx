@@ -227,6 +227,34 @@ describe('ChatView deferred-input unhappy paths', () => {
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
+  it('does not queue input for terminal active-run statuses', async () => {
+    const user = userEvent.setup();
+    mockStreamChatMessage.mockResolvedValue('new answer');
+
+    render(<ChatView initial={makeDetail({
+      runId: 'run-123',
+      status: 'completed',
+      waitingFor: null,
+    })} />);
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+
+    await waitFor(() => {
+      expect(mockStreamChatMessage).toHaveBeenCalledWith(
+        'chat-123',
+        {
+          content: 'queue this follow-up',
+          options: composerPayload.options,
+          pendingMessageId: undefined,
+        },
+        expect.objectContaining({
+          signal: expect.any(AbortSignal),
+        }),
+      );
+    });
+    expect(mockQueueChatRunInput).not.toHaveBeenCalled();
+  });
+
   it('lets the web user resume a paused run instead of trapping the composer', async () => {
     const user = userEvent.setup();
     mockResumeChatRun.mockResolvedValue({

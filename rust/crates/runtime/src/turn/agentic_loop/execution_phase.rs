@@ -2560,6 +2560,7 @@ pub(crate) fn observe_turn_end_without_tools(
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
 ) {
+    state.messaging.tool_call_generation = state.messaging.tool_call_generation.saturating_add(1);
     if let (Some(hub), Some(session)) = (
         state.telemetry.observability_hub.as_ref(),
         state.telemetry.observability_session.as_ref(),
@@ -2871,7 +2872,7 @@ mod tests {
     use crate::turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, VolatileKind, run_agentic_loop_with_host,
     };
-    use crate::turn::run_control::{RunControlProvider, RunQueuedInputPoll};
+    use crate::turn::run_control::{RunInputProvider, RunQueuedInputPoll, RunStatusProvider};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     struct SnapshotClearingHost {
@@ -2907,14 +2908,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl RunControlProvider for StubRunControlProvider {
+    impl RunStatusProvider for StubRunControlProvider {
         async fn control_status(
             &self,
             _run_id: &str,
         ) -> Option<crate::turn::run_control::RunControlStatus> {
             None
         }
+    }
 
+    #[async_trait]
+    impl RunInputProvider for StubRunControlProvider {
         async fn poll_user_inputs(
             &self,
             _run_id: &str,
@@ -2988,6 +2992,7 @@ mod tests {
         state.session_turn = 6;
         state.max_turns = 20;
         state.remaining_turns = 4;
+        state.messaging.tool_call_generation = 41;
         let hub = ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         state.telemetry.observability_hub = Some(Arc::new(hub));
@@ -2996,6 +3001,7 @@ mod tests {
         let turn_start_time = Instant::now() - Duration::from_millis(25);
         observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
 
+        assert_eq!(state.messaging.tool_call_generation, 42);
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);

@@ -474,6 +474,7 @@ function proxyRunStream(params: {
         });
         controller.enqueue(sseFrame({ type: 'error', message }));
       } finally {
+        reader.releaseLock();
         controller.close();
       }
     },

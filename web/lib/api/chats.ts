@@ -86,6 +86,7 @@ export function resumeChatRun(chatId: string) {
 }
 
 export type ChatStreamHandlers = {
+  signal?: AbortSignal;
   onLocalMessages?: (messages: { userMessage: ChatMessage; assistantMessage: ChatMessage }) => void;
   onArtifacts?: (artifacts: NonNullable<ChatMessage['artifacts']>) => void;
   onReasoning?: (reasoning: string) => void;
@@ -342,31 +343,39 @@ async function consumeChatStream(response: Response, handlers: ChatStreamHandler
   const state: ChatStreamState = { rawText: '', text: '', reasoning: '' };
   let buffer = '';
 
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  try {
+    for (;;) {
+      if (handlers.signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('The chat stream was aborted.', 'AbortError');
+      }
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() ?? '';
+      for (const frame of frames) {
+        const event = parseSseFrame(frame);
+        if (event) {
+          applyStreamEvent(event, state, handlers);
+        }
+      }
     }
-    buffer += decoder.decode(value, { stream: true });
-    const frames = buffer.split(/\r?\n\r?\n/);
-    buffer = frames.pop() ?? '';
-    for (const frame of frames) {
-      const event = parseSseFrame(frame);
+
+    const tail = decoder.decode();
+    if (tail) {
+      buffer += tail;
+    }
+    if (buffer.trim()) {
+      const event = parseSseFrame(buffer);
       if (event) {
         applyStreamEvent(event, state, handlers);
       }
     }
-  }
-
-  const tail = decoder.decode();
-  if (tail) {
-    buffer += tail;
-  }
-  if (buffer.trim()) {
-    const event = parseSseFrame(buffer);
-    if (event) {
-      applyStreamEvent(event, state, handlers);
-    }
+  } finally {
+    reader.releaseLock();
   }
 
   if (state.error) {
@@ -393,6 +402,7 @@ export async function streamChatMessage(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal: handlers.signal,
   });
   return consumeChatStream(response, handlers);
 }
@@ -404,7 +414,7 @@ export async function streamExistingChatRun(
 ) {
   const response = await fetch(
     `/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`,
-    { method: 'GET' },
+    { method: 'GET', signal: handlers.signal },
   );
   return consumeChatStream(response, handlers);
 }

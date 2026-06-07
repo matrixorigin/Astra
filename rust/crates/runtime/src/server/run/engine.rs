@@ -504,16 +504,19 @@ impl RunEngine {
 }
 
 use crate::turn::run_control::{
-    QueuedRunInputEvent, RunControlProvider, RunControlStatus, RunQueuedInputPoll,
+    QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll, RunStatusProvider,
 };
 
 #[async_trait::async_trait]
-impl RunControlProvider for RunEngine {
+impl RunStatusProvider for RunEngine {
     #[allow(clippy::blocks_in_conditions)]
     async fn control_status(&self, run_id: &str) -> Option<RunControlStatus> {
         self.check_control_status(run_id).await.ok().flatten()
     }
+}
 
+#[async_trait::async_trait]
+impl RunInputProvider for RunEngine {
     async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll {
         let Some(run) = self.store.load_run(run_id).await.ok().flatten() else {
             return RunQueuedInputPoll {
@@ -521,12 +524,13 @@ impl RunControlProvider for RunEngine {
                 inputs: Vec::new(),
             };
         };
+        let start_index = after_event_index.min(run.events.len());
 
         let inputs = run
             .events
             .iter()
             .enumerate()
-            .skip(after_event_index)
+            .skip(start_index)
             .filter_map(|(event_index, event)| {
                 let payload = event
                     .get("event_type")
@@ -543,7 +547,7 @@ impl RunControlProvider for RunEngine {
             .collect();
 
         RunQueuedInputPoll {
-            next_cursor: run.events.len(),
+            next_cursor: after_event_index.max(run.events.len()),
             inputs,
         }
     }
@@ -973,6 +977,30 @@ mod tests {
             engine.check_control_status("cancelled").await.unwrap(),
             Some(RunControlStatus::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn poll_user_inputs_keeps_cursor_when_after_index_exceeds_events() {
+        let engine = test_engine();
+        engine
+            .start_run("run-input", "user-1", "sess-input")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "run-input",
+                serde_json::json!({
+                    "event_type": "user_input",
+                    "data": { "input": { "content": "queued" } },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let poll = engine.poll_user_inputs("run-input", 99).await;
+
+        assert_eq!(poll.next_cursor, 99);
+        assert!(poll.inputs.is_empty());
     }
 
     #[tokio::test]

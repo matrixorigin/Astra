@@ -20,24 +20,28 @@ pub struct RunQueuedInputPoll {
     pub inputs: Vec<QueuedRunInputEvent>,
 }
 
-/// This trait lets the agentic loop periodically poll the database for the
-/// authoritative run status, enabling cross-pod control without sticky sessions.
+/// Polls the database for the authoritative run status, enabling cross-pod
+/// cancel/pause control without sticky sessions.
 #[async_trait]
-pub trait RunControlProvider: Send + Sync {
+pub trait RunStatusProvider: Send + Sync {
     /// Returns `Some(Cancelled)`, `Some(Paused)`, or `None` if the run is
     /// still active (or doesn't exist).
     async fn control_status(&self, run_id: &str) -> Option<RunControlStatus>;
+}
 
+/// Polls durable user input appended to a run while the agent is executing.
+#[async_trait]
+pub trait RunInputProvider: Send + Sync {
     /// Poll deferred `user_input` events appended to a durable run after the
     /// provided exclusive cursor.
-    async fn poll_user_inputs(
-        &self,
-        _run_id: &str,
-        after_event_index: usize,
-    ) -> RunQueuedInputPoll {
-        RunQueuedInputPoll {
-            next_cursor: after_event_index,
-            inputs: Vec::new(),
-        }
-    }
+    async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll;
 }
+
+/// Full run-control surface required by the agentic loop.
+///
+/// This is intentionally a composition of the status and input traits instead
+/// of a trait with optional no-op methods. Implementors must explicitly provide
+/// both halves, so a missing deferred-input implementation fails at compile time.
+pub trait RunControlProvider: RunStatusProvider + RunInputProvider {}
+
+impl<T> RunControlProvider for T where T: RunStatusProvider + RunInputProvider + Send + Sync {}

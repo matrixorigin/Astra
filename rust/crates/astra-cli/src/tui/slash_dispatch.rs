@@ -745,7 +745,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.show_info("No previous sessions found.".into());
                 return SlashResult::Handled;
             }
-            ctx.open_view("Opened session picker", Box::new(SessionPickerView::new(disco)));
+            ctx.open_view(
+                "Opened session picker",
+                Box::new(SessionPickerView::new(disco)),
+            );
             SlashResult::Handled
         }
 
@@ -3050,7 +3053,10 @@ async fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult 
         ctx.show_info("No previous sessions found.".into());
         return SlashResult::Handled;
     }
-    ctx.open_view("Opened session list", Box::new(SessionPickerView::new(disco)));
+    ctx.open_view(
+        "Opened session list",
+        Box::new(SessionPickerView::new(disco)),
+    );
     SlashResult::Handled
 }
 
@@ -3707,7 +3713,6 @@ mod panels_tests {
             );
         }
     }
-
 }
 
 #[cfg(test)]

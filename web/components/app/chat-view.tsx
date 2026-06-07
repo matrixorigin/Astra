@@ -16,6 +16,12 @@ import { getChat, queueChatRunInput, resumeChatRun, stopChatRun, streamChatMessa
 import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
+const QUEUEABLE_RUN_STATUSES = new Set(['running', 'waiting']);
+
 export function ChatView({ initial }: { initial: ChatDetail }) {
   const router = useRouter();
   const [detail, setDetail] = useState(initial);
@@ -26,6 +32,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
   const lifecycle = useChatLifecycleActions({ onChatUpdated: setDetail });
 
   const latestMessage = detail.messages[detail.messages.length - 1];
@@ -35,8 +42,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const canQueueDeferredInput = Boolean(
     detail.activeRun?.runId
       && activeRunStatus
-      && activeRunStatus !== 'paused'
-      && activeRunStatus !== 'cancelling',
+      && QUEUEABLE_RUN_STATUSES.has(activeRunStatus),
   );
   const canResumeRun = Boolean(
     detail.activeRun?.runId
@@ -63,7 +69,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         ? `Run ${detail.activeRun.status}`
         : isArchived
           ? 'Archived'
-          : 'Active';
+        : 'Active';
+
+  const nextStreamAbortSignal = useCallback(() => {
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    return controller.signal;
+  }, []);
 
   const startStream = useCallback(async ({
     text,
@@ -127,6 +140,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         options,
         pendingMessageId,
       }, {
+        signal: nextStreamAbortSignal(),
         onRunStarted: (runId) => {
           setStartingRun(false);
           setDetail((current) => ({
@@ -190,6 +204,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         },
       });
     } catch (error) {
+      if (isAbortError(error)) {
+        return;
+      }
       if (isAuthRequiredError(error)) {
         router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
         return;
@@ -212,7 +229,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     } finally {
       setStartingRun(false);
     }
-  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router]);
+  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, nextStreamAbortSignal, router]);
 
   const queueDeferredInput = useCallback(async ({
     text,
@@ -249,8 +266,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         if (refreshed) {
           setDetail(refreshed);
           if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
-            await startStream({ text, options, appendUser: true });
-            return;
+            try {
+              await startStream({ text, options, appendUser: true });
+              return;
+            } catch (fallbackError) {
+              window.alert(fallbackError instanceof Error ? fallbackError.message : 'Failed to start a new run.');
+              return;
+            }
           }
         }
       }
@@ -308,58 +330,79 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           )),
         }));
       };
-      await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
-        onRunUpdated: (run) => {
-          setDetail((current) => ({
-            ...current,
-            activeRun: {
-              runId: run.runId,
-              status: run.status,
-              waitingFor: run.waitingFor ?? null,
-            },
-          }));
-        },
-        onRunFinished: () => {
-          setStoppingRun(false);
-          setDetail((current) => ({
-            ...current,
-            activeRun: undefined,
-          }));
-        },
-        onReasoning: (reasoning) => {
-          patchAssistant({ reasoning, reasoningStatus: 'streaming', status: 'streaming' });
-        },
-        onReasoningDone: (reasoning) => {
-          patchAssistant({ reasoning, reasoningStatus: 'complete', status: 'streaming' });
-        },
-        onText: (content) => {
-          patchAssistant({ content, status: 'streaming' });
-        },
-        onArtifacts: (artifacts) => {
-          patchAssistant({ artifacts });
-        },
-        onDone: (content) => {
-          patchAssistant({
-            content: content || 'Astra completed the run without returning visible text.',
-            reasoningStatus: 'complete',
-            status: 'complete',
-          });
-        },
-        onCancelled: (content) => {
-          patchAssistant({
-            content: content || 'Stopped.',
-            reasoningStatus: 'complete',
-            status: 'complete',
-          });
-        },
-        onPaused: (content) => {
-          patchAssistant({
-            content,
-            status: 'streaming',
-          });
-        },
-      });
+      try {
+        await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+          signal: nextStreamAbortSignal(),
+          onRunUpdated: (run) => {
+            setDetail((current) => ({
+              ...current,
+              activeRun: {
+                runId: run.runId,
+                status: run.status,
+                waitingFor: run.waitingFor ?? null,
+              },
+            }));
+          },
+          onRunFinished: () => {
+            setStoppingRun(false);
+            setDetail((current) => ({
+              ...current,
+              activeRun: undefined,
+            }));
+          },
+          onReasoning: (reasoning) => {
+            patchAssistant({ reasoning, reasoningStatus: 'streaming', status: 'streaming' });
+          },
+          onReasoningDone: (reasoning) => {
+            patchAssistant({ reasoning, reasoningStatus: 'complete', status: 'streaming' });
+          },
+          onText: (content) => {
+            patchAssistant({ content, status: 'streaming' });
+          },
+          onArtifacts: (artifacts) => {
+            patchAssistant({ artifacts });
+          },
+          onDone: (content) => {
+            patchAssistant({
+              content: content || 'Astra completed the run without returning visible text.',
+              reasoningStatus: 'complete',
+              status: 'complete',
+            });
+          },
+          onCancelled: (content) => {
+            patchAssistant({
+              content: content || 'Stopped.',
+              reasoningStatus: 'complete',
+              status: 'complete',
+            });
+          },
+          onPaused: (content) => {
+            patchAssistant({
+              content,
+              status: 'streaming',
+            });
+          },
+        });
+      } catch (streamError) {
+        if (isAbortError(streamError)) {
+          return;
+        }
+        if (isAuthRequiredError(streamError)) {
+          router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+          return;
+        }
+        if (isNotFoundError(streamError)) {
+          router.replace(chatListHref);
+          return;
+        }
+        window.alert(streamError instanceof Error
+          ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
+          : 'The run resumed, but the web UI could not reconnect to its stream.');
+      }
     } catch (error) {
+      if (isAbortError(error)) {
+        return;
+      }
       if (isAuthRequiredError(error)) {
         router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
         return;
@@ -372,7 +415,11 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     } finally {
       setResumingRun(false);
     }
-  }, [canResumeRun, chatListHref, detail.activeRun?.runId, detail.chat.id, detail.messages, router]);
+  }, [canResumeRun, chatListHref, detail.activeRun?.runId, detail.chat.id, detail.messages, nextStreamAbortSignal, router]);
+
+  useEffect(() => () => {
+    streamAbortRef.current?.abort();
+  }, []);
 
   useEffect(() => {
     if (pinnedRef.current) {

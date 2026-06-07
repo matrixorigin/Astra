@@ -3393,7 +3393,7 @@ fn handle_app_event(
 mod tests {
     use super::*;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
-    use astra_runtime::turn::run_control::RunControlProvider;
+    use astra_runtime::turn::run_control::RunInputProvider;
 
     /// REGRESSION (reviewer L3 — Architecture): the
     /// `ReopenTarget::as_str() ↔ ReopenTarget::parse()` round-trip
