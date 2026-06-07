@@ -117,6 +117,13 @@ pub(crate) async fn poll_deferred_user_inputs(
         let poll = run_control
             .poll_user_inputs(run_id, state.messaging.deferred_user_input_cursor)
             .await;
+        if let Some(error) = &poll.error {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "deferred user input poll failed during execution phase"
+            );
+        }
         state.messaging.deferred_user_input_cursor = poll.next_cursor;
         for event in poll.inputs {
             polled_inputs.push(event.input.clone());
@@ -2954,6 +2961,7 @@ mod tests {
                 .unwrap_or(RunQueuedInputPoll {
                     next_cursor: after_event_index,
                     inputs: Vec::new(),
+                    error: None,
                 })
         }
 
@@ -4748,10 +4756,12 @@ mod tests {
                     event_index: 1,
                     input: serde_json::json!({"content": "Switch to writing tests first."}),
                 }],
+                error: None,
             },
             RunQueuedInputPoll {
                 next_cursor: 2,
                 inputs: Vec::new(),
+                error: None,
             },
         ]));
         state.run_control = Some(provider.clone());
@@ -4798,14 +4808,17 @@ mod tests {
                     event_index: 3,
                     input: serde_json::json!("Stop reading and patch the code."),
                 }],
+                error: None,
             },
             RunQueuedInputPoll {
                 next_cursor: 4,
                 inputs: Vec::new(),
+                error: None,
             },
             RunQueuedInputPoll {
                 next_cursor: 4,
                 inputs: Vec::new(),
+                error: None,
             },
         ])));
 
@@ -4849,6 +4862,7 @@ mod tests {
             RunQueuedInputPoll {
                 next_cursor: 0,
                 inputs: Vec::new(),
+                error: None,
             },
             RunQueuedInputPoll {
                 next_cursor: 5,
@@ -4856,10 +4870,12 @@ mod tests {
                     event_index: 4,
                     input: serde_json::json!({"content": "Stop and respond to the user first."}),
                 }],
+                error: None,
             },
             RunQueuedInputPoll {
                 next_cursor: 5,
                 inputs: Vec::new(),
+                error: None,
             },
         ])));
 

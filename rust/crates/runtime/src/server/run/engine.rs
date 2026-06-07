@@ -520,11 +520,27 @@ impl RunStatusProvider for RunEngine {
 #[async_trait::async_trait]
 impl RunInputProvider for RunEngine {
     async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll {
-        let Some(run) = self.store.load_run(run_id).await.ok().flatten() else {
-            return RunQueuedInputPoll {
-                next_cursor: after_event_index,
-                inputs: Vec::new(),
-            };
+        let run = match self.store.load_run(run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                return RunQueuedInputPoll {
+                    next_cursor: after_event_index,
+                    inputs: Vec::new(),
+                    error: None,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id,
+                    error = %error,
+                    "failed to poll queued user inputs from run store"
+                );
+                return RunQueuedInputPoll {
+                    next_cursor: after_event_index,
+                    inputs: Vec::new(),
+                    error: Some(error),
+                };
+            }
         };
         let start_index = after_event_index.min(run.events.len());
 
@@ -551,6 +567,7 @@ impl RunInputProvider for RunEngine {
         RunQueuedInputPoll {
             next_cursor: after_event_index.max(run.events.len()),
             inputs,
+            error: None,
         }
     }
 
@@ -674,6 +691,110 @@ mod tests {
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
+    }
+
+    struct FailingLoadRunStore;
+
+    #[async_trait::async_trait]
+    impl RunStateStore for FailingLoadRunStore {
+        async fn insert_run(&self, _record: DurableRunRecord) -> Result<(), String> {
+            Err("store unavailable".into())
+        }
+
+        async fn load_run(&self, _run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+            Err("load failed".into())
+        }
+
+        async fn update_run_status(
+            &self,
+            _run_id: &str,
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_run_usage(
+            &self,
+            _run_id: &str,
+            _prompt_tokens: u64,
+            _completion_tokens: u64,
+            _tool_calls: u32,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn save_checkpoint(
+            &self,
+            _run_id: &str,
+            _checkpoint_json: &str,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn load_latest_checkpoint(
+            &self,
+            _run_id: &str,
+            _checkpoint_kind: Option<&str>,
+        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn load_run_projection(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn append_events_batch(
+            &self,
+            _run_id: &str,
+            _events: &[serde_json::Value],
+        ) -> Result<(), String> {
+            Err("store unavailable".into())
+        }
+
+        async fn list_user_runs(
+            &self,
+            _user_id: &str,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_blocking_session_run(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_sub_runs(
+            &self,
+            _delegation_id: &str,
+        ) -> Result<Vec<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_retry_count(
+            &self,
+            _run_id: &str,
+            _retry_count: u32,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
     }
 
     #[tokio::test]
@@ -1027,6 +1148,18 @@ mod tests {
 
         assert_eq!(poll.next_cursor, 99);
         assert!(poll.inputs.is_empty());
+        assert_eq!(poll.error, None);
+    }
+
+    #[tokio::test]
+    async fn poll_user_inputs_reports_store_load_errors() {
+        let engine = RunEngine::new(Arc::new(FailingLoadRunStore));
+
+        let poll = engine.poll_user_inputs("run-input", 7).await;
+
+        assert_eq!(poll.next_cursor, 7);
+        assert!(poll.inputs.is_empty());
+        assert_eq!(poll.error.as_deref(), Some("load failed"));
     }
 
     #[tokio::test]

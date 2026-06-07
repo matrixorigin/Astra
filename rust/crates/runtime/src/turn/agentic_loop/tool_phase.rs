@@ -61,6 +61,13 @@ impl DeferredToolBoundaryTracker<'_> {
             .run_control
             .poll_user_inputs(self.run_id, *self.deferred_user_input_cursor)
             .await;
+        if let Some(error) = &poll.error {
+            tracing::warn!(
+                run_id = self.run_id,
+                error = %error,
+                "deferred user input poll failed during tool boundary"
+            );
+        }
         *self.deferred_user_input_cursor = poll.next_cursor;
         for event in poll.inputs {
             self.collected_inputs.push(event.input.clone());
@@ -1789,6 +1796,7 @@ mod tests {
                 .unwrap_or(RunQueuedInputPoll {
                     next_cursor: after_event_index,
                     inputs: Vec::new(),
+                    error: None,
                 })
         }
 
@@ -1828,6 +1836,7 @@ mod tests {
         let provider = StubRunControlProvider::new(vec![RunQueuedInputPoll {
             next_cursor: 0,
             inputs: Vec::new(),
+            error: None,
         }]);
         let mut deferred_user_inputs = vec![super::super::host::DeferredUserInput {
             event_index: 0,
@@ -1859,6 +1868,7 @@ mod tests {
                 event_index: 1,
                 input: json!({"content": "please answer this before more tools"}),
             }],
+            error: None,
         }]);
         let mut deferred_user_inputs = Vec::new();
         let mut cursor = 0;

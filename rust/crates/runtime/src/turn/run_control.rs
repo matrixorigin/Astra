@@ -18,6 +18,7 @@ pub struct QueuedRunInputEvent {
 pub struct RunQueuedInputPoll {
     pub next_cursor: usize,
     pub inputs: Vec<QueuedRunInputEvent>,
+    pub error: Option<String>,
 }
 
 /// Polls the database for the authoritative run status, enabling cross-pod
