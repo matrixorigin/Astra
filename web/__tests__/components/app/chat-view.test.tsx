@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { ChatView } from '@/components/app/chat-view';
@@ -379,6 +379,99 @@ describe('ChatView deferred-input unhappy paths', () => {
 
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-scroll deferred messages over manual scrollback', async () => {
+    const user = userEvent.setup();
+    const scrollTo = jest.fn();
+    mockQueueChatRunInput.mockResolvedValue({
+      userMessage: {
+        id: 'queued-user-1',
+        role: 'user',
+        content: 'queue this follow-up',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      },
+      activeRun: {
+        runId: 'run-123',
+        status: 'input-queued',
+        waitingFor: 'user_input',
+      },
+    });
+
+    render(<ChatView initial={{
+      ...makeDetail(),
+      messages: [{
+        id: 'existing-user',
+        role: 'user',
+        content: 'older message',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      }],
+    }} />);
+
+    const scroller = screen.getByTestId('chat-scroll-container');
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      scrollTop: { configurable: true, value: 200 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    fireEvent.scroll(scroller);
+    scrollTo.mockClear();
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('queue this follow-up')).toBeInTheDocument();
+    });
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it('auto-scrolls deferred messages when the user is pinned to the bottom', async () => {
+    const user = userEvent.setup();
+    const scrollTo = jest.fn();
+    mockQueueChatRunInput.mockResolvedValue({
+      userMessage: {
+        id: 'queued-user-1',
+        role: 'user',
+        content: 'queue this follow-up',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      },
+      activeRun: {
+        runId: 'run-123',
+        status: 'input-queued',
+        waitingFor: 'user_input',
+      },
+    });
+
+    render(<ChatView initial={{
+      ...makeDetail(),
+      messages: [{
+        id: 'existing-user',
+        role: 'user',
+        content: 'older message',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      }],
+    }} />);
+
+    const scroller = screen.getByTestId('chat-scroll-container');
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      scrollTop: { configurable: true, value: 430 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    fireEvent.scroll(scroller);
+    scrollTo.mockClear();
+
+    await user.click(screen.getByRole('button', { name: 'Submit composer' }));
+
+    await waitFor(() => {
+      expect(scrollTo).toHaveBeenCalledWith({ top: 1000 });
+    });
   });
 
   it('lets the web user resume a paused run instead of trapping the composer', async () => {

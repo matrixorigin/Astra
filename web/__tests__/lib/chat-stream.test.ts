@@ -38,6 +38,30 @@ function sseBody(frames: string[]) {
   };
 }
 
+function pendingSseBody() {
+  let releasePendingRead: (() => void) | null = null;
+  const cancel = jest.fn(() => {
+    releasePendingRead?.();
+    return Promise.resolve();
+  });
+  const releaseLock = jest.fn();
+  const read = jest.fn(() => new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
+    releasePendingRead = () => resolve({ value: undefined, done: true });
+  }));
+
+  return {
+    cancel,
+    releaseLock,
+    getReader() {
+      return {
+        read,
+        cancel,
+        releaseLock,
+      };
+    },
+  };
+}
+
 describe('streamChatMessage cancellation semantics', () => {
   beforeEach(() => {
     globalThis.fetch = jest.fn();
@@ -232,6 +256,28 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(body.releaseLock).toHaveBeenCalled();
   });
 
+  it('cancels the reader when the signal aborts during a pending read', async () => {
+    const body = pendingSseBody();
+    const controller = new AbortController();
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body,
+    });
+
+    const stream = streamChatMessage('chat-123', defaultPayload, {
+      signal: controller.signal,
+    });
+    await Promise.resolve();
+
+    controller.abort();
+
+    await waitUntil(() => {
+      expect(body.cancel).toHaveBeenCalled();
+    });
+    await expect(stream).rejects.toMatchObject({ name: 'AbortError' });
+    expect(body.releaseLock).toHaveBeenCalled();
+  });
+
   it('streams an existing run with an encoded GET URL', async () => {
     (globalThis.fetch as jest.Mock).mockResolvedValue({
       ok: true,
@@ -248,3 +294,19 @@ describe('streamChatMessage cancellation semantics', () => {
     );
   });
 });
+
+async function waitUntil(assertion: () => void) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      if (attempt === 19) {
+        throw error;
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    }
+  }
+}

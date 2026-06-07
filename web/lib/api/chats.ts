@@ -342,14 +342,24 @@ async function consumeChatStream(response: Response, handlers: ChatStreamHandler
   const decoder = new TextDecoder();
   const state: ChatStreamState = { rawText: '', text: '', reasoning: '' };
   let buffer = '';
+  let abortListener: (() => void) | undefined;
 
   try {
+    if (handlers.signal) {
+      abortListener = () => {
+        void reader.cancel();
+      };
+      handlers.signal.addEventListener('abort', abortListener, { once: true });
+    }
     for (;;) {
       if (handlers.signal?.aborted) {
         await reader.cancel();
         throw new DOMException('The chat stream was aborted.', 'AbortError');
       }
       const { value, done } = await reader.read();
+      if (handlers.signal?.aborted) {
+        throw new DOMException('The chat stream was aborted.', 'AbortError');
+      }
       if (done) {
         break;
       }
@@ -375,6 +385,9 @@ async function consumeChatStream(response: Response, handlers: ChatStreamHandler
       }
     }
   } finally {
+    if (handlers.signal && abortListener) {
+      handlers.signal.removeEventListener('abort', abortListener);
+    }
     reader.releaseLock();
   }
 

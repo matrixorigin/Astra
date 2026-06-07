@@ -557,6 +557,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
 
       <div
         ref={scrollRef}
+        data-testid="chat-scroll-container"
         onScroll={(event) => {
           const target = event.currentTarget;
           pinnedRef.current = isChatScrolledToBottom(target);
