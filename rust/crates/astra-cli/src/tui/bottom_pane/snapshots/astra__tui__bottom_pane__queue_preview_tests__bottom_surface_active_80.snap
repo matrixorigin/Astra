@@ -4,4 +4,4 @@ expression: "snapshot_text(&pane, Rect::new(0, 0, 80, 5))"
 ---
 · Message astra                                                                 
   Queued for next tool · Ctrl+C stops                                           
-  sonnet-4.6 · ~/github/astra · ⎇ enqueue…ext_call
+  sonnet-4.6 · Ask · ~/github/astra · ⎇ enqueue…ext_call

@@ -123,7 +123,10 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     let observed = state
         .deferred_input
         .observe_polled_user_inputs(poll, deferred_user_input_text);
-    if observed.raw_inputs.is_empty() {
+    let release_event_indices = state
+        .deferred_input
+        .release_event_indices_to_ack(&observed.released_event_indices);
+    if observed.raw_inputs.is_empty() && release_event_indices.is_empty() {
         return;
     }
 
@@ -131,13 +134,8 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         host.on_deferred_user_input(input);
     }
 
-    if !observed.inputs.is_empty() {
-        let combined = observed
-            .inputs
-            .iter()
-            .filter_map(deferred_user_input_text)
-            .collect::<Vec<_>>()
-            .join("\n\n");
+    if !observed.contents.is_empty() {
+        let combined = observed.contents.join("\n\n");
         if !combined.is_empty() {
             state.messages.push(serde_json::json!({
                 "role": "user",
@@ -151,19 +149,30 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         }
     }
 
+    state
+        .deferred_input
+        .commit_observed_cursor(observed.next_cursor);
+    if release_event_indices.is_empty() {
+        return;
+    }
     match run_control
-        .mark_user_inputs_released(&run_id, &observed.released_event_indices)
+        .mark_user_inputs_released(&run_id, &release_event_indices)
         .await
     {
         Ok(()) => state
             .deferred_input
-            .commit_observed_cursor(observed.next_cursor),
-        Err(error) => tracing::warn!(
-            run_id = %run_id,
-            ?observed.released_event_indices,
-            error = %error,
-            "failed to durably acknowledge deferred user input release"
-        ),
+            .note_release_ack_result(&release_event_indices, true),
+        Err(error) => {
+            state
+                .deferred_input
+                .note_release_ack_result(&release_event_indices, false);
+            tracing::warn!(
+                run_id = %run_id,
+                ?release_event_indices,
+                error = %error,
+                "failed to durably acknowledge deferred user input release"
+            );
+        }
     }
 }
 
@@ -2898,6 +2907,7 @@ mod tests {
     struct StubRunControlProvider {
         polls: Mutex<VecDeque<RunQueuedInputPoll>>,
         released: Mutex<Vec<usize>>,
+        release_failures: Mutex<usize>,
     }
 
     impl StubRunControlProvider {
@@ -2905,6 +2915,15 @@ mod tests {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
                 released: Mutex::new(Vec::new()),
+                release_failures: Mutex::new(0),
+            }
+        }
+
+        fn with_release_failures(polls: Vec<RunQueuedInputPoll>, release_failures: usize) -> Self {
+            Self {
+                polls: Mutex::new(VecDeque::from(polls)),
+                released: Mutex::new(Vec::new()),
+                release_failures: Mutex::new(release_failures),
             }
         }
     }
@@ -2942,6 +2961,12 @@ mod tests {
             _run_id: &str,
             event_indices: &[usize],
         ) -> Result<(), String> {
+            let mut release_failures = self.release_failures.lock().await;
+            if *release_failures > 0 {
+                *release_failures -= 1;
+                return Err("release failed".to_string());
+            }
+            drop(release_failures);
             self.released.lock().await.extend_from_slice(event_indices);
             Ok(())
         }
@@ -4786,6 +4811,46 @@ mod tests {
                 .messages
                 .iter()
                 .filter(|m| m.get("content").and_then(|c| c.as_str()) == Some("only once"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_retries_release_without_reinjecting_after_ack_failure() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-release-retry".into());
+        let provider = Arc::new(StubRunControlProvider::with_release_failures(
+            vec![
+                RunQueuedInputPoll {
+                    next_cursor: 2,
+                    inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                        event_index: 1,
+                        input: serde_json::json!({"content": "inject once"}),
+                    }],
+                    error: None,
+                },
+                RunQueuedInputPoll {
+                    next_cursor: 2,
+                    inputs: Vec::new(),
+                    error: None,
+                },
+            ],
+            1,
+        ));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|m| m.get("content").and_then(|c| c.as_str()) == Some("inject once"))
                 .count(),
             1
         );

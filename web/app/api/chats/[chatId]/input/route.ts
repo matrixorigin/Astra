@@ -4,6 +4,8 @@ import { getChatHydrated, queueDeferredRunInput } from '@/lib/api/web-store';
 import type { SendMessageRequest } from '@/lib/api/types';
 import { RuntimeClientError } from '@/lib/runtime-client';
 
+const MAX_DEFERRED_INPUT_CHARS = 20_000;
+
 export async function POST(
   request: NextRequest,
   context: { params: Promise<{ chatId: string }> },
@@ -17,6 +19,9 @@ export async function POST(
   const body = (await request.json()) as SendMessageRequest;
   if (!body.content?.trim()) {
     return NextResponse.json({ error: 'content is required' }, { status: 400 });
+  }
+  if ([...body.content].length > MAX_DEFERRED_INPUT_CHARS) {
+    return NextResponse.json({ error: 'deferred input is too large' }, { status: 413 });
   }
 
   const chat = await getChatHydrated(auth.user.user_id, chatId);

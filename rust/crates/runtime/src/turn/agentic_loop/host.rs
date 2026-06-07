@@ -666,17 +666,14 @@ pub struct StallTrackingState {
 pub struct DeferredInputState {
     /// Durable event cursor for deferred user-input polling.
     deferred_user_input_cursor: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeferredUserInput {
-    pub event_index: usize,
-    pub content: String,
+    /// Event indices already delivered to the model but not yet durably marked
+    /// as released. Retried on later poll points without re-injecting content.
+    pending_release_event_indices: Vec<usize>,
 }
 
 pub(crate) struct ObservedDeferredUserInputs {
     pub(crate) raw_inputs: Vec<Value>,
-    pub(crate) inputs: Vec<Value>,
+    pub(crate) contents: Vec<String>,
     pub(crate) released_event_indices: Vec<usize>,
     pub(crate) next_cursor: usize,
 }
@@ -684,6 +681,30 @@ pub(crate) struct ObservedDeferredUserInputs {
 impl DeferredInputState {
     pub fn deferred_user_input_cursor(&self) -> usize {
         self.deferred_user_input_cursor
+    }
+
+    pub(crate) fn release_event_indices_to_ack(&self, observed: &[usize]) -> Vec<usize> {
+        let mut indices = self.pending_release_event_indices.clone();
+        indices.extend(observed.iter().copied());
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    pub(crate) fn note_release_ack_result(&mut self, event_indices: &[usize], released: bool) {
+        if released {
+            let released = event_indices
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            self.pending_release_event_indices
+                .retain(|event_index| !released.contains(event_index));
+            return;
+        }
+        self.pending_release_event_indices
+            .extend(event_indices.iter().copied());
+        self.pending_release_event_indices.sort_unstable();
+        self.pending_release_event_indices.dedup();
     }
 
     pub(crate) fn observe_polled_user_inputs<F>(
@@ -695,7 +716,7 @@ impl DeferredInputState {
         F: FnMut(&Value) -> Option<String>,
     {
         let mut raw_inputs = Vec::new();
-        let mut polled_inputs = Vec::new();
+        let mut contents = Vec::new();
         let mut released_event_indices = Vec::new();
         for event in poll.inputs {
             released_event_indices.push(event.event_index);
@@ -703,13 +724,12 @@ impl DeferredInputState {
             let Some(content) = content_from_input(&event.input) else {
                 continue;
             };
-            polled_inputs.push(event.input.clone());
-            let _ = content;
+            contents.push(content);
         }
 
         ObservedDeferredUserInputs {
             raw_inputs,
-            inputs: polled_inputs,
+            contents,
             released_event_indices,
             next_cursor: poll.next_cursor,
         }

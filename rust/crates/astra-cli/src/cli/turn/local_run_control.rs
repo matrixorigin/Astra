@@ -6,6 +6,8 @@ use astra_runtime::turn::run_control::{
 };
 use serde_json::Value;
 
+const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
+
 #[derive(Default)]
 struct LocalRunControlState {
     next_event_index: usize,
@@ -34,6 +36,11 @@ impl LocalDeferredInputRunControl {
     pub(crate) fn enqueue_text(&self, text: &str) -> Result<(), String> {
         if text.trim().is_empty() {
             return Err("Deferred input cannot be empty.".to_string());
+        }
+        if text.chars().count() > MAX_DEFERRED_INPUT_CHARS {
+            return Err(format!(
+                "Deferred input is too large. Limit it to {MAX_DEFERRED_INPUT_CHARS} characters."
+            ));
         }
         self.enqueue_input(serde_json::json!({ "content": text }));
         Ok(())
@@ -126,6 +133,16 @@ mod tests {
             .enqueue_text("   ")
             .expect_err("blank deferred input should be rejected");
         assert!(error.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn local_run_control_rejects_oversized_input() {
+        let provider = LocalDeferredInputRunControl::default();
+        let text = "x".repeat(MAX_DEFERRED_INPUT_CHARS + 1);
+        let error = provider
+            .enqueue_text(&text)
+            .expect_err("oversized deferred input should be rejected");
+        assert!(error.contains("too large"));
     }
 
     #[tokio::test]

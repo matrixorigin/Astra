@@ -69,6 +69,7 @@ const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
+const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
 
 type StreamResult = {
@@ -641,6 +642,9 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
   content: string;
   options?: ComposerOptions;
 }) {
+  if ([...payload.content].length > MAX_DEFERRED_INPUT_CHARS) {
+    throw new Error('Deferred input is too large.');
+  }
   await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);

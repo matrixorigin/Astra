@@ -120,6 +120,42 @@ describe('queueDeferredRunInput', () => {
     });
   });
 
+  it('rejects oversized deferred input before calling the runtime', async () => {
+    const submitRunInput = jest.fn();
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        submitRunInput,
+      },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-1',
+      title: 'Deferred test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-1',
+        status: 'running',
+        waitingFor: null,
+      },
+    });
+
+    await expect(queueDeferredRunInput('user-a', 'chat-1', {
+      content: 'x'.repeat(20_001),
+      options: {
+        activeSkills: [],
+      },
+    })).rejects.toThrow('Deferred input is too large.');
+
+    expect(submitRunInput).not.toHaveBeenCalled();
+    expect(store.chats[0].messages).toEqual([]);
+  });
+
   it('hydrates a lost in-memory active run before submitting deferred input', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
       sessions: [{

@@ -3700,13 +3700,62 @@ mod panels_tests {
     #[test]
     fn session_views_emit_transcript_responses() {
         let source = include_str!("slash_dispatch.rs");
-        for needle in [
-            "ctx.open_view(\"Opened session list\", Box::new(SessionPickerView::new(disco)));",
-            "ctx.show_response(format!(\"Opened session history · {sid_short}\"));",
-            "ctx.open_view(",
-            "Opened session fork picker",
-            "Opened session analysis · {sid_short}",
+
+        fn body_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start_idx = source.find(start).expect(start);
+            let end_idx = source[start_idx..]
+                .find(end)
+                .map(|offset| start_idx + offset)
+                .expect(end);
+            &source[start_idx..end_idx]
+        }
+
+        for (name, body, needles) in [
+            (
+                "session list",
+                body_between(
+                    source,
+                    "async fn handle_session_list_view",
+                    "fn handle_session_history_view",
+                ),
+                &["ctx.open_view(", "Opened session list"][..],
+            ),
+            (
+                "session history",
+                body_between(
+                    source,
+                    "fn handle_session_history_view",
+                    "async fn handle_session_fork_view",
+                ),
+                &["ctx.show_response(", "Opened session history"][..],
+            ),
+            (
+                "session fork",
+                body_between(
+                    source,
+                    "async fn handle_session_fork_view",
+                    "fn handle_session_analyze_view",
+                ),
+                &["ctx.open_view(", "Opened session fork picker"][..],
+            ),
+            (
+                "session analysis",
+                body_between(
+                    source,
+                    "fn push_analyze_summary",
+                    "fn handle_session_export_view",
+                ),
+                &["ctx.open_view(", "Opened session analysis"][..],
+            ),
         ] {
+            for needle in needles {
+                assert!(
+                    body.contains(needle),
+                    "{name} slash command must emit a transcript response: missing {needle}"
+                );
+            }
+        }
+        for needle in ["ctx.open_view(", "ctx.show_response("] {
             assert!(
                 source.contains(needle),
                 "session view slash commands must emit transcript responses: missing {needle}"

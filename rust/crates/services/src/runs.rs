@@ -569,6 +569,19 @@ pub trait RunStateStore: Send + Sync {
         error_message: Option<&str>,
     ) -> Result<bool, String>;
 
+    /// Update run status only if the current status is one of `expected_statuses`.
+    ///
+    /// This is the compare-and-set primitive used by control-plane races where
+    /// a stale load must not overwrite a newer pause/cancel/terminal status.
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String>;
+
     /// Update token/tool counts.
     async fn update_run_usage(
         &self,
@@ -904,6 +917,43 @@ impl RunStateStore for InMemoryRunStateStore {
                 }
                 run.updated_at = chrono::Utc::now().to_rfc3339();
                 Some(run.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, None, None).await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                if !expected_statuses.contains(&run.status.as_str()) {
+                    None
+                } else {
+                    run.status = status.to_string();
+                    run.waiting_for = waiting_for.map(ToString::to_string);
+                    if let Some(msg) = error_message {
+                        run.error_message = Some(msg.to_string());
+                    }
+                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    Some(run.clone())
+                }
             } else {
                 None
             }
@@ -2057,6 +2107,52 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
         };
+        if result.rows_affected() > 0 {
+            self.sync_projection(run_id, None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let predicates = std::iter::repeat_n("?", expected_statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = if error_message.is_some() {
+            format!(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
+                 WHERE run_id = ? AND status IN ({predicates})"
+            )
+        } else {
+            format!(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = ?, updated_at = NOW(6)
+                 WHERE run_id = ? AND status IN ({predicates})"
+            )
+        };
+        let mut query = sqlx::query(&sql).bind(status).bind(waiting_for);
+        if let Some(error_message) = error_message {
+            query = query.bind(error_message);
+        }
+        query = query.bind(run_id);
+        for expected in expected_statuses {
+            query = query.bind(*expected);
+        }
+        let result = query.execute(self.pool.get()).await.map_err(|source| {
+            db_error("update_run_status_if_current", run_id, source).to_string()
+        })?;
         if result.rows_affected() > 0 {
             self.sync_projection(run_id, None, None)
                 .await

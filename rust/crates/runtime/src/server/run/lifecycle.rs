@@ -79,6 +79,8 @@ use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::{server_skill_subrun, server_tool_executor};
 
+const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
+
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
 
@@ -2239,6 +2241,15 @@ impl RunStatus {
 
 fn is_run_finished_event(event: &Value) -> bool {
     event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+}
+
+fn deferred_input_text_len(input: &Value) -> usize {
+    input
+        .get("content")
+        .or_else(|| input.get("text"))
+        .and_then(Value::as_str)
+        .map(|text| text.chars().count())
+        .unwrap_or(0)
 }
 
 fn is_completed_run_finished_event(event: &Value) -> bool {
@@ -5184,6 +5195,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "idempotency_key is required",
             ));
         }
+        if deferred_input_text_len(&input.input) > MAX_DEFERRED_INPUT_CHARS {
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "deferred input is too large",
+            ));
+        }
 
         let idempotency_key = input.idempotency_key.trim().to_string();
         let event = json!({
@@ -5226,7 +5243,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Self::run_status_from_durable(&durable_after_append.status)?;
         if matches!(
             durable_status_after_append,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
         ) {
             if let Some(event_index) = durable_after_append.events.iter().enumerate().find_map(
                 |(index, persisted_event)| {
@@ -5249,10 +5266,41 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &durable_after_append.status,
             ));
         }
-        self.run_engine
-            .persist_status(&run_id, STATUS_INPUT_QUEUED, Some("user_input"), None)
+        let status_updated = self
+            .run_engine
+            .persist_status_if_current(
+                &run_id,
+                &[STATUS_RUNNING, STATUS_INPUT_QUEUED, STATUS_WAITING],
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
             .await
             .map_err(|error| Self::durable_persist_error("input status", error))?;
+        if !status_updated {
+            let durable_after_conflict =
+                self.require_durable_run_for_user(&run_id, &user_id).await?;
+            if let Some(event_index) = durable_after_conflict.events.iter().enumerate().find_map(
+                |(index, persisted_event)| {
+                    (persisted_event
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        == Some(idempotency_key.as_str()))
+                    .then_some(index)
+                },
+            ) {
+                self.run_engine
+                    .mark_user_inputs_released(&run_id, &[event_index])
+                    .await
+                    .map_err(|error| {
+                        Self::durable_persist_error("input release rollback", error)
+                    })?;
+            }
+            return Err(Self::run_state_conflict(
+                "submit input to",
+                &durable_after_conflict.status,
+            ));
+        }
 
         if let Some(run) = self.runs.write().await.get_mut(&run_id) {
             run.events.push(event);
@@ -6908,6 +6956,31 @@ mod tests {
             }
             self.inner
                 .update_run_status(run_id, status, waiting_for, error_message)
+                .await
+        }
+
+        async fn update_run_status_if_current(
+            &self,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            let call = self.next_status_call();
+            if self.fail_status_calls.contains(&call) {
+                return Err(format!(
+                    "injected update_run_status_if_current failure on call {call}"
+                ));
+            }
+            self.inner
+                .update_run_status_if_current(
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                )
                 .await
         }
 
@@ -8786,6 +8859,36 @@ mod tests {
             )
             .await);
         assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_rejects_oversized_content() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-large-input", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .submit_run_input(
+                "run-large-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-large".into(),
+                    input: json!({"content": "x".repeat(MAX_DEFERRED_INPUT_CHARS + 1)}),
+                },
+            )
+            .await);
+
+        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE);
+        let durable = engine.load_run("run-large-input").await.unwrap().unwrap();
+        assert!(
+            durable.events.iter().all(|event| {
+                event.get("idempotency_key").and_then(Value::as_str) != Some("key-large")
+            }),
+            "oversized input must not be appended before validation"
+        );
     }
 
     #[tokio::test]

@@ -272,6 +272,35 @@ impl RunEngine {
         Ok(updated)
     }
 
+    /// Persist a status change only if the durable row is still in one of the
+    /// expected states. This prevents stale control-plane observations from
+    /// overwriting a newer pause/cancel/terminal status.
+    pub async fn persist_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        let updated = self
+            .store
+            .update_run_status_if_current(
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+            )
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            self.project_delegation_run_if_needed(run_id, status, summary)
+                .await?;
+        }
+        Ok(updated)
+    }
+
     async fn project_delegation_run_if_needed(
         &self,
         run_id: &str,
@@ -588,7 +617,13 @@ impl RunInputProvider for RunEngine {
         let mut error = None;
         if run.status == STATUS_INPUT_QUEUED && inputs.is_empty() && !released_indices.is_empty() {
             if let Err(update_error) = self
-                .persist_status(run_id, STATUS_RUNNING, None, None)
+                .persist_status_if_current(
+                    run_id,
+                    &[STATUS_INPUT_QUEUED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                )
                 .await
             {
                 tracing::warn!(
@@ -619,6 +654,12 @@ impl RunInputProvider for RunEngine {
             self.store.load_run(run_id).await?.ok_or_else(|| {
                 format!("run not found while acknowledging deferred input: {run_id}")
             })?;
+        match durable_run_status_kind(&run.status) {
+            DurableRunStatusKind::Cancelled
+            | DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Failed => return Ok(()),
+            _ => {}
+        }
         self.append_event(
             run_id,
             serde_json::json!({
@@ -627,10 +668,14 @@ impl RunInputProvider for RunEngine {
             }),
         )
         .await?;
-        if run.status != STATUS_INPUT_QUEUED {
+        let current =
+            self.store.load_run(run_id).await?.ok_or_else(|| {
+                format!("run not found after acknowledging deferred input: {run_id}")
+            })?;
+        if current.status != STATUS_INPUT_QUEUED {
             return Ok(());
         }
-        self.persist_status(run_id, STATUS_RUNNING, None, None)
+        self.persist_status_if_current(run_id, &[STATUS_INPUT_QUEUED], STATUS_RUNNING, None, None)
             .await
             .map(|_| ())
     }
@@ -748,6 +793,17 @@ mod tests {
         async fn update_run_status(
             &self,
             _run_id: &str,
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_run_status_if_current(
+            &self,
+            _run_id: &str,
+            _expected_statuses: &[&str],
             _status: &str,
             _waiting_for: Option<&str>,
             _error_message: Option<&str>,
@@ -1227,6 +1283,108 @@ mod tests {
             poll.inputs.is_empty(),
             "released inputs must not replay after crash recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn mark_user_inputs_released_does_not_overwrite_paused_status() {
+        let engine = test_engine();
+        engine
+            .start_run("run-paused-release", "user-1", "sess-paused")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-paused-release",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-paused-release",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        engine
+            .mark_user_inputs_released("run-paused-release", &[1])
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("run-paused-release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_PAUSED);
+        assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
+    }
+
+    #[tokio::test]
+    async fn mark_user_inputs_released_does_not_append_on_cancelled_run() {
+        let engine = test_engine();
+        engine
+            .start_run("run-cancelled-release", "user-1", "sess-cancelled")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-cancelled-release", STATUS_CANCELLED, None, None)
+            .await
+            .unwrap();
+        let before = engine
+            .load_run("run-cancelled-release")
+            .await
+            .unwrap()
+            .unwrap()
+            .events
+            .len();
+
+        engine
+            .mark_user_inputs_released("run-cancelled-release", &[1])
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("run-cancelled-release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+        assert_eq!(run.events.len(), before);
+    }
+
+    #[tokio::test]
+    async fn persist_status_if_current_does_not_overwrite_unexpected_status() {
+        let engine = test_engine();
+        engine
+            .start_run("run-cas", "user-1", "sess-cas")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-cas", STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+
+        let updated = engine
+            .persist_status_if_current(
+                "run-cas",
+                &[STATUS_INPUT_QUEUED],
+                STATUS_RUNNING,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let run = engine.load_run("run-cas").await.unwrap().unwrap();
+        assert!(!updated);
+        assert_eq!(run.status, STATUS_PAUSED);
+        assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
     }
 
     #[tokio::test]
