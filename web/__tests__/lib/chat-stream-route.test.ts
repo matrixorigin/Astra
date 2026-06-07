@@ -25,6 +25,7 @@ import {
   beginStreamingMessage,
   getChatHydrated,
   resolveBackendModelName,
+  setChatActiveRun,
   updateStreamingAssistantMessage,
 } from '@/lib/api/web-store';
 import { requireRuntimeClient } from '@/lib/runtime-client';
@@ -33,6 +34,7 @@ const mockRequireRuntimeUser = requireRuntimeUser as jest.MockedFunction<typeof 
 const mockGetChatHydrated = getChatHydrated as jest.MockedFunction<typeof getChatHydrated>;
 const mockResolveBackendModelName = resolveBackendModelName as jest.MockedFunction<typeof resolveBackendModelName>;
 const mockBeginStreamingMessage = beginStreamingMessage as jest.MockedFunction<typeof beginStreamingMessage>;
+const mockSetChatActiveRun = setChatActiveRun as jest.MockedFunction<typeof setChatActiveRun>;
 const mockUpdateStreamingAssistantMessage = updateStreamingAssistantMessage as jest.MockedFunction<typeof updateStreamingAssistantMessage>;
 const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<typeof requireRuntimeClient>;
 
@@ -51,6 +53,33 @@ function makeBackendStream() {
     body: {
       getReader: () => ({
         read,
+        cancel,
+        releaseLock,
+      }),
+    },
+    cancel,
+    releaseLock,
+  };
+}
+
+function makeBackendFrameStream(frames: string[]) {
+  const encoder = new TextEncoder();
+  const chunks = frames.map((frame) => encoder.encode(frame));
+  let index = 0;
+  const releaseLock = jest.fn();
+  const cancel = jest.fn();
+
+  return {
+    body: {
+      getReader: () => ({
+        async read() {
+          if (index >= chunks.length) {
+            return { value: undefined, done: true };
+          }
+          const value = chunks[index];
+          index += 1;
+          return { value, done: false };
+        },
         cancel,
         releaseLock,
       }),
@@ -136,6 +165,66 @@ describe('chat stream route proxy cancellation', () => {
 
     expect(backend.cancel).toHaveBeenCalled();
     expect(backend.releaseLock).toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ status: 'failed' }),
+    );
+  });
+
+  it('persists a cancelled backend run as a clean stopped assistant message', async () => {
+    const { POST } = await import('@/app/api/chats/[chatId]/stream/route');
+    const backend = makeBackendFrameStream([
+      'data: {"type":"run_started","run_id":"run-stop"}\n\n',
+      'data: {"type":"run_finished","run_id":"run-stop","status":"cancelled"}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: jest.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+
+    const response = await POST(
+      new Request('http://web.test/api/chats/chat-1/stream', {
+        method: 'POST',
+        body: JSON.stringify({
+          content: 'hello',
+          options: {
+            model: 'sonnet-4.6-adaptive',
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: 'chat-1' }) },
+    );
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(mockSetChatActiveRun).toHaveBeenCalledWith('user-a', 'chat-1', undefined);
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      'user-a',
+      'chat-1',
+      'assistant-1',
+      expect.objectContaining({
+        content: 'Stopped.',
+        status: 'complete',
+      }),
+    );
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),

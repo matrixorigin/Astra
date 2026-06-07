@@ -392,7 +392,10 @@ function proxyRunStream(params: {
           const status = typeof event.status === 'string' ? event.status : 'completed';
           runLifecycle = 'finished';
           setChatActiveRun(ownerUserId, chatId, undefined);
-          if (status === 'failed' || status === 'cancelled') {
+          if (status === 'cancelled') {
+            assistantText = assistantText || 'Stopped.';
+            lastStatus = 'complete';
+          } else if (status === 'failed') {
             const message = typeof event.error === 'string' ? event.error : assistantText;
             assistantText = message || assistantText;
             lastStatus = 'failed';
