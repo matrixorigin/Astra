@@ -1984,6 +1984,26 @@ mod tests {
         assert!(matches!(&persisted, TurnEvent::User { text, .. } if text == "hello"));
     }
 
+    #[test]
+    fn commit_deferred_user_keeps_live_active_cell() {
+        let mut w = fresh();
+        w.active_cell = Some(Box::new(AssistantCell::new_streaming()));
+
+        w.commit_deferred_user("stop after this tool");
+
+        assert_eq!(w.history.len(), 1, "deferred input is committed as history");
+        let persisted = w.history[0].to_persist().expect("user cell persists");
+        assert!(matches!(
+            &persisted,
+            TurnEvent::User { text, .. } if text == "stop after this tool"
+        ));
+        assert_eq!(
+            w.active_cell.as_deref().map(cell_kind),
+            Some(CellKind::Assistant),
+            "deferred input must not finalize the live assistant/tool cell"
+        );
+    }
+
     // ── AnswerDelta ──────────────────────────────────────────────
 
     #[test]

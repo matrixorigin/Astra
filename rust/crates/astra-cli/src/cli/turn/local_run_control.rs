@@ -70,6 +70,7 @@ impl RunInputProvider for LocalDeferredInputRunControl {
         RunQueuedInputPoll {
             next_cursor: guard.next_event_index.max(after_event_index),
             inputs,
+            error: None,
         }
     }
 
