@@ -476,4 +476,52 @@ describe('ChatView deferred-input unhappy paths', () => {
     expect(screen.getByText('Later completed note')).toBeInTheDocument();
     expect(screen.queryByText('Partial paused reply')).not.toBeInTheDocument();
   });
+
+  it('reconnects a resumed paused run even when no streaming assistant is present', async () => {
+    const user = userEvent.setup();
+    mockResumeChatRun.mockResolvedValue({
+      activeRun: {
+        runId: 'run-123',
+        status: 'running',
+        waitingFor: null,
+      },
+    });
+    mockStreamExistingChatRun.mockImplementation(async (_chatId, _runId, handlers) => {
+      handlers.onText?.('Recovered stream text');
+      handlers.onDone?.('Recovered stream final');
+      return 'Recovered stream final';
+    });
+
+    render(<ChatView initial={{
+      ...makeDetail({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: null,
+      }),
+      messages: [{
+        id: 'assistant-complete',
+        role: 'assistant',
+        content: 'Previous complete answer',
+        createdAt: '2026-06-07T00:00:00.000Z',
+        status: 'complete',
+      }],
+    }} />);
+
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+
+    await waitFor(() => {
+      expect(mockStreamExistingChatRun).toHaveBeenCalledWith(
+        'chat-123',
+        'run-123',
+        expect.objectContaining({
+          onText: expect.any(Function),
+          onDone: expect.any(Function),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText('Recovered stream final')).toBeInTheDocument();
+    });
+    expect(screen.getByText('Previous complete answer')).toBeInTheDocument();
+  });
 });

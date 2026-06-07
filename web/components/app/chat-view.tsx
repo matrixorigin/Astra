@@ -349,22 +349,34 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       return;
     }
     runControlMutationRef.current = true;
-    const assistantMessageId = [...detail.messages]
+    const existingAssistantMessageId = [...detail.messages]
       .reverse()
       .find((message) => (
         message.role === 'assistant'
         && (message.status === 'streaming' || message.reasoningStatus === 'streaming')
       ))?.id;
+    const assistantMessageId = existingAssistantMessageId ?? crypto.randomUUID();
     setResumingRun(true);
     try {
       const result = await resumeChatRun(detail.chat.id);
       setDetail((current) => ({
         ...current,
         activeRun: result.activeRun,
+        messages: existingAssistantMessageId || current.messages.some((message) => message.id === assistantMessageId)
+          ? current.messages
+          : [
+              ...current.messages,
+              {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: '',
+                createdAt: new Date().toISOString(),
+                status: 'streaming',
+                reasoning: '',
+                reasoningStatus: 'streaming',
+              },
+            ],
       }));
-      if (!assistantMessageId) {
-        return;
-      }
       const patchAssistant = (patch: Partial<ChatMessage>) => {
         setDetail((current) => ({
           ...current,
