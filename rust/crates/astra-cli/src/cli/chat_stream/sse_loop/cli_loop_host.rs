@@ -1189,9 +1189,9 @@ fn looks_plan_shaped(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        deferred_input_status_line, derive_turn_interaction_mode, permission_mode_change_audit_event,
-        plan_mode_missed_exit_reminder, plan_mode_restriction_names,
-        request_allowlist_restriction_names,
+        deferred_input_status_line, derive_turn_interaction_mode,
+        permission_mode_change_audit_event, plan_mode_missed_exit_reminder,
+        plan_mode_restriction_names, request_allowlist_restriction_names,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;

@@ -106,6 +106,12 @@ fn render_deferred_user_input(content: &str) -> String {
     )
 }
 
+fn render_deferred_user_input_text_reply_gate(content: &str) -> String {
+    format!(
+        "The user interrupted active execution with a newer message.\n\nNewest user message:\n{content}\n\nRequired behavior for your very next response:\n- Do not make any tool calls.\n- Reply directly to this newest user message in plain text first.\n- If it changes or stops the previous task, say so explicitly.\n- Only consider more tool calls after that direct response, and only if the user still wants more work."
+    )
+}
+
 pub(crate) async fn poll_deferred_user_inputs(
     state: &mut AgenticLoopState,
     queued_at_tool_generation: u64,
@@ -137,9 +143,11 @@ pub(crate) async fn poll_deferred_user_inputs(
 
 pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
     let mut ready = Vec::new();
+    let mut ready_contents = Vec::new();
     let current_generation = state.messaging.tool_call_generation;
     state.messaging.deferred_user_inputs.retain(|entry| {
         if current_generation > entry.queued_at_tool_generation {
+            ready_contents.push(entry.content.clone());
             ready.push(render_deferred_user_input(&entry.content));
             false
         } else {
@@ -147,9 +155,28 @@ pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
         }
     });
 
+    if !ready_contents.is_empty() {
+        state.messaging.deferred_user_input_ack_pending = true;
+        state.messaging.deferred_user_input_ack_content = Some(ready_contents.join("\n\n"));
+    }
+
     for message in ready {
         state.push_volatile(super::host::VolatileKind::DeferredUserInput, message);
     }
+}
+
+fn enforce_deferred_user_input_text_reply(state: &mut AgenticLoopState) -> bool {
+    if !state.messaging.deferred_user_input_ack_pending {
+        return false;
+    }
+    let Some(content) = state.messaging.deferred_user_input_ack_content.clone() else {
+        return false;
+    };
+    state.push_volatile(
+        super::host::VolatileKind::DeferredUserInput,
+        render_deferred_user_input_text_reply_gate(&content),
+    );
+    true
 }
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
@@ -1071,7 +1098,30 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         host.on_turn_completed(state);
     }
 
-    match map_ingest_outcome_to_iteration_control(ingest_outcome) {
+    let iteration_control = map_ingest_outcome_to_iteration_control(ingest_outcome);
+    if matches!(
+        iteration_control,
+        AgenticIngestIterationControl::ProceedWithToolCalls
+    ) && enforce_deferred_user_input_text_reply(state)
+    {
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                "↻ New user input landed during execution; replying before more tools.".to_string(),
+            );
+        }
+        record_early_exit_llm_round(
+            state,
+            &turn_result,
+            prep.turn_start_time,
+            Some("deferred_user_input_reply_gate"),
+        );
+        state.step_recorder.end_turn(false);
+        try_write_heavy_checkpoint(state);
+        return Ok(TurnExecutionControl::ContinueLoop);
+    }
+
+    match iteration_control {
         AgenticIngestIterationControl::Fatal(e) => {
             use astra_core::ErrorKind;
 
@@ -1392,6 +1442,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // Record the LLM round even for text-only responses (no tool calls).
             // Without this, simple Q&A turns have llm_rounds=0 in the
             // journal despite the LLM being called.
+            state.messaging.deferred_user_input_ack_pending = false;
+            state.messaging.deferred_user_input_ack_content = None;
             record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
             state.step_recorder.end_turn(true);
 
@@ -4726,6 +4778,11 @@ mod tests {
         release_ready_deferred_user_inputs(&mut state);
 
         assert!(state.messaging.deferred_user_inputs.is_empty());
+        assert!(state.messaging.deferred_user_input_ack_pending);
+        assert_eq!(
+            state.messaging.deferred_user_input_ack_content.as_deref(),
+            Some("Switch to writing tests first.")
+        );
         assert!(state.volatile_pending.iter().any(|entry| {
             entry.kind == VolatileKind::DeferredUserInput
                 && entry.content.contains("Switch to writing tests first.")
@@ -4818,11 +4875,26 @@ mod tests {
         let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
         release_ready_deferred_user_inputs(&mut state);
         assert!(state.messaging.deferred_user_inputs.is_empty());
+        assert!(state.messaging.deferred_user_input_ack_pending);
         assert!(state.volatile_pending.iter().any(|entry| {
             entry.kind == VolatileKind::DeferredUserInput
                 && entry
                     .content
                     .contains("Stop and respond to the user first.")
+        }));
+    }
+
+    #[test]
+    fn deferred_user_input_text_reply_gate_requeues_latest_message_before_tools() {
+        let mut state = make_state();
+        state.messaging.deferred_user_input_ack_pending = true;
+        state.messaging.deferred_user_input_ack_content = Some("先停啊！".to_string());
+
+        assert!(enforce_deferred_user_input_text_reply(&mut state));
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.kind == VolatileKind::DeferredUserInput
+                && entry.content.contains("Do not make any tool calls.")
+                && entry.content.contains("先停啊！")
         }));
     }
 

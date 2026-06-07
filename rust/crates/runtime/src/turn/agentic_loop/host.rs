@@ -684,6 +684,12 @@ pub struct MessagingState {
     pub deferred_user_input_cursor: usize,
     /// Monotonic count of completed tool-call rounds observed by this run.
     pub tool_call_generation: u64,
+    /// True after a deferred user input has been released into the next
+    /// model turn and remains awaiting a direct assistant response.
+    pub deferred_user_input_ack_pending: bool,
+    /// Raw content of the newest deferred user input(s) that still require
+    /// a direct assistant response before more tool calls are allowed.
+    pub deferred_user_input_ack_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
