@@ -26,6 +26,13 @@ pub use astra_turn_core::headless_tool_body_preview::{
     HeadlessRoundTerminal, HeadlessStderrStyle, NoopHeadlessTerminal,
 };
 
+#[async_trait::async_trait]
+pub trait ToolBoundaryObserver {
+    /// Called after each completed tool batch. Return `false` to stop the
+    /// current tool round and hand control back to the outer agent loop.
+    async fn on_tool_boundary(&mut self) -> bool;
+}
+
 pub(crate) type PermissionSyncHandle = std::sync::Arc<
     tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>,
 >;
@@ -77,6 +84,10 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub llm_round: u32,
     /// Whether the session is still in read-only plan authoring mode.
     pub plan_mode_active: bool,
+    /// Optional observer notified after each completed tool batch so the outer
+    /// loop can react to newly queued user input before executing more tools
+    /// from the same LLM round.
+    pub tool_boundary_observer: Option<&'a mut (dyn ToolBoundaryObserver + Send)>,
 }
 
 struct HeadlessPreparedRound<'a> {
@@ -203,6 +214,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         turn_start,
         llm_round,
         plan_mode_active,
+        mut tool_boundary_observer,
     } = ctx;
     let HeadlessPreparedRound {
         effective_permission_timeout,
@@ -291,9 +303,19 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 if !pipeline.run_batch_concurrent(items).await {
                     break 'outer;
                 }
+                if let Some(observer) = tool_boundary_observer.as_deref_mut()
+                    && !observer.on_tool_boundary().await
+                {
+                    break 'outer;
+                }
             }
             ToolBatch::Serial(item) => {
                 if !pipeline.run_slot_with_control(*item).await {
+                    break 'outer;
+                }
+                if let Some(observer) = tool_boundary_observer.as_deref_mut()
+                    && !observer.on_tool_boundary().await
+                {
                     break 'outer;
                 }
             }
@@ -355,7 +377,26 @@ pub(crate) fn partition_tool_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+    use astra_pipeline::step_recorder::StepRecorder;
+    use astra_text_utils::semantic_dedup::SemanticDedup;
+    use astra_turn_core::guardrails::turn_guard::TurnGuard;
+    use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use serde_json::json;
+
+    struct StopAfterFirstBoundary {
+        boundary_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBoundaryObserver for StopAfterFirstBoundary {
+        async fn on_tool_boundary(&mut self) -> bool {
+            self.boundary_calls += 1;
+            false
+        }
+    }
 
     fn server_idx(i: usize) -> HeadlessRoundToolIdx {
         HeadlessRoundToolIdx::ServerToolCall(i)
@@ -401,6 +442,113 @@ mod tests {
         assert!(
             matches!(batches.as_slice(), [ToolBatch::Serial(_)]),
             "agent.send_message mutates mailbox ordering and must stay serial"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_boundary_observer_stops_round_before_later_serial_tools() {
+        let api = ThinClient::new("http://127.0.0.1:1", None).expect("thin client");
+        let tool_calls = vec![
+            json!({
+                "id": "call-1",
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo first\"}"
+                }
+            }),
+            json!({
+                "id": "call-2",
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo second\"}"
+                }
+            }),
+        ];
+        let edge_tool_round = vec![
+            EdgeToolExecResult {
+                request_id: "req-1".to_string(),
+                tool: "bash".to_string(),
+                args: json!({"command": "echo first"}),
+                output: "first".to_string(),
+                tool_result_fields: None,
+                status: "ok".to_string(),
+                duration_ms: 5,
+            },
+            EdgeToolExecResult {
+                request_id: "req-2".to_string(),
+                tool: "bash".to_string(),
+                args: json!({"command": "echo second"}),
+                output: "second".to_string(),
+                tool_result_fields: None,
+                status: "ok".to_string(),
+                duration_ms: 5,
+            },
+        ];
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "tool-boundary-stop");
+        step_recorder.begin_turn(0);
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut call_counts = HashMap::new();
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = HashMap::new();
+        let mut observer = StopAfterFirstBoundary { boundary_calls: 0 };
+
+        run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            turn_index: 0,
+            quiet: true,
+            api: &api,
+            token: "",
+            current_session_id: None,
+            tool_calls: &tool_calls,
+            edge_tool_round: &edge_tool_round,
+            reasoning_content: "",
+            reasoning_signature: "",
+            edge_callback_outputs: &edge_callback_outputs,
+            messages: &mut messages,
+            tool_results: &mut tool_results,
+            valid_tool_names: &valid_tool_names,
+            restricted_tools: &mut restricted_tools,
+            turn_guard: &mut turn_guard,
+            step_recorder: &mut step_recorder,
+            idempotency_cache: &mut idempotency_cache,
+            semantic_dedup: &mut semantic_dedup,
+            call_counts: &mut call_counts,
+            max_identical_calls: 2,
+            max_tools_per_turn: 15,
+            repeated_cache_hit_suppression: 3,
+            max_consecutive_empty_name: 3,
+            tool_call_records: &mut tool_call_records,
+            tool_event_hooks: &tool_event_hooks,
+            term: &mut term,
+            mailbox: None,
+            permission_context: None,
+            progress_emitter: None,
+            pre_resolved_results: &[],
+            server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
+            plan_mode_active: false,
+            tool_boundary_observer: Some(&mut observer),
+        })
+        .await;
+
+        assert_eq!(observer.boundary_calls, 1);
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "only the first serial tool should run"
+        );
+        assert_eq!(
+            tool_call_records.len(),
+            1,
+            "later serial tools should not execute after the boundary observer stops the round"
         );
     }
 }

@@ -14,12 +14,15 @@ use super::super::agentic::adaptive_tuning::{
 use super::super::agentic::delegate_interception::{
     DelegationInterceptionResult, intercept_delegations, tool_call_name,
 };
+use super::super::agentic::headless_round::ToolBoundaryObserver;
 use super::super::agentic::headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
     run_agentic_headless_tool_round,
 };
 use super::super::agentic::tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
-use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
+use super::execution_phase::{
+    TurnExecutionPhase, deferred_user_input_text, observe_turn_end_without_tools,
+};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
     MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
@@ -38,6 +41,51 @@ use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
     Return(AgenticLoopOutcome),
+}
+
+struct DeferredToolBoundaryTracker<'a> {
+    run_control: &'a dyn crate::turn::run_control::RunControlProvider,
+    run_id: &'a str,
+    deferred_user_inputs: &'a mut Vec<super::host::DeferredUserInput>,
+    deferred_user_input_cursor: &'a mut usize,
+    tool_call_generation: &'a mut u64,
+    collected_inputs: Vec<Value>,
+    should_yield_to_deferred_input: bool,
+}
+
+impl DeferredToolBoundaryTracker<'_> {
+    async fn on_completed_tool_boundary(&mut self) -> bool {
+        let queued_at_tool_generation = *self.tool_call_generation;
+        let poll = self
+            .run_control
+            .poll_user_inputs(self.run_id, *self.deferred_user_input_cursor)
+            .await;
+        *self.deferred_user_input_cursor = poll.next_cursor;
+        for event in poll.inputs {
+            self.collected_inputs.push(event.input.clone());
+            let Some(content) = deferred_user_input_text(&event.input) else {
+                continue;
+            };
+            self.deferred_user_inputs
+                .push(super::host::DeferredUserInput {
+                    content,
+                    queued_at_tool_generation,
+                });
+        }
+        *self.tool_call_generation = self.tool_call_generation.saturating_add(1);
+        self.should_yield_to_deferred_input = self
+            .deferred_user_inputs
+            .iter()
+            .any(|entry| *self.tool_call_generation > entry.queued_at_tool_generation);
+        !self.should_yield_to_deferred_input
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolBoundaryObserver for DeferredToolBoundaryTracker<'_> {
+    async fn on_tool_boundary(&mut self) -> bool {
+        self.on_completed_tool_boundary().await
+    }
 }
 
 fn build_runtime_session_quality_assessment(
@@ -988,20 +1036,34 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     let evo_records_before = state.stall.tool_call_records.len();
+    let plan_mode_active = host.plan_mode_active(state);
+    let headless_quiet = prep.quiet || state.skill_produced_output;
+    let obs_turn_start = state
+        .turn_event_buffer
+        .as_ref()
+        .map(|b| b.turn_start_instant());
+    let obs_llm_round = state
+        .turn_event_buffer
+        .as_ref()
+        .map(|b| b.current_round())
+        .unwrap_or(0);
+    let mut deferred_tool_boundary_tracker = match (
+        state.run_control.as_deref(),
+        state.current_run_id.as_deref(),
+    ) {
+        (Some(run_control), Some(run_id)) => Some(DeferredToolBoundaryTracker {
+            run_control,
+            run_id,
+            deferred_user_inputs: &mut state.messaging.deferred_user_inputs,
+            deferred_user_input_cursor: &mut state.messaging.deferred_user_input_cursor,
+            tool_call_generation: &mut state.messaging.tool_call_generation,
+            collected_inputs: Vec::new(),
+            should_yield_to_deferred_input: false,
+        }),
+        _ => None,
+    };
     {
-        let plan_mode_active = host.plan_mode_active(state);
         let mut term_adapter = HostTerminalAdapter(host);
-        let headless_quiet = prep.quiet || state.skill_produced_output;
-        let obs_turn_start = state
-            .turn_event_buffer
-            .as_ref()
-            .map(|b| b.turn_start_instant());
-        let obs_llm_round = state
-            .turn_event_buffer
-            .as_ref()
-            .map(|b| b.current_round())
-            .unwrap_or(0);
-
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -1037,8 +1099,22 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             turn_start: obs_turn_start,
             llm_round: obs_llm_round,
             plan_mode_active,
+            tool_boundary_observer: deferred_tool_boundary_tracker
+                .as_mut()
+                .map(|tracker| tracker as &mut (dyn ToolBoundaryObserver + Send)),
         })
         .await;
+    }
+    if let Some(tracker) = deferred_tool_boundary_tracker.as_ref() {
+        for input in &tracker.collected_inputs {
+            host.on_deferred_user_input(input);
+        }
+    }
+    if deferred_tool_boundary_tracker
+        .as_ref()
+        .is_some_and(|tracker| tracker.should_yield_to_deferred_input)
+    {
+        return Ok(TurnToolPhaseControl::ContinueLoop);
     }
 
     // Record LLM round in the turn event buffer and advance the round counter.

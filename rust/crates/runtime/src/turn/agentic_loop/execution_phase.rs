@@ -62,7 +62,7 @@ fn global_alert_dispatcher()
         .as_ref()
 }
 
-fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
     fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
         value
             .and_then(serde_json::Value::as_str)
@@ -106,7 +106,7 @@ fn render_deferred_user_input(content: &str) -> String {
     )
 }
 
-async fn poll_deferred_user_inputs(
+pub(crate) async fn poll_deferred_user_inputs(
     state: &mut AgenticLoopState,
     queued_at_tool_generation: u64,
 ) -> Vec<serde_json::Value> {
@@ -135,7 +135,7 @@ async fn poll_deferred_user_inputs(
     polled_inputs
 }
 
-fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
+pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) {
     let mut ready = Vec::new();
     let current_generation = state.messaging.tool_call_generation;
     state.messaging.deferred_user_inputs.retain(|entry| {
@@ -928,17 +928,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     let turn_result = turn_result?;
-    let completed_tool_round =
-        turn_result.accum.has_tool_calls || !turn_result.edge_tool_round.is_empty();
-    if completed_tool_round {
-        let tool_call_generation = state.messaging.tool_call_generation;
-        let polled_inputs = poll_deferred_user_inputs(state, tool_call_generation).await;
-        for input in &polled_inputs {
-            host.on_deferred_user_input(input);
-        }
-        state.messaging.tool_call_generation =
-            state.messaging.tool_call_generation.saturating_add(1);
-    }
     state.rate_limit_cooldown.record_success();
     // Clear pipeline recovery escalation after a successful LLM call —
     // the PTL pressure is relieved.
