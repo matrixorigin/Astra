@@ -469,7 +469,7 @@ fn truncate_by_width(s: &str, max_width: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn humanize_tool_name(name: &str) -> String {
+pub(super) fn humanize_tool_name(name: &str) -> String {
     let mut out = String::new();
     for (i, part) in name.split('_').filter(|part| !part.is_empty()).enumerate() {
         if i > 0 {

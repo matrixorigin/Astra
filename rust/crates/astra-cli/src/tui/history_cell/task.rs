@@ -1,4 +1,4 @@
-//! Task-invocation history cell — the `▶ Task: <description>` block
+//! Task-invocation history cell — the `▶ Task · <description>` block
 //! that mirrors the `Task` tool UX from claude-code.
 //!
 //! Unlike [`ToolCell`](super::tool::ToolCell), a TaskCell is a
@@ -11,7 +11,8 @@
 //! Three visual states:
 //! - **Running** — accent arrow, shimmer title, children render
 //!   live underneath.
-//! - **Completed** — green arrow, `Task <name>` title, output
+//! - **Completed** — green arrow, `Task · <name> · done · 42ms`
+//!   title, output
 //!   summary folded under the children.
 //! - **Failed** — red arrow, same layout plus an error line.
 //!
@@ -29,6 +30,7 @@ use unicode_width::UnicodeWidthStr;
 use super::HistoryCell;
 use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR;
+use crate::tui::history_cell::tool::humanize_tool_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskStatus {
@@ -171,10 +173,10 @@ impl TaskCell {
 
     fn title_text(&self) -> &'static str {
         match self.status {
-            TaskStatus::Running => "Task",
-            TaskStatus::Completed => "Task done",
-            TaskStatus::Failed if self.is_interrupted_wait() => "Task interrupted",
-            TaskStatus::Failed => "Task failed",
+            TaskStatus::Running => "running",
+            TaskStatus::Completed => "done",
+            TaskStatus::Failed if self.is_interrupted_wait() => "interrupted",
+            TaskStatus::Failed => "failed",
         }
     }
 
@@ -190,6 +192,21 @@ impl TaskCell {
     }
 }
 
+fn child_display_name(name: &str) -> String {
+    match name {
+        "bash" => "Bash".into(),
+        "read" | "read_file" => "Read".into(),
+        "write_file" => "Write file".into(),
+        "str_replace" => "Replace text".into(),
+        "grep" | "glob" => "Search".into(),
+        "list_dir" => "List directory".into(),
+        "task" => "Task".into(),
+        "memory" => "Memory".into(),
+        "tool_search" => "Tool search".into(),
+        _ => humanize_tool_name(name),
+    }
+}
+
 /// Max children shown inline when the task is no longer running.
 /// Beyond this threshold the cell collapses to a summary line.
 const COLLAPSE_THRESHOLD: usize = 3;
@@ -201,22 +218,21 @@ impl HistoryCell for TaskCell {
         let max_child_w = w.saturating_sub(6);
 
         // Header.
+        let task_label = "Task";
+        let desc = trimmed_desc(&self.description, max_child_w);
         let header = if self.status == TaskStatus::Running {
-            let text = format!(
-                "{} {} ({})",
-                self.title_text(),
-                trimmed_desc(&self.description, max_child_w),
-                self.elapsed_str()
-            );
+            let text = format!("{task_label} · {desc} · {}", self.elapsed_str());
             let mut spans = vec![self.arrow()];
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
+            let meta = format!("{} · {}", self.title_text(), self.elapsed_str());
             Line::from(vec![
                 self.arrow(),
-                Span::styled(format!("{} ", self.title_text()), Style::default().bold()),
-                Span::raw(trimmed_desc(&self.description, max_child_w)),
-                Span::styled(format!(" ({})", self.elapsed_str()), dim),
+                Span::styled(task_label, Style::default().bold()),
+                Span::styled(" · ", dim),
+                Span::raw(desc),
+                Span::styled(format!(" · {meta}"), dim),
             ])
         };
 
@@ -250,36 +266,38 @@ impl HistoryCell for TaskCell {
                 Span::styled(summary, dim),
             ]));
         } else {
-            // Inline children — each as `  ├ • <name> <desc> (<dur>)`.
+            // Inline children — each as `  ├ Bash · 20ms · ls`.
             let total = self.children.len();
             for (i, child) in self.children.iter().enumerate() {
                 let is_last = i + 1 == total && self.status != TaskStatus::Running;
                 let connector = if is_last { "  └ " } else { "  ├ " };
-                let bullet_color = match child.status {
-                    ChildStatus::Running => Style::default().fg(Color::DarkGray),
+                let name_style = match child.status {
+                    ChildStatus::Running => Style::default().fg(Color::DarkGray).bold(),
                     ChildStatus::Success => Style::default().fg(Color::Green).bold(),
                     ChildStatus::Failed => Style::default().fg(Color::Red).bold(),
                 };
-                let dur = child
-                    .duration_ms
-                    .map(|ms| {
-                        if ms < 1000 {
-                            format!(" ({ms}ms)")
-                        } else {
-                            format!(" ({:.1}s)", ms as f64 / 1000.0)
-                        }
-                    })
-                    .unwrap_or_default();
+                let meta = match child.status {
+                    ChildStatus::Running => "running".to_string(),
+                    ChildStatus::Success => child
+                        .duration_ms
+                        .map(format_duration_ms)
+                        .unwrap_or_else(|| "done".into()),
+                    ChildStatus::Failed => child
+                        .duration_ms
+                        .map(|ms| format!("failed · {}", format_duration_ms(ms)))
+                        .unwrap_or_else(|| "failed".into()),
+                };
+                let name = child_display_name(&child.name);
+                let name_width = name.width();
                 lines.push(Line::from(vec![
                     Span::styled(connector.to_string(), dim),
-                    Span::styled("• ", bullet_color),
-                    Span::styled(child.name.clone(), Style::default().bold()),
-                    Span::raw(" "),
+                    Span::styled(name, name_style),
+                    Span::styled(format!(" · {meta}"), dim),
+                    Span::styled(" · ", dim),
                     Span::raw(truncate_by_width(
                         &child.description,
-                        max_child_w.saturating_sub(child.name.width() + 4),
+                        max_child_w.saturating_sub(name_width + meta.width() + 7),
                     )),
-                    Span::styled(dur, dim),
                 ]));
             }
         }
@@ -367,6 +385,14 @@ impl HistoryCell for TaskCell {
                 });
             }
         }
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
     }
 }
 
@@ -458,8 +484,14 @@ mod tests {
 
         let out = render(&t, 100, 4);
         let normalized = out.replace('\n', " ");
-        assert!(out.contains("Task interrupted"), "{out}");
-        assert!(!out.contains("Task failed"), "{out}");
+        assert!(
+            out.contains("Task · Get agent result: reviewer@abc · interrupted"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Task · Get agent result: reviewer@abc · failed"),
+            "{out}"
+        );
         assert!(normalized.contains(AGENT_RESULT_INTERRUPTED_ERROR), "{out}");
     }
 
@@ -507,7 +539,7 @@ mod tests {
         let t = TaskCell::new_running("tu_parent", "audit cache correctness");
         let out = render(&t, 80, 2);
         assert!(out.contains("▶"), "missing arrow: {out}");
-        assert!(out.contains("Task"), "missing label: {out}");
+        assert!(out.contains("Task ·"), "missing label: {out}");
         assert!(
             out.contains("audit cache correctness"),
             "missing desc: {out}"
@@ -519,7 +551,10 @@ mod tests {
         let mut t = TaskCell::new_running("tu_parent", "do work");
         t.complete("success", 2500, Some("3 files changed".into()), None);
         let out = render(&t, 80, 4);
-        assert!(out.contains("Task done"), "missing completed label: {out}");
+        assert!(
+            out.contains("Task · do work · done"),
+            "missing completed label: {out}"
+        );
         assert!(out.contains("2.5s"), "missing duration: {out}");
         assert!(out.contains("3 files changed"), "missing summary: {out}");
     }
@@ -536,7 +571,10 @@ mod tests {
         let mut t = TaskCell::new_running("tu_parent", "risky");
         t.complete("error", 100, None, Some("timeout".into()));
         let out = render(&t, 80, 3);
-        assert!(out.contains("Task failed"), "missing failed label: {out}");
+        assert!(
+            out.contains("Task · risky · failed"),
+            "missing failed label: {out}"
+        );
         assert!(out.contains("⚠"), "missing error marker: {out}");
         assert!(out.contains("timeout"), "missing error text: {out}");
     }
@@ -549,8 +587,11 @@ mod tests {
         t.push_child_completed("tu_a", "success", 20);
         let out = render(&t, 80, 5);
         assert!(out.contains("├"), "missing mid-connector: {out}");
-        assert!(out.contains("bash"), "missing first child: {out}");
-        assert!(out.contains("read_file"), "missing second child: {out}");
+        assert!(out.contains("Bash · 20ms"), "missing first child: {out}");
+        assert!(
+            out.contains("Read · running"),
+            "missing second child: {out}"
+        );
     }
 
     #[test]
