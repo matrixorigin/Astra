@@ -41,7 +41,7 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
         "active composer should use a short primary prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Queued after next tool call"),
+        rendered.contains("Queued for next tool call"),
         "active composer should explain queued delivery boundary in the helper row; got {rendered:?}"
     );
     assert!(
@@ -60,7 +60,7 @@ fn idle_composer_uses_clean_prompt_and_editor_hint() {
         "idle composer should render a short prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Ctrl+E editor"),
+        rendered.contains("Ctrl+E opens editor"),
         "idle helper row should carry editor guidance; got {rendered:?}"
     );
 }

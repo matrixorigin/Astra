@@ -18,7 +18,7 @@ use super::textarea::{TextArea, TextAreaAction};
 /// rewritten after an append crosses this threshold.
 const HISTORY_MAX_ENTRIES: usize = 500;
 
-/// Duration the `›` prefix glows after the user submits a message.
+/// Duration the `·` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
 /// glance even when the next frame arrives quickly.
 const SUBMIT_FLASH_DURATION: Duration = Duration::from_millis(180);
@@ -37,7 +37,7 @@ pub(crate) struct ChatComposer {
     pasted_blobs: Vec<(String, String)>,
     paste_counter: u32,
     /// Wall-clock instant of the most recent submit. When within
-    /// `SUBMIT_FLASH_DURATION`, the `›` prefix renders in an accent
+    /// `SUBMIT_FLASH_DURATION`, the `·` prefix renders in an accent
     /// color so the user gets instant visual feedback that the message
     /// was accepted.
     last_submit_at: Option<Instant>,
@@ -74,7 +74,7 @@ impl ChatComposer {
             history,
             history_index: None,
             draft: None,
-            prompt_prefix: "› ".to_string(),
+            prompt_prefix: "· ".to_string(),
             pasted_blobs: Vec::new(),
             paste_counter: 0,
             last_submit_at: None,

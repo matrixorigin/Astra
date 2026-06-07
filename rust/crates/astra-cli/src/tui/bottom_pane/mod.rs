@@ -1139,17 +1139,17 @@ fn render_composer_hint_bar(area: Rect, buf: &mut Buffer, task_active: bool) {
         choose_hint(
             area.width,
             &[
-                "Queued after next tool call · Ctrl+C stops",
-                "After next tool call · Ctrl+C stops",
-                "Queued · Ctrl+C stops",
+                "Queued for next tool call · Ctrl+C stops",
+                "Next tool call · Ctrl+C stops",
+                "Queued · Ctrl+C",
             ],
         )
     } else {
         choose_hint(
             area.width,
             &[
-                "Ctrl+E editor · Shift+Enter newline",
-                "Ctrl+E editor · newline",
+                "Ctrl+E opens editor · Shift+Enter newline",
+                "Ctrl+E editor · Shift+Enter",
                 "Ctrl+E",
             ],
         )
@@ -1162,9 +1162,8 @@ fn render_composer_hint_bar(area: Rect, buf: &mut Buffer, task_active: bool) {
     ];
     let used = 2 + hint_width;
     let remaining = area.width as usize;
-    if remaining > used + 1 {
-        spans.push(Span::styled(" ", rule_style));
-        spans.push(Span::styled("─".repeat(remaining - used - 1), rule_style));
+    if remaining > used {
+        spans.push(Span::styled(" ".repeat(remaining - used), rule_style));
     }
     Widget::render(Line::from(spans), area, buf);
 }

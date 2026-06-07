@@ -85,6 +85,16 @@ const MODEL_MAX_WIDTH: usize = 22;
 const BRANCH_MAX_WIDTH: usize = 20;
 const CWD_MAX_WIDTH: usize = 24;
 
+fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Prompt => "Ask",
+        PermissionMode::Auto => "Auto",
+        PermissionMode::Plan => "Plan",
+        PermissionMode::AcceptEdits => "Edits",
+        PermissionMode::Deny => "Deny",
+    }
+}
+
 impl StatusLine {
     /// Build a status line from context.
     pub fn from_context(ctx: &StatusContext) -> Self {
@@ -113,7 +123,7 @@ impl StatusLine {
         match ctx.permission_mode {
             PermissionMode::Prompt => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -121,7 +131,7 @@ impl StatusLine {
             }
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -129,7 +139,7 @@ impl StatusLine {
             }
             PermissionMode::Plan => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::Blue)
                         .add_modifier(Modifier::BOLD),
@@ -137,7 +147,7 @@ impl StatusLine {
             }
             PermissionMode::AcceptEdits => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -145,7 +155,7 @@ impl StatusLine {
             }
             PermissionMode::Deny => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
             }

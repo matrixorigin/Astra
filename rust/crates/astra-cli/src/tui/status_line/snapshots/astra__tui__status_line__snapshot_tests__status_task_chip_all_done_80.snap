@@ -3,4 +3,4 @@ source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
 assertion_line: 176
 expression: "render_ctx(&ctx, 80)"
 ---
-  default · ▶ 4 done                             sonnet-4.6 · ~/projects/astra
+  Ask · ▶ 4 done                                 sonnet-4.6 · ~/projects/astra

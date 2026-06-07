@@ -3,6 +3,6 @@ source: crates/astra-cli/src/tui/bottom_pane/queue_preview_tests.rs
 assertion_line: 116
 expression: "snapshot_text(&pane, Rect::new(0, 0, 42, 4))"
 ---
-› Send follow-up                          
-  After next tool call · Ctrl+C stops ────
-  default    sonnet-4.6 · ~/github/astra
+· Send follow-up                          
+  Queued for next tool call · Ctrl+C stops
+  Ask        sonnet-4.6 · ~/github/astra
