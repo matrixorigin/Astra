@@ -191,6 +191,7 @@ mod tests {
             hooks: Default::default(),
             cancellation: Default::default(),
             messaging: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: None,

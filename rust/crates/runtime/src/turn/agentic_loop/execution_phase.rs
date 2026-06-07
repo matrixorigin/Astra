@@ -108,7 +108,7 @@ fn render_deferred_user_input(content: &str) -> String {
 
 pub(crate) async fn poll_deferred_user_inputs(
     state: &mut AgenticLoopState,
-    queued_at_tool_generation: u64,
+    queued_at_completed_tool_rounds: u64,
 ) -> Vec<serde_json::Value> {
     if let (Some(run_control), Some(run_id)) =
         (state.run_control.as_ref(), state.current_run_id.as_deref())
@@ -116,8 +116,8 @@ pub(crate) async fn poll_deferred_user_inputs(
         return poll_and_stage_deferred_inputs(
             run_control.as_ref(),
             run_id,
-            &mut state.messaging.deferred_input,
-            queued_at_tool_generation,
+            &mut state.deferred_input,
+            queued_at_completed_tool_rounds,
             "execution phase",
         )
         .await
@@ -135,7 +135,7 @@ pub(crate) async fn poll_and_stage_deferred_inputs(
     run_control: &dyn crate::turn::run_control::RunControlProvider,
     run_id: &str,
     deferred_input: &mut DeferredInputState,
-    queued_at_tool_generation: u64,
+    queued_at_completed_tool_rounds: u64,
     phase: &'static str,
 ) -> DeferredInputPollResult {
     let poll = run_control
@@ -149,10 +149,11 @@ pub(crate) async fn poll_and_stage_deferred_inputs(
             "deferred user input poll failed"
         );
     }
-    let staged =
-        deferred_input.stage_polled_user_inputs(poll, queued_at_tool_generation, |input| {
-            deferred_user_input_text(input)
-        });
+    let staged = deferred_input.stage_polled_user_inputs(
+        poll,
+        queued_at_completed_tool_rounds,
+        deferred_user_input_text,
+    );
     DeferredInputPollResult {
         inputs: staged.inputs,
         staged_count: staged.staged_count,
@@ -162,7 +163,7 @@ pub(crate) async fn poll_and_stage_deferred_inputs(
 pub(crate) fn release_ready_deferred_user_inputs(state: &mut AgenticLoopState) -> Vec<usize> {
     let mut ready_contents = Vec::new();
     let mut released_event_indices = Vec::new();
-    for entry in state.messaging.release_ready_deferred_user_inputs() {
+    for entry in state.deferred_input.release_ready_deferred_user_inputs() {
         released_event_indices.push(entry.event_index);
         ready_contents.push(entry.content);
     }
@@ -449,8 +450,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         emitter.llm_call_started(turn_index as u32);
     }
 
-    let tool_call_generation = state.messaging.tool_call_generation();
-    let polled_inputs = poll_deferred_user_inputs(state, tool_call_generation).await;
+    let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+    let polled_inputs = poll_deferred_user_inputs(state, completed_tool_rounds).await;
     for input in &polled_inputs {
         host.on_deferred_user_input(input);
     }
@@ -2598,7 +2599,7 @@ pub(crate) fn observe_turn_end_without_tools(
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
 ) {
-    state.messaging.record_tool_boundary();
+    state.deferred_input.record_tool_boundary();
     if let (Some(hub), Some(session)) = (
         state.telemetry.observability_hub.as_ref(),
         state.telemetry.observability_session.as_ref(),
@@ -3037,10 +3038,7 @@ mod tests {
         state.session_turn = 6;
         state.max_turns = 20;
         state.remaining_turns = 4;
-        state
-            .messaging
-            .deferred_input
-            .set_tool_call_generation_for_test(41);
+        state.deferred_input.set_completed_tool_rounds_for_test(41);
         let hub = ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         state.telemetry.observability_hub = Some(Arc::new(hub));
@@ -3049,7 +3047,7 @@ mod tests {
         let turn_start_time = Instant::now() - Duration::from_millis(25);
         observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
 
-        assert_eq!(state.messaging.tool_call_generation(), 42);
+        assert_eq!(state.deferred_input.completed_tool_rounds(), 42);
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
@@ -4779,35 +4777,20 @@ mod tests {
         ]));
         state.run_control = Some(provider.clone());
 
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            1
-        );
-        assert_eq!(state.messaging.deferred_user_input_cursor(), 2);
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 1);
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
 
-        state
-            .messaging
-            .deferred_input
-            .set_tool_call_generation_for_test(1);
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        state.deferred_input.set_completed_tool_rounds_for_test(1);
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let released = release_ready_deferred_user_inputs(&mut state);
         mark_released_deferred_user_inputs(&state, released).await;
 
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            0
-        );
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 0);
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(state.message, "Switch to writing tests first.");
         assert_eq!(
@@ -4828,10 +4811,7 @@ mod tests {
     async fn deferred_user_input_submitted_after_tool_round_waits_for_future_tool_round() {
         let mut state = make_state();
         state.current_run_id = Some("run-late-queued".into());
-        state
-            .messaging
-            .deferred_input
-            .set_tool_call_generation_for_test(1);
+        state.deferred_input.set_completed_tool_rounds_for_test(1);
         state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
             RunQueuedInputPoll {
                 next_cursor: 4,
@@ -4853,44 +4833,23 @@ mod tests {
             },
         ])));
 
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            1
-        );
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 1);
 
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
         assert!(state.volatile_pending.is_empty());
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            1
-        );
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 1);
 
-        state
-            .messaging
-            .deferred_input
-            .set_tool_call_generation_for_test(2);
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        state.deferred_input.set_completed_tool_rounds_for_test(2);
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            0
-        );
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 0);
         assert_eq!(state.message, "Stop reading and patch the code.");
         assert_eq!(
             state
@@ -4931,49 +4890,25 @@ mod tests {
             },
         ])));
 
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 0);
+
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 1);
         assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
+            state.deferred_input.pending_deferred_user_inputs_for_test()[0]
+                .queued_at_completed_tool_rounds,
             0
         );
 
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            1
-        );
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_inputs_for_test()[0]
-                .queued_at_tool_generation,
-            0
-        );
-
-        state
-            .messaging
-            .deferred_input
-            .set_tool_call_generation_for_test(1);
-        let tool_call_generation = state.messaging.tool_call_generation();
-        let _ = poll_deferred_user_inputs(&mut state, tool_call_generation).await;
+        state.deferred_input.set_completed_tool_rounds_for_test(1);
+        let completed_tool_rounds = state.deferred_input.completed_tool_rounds();
+        let _ = poll_deferred_user_inputs(&mut state, completed_tool_rounds).await;
         let _ = release_ready_deferred_user_inputs(&mut state);
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            0
-        );
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 0);
         assert_eq!(state.message, "Stop and respond to the user first.");
         assert_eq!(
             state
@@ -4994,31 +4929,19 @@ mod tests {
     #[test]
     fn deferred_user_input_releases_after_text_only_turn_boundary() {
         let mut state = make_state();
-        state
-            .messaging
-            .deferred_input
-            .set_tool_call_generation_for_test(7);
-        state
-            .messaging
-            .deferred_input
-            .push_deferred_user_input_for_test(
-                9,
-                "Stop tool work and answer directly.".to_string(),
-                7,
-            );
+        state.deferred_input.set_completed_tool_rounds_for_test(7);
+        state.deferred_input.push_deferred_user_input_for_test(
+            9,
+            "Stop tool work and answer directly.".to_string(),
+            7,
+        );
 
         observe_turn_end_without_tools(&mut state, 0, Instant::now(), None);
         let released = release_ready_deferred_user_inputs(&mut state);
 
-        assert_eq!(state.messaging.tool_call_generation(), 8);
+        assert_eq!(state.deferred_input.completed_tool_rounds(), 8);
         assert_eq!(released, vec![9]);
-        assert_eq!(
-            state
-                .messaging
-                .deferred_input
-                .pending_deferred_user_input_count(),
-            0
-        );
+        assert_eq!(state.deferred_input.pending_deferred_user_input_count(), 0);
         assert_eq!(state.message, "Stop tool work and answer directly.");
         assert_eq!(
             state

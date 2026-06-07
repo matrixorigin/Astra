@@ -424,6 +424,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             messaging: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(

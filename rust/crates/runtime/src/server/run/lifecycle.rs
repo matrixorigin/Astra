@@ -3633,6 +3633,7 @@ impl AgenticRunLifecycleService {
             },
             cancellation: Default::default(),
             messaging: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(
@@ -6061,6 +6062,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 mailbox: config.mailbox,
                 ..Default::default()
             },
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(

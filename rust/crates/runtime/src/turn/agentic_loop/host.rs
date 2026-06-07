@@ -192,6 +192,10 @@ pub trait AgenticLoopHost: Send {
     /// `edge_profile`, can use this hook to keep the next LLM round aligned
     /// with any per-input runtime hints before the deferred user message is
     /// surfaced to the model.
+    ///
+    /// Contract: the loop calls this at most once per durable input event.
+    /// `DeferredInputState` advances its append-only cursor when staging a
+    /// poll result, so hosts do not need to deduplicate repeated hook calls.
     fn on_deferred_user_input(&mut self, _input: &Value) {}
 
     /// Headless round terminal output.
@@ -667,14 +671,14 @@ pub struct DeferredInputState {
     /// Durable event cursor for deferred user-input polling.
     deferred_user_input_cursor: usize,
     /// Monotonic count of completed tool-call rounds observed by this run.
-    tool_call_generation: u64,
+    completed_tool_rounds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredUserInput {
     pub event_index: usize,
     pub content: String,
-    pub queued_at_tool_generation: u64,
+    pub queued_at_completed_tool_rounds: u64,
 }
 
 pub(crate) struct StagedDeferredUserInputs {
@@ -687,8 +691,8 @@ impl DeferredInputState {
         self.deferred_user_input_cursor
     }
 
-    pub fn tool_call_generation(&self) -> u64 {
-        self.tool_call_generation
+    pub fn completed_tool_rounds(&self) -> u64 {
+        self.completed_tool_rounds
     }
 
     pub fn pending_deferred_user_input_count(&self) -> usize {
@@ -696,13 +700,13 @@ impl DeferredInputState {
     }
 
     pub fn record_tool_boundary(&mut self) {
-        self.tool_call_generation = self.tool_call_generation.saturating_add(1);
+        self.completed_tool_rounds = self.completed_tool_rounds.saturating_add(1);
     }
 
     pub(crate) fn stage_polled_user_inputs<F>(
         &mut self,
         poll: crate::turn::run_control::RunQueuedInputPoll,
-        queued_at_tool_generation: u64,
+        queued_at_completed_tool_rounds: u64,
         mut content_from_input: F,
     ) -> StagedDeferredUserInputs
     where
@@ -720,7 +724,7 @@ impl DeferredInputState {
             self.deferred_user_inputs.push(DeferredUserInput {
                 event_index: event.event_index,
                 content,
-                queued_at_tool_generation,
+                queued_at_completed_tool_rounds,
             });
             staged_count += 1;
         }
@@ -732,12 +736,12 @@ impl DeferredInputState {
     }
 
     pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {
-        let current_generation = self.tool_call_generation;
+        let current_generation = self.completed_tool_rounds;
         let mut pending = Vec::new();
         let mut ready = Vec::new();
 
         for entry in std::mem::take(&mut self.deferred_user_inputs) {
-            if current_generation > entry.queued_at_tool_generation {
+            if current_generation > entry.queued_at_completed_tool_rounds {
                 ready.push(entry);
             } else {
                 pending.push(entry);
@@ -754,8 +758,8 @@ impl DeferredInputState {
     }
 
     #[cfg(test)]
-    pub fn set_tool_call_generation_for_test(&mut self, generation: u64) {
-        self.tool_call_generation = generation;
+    pub fn set_completed_tool_rounds_for_test(&mut self, completed_tool_rounds: u64) {
+        self.completed_tool_rounds = completed_tool_rounds;
     }
 
     #[cfg(test)]
@@ -763,12 +767,12 @@ impl DeferredInputState {
         &mut self,
         event_index: usize,
         content: String,
-        queued_at_tool_generation: u64,
+        queued_at_completed_tool_rounds: u64,
     ) {
         self.deferred_user_inputs.push(DeferredUserInput {
             event_index,
             content,
-            queued_at_tool_generation,
+            queued_at_completed_tool_rounds,
         });
     }
 }
@@ -791,25 +795,6 @@ pub struct MessagingState {
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
-    pub deferred_input: DeferredInputState,
-}
-
-impl MessagingState {
-    pub fn deferred_user_input_cursor(&self) -> usize {
-        self.deferred_input.deferred_user_input_cursor()
-    }
-
-    pub fn tool_call_generation(&self) -> u64 {
-        self.deferred_input.tool_call_generation()
-    }
-
-    pub fn record_tool_boundary(&mut self) {
-        self.deferred_input.record_tool_boundary();
-    }
-
-    pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {
-        self.deferred_input.release_ready_deferred_user_inputs()
-    }
 }
 
 /// Point-in-time summary of the active session task board.
@@ -1243,6 +1228,9 @@ pub struct AgenticLoopState {
     pub telemetry: TelemetryState,
     pub stall: StallTrackingState,
     pub messaging: MessagingState,
+    /// Durable user input queued while a run is active. Kept separate from
+    /// `messaging`, which is reserved for agent-to-agent routing state.
+    pub deferred_input: DeferredInputState,
     pub hooks: StopHookState,
     pub cancellation: CancellationState,
     pub error_recovery: ErrorRecoveryState,
@@ -2356,6 +2344,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         hooks: Default::default(),
         messaging: Default::default(),
         cancellation: Default::default(),
+        deferred_input: Default::default(),
         error_recovery: Default::default(),
         pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -2732,6 +2721,7 @@ pub(crate) mod tests {
             hooks: Default::default(),
             messaging: Default::default(),
             cancellation: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             pipeline_session: None,
             message: "test query".to_string(),
