@@ -6,8 +6,8 @@
 //! Shape:
 //!
 //! ```text
-//! ✶ Thinking (16s · ↓ 5.1k tokens · esc to interrupt)
-//! ✶ Running bash (2s)
+//! • Thinking · 16s · 5.1k tokens · Esc stops
+//! • Thinking · 3s · Bash · Esc stops
 //! ```
 //!
 //! Design rules — drawn from Codex's `StatusIndicatorWidget`:
@@ -87,7 +87,7 @@ pub(crate) struct StatusIndicator {
 }
 
 /// How long the model can be silent in `Thinking` state before the
-/// spinner shows the `· thought for Ns` chip. Tuned to match the
+/// indicator shows the `· thinking Ns` chip. Tuned to match the
 /// "this is taking longer than usual" expectation: short enough to
 /// reassure the user during Bedrock extended-thinking pauses,
 /// long enough to avoid flickering in/out for a normal prompt.
@@ -205,7 +205,7 @@ fn render_for(
     let label = turn_label.unwrap_or(&state_label);
     let activity = (state_label != label).then_some(state_label.as_str());
 
-    // Surface a `· thought for Ns` chip during long silent stretches
+    // Surface a `· thinking Ns` chip during long silent stretches
     // in Thinking state. Bedrock extended-thinking can churn 60-120s
     // without any SSE delta — this chip is the only signal the user
     // has that the model is alive on the other end.
@@ -213,10 +213,10 @@ fn render_for(
 
     let mut spans = vec![Span::styled(format!("{} ", star_frame(now)), star_style)];
     spans.extend(label_spans(label, label_style, now));
-    spans.push(Span::styled(
-        suffix(elapsed, stream_chars, thought_for, activity),
-        dim,
-    ));
+    let suffix = suffix(elapsed, stream_chars, thought_for, activity);
+    if !suffix.is_empty() {
+        spans.push(Span::styled(format!(" {suffix}"), dim));
+    }
     Some(Line::from(spans))
 }
 
@@ -232,7 +232,7 @@ fn render_for(
 /// not a drive-by rewrite.
 fn label_for_tool(name: &str) -> String {
     match name {
-        "bash" => "Running bash".into(),
+        "bash" => "Bash".into(),
         "write_file" => "Writing".into(),
         "read_file" => "Reading".into(),
         "str_replace" => "Editing".into(),
@@ -245,8 +245,8 @@ fn label_for_tool(name: &str) -> String {
     }
 }
 
-/// Returns `Some(elapsed)` when the spinner should display the
-/// `· thought for Ns` chip. Conditions:
+/// Returns `Some(elapsed)` when the indicator should display the
+/// `· thinking Ns` chip. Conditions:
 /// 1. State is Thinking (chip is meaningless for tool execution etc.)
 /// 2. No tokens have streamed yet (token counter takes over once any
 ///    have arrived — the counter itself proves the model is active)
@@ -279,7 +279,7 @@ fn stall_intensity_color(elapsed: Option<Duration>, theme: &crate::tui::theme::T
     }
 }
 
-/// Parenthesised suffix: `(elapsed · thought for Ns · ↓ N tokens · esc to interrupt)`.
+/// Inline suffix: `· elapsed · thinking Ns · 5.1k tokens · Esc stops`.
 /// Sections elide when they'd be meaningless (token counter
 /// before first delta, no-yet elapsed at state flip, thought-for
 /// chip during normal streaming).
@@ -297,16 +297,20 @@ fn suffix(
         parts.push(activity.to_string());
     }
     if let Some(d) = thought_for {
-        parts.push(format!("thought for {}", fmt_duration_coarse(d)));
+        parts.push(format!("thinking {}", fmt_duration_coarse(d)));
     }
     if stream_chars > 0 {
         parts.push(format!(
-            "↓ {} tokens",
+            "{} tokens",
             fmt_tokens(approx_tokens(stream_chars))
         ));
     }
-    parts.push("esc to interrupt".into());
-    format!(" ({})", parts.join(" · "))
+    parts.push("Esc stops".into());
+    parts
+        .into_iter()
+        .map(|part| format!("· {part}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn fmt_duration_coarse(d: Duration) -> String {
@@ -411,14 +415,8 @@ fn color_to_rgb_approx(color: Color) -> Option<(u8, u8, u8)> {
 /// Rotating star glyph. Time-keyed to a 500 ms window — slow
 /// heartbeat, fast enough to reassure the terminal isn't frozen.
 fn star_frame(now: Instant) -> &'static str {
-    const FRAMES: [&str; 4] = ["✶", "✷", "✹", "✺"];
-    // Instant has no fixed epoch, so key off a process-monotonic
-    // bucket count. Wraps at u64::MAX ≈ never.
-    let bucket = now
-        .elapsed()
-        .saturating_add(Duration::from_nanos(1))
-        .as_millis() as u64
-        / 500;
+    const FRAMES: [&str; 4] = ["·", "•", "●", "•"];
+    let bucket = (crate::tui::shimmer::time_at(now).max(0.0) * 2.0).floor() as usize;
     FRAMES[(bucket as usize) % FRAMES.len()]
 }
 
@@ -426,7 +424,7 @@ fn star_frame(now: Instant) -> &'static str {
 mod tests {
     use super::{
         IndicatorState, StatusIndicator, approx_tokens, fmt_duration_coarse, fmt_tokens,
-        label_spans_for_mode, render_for, stall_intensity_color,
+        label_spans_for_mode, render_for, stall_intensity_color, star_frame,
     };
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
@@ -507,10 +505,13 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&line);
-        assert!(any_star(&text), "star missing: {text}");
+        assert!(
+            ["·", "•", "●"].iter().any(|g| text.contains(g)),
+            "indicator dot missing: {text}"
+        );
         assert!(text.contains("Thinking"));
         assert!(text.contains("3s"));
-        assert!(text.contains("esc to interrupt"));
+        assert!(text.contains("Esc stops"));
     }
 
     #[test]
@@ -550,7 +551,7 @@ mod tests {
             started_at: t0,
         };
         let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
-        assert!(text_of(&line).contains("Running bash"));
+        assert!(text_of(&line).contains("Bash"));
     }
 
     #[test]
@@ -576,7 +577,7 @@ mod tests {
             "primary label must not switch away from the turn verb: {tool}"
         );
         assert!(
-            tool.contains("Running bash"),
+            tool.contains("Bash"),
             "tool activity should remain visible as secondary context: {tool}"
         );
     }
@@ -645,7 +646,7 @@ mod tests {
     fn tool_name_maps_to_human_verb() {
         let t0 = Instant::now();
         let cases: &[(&str, &str)] = &[
-            ("bash", "Running bash"),
+            ("bash", "Bash"),
             ("write_file", "Writing"),
             ("read_file", "Reading"),
             ("str_replace", "Editing"),
@@ -728,11 +729,13 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&line);
-        assert!(text.contains("↓"), "down arrow missing: {text}");
-        // Rounding tolerance: 5.0k or 5.1k both acceptable.
         assert!(
             text.contains("5.0k") || text.contains("5.1k"),
             "unexpected token count: {text}"
+        );
+        assert!(
+            !text.contains("↓"),
+            "token counter should now be calmer text without arrows: {text}"
         );
     }
 
@@ -774,23 +777,23 @@ mod tests {
     }
 
     /// Bedrock extended-thinking can churn for 60-120s with zero
-    /// SSE deltas. Pre-fix the user saw `✶ Thinking (Ns · esc to
-    /// interrupt)` with N climbing but no other signal that the
-    /// model was actually working — indistinguishable from a
-    /// hung UI. Surface a `thought for Ns` chip after a short
-    /// silence window so the user can tell the difference.
+    /// SSE deltas. Pre-fix the user saw `• Thinking · Ns · Esc
+    /// stops` with N climbing but no other signal that the model
+    /// was actually working — indistinguishable from a hung UI.
+    /// Surface a `thinking Ns` chip after a short silence window
+    /// so the user can tell the difference.
     #[test]
     fn thought_for_suffix_appears_after_silent_window() {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.set_state(IndicatorState::Thinking { started_at: t0 });
 
-        // Just after start: no thought-for chip yet (well within
+        // Just after start: no silent-thinking chip yet (well within
         // the silent-window threshold).
         let line = s.render_at(t0 + Duration::from_secs(1)).unwrap();
         assert!(
-            !text_of(&line).contains("thought for"),
-            "fresh thinking shouldn't show thought-for: {}",
+            !text_of(&line).contains("thinking 1s"),
+            "fresh thinking shouldn't show the silent-thinking chip: {}",
             text_of(&line)
         );
 
@@ -798,7 +801,7 @@ mod tests {
         let line = s.render_at(t0 + Duration::from_secs(7)).unwrap();
         let text = text_of(&line);
         assert!(
-            text.contains("thought for") && text.contains("7s"),
+            text.contains("thinking 7s"),
             "after 7s of silence the chip should show: {text}"
         );
     }
@@ -815,23 +818,23 @@ mod tests {
 
         // 7s in with no tokens — chip is showing.
         let line = s.render_at(t0 + Duration::from_secs(7)).unwrap();
-        assert!(text_of(&line).contains("thought for"));
+        assert!(text_of(&line).contains("thinking"));
 
         // First token streams.
         s.bump_stream_chars(40); // ~10 tokens
         let line = s.render_at(t0 + Duration::from_secs(8)).unwrap();
         let text = text_of(&line);
         assert!(
-            !text.contains("thought for"),
-            "thought-for chip should hide once tokens stream: {text}"
+            !text.contains("thinking 8s"),
+            "silent-thinking chip should hide once tokens stream: {text}"
         );
-        assert!(text.contains("↓"), "token counter takes over: {text}");
+        assert!(text.contains("tokens"), "token counter takes over: {text}");
     }
 
     #[test]
     fn thought_for_suffix_only_in_thinking_state() {
         // Tool / Waiting / AwaitingApproval already have their own
-        // semantics — adding a "thought for Ns" chip would be
+        // semantics — adding a "thinking Ns" chip would be
         // nonsense.
         let t0 = Instant::now();
         let line = render_for(
@@ -846,9 +849,19 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !text_of(&line).contains("thought for"),
-            "thought-for chip is Thinking-only"
+            !text_of(&line).contains("thinking 15s"),
+            "silent-thinking chip is Thinking-only"
         );
+    }
+
+    #[test]
+    fn star_frame_advances_across_half_second_buckets() {
+        let origin = crate::tui::shimmer::process_start();
+        let a = star_frame(origin);
+        let b = star_frame(origin + Duration::from_millis(600));
+        let c = star_frame(origin + Duration::from_millis(1100));
+        assert_ne!(a, b, "indicator frame should advance after 600ms");
+        assert_ne!(b, c, "indicator frame should continue advancing");
     }
 
     #[test]

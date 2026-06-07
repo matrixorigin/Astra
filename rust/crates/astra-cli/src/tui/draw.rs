@@ -546,14 +546,10 @@ pub(crate) fn do_draw(
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
 
-    // Stronger separator between scrollback area and composer so the
-    // input region stays visually anchored even on low-contrast themes.
-    let sep_line = Line::from(ratatui::text::Span::styled(
-        "━".repeat(width as usize),
-        ratatui::style::Style::default()
-            .fg(ratatui::style::Color::Gray)
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    ));
+    // Soft rule between scrollback and the bottom surface. Keep the
+    // break visible, but avoid a heavy console-style bar that competes
+    // with the actual content and input chrome.
+    let sep_line = separator_line(width);
     let sep_renderable = RenderableItem::Owned(Box::new(sep_line));
 
     let bp_renderable = BottomPaneRenderable(bottom_pane);
@@ -616,6 +612,20 @@ pub(crate) fn do_draw(
         })
         .map_err(|e| format!("draw: {e}"))?;
     Ok(())
+}
+
+fn separator_line(width: u16) -> Line<'static> {
+    let theme = super::theme::current();
+    let inner = width.saturating_sub(4) as usize;
+    let spans = vec![
+        ratatui::text::Span::raw("  "),
+        ratatui::text::Span::styled(
+            "─".repeat(inner),
+            ratatui::style::Style::default().fg(theme.dim),
+        ),
+        ratatui::text::Span::raw("  "),
+    ];
+    Line::from(spans)
 }
 
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
