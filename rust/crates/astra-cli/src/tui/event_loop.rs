@@ -411,7 +411,7 @@ fn refresh_open_agent_detail_by_id(
     }
 }
 
-/// Detect a `SystemLevel::Response` cell (the `⎿`-prefixed kind).
+/// Detect a `SystemLevel::Response` cell (the `Result ·` kind).
 /// Used by `flush_chat_widget` to omit the usual trailing blank so
 /// the response hugs the `› /cmd` line above it.
 fn is_response_cell(cell: &dyn history_cell::HistoryCell) -> bool {
@@ -422,7 +422,7 @@ fn is_response_cell(cell: &dyn history_cell::HistoryCell) -> bool {
 
 /// Detect a UserCell whose text is a slash command (`/model`,
 /// `/login`, …). These pair tightly with a following response cell
-/// so their trailing blank is suppressed — `› /cmd` hugs `⎿ reply`.
+/// so their trailing blank is suppressed — `> /cmd` hugs `Result · reply`.
 fn is_slash_user_cell(cell: &dyn history_cell::HistoryCell) -> bool {
     cell.as_any_ref()
         .downcast_ref::<history_cell::user::UserCell>()
@@ -431,7 +431,7 @@ fn is_slash_user_cell(cell: &dyn history_cell::HistoryCell) -> bool {
 
 /// Prose submits should hit scrollback immediately; slash commands wait
 /// until their paired response/view result is ready so `› /cmd` and
-/// `⎿ reply` land in one flush with no synthetic blank row between them.
+/// `Result · reply` land in one flush with no synthetic blank row between them.
 fn should_flush_submitted_user_cell_immediately(text: &str) -> bool {
     !text.trim_start().starts_with('/')
 }

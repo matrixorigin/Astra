@@ -1,8 +1,9 @@
-//! System-turn history cell — info / warning / error messages.
+//! System-turn history cell — note / result / warning / error messages.
 //!
 //! Used for any TUI-generated notice that isn't model output:
 //! session restored, permission mode changed, non-fatal errors,
-//! etc. Rendered dim by default; warnings yellow; errors red.
+//! etc. Rendered as compact labeled rows so they read like product
+//! feedback rather than raw terminal logs.
 //!
 //! Persists as [`TurnEvent::System`]. Never live — the text is
 //! fully known at construction time, same as `UserCell`.
@@ -31,12 +32,12 @@ impl SystemCell {
         }
     }
 
-    /// Response to a slash command. Renders with a `⎿` corner glyph
-    /// so the reply visually pairs with the `› /cmd` line above:
+    /// Response to a slash command. Renders as a compact `Result ·`
+    /// row so the reply visually pairs with the `> /cmd` line above:
     ///
     /// ```text
-    /// › /model
-    ///   ⎿  Set model to Opus 4.6
+    /// > /model
+    ///   Result · Set model to Opus 4.6
     /// ```
     pub fn response(message: impl Into<String>) -> Self {
         Self {
@@ -100,32 +101,54 @@ impl SystemCell {
 
 impl HistoryCell for SystemCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let style = match self.level {
-            SystemLevel::Info => Style::default().dim(),
-            SystemLevel::Response => Style::default().dim(),
-            SystemLevel::Warning => Style::default().yellow(),
-            SystemLevel::Error => Style::default().red(),
+        let (label, label_style, body_style) = match self.level {
+            SystemLevel::Info => (
+                "Note",
+                Style::default()
+                    .fg(crate::tui::theme::current().dim)
+                    .add_modifier(ratatui::style::Modifier::DIM),
+                Style::default()
+                    .fg(crate::tui::theme::current().dim)
+                    .add_modifier(ratatui::style::Modifier::DIM),
+            ),
+            SystemLevel::Response => (
+                "Result",
+                Style::default()
+                    .fg(crate::tui::theme::current().dim)
+                    .add_modifier(ratatui::style::Modifier::DIM),
+                Style::default()
+                    .fg(crate::tui::theme::current().dim)
+                    .add_modifier(ratatui::style::Modifier::DIM),
+            ),
+            SystemLevel::Warning => (
+                "Warning",
+                Style::default().yellow().bold(),
+                Style::default().yellow(),
+            ),
+            SystemLevel::Error => (
+                "Error",
+                Style::default().red().bold(),
+                Style::default().red(),
+            ),
         };
-
-        // `Response` gets the `⎿` corner glyph on the first line and
-        // hanging-indent alignment on continuation lines, so multi-line
-        // responses read as one visual block paired with `› /cmd`:
-        //
-        //   › /model
-        //     ⎿  Set model to Opus 4.6
-        //        (1M context, thinking enabled)
-        if self.level == SystemLevel::Response {
-            let mut out: Vec<Line<'static>> = Vec::new();
-            for (i, l) in self.message.lines().enumerate() {
-                let prefix = if i == 0 { "  ⎿  " } else { "     " };
-                out.push(Line::from(Span::styled(format!("{prefix}{l}"), style)));
-            }
-            return out;
-        }
-
+        let prefix = format!("  {label} · ");
+        let continuation = " ".repeat(prefix.len());
         self.message
             .lines()
-            .map(|l| Line::from(Span::styled(format!("  {l}"), style)))
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    Line::from(vec![
+                        Span::styled(prefix.clone(), label_style),
+                        Span::styled(line.to_string(), body_style),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::raw(continuation.clone()),
+                        Span::styled(line.to_string(), body_style),
+                    ])
+                }
+            })
             .collect()
     }
 
@@ -205,17 +228,20 @@ mod tests {
     fn info_renders_indented() {
         let cell = SystemCell::info("session resumed");
         let out = render(&cell, 40, 1);
-        assert_eq!(out.trim(), "session resumed");
-        assert!(out.starts_with("  "), "indent missing: {out:?}");
+        assert!(out.contains("session resumed"));
+        assert!(out.starts_with("  Note · "), "label missing: {out:?}");
     }
 
     #[test]
-    fn response_gets_claude_code_corner_glyph_on_first_line() {
-        // Slash-command response must visually pair with the `›
-        // /cmd` prompt above it, with `⎿` on the first content line.
+    fn response_gets_result_label_on_first_line() {
+        // Slash-command response must visually pair with the `>
+        // /cmd` prompt above it, with a stable `Result ·` label.
         let cell = SystemCell::response("Set model to Opus 4.6");
         let out = render(&cell, 60, 1);
-        assert!(out.contains("⎿"), "⎿ glyph missing on response: {out:?}");
+        assert!(
+            out.contains("Result ·"),
+            "result label missing on response: {out:?}"
+        );
         assert!(
             out.contains("Set model to Opus 4.6"),
             "body missing: {out:?}"
@@ -224,21 +250,24 @@ mod tests {
 
     #[test]
     fn response_continuation_lines_hang_indent() {
-        // Multi-line responses must keep the `⎿` only on row 0 and
+        // Multi-line responses must keep the label only on row 0 and
         // align continuation lines under the body so the block reads
         // as one unit.
         let cell = SystemCell::response("Set model to Opus 4.6\n(1M context, thinking enabled)");
         let out = render(&cell, 80, 2);
         let rows: Vec<&str> = out.lines().collect();
-        assert!(rows[0].contains("⎿"), "first row should have ⎿: {rows:?}");
         assert!(
-            !rows[1].contains("⎿"),
-            "continuation must NOT repeat ⎿: {rows:?}"
+            rows[0].contains("Result ·"),
+            "first row should have Result label: {rows:?}"
+        );
+        assert!(
+            !rows[1].contains("Result ·"),
+            "continuation must NOT repeat label: {rows:?}"
         );
         // Continuation indent should match the depth of content
-        // after `  ⎿  ` so the eye reads them as aligned.
+        // after `  Result · ` so the eye reads them as aligned.
         assert!(
-            rows[1].starts_with("     "),
+            rows[1].starts_with("           "),
             "continuation row should hang-indent under body: {rows:?}"
         );
     }

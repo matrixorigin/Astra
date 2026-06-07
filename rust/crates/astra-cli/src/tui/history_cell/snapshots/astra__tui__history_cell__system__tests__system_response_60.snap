@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/system.rs
-assertion_line: 349
+assertion_line: 374
 expression: "render(&SystemCell::response(\"Set model to Opus 4.6\"), 60, 1)"
 ---
-  ⎿  Set model to Opus 4.6
+  Result · Set model to Opus 4.6

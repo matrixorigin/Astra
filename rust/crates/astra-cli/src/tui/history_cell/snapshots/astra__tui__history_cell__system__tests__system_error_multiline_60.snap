@@ -1,7 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/system.rs
-assertion_line: 372
+assertion_line: 400
 expression: "render(&cell, 60, 2)"
 ---
-  error: rate limited
-  retry after 60s
+  Error · error: rate limited
+           retry after 60s

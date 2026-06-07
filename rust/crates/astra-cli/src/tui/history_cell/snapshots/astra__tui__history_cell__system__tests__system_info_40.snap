@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/system.rs
-assertion_line: 341
+assertion_line: 366
 expression: "render(&SystemCell::info(\"session resumed\"), 40, 1)"
 ---
-  session resumed
+  Note · session resumed
