@@ -9,7 +9,7 @@ use ratatui::{
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::textarea::{TextArea, TextAreaAction};
 
@@ -51,8 +51,8 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const IDLE_COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor";
-const ACTIVE_TURN_PLACEHOLDER: &str = "Enter defers to next tool call  · Ctrl+C interrupts";
+const IDLE_COMPOSER_PLACEHOLDER: &str = "Message astra";
+const ACTIVE_TURN_PLACEHOLDER: &str = "Send follow-up";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -421,13 +421,18 @@ impl ChatComposer {
             return;
         }
 
-        // Codex: › bold when active. While a submit flash is active,
-        // paint the prefix in the theme accent — gives users a quick
-        // "message accepted" cue that doesn't require reading the
-        // scrollback.
-        let mut prefix_style = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
+        let theme = crate::tui::theme::current();
+        let panel = crate::tui::style::composer_surface_style();
+        fill_area(buf, area, panel);
+
+        // Keep the composer prompt visible without shouting. The
+        // submit flash still upgrades it to the full accent to signal
+        // that the input was accepted.
+        let mut prefix_style = Style::default()
+            .fg(theme.accent_dim())
+            .add_modifier(ratatui::style::Modifier::BOLD)
+            .bg(panel.bg.unwrap_or(Color::Reset));
         if self.is_flashing() {
-            let theme = crate::tui::theme::current();
             prefix_style = prefix_style.fg(theme.accent);
         }
         let prefix = Span::styled(&self.prompt_prefix, prefix_style);
@@ -448,7 +453,12 @@ impl ChatComposer {
             } else {
                 IDLE_COMPOSER_PLACEHOLDER
             };
-            let placeholder = Span::styled(placeholder_text, Style::default().fg(Color::DarkGray));
+            let placeholder = Span::styled(
+                truncate_end(placeholder_text, text_area.width as usize),
+                Style::default()
+                    .fg(theme.dim)
+                    .bg(panel.bg.unwrap_or(Color::Reset)),
+            );
             Widget::render(Line::from(placeholder), text_area, buf);
         } else {
             self.textarea.render(text_area, buf);
@@ -475,6 +485,35 @@ pub(crate) enum ComposerAction {
     Quit,
     Consumed,
     Unhandled,
+}
+
+fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
+    for y in area.y..area.y + area.height {
+        buf.set_string(area.x, y, " ".repeat(area.width as usize), style);
+    }
+}
+
+fn truncate_end(text: &str, max_width: usize) -> String {
+    let width = text.width();
+    if width <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > keep {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -625,14 +664,14 @@ mod paste_tests {
     }
 
     #[test]
-    fn placeholder_mentions_external_editor_shortcut() {
-        assert!(IDLE_COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
-        assert!(IDLE_COMPOSER_PLACEHOLDER.contains("editor"));
+    fn idle_placeholder_is_clean_primary_prompt() {
+        assert!(IDLE_COMPOSER_PLACEHOLDER.contains("Message"));
+        assert!(!IDLE_COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
     }
 
     #[test]
-    fn active_turn_placeholder_mentions_queue_and_interrupt() {
-        assert!(ACTIVE_TURN_PLACEHOLDER.contains("next tool call"));
-        assert!(ACTIVE_TURN_PLACEHOLDER.contains("Ctrl+C"));
+    fn active_turn_placeholder_is_short_follow_up_prompt() {
+        assert!(ACTIVE_TURN_PLACEHOLDER.contains("follow-up"));
+        assert!(!ACTIVE_TURN_PLACEHOLDER.contains("Ctrl+C"));
     }
 }

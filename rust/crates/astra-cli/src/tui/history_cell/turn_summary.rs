@@ -357,7 +357,10 @@ mod tests {
         let mut c = mk_full();
         c.cache_read_tokens = Some(0);
         let out = render(&c, 120);
-        assert!(!out.contains("cache"), "zero-hit cache chip must elide: {out}");
+        assert!(
+            !out.contains("cache"),
+            "zero-hit cache chip must elide: {out}"
+        );
     }
 
     #[test]

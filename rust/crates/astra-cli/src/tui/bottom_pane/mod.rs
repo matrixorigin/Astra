@@ -1047,6 +1047,7 @@ impl BottomPane {
             self.render_focused_approval(chunks[0], buf);
             self.composer
                 .render(chunks[1], buf, self.task_status.is_active());
+            render_composer_hint_bar(chunks[2], buf, self.task_status.is_active());
             if let Some(ref menu) = self.slash_menu {
                 slash_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref menu) = self.mention_menu {
@@ -1066,6 +1067,7 @@ impl BottomPane {
             self.render_focused_approval(chunks[0], buf);
             self.composer
                 .render(chunks[1], buf, self.task_status.is_active());
+            render_composer_hint_bar(chunks[2], buf, self.task_status.is_active());
             self.footer.render(chunks[3], buf);
         }
     }
@@ -1112,6 +1114,69 @@ fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
         Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
     ]);
     Widget::render(styled, area, buf);
+}
+
+fn render_composer_hint_bar(area: Rect, buf: &mut Buffer, task_active: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Widget;
+    use unicode_width::UnicodeWidthStr;
+
+    let theme = crate::tui::theme::current();
+    let panel = crate::tui::style::composer_surface_style();
+    let rule_style = Style::default()
+        .fg(theme.dim)
+        .bg(panel.bg.unwrap_or(ratatui::style::Color::Reset));
+
+    for y in area.y..area.y + area.height {
+        buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
+    }
+
+    let hint = if task_active {
+        choose_hint(
+            area.width,
+            &[
+                "Queued after next tool call · Ctrl+C stops",
+                "After next tool call · Ctrl+C stops",
+                "Queued · Ctrl+C stops",
+            ],
+        )
+    } else {
+        choose_hint(
+            area.width,
+            &[
+                "Ctrl+E editor · Shift+Enter newline",
+                "Ctrl+E editor · newline",
+                "Ctrl+E",
+            ],
+        )
+    };
+
+    let hint_width = UnicodeWidthStr::width(hint);
+    let mut spans = vec![
+        Span::styled("  ", rule_style),
+        Span::styled(hint.to_string(), rule_style),
+    ];
+    let used = 2 + hint_width;
+    let remaining = area.width as usize;
+    if remaining > used + 1 {
+        spans.push(Span::styled(" ", rule_style));
+        spans.push(Span::styled("─".repeat(remaining - used - 1), rule_style));
+    }
+    Widget::render(Line::from(spans), area, buf);
+}
+
+fn choose_hint<'a>(width: u16, options: &'a [&'a str]) -> &'a str {
+    let available = width.saturating_sub(2) as usize;
+    for option in options {
+        if unicode_width::UnicodeWidthStr::width(*option) <= available {
+            return option;
+        }
+    }
+    options.last().copied().unwrap_or("")
 }
 
 /// Summary of what happened when the user activates a button on the
