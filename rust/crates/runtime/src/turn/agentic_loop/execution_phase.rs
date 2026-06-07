@@ -4915,6 +4915,41 @@ mod tests {
     }
 
     #[test]
+    fn deferred_user_input_releases_after_text_only_turn_boundary() {
+        let mut state = make_state();
+        state.messaging.tool_call_generation = 7;
+        state.messaging.deferred_user_inputs.push(
+            crate::turn::agentic_loop::host::DeferredUserInput {
+                event_index: 9,
+                content: "Stop tool work and answer directly.".to_string(),
+                queued_at_tool_generation: 7,
+            },
+        );
+
+        observe_turn_end_without_tools(&mut state, 0, Instant::now(), None);
+        let released = release_ready_deferred_user_inputs(&mut state);
+
+        assert_eq!(state.messaging.tool_call_generation, 8);
+        assert_eq!(released, vec![9]);
+        assert!(state.messaging.deferred_user_inputs.is_empty());
+        assert_eq!(state.message, "Stop tool work and answer directly.");
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str()),
+            Some("Stop tool work and answer directly.")
+        );
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.kind == VolatileKind::DeferredUserInput
+                && entry
+                    .content
+                    .contains("Stop tool work and answer directly.")
+        }));
+    }
+
+    #[test]
     fn deferred_user_input_text_preserves_active_skills_hint() {
         let rendered = deferred_user_input_text(&serde_json::json!({
             "content": "Use the release checklist.",
