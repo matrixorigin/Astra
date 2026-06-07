@@ -2769,7 +2769,13 @@ mod tests {
             }
         }
 
-        async fn mark_user_inputs_released(&self, _run_id: &str, _event_indices: &[usize]) {}
+        async fn mark_user_inputs_released(
+            &self,
+            _run_id: &str,
+            _event_indices: &[usize],
+        ) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// In-memory AtomicBool flag set → immediate cancel, no DB poll needed.

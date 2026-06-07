@@ -20,6 +20,9 @@ struct LocalRunControlState {
 /// turn-scoped in-memory queue instead.
 #[derive(Default)]
 pub(crate) struct LocalDeferredInputRunControl {
+    // This lock is only held for short in-memory queue mutations and never
+    // across an `.await`, so a std::sync::Mutex keeps the local TUI hot path
+    // simple without introducing async lock wakeups.
     state: Mutex<LocalRunControlState>,
 }
 
@@ -74,7 +77,24 @@ impl RunInputProvider for LocalDeferredInputRunControl {
         }
     }
 
-    async fn mark_user_inputs_released(&self, _run_id: &str, _event_indices: &[usize]) {}
+    async fn mark_user_inputs_released(
+        &self,
+        _run_id: &str,
+        event_indices: &[usize],
+    ) -> Result<(), String> {
+        if event_indices.is_empty() {
+            return Ok(());
+        }
+        let released = event_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut guard = recover_mutex_lock(&self.state);
+        guard
+            .inputs
+            .retain(|event| !released.contains(&event.event_index));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -106,5 +126,22 @@ mod tests {
             .enqueue_text("   ")
             .expect_err("blank deferred input should be rejected");
         assert!(error.contains("cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn local_run_control_evicts_released_inputs() {
+        let provider = LocalDeferredInputRunControl::default();
+        provider.enqueue_text("first").expect("enqueue first");
+        provider.enqueue_text("second").expect("enqueue second");
+
+        provider
+            .mark_user_inputs_released("run-local", &[1])
+            .await
+            .expect("release should succeed");
+
+        let remaining = provider.poll_user_inputs("run-local", 0).await;
+        assert_eq!(remaining.next_cursor, 2);
+        assert_eq!(remaining.inputs.len(), 1);
+        assert_eq!(remaining.inputs[0].event_index, 2);
     }
 }

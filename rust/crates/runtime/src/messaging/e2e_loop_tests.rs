@@ -693,7 +693,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -770,7 +769,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: true,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -861,7 +859,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -966,7 +963,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -1091,7 +1087,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -1205,7 +1200,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -1304,7 +1298,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -1431,7 +1424,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -1562,7 +1554,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 
@@ -1646,7 +1637,6 @@ mod tests {
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
-            tool_boundary_observer: None,
         })
         .await;
 

@@ -2,6 +2,39 @@ import type { ChatDetail } from '@/lib/api/types';
 
 const QUEUEABLE_RUN_STATUSES = new Set(['running', 'input-queued', 'waiting']);
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const RUN_STATUS_PRIORITY: Record<string, number> = {
+  waiting: 4,
+  'input-queued': 4,
+  cancelling: 3,
+  running: 2,
+  paused: 1,
+};
+
+export function normalizeChatRunStatus(status?: string | null): string | null {
+  const normalized = status?.trim().toLowerCase();
+  return normalized ? normalized : null;
+}
+
+export function isTerminalChatRunStatus(status?: string | null): boolean {
+  const normalized = normalizeChatRunStatus(status);
+  return Boolean(normalized && TERMINAL_RUN_STATUSES.has(normalized));
+}
+
+export function runBlocksChatTurn(status?: string | null): boolean {
+  const normalized = normalizeChatRunStatus(status);
+  return Boolean(normalized && !TERMINAL_RUN_STATUSES.has(normalized));
+}
+
+export function activeRunPriority(run: { status: string; waitingFor?: string | null }): number {
+  const normalized = normalizeChatRunStatus(run.status);
+  if (!normalized) {
+    return 0;
+  }
+  if (normalized === 'paused' && run.waitingFor === 'user_input') {
+    return RUN_STATUS_PRIORITY['input-queued'];
+  }
+  return RUN_STATUS_PRIORITY[normalized] ?? 0;
+}
 
 export type ChatRunUiState = {
   activeRunStatus: string | null;
@@ -23,7 +56,7 @@ export function deriveChatRunUiState(params: {
   resumingRun: boolean;
   stoppingRun: boolean;
 }): ChatRunUiState {
-  const activeRunStatus = params.activeRun?.status.trim().toLowerCase() ?? null;
+  const activeRunStatus = normalizeChatRunStatus(params.activeRun?.status);
   const hasActiveRun = Boolean(params.activeRun?.runId && activeRunStatus);
   const canQueueDeferredInput = Boolean(
     hasActiveRun && activeRunStatus && QUEUEABLE_RUN_STATUSES.has(activeRunStatus),
@@ -33,7 +66,7 @@ export function deriveChatRunUiState(params: {
   const activeRunBlocksNewInput = Boolean(
     hasActiveRun
       && activeRunStatus
-      && !TERMINAL_RUN_STATUSES.has(activeRunStatus)
+      && !isTerminalChatRunStatus(activeRunStatus)
       && !canQueueDeferredInput
       && !canResumeRun
       && activeRunStatus !== 'cancelling',

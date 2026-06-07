@@ -211,6 +211,7 @@ function lastAssistantMessageId(messages: Array<{ id: string; role: string }>) {
 
 function proxyRunStream(params: {
   backendResponse: Response;
+  backendAbortController: AbortController;
   ownerUserId: string;
   chatId: string;
   sessionId: string;
@@ -224,6 +225,7 @@ function proxyRunStream(params: {
 }) {
   const {
     backendResponse,
+    backendAbortController,
     ownerUserId,
     chatId,
     sessionId,
@@ -489,7 +491,7 @@ function proxyRunStream(params: {
           status: 'failed',
         });
         controller.enqueue(sseFrame({ type: 'error', message }));
-      } finally {
+    } finally {
         backendReader = null;
         reader.releaseLock();
         if (!clientCancelled) {
@@ -499,6 +501,7 @@ function proxyRunStream(params: {
     },
     async cancel() {
       clientCancelled = true;
+      backendAbortController.abort();
       await backendReader?.cancel();
     },
   });
@@ -573,10 +576,12 @@ export async function POST(
   if (!started) {
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
+  const backendAbortController = new AbortController();
   const backendResponse = await runtime.fetchResponse(PATH_CHAT_STREAM, {
     method: 'POST',
     auth: 'required',
     operation: 'stream web chat turn',
+    signal: backendAbortController.signal,
     json: {
       message: body.content,
       session_id: sessionId,
@@ -603,6 +608,7 @@ export async function POST(
   }
   return proxyRunStream({
     backendResponse,
+    backendAbortController,
     ownerUserId,
     chatId,
     sessionId,
@@ -663,10 +669,12 @@ export async function GET(
     return NextResponse.json({ error: message }, { status: 502 });
   }
 
+  const backendAbortController = new AbortController();
   const backendResponse = await runtime.fetchResponse(chatRunStreamPath(runId), {
     method: 'GET',
     auth: 'required',
     operation: `stream existing web run ${runId}`,
+    signal: backendAbortController.signal,
   });
 
   if (!backendResponse.ok || !backendResponse.body) {
@@ -680,6 +688,7 @@ export async function GET(
 
   return proxyRunStream({
     backendResponse,
+    backendAbortController,
     ownerUserId,
     chatId,
     sessionId,

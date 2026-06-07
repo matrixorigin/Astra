@@ -699,6 +699,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 ..Default::default()
             },
             messaging: Default::default(),
+            deferred_input: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,

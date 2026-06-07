@@ -42,7 +42,11 @@ pub trait RunInputProvider: Send + Sync {
     /// Mark deferred inputs as released to the model. Durable providers use this
     /// to clear an `input-queued` run status once the queued input is no longer
     /// just pending at a future tool boundary.
-    async fn mark_user_inputs_released(&self, run_id: &str, event_indices: &[usize]);
+    async fn mark_user_inputs_released(
+        &self,
+        run_id: &str,
+        event_indices: &[usize],
+    ) -> Result<(), String>;
 }
 
 /// Full run-control surface required by the agentic loop.

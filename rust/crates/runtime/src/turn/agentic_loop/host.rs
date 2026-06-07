@@ -664,26 +664,21 @@ pub struct StallTrackingState {
 
 #[derive(Default)]
 pub struct DeferredInputState {
-    /// Deferred user-input events submitted while the run is still active.
-    /// The execution phase releases entries only after a later tool-call round
-    /// completes.
-    deferred_user_inputs: Vec<DeferredUserInput>,
     /// Durable event cursor for deferred user-input polling.
     deferred_user_input_cursor: usize,
-    /// Monotonic count of completed tool-call rounds observed by this run.
-    completed_tool_rounds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredUserInput {
     pub event_index: usize,
     pub content: String,
-    pub queued_at_completed_tool_rounds: u64,
 }
 
-pub(crate) struct StagedDeferredUserInputs {
+pub(crate) struct ObservedDeferredUserInputs {
+    pub(crate) raw_inputs: Vec<Value>,
     pub(crate) inputs: Vec<Value>,
-    pub(crate) staged_count: usize,
+    pub(crate) released_event_indices: Vec<usize>,
+    pub(crate) next_cursor: usize,
 }
 
 impl DeferredInputState {
@@ -691,89 +686,42 @@ impl DeferredInputState {
         self.deferred_user_input_cursor
     }
 
-    pub fn completed_tool_rounds(&self) -> u64 {
-        self.completed_tool_rounds
-    }
-
-    pub fn pending_deferred_user_input_count(&self) -> usize {
-        self.deferred_user_inputs.len()
-    }
-
-    pub fn record_tool_boundary(&mut self) {
-        self.completed_tool_rounds = self.completed_tool_rounds.saturating_add(1);
-    }
-
-    pub(crate) fn stage_polled_user_inputs<F>(
+    pub(crate) fn observe_polled_user_inputs<F>(
         &mut self,
         poll: crate::turn::run_control::RunQueuedInputPoll,
-        queued_at_completed_tool_rounds: u64,
         mut content_from_input: F,
-    ) -> StagedDeferredUserInputs
+    ) -> ObservedDeferredUserInputs
     where
         F: FnMut(&Value) -> Option<String>,
     {
-        self.deferred_user_input_cursor = poll.next_cursor;
-
+        let mut raw_inputs = Vec::new();
         let mut polled_inputs = Vec::new();
-        let mut staged_count = 0;
+        let mut released_event_indices = Vec::new();
         for event in poll.inputs {
-            polled_inputs.push(event.input.clone());
+            released_event_indices.push(event.event_index);
+            raw_inputs.push(event.input.clone());
             let Some(content) = content_from_input(&event.input) else {
                 continue;
             };
-            self.deferred_user_inputs.push(DeferredUserInput {
-                event_index: event.event_index,
-                content,
-                queued_at_completed_tool_rounds,
-            });
-            staged_count += 1;
+            polled_inputs.push(event.input.clone());
+            let _ = content;
         }
 
-        StagedDeferredUserInputs {
+        ObservedDeferredUserInputs {
+            raw_inputs,
             inputs: polled_inputs,
-            staged_count,
+            released_event_indices,
+            next_cursor: poll.next_cursor,
         }
     }
 
-    pub fn release_ready_deferred_user_inputs(&mut self) -> Vec<DeferredUserInput> {
-        let current_generation = self.completed_tool_rounds;
-        let mut pending = Vec::new();
-        let mut ready = Vec::new();
-
-        for entry in std::mem::take(&mut self.deferred_user_inputs) {
-            if current_generation > entry.queued_at_completed_tool_rounds {
-                ready.push(entry);
-            } else {
-                pending.push(entry);
-            }
-        }
-
-        self.deferred_user_inputs = pending;
-        ready
+    #[cfg(test)]
+    pub fn set_deferred_user_input_cursor_for_test(&mut self, cursor: usize) {
+        self.deferred_user_input_cursor = cursor;
     }
 
-    #[cfg(test)]
-    pub fn pending_deferred_user_inputs_for_test(&self) -> &[DeferredUserInput] {
-        &self.deferred_user_inputs
-    }
-
-    #[cfg(test)]
-    pub fn set_completed_tool_rounds_for_test(&mut self, completed_tool_rounds: u64) {
-        self.completed_tool_rounds = completed_tool_rounds;
-    }
-
-    #[cfg(test)]
-    pub fn push_deferred_user_input_for_test(
-        &mut self,
-        event_index: usize,
-        content: String,
-        queued_at_completed_tool_rounds: u64,
-    ) {
-        self.deferred_user_inputs.push(DeferredUserInput {
-            event_index,
-            content,
-            queued_at_completed_tool_rounds,
-        });
+    pub fn commit_observed_cursor(&mut self, next_cursor: usize) {
+        self.deferred_user_input_cursor = self.deferred_user_input_cursor.max(next_cursor);
     }
 }
 

@@ -691,6 +691,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 progress_emitter: config.progress_emitter,
                 ..Default::default()
             },
+            deferred_input: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,

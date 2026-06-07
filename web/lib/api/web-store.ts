@@ -11,6 +11,7 @@ import {
   type RuntimeTranscriptResponse,
   type StreamEvent,
 } from '@astra/sdk';
+import { activeRunPriority, isTerminalChatRunStatus, runBlocksChatTurn } from '@/lib/chat-run-state';
 import {
   RuntimeClientError,
   WebRuntimeClient,
@@ -36,18 +37,21 @@ import type {
   UserSummary,
 } from '@/lib/api/types';
 
+type ChatActiveRunSource = 'backend_poll' | 'stream' | 'local_mutation';
+
+type ChatActiveRunRecord = NonNullable<ChatDetail['activeRun']> & {
+  source: ChatActiveRunSource;
+  observedAt: string;
+};
+
 type ChatRecord = ChatSummary & {
   createdAt: string;
   archivedAt?: string | null;
   messages: ChatMessage[];
-  activeRun?: {
-    runId: string;
-    status: string;
-    waitingFor?: string | null;
-  };
+  activeRun?: ChatActiveRunRecord;
   pendingTurn?: {
-    messageId: string;
-    content: string;
+  messageId: string;
+  content: string;
     options: ComposerOptions;
   };
 };
@@ -62,6 +66,7 @@ type Store = {
 
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
+const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
@@ -105,34 +110,78 @@ function normalizedActiveSkills(skills?: string[]) {
   ));
 }
 
-function runBlocksChatTurn(status?: string | null) {
-  const normalized = status?.trim().toLowerCase();
-  return Boolean(
-    normalized
-    && normalized !== 'completed'
-    && normalized !== 'failed'
-    && normalized !== 'cancelled'
-  );
+function makeActiveRunRecord(
+  activeRun: NonNullable<ChatDetail['activeRun']>,
+  source: ChatActiveRunSource,
+  observedAt = nowIso(),
+): ChatActiveRunRecord {
+  return {
+    runId: activeRun.runId,
+    status: activeRun.status,
+    waitingFor: activeRun.waitingFor ?? null,
+    source,
+    observedAt,
+  };
 }
 
-function activeRunPriority(run: {
-  status: string;
-  waitingFor?: string | null;
-}) {
-  const status = run.status.trim().toLowerCase();
-  if (status === 'waiting') {
-    return 3;
+function isFreshLocalActiveRun(activeRun: ChatActiveRunRecord, now = Date.now()) {
+  if (activeRun.source === 'backend_poll') {
+    return false;
   }
-  if (status === 'input-queued') {
-    return 3;
+  const observedAt = Date.parse(activeRun.observedAt);
+  return Number.isFinite(observedAt) && now - observedAt <= LOCAL_ACTIVE_RUN_GRACE_MS;
+}
+
+function compareActiveRunDeterministically(
+  left: ChatActiveRunRecord,
+  right: ChatActiveRunRecord,
+) {
+  const priorityDelta = activeRunPriority(left) - activeRunPriority(right);
+  if (priorityDelta !== 0) {
+    return priorityDelta;
   }
-  if (status === 'running') {
-    return 2;
+  return left.runId.localeCompare(right.runId);
+}
+
+function mergeActiveRunRecord(params: {
+  existing?: ChatActiveRunRecord;
+  backend?: ChatActiveRunRecord;
+  backendRunStatuses: Map<string, string>;
+  now?: number;
+}): ChatActiveRunRecord | undefined {
+  const { existing, backend, backendRunStatuses, now = Date.now() } = params;
+  if (existing) {
+    const backendStatusForExisting = backendRunStatuses.get(existing.runId);
+    if (isTerminalChatRunStatus(backendStatusForExisting)) {
+    return undefined;
+    }
   }
-  if (status === 'paused') {
-    return 1;
+  if (!backend) {
+    return existing && runBlocksChatTurn(existing.status) && isFreshLocalActiveRun(existing, now)
+    ? existing
+    : undefined;
   }
-  return 0;
+  if (!existing) {
+    return backend;
+  }
+  if (existing.runId !== backend.runId) {
+    return backend;
+  }
+  if (existing.source !== 'backend_poll' && compareActiveRunDeterministically(existing, backend) >= 0) {
+    return existing;
+  }
+  return backend;
+}
+
+function publicActiveRun(activeRun?: ChatActiveRunRecord): ChatDetail['activeRun'] {
+  if (!activeRun) {
+    return undefined;
+  }
+  return {
+    runId: activeRun.runId,
+    status: activeRun.status,
+    waitingFor: activeRun.waitingFor ?? null,
+  };
 }
 
 function seedStore(): Store {
@@ -399,7 +448,7 @@ export function getChat(ownerUserId: string, chatId: string): ChatDetail | null 
     },
     messages: chat.messages,
     project: project ? { id: project.id, name: project.name } : undefined,
-    activeRun: chat.activeRun,
+    activeRun: publicActiveRun(chat.activeRun),
     pendingTurn: chat.pendingTurn,
   };
 }
@@ -568,13 +617,23 @@ export function beginStreamingMessage(ownerUserId: string, chatId: string, paylo
   };
 }
 
-export function setChatActiveRun(ownerUserId: string, chatId: string, activeRun?: ChatRecord['activeRun']) {
+export function setChatActiveRun(
+  ownerUserId: string,
+  chatId: string,
+  activeRun?: ChatDetail['activeRun'] | ChatActiveRunRecord,
+) {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
   }
-  chat.activeRun = activeRun;
+  chat.activeRun = activeRun
+    ? makeActiveRunRecord(
+        activeRun,
+        'source' in activeRun ? activeRun.source : 'stream',
+        'observedAt' in activeRun ? activeRun.observedAt : nowIso(),
+      )
+    : undefined;
   return chat.activeRun;
 }
 
@@ -622,15 +681,15 @@ export async function queueDeferredRunInput(ownerUserId: string, chatId: string,
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
   }
-  chat.activeRun = {
+  chat.activeRun = makeActiveRunRecord({
     runId: chat.activeRun.runId,
     status: 'input-queued',
     waitingFor: 'user_input',
-  };
+  }, 'local_mutation');
 
   return {
     userMessage,
-    activeRun: chat.activeRun,
+    activeRun: publicActiveRun(chat.activeRun),
   };
 }
 
@@ -651,14 +710,14 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
   });
 
   await client.sdk.cancelRun(chat.activeRun.runId);
-  chat.activeRun = {
+  chat.activeRun = makeActiveRunRecord({
     runId: chat.activeRun.runId,
     status: 'cancelling',
     waitingFor: null,
-  };
+  }, 'local_mutation');
 
   return {
-    activeRun: chat.activeRun,
+    activeRun: publicActiveRun(chat.activeRun),
   };
 }
 
@@ -682,14 +741,14 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
   });
 
   await client.sdk.resumeRun(chat.activeRun.runId);
-  chat.activeRun = {
+  chat.activeRun = makeActiveRunRecord({
     runId: chat.activeRun.runId,
     status: 'running',
     waitingFor: null,
-  };
+  }, 'local_mutation');
 
   return {
-    activeRun: chat.activeRun,
+    activeRun: publicActiveRun(chat.activeRun),
   };
 }
 
@@ -1063,20 +1122,23 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
 
   const sessions = await listAllBackendSessions(client, ownerUserId);
   const runs = await listAllBackendRuns(client, ownerUserId);
+  const syncStartedAt = nowIso();
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
   const backendChatIds = new Set<string>();
-  const activeRunBySession = new Map<string, NonNullable<ChatRecord['activeRun']>>();
+  const activeRunBySession = new Map<string, ChatActiveRunRecord>();
+  const backendRunStatuses = new Map<string, string>();
 
   for (const run of runs) {
+    backendRunStatuses.set(run.runId, run.status);
     if (!runBlocksChatTurn(run.status)) {
       continue;
     }
-    const candidate = {
+    const candidate = makeActiveRunRecord({
       runId: run.runId,
       status: run.status,
       waitingFor: run.waitingFor ?? null,
-    };
+    }, 'backend_poll', syncStartedAt);
     const current = activeRunBySession.get(run.sessionId);
     if (!current || activeRunPriority(candidate) > activeRunPriority(current)) {
       activeRunBySession.set(run.sessionId, candidate);
@@ -1089,7 +1151,11 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     if (!record) {
       continue;
     }
-    record.activeRun = activeRunBySession.get(record.id);
+    record.activeRun = mergeActiveRunRecord({
+      existing: existing?.activeRun,
+      backend: activeRunBySession.get(record.id),
+      backendRunStatuses,
+    });
     backendChatIds.add(record.id);
     const index = store.chats.findIndex((chat) => chat.id === record.id);
     if (index >= 0) {

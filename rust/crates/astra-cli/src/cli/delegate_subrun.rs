@@ -442,6 +442,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     .map(|b| b.for_agent(profile.agent_id.clone())),
                 ..Default::default()
             },
+            deferred_input: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: config.pause_flag.clone(),

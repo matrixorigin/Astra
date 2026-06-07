@@ -26,6 +26,7 @@ use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::turn::run_control::RunInputProvider;
 use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
@@ -2210,7 +2211,8 @@ impl RunStatus {
             ),
             Self::InputQueued => matches!(
                 next,
-                Self::Running
+                Self::InputQueued
+                    | Self::Running
                     | Self::Paused
                     | Self::Waiting
                     | Self::Completed
@@ -5210,14 +5212,43 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         }
 
+        durable_status
+            .try_transition(&RunStatus::InputQueued)
+            .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
+
         self.run_engine
             .append_event(&run_id, event.clone())
             .await
             .map_err(|error| Self::durable_persist_error("input", error))?;
 
-        durable_status
-            .try_transition(&RunStatus::InputQueued)
-            .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
+        let durable_after_append = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let durable_status_after_append =
+            Self::run_status_from_durable(&durable_after_append.status)?;
+        if matches!(
+            durable_status_after_append,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            if let Some(event_index) = durable_after_append.events.iter().enumerate().find_map(
+                |(index, persisted_event)| {
+                    (persisted_event
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        == Some(idempotency_key.as_str()))
+                    .then_some(index)
+                },
+            ) {
+                self.run_engine
+                    .mark_user_inputs_released(&run_id, &[event_index])
+                    .await
+                    .map_err(|error| {
+                        Self::durable_persist_error("input release rollback", error)
+                    })?;
+            }
+            return Err(Self::run_state_conflict(
+                "submit input to",
+                &durable_after_append.status,
+            ));
+        }
         self.run_engine
             .persist_status(&run_id, STATUS_INPUT_QUEUED, Some("user_input"), None)
             .await
@@ -8692,6 +8723,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-queued-input", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-queued-input",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = svc
+            .submit_run_input(
+                "run-queued-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-queued-1".into(),
+                    input: json!({"answer": "keep queueing"}),
+                },
+            )
+            .await
+            .expect("input-queued runs should accept additional deferred input");
+
+        assert!(result.accepted);
+        assert!(!result.duplicate);
+        let durable = engine.load_run("run-queued-input").await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_INPUT_QUEUED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+        assert!(durable.events.iter().any(|event| {
+            event.get("idempotency_key").and_then(Value::as_str) == Some("key-queued-1")
+        }));
+    }
+
+    #[tokio::test]
     async fn submit_run_input_rejects_paused_durable_run() {
         let svc = test_service_with_engine();
         let engine = &svc.run_engine;
@@ -9054,8 +9125,10 @@ mod tests {
         let err = Running.try_transition(&Running);
         assert!(err.is_err(), "Running → Running must be rejected");
 
-        let err = InputQueued.try_transition(&InputQueued);
-        assert!(err.is_err(), "InputQueued → InputQueued must be rejected");
+        assert!(
+            InputQueued.try_transition(&InputQueued).is_ok(),
+            "InputQueued → InputQueued must stay queueable for repeated user input"
+        );
     }
 
     /// P1-F: list_runs pagination must be deterministic — all runs appear

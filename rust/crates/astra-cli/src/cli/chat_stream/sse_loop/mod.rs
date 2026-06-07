@@ -743,6 +743,7 @@ pub(crate) async fn stream_chat_sse(
             progress_emitter: None,
             ..Default::default()
         },
+        deferred_input: Default::default(),
         cancellation: CancellationState {
             flag: None,
             pause_flag: None,

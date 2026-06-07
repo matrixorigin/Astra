@@ -2,7 +2,7 @@ jest.mock('@/lib/runtime-config', () => ({
   getRuntimeConfig: jest.fn(),
 }));
 
-import { createChatWithMessage, getChatHydrated, listChats } from '@/lib/api/web-store';
+import { createChatWithMessage, getChatHydrated, getStore, listChats, setChatActiveRun } from '@/lib/api/web-store';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 const mockGetRuntimeConfig = getRuntimeConfig as jest.MockedFunction<typeof getRuntimeConfig>;
@@ -193,5 +193,73 @@ describe('web store user scoping', () => {
       status: 'running',
       waitingFor: null,
     });
+  });
+
+  it('preserves fresher local run state when backend polling lags behind the stream', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
+        runtimeSession('session-stream-lag', 'user-a', 'lag'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
+        runtimeRun('run-stream-lag', 'session-stream-lag', 'running'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+
+    getStore('user-a').chats.push({
+      id: 'session-stream-lag',
+      title: 'lag',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: undefined,
+    });
+    setChatActiveRun('user-a', 'session-stream-lag', {
+      runId: 'run-stream-lag',
+      status: 'input-queued',
+      waitingFor: 'user_input',
+    });
+
+    const detail = await getChatHydrated('user-a', 'session-stream-lag');
+    expect(detail?.activeRun).toEqual({
+      runId: 'run-stream-lag',
+      status: 'input-queued',
+      waitingFor: 'user_input',
+    });
+  });
+
+  it('clears ghost local active runs once the backend reports the same run as terminal', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
+        runtimeSession('session-terminal-sync', 'user-a', 'terminal'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
+        runtimeRun('run-terminal-sync', 'session-terminal-sync', 'completed'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+
+    getStore('user-a').chats.push({
+      id: 'session-terminal-sync',
+      title: 'terminal',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: undefined,
+    });
+    setChatActiveRun('user-a', 'session-terminal-sync', {
+      runId: 'run-terminal-sync',
+      status: 'running',
+      waitingFor: null,
+    });
+
+    const detail = await getChatHydrated('user-a', 'session-terminal-sync');
+    expect(detail?.activeRun).toBeUndefined();
   });
 });

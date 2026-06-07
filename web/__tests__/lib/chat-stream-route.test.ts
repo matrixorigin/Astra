@@ -131,7 +131,7 @@ describe('chat stream route proxy cancellation', () => {
   it('cancels the backend SSE reader when the web client disconnects', async () => {
     const { POST } = await import('@/app/api/chats/[chatId]/stream/route');
     const backend = makeBackendStream();
-    mockRequireRuntimeClient.mockResolvedValue({
+    const runtime = {
       sdk: {
         getRuntimeSession: jest.fn().mockResolvedValue({}),
         listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
@@ -140,7 +140,8 @@ describe('chat stream route proxy cancellation', () => {
         ok: true,
         body: backend.body,
       }),
-    } as never);
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
 
     const response = await POST(
       new Request('http://web.test/api/chats/chat-1/stream', {
@@ -163,6 +164,9 @@ describe('chat stream route proxy cancellation', () => {
     await reader?.read();
     await reader?.cancel();
 
+    const signal = runtime.fetchResponse.mock.calls[0]?.[1]?.signal as AbortSignal | undefined;
+    expect(signal).toBeDefined();
+    expect(signal?.aborted).toBe(true);
     expect(backend.cancel).toHaveBeenCalled();
     expect(backend.releaseLock).toHaveBeenCalled();
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(

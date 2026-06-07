@@ -371,7 +371,7 @@ impl RunEngine {
     ) -> Result<Option<RunControlStatus>, String> {
         let record = self.store.load_run(run_id).await?;
         Ok(match record {
-            None => Some(RunControlStatus::Cancelled),
+            None => None,
             Some(r) => match durable_run_status_kind(&r.status) {
                 DurableRunStatusKind::Cancelled => Some(RunControlStatus::Cancelled),
                 DurableRunStatusKind::Paused => Some(RunControlStatus::Paused),
@@ -542,9 +542,27 @@ impl RunInputProvider for RunEngine {
                 };
             }
         };
+        let released_indices = run
+            .events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("user_inputs_released")
+            })
+            .flat_map(|event| {
+                event
+                    .get("data")
+                    .and_then(|data| data.get("event_indices"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+            })
+            .collect::<std::collections::HashSet<_>>();
         let start_index = after_event_index.min(run.events.len());
 
-        let inputs = run
+        let inputs: Vec<QueuedRunInputEvent> = run
             .events
             .iter()
             .enumerate()
@@ -557,6 +575,9 @@ impl RunInputProvider for RunEngine {
                     .and_then(|_| event.get("data"))
                     .and_then(|data| data.get("input"))
                     .cloned()?;
+                if released_indices.contains(&event_index) {
+                    return None;
+                }
                 Some(QueuedRunInputEvent {
                     event_index,
                     input: payload,
@@ -564,35 +585,54 @@ impl RunInputProvider for RunEngine {
             })
             .collect();
 
+        let mut error = None;
+        if run.status == STATUS_INPUT_QUEUED && inputs.is_empty() && !released_indices.is_empty() {
+            if let Err(update_error) = self
+                .persist_status(run_id, STATUS_RUNNING, None, None)
+                .await
+            {
+                tracing::warn!(
+                    run_id,
+                    error = %update_error,
+                    "failed to auto-heal stale input-queued status after released inputs"
+                );
+                error = Some(update_error);
+            }
+        }
+
         RunQueuedInputPoll {
             next_cursor: after_event_index.max(run.events.len()),
             inputs,
-            error: None,
+            error,
         }
     }
 
-    async fn mark_user_inputs_released(&self, run_id: &str, event_indices: &[usize]) {
+    async fn mark_user_inputs_released(
+        &self,
+        run_id: &str,
+        event_indices: &[usize],
+    ) -> Result<(), String> {
         if event_indices.is_empty() {
-            return;
+            return Ok(());
         }
-        let Ok(Some(run)) = self.store.load_run(run_id).await else {
-            return;
-        };
+        let run =
+            self.store.load_run(run_id).await?.ok_or_else(|| {
+                format!("run not found while acknowledging deferred input: {run_id}")
+            })?;
+        self.append_event(
+            run_id,
+            serde_json::json!({
+                "event_type": "user_inputs_released",
+                "data": { "event_indices": event_indices },
+            }),
+        )
+        .await?;
         if run.status != STATUS_INPUT_QUEUED {
-            return;
+            return Ok(());
         }
-        if let Err(error) = self
-            .persist_status(run_id, STATUS_RUNNING, None, None)
+        self.persist_status(run_id, STATUS_RUNNING, None, None)
             .await
-        {
-            tracing::warn!(
-                target: "astra_runtime::run_engine",
-                %run_id,
-                ?event_indices,
-                error = %error,
-                "failed to clear input-queued status after releasing deferred input"
-            );
-        }
+            .map(|_| ())
     }
 }
 
@@ -1174,11 +1214,28 @@ mod tests {
             .await
             .unwrap();
 
-        engine.mark_user_inputs_released("run-queued", &[1]).await;
+        engine
+            .mark_user_inputs_released("run-queued", &[1])
+            .await
+            .unwrap();
 
         let run = engine.load_run("run-queued").await.unwrap().unwrap();
         assert_eq!(run.status, STATUS_RUNNING);
         assert_eq!(run.waiting_for, None);
+        let poll = engine.poll_user_inputs("run-queued", 0).await;
+        assert!(
+            poll.inputs.is_empty(),
+            "released inputs must not replay after crash recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_run_does_not_report_cancelled_control_status() {
+        let engine = test_engine();
+        assert_eq!(
+            engine.check_control_status("missing-run").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

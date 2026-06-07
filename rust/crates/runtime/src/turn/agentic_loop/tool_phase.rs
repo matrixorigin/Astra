@@ -14,19 +14,16 @@ use super::super::agentic::adaptive_tuning::{
 use super::super::agentic::delegate_interception::{
     DelegationInterceptionResult, intercept_delegations, tool_call_name,
 };
-use super::super::agentic::headless_round::ToolBoundaryObserver;
 use super::super::agentic::headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
     run_agentic_headless_tool_round,
 };
 use super::super::agentic::tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
-use super::execution_phase::{
-    TurnExecutionPhase, observe_turn_end_without_tools, poll_and_stage_deferred_inputs,
-};
+use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    DeferredInputState, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
-    finalize_turn_trace, record_edge_tool_observability,
+    MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
+    record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use astra_turn_core::agentic_post_tool_policy::{
@@ -41,45 +38,6 @@ use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
     Return(AgenticLoopOutcome),
-}
-
-struct DeferredToolBoundaryTracker<'a> {
-    run_control: &'a dyn crate::turn::run_control::RunControlProvider,
-    run_id: &'a str,
-    deferred_input: &'a mut DeferredInputState,
-    collected_inputs: Vec<Value>,
-    /// One-shot latch: once any new deferred input arrives during this tool
-    /// phase, every later tool boundary returns `false` so the loop yields to
-    /// that input. Do not reset this inside the same tool phase.
-    should_yield_to_deferred_input: bool,
-}
-
-impl DeferredToolBoundaryTracker<'_> {
-    async fn on_completed_tool_boundary(&mut self) -> bool {
-        let queued_at_completed_tool_rounds = self.deferred_input.completed_tool_rounds();
-        let poll_result = poll_and_stage_deferred_inputs(
-            self.run_control,
-            self.run_id,
-            self.deferred_input,
-            queued_at_completed_tool_rounds,
-            "tool boundary",
-        )
-        .await;
-        let ready_new_input_seen = poll_result.staged_count > 0;
-        self.collected_inputs.extend(poll_result.inputs);
-        self.deferred_input.record_tool_boundary();
-        if ready_new_input_seen {
-            self.should_yield_to_deferred_input = true;
-        }
-        !self.should_yield_to_deferred_input
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolBoundaryObserver for DeferredToolBoundaryTracker<'_> {
-    async fn on_tool_boundary(&mut self) -> bool {
-        self.on_completed_tool_boundary().await
-    }
 }
 
 fn build_runtime_session_quality_assessment(
@@ -1041,19 +999,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .as_ref()
         .map(|b| b.current_round())
         .unwrap_or(0);
-    let mut deferred_tool_boundary_tracker = match (
-        state.run_control.as_deref(),
-        state.current_run_id.as_deref(),
-    ) {
-        (Some(run_control), Some(run_id)) => Some(DeferredToolBoundaryTracker {
-            run_control,
-            run_id,
-            deferred_input: &mut state.deferred_input,
-            collected_inputs: Vec::new(),
-            should_yield_to_deferred_input: false,
-        }),
-        _ => None,
-    };
     {
         let mut term_adapter = HostTerminalAdapter(host);
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1091,22 +1036,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             turn_start: obs_turn_start,
             llm_round: obs_llm_round,
             plan_mode_active,
-            tool_boundary_observer: deferred_tool_boundary_tracker
-                .as_mut()
-                .map(|tracker| tracker as &mut (dyn ToolBoundaryObserver + Send)),
         })
         .await;
-    }
-    if let Some(tracker) = deferred_tool_boundary_tracker.as_ref() {
-        for input in &tracker.collected_inputs {
-            host.on_deferred_user_input(input);
-        }
-    }
-    if deferred_tool_boundary_tracker
-        .as_ref()
-        .is_some_and(|tracker| tracker.should_yield_to_deferred_input)
-    {
-        return Ok(TurnToolPhaseControl::ContinueLoop);
     }
 
     // Record LLM round in the turn event buffer and advance the round counter.
@@ -1733,58 +1664,11 @@ mod tests {
         JournalEvent, JournalEventType, JournalWriter, ToolCallRecord,
     };
     use serde_json::json;
-    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{make_state, text_result};
-    use crate::turn::run_control::{
-        QueuedRunInputEvent, RunInputProvider, RunQueuedInputPoll, RunStatusProvider,
-    };
-
-    struct StubRunControlProvider {
-        polls: std::sync::Mutex<VecDeque<RunQueuedInputPoll>>,
-    }
-
-    impl StubRunControlProvider {
-        fn new(polls: Vec<RunQueuedInputPoll>) -> Self {
-            Self {
-                polls: std::sync::Mutex::new(VecDeque::from(polls)),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl RunStatusProvider for StubRunControlProvider {
-        async fn control_status(
-            &self,
-            _run_id: &str,
-        ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
-            Ok(None)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl RunInputProvider for StubRunControlProvider {
-        async fn poll_user_inputs(
-            &self,
-            _run_id: &str,
-            after_event_index: usize,
-        ) -> RunQueuedInputPoll {
-            self.polls
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(RunQueuedInputPoll {
-                    next_cursor: after_event_index,
-                    inputs: Vec::new(),
-                    error: None,
-                })
-        }
-
-        async fn mark_user_inputs_released(&self, _run_id: &str, _event_indices: &[usize]) {}
-    }
 
     fn summary_tool_record(
         ok: bool,
@@ -1812,63 +1696,6 @@ mod tests {
         let state = make_state();
         let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string());
         assert_eq!(snapshot.lifecycle_summary, "turn-start lifecycle");
-    }
-
-    #[tokio::test]
-    async fn deferred_boundary_tracker_ignores_preexisting_ready_inputs() {
-        let provider = StubRunControlProvider::new(vec![RunQueuedInputPoll {
-            next_cursor: 0,
-            inputs: Vec::new(),
-            error: None,
-        }]);
-        let mut deferred_input = DeferredInputState::default();
-        deferred_input.set_completed_tool_rounds_for_test(1);
-        deferred_input.push_deferred_user_input_for_test(
-            0,
-            "already queued before this tool phase".to_string(),
-            0,
-        );
-        let mut tracker = DeferredToolBoundaryTracker {
-            run_control: &provider,
-            run_id: "run-1",
-            deferred_input: &mut deferred_input,
-            collected_inputs: Vec::new(),
-            should_yield_to_deferred_input: false,
-        };
-
-        assert!(tracker.on_completed_tool_boundary().await);
-        assert!(!tracker.should_yield_to_deferred_input);
-        assert_eq!(tracker.deferred_input.completed_tool_rounds(), 2);
-    }
-
-    #[tokio::test]
-    async fn deferred_boundary_tracker_yields_for_inputs_polled_this_boundary() {
-        let provider = StubRunControlProvider::new(vec![RunQueuedInputPoll {
-            next_cursor: 2,
-            inputs: vec![QueuedRunInputEvent {
-                event_index: 1,
-                input: json!({"content": "please answer this before more tools"}),
-            }],
-            error: None,
-        }]);
-        let mut deferred_input = DeferredInputState::default();
-        deferred_input.set_completed_tool_rounds_for_test(1);
-        let mut tracker = DeferredToolBoundaryTracker {
-            run_control: &provider,
-            run_id: "run-1",
-            deferred_input: &mut deferred_input,
-            collected_inputs: Vec::new(),
-            should_yield_to_deferred_input: false,
-        };
-
-        assert!(!tracker.on_completed_tool_boundary().await);
-        assert!(tracker.should_yield_to_deferred_input);
-        assert_eq!(tracker.deferred_input.completed_tool_rounds(), 2);
-        assert_eq!(tracker.collected_inputs.len(), 1);
-        assert_eq!(
-            tracker.deferred_input.pending_deferred_user_input_count(),
-            1
-        );
     }
 
     #[test]
