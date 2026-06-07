@@ -797,6 +797,16 @@ impl ChatWidget {
         self.commit_cell(Box::new(cell));
     }
 
+    /// Commit a user message directly into history without opening a new turn
+    /// or draining the current live tool/assistant state.
+    ///
+    /// Used for deferred inputs that become active mid-turn: the transcript
+    /// should show the newest user message as a first-class user row, but the
+    /// current streaming turn should remain live until the runtime yields.
+    pub fn commit_deferred_user(&mut self, text: impl Into<String>) {
+        self.commit_cell(Box::new(UserCell::new(text.into())));
+    }
+
     /// Single choke-point for routing events into state mutation.
     /// Any `AppEvent` emitted by the outer loop MUST go through
     /// here — nothing else in the TUI reaches into `history` or

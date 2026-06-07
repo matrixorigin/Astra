@@ -102,7 +102,7 @@ pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<Stri
 
 fn render_deferred_user_input(content: &str) -> String {
     format!(
-        "Queued user message submitted during execution after a tool call boundary:\n{content}\n\nAdjust the current plan before making more tool calls."
+        "A newer user message arrived during execution and now supersedes the previous plan.\n\nLatest user message:\n{content}\n\nRequired behavior:\n- Treat this as the newest user instruction.\n- Address it before making more tool calls.\n- Do not continue the previous plan blindly.\n- Only make another tool call if it is directly necessary to satisfy this newest user message."
     )
 }
 

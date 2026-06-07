@@ -246,9 +246,7 @@ fn deferred_input_status_line(input: &Value) -> Option<String> {
     if text.replace('\n', " ↩ ").chars().count() > 80 {
         preview.push_str("...");
     }
-    Some(format!(
-        "__deferred_input_applied__:Queued input reached the model after a tool boundary: {preview}"
-    ))
+    Some(format!("__deferred_input_applied__:{preview}"))
 }
 
 fn permission_mode_change_audit_event(

@@ -147,9 +147,7 @@ fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_w
         }
         TuiAppEvent::StatusLine(text) => {
             if let Some(message) = text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX) {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
-                    message.trim().to_string(),
-                ));
+                chat_widget.commit_deferred_user(message.trim().to_string());
             }
         }
         _ => {}
@@ -3480,6 +3478,10 @@ mod tests {
         assert!(
             source.contains("text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX)"),
             "TUI should surface deferred-input-applied status lines into chat history"
+        );
+        assert!(
+            source.contains("chat_widget.commit_deferred_user"),
+            "applied deferred input should be rendered as a user transcript row"
         );
     }
 
