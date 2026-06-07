@@ -21,6 +21,10 @@ function isStaticAsset(pathname: string): boolean {
   );
 }
 
+function isEnabledE2ePath(pathname: string): boolean {
+  return process.env.ASTRA_ENABLE_E2E_PAGES === '1' && pathname.startsWith('/e2e/');
+}
+
 function hasAuthCredential(request: NextRequest): boolean {
   return (
     request.cookies.has(ACCESS_TOKEN_COOKIE) ||
@@ -41,6 +45,10 @@ export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   if (isStaticAsset(pathname)) {
+    return NextResponse.next();
+  }
+
+  if (isEnabledE2ePath(pathname)) {
     return NextResponse.next();
   }
 

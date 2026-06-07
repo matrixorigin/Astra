@@ -5,6 +5,8 @@ node_modules/
 .next/
 .next-dev/
 out/
+test-results/
+playwright-report/
 
 # misc
 .DS_Store
