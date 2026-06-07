@@ -18,8 +18,8 @@ fn idle_shows_mode_chip_without_tutorial_legend() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        !plain.contains("Ask"),
-        "default prompt mode should stay implicit; got {plain:?}"
+        plain.contains("Ask"),
+        "default prompt mode should be visible; got {plain:?}"
     );
     assert!(
         !plain.contains("/commands"),
@@ -112,7 +112,7 @@ fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
     );
     assert!(
         rendered.contains("sonnet-4.6"),
-        "model should carry the footer when default mode is hidden; got {rendered:?}"
+        "model should remain visible with the default mode chip; got {rendered:?}"
     );
 }
 
@@ -167,7 +167,18 @@ fn thinking_suffix_is_compacted_before_model_identity_is_lost() {
 #[test]
 fn ask_mode_renders_default_chip() {
     let s = StatusLine::from_context(&ctx());
-    assert!(!s.plain().contains("Ask"));
+    assert!(s.plain().contains("Ask"));
+    let chip = s
+        .left
+        .iter()
+        .find(|seg| seg.text == "Ask")
+        .expect("ask chip segment");
+    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Gray));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -424,10 +435,14 @@ fn right_segments_joined_with_middle_dot() {
 
 #[test]
 fn empty_context_produces_some_left_content() {
-    // Default prompt mode stays implicit, so an empty context should
-    // remain visually quiet rather than inventing filler.
     let s = StatusLine::from_context(&ctx());
-    assert!(s.left.is_empty());
+    assert_eq!(
+        s.left
+            .iter()
+            .map(|seg| seg.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Ask"]
+    );
 }
 
 #[test]

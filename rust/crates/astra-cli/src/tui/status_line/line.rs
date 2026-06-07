@@ -110,44 +110,44 @@ impl StatusLine {
             ));
         }
 
-        if should_render_mode_chip(ctx) {
-            match ctx.permission_mode {
-                PermissionMode::Prompt => {
-                    out.left.push(Segment::styled(
-                        permission_mode_label(ctx.permission_mode),
-                        muted.add_modifier(Modifier::BOLD),
-                    ));
-                }
-                PermissionMode::Auto => {
-                    out.left.push(Segment::styled(
-                        permission_mode_label(ctx.permission_mode),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-                PermissionMode::Plan => {
-                    out.left.push(Segment::styled(
-                        permission_mode_label(ctx.permission_mode),
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-                PermissionMode::AcceptEdits => {
-                    out.left.push(Segment::styled(
-                        permission_mode_label(ctx.permission_mode),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-                PermissionMode::Deny => {
-                    out.left.push(Segment::styled(
-                        permission_mode_label(ctx.permission_mode),
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ));
-                }
+        // Permission mode changes whether tools run automatically or ask first.
+        // Keep it visible so `/mode` feedback matches the persistent status line.
+        match ctx.permission_mode {
+            PermissionMode::Prompt => {
+                out.left.push(Segment::styled(
+                    permission_mode_label(ctx.permission_mode),
+                    muted.add_modifier(Modifier::BOLD),
+                ));
+            }
+            PermissionMode::Auto => {
+                out.left.push(Segment::styled(
+                    permission_mode_label(ctx.permission_mode),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            PermissionMode::Plan => {
+                out.left.push(Segment::styled(
+                    permission_mode_label(ctx.permission_mode),
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            PermissionMode::AcceptEdits => {
+                out.left.push(Segment::styled(
+                    permission_mode_label(ctx.permission_mode),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            PermissionMode::Deny => {
+                out.left.push(Segment::styled(
+                    permission_mode_label(ctx.permission_mode),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
             }
         }
 
@@ -295,14 +295,6 @@ impl StatusLine {
             }
             ordered.pop();
         }
-    }
-}
-
-fn should_render_mode_chip(ctx: &StatusContext) -> bool {
-    match ctx.permission_mode {
-        PermissionMode::Prompt => false,
-        PermissionMode::Auto => !is_dense_footer_context(ctx),
-        PermissionMode::Plan | PermissionMode::AcceptEdits | PermissionMode::Deny => true,
     }
 }
 

@@ -1214,7 +1214,7 @@ fn build_permission_mode_picker(
 ) -> ListSelectionView {
     let items = vec![
         SelectionItem {
-            name: "Default".into(),
+            name: "Ask".into(),
             description: Some("Ask before write or execute tools".into()),
             is_current: current == crate::cli::permission_manager::PermissionMode::Prompt,
         },
@@ -1244,7 +1244,7 @@ fn build_permission_mode_picker(
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles default → auto → edit → plan · /allow rules · /allow trust · /allow trace",
+        "Shift+Tab cycles ask → auto → edit → plan · /allow rules · /allow trust · /allow trace",
     )
 }
 
@@ -1267,11 +1267,11 @@ pub(crate) fn permission_mode_feedback(
     use crate::cli::permission_manager::PermissionMode;
 
     match mode {
-        PermissionMode::Prompt => "Mode → default",
-        PermissionMode::Auto => "Mode → auto",
-        PermissionMode::AcceptEdits => "Mode → edit",
-        PermissionMode::Plan => "Mode → plan",
-        PermissionMode::Deny => "Mode → deny",
+        PermissionMode::Prompt => "Mode → Ask",
+        PermissionMode::Auto => "Mode → Auto",
+        PermissionMode::AcceptEdits => "Mode → Edits",
+        PermissionMode::Plan => "Mode → Plan",
+        PermissionMode::Deny => "Mode → Deny",
     }
 }
 
@@ -1489,7 +1489,7 @@ pub(crate) fn handle_view_result(
             );
             return;
         }
-        "Default" => {
+        "Ask" | "Default" => {
             apply_permission_mode_selection(
                 state,
                 chat_widget,
@@ -3964,7 +3964,7 @@ mod view_result_tests {
         assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → auto")
+            Some("Mode → Auto")
         );
     }
 
@@ -3979,7 +3979,7 @@ mod view_result_tests {
         assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → edit")
+            Some("Mode → Edits")
         );
     }
 
@@ -3994,7 +3994,7 @@ mod view_result_tests {
         assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → plan")
+            Some("Mode → Plan")
         );
     }
 
@@ -4005,12 +4005,12 @@ mod view_result_tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Default", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result("Ask", &mut state, &mut bottom_pane, &mut chat_widget);
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → default")
+            Some("Mode → Ask")
         );
     }
 

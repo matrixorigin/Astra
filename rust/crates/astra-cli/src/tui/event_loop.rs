@@ -3992,7 +3992,7 @@ mod tests {
         let slash_rows = slash.display_lines(80).len();
         let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![
             Arc::new(slash),
-            Arc::new(history_cell::system::SystemCell::response("Mode → auto")),
+            Arc::new(history_cell::system::SystemCell::response("Mode → Auto")),
         ];
         let lines = render_history_batch_lines(&cells, 80);
 
@@ -4020,7 +4020,7 @@ mod tests {
         );
         let response_idx = rendered
             .iter()
-            .position(|line| line.contains("Mode → auto"))
+            .position(|line| line.contains("Mode → Auto"))
             .expect("response row present");
         assert_eq!(
             response_idx, slash_rows,
