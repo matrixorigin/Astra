@@ -29,6 +29,7 @@ type ComposerProps = {
 };
 
 const SKILL_TOKEN_SELECTOR = '[data-composer-skill-token="true"]';
+const COMPACT_PLACEHOLDER_MAX_CHARS = 36;
 
 type EditorSnapshot = {
   html: string;
@@ -52,6 +53,26 @@ function uniqueSkillNames(skills: string[]) {
     }
   }
   return result;
+}
+
+export function compactComposerPlaceholder(placeholder: string) {
+  const trimmed = placeholder.trim();
+  if (trimmed.startsWith('Queue a follow-up')) {
+    return 'Queue follow-up...';
+  }
+  if (trimmed.startsWith('Run paused')) {
+    return 'Run paused...';
+  }
+  if (trimmed.startsWith('Stopping current run')) {
+    return 'Stopping...';
+  }
+  if (trimmed.startsWith('Run status is')) {
+    return 'Run status blocked...';
+  }
+  if (trimmed.length <= COMPACT_PLACEHOLDER_MAX_CHARS) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, COMPACT_PLACEHOLDER_MAX_CHARS - 3).trimEnd()}...`;
 }
 
 function createSkillToken(skillName: string) {
@@ -194,6 +215,7 @@ export function Composer({
   const slashRangeRef = useRef<Range | null>(null);
   const wasDisabledRef = useRef(Boolean(disabled));
   const canSubmit = text.trim().length > 0 && !submitting && !disabled;
+  const visualPlaceholder = compactComposerPlaceholder(placeholder);
   const slashCommands = useMemo(() => {
     if (slashQuery === null) {
       return [];
@@ -450,6 +472,7 @@ export function Composer({
           role="textbox"
           aria-label={placeholder}
           aria-multiline="true"
+          title={placeholder}
           onInput={() => {
             syncEditorState();
             refreshSlashQuery();
@@ -502,7 +525,7 @@ export function Composer({
             }
           }}
           className="max-h-[200px] min-h-7 min-w-[14rem] flex-1 overflow-y-auto whitespace-pre-wrap break-words border-0 bg-transparent p-0 text-[17px] leading-[1.6] text-text shadow-none outline-none ring-0 empty:before:text-text-muted empty:before:content-[attr(data-placeholder)] focus:border-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0"
-          data-placeholder={placeholder}
+          data-placeholder={visualPlaceholder}
         />
       </div>
       {showSlashPanel ? (
