@@ -3,12 +3,12 @@
 //! Visual language mirrors Cursor/Copilot:
 //!
 //! ```text
-//! ⏸ bash wants to run
+//! Approval · Bash
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
 //! ▸ Allow once    Always allow    Reject
-//!   ← → navigate · Enter confirm · Esc reject
+//!   ← → choose · Enter confirm · Esc reject
 //! ```
 //!
 //! The focused button uses a reversed pill (accent bg, contrasting fg);
@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
 use crate::tui::approval::ButtonRow;
+use crate::tui::history_cell::tool::humanize_tool_name;
 use crate::tui::turn_event::TurnEvent;
 
 /// Issue #326 P3 / R1 Major 7: pick the most-alarming colour
@@ -59,6 +60,23 @@ fn highest_risk_color(labels: &[String]) -> Color {
     // BashExecute and other "vanilla" tags fall through to a
     // softer colour so the screen isn't shouting on every prompt.
     Color::Cyan
+}
+
+fn humanize_risk_tag(label: &str) -> &'static str {
+    match label {
+        "BashExecute" => "Bash",
+        "WritesOutsidePackage" => "Outside package",
+        "WritesOutsideWorkspace" => "Outside workspace",
+        "WritesSensitiveFile" => "Sensitive file",
+        "NetworkExfiltration" => "Network",
+        "CredentialAccess" => "Credentials",
+        "GitDestructive" => "Git destructive",
+        "SqlDestructive" => "SQL destructive",
+        "MCPUnknownCapability" => "Unknown MCP capability",
+        "WorkspaceUntrusted" => "Untrusted workspace",
+        "SandboxExpansion" => "Sandbox expansion",
+        _ => "Risk",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -421,12 +439,11 @@ impl HistoryCell for ApprovalCell {
         let mut lines = Vec::new();
 
         // ── Top border with embedded title ────────────────────────
-        //     ╭─ ⏸ bash wants to run ─[agent:foo]─[ssh:host]──
+        //     ╭─ Approval · Bash [agent:foo] [ssh:host]
         let mut top_spans = vec![
             Span::styled("╭─ ".to_string(), accent_style),
-            Span::styled("⏸ ".to_string(), accent_style),
             Span::styled(
-                self.header.clone(),
+                format!("Approval · {}", humanize_tool_name(&self.tool)),
                 accent_style.add_modifier(Modifier::BOLD),
             ),
         ];
@@ -450,6 +467,13 @@ impl HistoryCell for ApprovalCell {
         let bar = Span::styled("│ ".to_string(), accent_style);
         let empty_bar = Span::styled("│".to_string(), accent_style);
 
+        if !self.header.is_empty() {
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(self.header.clone(), body_style.add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
         // Risk badge row (issue #326 P3 / R1 Major 7).
         if !self.risk_tag_labels.is_empty() {
             let risk_color = highest_risk_color(&self.risk_tag_labels);
@@ -457,7 +481,7 @@ impl HistoryCell for ApprovalCell {
             let badges = self
                 .risk_tag_labels
                 .iter()
-                .map(|t| format!("⚑ {t}"))
+                .map(|t| format!("⚑ {}", humanize_risk_tag(t)))
                 .collect::<Vec<_>>()
                 .join("  ");
             lines.push(Line::from(vec![
@@ -482,7 +506,6 @@ impl HistoryCell for ApprovalCell {
         if !self.reason.is_empty() {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("⚠ ".to_string(), muted),
                 Span::styled(self.reason.clone(), muted),
             ]));
         }
@@ -549,7 +572,7 @@ impl HistoryCell for ApprovalCell {
         // style. Unfocused: plain border close — the user isn't
         // looking at this card for actions yet.
         let bottom = if self.focused {
-            let hint = "←→ select · Enter confirm · Esc reject";
+            let hint = "←→ choose · Enter confirm · Esc reject";
             Line::from(vec![
                 Span::styled("╰─ ".to_string(), accent_style),
                 Span::styled(hint.to_string(), muted),
@@ -604,7 +627,7 @@ mod tests {
             true,
         );
         let rendered = render(&cell);
-        assert!(rendered.contains("⏸"), "header glyph missing");
+        assert!(rendered.contains("Approval · Bash"), "header missing");
         assert!(rendered.contains("rm -rf /tmp/x"), "detail missing");
         assert!(rendered.contains("destructive path"), "reason missing");
         // Cursor-style rounded box edges.
@@ -617,7 +640,7 @@ mod tests {
         // Hint is advertised on the bottom border for focused cells,
         // including every key binding the user can reach.
         assert!(
-            rendered.contains("←→ select"),
+            rendered.contains("←→ choose"),
             "arrow-key hint missing on focused cell"
         );
         assert!(
@@ -643,7 +666,7 @@ mod tests {
         assert!(rendered.contains("╰─"));
         // But the action hint is reserved for the focused cell.
         assert!(
-            !rendered.contains("←→ select"),
+            !rendered.contains("←→ choose"),
             "unfocused cell should not advertise actions"
         );
     }
@@ -669,10 +692,10 @@ mod tests {
         .with_risk_tag_labels(vec!["BashExecute".into(), "WritesOutsidePackage".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("⚑ BashExecute"),
+            rendered.contains("⚑ Bash"),
             "risk tag chip should appear, got:\n{rendered}"
         );
-        assert!(rendered.contains("⚑ WritesOutsidePackage"));
+        assert!(rendered.contains("⚑ Outside package"));
     }
 
     #[test]
