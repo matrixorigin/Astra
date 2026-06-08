@@ -3380,6 +3380,8 @@ fn handle_app_event(
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
+        | TuiAppEvent::TurnWarning(_)
+        | TuiAppEvent::TurnInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);

@@ -25,10 +25,17 @@ impl ReplUiAdapter for TuiUiAdapter {
         let _ = self.tx.send(TuiAppEvent::TurnError(msg.to_string()));
     }
     fn show_warning(&mut self, msg: &str) {
-        let _ = self.tx.send(TuiAppEvent::StatusLine(format!("⚠ {msg}")));
+        // Route warnings through TurnWarning so the ChatWidget commits
+        // a SystemCell::warning into scrollback. Previously this was a
+        // StatusLine, which the bridge intentionally drops (it's meant
+        // for bottom-pane status only) — that made warnings like
+        // "Not logged in" disappear silently.
+        let _ = self.tx.send(TuiAppEvent::TurnWarning(msg.to_string()));
     }
     fn show_info(&mut self, msg: &str) {
-        let _ = self.tx.send(TuiAppEvent::StatusLine(msg.to_string()));
+        // Same story: StatusLine is dropped by the bridge, so we route
+        // through TurnInfo for scrollback visibility.
+        let _ = self.tx.send(TuiAppEvent::TurnInfo(msg.to_string()));
     }
     fn show_status(&mut self, msg: &str) {
         let _ = self.tx.send(TuiAppEvent::StatusLine(msg.to_string()));
