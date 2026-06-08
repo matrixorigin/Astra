@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { ChatView } from "@/components/app/chat-view";
+import { ToastProvider } from "@/components/ui/toast";
 import { WebApiError } from "@/lib/api/errors";
 import type { ChatDetail, ComposerOptions } from "@/lib/api/types";
 import {
@@ -214,7 +215,11 @@ describe("ChatView deferred-input unhappy paths", () => {
       new WebApiError(500, "runtime temporarily unavailable"),
     );
 
-    render(<ChatView initial={makeDetail()} />);
+    render(
+      <ToastProvider>
+        <ChatView initial={makeDetail()} />
+      </ToastProvider>,
+    );
 
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
@@ -226,9 +231,9 @@ describe("ChatView deferred-input unhappy paths", () => {
     });
     expect(mockGetChat).not.toHaveBeenCalled();
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
-    expect(window.alert).toHaveBeenCalledWith(
-      "runtime temporarily unavailable",
-    );
+    expect(
+      screen.getByText("runtime temporarily unavailable"),
+    ).toBeInTheDocument();
   });
 
   it("reconciles pending first-turn placeholders with persisted stream messages", async () => {
@@ -394,6 +399,81 @@ describe("ChatView deferred-input unhappy paths", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("does not replace follow-up streaming text with stale hydrated transcript", async () => {
+    jest.useFakeTimers();
+    try {
+      let streamSignal: AbortSignal | undefined;
+      mockGetChat.mockResolvedValue({
+        ...makeDetail(null),
+        messages: [
+          {
+            id: "user-old",
+            role: "user",
+            content: "old turn",
+            createdAt: "2026-06-07T00:00:00.000Z",
+            status: "complete",
+          },
+          {
+            id: "assistant-old",
+            role: "assistant",
+            content: "old reply",
+            createdAt: "2026-06-07T00:00:01.000Z",
+            status: "complete",
+          },
+        ],
+      });
+      mockStreamChatMessage.mockImplementation(
+        async (_chatId, _payload, handlers) => {
+          streamSignal = handlers.signal;
+          handlers.onText?.("live second reply");
+          return new Promise<string>(() => {});
+        },
+      );
+
+      render(
+        <ChatView
+          initial={{
+            ...makeDetail(null),
+            messages: [
+              {
+                id: "user-old",
+                role: "user",
+                content: "old turn",
+                createdAt: "2026-06-07T00:00:00.000Z",
+                status: "complete",
+              },
+              {
+                id: "assistant-old",
+                role: "assistant",
+                content: "old reply",
+                createdAt: "2026-06-07T00:00:01.000Z",
+                status: "complete",
+              },
+            ],
+          }}
+        />,
+      );
+
+      composerPayload = {
+        text: "second turn",
+        options: composerPayload.options,
+      };
+      fireEvent.click(screen.getByRole("button", { name: "Submit composer" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("live second reply")).toBeInTheDocument();
+      });
+      jest.advanceTimersByTime(3_100);
+      await Promise.resolve();
+
+      expect(mockGetChat).not.toHaveBeenCalled();
+      expect(streamSignal?.aborted).toBe(false);
+      expect(screen.getByText("live second reply")).toBeInTheDocument();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("falls back to a fresh stream only after an explicit stale-run conflict", async () => {
@@ -946,24 +1026,26 @@ describe("ChatView deferred-input unhappy paths", () => {
     });
 
     render(
-      <ChatView
-        initial={{
-          ...makeDetail({
-            runId: "run-123",
-            status: "paused",
-            waitingFor: null,
-          }),
-          messages: [
-            {
-              id: "assistant-paused",
-              role: "assistant",
-              content: "Partial paused reply",
-              createdAt: "2026-06-07T00:00:00.000Z",
-              status: "streaming",
-            },
-          ],
-        }}
-      />,
+      <ToastProvider>
+        <ChatView
+          initial={{
+            ...makeDetail({
+              runId: "run-123",
+              status: "paused",
+              waitingFor: null,
+            }),
+            messages: [
+              {
+                id: "assistant-paused",
+                role: "assistant",
+                content: "Partial paused reply",
+                createdAt: "2026-06-07T00:00:00.000Z",
+                status: "streaming",
+              },
+            ],
+          }}
+        />
+      </ToastProvider>,
     );
 
     await user.click(screen.getByRole("button", { name: "Resume" }));
@@ -976,8 +1058,10 @@ describe("ChatView deferred-input unhappy paths", () => {
         screen.getByText("Refreshed paused transcript"),
       ).toBeInTheDocument();
     });
-    expect(window.alert).toHaveBeenCalledWith(
-      "The run resumed, but the web UI could not reconnect to its stream. (stream socket closed)",
-    );
+    expect(
+      screen.getByText((content) =>
+        content.includes("could not reconnect to its stream"),
+      ),
+    ).toBeInTheDocument();
   });
 });

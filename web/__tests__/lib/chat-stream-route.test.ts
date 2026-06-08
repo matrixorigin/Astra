@@ -845,10 +845,9 @@ describe("chat existing run stream route", () => {
       value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
     });
 
-    const response = await GET(
-      request as never,
-      { params: Promise.resolve({ chatId: "web-chat-1" }) },
-    );
+    const response = await GET(request as never, {
+      params: Promise.resolve({ chatId: "web-chat-1" }),
+    });
 
     const reader = response.body?.getReader();
     expect(reader).toBeDefined();
@@ -878,6 +877,57 @@ describe("chat existing run stream route", () => {
       expect.objectContaining({
         content: "reply",
         status: "complete",
+      }),
+    );
+  });
+
+  it("clears the active run when the backend stream reports a mismatched session id", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"session_info","session_id":"wrong-session","run_id":"run-1"}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: jest.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+    const request = new Request(
+      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      { method: "GET" },
+    );
+    Object.defineProperty(request, "nextUrl", {
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+    });
+
+    const response = await GET(request as never, {
+      params: Promise.resolve({ chatId: "web-chat-1" }),
+    });
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(mockSetChatActiveRun).toHaveBeenCalledWith(
+      "user-a",
+      "web-chat-1",
+      undefined,
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "web-chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: expect.stringContaining("wrong-session"),
+        status: "failed",
       }),
     );
   });

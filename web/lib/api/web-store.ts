@@ -1,4 +1,4 @@
-import type { RuntimeConfig } from '@/lib/runtime-config';
+import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
   buildQueryString,
   chatRunStreamPath,
@@ -10,9 +10,20 @@ import {
   type RuntimeTranscriptItemResponse,
   type RuntimeTranscriptResponse,
   type StreamEvent,
-} from '@astra/sdk';
-import { activeRunPriority, isTerminalChatRunStatus, runBlocksChatTurn } from '@/lib/chat-run-state';
-import { RuntimeClientError, WebRuntimeClient, getRuntimeClient, readRuntimeErrorDetail, requireRuntimeClient, runtimeErrorDetail } from '@/lib/runtime-client';
+} from "@astra/sdk";
+import {
+  activeRunPriority,
+  isTerminalChatRunStatus,
+  runBlocksChatTurn,
+} from "@/lib/chat-run-state";
+import {
+  RuntimeClientError,
+  WebRuntimeClient,
+  getRuntimeClient,
+  readRuntimeErrorDetail,
+  requireRuntimeClient,
+  runtimeErrorDetail,
+} from "@/lib/runtime-client";
 import type {
   ChatDetail,
   ChatListResponse,
@@ -28,11 +39,12 @@ import type {
   SearchResponse,
   SidebarData,
   UserSummary,
-} from '@/lib/api/types';
+} from "@/lib/api/types";
+import { modelCache } from "@/lib/api/model-cache";
 
-type ChatActiveRunSource = 'backend_poll' | 'stream' | 'local_mutation';
+type ChatActiveRunSource = "backend_poll" | "stream" | "local_mutation";
 
-type ChatActiveRunRecord = NonNullable<ChatDetail['activeRun']> & {
+type ChatActiveRunRecord = NonNullable<ChatDetail["activeRun"]> & {
   source: ChatActiveRunSource;
   observedAt: string;
 };
@@ -51,13 +63,13 @@ type ChatRecord = ChatSummary & {
 };
 
 export class StaleDeferredRunError extends Error {
-  constructor(message = 'No active run is available for deferred input.') {
+  constructor(message = "No active run is available for deferred input.") {
     super(message);
-    this.name = 'StaleDeferredRunError';
+    this.name = "StaleDeferredRunError";
   }
 }
 
-type ProjectRecord = ProjectDetail['project'];
+type ProjectRecord = ProjectDetail["project"];
 
 type Store = {
   projects: ProjectRecord[];
@@ -71,17 +83,7 @@ const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
-const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
-// Cache for listModels() results; keyed by accessToken — different users have different model lists.
-// NOTE: no TTL-triggered eviction; grows by user count (single-user dev is fine).
-const modelListCache = new Map<
-  string,
-  {
-    promise: Promise<Array<{ model_id?: string; name?: string }>>;
-    expiresAt: number;
-  }
->();
-const MODEL_LIST_CACHE_TTL_MS = 60_000;
+const LEGACY_LOCAL_CHAT_IDS = new Set(["chat-web-agent-notes"]);
 
 type StreamResult = {
   assistantText: string;
@@ -99,14 +101,14 @@ declare global {
   var __astraWebStores: Record<string, Store> | undefined;
 }
 
-const DEFAULT_STORE_SCOPE = 'offline';
+const DEFAULT_STORE_SCOPE = "offline";
 
 function nowIso() {
   return new Date().toISOString();
 }
 
 function titleFromMessage(message: string) {
-  const text = message.trim().replace(/\s+/g, ' ');
+  const text = message.trim().replace(/\s+/g, " ");
   if (!text) {
     return null;
   }
@@ -117,10 +119,16 @@ function normalizedActiveSkills(skills?: string[]) {
   if (!Array.isArray(skills)) {
     return [];
   }
-  return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+  return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
+    (left, right) => left.localeCompare(right),
+  );
 }
 
-function makeActiveRunRecord(activeRun: NonNullable<ChatDetail['activeRun']>, source: ChatActiveRunSource, observedAt = nowIso()): ChatActiveRunRecord {
+function makeActiveRunRecord(
+  activeRun: NonNullable<ChatDetail["activeRun"]>,
+  source: ChatActiveRunSource,
+  observedAt = nowIso(),
+): ChatActiveRunRecord {
   return {
     runId: activeRun.runId,
     status: activeRun.status,
@@ -130,15 +138,23 @@ function makeActiveRunRecord(activeRun: NonNullable<ChatDetail['activeRun']>, so
   };
 }
 
-function isFreshLocalActiveRun(activeRun: ChatActiveRunRecord, now = Date.now()) {
-  if (activeRun.source === 'backend_poll') {
+function isFreshLocalActiveRun(
+  activeRun: ChatActiveRunRecord,
+  now = Date.now(),
+) {
+  if (activeRun.source === "backend_poll") {
     return false;
   }
   const observedAt = Date.parse(activeRun.observedAt);
-  return Number.isFinite(observedAt) && now - observedAt <= LOCAL_ACTIVE_RUN_GRACE_MS;
+  return (
+    Number.isFinite(observedAt) && now - observedAt <= LOCAL_ACTIVE_RUN_GRACE_MS
+  );
 }
 
-function compareActiveRunDeterministically(left: ChatActiveRunRecord, right: ChatActiveRunRecord) {
+function compareActiveRunDeterministically(
+  left: ChatActiveRunRecord,
+  right: ChatActiveRunRecord,
+) {
   const priorityDelta = activeRunPriority(left) - activeRunPriority(right);
   if (priorityDelta !== 0) {
     return priorityDelta;
@@ -160,7 +176,11 @@ function mergeActiveRunRecord(params: {
     }
   }
   if (!backend) {
-    return existing && runBlocksChatTurn(existing.status) && isFreshLocalActiveRun(existing, now) ? existing : undefined;
+    return existing &&
+      runBlocksChatTurn(existing.status) &&
+      isFreshLocalActiveRun(existing, now)
+      ? existing
+      : undefined;
   }
   if (!existing) {
     return backend;
@@ -168,7 +188,10 @@ function mergeActiveRunRecord(params: {
   if (existing.runId !== backend.runId) {
     return backend;
   }
-  if (existing.source !== 'backend_poll' && compareActiveRunDeterministically(existing, backend) >= 0) {
+  if (
+    existing.source !== "backend_poll" &&
+    compareActiveRunDeterministically(existing, backend) >= 0
+  ) {
     return existing;
   }
   return backend;
@@ -178,7 +201,9 @@ function backendSessionIdForChat(chat: ChatRecord) {
   return chat.backendSessionId ?? chat.id;
 }
 
-function publicActiveRun(activeRun?: ChatActiveRunRecord): ChatDetail['activeRun'] {
+function publicActiveRun(
+  activeRun?: ChatActiveRunRecord,
+): ChatDetail["activeRun"] {
   if (!activeRun) {
     return undefined;
   }
@@ -191,16 +216,17 @@ function publicActiveRun(activeRun?: ChatActiveRunRecord): ChatDetail['activeRun
 
 function seedStore(): Store {
   const now = nowIso();
-  const projectId = 'project-web-agent';
+  const projectId = "project-web-agent";
   return {
     projects: [
       {
         id: projectId,
-        name: 'Web agent workspace',
-        description: 'Session durability, context, and remote agent UI notes.',
-        instructions: 'Prefer concise implementation notes. Keep session state durable and auditable.',
-        memory: 'The user is validating the Astra web agent v1 workflow.',
-        visibility: 'private',
+        name: "Web agent workspace",
+        description: "Session durability, context, and remote agent UI notes.",
+        instructions:
+          "Prefer concise implementation notes. Keep session state durable and auditable.",
+        memory: "The user is validating the Astra web agent v1 workflow.",
+        visibility: "private",
         starred: true,
         createdAt: now,
         updatedAt: now,
@@ -223,31 +249,31 @@ export function getStore(ownerUserId = DEFAULT_STORE_SCOPE) {
 
 export function getCurrentUser(): UserSummary {
   return {
-    id: 'local-user',
-    name: 'Astra user',
-    plan: 'free',
+    id: "local-user",
+    name: "Astra user",
+    plan: "free",
   };
 }
 
 export function listModelSummaries(): ModelSummary[] {
   return [
     {
-      id: 'sonnet-4.6-adaptive',
-      name: 'Sonnet 4.6',
-      subtitle: 'Responsive everyday work',
-      tier: 'included',
+      id: "sonnet-4.6-adaptive",
+      name: "Sonnet 4.6",
+      subtitle: "Responsive everyday work",
+      tier: "included",
     },
     {
-      id: 'opus-4.7',
-      name: 'Opus 4.7',
-      subtitle: 'Most capable for ambitious work',
-      tier: 'upgrade',
+      id: "opus-4.7",
+      name: "Opus 4.7",
+      subtitle: "Most capable for ambitious work",
+      tier: "upgrade",
     },
     {
-      id: 'haiku-4.5',
-      name: 'Haiku 4.5',
-      subtitle: 'Fastest and most efficient',
-      tier: 'included',
+      id: "haiku-4.5",
+      name: "Haiku 4.5",
+      subtitle: "Fastest and most efficient",
+      tier: "included",
     },
   ];
 }
@@ -274,13 +300,15 @@ export async function listChats(
       return false;
     }
     if (hasProjectFilter) {
-      const expected = params.projectId === 'null' ? null : (params.projectId ?? null);
+      const expected =
+        params.projectId === "null" ? null : (params.projectId ?? null);
       if (chat.projectId !== expected) {
         return false;
       }
     }
     if (query) {
-      const haystack = `${chat.title ?? ''} ${chat.lastMessagePreview ?? ''}`.toLowerCase();
+      const haystack =
+        `${chat.title ?? ""} ${chat.lastMessagePreview ?? ""}`.toLowerCase();
       return haystack.includes(query);
     }
     return true;
@@ -298,7 +326,7 @@ export function listProjects(
   ownerUserId: string,
   params: {
     q?: string | null;
-    sort?: 'activity' | 'created' | 'name';
+    sort?: "activity" | "created" | "name";
     cursor?: string | null;
     limit?: number;
   },
@@ -307,18 +335,20 @@ export function listProjects(
   const limit = params.limit ?? 24;
   const offset = Number(params.cursor ?? 0);
   const query = params.q?.trim().toLowerCase();
-  const sort = params.sort ?? 'activity';
+  const sort = params.sort ?? "activity";
   let projects = store.projects.filter((project) => {
     if (!query) {
       return true;
     }
-    return `${project.name} ${project.description ?? ''}`.toLowerCase().includes(query);
+    return `${project.name} ${project.description ?? ""}`
+      .toLowerCase()
+      .includes(query);
   });
   projects = projects.sort((a, b) => {
-    if (sort === 'name') {
+    if (sort === "name") {
       return a.name.localeCompare(b.name);
     }
-    if (sort === 'created') {
+    if (sort === "created") {
       return b.createdAt.localeCompare(a.createdAt);
     }
     return b.updatedAt.localeCompare(a.updatedAt);
@@ -330,7 +360,10 @@ export function listProjects(
   };
 }
 
-export function createProject(ownerUserId: string, payload: CreateProjectRequest) {
+export function createProject(
+  ownerUserId: string,
+  payload: CreateProjectRequest,
+) {
   const store = getStore(ownerUserId);
   const timestamp = nowIso();
   const project: ProjectRecord = {
@@ -339,7 +372,7 @@ export function createProject(ownerUserId: string, payload: CreateProjectRequest
     description: payload.description?.trim() || null,
     instructions: payload.instructions?.trim() || null,
     memory: null,
-    visibility: 'private',
+    visibility: "private",
     starred: false,
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -349,7 +382,10 @@ export function createProject(ownerUserId: string, payload: CreateProjectRequest
   return projectSummary(project);
 }
 
-export function getProject(ownerUserId: string, projectId: string): ProjectDetail | null {
+export function getProject(
+  ownerUserId: string,
+  projectId: string,
+): ProjectDetail | null {
   const store = getStore(ownerUserId);
   const project = store.projects.find((item) => item.id === projectId);
   if (!project) {
@@ -365,12 +401,19 @@ export function getProject(ownerUserId: string, projectId: string): ProjectDetai
   };
 }
 
-export async function getProjectHydrated(ownerUserId: string, projectId: string): Promise<ProjectDetail | null> {
+export async function getProjectHydrated(
+  ownerUserId: string,
+  projectId: string,
+): Promise<ProjectDetail | null> {
   await syncBackendSessions(ownerUserId);
   return getProject(ownerUserId, projectId);
 }
 
-export function updateProject(ownerUserId: string, projectId: string, payload: Partial<CreateProjectRequest>) {
+export function updateProject(
+  ownerUserId: string,
+  projectId: string,
+  payload: Partial<CreateProjectRequest>,
+) {
   const store = getStore(ownerUserId);
   const project = store.projects.find((item) => item.id === projectId);
   if (!project) {
@@ -389,7 +432,11 @@ export function updateProject(ownerUserId: string, projectId: string, payload: P
   return getProject(ownerUserId, projectId);
 }
 
-export function setProjectStar(ownerUserId: string, projectId: string, starred: boolean) {
+export function setProjectStar(
+  ownerUserId: string,
+  projectId: string,
+  starred: boolean,
+) {
   const store = getStore(ownerUserId);
   const project = store.projects.find((item) => item.id === projectId);
   if (!project) {
@@ -400,7 +447,11 @@ export function setProjectStar(ownerUserId: string, projectId: string, starred: 
   return { starred };
 }
 
-export function addProjectFile(ownerUserId: string, projectId: string, file: File): KnowledgeFile | null {
+export function addProjectFile(
+  ownerUserId: string,
+  projectId: string,
+  file: File,
+): KnowledgeFile | null {
   const store = getStore(ownerUserId);
   if (!store.projects.some((project) => project.id === projectId)) {
     return null;
@@ -409,10 +460,10 @@ export function addProjectFile(ownerUserId: string, projectId: string, file: Fil
   const record: KnowledgeFile = {
     id: crypto.randomUUID(),
     filename: file.name,
-    mimeType: file.type || 'application/octet-stream',
+    mimeType: file.type || "application/octet-stream",
     sizeBytes: file.size,
-    sourceType: 'upload',
-    indexStatus: 'indexed',
+    sourceType: "upload",
+    indexStatus: "indexed",
     indexedAt: timestamp,
     createdAt: timestamp,
   };
@@ -422,7 +473,11 @@ export function addProjectFile(ownerUserId: string, projectId: string, file: Fil
   return record;
 }
 
-export function removeProjectFile(ownerUserId: string, projectId: string, fileId: string) {
+export function removeProjectFile(
+  ownerUserId: string,
+  projectId: string,
+  fileId: string,
+) {
   const store = getStore(ownerUserId);
   const files = store.files[projectId];
   if (!files) {
@@ -437,13 +492,22 @@ export function removeProjectFile(ownerUserId: string, projectId: string, fileId
   return false;
 }
 
-export function getChat(ownerUserId: string, chatId: string): ChatDetail | null {
+/**
+ * Synchronous in-memory snapshot. Route/UI detail reads should prefer
+ * getChatHydrated so backend sessions, runs, and transcripts are reconciled.
+ */
+export function getChat(
+  ownerUserId: string,
+  chatId: string,
+): ChatDetail | null {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
   }
-  const project = chat.projectId ? store.projects.find((item) => item.id === chat.projectId) : undefined;
+  const project = chat.projectId
+    ? store.projects.find((item) => item.id === chat.projectId)
+    : undefined;
   return {
     chat: {
       id: chat.id,
@@ -467,7 +531,10 @@ export function getChat(ownerUserId: string, chatId: string): ChatDetail | null 
   };
 }
 
-export async function getChatHydrated(ownerUserId: string, chatId: string): Promise<ChatDetail | null> {
+export async function getChatHydrated(
+  ownerUserId: string,
+  chatId: string,
+): Promise<ChatDetail | null> {
   await syncBackendSessions(ownerUserId);
   await syncBackendTranscript(ownerUserId, chatId);
   return getChat(ownerUserId, chatId);
@@ -478,24 +545,27 @@ export async function createChatWithMessage(
   payload: {
     message: string;
     model: string;
-    options: Omit<ComposerOptions, 'model'>;
+    options: Omit<ComposerOptions, "model">;
     projectId?: string | null;
   },
 ) {
   const store = getStore(ownerUserId);
   const timestamp = nowIso();
   const projectId = payload.projectId ?? null;
-  if (projectId && !store.projects.some((project) => project.id === projectId)) {
+  if (
+    projectId &&
+    !store.projects.some((project) => project.id === projectId)
+  ) {
     throw new Error(`Cannot create chat: project ${projectId} was not found.`);
   }
   const title = titleFromMessage(payload.message);
   const userMessage: ChatMessage = {
     id: crypto.randomUUID(),
-    role: 'user',
+    role: "user",
     content: payload.message,
     activeSkills: payload.options.activeSkills,
     createdAt: timestamp,
-    status: 'complete',
+    status: "complete",
   };
   const chat: ChatRecord = {
     id: `web-${crypto.randomUUID()}`,
@@ -544,11 +614,11 @@ export async function sendMessage(
   const timestamp = nowIso();
   const userMessage: ChatMessage = {
     id: crypto.randomUUID(),
-    role: 'user',
+    role: "user",
     content: payload.content,
     activeSkills: payload.options?.activeSkills,
     createdAt: timestamp,
-    status: 'complete',
+    status: "complete",
   };
   chat.messages.push(userMessage);
   chat.lastMessageAt = timestamp;
@@ -565,7 +635,11 @@ export async function sendMessage(
     activeSkills: payload.options?.activeSkills,
   });
   assertBackendSessionMatchesChat(chat.id, agentResult.sessionId);
-  const assistantMessage = appendAssistantMessage(chat, agentResult.assistantText, agentResult.ok);
+  const assistantMessage = appendAssistantMessage(
+    chat,
+    agentResult.assistantText,
+    agentResult.ok,
+  );
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
   }
@@ -589,31 +663,35 @@ export function beginStreamingMessage(
 
   const timestamp = nowIso();
   const pendingUserMessage =
-    payload.pendingMessageId && chat.pendingTurn?.messageId === payload.pendingMessageId
-      ? chat.messages.find((item) => item.id === payload.pendingMessageId && item.role === 'user')
+    payload.pendingMessageId &&
+    chat.pendingTurn?.messageId === payload.pendingMessageId
+      ? chat.messages.find(
+          (item) =>
+            item.id === payload.pendingMessageId && item.role === "user",
+        )
       : undefined;
   if (payload.pendingMessageId && !pendingUserMessage) {
     return null;
   }
   const userMessage: ChatMessage = pendingUserMessage ?? {
     id: crypto.randomUUID(),
-    role: 'user',
+    role: "user",
     content: payload.content,
     activeSkills: payload.options?.activeSkills,
     createdAt: timestamp,
-    status: 'complete',
+    status: "complete",
   };
   if (pendingUserMessage && payload.options?.activeSkills?.length) {
     pendingUserMessage.activeSkills = payload.options.activeSkills;
   }
   const assistantMessage: ChatMessage = {
     id: crypto.randomUUID(),
-    role: 'assistant',
-    content: '',
+    role: "assistant",
+    content: "",
     createdAt: timestamp,
-    reasoning: '',
-    reasoningStatus: 'streaming',
-    status: 'streaming',
+    reasoning: "",
+    reasoningStatus: "streaming",
+    status: "streaming",
   };
 
   if (pendingUserMessage) {
@@ -639,14 +717,22 @@ export function beginStreamingMessage(
   };
 }
 
-export function setChatActiveRun(ownerUserId: string, chatId: string, activeRun?: ChatDetail['activeRun'] | ChatActiveRunRecord) {
+export function setChatActiveRun(
+  ownerUserId: string,
+  chatId: string,
+  activeRun?: ChatDetail["activeRun"] | ChatActiveRunRecord,
+) {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
   }
   chat.activeRun = activeRun
-    ? makeActiveRunRecord(activeRun, 'source' in activeRun ? activeRun.source : 'stream', 'observedAt' in activeRun ? activeRun.observedAt : nowIso())
+    ? makeActiveRunRecord(
+        activeRun,
+        "source" in activeRun ? activeRun.source : "stream",
+        "observedAt" in activeRun ? activeRun.observedAt : nowIso(),
+      )
     : undefined;
   return chat.activeRun;
 }
@@ -660,7 +746,7 @@ export async function queueDeferredRunInput(
   },
 ) {
   if ([...payload.content].length > MAX_DEFERRED_INPUT_CHARS) {
-    throw new Error('Deferred input is too large.');
+    throw new Error("Deferred input is too large.");
   }
   await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
@@ -673,7 +759,7 @@ export async function queueDeferredRunInput(
   }
 
   const client = await requireRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `submit deferred run input for ${chat.activeRun.runId}`,
   });
   const activeRunId = chat.activeRun.runId;
@@ -681,15 +767,22 @@ export async function queueDeferredRunInput(
   try {
     runStatus = await client.sdk.getRunStatus(activeRunId);
   } catch (error) {
-    if (error instanceof RuntimeClientError && error.status && [404, 409, 410].includes(error.status)) {
+    if (
+      error instanceof RuntimeClientError &&
+      error.status &&
+      [404, 409, 410].includes(error.status)
+    ) {
       chat.activeRun = undefined;
-      throw new StaleDeferredRunError('The previous run is no longer active.');
+      throw new StaleDeferredRunError("The previous run is no longer active.");
     }
     throw error;
   }
-  if (runStatus.sessionId !== backendSessionIdForChat(chat) || !runBlocksChatTurn(runStatus.status)) {
+  if (
+    runStatus.sessionId !== backendSessionIdForChat(chat) ||
+    !runBlocksChatTurn(runStatus.status)
+  ) {
     chat.activeRun = undefined;
-    throw new StaleDeferredRunError('The previous run is no longer active.');
+    throw new StaleDeferredRunError("The previous run is no longer active.");
   }
   chat.activeRun = makeActiveRunRecord(
     {
@@ -697,7 +790,7 @@ export async function queueDeferredRunInput(
       status: runStatus.status,
       waitingFor: runStatus.waitingFor ?? null,
     },
-    'backend_poll',
+    "backend_poll",
   );
 
   const activeSkills = normalizedActiveSkills(payload.options?.activeSkills);
@@ -710,9 +803,13 @@ export async function queueDeferredRunInput(
       },
     });
   } catch (error) {
-    if (error instanceof RuntimeClientError && error.status && [404, 409, 410].includes(error.status)) {
+    if (
+      error instanceof RuntimeClientError &&
+      error.status &&
+      [404, 409, 410].includes(error.status)
+    ) {
       chat.activeRun = undefined;
-      throw new StaleDeferredRunError('The previous run is no longer active.');
+      throw new StaleDeferredRunError("The previous run is no longer active.");
     }
     throw error;
   }
@@ -720,11 +817,11 @@ export async function queueDeferredRunInput(
   const timestamp = nowIso();
   const userMessage: ChatMessage = {
     id: crypto.randomUUID(),
-    role: 'user',
+    role: "user",
     content: payload.content,
     activeSkills: activeSkills.length ? activeSkills : undefined,
     createdAt: timestamp,
-    status: 'complete',
+    status: "complete",
   };
 
   chat.messages.push(userMessage);
@@ -736,10 +833,10 @@ export async function queueDeferredRunInput(
   chat.activeRun = makeActiveRunRecord(
     {
       runId: chat.activeRun.runId,
-      status: 'input-queued',
-      waitingFor: 'user_input',
+      status: "input-queued",
+      waitingFor: "user_input",
     },
-    'local_mutation',
+    "local_mutation",
   );
 
   return {
@@ -756,11 +853,11 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
     return null;
   }
   if (!chat.activeRun?.runId) {
-    throw new Error('No active run is available to stop.');
+    throw new Error("No active run is available to stop.");
   }
 
   const client = await requireRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `cancel active run ${chat.activeRun.runId}`,
   });
 
@@ -768,10 +865,10 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
   chat.activeRun = makeActiveRunRecord(
     {
       runId: chat.activeRun.runId,
-      status: 'cancelling',
+      status: "cancelling",
       waitingFor: null,
     },
-    'local_mutation',
+    "local_mutation",
   );
 
   return {
@@ -787,14 +884,14 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     return null;
   }
   if (!chat.activeRun?.runId) {
-    throw new Error('No paused run is available to resume.');
+    throw new Error("No paused run is available to resume.");
   }
-  if (chat.activeRun.status.trim().toLowerCase() !== 'paused') {
-    throw new Error('Only paused runs can be resumed.');
+  if (chat.activeRun.status.trim().toLowerCase() !== "paused") {
+    throw new Error("Only paused runs can be resumed.");
   }
 
   const client = await requireRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `resume active run ${chat.activeRun.runId}`,
   });
 
@@ -802,10 +899,10 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
   chat.activeRun = makeActiveRunRecord(
     {
       runId: chat.activeRun.runId,
-      status: 'running',
+      status: "running",
       waitingFor: null,
     },
-    'local_mutation',
+    "local_mutation",
   );
 
   return {
@@ -820,9 +917,9 @@ export function updateStreamingAssistantMessage(
   patch: {
     content?: string;
     reasoning?: string;
-    reasoningStatus?: ChatMessage['reasoningStatus'];
-    status?: ChatMessage['status'];
-    artifacts?: ChatMessage['artifacts'];
+    reasoningStatus?: ChatMessage["reasoningStatus"];
+    status?: ChatMessage["status"];
+    artifacts?: ChatMessage["artifacts"];
   },
 ) {
   const store = getStore(ownerUserId);
@@ -859,7 +956,11 @@ export function updateStreamingAssistantMessage(
   return message;
 }
 
-export async function updateChatModel(ownerUserId: string, chatId: string, model: string) {
+export async function updateChatModel(
+  ownerUserId: string,
+  chatId: string,
+  model: string,
+) {
   const normalized = model.trim();
   if (!normalized) {
     return null;
@@ -874,13 +975,20 @@ export async function updateChatModel(ownerUserId: string, chatId: string, model
   return getChat(ownerUserId, chatId);
 }
 
-export function moveChat(ownerUserId: string, chatId: string, projectId: string | null) {
+export function moveChat(
+  ownerUserId: string,
+  chatId: string,
+  projectId: string | null,
+) {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
   }
-  if (projectId && !store.projects.some((project) => project.id === projectId)) {
+  if (
+    projectId &&
+    !store.projects.some((project) => project.id === projectId)
+  ) {
     return null;
   }
   chat.projectId = projectId;
@@ -888,7 +996,11 @@ export function moveChat(ownerUserId: string, chatId: string, projectId: string 
   return getChat(ownerUserId, chatId);
 }
 
-export async function archiveChat(ownerUserId: string, chatId: string, archived: boolean) {
+export async function archiveChat(
+  ownerUserId: string,
+  chatId: string,
+  archived: boolean,
+) {
   const chat = getStore(ownerUserId).chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
@@ -898,7 +1010,10 @@ export async function archiveChat(ownerUserId: string, chatId: string, archived:
   return getChat(ownerUserId, chatId);
 }
 
-export async function deleteChat(ownerUserId: string, chatId: string): Promise<boolean> {
+export async function deleteChat(
+  ownerUserId: string,
+  chatId: string,
+): Promise<boolean> {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
@@ -912,7 +1027,9 @@ export async function deleteChat(ownerUserId: string, chatId: string): Promise<b
   return true;
 }
 
-export async function deleteArchivedChats(ownerUserId: string): Promise<number> {
+export async function deleteArchivedChats(
+  ownerUserId: string,
+): Promise<number> {
   await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
   const archivedChats = store.chats.filter((chat) => chat.archivedAt);
@@ -921,7 +1038,11 @@ export async function deleteArchivedChats(ownerUserId: string): Promise<number> 
   }
   const archivedIds = new Set(archivedChats.map((chat) => chat.id));
   store.chats = store.chats.filter((chat) => !archivedIds.has(chat.id));
-  const touchedProjectIds = new Set(archivedChats.map((chat) => chat.projectId).filter((projectId): projectId is string => Boolean(projectId)));
+  const touchedProjectIds = new Set(
+    archivedChats
+      .map((chat) => chat.projectId)
+      .filter((projectId): projectId is string => Boolean(projectId)),
+  );
   for (const projectId of touchedProjectIds) {
     touchProjectInStore(store, projectId);
   }
@@ -932,7 +1053,7 @@ export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
   await syncBackendSessions(ownerUserId);
   const store = getStore(ownerUserId);
   const recentChats: Array<{
-    kind: 'chat';
+    kind: "chat";
     id: string;
     title: string;
     href: string;
@@ -940,22 +1061,27 @@ export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
   }> = store.chats
     .filter((chat) => !chat.archivedAt)
     .map((chat) => ({
-      kind: 'chat',
+      kind: "chat",
       id: chat.id,
-      title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? 'Untitled',
-      href: chat.projectId ? `/projects/${chat.projectId}/chats/${chat.id}` : `/chats/${chat.id}`,
+      title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? "Untitled",
+      href: chat.projectId
+        ? `/projects/${chat.projectId}/chats/${chat.id}`
+        : `/chats/${chat.id}`,
       updatedAt: chat.lastMessageAt,
     }));
-  const projectChats = store.chats.filter((chat) => !chat.archivedAt && chat.projectId).sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
+  const projectChats = store.chats
+    .filter((chat) => !chat.archivedAt && chat.projectId)
+    .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
   const recentProjectGroups = store.projects
     .map((project) => {
       const chats = projectChats
         .filter((chat) => chat.projectId === project.id)
         .slice(0, 8)
         .map((chat) => ({
-          kind: 'chat' as const,
+          kind: "chat" as const,
           id: chat.id,
-          title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? 'Untitled',
+          title:
+            chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? "Untitled",
           href: `/projects/${project.id}/chats/${chat.id}`,
           updatedAt: chat.lastMessageAt,
         }));
@@ -965,7 +1091,7 @@ export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
       const updatedAt = chats[0]?.updatedAt ?? project.updatedAt;
       return {
         project: {
-          kind: 'project' as const,
+          kind: "project" as const,
           id: project.id,
           title: project.name,
           href: `/projects/${project.id}`,
@@ -983,14 +1109,14 @@ export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
     .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
     .slice(0, 20)
     .map((chat) => ({
-      kind: 'chat' as const,
+      kind: "chat" as const,
       id: chat.id,
-      title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? 'Untitled',
+      title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? "Untitled",
       href: `/chats/${chat.id}`,
       updatedAt: chat.lastMessageAt,
     }));
   const archivedChats: Array<{
-    kind: 'chat';
+    kind: "chat";
     id: string;
     title: string;
     href: string;
@@ -998,33 +1124,39 @@ export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
   }> = store.chats
     .filter((chat) => chat.archivedAt)
     .map((chat) => ({
-      kind: 'chat',
+      kind: "chat",
       id: chat.id,
-      title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? 'Untitled',
-      href: chat.projectId ? `/projects/${chat.projectId}/chats/${chat.id}` : `/chats/${chat.id}`,
+      title: chat.title ?? chat.lastMessagePreview?.slice(0, 48) ?? "Untitled",
+      href: chat.projectId
+        ? `/projects/${chat.projectId}/chats/${chat.id}`
+        : `/chats/${chat.id}`,
       updatedAt: chat.archivedAt ?? chat.lastMessageAt,
     }));
   const recentProjects: Array<{
-    kind: 'project';
+    kind: "project";
     id: string;
     title: string;
     href: string;
     updatedAt: string;
   }> = store.projects.map((project) => ({
-    kind: 'project',
+    kind: "project",
     id: project.id,
     title: project.name,
     href: `/projects/${project.id}`,
     updatedAt: project.updatedAt,
   }));
-  const recents = [...recentChats, ...recentProjects].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 20);
-  const untitled = recentChats.filter((chat) => chat.title === 'Untitled');
+  const recents = [...recentChats, ...recentProjects]
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 20);
+  const untitled = recentChats.filter((chat) => chat.title === "Untitled");
   return {
     recents,
     recentProjectGroups,
     recentOtherChats,
     untitled,
-    archivedChats: archivedChats.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 50),
+    archivedChats: archivedChats
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, 50),
     user: getCurrentUser(),
   };
 }
@@ -1040,13 +1172,15 @@ export async function ensureChatBackendSession(
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
-    throw new Error(`Cannot create persisted session: chat ${chatId} was not found.`);
+    throw new Error(
+      `Cannot create persisted session: chat ${chatId} was not found.`,
+    );
   }
   if (chat.backendSessionId) {
     return chat.backendSessionId;
   }
 
-  const model = params.model ?? chat.model ?? 'sonnet-4.6-adaptive';
+  const model = params.model ?? chat.model ?? "sonnet-4.6-adaptive";
   const session = await createBackendSession({
     title: chat.title,
     projectId: chat.projectId,
@@ -1061,7 +1195,13 @@ export function searchData(ownerUserId: string, query: string): SearchResponse {
   const q = query.trim().toLowerCase();
   const store = getStore(ownerUserId);
   const projects = store.projects
-    .filter((project) => !q || `${project.name} ${project.description ?? ''}`.toLowerCase().includes(q))
+    .filter(
+      (project) =>
+        !q ||
+        `${project.name} ${project.description ?? ""}`
+          .toLowerCase()
+          .includes(q),
+    )
     .slice(0, 8)
     .map((project) => ({
       id: project.id,
@@ -1070,7 +1210,13 @@ export function searchData(ownerUserId: string, query: string): SearchResponse {
     }));
   const chats = store.chats
     .filter((chat) => !chat.archivedAt)
-    .filter((chat) => !q || `${chat.title ?? ''} ${chat.lastMessagePreview ?? ''}`.toLowerCase().includes(q))
+    .filter(
+      (chat) =>
+        !q ||
+        `${chat.title ?? ""} ${chat.lastMessagePreview ?? ""}`
+          .toLowerCase()
+          .includes(q),
+    )
     .slice(0, 12)
     .map((chat) => ({
       id: chat.id,
@@ -1093,30 +1239,45 @@ function chatSummary(chat: ChatRecord): ChatSummary {
   };
 }
 
-function metadataString(metadata: Record<string, unknown> | undefined, key: string): string | null {
+function metadataString(
+  metadata: Record<string, unknown> | undefined,
+  key: string,
+): string | null {
   const value = metadata?.[key];
-  return typeof value === 'string' && value.trim() ? value : null;
+  return typeof value === "string" && value.trim() ? value : null;
 }
 
 function isWebSession(session: RuntimeSessionResponse): boolean {
-  return metadataString(session.metadata, 'source') === 'web_v1';
+  return metadataString(session.metadata, "source") === "web_v1";
 }
 
 function isUnpersistedLocalChat(chat: ChatRecord): boolean {
-  return !chat.backendSessionId && (Boolean(chat.pendingTurn) || Boolean(chat.activeRun) || chat.messages.some((message) => message.status === 'streaming'));
+  return (
+    !chat.backendSessionId &&
+    (Boolean(chat.pendingTurn) ||
+      Boolean(chat.activeRun) ||
+      chat.messages.some((message) => message.status === "streaming"))
+  );
 }
 
-function chatRecordFromBackendSession(session: RuntimeSessionResponse, existing?: ChatRecord): ChatRecord | null {
+function chatRecordFromBackendSession(
+  session: RuntimeSessionResponse,
+  existing?: ChatRecord,
+): ChatRecord | null {
   if (!session.session_id || !isWebSession(session)) {
     return null;
   }
 
   const createdAt = session.created_at ?? existing?.createdAt ?? nowIso();
   const updatedAt = session.updated_at ?? existing?.lastMessageAt ?? createdAt;
-  const projectId = metadataString(session.metadata, 'project_id');
-  const model = metadataString(session.metadata, 'current_model') ?? metadataString(session.metadata, 'initial_model') ?? existing?.model ?? null;
+  const projectId = metadataString(session.metadata, "project_id");
+  const model =
+    metadataString(session.metadata, "current_model") ??
+    metadataString(session.metadata, "initial_model") ??
+    existing?.model ??
+    null;
   const title = session.title ?? existing?.title ?? null;
-  const archivedAt = session.status === 'archived' ? updatedAt : null;
+  const archivedAt = session.status === "archived" ? updatedAt : null;
 
   return {
     id: existing?.id ?? session.session_id,
@@ -1134,7 +1295,10 @@ function chatRecordFromBackendSession(session: RuntimeSessionResponse, existing?
   };
 }
 
-async function listAllBackendRuns(client: WebRuntimeClient, ownerUserId: string): Promise<RunStatus[]> {
+async function listAllBackendRuns(
+  client: WebRuntimeClient,
+  ownerUserId: string,
+): Promise<RunStatus[]> {
   const runs: RunStatus[] = [];
   let offset = 0;
 
@@ -1146,16 +1310,29 @@ async function listAllBackendRuns(client: WebRuntimeClient, ownerUserId: string)
         offset,
       });
     } catch (error) {
-      throw runtimeOperationError(`Cannot sync active runs for user ${ownerUserId}`, error);
+      throw runtimeOperationError(
+        `Cannot sync active runs for user ${ownerUserId}`,
+        error,
+      );
     }
 
     const page = Array.isArray(parsed.runs) ? parsed.runs : [];
     runs.push(...page);
 
-    const responseLimit = typeof parsed.limit === 'number' && parsed.limit > 0 ? parsed.limit : RUN_SYNC_PAGE_SIZE;
-    const total = typeof parsed.total === 'number' && Number.isFinite(parsed.total) ? parsed.total : null;
+    const responseLimit =
+      typeof parsed.limit === "number" && parsed.limit > 0
+        ? parsed.limit
+        : RUN_SYNC_PAGE_SIZE;
+    const total =
+      typeof parsed.total === "number" && Number.isFinite(parsed.total)
+        ? parsed.total
+        : null;
 
-    if (page.length === 0 || page.length < responseLimit || (total !== null && offset + page.length >= total)) {
+    if (
+      page.length === 0 ||
+      page.length < responseLimit ||
+      (total !== null && offset + page.length >= total)
+    ) {
       break;
     }
 
@@ -1165,7 +1342,10 @@ async function listAllBackendRuns(client: WebRuntimeClient, ownerUserId: string)
   return runs;
 }
 
-async function listAllBackendSessions(client: WebRuntimeClient, ownerUserId: string): Promise<RuntimeSessionResponse[]> {
+async function listAllBackendSessions(
+  client: WebRuntimeClient,
+  ownerUserId: string,
+): Promise<RuntimeSessionResponse[]> {
   const sessions: RuntimeSessionResponse[] = [];
   let offset = 0;
 
@@ -1177,16 +1357,29 @@ async function listAllBackendSessions(client: WebRuntimeClient, ownerUserId: str
         offset,
       });
     } catch (error) {
-      throw runtimeOperationError(`Cannot sync persisted sessions for user ${ownerUserId}`, error);
+      throw runtimeOperationError(
+        `Cannot sync persisted sessions for user ${ownerUserId}`,
+        error,
+      );
     }
 
     const page = Array.isArray(parsed.sessions) ? parsed.sessions : [];
     sessions.push(...page);
 
-    const responseLimit = typeof parsed.limit === 'number' && parsed.limit > 0 ? parsed.limit : SESSION_SYNC_PAGE_SIZE;
-    const total = typeof parsed.total === 'number' && Number.isFinite(parsed.total) ? parsed.total : null;
+    const responseLimit =
+      typeof parsed.limit === "number" && parsed.limit > 0
+        ? parsed.limit
+        : SESSION_SYNC_PAGE_SIZE;
+    const total =
+      typeof parsed.total === "number" && Number.isFinite(parsed.total)
+        ? parsed.total
+        : null;
 
-    if (page.length === 0 || page.length < responseLimit || (total !== null && offset + page.length >= total)) {
+    if (
+      page.length === 0 ||
+      page.length < responseLimit ||
+      (total !== null && offset + page.length >= total)
+    ) {
       break;
     }
 
@@ -1198,7 +1391,7 @@ async function listAllBackendSessions(client: WebRuntimeClient, ownerUserId: str
 
 async function syncBackendSessions(ownerUserId: string): Promise<void> {
   const client = await getRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `sync persisted sessions for user ${ownerUserId}`,
   });
   if (!client) {
@@ -1210,7 +1403,11 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   const syncStartedAt = nowIso();
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
-  const byBackendSessionId = new Map(store.chats.filter((chat) => chat.backendSessionId).map((chat) => [chat.backendSessionId as string, chat]));
+  const byBackendSessionId = new Map(
+    store.chats
+      .filter((chat) => chat.backendSessionId)
+      .map((chat) => [chat.backendSessionId as string, chat]),
+  );
   const backendChatIds = new Set<string>();
   const activeRunBySession = new Map<string, ChatActiveRunRecord>();
   const backendRunStatuses = new Map<string, string>();
@@ -1226,7 +1423,7 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
         status: run.status,
         waitingFor: run.waitingFor ?? null,
       },
-      'backend_poll',
+      "backend_poll",
       syncStartedAt,
     );
     const current = activeRunBySession.get(run.sessionId);
@@ -1236,14 +1433,19 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   }
 
   for (const session of sessions) {
-    const existing = session.session_id ? (byBackendSessionId.get(session.session_id) ?? byId.get(session.session_id)) : undefined;
+    const existing = session.session_id
+      ? (byBackendSessionId.get(session.session_id) ??
+        byId.get(session.session_id))
+      : undefined;
     const record = chatRecordFromBackendSession(session, existing);
     if (!record) {
       continue;
     }
     record.activeRun = mergeActiveRunRecord({
       existing: existing?.activeRun,
-      backend: session.session_id ? activeRunBySession.get(session.session_id) : undefined,
+      backend: session.session_id
+        ? activeRunBySession.get(session.session_id)
+        : undefined,
       backendRunStatuses,
     });
     backendChatIds.add(record.id);
@@ -1260,20 +1462,40 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   // disappeared (for example after a developer resets the MatrixOne database).
   // Keeping those shells lets the UI send messages to non-existent sessions and
   // turns a clean 404 into a fake assistant error message.
-  store.chats = store.chats.filter((chat) => backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat));
+  store.chats = store.chats.filter(
+    (chat) => backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat),
+  );
   normalizeCanonicalChatIds(store);
   store.chats.sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
 }
 
-function transcriptItemToMessage(chatId: string, item: RuntimeTranscriptItemResponse): ChatMessage | null {
-  if (typeof item.item_seq !== 'number' || typeof item.role !== 'string' || typeof item.content !== 'string') {
+function transcriptItemToMessage(
+  chatId: string,
+  item: RuntimeTranscriptItemResponse,
+): ChatMessage | null {
+  if (
+    typeof item.item_seq !== "number" ||
+    typeof item.role !== "string" ||
+    typeof item.content !== "string"
+  ) {
     return null;
   }
-  if (item.role !== 'user' && item.role !== 'assistant' && item.role !== 'system') {
+  if (
+    item.role !== "user" &&
+    item.role !== "assistant" &&
+    item.role !== "system"
+  ) {
     return null;
   }
-  const reasoning = typeof item.reasoning === 'string' ? item.reasoning.trim() : '';
-  const reasoningStatus = item.reasoning_status === 'streaming' || item.reasoning_status === 'complete' ? item.reasoning_status : reasoning ? 'complete' : undefined;
+  const reasoning =
+    typeof item.reasoning === "string" ? item.reasoning.trim() : "";
+  const reasoningStatus =
+    item.reasoning_status === "streaming" ||
+    item.reasoning_status === "complete"
+      ? item.reasoning_status
+      : reasoning
+        ? "complete"
+        : undefined;
 
   return {
     id: `${chatId}:${item.item_seq}`,
@@ -1282,21 +1504,28 @@ function transcriptItemToMessage(chatId: string, item: RuntimeTranscriptItemResp
     reasoning: reasoning || undefined,
     reasoningStatus,
     createdAt: item.created_at ?? nowIso(),
-    status: 'complete',
+    status: "complete",
   };
 }
 
-async function syncBackendTranscript(ownerUserId: string, chatId: string): Promise<void> {
+async function syncBackendTranscript(
+  ownerUserId: string,
+  chatId: string,
+): Promise<void> {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
-  const hasIncompleteAssistant = chat?.messages.some((message) => message.role === 'assistant' && message.status === 'streaming') ?? false;
+  const hasIncompleteAssistant =
+    chat?.messages.some(
+      (message) =>
+        message.role === "assistant" && message.status === "streaming",
+    ) ?? false;
   if (!chat || (chat.messages.length > 0 && !hasIncompleteAssistant)) {
     return;
   }
   const backendSessionId = chat.backendSessionId ?? chat.id;
 
   const client = await getRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `sync persisted transcript for session ${backendSessionId}`,
   });
   if (!client) {
@@ -1305,11 +1534,18 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
 
   let parsed: RuntimeTranscriptResponse;
   try {
-    parsed = await client.sdk.getSessionTranscript(backendSessionId, { limit: 200 });
+    parsed = await client.sdk.getSessionTranscript(backendSessionId, {
+      limit: 200,
+    });
   } catch (error) {
-    throw runtimeOperationError(`Cannot sync persisted transcript for session ${backendSessionId}`, error);
+    throw runtimeOperationError(
+      `Cannot sync persisted transcript for session ${backendSessionId}`,
+      error,
+    );
   }
-  const messages = (parsed.items ?? []).map((item) => transcriptItemToMessage(chatId, item)).filter((message): message is ChatMessage => Boolean(message));
+  const messages = (parsed.items ?? [])
+    .map((item) => transcriptItemToMessage(chatId, item))
+    .filter((message): message is ChatMessage => Boolean(message));
   if (!messages.length) {
     return;
   }
@@ -1319,12 +1555,17 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   chat.lastMessagePreview = latest?.content ?? chat.lastMessagePreview;
 }
 
-async function createBackendSession(params: { title: string | null; projectId: string | null; model: string; runtime?: WebRuntimeClient }): Promise<{ sessionId: string }> {
+async function createBackendSession(params: {
+  title: string | null;
+  projectId: string | null;
+  model: string;
+  runtime?: WebRuntimeClient;
+}): Promise<{ sessionId: string }> {
   const client =
     params.runtime ??
     (await requireRuntimeClient({
-      auth: 'required',
-      operation: 'create persisted session',
+      auth: "required",
+      operation: "create persisted session",
     }));
   let parsed: RuntimeSessionResponse;
   try {
@@ -1332,17 +1573,19 @@ async function createBackendSession(params: { title: string | null; projectId: s
       agent_id: null,
       title: params.title,
       metadata: {
-        source: 'web_v1',
+        source: "web_v1",
         project_id: params.projectId,
         initial_model: params.model,
         current_model: params.model,
       },
     });
   } catch (error) {
-    throw runtimeOperationError('Cannot create persisted session', error);
+    throw runtimeOperationError("Cannot create persisted session", error);
   }
   if (!parsed.session_id) {
-    throw new Error('Cannot create persisted session: runtime response did not include session_id.');
+    throw new Error(
+      "Cannot create persisted session: runtime response did not include session_id.",
+    );
   }
 
   return { sessionId: parsed.session_id };
@@ -1351,42 +1594,57 @@ async function createBackendSession(params: { title: string | null; projectId: s
 async function deleteBackendSession(chat: ChatRecord): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
   const client = await requireRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `delete persisted session ${sessionId}`,
   });
   try {
     await client.sdk.deleteSession(sessionId);
   } catch (error) {
-    throw runtimeOperationError(`Cannot delete persisted session ${sessionId}`, error);
+    throw runtimeOperationError(
+      `Cannot delete persisted session ${sessionId}`,
+      error,
+    );
   }
 }
 
-async function updateBackendSessionArchive(chat: ChatRecord, archived: boolean): Promise<void> {
+async function updateBackendSessionArchive(
+  chat: ChatRecord,
+  archived: boolean,
+): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
   const client = await requireRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `update persisted session ${sessionId} archive state`,
   });
   try {
     await client.sdk.updateRuntimeSession(sessionId, {
-      status: archived ? 'archived' : 'active',
+      status: archived ? "archived" : "active",
     });
   } catch (error) {
-    throw runtimeOperationError(`Cannot update persisted session ${sessionId}`, error);
+    throw runtimeOperationError(
+      `Cannot update persisted session ${sessionId}`,
+      error,
+    );
   }
 }
 
-async function updateBackendSessionModel(chat: ChatRecord, model: string): Promise<void> {
+async function updateBackendSessionModel(
+  chat: ChatRecord,
+  model: string,
+): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
   const client = await requireRuntimeClient({
-    auth: 'required',
+    auth: "required",
     operation: `update persisted session ${sessionId} model`,
   });
   let parsed: RuntimeSessionResponse;
   try {
     parsed = await client.sdk.getRuntimeSession(sessionId);
   } catch (error) {
-    throw runtimeOperationError(`Cannot read persisted session ${sessionId} before model update`, error);
+    throw runtimeOperationError(
+      `Cannot read persisted session ${sessionId} before model update`,
+      error,
+    );
   }
 
   const metadata = {
@@ -1397,13 +1655,18 @@ async function updateBackendSessionModel(chat: ChatRecord, model: string): Promi
   try {
     await client.sdk.updateRuntimeSession(sessionId, { metadata });
   } catch (error) {
-    throw runtimeOperationError(`Cannot update persisted session ${sessionId} model`, error);
+    throw runtimeOperationError(
+      `Cannot update persisted session ${sessionId} model`,
+      error,
+    );
   }
 }
 
 function assertBackendSessionMatchesChat(chatId: string, sessionId?: string) {
   if (sessionId && sessionId !== chatId) {
-    throw new Error(`Runtime returned session_id ${sessionId}, but Web chat is bound to ${chatId}.`);
+    throw new Error(
+      `Runtime returned session_id ${sessionId}, but Web chat is bound to ${chatId}.`,
+    );
   }
 }
 
@@ -1415,7 +1678,9 @@ function normalizeCanonicalChatIds(store: Store) {
     if (LEGACY_LOCAL_CHAT_IDS.has(chat.id)) {
       continue;
     }
-    const backendSessionId = chat.backendSessionId ?? (chat.id.startsWith('web-') ? undefined : chat.id);
+    const backendSessionId =
+      chat.backendSessionId ??
+      (chat.id.startsWith("web-") ? undefined : chat.id);
     if (backendSessionId && seenBackendSessionIds.has(backendSessionId)) {
       continue;
     }
@@ -1449,14 +1714,18 @@ function touchProjectInStore(store: Store, projectId: string) {
   }
 }
 
-function appendAssistantMessage(chat: ChatRecord, text: string, ok: boolean): ChatMessage {
+function appendAssistantMessage(
+  chat: ChatRecord,
+  text: string,
+  ok: boolean,
+): ChatMessage {
   const timestamp = nowIso();
   const message: ChatMessage = {
     id: crypto.randomUUID(),
-    role: 'assistant',
+    role: "assistant",
     content: text,
     createdAt: timestamp,
-    status: ok ? 'complete' : 'failed',
+    status: ok ? "complete" : "failed",
   };
   chat.messages.push(message);
   chat.lastMessageAt = timestamp;
@@ -1471,12 +1740,15 @@ async function callBackendAgent(params: {
   activeSkills?: string[];
 }): Promise<{ ok: boolean; sessionId?: string; assistantText: string }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), AGENT_RESPONSE_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    AGENT_RESPONSE_TIMEOUT_MS,
+  );
 
   try {
     const client = await requireRuntimeClient({
-      auth: 'optional',
-      operation: 'start web chat turn',
+      auth: "optional",
+      operation: "start web chat turn",
     });
     const model = await resolveBackendModelName(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
@@ -1488,8 +1760,10 @@ async function callBackendAgent(params: {
         model,
         allowSkills: activeSkills.length ? activeSkills : undefined,
         context: {
-          source: 'web_v1',
-          edge_profile: activeSkills.length ? { active_skills: activeSkills } : undefined,
+          source: "web_v1",
+          edge_profile: activeSkills.length
+            ? { active_skills: activeSkills }
+            : undefined,
         },
       },
       {
@@ -1513,11 +1787,19 @@ async function callBackendAgent(params: {
     return {
       ok: true,
       sessionId: run.sessionId,
-      assistantText: run.runId ? 'Astra completed the run without returning visible text.' : 'The run was accepted by Astra.',
+      assistantText: run.runId
+        ? "Astra completed the run without returning visible text."
+        : "The run was accepted by Astra.",
     };
   } catch (error) {
-    const message = error instanceof Error && error.name === 'AbortError' ? `timed out after ${AGENT_RESPONSE_TIMEOUT_MS / 1000}s` : runtimeErrorDetail(error, 'unknown error');
-    const prefix = error instanceof RuntimeClientError ? 'Astra runtime rejected the request' : 'I could not reach the Astra runtime from the web UI';
+    const message =
+      error instanceof Error && error.name === "AbortError"
+        ? `timed out after ${AGENT_RESPONSE_TIMEOUT_MS / 1000}s`
+        : runtimeErrorDetail(error, "unknown error");
+    const prefix =
+      error instanceof RuntimeClientError
+        ? "Astra runtime rejected the request"
+        : "I could not reach the Astra runtime from the web UI";
     return {
       ok: false,
       assistantText: `${prefix}. (${message})`,
@@ -1527,22 +1809,31 @@ async function callBackendAgent(params: {
   }
 }
 
-async function readRunStream(client: WebRuntimeClient, runId: string): Promise<StreamResult> {
+async function readRunStream(
+  client: WebRuntimeClient,
+  runId: string,
+): Promise<StreamResult> {
   const startedAt = Date.now();
   let nextOffset = 0;
-  let assistantText = '';
+  let assistantText = "";
 
   while (Date.now() - startedAt < AGENT_STREAM_TIMEOUT_MS) {
     const controller = new AbortController();
-    const remainingMs = Math.max(1, AGENT_STREAM_TIMEOUT_MS - (Date.now() - startedAt));
+    const remainingMs = Math.max(
+      1,
+      AGENT_STREAM_TIMEOUT_MS - (Date.now() - startedAt),
+    );
     const timeout = setTimeout(() => controller.abort(), remainingMs);
 
     try {
-      const response = await client.fetchResponse(`${chatRunStreamPath(runId)}${buildQueryString({ last_index: nextOffset })}`, {
-        auth: 'required',
-        operation: `stream run ${runId}`,
-        signal: controller.signal,
-      });
+      const response = await client.fetchResponse(
+        `${chatRunStreamPath(runId)}${buildQueryString({ last_index: nextOffset })}`,
+        {
+          auth: "required",
+          operation: `stream run ${runId}`,
+          signal: controller.signal,
+        },
+      );
 
       if (!response.ok) {
         return { assistantText, error: await readRuntimeErrorDetail(response) };
@@ -1552,7 +1843,10 @@ async function readRunStream(client: WebRuntimeClient, runId: string): Promise<S
       if (parsed.assistantText) {
         assistantText = parsed.assistantText;
       }
-      if (typeof parsed.nextOffset === 'number' && parsed.nextOffset > nextOffset) {
+      if (
+        typeof parsed.nextOffset === "number" &&
+        parsed.nextOffset > nextOffset
+      ) {
         nextOffset = parsed.nextOffset;
       }
       if (parsed.error || parsed.finished) {
@@ -1565,11 +1859,11 @@ async function readRunStream(client: WebRuntimeClient, runId: string): Promise<S
       }
     } catch (error) {
       const detail =
-        error instanceof Error && error.name === 'AbortError'
+        error instanceof Error && error.name === "AbortError"
           ? `timed out after ${AGENT_STREAM_TIMEOUT_MS / 1000}s while waiting for Astra`
           : error instanceof Error
             ? error.message
-            : 'unknown stream error';
+            : "unknown stream error";
       return { assistantText, error: detail };
     } finally {
       clearTimeout(timeout);
@@ -1585,31 +1879,38 @@ async function readRunStream(client: WebRuntimeClient, runId: string): Promise<S
 }
 
 function parseRunSseText(text: string): StreamResult {
-  let assistantText = '';
-  let finalText = '';
+  let assistantText = "";
+  let finalText = "";
   let error: string | undefined;
   let finished = false;
   let nextOffset = 0;
 
-  for (const event of parseSseDataEvents(text.replace(/\r\n/g, '\n'))) {
+  for (const event of parseSseDataEvents(text.replace(/\r\n/g, "\n"))) {
     const record = event as StreamEvent & Record<string, unknown>;
-    const type = typeof record.type === 'string' ? record.type : '';
-    if (typeof record.index === 'number' && Number.isFinite(record.index)) {
+    const type = typeof record.type === "string" ? record.type : "";
+    if (typeof record.index === "number" && Number.isFinite(record.index)) {
       nextOffset = Math.max(nextOffset, Math.trunc(record.index) + 1);
     }
 
-    if (type === 'text_delta' && typeof record.content === 'string') {
+    if (type === "text_delta" && typeof record.content === "string") {
       assistantText += record.content;
-    } else if (type === 'text_done' && typeof record.full_text === 'string') {
+    } else if (type === "text_done" && typeof record.full_text === "string") {
       finalText = record.full_text;
-    } else if (type === 'turn_complete' && typeof record.assistant_text === 'string') {
+    } else if (
+      type === "turn_complete" &&
+      typeof record.assistant_text === "string"
+    ) {
       finalText = record.assistant_text;
-    } else if (type === 'error' && typeof record.message === 'string') {
+    } else if (type === "error" && typeof record.message === "string") {
       error = record.message;
-    } else if (type === 'run_finished' && record.status === 'failed' && typeof record.error === 'string') {
+    } else if (
+      type === "run_finished" &&
+      record.status === "failed" &&
+      typeof record.error === "string"
+    ) {
       error = record.error;
       finished = true;
-    } else if (type === 'run_finished') {
+    } else if (type === "run_finished") {
       finished = true;
     }
   }
@@ -1622,36 +1923,40 @@ function parseRunSseText(text: string): StreamResult {
   };
 }
 
-export async function resolveBackendModelName(runtime: RuntimeConfig | WebRuntimeClient, model?: string) {
+export async function resolveBackendModelName(
+  runtime: RuntimeConfig | WebRuntimeClient,
+  model?: string,
+) {
   if (!model) {
     return model;
   }
 
   try {
-    const client = runtime instanceof WebRuntimeClient ? runtime : new WebRuntimeClient(runtime);
+    const client =
+      runtime instanceof WebRuntimeClient
+        ? runtime
+        : new WebRuntimeClient(runtime);
     const accessToken = client.config.accessToken;
     if (!accessToken) {
       return model;
     }
 
-    const now = Date.now();
-    const cached = modelListCache.get(accessToken);
+    const cached = modelCache.get(accessToken);
     let modelsPromise: Promise<Array<{ model_id?: string; name?: string }>>;
-    if (cached && cached.expiresAt > now) {
-      modelsPromise = cached.promise;
+    if (cached) {
+      modelsPromise = cached;
     } else {
       modelsPromise = client.sdk.listModels();
-      modelListCache.set(accessToken, {
-        promise: modelsPromise,
-        expiresAt: now + MODEL_LIST_CACHE_TTL_MS,
-      });
+      modelCache.set(accessToken, modelsPromise);
     }
 
     const models = await modelsPromise.catch((err) => {
-      modelListCache.delete(accessToken);
+      modelCache.invalidate(accessToken);
       throw err;
     });
-    const matched = models.find((item) => item.model_id === model || item.name === model);
+    const matched = models.find(
+      (item) => item.model_id === model || item.name === model,
+    );
     return matched?.name ?? model;
   } catch {
     return model;

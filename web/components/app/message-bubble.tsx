@@ -1,19 +1,36 @@
-'use client';
+"use client";
 
-import { CheckCircle2, ChevronDown, Clock3, Copy, Download, Loader, RefreshCcw, ThumbsDown, ThumbsUp } from 'lucide-react';
-import { Children, isValidElement, useEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
-import ReactMarkdown from 'react-markdown';
-import type { Components } from 'react-markdown';
-import rehypeHighlight from 'rehype-highlight';
-import rehypeKatex from 'rehype-katex';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import { SkillMentionText } from '@/components/app/skill-mention-text';
-import { IconButton } from '@/components/ui/icon-button';
-import { splitThinkingTags } from '@/lib/api/chats';
-import type { ChatArtifactRef, ChatMessage } from '@/lib/api/types';
-import { cn } from '@/lib/utils/cn';
+import {
+  CheckCircle2,
+  ChevronDown,
+  Clock3,
+  Copy,
+  Download,
+  Loader,
+  RefreshCcw,
+  ThumbsDown,
+  ThumbsUp,
+} from "lucide-react";
+import {
+  Children,
+  isValidElement,
+  memo,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import type { ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import { SkillMentionText } from "@/components/app/skill-mention-text";
+import { IconButton } from "@/components/ui/icon-button";
+import { splitThinkingTags } from "@/lib/api/chats";
+import type { ChatArtifactRef, ChatMessage } from "@/lib/api/types";
+import { cn } from "@/lib/utils/cn";
 
 const markdownRemarkPlugins = [remarkGfm, remarkMath];
 const markdownRehypePlugins = [rehypeKatex, rehypeHighlight];
@@ -21,11 +38,12 @@ const markdownRehypePlugins = [rehypeKatex, rehypeHighlight];
 const markdownComponents: Components = {
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
   p: ({ children }) => {
-    const elementChildren = Children.toArray(children).filter((child) => (
-      typeof child !== 'string' || child.trim().length > 0
-    ));
-    const mathOnly = elementChildren.length === 1 && isKatexElement(elementChildren[0]);
-    return <p className={mathOnly ? 'text-center' : undefined}>{children}</p>;
+    const elementChildren = Children.toArray(children).filter(
+      (child) => typeof child !== "string" || child.trim().length > 0,
+    );
+    const mathOnly =
+      elementChildren.length === 1 && isKatexElement(elementChildren[0]);
+    return <p className={mathOnly ? "text-center" : undefined}>{children}</p>;
   },
   table: ({ children }) => (
     <div className="mb-6 w-full overflow-x-auto px-2">
@@ -37,14 +55,17 @@ const markdownComponents: Components = {
 function CodeBlock({ children }: { children: ReactNode }) {
   const [copied, setCopied] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const codeText = extractText(children).replace(/\n$/, '');
+  const codeText = extractText(children).replace(/\n$/, "");
   const language = extractCodeLanguage(children);
 
-  useEffect(() => () => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    },
+    [],
+  );
 
   const copyCode = async () => {
     try {
@@ -55,7 +76,7 @@ function CodeBlock({ children }: { children: ReactNode }) {
       }
       timeoutRef.current = setTimeout(() => setCopied(false), 1400);
     } catch (error) {
-      console.warn('Failed to copy code block', error);
+      console.warn("Failed to copy code block", error);
     }
   };
 
@@ -68,20 +89,26 @@ function CodeBlock({ children }: { children: ReactNode }) {
           <span className="size-2.5 rounded-full bg-[#27c93f]" />
         </span>
         <span className="truncate text-[10px] uppercase tracking-[0.08em] text-[#8b949e]">
-          {language ?? 'text'}
+          {language ?? "text"}
         </span>
         <button
           type="button"
           onClick={copyCode}
           className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-[#8b949e] transition hover:bg-white/[0.06] hover:text-[#c9d1d9] focus:outline-none"
-          aria-label={copied ? 'Code copied' : 'Copy code'}
+          aria-label={copied ? "Code copied" : "Copy code"}
         >
-          {copied ? <CheckCircle2 className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
-          <span>{copied ? 'Copied' : 'Copy'}</span>
+          {copied ? (
+            <CheckCircle2 className="size-3.5 text-success" />
+          ) : (
+            <Copy className="size-3.5" />
+          )}
+          <span>{copied ? "Copied" : "Copy"}</span>
         </button>
       </div>
       <div className="group/code relative">
-        <pre className="!m-0 !rounded-none !border-0 !bg-[#0f1419] !px-4 !py-3.5">{children}</pre>
+        <pre className="!m-0 !rounded-none !border-0 !bg-[#0f1419] !px-4 !py-3.5">
+          {children}
+        </pre>
       </div>
     </div>
   );
@@ -100,22 +127,22 @@ function extractCodeLanguage(node: ReactNode): string | null {
   if (!isValidElement<{ className?: string }>(node)) {
     return null;
   }
-  const className = node.props.className ?? '';
+  const className = node.props.className ?? "";
   const match = className.match(/language-([a-z0-9_+-]+)/i);
   return match?.[1] ?? null;
 }
 
 function extractText(node: ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') {
+  if (typeof node === "string" || typeof node === "number") {
     return String(node);
   }
   if (Array.isArray(node)) {
-    return node.map(extractText).join('');
+    return node.map(extractText).join("");
   }
   if (isValidElement<{ children?: ReactNode }>(node)) {
     return extractText(node.props.children);
   }
-  return '';
+  return "";
 }
 
 function isKatexElement(child: ReactNode) {
@@ -124,31 +151,42 @@ function isKatexElement(child: ReactNode) {
   }
   const className = child.props.className;
   if (Array.isArray(className)) {
-    return className.includes('katex');
+    return className.includes("katex");
   }
-  return typeof className === 'string' && className.split(/\s+/).includes('katex');
+  return (
+    typeof className === "string" && className.split(/\s+/).includes("katex")
+  );
 }
 
-export function MessageBubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === 'user';
+export const MessageBubble = memo(function MessageBubble({
+  message,
+}: {
+  message: ChatMessage;
+}) {
+  const isUser = message.role === "user";
   const splitContent = splitThinkingTags(message.content);
   const rawContent = splitContent.visibleText;
   const rawReasoning = message.reasoning?.trim() || splitContent.reasoning;
-  const orphanStreamingReasoning = !isUser
-    && message.status === 'streaming'
-    && !rawReasoning.trim()
-    && !splitContent.hasThinking
-    && isLikelyOrphanStreamingReasoning(rawContent);
-  const content = orphanStreamingReasoning ? '' : rawContent;
+  const orphanStreamingReasoning =
+    !isUser &&
+    message.status === "streaming" &&
+    !rawReasoning.trim() &&
+    !splitContent.hasThinking &&
+    isLikelyOrphanStreamingReasoning(rawContent);
+  const content = orphanStreamingReasoning ? "" : rawContent;
   const reasoning = orphanStreamingReasoning ? rawContent : rawReasoning;
-  const reasoningStreaming = message.reasoningStatus === 'streaming' || splitContent.reasoningOpen || orphanStreamingReasoning;
+  const reasoningStreaming =
+    message.reasoningStatus === "streaming" ||
+    splitContent.reasoningOpen ||
+    orphanStreamingReasoning;
   const hasReasoning = Boolean(reasoning.trim());
-  const showReasoning = !isUser && (
-    hasReasoning ||
-    message.reasoningStatus === 'streaming' ||
-    (message.status === 'streaming' && reasoningStreaming)
-  );
-  const isStreamingEmpty = message.status === 'streaming' && !content.trim() && !hasReasoning;
+  const showReasoning =
+    !isUser &&
+    (hasReasoning ||
+      message.reasoningStatus === "streaming" ||
+      (message.status === "streaming" && reasoningStreaming));
+  const isStreamingEmpty =
+    message.status === "streaming" && !content.trim() && !hasReasoning;
   if (isUser) {
     return (
       <article className="flex justify-end py-4">
@@ -165,19 +203,19 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
 
   return (
     <article className="group py-1 pb-8">
-      {message.status === 'failed' ? (
+      {message.status === "failed" ? (
         <div className="mb-3 inline-flex rounded-full bg-danger/10 px-2.5 py-1 text-xs font-medium text-danger">
           error
         </div>
       ) : null}
       {showReasoning ? (
-        <ReasoningPanel
-          reasoning={reasoning}
-          streaming={reasoningStreaming}
-        />
+        <ReasoningPanel reasoning={reasoning} streaming={reasoningStreaming} />
       ) : null}
       {isStreamingEmpty ? (
-        <div className="flex h-7 items-center gap-1 text-text-muted" aria-label="Astra is responding">
+        <div
+          className="flex h-7 items-center gap-1 text-text-muted"
+          aria-label="Astra is responding"
+        >
           <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
           <span className="size-1.5 animate-bounce rounded-full bg-text-muted [animation-delay:120ms]" />
           <span className="size-1.5 animate-bounce rounded-full bg-text-muted [animation-delay:240ms]" />
@@ -188,17 +226,35 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
       {message.artifacts?.length ? (
         <ArtifactList artifacts={message.artifacts} />
       ) : null}
-      {message.status !== 'streaming' ? (
+      {message.status !== "streaming" ? (
         <div className="mt-3 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-          <IconButton icon={Copy} label="Copy response" className="size-8" onClick={() => navigator.clipboard?.writeText(content)} />
-          <IconButton icon={RefreshCcw} label="Regenerate response" className="size-8" disabled />
-          <IconButton icon={ThumbsUp} label="Good response" className="size-8" />
-          <IconButton icon={ThumbsDown} label="Bad response" className="size-8" />
+          <IconButton
+            icon={Copy}
+            label="Copy response"
+            className="size-8"
+            onClick={() => navigator.clipboard?.writeText(content)}
+          />
+          <IconButton
+            icon={RefreshCcw}
+            label="Regenerate response"
+            className="size-8"
+            disabled
+          />
+          <IconButton
+            icon={ThumbsUp}
+            label="Good response"
+            className="size-8"
+          />
+          <IconButton
+            icon={ThumbsDown}
+            label="Bad response"
+            className="size-8"
+          />
         </div>
       ) : null}
     </article>
   );
-}
+});
 
 function ArtifactList({ artifacts }: { artifacts: ChatArtifactRef[] }) {
   const visibleArtifacts = artifacts.filter(isChatVisibleArtifact);
@@ -216,20 +272,27 @@ function ArtifactList({ artifacts }: { artifacts: ChatArtifactRef[] }) {
 }
 
 function isChatVisibleArtifact(artifact: ChatArtifactRef) {
-  return artifact.kind !== 'composite_snapshot_index'
-    && artifact.source !== 'composite_snapshot_index';
+  return (
+    artifact.kind !== "composite_snapshot_index" &&
+    artifact.source !== "composite_snapshot_index"
+  );
 }
 
 function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
-  const content = artifact.content && typeof artifact.content === 'object'
-    ? artifact.content as Record<string, unknown>
-    : null;
+  const content =
+    artifact.content && typeof artifact.content === "object"
+      ? (artifact.content as Record<string, unknown>)
+      : null;
   const payload = buildArtifactPayload(artifact, content);
-  const title = artifact.title || artifact.filename || artifact.downloadFilename || artifact.kind;
-  const subtitle = [
-    artifact.contentType,
-    formatBytes(artifact.sizeBytes),
-  ].filter(Boolean).join(' · ') || artifact.kind;
+  const title =
+    artifact.title ||
+    artifact.filename ||
+    artifact.downloadFilename ||
+    artifact.kind;
+  const subtitle =
+    [artifact.contentType, formatBytes(artifact.sizeBytes)]
+      .filter(Boolean)
+      .join(" · ") || artifact.kind;
 
   const download = () => {
     if (!payload) {
@@ -237,7 +300,7 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
     }
     const blob = new Blob([payload.bytes], { type: payload.contentType });
     const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
+    const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = artifact.downloadFilename || artifact.filename || title;
     document.body.appendChild(anchor);
@@ -250,7 +313,9 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
     <div className="overflow-hidden rounded-[18px] border border-border bg-surface shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
       <div className="flex items-center justify-between gap-4 border-b border-border px-4 py-3">
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-text">{title}</div>
+          <div className="truncate text-sm font-semibold text-text">
+            {title}
+          </div>
           <div className="mt-0.5 text-xs text-text-muted">{subtitle}</div>
         </div>
         <button
@@ -263,7 +328,7 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
           Download
         </button>
       </div>
-      {payload?.previewKind === 'image' ? (
+      {payload?.previewKind === "image" ? (
         <div className="bg-white p-4">
           {/* Artifact previews may be data URLs generated at runtime, so next/image cannot optimize them. */}
           {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -273,15 +338,15 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
             className="max-h-[560px] w-full object-contain"
           />
         </div>
-      ) : payload?.previewKind === 'text' ? (
+      ) : payload?.previewKind === "text" ? (
         <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap bg-[#0d1117] p-4 font-mono text-sm leading-6 text-[#e6edf3]">
           {payload.previewText}
         </pre>
       ) : (
         <div className="px-4 py-5 text-sm text-text-muted">
           {payload
-            ? 'Preview is not available for this artifact type. Use Download to open the file.'
-            : 'Artifact payload is not available in this message.'}
+            ? "Preview is not available for this artifact type. Use Download to open the file."
+            : "Artifact payload is not available in this message."}
         </div>
       )}
     </div>
@@ -291,7 +356,7 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
 type ArtifactPayload = {
   bytes: BlobPart;
   contentType: string;
-  previewKind: 'image' | 'text' | 'none';
+  previewKind: "image" | "text" | "none";
   previewUrl?: string;
   previewText?: string;
 };
@@ -303,28 +368,43 @@ function buildArtifactPayload(
   if (!content) {
     return null;
   }
-  const contentType = artifact.contentType || stringValue(content.content_type) || 'application/octet-stream';
+  const contentType =
+    artifact.contentType ||
+    stringValue(content.content_type) ||
+    "application/octet-stream";
   const encoding = stringValue(content.encoding);
   const data = stringValue(content.data);
 
-  if (encoding === 'base64' && data) {
+  if (encoding === "base64" && data) {
     const bytes = bytesFromBase64(data);
     return {
       bytes,
       contentType,
-      previewKind: contentType.startsWith('image/') ? 'image' : 'none',
-      previewUrl: contentType.startsWith('image/') ? `data:${contentType};base64,${data}` : undefined,
+      previewKind: contentType.startsWith("image/") ? "image" : "none",
+      previewUrl: contentType.startsWith("image/")
+        ? `data:${contentType};base64,${data}`
+        : undefined,
     };
   }
 
-  if (encoding === 'utf-8' && typeof data === 'string') {
-    const previewKind = contentType.startsWith('image/svg+xml') ? 'image' : (isTextPreviewType(contentType) ? 'text' : 'none');
+  if (encoding === "utf-8" && typeof data === "string") {
+    const previewKind = contentType.startsWith("image/svg+xml")
+      ? "image"
+      : isTextPreviewType(contentType)
+        ? "text"
+        : "none";
     return {
       bytes: data,
-      contentType: contentType.startsWith('text/') ? `${contentType};charset=utf-8` : contentType,
+      contentType: contentType.startsWith("text/")
+        ? `${contentType};charset=utf-8`
+        : contentType,
       previewKind,
-      previewUrl: previewKind === 'image' ? `data:${contentType};charset=utf-8,${encodeURIComponent(data)}` : undefined,
-      previewText: previewKind === 'text' ? truncateArtifactPreview(data) : undefined,
+      previewUrl:
+        previewKind === "image"
+          ? `data:${contentType};charset=utf-8,${encodeURIComponent(data)}`
+          : undefined,
+      previewText:
+        previewKind === "text" ? truncateArtifactPreview(data) : undefined,
     };
   }
 
@@ -332,8 +412,8 @@ function buildArtifactPayload(
   if (legacySvg) {
     return {
       bytes: legacySvg,
-      contentType: 'image/svg+xml;charset=utf-8',
-      previewKind: 'image',
+      contentType: "image/svg+xml;charset=utf-8",
+      previewKind: "image",
       previewUrl: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(legacySvg)}`,
     };
   }
@@ -342,7 +422,7 @@ function buildArtifactPayload(
 }
 
 function stringValue(value: unknown) {
-  return typeof value === 'string' && value.length > 0 ? value : null;
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function bytesFromBase64(value: string) {
@@ -355,12 +435,14 @@ function bytesFromBase64(value: string) {
 }
 
 function isTextPreviewType(contentType: string) {
-  return contentType.startsWith('text/')
-    || contentType === 'application/json'
-    || contentType === 'application/x-ndjson'
-    || contentType === 'application/yaml'
-    || contentType === 'application/toml'
-    || contentType === 'application/xml';
+  return (
+    contentType.startsWith("text/") ||
+    contentType === "application/json" ||
+    contentType === "application/x-ndjson" ||
+    contentType === "application/yaml" ||
+    contentType === "application/toml" ||
+    contentType === "application/xml"
+  );
 }
 
 function truncateArtifactPreview(value: string) {
@@ -380,12 +462,23 @@ function formatBytes(value?: number | null) {
   return `${(value / 1024 / 1024).toFixed(1)} MiB`;
 }
 
-function ReasoningPanel({ reasoning, streaming }: { reasoning: string; streaming: boolean }) {
+function ReasoningPanel({
+  reasoning,
+  streaming,
+}: {
+  reasoning: string;
+  streaming: boolean;
+}) {
   const [open, setOpen] = useState(streaming);
   const userToggledRef = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const summary = streaming ? 'Thinking' : (reasoning.trim() ? firstLine(reasoning) : 'Done');
-  const body = reasoning.trim() || (streaming ? 'Preparing response...' : 'Done');
+  const summary = streaming
+    ? "Thinking"
+    : reasoning.trim()
+      ? firstLine(reasoning)
+      : "Done";
+  const body =
+    reasoning.trim() || (streaming ? "Preparing response..." : "Done");
   const blocks = splitReasoningBlocks(body);
 
   useEffect(() => {
@@ -416,23 +509,31 @@ function ReasoningPanel({ reasoning, streaming }: { reasoning: string; streaming
           <Loader className="size-4 shrink-0 animate-spin text-warning" />
         ) : null}
         <span className="truncate">{summary}</span>
-        <ChevronDown className={cn('size-4 shrink-0 transition-transform duration-200', open && 'rotate-180')} />
+        <ChevronDown
+          className={cn(
+            "size-4 shrink-0 transition-transform duration-200",
+            open && "rotate-180",
+          )}
+        />
       </button>
       <span className="sr-only" role="status" aria-live="polite">
-        {streaming ? 'Astra is thinking' : 'Astra finished thinking'}
+        {streaming ? "Astra is thinking" : "Astra finished thinking"}
       </span>
       <div
         className={cn(
-          'grid transition-[grid-template-rows] duration-300 ease-out',
-          open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
+          "grid transition-[grid-template-rows] duration-300 ease-out",
+          open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
         )}
       >
         <div className="min-w-0 overflow-hidden">
           <div
             ref={bodyRef}
             className={cn(
-              'mt-3 pr-2',
-              open && (streaming ? 'max-h-56 overflow-y-auto' : 'max-h-[360px] overflow-y-auto'),
+              "mt-3 pr-2",
+              open &&
+                (streaming
+                  ? "max-h-56 overflow-y-auto"
+                  : "max-h-[360px] overflow-y-auto"),
             )}
           >
             <div className="space-y-0">
@@ -446,9 +547,14 @@ function ReasoningPanel({ reasoning, streaming }: { reasoning: string; streaming
               {!streaming ? (
                 <div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3">
                   <div className="flex justify-center">
-                    <CheckCircle2 className="mt-0.5 size-5 text-text-muted" strokeWidth={1.8} />
+                    <CheckCircle2
+                      className="mt-0.5 size-5 text-text-muted"
+                      strokeWidth={1.8}
+                    />
                   </div>
-                  <div className="pb-1 text-[16px] leading-6 text-text-secondary">Done</div>
+                  <div className="pb-1 text-[16px] leading-6 text-text-secondary">
+                    Done
+                  </div>
                 </div>
               ) : null}
             </div>
@@ -459,7 +565,13 @@ function ReasoningPanel({ reasoning, streaming }: { reasoning: string; streaming
   );
 }
 
-function ReasoningStep({ content, isLast }: { content: string; isLast: boolean }) {
+function ReasoningStep({
+  content,
+  isLast,
+}: {
+  content: string;
+  isLast: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const shouldClamp = content.length > 520 || content.split(/\r?\n/).length > 7;
 
@@ -472,8 +584,8 @@ function ReasoningStep({ content, isLast }: { content: string; isLast: boolean }
       <div className="min-w-0 pb-5">
         <div
           className={cn(
-            'relative min-w-0 overflow-hidden',
-            shouldClamp && !expanded && 'max-h-[8.25rem]',
+            "relative min-w-0 overflow-hidden",
+            shouldClamp && !expanded && "max-h-[8.25rem]",
           )}
         >
           <ReasoningMarkdown content={content} />
@@ -487,7 +599,7 @@ function ReasoningStep({ content, isLast }: { content: string; isLast: boolean }
             onClick={() => setExpanded((value) => !value)}
             className="mt-1 text-[14px] leading-5 text-text-muted transition-colors hover:text-text-secondary"
           >
-            {expanded ? 'Show less' : 'Show more'}
+            {expanded ? "Show less" : "Show more"}
           </button>
         ) : null}
       </div>
@@ -509,9 +621,20 @@ function ReasoningMarkdown({ content }: { content: string }) {
   );
 }
 
-function MarkdownContent({ content, muted }: { content: string; muted?: boolean }) {
+function MarkdownContent({
+  content,
+  muted,
+}: {
+  content: string;
+  muted?: boolean;
+}) {
   return (
-    <div className={cn('astra-markdown', muted && 'text-text-secondary [&_*]:text-inherit')}>
+    <div
+      className={cn(
+        "astra-markdown",
+        muted && "text-text-secondary [&_*]:text-inherit",
+      )}
+    >
       <ReactMarkdown
         remarkPlugins={markdownRemarkPlugins}
         rehypePlugins={markdownRehypePlugins}
@@ -537,19 +660,21 @@ function isLikelyOrphanStreamingReasoning(text: string) {
   if (value.length < 12) {
     return false;
   }
-  return /^(The user\b|User\b|They(?:'re| are)\b|This is\b|I (?:need|should|will|can|must|want|have to|am going)\b|We need\b|Need to\b|Let me\b|Let's\b)/i.test(value);
+  return /^(The user\b|User\b|They(?:'re| are)\b|This is\b|I (?:need|should|will|can|must|want|have to|am going)\b|We need\b|Need to\b|Let me\b|Let's\b)/i.test(
+    value,
+  );
 }
 
 function firstLine(text: string) {
   const line = text.trim().split(/\r?\n/).find(Boolean);
   if (!line) {
-    return 'Done';
+    return "Done";
   }
   return line.length > 56 ? `${line.slice(0, 53)}...` : line;
 }
 
 function splitReasoningBlocks(text: string) {
-  const normalized = text.trim().replace(/\n{3,}/g, '\n\n');
+  const normalized = text.trim().replace(/\n{3,}/g, "\n\n");
   if (!normalized) {
     return [];
   }
@@ -561,11 +686,12 @@ function splitReasoningBlocks(text: string) {
     return paragraphBlocks;
   }
 
-  const sentenceParts = normalized.match(/[^.!?。！？]+[.!?。！？]?/g)
+  const sentenceParts = normalized
+    .match(/[^.!?。！？]+[.!?。！？]?/g)
     ?.map((part) => part.trim())
     .filter(Boolean) ?? [normalized];
   const blocks: string[] = [];
-  let current = '';
+  let current = "";
   for (const part of sentenceParts) {
     if (current && `${current} ${part}`.length > 560) {
       blocks.push(current);

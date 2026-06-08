@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   StaleDeferredRunError,
-  getChat,
+  getChatHydrated,
   queueDeferredRunInput,
 } from "@/lib/api/web-store";
 import type { SendMessageRequest } from "@/lib/api/types";
@@ -31,7 +31,7 @@ export async function POST(
     );
   }
 
-  const chat = getChat(auth.user.user_id, chatId);
+  const chat = await getChatHydrated(auth.user.user_id, chatId);
   if (!chat) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }

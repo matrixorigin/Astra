@@ -3,7 +3,14 @@
 import { MoreVertical } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { ChatActionsMenu } from "@/components/app/chat-actions-menu";
 import { ChatDotNavigator } from "@/components/app/chat-dot-navigator";
 import { Composer } from "@/components/app/composer";
@@ -32,6 +39,7 @@ import {
   isChatScrolledToBottom,
   shouldAutoScrollChat,
 } from "@/lib/chat-scroll-state";
+import { useToast } from "@/components/ui/toast";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
@@ -40,13 +48,76 @@ function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-function hasCompletedAssistantMessage(detail: ChatDetail) {
-  return detail.messages.some(
-    (message) =>
+function hasCompletedAssistantAfterUser(
+  detail: ChatDetail,
+  userMessageId: string,
+) {
+  const userIndex = detail.messages.findIndex((m) => m.id === userMessageId);
+  if (userIndex === -1) return false;
+  for (let i = userIndex + 1; i < detail.messages.length; i++) {
+    const message = detail.messages[i];
+    if (
       message.role === "assistant" &&
       message.status !== "streaming" &&
-      message.content.trim(),
-  );
+      message.content.trim()
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function createAssistantPatchController(params: {
+  setDetail: Dispatch<SetStateAction<ChatDetail>>;
+  getAssistantId: () => string;
+}) {
+  let framePatch: Partial<ChatMessage> | null = null;
+  let frameRaf: number | null = null;
+
+  const applyPatch = (assistantId: string, patch: Partial<ChatMessage>) => {
+    params.setDetail((current) => ({
+      ...current,
+      messages: current.messages.map((message) =>
+        message.id === assistantId ? { ...message, ...patch } : message,
+      ),
+    }));
+  };
+
+  const flush = () => {
+    const patch = framePatch;
+    const assistantId = params.getAssistantId();
+    framePatch = null;
+    frameRaf = null;
+    if (patch) {
+      applyPatch(assistantId, patch);
+    }
+  };
+
+  return {
+    patchNow(patch: Partial<ChatMessage>) {
+      applyPatch(params.getAssistantId(), patch);
+    },
+    patchBatched(patch: Partial<ChatMessage>) {
+      framePatch = { ...framePatch, ...patch };
+      if (frameRaf === null) {
+        frameRaf = requestAnimationFrame(flush);
+      }
+    },
+    flushNow() {
+      if (frameRaf !== null) {
+        cancelAnimationFrame(frameRaf);
+        frameRaf = null;
+      }
+      flush();
+    },
+    cancel() {
+      if (frameRaf !== null) {
+        cancelAnimationFrame(frameRaf);
+        frameRaf = null;
+      }
+      framePatch = null;
+    },
+  };
 }
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
@@ -61,8 +132,21 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const reconcileTimerRef = useRef<number | undefined>(undefined);
+  const reconcileIntervalRef = useRef<number | undefined>(undefined);
+  const stopReconcileRef = useRef<() => void>(() => {
+    if (reconcileTimerRef.current) {
+      window.clearTimeout(reconcileTimerRef.current);
+      reconcileTimerRef.current = undefined;
+    }
+    if (reconcileIntervalRef.current) {
+      window.clearInterval(reconcileIntervalRef.current);
+      reconcileIntervalRef.current = undefined;
+    }
+  });
   const runControlMutationRef = useRef(false);
   const lifecycle = useChatLifecycleActions({ onChatUpdated: setDetail });
+  const { addToast } = useToast();
 
   const latestMessage = detail.messages[detail.messages.length - 1];
   const isArchived = Boolean(detail.chat.archivedAt);
@@ -139,36 +223,28 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         reasoningStatus: "streaming",
       };
 
-      const patchAssistant = (patch: Partial<ChatMessage>) => {
-        const targetAssistantId = currentAssistantId;
-        setDetail((current) => ({
-          ...current,
-          messages: current.messages.map((message) =>
-            message.id === targetAssistantId
-              ? { ...message, ...patch }
-              : message,
-          ),
-        }));
-      };
+      const assistantPatcher = createAssistantPatchController({
+        setDetail,
+        getAssistantId: () => currentAssistantId,
+      });
       let recoveredFromHydration = false;
-      let reconcileTimer: number | undefined;
-      let reconcileInterval: number | undefined;
+      const canReconcilePersistedTranscript = Boolean(pendingMessageId);
       const stopReconcile = () => {
-        if (reconcileTimer) {
-          window.clearTimeout(reconcileTimer);
-          reconcileTimer = undefined;
-        }
-        if (reconcileInterval) {
-          window.clearInterval(reconcileInterval);
-          reconcileInterval = undefined;
-        }
+        reconcileTimerRef.current = undefined;
+        reconcileIntervalRef.current = undefined;
+        stopReconcileRef.current();
       };
       const reconcilePersistedTranscript = async () => {
-        if (recoveredFromHydration) {
+        if (!canReconcilePersistedTranscript || recoveredFromHydration) {
           return;
         }
+        // The SSE proxy writes to the web-store asynchronously; an early poll
+        // can observe stale data, so the interval below retries until hydrated.
         const refreshed = await getChat(detail.chat.id).catch(() => null);
-        if (!refreshed || !hasCompletedAssistantMessage(refreshed)) {
+        if (
+          !refreshed ||
+          !hasCompletedAssistantAfterUser(refreshed, pendingMessageId!)
+        ) {
           return;
         }
         recoveredFromHydration = true;
@@ -178,12 +254,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         setDetail(refreshed);
         streamAbortRef.current?.abort();
       };
-      reconcileTimer = window.setTimeout(() => {
-        void reconcilePersistedTranscript();
-        reconcileInterval = window.setInterval(() => {
+      if (canReconcilePersistedTranscript) {
+        reconcileTimerRef.current = window.setTimeout(() => {
           void reconcilePersistedTranscript();
-        }, STREAM_RECONCILE_INTERVAL_MS);
-      }, STREAM_RECONCILE_INITIAL_DELAY_MS);
+          reconcileIntervalRef.current = window.setInterval(() => {
+            void reconcilePersistedTranscript();
+          }, STREAM_RECONCILE_INTERVAL_MS);
+        }, STREAM_RECONCILE_INITIAL_DELAY_MS);
+      }
 
       setStartingRun(true);
       setDetail((current) => ({
@@ -297,32 +375,33 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               }));
             },
             onReasoning: (reasoning) => {
-              patchAssistant({
+              assistantPatcher.patchBatched({
                 reasoning,
                 reasoningStatus: "streaming",
                 status: "streaming",
               });
             },
             onReasoningDone: (reasoning) => {
-              patchAssistant({
+              assistantPatcher.patchBatched({
                 reasoning,
                 reasoningStatus: "complete",
                 status: "streaming",
               });
             },
             onText: (content) => {
-              patchAssistant({ content, status: "streaming" });
+              assistantPatcher.patchBatched({ content, status: "streaming" });
             },
             onArtifacts: (artifacts) => {
-              patchAssistant({ artifacts });
+              assistantPatcher.patchBatched({ artifacts });
             },
             onDone: (content) => {
+              assistantPatcher.flushNow();
               setStartingRun(false);
               setDetail((current) => ({
                 ...current,
                 activeRun: undefined,
               }));
-              patchAssistant({
+              assistantPatcher.patchNow({
                 content:
                   content ||
                   "Astra completed the run without returning visible text.",
@@ -331,20 +410,22 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               });
             },
             onCancelled: (content) => {
+              assistantPatcher.flushNow();
               setStoppingRun(false);
               setStartingRun(false);
               setDetail((current) => ({
                 ...current,
                 activeRun: undefined,
               }));
-              patchAssistant({
+              assistantPatcher.patchNow({
                 content: content || "Stopped.",
                 reasoningStatus: "complete",
                 status: "complete",
               });
             },
             onPaused: (content) => {
-              patchAssistant({
+              assistantPatcher.flushNow();
+              assistantPatcher.patchNow({
                 content,
                 status: "streaming",
               });
@@ -377,11 +458,12 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         }
         const message =
           error instanceof Error ? error.message : "Astra stream failed.";
-        patchAssistant({
+        assistantPatcher.patchNow({
           content: `I could not reach the Astra runtime from the web UI. (${message})`,
           status: "failed",
         });
       } finally {
+        assistantPatcher.cancel();
         stopReconcile();
         setStartingRun(false);
       }
@@ -420,25 +502,22 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             result.userMessage,
             {
               id: assistantMessageId,
-              role: "assistant",
+              role: "assistant" as const,
               content: "",
               createdAt: new Date().toISOString(),
-              status: "streaming",
+              status: "streaming" as const,
               reasoning: "",
-              reasoningStatus: "streaming",
+              reasoningStatus: "streaming" as const,
             },
-          ],
+          ].sort(
+            (a, b) =>
+              new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+          ),
         }));
-        const patchAssistant = (patch: Partial<ChatMessage>) => {
-          setDetail((current) => ({
-            ...current,
-            messages: current.messages.map((message) =>
-              message.id === assistantMessageId
-                ? { ...message, ...patch }
-                : message,
-            ),
-          }));
-        };
+        const assistantPatcher = createAssistantPatchController({
+          setDetail,
+          getAssistantId: () => assistantMessageId,
+        });
         void streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
           signal: nextStreamAbortSignal(),
           onRunUpdated: (run) => {
@@ -459,31 +538,32 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             }));
           },
           onReasoning: (reasoning) => {
-            patchAssistant({
+            assistantPatcher.patchBatched({
               reasoning,
               reasoningStatus: "streaming",
               status: "streaming",
             });
           },
           onReasoningDone: (reasoning) => {
-            patchAssistant({
+            assistantPatcher.patchBatched({
               reasoning,
               reasoningStatus: "complete",
               status: "streaming",
             });
           },
           onText: (content) => {
-            patchAssistant({ content, status: "streaming" });
+            assistantPatcher.patchBatched({ content, status: "streaming" });
           },
           onArtifacts: (artifacts) => {
-            patchAssistant({ artifacts });
+            assistantPatcher.patchBatched({ artifacts });
           },
           onDone: (content) => {
+            assistantPatcher.flushNow();
             setDetail((current) => ({
               ...current,
               activeRun: undefined,
             }));
-            patchAssistant({
+            assistantPatcher.patchNow({
               content:
                 content ||
                 "Astra completed the run without returning visible text.",
@@ -492,44 +572,50 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             });
           },
           onCancelled: (content) => {
+            assistantPatcher.flushNow();
             setDetail((current) => ({
               ...current,
               activeRun: undefined,
             }));
-            patchAssistant({
+            assistantPatcher.patchNow({
               content: content || "Stopped.",
               reasoningStatus: "complete",
               status: "complete",
             });
           },
           onPaused: (content) => {
-            patchAssistant({
+            assistantPatcher.flushNow();
+            assistantPatcher.patchNow({
               content,
               status: "streaming",
             });
           },
-        }).catch((streamError: unknown) => {
-          if (isAbortError(streamError)) {
-            return;
-          }
-          if (isAuthRequiredError(streamError)) {
-            router.push(
-              `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-            );
-            return;
-          }
-          if (isNotFoundError(streamError)) {
-            router.replace(chatListHref);
-            return;
-          }
-          patchAssistant({
-            content:
-              streamError instanceof Error
-                ? `The input was queued, but the web UI could not reconnect to the run stream. (${streamError.message})`
-                : "The input was queued, but the web UI could not reconnect to the run stream.",
-            status: "failed",
+        })
+          .catch((streamError: unknown) => {
+            if (isAbortError(streamError)) {
+              return;
+            }
+            if (isAuthRequiredError(streamError)) {
+              router.push(
+                `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
+              );
+              return;
+            }
+            if (isNotFoundError(streamError)) {
+              router.replace(chatListHref);
+              return;
+            }
+            assistantPatcher.patchNow({
+              content:
+                streamError instanceof Error
+                  ? `The input was queued, but the web UI could not reconnect to the run stream. (${streamError.message})`
+                  : "The input was queued, but the web UI could not reconnect to the run stream.",
+              status: "failed",
+            });
+          })
+          .finally(() => {
+            assistantPatcher.cancel();
           });
-        });
       } catch (error) {
         if (isAuthRequiredError(error)) {
           router.push(
@@ -551,10 +637,11 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             }
           }
         }
-        window.alert(
+        addToast(
           error instanceof Error
             ? error.message
             : "Failed to queue input for the active run.",
+          "error",
         );
       } finally {
         runControlMutationRef.current = false;
@@ -562,6 +649,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       }
     },
     [
+      addToast,
       chatListHref,
       detail.chat.archivedAt,
       detail.chat.id,
@@ -597,16 +685,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         router.replace(chatListHref);
         return;
       }
-      window.alert(
+      addToast(
         error instanceof Error
           ? error.message
           : "Failed to stop the active run.",
+        "error",
       );
     } finally {
       runControlMutationRef.current = false;
       setStoppingRun(false);
     }
   }, [
+    addToast,
     canStopRun,
     chatListHref,
     detail.activeRun?.runId,
@@ -655,16 +745,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                 },
               ],
       }));
-      const patchAssistant = (patch: Partial<ChatMessage>) => {
-        setDetail((current) => ({
-          ...current,
-          messages: current.messages.map((message) =>
-            message.id === assistantMessageId
-              ? { ...message, ...patch }
-              : message,
-          ),
-        }));
-      };
+      const assistantPatcher = createAssistantPatchController({
+        setDetail,
+        getAssistantId: () => assistantMessageId,
+      });
       try {
         await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
           signal: nextStreamAbortSignal(),
@@ -686,31 +770,32 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             }));
           },
           onReasoning: (reasoning) => {
-            patchAssistant({
+            assistantPatcher.patchBatched({
               reasoning,
               reasoningStatus: "streaming",
               status: "streaming",
             });
           },
           onReasoningDone: (reasoning) => {
-            patchAssistant({
+            assistantPatcher.patchBatched({
               reasoning,
               reasoningStatus: "complete",
               status: "streaming",
             });
           },
           onText: (content) => {
-            patchAssistant({ content, status: "streaming" });
+            assistantPatcher.patchBatched({ content, status: "streaming" });
           },
           onArtifacts: (artifacts) => {
-            patchAssistant({ artifacts });
+            assistantPatcher.patchBatched({ artifacts });
           },
           onDone: (content) => {
+            assistantPatcher.flushNow();
             setDetail((current) => ({
               ...current,
               activeRun: undefined,
             }));
-            patchAssistant({
+            assistantPatcher.patchNow({
               content:
                 content ||
                 "Astra completed the run without returning visible text.",
@@ -719,18 +804,20 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             });
           },
           onCancelled: (content) => {
+            assistantPatcher.flushNow();
             setDetail((current) => ({
               ...current,
               activeRun: undefined,
             }));
-            patchAssistant({
+            assistantPatcher.patchNow({
               content: content || "Stopped.",
               reasoningStatus: "complete",
               status: "complete",
             });
           },
           onPaused: (content) => {
-            patchAssistant({
+            assistantPatcher.flushNow();
+            assistantPatcher.patchNow({
               content,
               status: "streaming",
             });
@@ -757,11 +844,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           // Keep the local running state if refresh also fails; the alert still
           // tells the user that stream reconnection did not attach.
         }
-        window.alert(
+        addToast(
           streamError instanceof Error
             ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
             : "The run resumed, but the web UI could not reconnect to its stream.",
+          "warning",
         );
+      } finally {
+        assistantPatcher.cancel();
       }
     } catch (error) {
       if (isAbortError(error)) {
@@ -777,16 +867,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         router.replace(chatListHref);
         return;
       }
-      window.alert(
+      addToast(
         error instanceof Error
           ? error.message
           : "Failed to resume the paused run.",
+        "error",
       );
     } finally {
       runControlMutationRef.current = false;
       setResumingRun(false);
     }
   }, [
+    addToast,
     canResumeRun,
     chatListHref,
     detail.activeRun?.runId,
@@ -799,6 +891,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   useEffect(
     () => () => {
       streamAbortRef.current?.abort();
+      stopReconcileRef.current();
     },
     [],
   );
@@ -888,14 +981,15 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         void getChat(detail.chat.id)
           .then(setDetail)
           .catch((error: unknown) => {
-            window.alert(
+            addToast(
               error instanceof Error
                 ? error.message
                 : "Failed to refresh chat state.",
+              "error",
             );
           });
       }),
-    [chatListHref, detail.chat.id, isArchived, router],
+    [addToast, chatListHref, detail.chat.id, isArchived, router],
   );
 
   return (
