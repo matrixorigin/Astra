@@ -8,13 +8,13 @@
 //! With ETA: `  ⬢ [subtask] Label              3s/~45s ⣾`
 
 use super::{
-    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
-    term_width,
+    clear_stderr_line, interruptible_sleep, paint_unified_line, term_width, truncate_label,
+    ICON_RUNNING, SPINNER_FRAMES,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Animated spinner for background plan execution.
 ///
@@ -45,7 +45,7 @@ impl PlanActivitySpinner {
             };
         }
 
-        let tag = truncate_tag(subtask_tag, 16);
+        let tag = truncate_label(subtask_tag, 16);
         let full_label = format!("[{tag}] {label}");
         let t0 = std::time::Instant::now();
         let w = term_width();
@@ -106,18 +106,4 @@ impl Drop for PlanActivitySpinner {
         }
         clear_stderr_line();
     }
-}
-
-/// Truncate a subtask tag to fit in the spinner line.
-fn truncate_tag(s: &str, max_chars: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= max_chars {
-        return t.to_string();
-    }
-    format!(
-        "{}…",
-        t.chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>()
-    )
 }

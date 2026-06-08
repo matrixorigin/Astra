@@ -47,7 +47,7 @@ impl SkillInstallStatusSurface<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SkillInstallStatusKind, skill_install_status_kind, skill_install_status_surface};
+    use super::{skill_install_status_kind, skill_install_status_surface, SkillInstallStatusKind};
 
     #[test]
     fn skill_install_status_helpers_classify_known_statuses() {

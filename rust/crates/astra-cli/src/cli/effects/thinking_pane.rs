@@ -3,7 +3,7 @@
 //! Shows reasoning/thinking content in a viewport that grows until a cap,
 //! then folds away old lines with a "hidden lines above" header.
 
-use crate::cli::terminal_region::{TerminalRegion, char_display_width};
+use crate::cli::terminal_region::{char_display_width, TerminalRegion};
 use crossterm::style::Stylize;
 use std::time::Instant;
 
@@ -218,7 +218,7 @@ fn buffer_to_visual_lines(buffer: &str, w: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThinkingPreviewPane, buffer_to_visual_lines, wrap_line_to_width};
+    use super::{buffer_to_visual_lines, wrap_line_to_width, ThinkingPreviewPane};
 
     #[test]
     fn test_wrap_line_to_width() {

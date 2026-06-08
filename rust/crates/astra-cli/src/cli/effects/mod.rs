@@ -31,7 +31,7 @@ mod ttft_spinner;
 pub use plan_spinner::PlanActivitySpinner;
 pub use prep_spinner::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
 pub use spinner::Spinner;
-pub use thinking_pane::{ThinkingPreviewPane, thinking_viewport_rows};
+pub use thinking_pane::{thinking_viewport_rows, ThinkingPreviewPane};
 pub use tool_spinner::{ToolRegionState, ToolRunningLineSpinner, ToolStdoutLineAnim};
 pub use ttft_spinner::TtftWaitLineSpinner;
 
@@ -130,6 +130,20 @@ pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char,
 
 /// Standard icon for running operations (tool calls, system states).
 pub const ICON_RUNNING: &str = "○";
+
+/// Truncate a label string, adding ellipsis if it exceeds max_chars.
+pub(crate) fn truncate_label(s: &str, max_chars: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    format!(
+        "{}…",
+        t.chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+    )
+}
 
 /// Which kind of spinner is shown in the single "thinking" stderr slot.
 pub enum ThinkingSpinnerKind {

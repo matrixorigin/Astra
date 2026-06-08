@@ -57,7 +57,7 @@ impl SessionWorkspaceStatusSurface<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionWorkspaceStatusKind, session_workspace_status_kind, session_workspace_status_surface,
+        session_workspace_status_kind, session_workspace_status_surface, SessionWorkspaceStatusKind,
     };
 
     #[test]

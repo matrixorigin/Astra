@@ -4,8 +4,8 @@
 //! - [`ChatTurnPrepLineGuard`]: RAII guard for chat request preparation
 
 use super::{
-    ICON_RUNNING, SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, interruptible_sleep, paint_unified_line,
-    term_width,
+    interruptible_sleep, paint_unified_line, term_width, ICON_RUNNING, SPINNER_FRAMES,
+    SPINNER_SHOW_DELAY_MS,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal, Write};
@@ -49,42 +49,14 @@ impl Drop for ChatTurnPrepLineGuard {
 }
 
 impl PlanAssembleLineSpinner {
-    /// Start with current time as origin.
-    #[allow(dead_code)]
-    pub fn start() -> Self {
-        Self::start_with_origin(std::time::Instant::now())
-    }
-
-    /// Start with a specific origin time for elapsed seconds.
-    #[allow(dead_code)]
-    pub fn start_with_origin(origin: std::time::Instant) -> Self {
-        Self::start_with_origin_release(origin, None)
-    }
-
-    /// Like [`Self::start_with_origin`], but when `line_release` becomes true,
-    /// the thread clears the status line and exits.
-    pub fn start_with_origin_release(
-        origin: std::time::Instant,
-        line_release: Option<Arc<AtomicBool>>,
-    ) -> Self {
-        Self::start_with_origin_release_kind(
-            origin,
-            line_release,
-            SecStatusLineKind::PlanAssemble,
-            None,
-        )
-    }
-
     /// Normal chat: payload + HTTP until response headers.
     ///
     /// `phase` is updated by the payload builder so the line shows *what* is running.
     pub fn start_chat_request_prep_line(phase: ChatPrepPhaseLabel) -> Self {
-        Self::start_with_origin_release_kind(
-            std::time::Instant::now(),
-            None,
-            SecStatusLineKind::ChatRequestPrep,
-            Some(phase),
-        )
+        let origin = std::time::Instant::now();
+        let kind = SecStatusLineKind::ChatRequestPrep;
+        let chat_prep_phase = Some(phase);
+        Self::start_with_origin_release_kind(origin, None, kind, chat_prep_phase)
     }
 
     fn start_with_origin_release_kind(

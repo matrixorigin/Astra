@@ -4,13 +4,13 @@
 //! Format: `  ⬢ Waiting for model                 3s ⣾`
 
 use super::{
-    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
-    term_width,
+    clear_stderr_line, interruptible_sleep, paint_unified_line, term_width, ICON_RUNNING,
+    SPINNER_FRAMES,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Pre-TTFT wait spinner on stderr.
 ///

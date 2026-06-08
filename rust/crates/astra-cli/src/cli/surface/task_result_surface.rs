@@ -313,9 +313,9 @@ pub(crate) fn render_task_result_header_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskResultArtifactSurface, load_task_result_read_surface, task_result_effective_error_kind,
-        task_result_header_fields, task_result_header_surface, task_result_json_payload,
-        task_result_lookup_exit_code, task_result_missing_text,
+        load_task_result_read_surface, task_result_effective_error_kind, task_result_header_fields,
+        task_result_header_surface, task_result_json_payload, task_result_lookup_exit_code,
+        task_result_missing_text, TaskResultArtifactSurface,
     };
     use astra_services::{TaskCheckpoint, TaskOutcome, TaskRecord, TaskStatus};
 

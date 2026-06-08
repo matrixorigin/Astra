@@ -3,13 +3,13 @@
 //! Format: `  ⬢ Thinking                          3s ⣾`
 
 use super::{
-    ICON_RUNNING, SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, clear_stderr_line, interruptible_sleep,
-    paint_unified_line, term_width,
+    clear_stderr_line, interruptible_sleep, paint_unified_line, term_width, ICON_RUNNING,
+    SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// A spinner that runs in a background thread.
 ///

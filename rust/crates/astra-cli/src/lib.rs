@@ -26,7 +26,6 @@
 )]
 
 // ═══════════════════════════ Top-level utility modules ═══════════════════
-pub mod delta_log;
 pub mod diff_utils;
 pub mod edge_tools;
 pub mod explain_dag;

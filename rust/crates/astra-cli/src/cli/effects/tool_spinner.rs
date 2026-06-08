@@ -5,8 +5,8 @@
 //! - [`ToolStdoutLineAnim`]: stdout animation via TerminalRegion for raw mode
 
 use super::{
-    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
-    term_width,
+    clear_stderr_line, interruptible_sleep, paint_unified_line, term_width, truncate_label,
+    ICON_RUNNING, SPINNER_FRAMES,
 };
 use crate::cli::terminal_region::TerminalRegion;
 use crossterm::style::Stylize;
@@ -54,13 +54,9 @@ impl ToolRunningLineSpinner {
             Some((cur, total)) if total > 1 => {
                 let prefix = format!("[{}/{}] ", cur, total);
                 let remaining = w.saturating_sub(16 + prefix.len()).max(20);
-                format!(
-                    "{}{}",
-                    prefix,
-                    truncate_cli_status_detail(&description, remaining)
-                )
+                format!("{}{}", prefix, truncate_label(&description, remaining))
             }
-            _ => truncate_cli_status_detail(&description, w.saturating_sub(16).max(30)),
+            _ => truncate_label(&description, w.saturating_sub(16).max(30)),
         };
         let t0 = Instant::now();
         let icon = format!("{}", ICON_RUNNING.magenta());
@@ -184,18 +180,4 @@ impl Drop for ToolStdoutLineAnim {
             let _ = h.join();
         }
     }
-}
-
-/// Truncate a CLI status detail string, adding ellipsis if needed.
-fn truncate_cli_status_detail(s: &str, max_chars: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= max_chars {
-        return t.to_string();
-    }
-    format!(
-        "{}…",
-        t.chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>()
-    )
 }
