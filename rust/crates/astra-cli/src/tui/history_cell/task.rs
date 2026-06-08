@@ -298,13 +298,33 @@ impl HistoryCell for TaskCell {
                             + if meta.is_some() { 3 } else { 0 },
                     ),
                 );
+                let theme = crate::tui::theme::current();
                 let mut spans = vec![
                     Span::styled(connector.to_string(), dim),
                     Span::styled(name, name_style),
                 ];
                 if !desc.is_empty() {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::raw(desc));
+                    // Apply semantic styling based on tool type.
+                    if child.name == "bash" {
+                        if let Some(cmd) = desc.strip_prefix("$ ") {
+                            spans.push(Span::styled("$ ", dim));
+                            spans.push(Span::styled(cmd.to_string(), theme.command_style()));
+                        } else {
+                            spans.push(Span::styled(desc.to_string(), theme.command_style()));
+                        }
+                    } else if matches!(
+                        child.name.as_str(),
+                        "read" | "read_file" | "write_file" | "grep" | "glob" | "list_dir"
+                    ) && desc.contains('/')
+                    {
+                        spans.extend(crate::tui::path_style::style_file_path_flat(
+                            &desc,
+                            Style::default(),
+                        ));
+                    } else {
+                        spans.push(Span::raw(desc.to_string()));
+                    }
                 }
                 if let Some(meta) = meta {
                     spans.push(Span::styled(format!(" · {meta}"), dim));

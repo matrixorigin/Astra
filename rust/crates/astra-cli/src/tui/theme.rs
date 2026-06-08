@@ -16,7 +16,7 @@
 
 use std::sync::OnceLock;
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 
 use super::color::blend;
 
@@ -47,6 +47,41 @@ pub(crate) struct Theme {
     pub quote: Color,
     /// Link URL colour.
     pub link: Color,
+    /// Dimmed directory-portion of a file path (e.g. `src/tui/`).
+    pub path_dim: Color,
+    /// Bright filename-portion of a file path (e.g. `tool.rs`).
+    pub path_file: Color,
+    /// Shell command text (e.g. the `git diff` in `$ git diff --stat`).
+    pub command: Color,
+    // ── Markdown semantic slots ──────────────────────────────────────────
+    /// Heading text (h1/h2/h3).
+    pub md_heading: Color,
+    /// Inline code (e.g. `code`).
+    pub md_code: Color,
+    /// Hyperlink text.
+    pub md_link: Color,
+    /// Blockquote text (e.g. `> quote`).
+    pub md_blockquote: Color,
+    /// Ordered/unordered list markers.
+    pub md_list_marker: Color,
+    // ── Diff semantic slots ──────────────────────────────────────────────
+    /// Added line foreground (colorblind-friendly: blue-green tint).
+    pub diff_add_fg: Color,
+    /// Added line background.
+    pub diff_add_bg: Color,
+    /// Deleted line foreground (colorblind-friendly: orange-red tint).
+    pub diff_del_fg: Color,
+    /// Deleted line background.
+    pub diff_del_bg: Color,
+    /// Hunk header (@@ ... @@).
+    pub diff_hunk: Color,
+    /// Context/unchanged lines.
+    pub diff_context: Color,
+    // ── Status indicator semantic slots ──────────────────────────────────
+    /// Stall warning threshold color (5s).
+    pub stall_warn: Color,
+    /// Stall error threshold color (10s).
+    pub stall_error: Color,
 }
 
 impl Theme {
@@ -73,6 +108,26 @@ impl Theme {
             error: Color::Red,
             quote: Color::Green,
             link: Color::Cyan,
+            path_dim: Color::DarkGray,
+            path_file: Color::White,
+            command: Color::Cyan,
+            // Markdown: heading in soft lavender, inline code in muted
+            // lavender (distinct from command cyan), links in cyan.
+            md_heading: Color::Rgb(180, 160, 220),
+            md_code: Color::Rgb(200, 180, 220),
+            md_link: Color::Cyan,
+            md_blockquote: Color::Green,
+            md_list_marker: Color::Rgb(140, 170, 220),
+            // Diff: colorblind-friendly palette (blue-green adds, orange-red dels).
+            diff_add_fg: Color::Rgb(34, 197, 94),
+            diff_add_bg: Color::Rgb(33, 58, 43),
+            diff_del_fg: Color::Rgb(239, 68, 68),
+            diff_del_bg: Color::Rgb(74, 34, 29),
+            diff_hunk: Color::Cyan,
+            diff_context: Color::DarkGray,
+            // Status indicator: stall thresholds use warn/error colors.
+            stall_warn: Color::Yellow,
+            stall_error: Color::Red,
         }
     }
 
@@ -92,6 +147,25 @@ impl Theme {
             error: Color::Rgb(170, 34, 34),
             quote: Color::Rgb(80, 110, 80),
             link: Color::Rgb(148, 40, 148),
+            path_dim: Color::Gray,
+            path_file: Color::Black,
+            command: Color::Rgb(0, 100, 140),
+            // Markdown: deep purple heading, muted lavender code, purple link.
+            md_heading: Color::Rgb(100, 60, 140),
+            md_code: Color::Rgb(120, 80, 150),
+            md_link: Color::Rgb(148, 40, 148),
+            md_blockquote: Color::Rgb(80, 110, 80),
+            md_list_marker: Color::Rgb(70, 100, 150),
+            // Diff: GitHub-style pastels (colorblind-friendly).
+            diff_add_fg: Color::Rgb(31, 35, 40),
+            diff_add_bg: Color::Rgb(218, 251, 225),
+            diff_del_fg: Color::Rgb(31, 35, 40),
+            diff_del_bg: Color::Rgb(255, 235, 233),
+            diff_hunk: Color::Rgb(148, 40, 148),
+            diff_context: Color::Gray,
+            // Status indicator: stall thresholds use warn/error colors.
+            stall_warn: Color::Rgb(135, 89, 0),
+            stall_error: Color::Rgb(170, 34, 34),
         }
     }
 
@@ -115,6 +189,60 @@ impl Theme {
         };
         let (r, g, b) = blend(bg, acc, 0.6);
         Color::Rgb(r, g, b)
+    }
+
+    /// Style for the directory portion of a file path.
+    pub fn path_dim_style(&self) -> Style {
+        Style::default().fg(self.path_dim)
+    }
+
+    /// Style for the filename portion of a file path.
+    pub fn path_file_style(&self) -> Style {
+        Style::default().fg(self.path_file)
+    }
+
+    /// Style for shell command text (the body after `$ `).
+    pub fn command_style(&self) -> Style {
+        Style::default().fg(self.command)
+    }
+
+    // ── Markdown helper styles ───────────────────────────────────────────
+    pub fn md_heading_style(&self) -> Style {
+        Style::default().fg(self.md_heading)
+    }
+    pub fn md_code_style(&self) -> Style {
+        Style::default().fg(self.md_code)
+    }
+    pub fn md_link_style(&self) -> Style {
+        Style::default().fg(self.md_link)
+    }
+    pub fn md_blockquote_style(&self) -> Style {
+        Style::default().fg(self.md_blockquote)
+    }
+    pub fn md_list_marker_style(&self) -> Style {
+        Style::default().fg(self.md_list_marker)
+    }
+
+    // ── Diff helper styles ───────────────────────────────────────────────
+    pub fn diff_add_style(&self) -> Style {
+        Style::default().fg(self.diff_add_fg).bg(self.diff_add_bg)
+    }
+    pub fn diff_del_style(&self) -> Style {
+        Style::default().fg(self.diff_del_fg).bg(self.diff_del_bg)
+    }
+    pub fn diff_context_style(&self) -> Style {
+        Style::default().fg(self.diff_context)
+    }
+    pub fn diff_hunk_style(&self) -> Style {
+        Style::default().fg(self.diff_hunk)
+    }
+
+    // ── Status indicator helper styles ───────────────────────────────────
+    pub fn stall_warn_style(&self) -> Style {
+        Style::default().fg(self.stall_warn)
+    }
+    pub fn stall_error_style(&self) -> Style {
+        Style::default().fg(self.stall_error)
     }
 }
 

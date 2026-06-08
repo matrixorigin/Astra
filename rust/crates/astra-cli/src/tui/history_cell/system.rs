@@ -101,33 +101,32 @@ impl SystemCell {
 
 impl HistoryCell for SystemCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let (label, label_style, body_style) = match self.level {
+        let (prefix, label_style, body_style) = match self.level {
             SystemLevel::Info => (
-                "Note",
+                "ℹ Note · ",
                 Style::default()
                     .fg(crate::tui::theme::current().dim)
                     .add_modifier(ratatui::style::Modifier::DIM),
                 Style::default().fg(Color::Gray),
             ),
             SystemLevel::Response => (
-                "Result",
+                "Result · ",
                 Style::default()
                     .fg(crate::tui::theme::current().dim)
                     .add_modifier(ratatui::style::Modifier::DIM),
                 Style::default().fg(Color::White),
             ),
             SystemLevel::Warning => (
-                "Warning",
+                "⚠ Warning · ",
                 Style::default().yellow().bold(),
                 Style::default().yellow(),
             ),
             SystemLevel::Error => (
-                "Error",
+                "✖ Error · ",
                 Style::default().red().bold(),
                 Style::default().red(),
             ),
         };
-        let prefix = format!("{label} · ");
         let continuation = "  ".to_string();
         self.message
             .lines()
@@ -135,7 +134,7 @@ impl HistoryCell for SystemCell {
             .map(|(i, line)| {
                 if i == 0 {
                     Line::from(vec![
-                        Span::styled(prefix.clone(), label_style),
+                        Span::styled(prefix.to_string(), label_style),
                         Span::styled(line.to_string(), body_style),
                     ])
                 } else {
@@ -225,7 +224,7 @@ mod tests {
         let cell = SystemCell::info("session resumed");
         let out = render(&cell, 40, 1);
         assert!(out.contains("session resumed"));
-        assert!(out.starts_with("Note · "), "label missing: {out:?}");
+        assert!(out.starts_with("ℹ Note · "), "label missing: {out:?}");
     }
 
     #[test]
@@ -273,7 +272,7 @@ mod tests {
         let cell = SystemCell::error("first line\nsecond line");
         let out = render(&cell, 40, 2);
         let rows: Vec<&str> = out.lines().collect();
-        assert!(rows[0].starts_with("Error · "), "{rows:?}");
+        assert!(rows[0].starts_with("✖ Error · "), "{rows:?}");
         assert!(rows[1].starts_with("  "), "{rows:?}");
     }
 

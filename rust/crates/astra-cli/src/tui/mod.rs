@@ -33,6 +33,7 @@ mod layout;
 mod markdown;
 mod markdown_render;
 mod mention_menu;
+pub(crate) mod path_style;
 mod render;
 mod session_picker;
 mod shimmer;

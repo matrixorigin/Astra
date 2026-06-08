@@ -392,10 +392,19 @@ impl HistoryCell for ToolCell {
                 self.bullet(),
                 Span::styled("Edited ", Style::default().bold()),
             ];
-            spans.push(Span::styled(
-                truncate_by_width(&edited.label, w.saturating_sub(24).max(12)),
-                Style::default(),
-            ));
+            // Use path styling for file paths — directory dim, filename bright.
+            if edited.label.contains('/') || edited.label.contains('\\') {
+                let truncated = truncate_by_width(&edited.label, w.saturating_sub(24).max(12));
+                spans.extend(crate::tui::path_style::style_file_path_flat(
+                    &truncated,
+                    Style::default(),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    truncate_by_width(&edited.label, w.saturating_sub(24).max(12)),
+                    Style::default(),
+                ));
+            }
             if edited.additions > 0 || edited.deletions > 0 {
                 spans.push(Span::styled(" · ", meta_style));
                 spans.push(Span::styled(
@@ -443,7 +452,7 @@ impl HistoryCell for ToolCell {
         if edited_diff.is_none() && !self.description.is_empty() {
             let description = sanitize_terminal_text(&self.description);
             let theme = crate::tui::theme::current();
-            let command_style = Style::default().fg(theme.selected_fg);
+            let command_style = theme.command_style();
             let desc_prefix = if description_has_children {
                 "  ├ "
             } else {
@@ -459,7 +468,13 @@ impl HistoryCell for ToolCell {
                 if self.name == "bash" {
                     if let Some(cmd) = dl.strip_prefix("$ ") {
                         spans.push(Span::styled("$ ".to_string(), dim));
-                        spans.push(Span::styled(cmd.to_string(), command_style));
+                        // Split command name (bold + colour) from arguments (dim).
+                        if let Some((first, rest)) = cmd.split_once(' ') {
+                            spans.push(Span::styled(first.to_string(), command_style.bold()));
+                            spans.push(Span::styled(format!(" {rest}"), command_style));
+                        } else {
+                            spans.push(Span::styled(cmd.to_string(), command_style.bold()));
+                        }
                     } else {
                         spans.push(Span::styled(dl.to_string(), command_style));
                     }
@@ -519,11 +534,28 @@ impl HistoryCell for ToolCell {
                     } else {
                         "  ├ ".to_string()
                     };
+                    // Style git diff --stat lines: dim path, bright filename.
+                    // Also detect bare file paths in plain output lines.
+                    let styled_content: Vec<Span<'static>> =
+                        if let Some(file_part) = ol.trim().split_once('|') {
+                            let path = file_part.0.trim();
+                            let stats = file_part.1; // includes leading "| "
+                            let mut spans = Vec::new();
+                            spans.extend(crate::tui::path_style::style_file_path(path));
+                            spans.push(Span::styled(format!(" |{stats}"), dim));
+                            spans
+                        } else {
+                            let trimmed = ol.trim();
+                            if looks_like_file_path(trimmed) {
+                                crate::tui::path_style::style_file_path(trimmed)
+                            } else {
+                                vec![Span::raw((*ol).to_string())]
+                            }
+                        };
+                    let mut line_spans = vec![Span::styled(gutter.clone(), dim)];
+                    line_spans.extend(styled_content);
                     lines.extend(wrap_prefixed_line(
-                        Line::from(vec![
-                            Span::styled(gutter.clone(), dim),
-                            Span::raw((*ol).to_string()),
-                        ]),
+                        Line::from(line_spans),
                         width,
                         Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
                     ));
@@ -760,6 +792,23 @@ pub(super) fn humanize_tool_name(name: &str) -> String {
     }
 }
 
+/// Quick heuristic: does `s` look like a file path that should be
+/// rendered with dimmed directory / bright filename styling?
+fn looks_like_file_path(s: &str) -> bool {
+    // Must contain a path separator and a dot (likely an extension).
+    if !s.contains('/') && !s.contains('\\') {
+        return false;
+    }
+    // Reject URLs and flag-like strings.
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("--") {
+        return false;
+    }
+    // Must have a dot after the last separator (an extension).
+    let last_sep = s.rfind('/').or_else(|| s.rfind('\\')).unwrap_or(0);
+    let after_sep = &s[last_sep..];
+    after_sep.contains('.')
+}
+
 struct EditedDiffPreview<'a> {
     label: String,
     additions: usize,
@@ -893,7 +942,7 @@ mod tests {
         assert_eq!(desc.spans[1].content.as_ref(), "$ ");
         assert_eq!(
             desc.spans[2].style.fg,
-            Some(crate::tui::theme::current().selected_fg)
+            Some(crate::tui::theme::current().command)
         );
     }
 
