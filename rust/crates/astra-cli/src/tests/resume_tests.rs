@@ -1,6 +1,8 @@
 use super::chat_stream_tests::sse_text_response;
 use super::*;
 use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+use crate::cli::session::session_runtime;
+use crate::cli::turn::turn_entry::{TurnContext, handle_chat_input};
 use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 

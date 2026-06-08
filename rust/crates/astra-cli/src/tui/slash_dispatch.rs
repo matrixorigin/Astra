@@ -4185,7 +4185,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(stats_view)]
     fn build_recent_session_history_lines_surfaces_scan_error() {
         let tmp = tempfile::tempdir().unwrap();
         let broken_root = tmp.path().join("broken-sessions-root");
@@ -4199,7 +4199,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(stats_view)]
     fn build_recent_session_history_lines_marks_unreadable_journals() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let good_session = format!("stats-good-{}", uuid::Uuid::new_v4());
@@ -4220,7 +4220,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(stats_view)]
     fn build_recent_session_history_lines_surfaces_no_readable_sessions() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let bad_session = format!("stats-bad-only-{}", uuid::Uuid::new_v4());
@@ -4242,7 +4242,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(stats_view)]
     fn read_session_journal_for_stats_surfaces_directory_error() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("stats-dir-{}", uuid::Uuid::new_v4());

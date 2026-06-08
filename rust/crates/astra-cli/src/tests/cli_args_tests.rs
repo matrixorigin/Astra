@@ -1,4 +1,6 @@
 use super::*;
+use crate::cli::cli_config::cli_args::{ServeMode, SessionCaptureCmd};
+use crate::cli::session::session_state::ExplainMode;
 
 // ── CLI arg parsing tests ─────────────────────────────────────────────
 // 128 tests → 16 table-driven tests + 2 integration tests (+3 composite)
