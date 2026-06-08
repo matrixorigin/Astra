@@ -503,12 +503,20 @@ function ReasoningPanel({
           setOpen((value) => !value);
         }}
         aria-expanded={open}
-        className="inline-flex max-w-full items-center gap-2 py-1 text-left text-[15px] leading-6 text-text-muted transition-colors hover:text-text-secondary"
+        className="inline-flex max-w-full items-center gap-2 py-1 text-left text-[15px] leading-6 font-bold text-text-secondary transition-colors hover:text-text"
       >
         {streaming ? (
           <Loader className="size-4 shrink-0 animate-spin text-warning" />
         ) : null}
-        <span className="truncate">{summary}</span>
+        <span
+          className={cn(
+            "truncate",
+            streaming &&
+              "bg-gradient-to-r from-text-secondary via-accent to-text bg-clip-text text-transparent",
+          )}
+        >
+          {summary}
+        </span>
         <ChevronDown
           className={cn(
             "size-4 shrink-0 transition-transform duration-200",

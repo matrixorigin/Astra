@@ -136,7 +136,7 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
         } else {
             // Summary lines like "3+ 0-" or other non-diff content
             let rendered = if raw.starts_with("… +") {
-                format!("    {raw} · Ctrl+O transcript")
+                format!("    {raw} (Ctrl+O to view transcript)")
             } else {
                 format!("    {raw}")
             };
@@ -151,7 +151,7 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
     if total_lines > max_lines {
         let remaining = total_lines - max_lines;
         lines.push(Line::from(Span::styled(
-            format!("    … +{remaining} more lines · Ctrl+O transcript"),
+            format!("    … +{remaining} more lines (Ctrl+O to view transcript)"),
             Style::default().fg(Color::DarkGray),
         )));
     }

@@ -7,7 +7,7 @@
 //!   until the final `complete()` call.
 //! - **Success** — green bullet, `Ran <name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
-//! - **Failed** — red bullet, `Ran <name> · Xms · failed`, otherwise identical
+//! - **Failed** — red bullet, `Ran <name> · Xms`, otherwise identical
 //!   to Success.
 //!
 //! Diff-looking output summaries (lines starting with `+` or `-`)
@@ -199,14 +199,6 @@ impl ToolCell {
         }
     }
 
-    fn title_text(&self) -> &'static str {
-        match self.status {
-            ToolStatus::Running => "running",
-            ToolStatus::Success => "done",
-            ToolStatus::Failed => "failed",
-        }
-    }
-
     fn display_name(&self) -> String {
         match self.name.as_str() {
             "bash" => "Bash".into(),
@@ -233,10 +225,6 @@ impl ToolCell {
             (None, Some(output)) => Some(output),
             (None, None) => None,
         }
-    }
-
-    fn has_transcript(&self) -> bool {
-        self.output.is_some() || self.output_summary.is_some()
     }
 
     fn edited_diff_preview(&self) -> Option<EditedDiffPreview<'_>> {
@@ -398,6 +386,7 @@ impl HistoryCell for ToolCell {
         } else {
             self.edited_diff_preview()
         };
+        let preview_text = self.preview_text().filter(|text| !text.trim().is_empty());
         let header = if let Some(edited) = edited_diff.as_ref() {
             let mut spans = vec![
                 self.bullet(),
@@ -426,28 +415,21 @@ impl HistoryCell for ToolCell {
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
-            let mut spans = vec![
+            let spans = vec![
                 self.bullet(),
                 Span::styled(format!("Ran {label}"), Style::default().bold()),
                 Span::styled(" · ", meta_style),
                 Span::styled(self.elapsed_str(), meta_style),
             ];
-            if self.status == ToolStatus::Failed {
-                spans.push(Span::styled(" · ", meta_style));
-                spans.push(Span::styled(
-                    self.title_text(),
-                    Style::default().fg(Color::Red),
-                ));
-            }
             Line::from(spans)
         };
 
         let mut lines = vec![header];
 
-        let has_error_label = self.status == ToolStatus::Failed
-            && (self.has_transcript() || self.preview_text().is_none());
-        let has_preview_block = edited_diff.is_some() || self.preview_text().is_some();
-        let description_has_children = has_error_label || has_preview_block;
+        let missing_failure_details =
+            self.status == ToolStatus::Failed && edited_diff.is_none() && preview_text.is_none();
+        let has_preview_block = edited_diff.is_some() || preview_text.is_some();
+        let description_has_children = missing_failure_details || has_preview_block;
 
         // Spinner + progress bar for long-running tools.
         if self.status == ToolStatus::Running {
@@ -494,13 +476,7 @@ impl HistoryCell for ToolCell {
 
         // Output summary — diff renderer for +/- content,
         // plain truncated preview otherwise.
-        if self.status == ToolStatus::Failed && self.has_transcript() {
-            lines.push(Line::from(vec![
-                Span::styled("  └ ", dim),
-                Span::styled("Details in transcript", Style::default().fg(Color::Red)),
-                Span::styled(" · Ctrl+O transcript", dim),
-            ]));
-        } else if self.status == ToolStatus::Failed && self.preview_text().is_none() {
+        if missing_failure_details {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", dim),
                 Span::styled("No details returned", Style::default().fg(Color::Red)),
@@ -518,7 +494,7 @@ impl HistoryCell for ToolCell {
                         .map(|line| pad_line_background(line, width)),
                 );
             }
-        } else if let Some(summary) = self.preview_text() {
+        } else if let Some(summary) = preview_text {
             let summary = sanitize_terminal_text(summary);
             let has_diff = looks_like_unified_diff_preview(&summary);
             if has_diff {
@@ -556,7 +532,10 @@ impl HistoryCell for ToolCell {
                     let remaining = summary.lines().count() - 5;
                     lines.push(Line::from(vec![
                         Span::styled("  └ ".to_string(), dim),
-                        Span::styled(format!("… +{remaining} lines · Ctrl+O transcript"), dim),
+                        Span::styled(
+                            format!("… +{remaining} lines (Ctrl+O to view transcript)"),
+                            dim,
+                        ),
                     ]));
                 }
             }
@@ -899,10 +878,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_header_is_red_and_says_failed() {
+    fn failed_header_uses_red_bullet_without_status_word() {
         let t = err_tool("bash", "false", 10);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Ran Bash · 10ms · failed"));
+        assert!(out.contains("• Ran Bash · 10ms"));
+        assert!(!out.contains("· failed"), "{out}");
     }
 
     #[test]
@@ -922,9 +902,9 @@ mod tests {
         let mut t = err_tool("bash", "cat missing.txt", 10);
         t.output = Some("cat: missing.txt: No such file or directory".into());
         let out = render(&t, 80, 5);
-        assert!(out.contains("Details in transcript"), "{out}");
+        assert!(!out.contains("Details in transcript"), "{out}");
         assert!(out.contains("No such file or directory"), "{out}");
-        assert!(out.contains("Ctrl+O transcript"), "{out}");
+        assert!(!out.contains("Ctrl+O transcript"), "{out}");
     }
 
     #[test]
@@ -955,7 +935,7 @@ mod tests {
         assert!(out.contains("file-5"));
         assert!(!out.contains("file-6"), "row 6 should have been trimmed");
         assert!(out.contains("… +3 lines"));
-        assert!(out.contains("Ctrl+O transcript"));
+        assert!(out.contains("(Ctrl+O to view transcript)"));
     }
 
     #[test]
@@ -1014,7 +994,7 @@ mod tests {
         assert!(out.contains("   1 + print(\"new1\")"), "{out}");
         assert!(out.contains("   5 + print(\"new5\")"), "{out}");
         assert!(out.contains("… +1 more changed lines"), "{out}");
-        assert!(out.contains("Ctrl+O transcript"), "{out}");
+        assert!(out.contains("(Ctrl+O to view transcript)"), "{out}");
     }
 
     #[test]
@@ -1050,7 +1030,7 @@ mod tests {
         assert!(out.contains("line 1"), "{out}");
         assert!(out.contains("line 5"), "{out}");
         assert!(!out.contains("286 lines captured"), "{out}");
-        assert!(out.contains("Ctrl+O transcript"), "{out}");
+        assert!(out.contains("(Ctrl+O to view transcript)"), "{out}");
     }
 
     #[test]

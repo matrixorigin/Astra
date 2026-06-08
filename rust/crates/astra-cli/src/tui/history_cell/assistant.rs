@@ -434,9 +434,9 @@ fn render_body_with_gutter(
 ///
 /// Example: `• Thought · 12 lines · 50 tokens`
 fn thought_header_lines(line_count: usize, token_count: u64) -> Vec<Line<'static>> {
-    let dim = Style::default()
-        .fg(crate::tui::theme::current().dim)
-        .add_modifier(Modifier::DIM);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let stat = dim; // stat labels in dim — secondary but readable
     let label = if line_count == 1 {
         "1 line".to_string()
     } else {
@@ -449,12 +449,33 @@ fn thought_header_lines(line_count: usize, token_count: u64) -> Vec<Line<'static
     };
     vec![Line::from(vec![
         Span::styled("• ", dim),
-        Span::styled("Thought", dim),
-        Span::styled(" · ", dim),
-        Span::styled(label, dim),
-        Span::styled(" · ", dim),
-        Span::styled(tok_label, dim),
+        thought_gradient("Thought", theme),
+        Span::styled(" · ", stat),
+        Span::styled(label, stat),
+        Span::styled(" · ", stat),
+        Span::styled(tok_label, stat),
     ])]
+}
+
+/// Build a gradient-rendered "Thought" span: bold, tinted with a blend
+/// of accent toward foreground so it stands out but stays readable.
+/// The visual gradient across the header line comes from the transition
+/// Thought (bold, accent-blend) → stat labels (dim).
+pub(super) fn thought_gradient(word: &str, theme: &crate::tui::theme::Theme) -> Span<'static> {
+    use crate::tui::color::blend;
+    use crate::tui::theme::color_to_rgb;
+
+    let accent = color_to_rgb(theme.accent);
+    let fg_rgb = color_to_rgb(theme.fg);
+    // Blend accent 60% toward fg — keeps the accent character but
+    // prevents it from being too loud on a dark terminal.
+    let (r, g, b) = blend(accent, fg_rgb, 0.6);
+    Span::styled(
+        word.to_string(),
+        Style::default()
+            .fg(Color::Rgb(r, g, b))
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// Max body rows shown beneath the `Thinking` header while the
@@ -473,9 +494,11 @@ const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 4;
 /// thinking body stays hidden — once `</think>` arrives this whole
 /// block collapses to a one-line `Thought · N lines · N tokens` header.
 fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
-    let dim = Style::default()
-        .fg(crate::tui::theme::current().dim)
-        .add_modifier(Modifier::DIM);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let stat = dim; // stat labels in dim but without DIM modifier
+    // Body preview text: fg dim only — readable but visually subordinate.
+    let preview_text = Style::default().fg(theme.dim);
 
     let line_count = think_partial.trim().lines().count().max(1);
     let token_count = approx_tokens(think_partial.chars().count() as u64);
@@ -489,15 +512,15 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     } else {
         format!("{token_count} tokens")
     };
-    let header_text = format!("Thought · {line_label} · {tok_label}");
 
-    // Header line — intentionally calm and dim. The dedicated live
-    // status indicator already surfaces "working" above the composer;
-    // duplicating that energy inside scrollback made the transcript
-    // feel more like a debug view than a product surface.
+    // Header line: bold Thought with accent blend, then dim stats.
     let mut out = vec![Line::from(vec![
         Span::styled("• ", dim),
-        Span::styled(header_text, dim),
+        thought_gradient("Thought", theme),
+        Span::styled(" · ", stat),
+        Span::styled(line_label, stat),
+        Span::styled(" · ", stat),
+        Span::styled(tok_label, stat),
     ])];
 
     // Soft-wrap the partial thinking content, then render the most
@@ -524,14 +547,17 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
         let hidden = total - tail;
         out.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(format!("⋯ +{hidden} more"), dim),
+            Span::styled(format!("⋯ +{hidden} more"), stat),
         ]));
         total - tail
     } else {
         0
     };
     for row in body_rows.into_iter().skip(visible_start) {
-        out.push(Line::from(vec![Span::raw("    "), Span::styled(row, dim)]));
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(row, preview_text),
+        ]));
     }
     out
 }

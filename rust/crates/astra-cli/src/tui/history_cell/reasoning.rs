@@ -128,11 +128,13 @@ impl HistoryCell for ReasoningCell {
             return Vec::new();
         }
 
-        let dim = Style::default()
-            .fg(crate::tui::theme::current().dim)
-            .add_modifier(Modifier::DIM);
+        let theme = crate::tui::theme::current();
+        let stat = Style::default().fg(theme.dim);
+        let dim = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
+        // Body preview text: fg dim only — readable but visually subordinate.
+        let body = Style::default().fg(theme.dim);
 
-        // Done thinking → collapse to header only (`Thought ·
+        // Done thinking → collapse to header only (`Thought ·`
         // 22s · 45 lines · N tokens`). A 20-second reasoning blob is ~40+
         // wrapped rows of dim prose; scrollback-dumping all of it
         // crowds out the actual answer below. Collapse to a one-line
@@ -152,13 +154,14 @@ impl HistoryCell for ReasoningCell {
         } else {
             format!("{token_count} tokens")
         };
-        let header_text = self
+        let stat_text = self
             .duration_label()
-            .map(|d| format!("Thought · {d} · {line_label} · {tok_label}"))
-            .unwrap_or_else(|| format!("Thought · {line_label} · {tok_label}"));
+            .map(|d| format!(" · {d} · {line_label} · {tok_label}"))
+            .unwrap_or_else(|| format!(" · {line_label} · {tok_label}"));
         let header_line = Line::from(vec![
             Span::styled("• ", dim),
-            Span::styled(header_text, dim),
+            super::assistant::thought_gradient("Thought", theme),
+            Span::styled(stat_text, stat),
         ]);
         // Preserve live body preview (below).
 
@@ -197,10 +200,7 @@ impl HistoryCell for ReasoningCell {
                 0
             };
             for row in body_rows.into_iter().skip(visible) {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(row, dim),
-                ]));
+                lines.push(Line::from(vec![Span::raw("    "), Span::styled(row, body)]));
             }
         }
 
@@ -324,18 +324,9 @@ mod tests {
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("draft");
         let out = render(&c, 60, 3);
-        assert!(
-            out.contains("Thought"),
-            "missing Thought header: {out}"
-        );
-        assert!(
-            out.contains("1 line"),
-            "missing line count: {out}"
-        );
-        assert!(
-            out.contains("token"),
-            "missing token count: {out}"
-        );
+        assert!(out.contains("Thought"), "missing Thought header: {out}");
+        assert!(out.contains("1 line"), "missing line count: {out}");
+        assert!(out.contains("token"), "missing token count: {out}");
     }
 
     #[test]

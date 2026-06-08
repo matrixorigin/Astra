@@ -141,7 +141,7 @@ fn perceived_lightness(r: u8, g: u8, b: u8) -> f32 {
     (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0
 }
 
-fn color_to_rgb(c: Color) -> (u8, u8, u8) {
+pub(crate) fn color_to_rgb(c: Color) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
         _ => (128, 128, 128),
