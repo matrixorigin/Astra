@@ -48,6 +48,16 @@ const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 
+fn ctrl_b_promoted_notification(job_id: &str) -> String {
+    format!(
+        "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use job(action='output') for the latest job, job(action='output', job_id='{job_id}') for this job, or job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
+    )
+}
+
+fn ctrl_b_cancelled_without_promotion_notification() -> String {
+    "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
     Agents,
@@ -2486,12 +2496,12 @@ pub(crate) async fn run_tui_session(
                                     // command; doing so risks duplicate side
                                     // effects.
                                     if let Some(job_id) = ctrl_b_promoted_job_id {
-                                        state.pending_bg_notifications.push(format!(
-                                            "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use job(action='output') for the latest job, job(action='output', job_id='{job_id}') for this job, or job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
-                                        ));
+                                        state
+                                            .pending_bg_notifications
+                                            .push(ctrl_b_promoted_notification(&job_id));
                                     } else if ctrl_b_fallback_cancelled {
                                         state.pending_bg_notifications.push(
-                                            "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
+                                            ctrl_b_cancelled_without_promotion_notification(),
                                         );
                                     }
 
@@ -3437,6 +3447,34 @@ mod tests {
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
             assert_eq!(decoded, target, "variant {encoded} did not round-trip");
         }
+    }
+
+    #[test]
+    fn ctrl_b_promoted_notification_guides_output_without_rerun() {
+        let notification = ctrl_b_promoted_notification("bg-shell-7");
+
+        assert!(notification.contains("<status>promoted</status>"));
+        assert!(notification.contains("<job_id>bg-shell-7</job_id>"));
+        assert!(notification.contains("job(action='output')"));
+        assert!(notification.contains("job(action='output', job_id='bg-shell-7')"));
+        assert!(notification.contains("job(action='list')"));
+        assert!(
+            !notification.contains("job(action='shell'"),
+            "true Ctrl+B promotion must not tell the model to re-run a side-effecting command: {notification}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_fallback_notification_guides_explicit_background_rerun() {
+        let notification = ctrl_b_cancelled_without_promotion_notification();
+
+        assert!(notification.contains("<status>cancelled_without_promotion</status>"));
+        assert!(notification.contains("no active bash command could be promoted"));
+        assert!(notification.contains("job(action='shell', command='...')"));
+        assert!(
+            !notification.contains("<job_id>"),
+            "fallback cancellation should not invent a background job id: {notification}"
+        );
     }
 
     #[tokio::test]
