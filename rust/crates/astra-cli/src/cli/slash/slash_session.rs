@@ -8245,7 +8245,7 @@ mod resume_tests {
             child_list.contains("\"status\":\"paused\""),
             "forked child should inherit active parent work as paused, not in_progress: {child_list}"
         );
-        let child_snapshot = state.task_manager.snapshot().await;
+        let child_snapshot = state.task_manager.snapshot().await.unwrap();
         assert_eq!(
             child_snapshot[0]
                 .metadata

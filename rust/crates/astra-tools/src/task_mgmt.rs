@@ -806,11 +806,11 @@ pub trait TaskStore: Send + Sync {
     /// Return and consume the next integer to use when forming `task-<n>` ids.
     /// Must be monotonic per session_id.
     async fn next_task_id(&self, session_id: &str) -> Result<u32, String>;
-    /// Optional: set the id counter (used by `restore_snapshot` to rewind
-    /// numbering after a turn rollback). Default impl ignores the hint.
-    async fn set_next_task_id(&self, _session_id: &str, _next: u32) -> Result<(), String> {
-        Ok(())
-    }
+    /// Set the id counter (used by `restore_snapshot` to rewind
+    /// numbering after a turn rollback). Every store must implement
+    /// this — a silent no-op default would silently break snapshot
+    /// restore.
+    async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String>;
     /// Restore task rows and the next-id counter as one logical rollback
     /// operation. Stores that can update both under one lock/transaction
     /// should override this method. The default is deliberately ordered
@@ -1745,26 +1745,12 @@ impl TaskManager {
             .clone()
     }
 
-    /// Get a snapshot of all tasks (for brief/diagnostics). This is async
-    /// because the store may be remote (MatrixOne).
-    ///
-    /// Best-effort: logs an error and returns empty on storage failure
-    /// rather than propagating. Callers that need error awareness should
-    /// use [`TaskManager::load_tasks`] instead.
-    pub async fn snapshot(&self) -> Vec<SessionTask> {
-        let sid = self.sid();
-        match self.store.load(&sid).await {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::error!(
-                    session_id = %sid,
-                    error = %e,
-                    "task snapshot load failed — returning empty; \
-                     callers that need error awareness should use load_tasks()"
-                );
-                Vec::new()
-            }
-        }
+    /// Get a snapshot of all tasks. Returns an error when the backing
+    /// store is unavailable — unlike the old best-effort API that silently
+    /// returned empty, this forces callers to handle storage failures
+    /// explicitly.
+    pub async fn snapshot(&self) -> Result<Vec<SessionTask>, String> {
+        self.store.load(&self.sid()).await
     }
 
     /// Load all tasks and surface backend errors to callers that must not
@@ -1797,9 +1783,11 @@ impl TaskManager {
         // next `next_task_id` call. Propagating the error forces the
         // caller to abort the mutation instead of capturing a snapshot
         // that could corrupt the id space on rollback.
-        let peeked = self.store.peek_next_task_id(&sid).await.map_err(|e| {
-            format!("snapshot peek_next_task_id failed: {e}")
-        })?;
+        let peeked = self
+            .store
+            .peek_next_task_id(&sid)
+            .await
+            .map_err(|e| format!("snapshot peek_next_task_id failed: {e}"))?;
         Ok(TaskManagerSnapshot {
             tasks,
             next_task_id: peeked,
@@ -4107,7 +4095,7 @@ mod tests {
         }
 
         let mgr = TaskManager::new("sess-race", store);
-        let tasks = mgr.snapshot().await;
+        let tasks = mgr.snapshot().await.unwrap();
         assert_eq!(tasks.len(), 32, "lost task(s): {tasks:?}");
         let mut ids: Vec<_> = tasks.iter().map(|t| t.id.clone()).collect();
         ids.sort();
@@ -5074,8 +5062,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn prepare_task_snapshot_for_fork_pauses_live_parent_work() {
         let snapshot = TaskManagerSnapshot {
@@ -5193,13 +5179,15 @@ mod tests {
             .unwrap();
         let store: Arc<dyn TaskStore> = Arc::new(FlakyPeekStore { inner });
         let mgr = TaskManager::new("sess-fallback", store);
-        let snap = mgr
-            .try_snapshot_state()
-            .await
-            .expect("snapshot with peek fallback");
-        assert_eq!(
-            snap.next_task_id, 43,
-            "peek failure must fall back to max(task id) + 1, not 1"
+        let snap = mgr.try_snapshot_state().await;
+        assert!(
+            snap.is_err(),
+            "peek failure must propagate — no fallback that could rewind counter"
+        );
+        let err = snap.unwrap_err();
+        assert!(
+            err.contains("peek_next_task_id failed"),
+            "error must identify root cause: {err}"
         );
     }
 
@@ -5447,6 +5435,9 @@ mod tests {
         }
         async fn peek_next_task_id(&self, _sid: &str) -> Result<u32, String> {
             Ok(1)
+        }
+        async fn set_next_task_id(&self, sid: &str, n: u32) -> Result<(), String> {
+            self.inner.set_next_task_id(sid, n).await
         }
     }
 

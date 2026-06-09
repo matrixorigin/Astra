@@ -354,7 +354,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tasks = state.task_manager.snapshot().await;
+        let tasks = state.task_manager.snapshot().await.unwrap();
         let approved: Vec<_> = tasks
             .iter()
             .filter(|task| {
@@ -500,7 +500,7 @@ mod tests {
             "oversized approved plan should surface the task fan-out limit: {err}"
         );
         assert!(
-            state.task_manager.snapshot().await.is_empty(),
+            state.task_manager.snapshot().await.unwrap().is_empty(),
             "rejected oversized plan should not leave partial task-board work"
         );
     }
@@ -539,7 +539,7 @@ mod tests {
             err.contains("title") && err.contains("exceeds"),
             "original create validation error should be surfaced: {err}"
         );
-        let tasks = state.task_manager.snapshot().await;
+        let tasks = state.task_manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             1,
@@ -571,7 +571,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tasks = state.task_manager.snapshot().await;
+        let tasks = state.task_manager.snapshot().await.unwrap();
         assert!(
             tasks
                 .iter()

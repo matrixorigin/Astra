@@ -4231,9 +4231,7 @@ impl ServerToolExecutor {
             }
         }
         if let Some(conflict) = last_conflict {
-            return format!(
-                "Error: save plan after {MAX_CAS_RETRIES} retries: {conflict}"
-            );
+            return format!("Error: save plan after {MAX_CAS_RETRIES} retries: {conflict}");
         }
 
         if let Err(e) = repo.set_active_plan(&self.session_id, Some(&plan_id)).await {
@@ -7452,7 +7450,7 @@ esac
             "exit_plan_mode approved must announce unlock; got: {result}"
         );
 
-        let tasks = exec.task_manager.snapshot().await;
+        let tasks = exec.task_manager.snapshot().await.unwrap();
         let approved_plan_tasks: Vec<_> = tasks
             .iter()
             .filter(|task| {
@@ -7544,7 +7542,7 @@ esac
             "exit_plan_mode should surface the original task-board mirror failure: {result}"
         );
 
-        let tasks = exec.task_manager.snapshot().await;
+        let tasks = exec.task_manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -7728,7 +7726,7 @@ esac
             "exit_plan_mode approved must announce unlock; got: {result}"
         );
 
-        let tasks = exec.task_manager.snapshot().await;
+        let tasks = exec.task_manager.snapshot().await.unwrap();
         assert!(
             tasks.iter().any(|task| {
                 task.metadata
@@ -8316,7 +8314,7 @@ esac
             .await;
 
         assert!(
-            exec.task_manager.snapshot().await.is_empty(),
+            exec.task_manager.snapshot().await.unwrap().is_empty(),
             "rejected plan must not create task-board work while still authoring"
         );
     }
@@ -8345,7 +8343,7 @@ esac
             .await;
 
         assert!(
-            exec.task_manager.snapshot().await.is_empty(),
+            exec.task_manager.snapshot().await.unwrap().is_empty(),
             "empty plan approval must not create task-board work"
         );
     }

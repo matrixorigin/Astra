@@ -340,7 +340,7 @@ enum SearchSortMode {
     Path,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StreamKind {
     Stdout,
     Stderr,
@@ -426,17 +426,23 @@ struct SearchIgnoreRule {
 /// paths in any order.
 fn is_rm_recursive_force(lower: &str) -> bool {
     // Split into individual commands by shell operators.
-    // We use a regex-like manual split: walk the string and cut at `;`, `|`,
-    // `&`, or `\n`/`\r`. Consecutive operators (`&&`, `||`) produce empty
-    // segments which are harmless — we skip them.
     let commands: Vec<&str> = lower
         .split(|c: char| c == ';' || c == '|' || c == '&' || c == '\n' || c == '\r')
         .collect();
 
     for cmd in commands {
         let args: Vec<&str> = cmd.split_ascii_whitespace().collect();
-        // Find the `rm` token. It must be the first non-env-var token.
-        // We accept `rm` at any position to handle `sudo rm`, `env rm`, etc.
+
+        // Recursively check `bash -c "<script>"`, `sh -c "<script>"`, etc.
+        // This closes the simplest bypass where a user wraps `rm -rf` in a
+        // quoted -c argument that the tokenizer can't see inside.
+        if let Some(script) = extract_c_argument(&args) {
+            if is_rm_recursive_force(script) {
+                return true;
+            }
+            continue;
+        }
+
         let rm_pos = match args.iter().position(|a| *a == "rm") {
             Some(p) => p,
             None => continue,
@@ -449,24 +455,59 @@ fn is_rm_recursive_force(lower: &str) -> bool {
             } else if arg == "--force" {
                 has_force = true;
             } else if arg.starts_with("--") {
-                // Other long flags (--verbose, --interactive, etc.) — skip.
             } else if arg.starts_with('-') {
-                // Short flags: may be combined (-rf, -fr, -rfv, -rfi).
                 for c in arg.chars().skip(1) {
                     match c {
                         'r' | 'R' => has_recursive = true,
                         'f' => has_force = true,
-                        _ => {} // -v, -i, -d, etc.
+                        _ => {}
                     }
                 }
             }
-            // Non-flag arguments are paths — skip without affecting detection.
         }
         if has_recursive && has_force {
             return true;
         }
     }
     false
+}
+
+/// When args looks like `["bash", "-c", "\"rm -rf /\""]` (or `sh`, `zsh`),
+/// extract the script argument with outer quotes stripped and return it
+/// for recursive scanning. Returns `None` if the command is not a
+/// `*-c <script>` invocation.
+fn extract_c_argument<'a>(args: &[&'a str]) -> Option<&'a str> {
+    // Match `bash -c <script>`, `sh -c <script>`, `zsh -c <script>`.
+    if args.len() < 3 {
+        return None;
+    }
+    if !matches!(
+        args[0],
+        "bash"
+            | "sh"
+            | "zsh"
+            | "/bin/bash"
+            | "/bin/sh"
+            | "/bin/zsh"
+            | "/usr/bin/bash"
+            | "/usr/bin/sh"
+            | "/usr/bin/zsh"
+    ) {
+        return None;
+    }
+    if args[1] != "-c" {
+        return None;
+    }
+    let script = args[2];
+    // Strip one layer of matching outer quotes (single or double).
+    let stripped = if (script.starts_with('"') && script.ends_with('"'))
+        || (script.starts_with('\'') && script.ends_with('\''))
+    {
+        &script[1..script.len().saturating_sub(1)]
+    } else {
+        script
+    };
+    Some(stripped)
 }
 
 fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
@@ -2789,7 +2830,7 @@ async fn run_readonly_command_with_partial(
         .take()
         .ok_or_else(|| format!("Error: failed to capture {command_kind} stderr"))?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(StreamKind, String)>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(StreamKind, String)>(256);
     let stdout_task = tokio::spawn(read_stream(stdout, StreamKind::Stdout, tx.clone()));
     let stderr_task = tokio::spawn(read_stream(stderr, StreamKind::Stderr, tx));
 
@@ -2921,12 +2962,10 @@ pub(crate) async fn run_bash_with_detach(
         .take()
         .ok_or_else(|| "Error: failed to capture bash command stderr".to_string())?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(StreamKind, String)>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(StreamKind, String)>(256);
     // Two private notify halves so the outer detach signal fans out
-    // to both reader tasks without losing notifications. Cloning the
-    // shared Notify directly works because notify_one wakes one
-    // waiter; we want both to stop, so we trip both manually after
-    // observing the shared signal.
+    // to both reader tasks without losing notifications. We trip
+    // both manually after observing the shared oneshot signal.
     let stdout_detach = Arc::new(tokio::sync::Notify::new());
     let stderr_detach = Arc::new(tokio::sync::Notify::new());
     let stdout_task = tokio::spawn(read_stream_until_detach(
@@ -2941,6 +2980,11 @@ pub(crate) async fn run_bash_with_detach(
         tx,
         stderr_detach.clone(),
     ));
+
+    // Take the watch receiver for detach. If absent, treat as no detach
+    // plumbing (legacy path). The watch receiver is borrowed in select!
+    // so we don't need ownership gymnastics.
+    let mut signal_rx = detach.signal_rx.lock().await.take();
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut stdout_text = String::new();
@@ -2975,33 +3019,55 @@ pub(crate) async fn run_bash_with_detach(
                     break;
                 }
                 // Race: detach signal vs cancel vs idle tick.
-                let detach_signal = detach.signal.clone();
-                if let Some(token) = cancel_token {
+                // Watch receiver's `changed()` borrows `&mut self` so it
+                // plays nicely with select! without ownership transfer.
+                if let Some(ref mut rx) = signal_rx {
+                    if let Some(token) = cancel_token {
+                        tokio::select! {
+                            _ = token.cancelled() => {
+                                cancelled = true;
+                                sigkill_process_group(&mut child).await;
+                                break;
+                            }
+                            res = rx.changed() => {
+                                if res.is_ok() {
+                                    detached = true;
+                                    stdout_detach.notify_one();
+                                    stderr_detach.notify_one();
+                                    break;
+                                }
+                                // Sender dropped → no detach possible.
+                                signal_rx = None;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        }
+                    } else {
+                        tokio::select! {
+                            res = rx.changed() => {
+                                if res.is_ok() {
+                                    detached = true;
+                                    stdout_detach.notify_one();
+                                    stderr_detach.notify_one();
+                                    break;
+                                }
+                                signal_rx = None;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        }
+                    }
+                } else if let Some(token) = cancel_token {
+                    // No detach signal available, but cancel is wired.
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
                             sigkill_process_group(&mut child).await;
                             break;
                         }
-                        _ = detach_signal.notified() => {
-                            detached = true;
-                            // Trip both reader notifies so they yield streams.
-                            stdout_detach.notify_one();
-                            stderr_detach.notify_one();
-                            break;
-                        }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                     }
                 } else {
-                    tokio::select! {
-                        _ = detach_signal.notified() => {
-                            detached = true;
-                            stdout_detach.notify_one();
-                            stderr_detach.notify_one();
-                            break;
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                    }
+                    // Neither detach nor cancel: plain tick.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
             Err(e) => {
@@ -3054,11 +3120,15 @@ pub(crate) async fn run_bash_with_detach(
             return Ok(BashRunOutcome::Detached(payload));
         }
         // Streams already drained — fall back to Completed shape.
-        let _ = child.wait().await;
+        let exit_code = child
+            .wait()
+            .await
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
         return Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
             stdout: stdout_text,
             stderr: stderr_text,
-            exit_code: -1,
+            exit_code,
             timed_out: false,
             cancelled: false,
             stdout_capped,
@@ -3099,7 +3169,7 @@ pub(crate) async fn run_bash_with_detach(
 async fn read_stream<R>(
     mut stream: R,
     kind: StreamKind,
-    tx: tokio::sync::mpsc::UnboundedSender<(StreamKind, String)>,
+    tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -3109,7 +3179,14 @@ async fn read_stream<R>(
             Ok(0) => break,
             Ok(read) => {
                 let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                let _ = tx.send((kind, text));
+                if tx.send((kind, text)).await.is_err() {
+                    tracing::warn!(
+                        stream_kind = ?kind,
+                        "command output channel closed; {} bytes of output lost",
+                        read
+                    );
+                    break;
+                }
             }
             Err(_) => break,
         }
@@ -3133,7 +3210,7 @@ async fn read_stream<R>(
 async fn read_stream_until_detach<R>(
     mut stream: R,
     kind: StreamKind,
-    tx: tokio::sync::mpsc::UnboundedSender<(StreamKind, String)>,
+    tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
     detach: std::sync::Arc<tokio::sync::Notify>,
 ) -> Option<R>
 where
@@ -3150,7 +3227,14 @@ where
                 Ok(0) => return None,
                 Ok(read) => {
                     let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                    let _ = tx.send((kind, text));
+                    if tx.send((kind, text)).await.is_err() {
+                        tracing::warn!(
+                            stream_kind = ?kind,
+                            "detach command output channel closed; {} bytes lost",
+                            read
+                        );
+                        return None;
+                    }
                 }
                 Err(_) => return None,
             },
@@ -3162,7 +3246,7 @@ where
 }
 
 fn drain_command_chunks(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(StreamKind, String)>,
+    rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
     stdout_text: &mut String,
     stderr_text: &mut String,
     max_stdout_bytes: usize,
@@ -4994,7 +5078,7 @@ printf 'probe.txt:1:needle\n'
         // armed. 200ms is comfortably more than the 25ms tick
         // without entering the post-sleep `after` window.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        listener.signal.notify_one();
+        listener.signal_tx.send(true).expect("detach signal send");
 
         let payload = listener
             .payload_rx

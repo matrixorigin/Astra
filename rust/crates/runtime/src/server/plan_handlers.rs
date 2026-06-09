@@ -2150,7 +2150,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(tasks.len(), 2, "{tasks:?}");
         let first = tasks
             .iter()
@@ -2242,7 +2242,7 @@ mod tests {
             "oversized approved plan should surface the task fan-out limit: {err}"
         );
         assert!(
-            manager.snapshot().await.is_empty(),
+            manager.snapshot().await.unwrap().is_empty(),
             "rejected oversized plan should not leave partial task-board work"
         );
     }
@@ -2310,7 +2310,7 @@ mod tests {
             err.contains("title") && err.contains("exceeds"),
             "original create validation error should be surfaced: {err}"
         );
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -2351,7 +2351,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(tasks.len(), 2, "{tasks:?}");
         assert!(
             tasks.iter().any(|task| {
@@ -2415,7 +2415,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -2482,7 +2482,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -2527,7 +2527,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(tasks.len(), 2, "{tasks:?}");
         let task = tasks
             .iter()
@@ -2583,7 +2583,7 @@ mod tests {
         .await
         .unwrap();
 
-        let completed = manager.snapshot().await;
+        let completed = manager.snapshot().await.unwrap();
         assert_eq!(
             completed
                 .iter()
@@ -2607,7 +2607,7 @@ mod tests {
             "redo of completed task-board history should fail closed: {error}"
         );
 
-        let after_redo = manager.snapshot().await;
+        let after_redo = manager.snapshot().await.unwrap();
         assert_eq!(
             after_redo
                 .iter()
@@ -2634,7 +2634,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            manager.snapshot().await.is_empty(),
+            manager.snapshot().await.unwrap().is_empty(),
             "status sync should not auto-create task-board work"
         );
     }
@@ -2693,7 +2693,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(tasks.len(), 2, "{tasks:?}");
         let first = tasks
             .iter()
@@ -2765,7 +2765,7 @@ mod tests {
             err.contains("title") && err.contains("exceeds"),
             "original create validation error should be surfaced: {err}"
         );
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -2832,7 +2832,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -2914,7 +2914,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -2978,7 +2978,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = manager.snapshot().await;
+        let tasks = manager.snapshot().await.unwrap();
         assert_eq!(tasks.len(), 2, "{tasks:?}");
         assert_eq!(
             tasks
@@ -3045,7 +3045,7 @@ mod tests {
             .unwrap();
         }
 
-        let completed = manager.snapshot().await;
+        let completed = manager.snapshot().await.unwrap();
         assert_eq!(
             completed
                 .iter()
@@ -3069,7 +3069,7 @@ mod tests {
             "MatrixOne redo of completed task-board history should fail closed: {error}"
         );
 
-        let after_redo = manager.snapshot().await;
+        let after_redo = manager.snapshot().await.unwrap();
         assert_eq!(
             after_redo
                 .iter()

@@ -261,6 +261,10 @@ impl TaskStore for HttpTaskStore {
         Err("HttpTaskStore: id allocation is server-side".into())
     }
 
+    async fn set_next_task_id(&self, _session_id: &str, _next: u32) -> Result<(), String> {
+        Err("HttpTaskStore: id counter is server-side".into())
+    }
+
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
         Some(self.notify_tx.subscribe())
     }

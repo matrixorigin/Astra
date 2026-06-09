@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 /// Live child + streams transferred from the bash runner to the
 /// background registry on Ctrl+B promotion. `partial_stdout` /
@@ -40,29 +41,27 @@ pub struct DetachedShellPayload {
     pub partial_stderr: String,
 }
 
-/// One-shot handle the bash runner uses to report a successful
-/// detach back to the TUI. The TUI keeps the [`oneshot::Receiver`]
-/// half before invoking the bash tool; the runner takes the
-/// [`oneshot::Sender`] half on detach signal and transfers ownership
-/// of [`DetachedShellPayload`] through it.
+/// One-shot handle the bash runner uses to observe a detach request
+/// and report a successful detach back to the TUI. Uses a watch channel
+/// for the TUI→runner signal (so the runner can borrow it in select!)
+/// and a oneshot for the runner→TUI payload reply. Both are wrapped
+/// so the runner takes them atomically on entry.
 pub struct DetachShellHandle {
-    /// Trigger the bash runner to detach. The runner observes
-    /// `signal.notified()` (or equivalent) and stops reading.
-    pub signal: Arc<tokio::sync::Notify>,
-    /// One-shot reply channel for the runner to report the live
-    /// child + streams. `Mutex<Option<...>>` so the receiver side
-    /// can take it; sender is moved out by the runner at signal
-    /// time. If the runner never signals (turn completes normally,
-    /// times out, or is cancelled), the sender drops and the
-    /// receiver observes a closed channel.
+    /// Watch receiver: the TUI writes `true` on Ctrl+B. The runner
+    /// borrows `&mut self` in select! — no ownership transfer needed.
+    pub signal_rx: Arc<Mutex<Option<watch::Receiver<bool>>>>,
+    /// One-shot reply channel for the runner to transfer the live
+    /// child + streams back to the TUI.
     pub payload_tx: Arc<Mutex<Option<oneshot::Sender<DetachedShellPayload>>>>,
 }
 
-/// TUI-side end of the detach plumbing. Owns the receiver half so
-/// it can `await` the payload after firing the signal.
+/// TUI-side end of the detach plumbing. Writes `true` to `signal_tx`
+/// on Ctrl+B, then awaits `payload_rx` for the live child + streams.
 pub struct DetachShellListener {
+    /// Signal to the bash runner: begin detach.
+    pub signal_tx: watch::Sender<bool>,
+    /// Receive the detached child + streams from the runner.
     pub payload_rx: oneshot::Receiver<DetachedShellPayload>,
-    pub signal: Arc<tokio::sync::Notify>,
 }
 
 /// Renewable slot the TUI installs on `ToolContext`. The bash runner
@@ -87,15 +86,15 @@ pub fn new_slot_with_handle() -> (DetachShellSlot, DetachShellListener) {
 /// the [`DetachShellListener`] until either Ctrl+B fires or the
 /// turn ends.
 pub fn new_detach_pair() -> (DetachShellHandle, DetachShellListener) {
-    let (tx, rx) = oneshot::channel::<DetachedShellPayload>();
-    let signal = Arc::new(tokio::sync::Notify::new());
+    let (payload_tx, payload_rx) = oneshot::channel::<DetachedShellPayload>();
+    let (signal_tx, signal_rx) = watch::channel(false);
     let handle = DetachShellHandle {
-        signal: signal.clone(),
-        payload_tx: Arc::new(Mutex::new(Some(tx))),
+        signal_rx: Arc::new(Mutex::new(Some(signal_rx))),
+        payload_tx: Arc::new(Mutex::new(Some(payload_tx))),
     };
     let listener = DetachShellListener {
-        payload_rx: rx,
-        signal,
+        signal_tx,
+        payload_rx,
     };
     (handle, listener)
 }
@@ -106,17 +105,15 @@ mod tests {
 
     /// Sanity: pair construction yields linked signal halves and
     /// a oneshot pair where dropping the handle without taking the
-    /// sender closes the receiver promptly.
+    /// sender closes the payload receiver promptly. The signal_tx
+    /// lives on the listener side (TUI), so dropping just the handle
+    /// must still close the payload receiver.
     #[tokio::test]
     async fn dropping_handle_without_signal_closes_listener_channel() {
         let (handle, listener) = new_detach_pair();
-        // Same Notify instance — `notify_one()` on the handle side
-        // is observable on the listener side.
-        handle.signal.notify_one();
-        // Just exercise the await path; we don't care about the
-        // notification firing first vs the drop closing the rx.
+        // Drop the handle side — the payload sender goes with it.
         drop(handle);
-        // The receiver observes channel closure (sender dropped).
+        // The payload receiver observes channel closure (sender dropped).
         let result = listener.payload_rx.await;
         assert!(
             result.is_err(),

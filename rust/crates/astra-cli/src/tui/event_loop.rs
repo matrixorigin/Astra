@@ -1911,7 +1911,10 @@ pub(crate) async fn run_tui_session(
                                                             {
                                                                 let listener = bash_detach_listener.take();
                                                                 if let Some(listener) = listener {
-                                                                    listener.signal.notify_one();
+                                                                    // Fire the watch signal to request detach.
+                                                                    // If the runner already completed, send
+                                                                    // fails silently — the handler moves on.
+                                                                    let _ = listener.signal_tx.send(true);
                                                                     // Wait briefly for the runner to ship
                                                                     // the live child + streams payload.
                                                                     // 500ms is comfortably more than the

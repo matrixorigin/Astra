@@ -2565,7 +2565,7 @@ mod tests {
         );
 
         assert!(
-            target.snapshot().await.is_empty(),
+            target.snapshot().await.unwrap().is_empty(),
             "refused terminal adopt must not create a target clone"
         );
 

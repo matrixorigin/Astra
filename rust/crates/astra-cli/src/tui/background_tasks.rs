@@ -367,7 +367,14 @@ impl BackgroundTaskRegistry {
     }
 
     /// Drain the JoinSet without consuming pending_completions.
-    /// Updates handle status and pushes events to the queue.
+    /// Collect all completed `JoinSet` futures and push terminal events
+    /// into `pending_completions`. Must be called before any method that
+    /// reads task state (`kill`, `latest_job_id`, `render_job_list_xml`,
+    /// `poll_completions`, etc.) to ensure handles reflect the latest
+    /// runner-reported status.
+    ///
+    /// Idempotent: safe to call multiple times per tick; only new
+    /// completions are collected.
     pub fn drain_join_set(&mut self) {
         while let Some(result) = self.join_set.try_join_next() {
             match result {
@@ -401,6 +408,7 @@ impl BackgroundTaskRegistry {
 
     /// Kill all running tasks. Returns IDs of killed tasks.
     pub fn kill_all(&mut self) -> Vec<String> {
+        self.drain_join_set();
         let ids: Vec<String> = self
             .tasks
             .iter()
@@ -476,6 +484,7 @@ impl BackgroundTaskRegistry {
 
     /// Check all running shell tasks for stalls (no output growth for STALL_THRESHOLD).
     pub fn stall_check(&mut self) {
+        self.drain_join_set();
         let mut stall_events = Vec::new();
         for handle in self.tasks.values_mut() {
             if handle.status().is_terminal() {

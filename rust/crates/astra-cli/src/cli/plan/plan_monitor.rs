@@ -1128,19 +1128,15 @@ async fn sync_task_board_subtask_status(
     subtask_id: &str,
     status: astra_services::task_orchestrator::TaskStatus,
 ) -> Result<(), String> {
-    let task = state
-        .task_manager
-        .snapshot()
-        .await
-        .into_iter()
-        .find(|task| {
-            crate::cli::plan::plan_task_board::approved_plan_step_task_matches(
-                task,
-                goal,
-                plan_fingerprint,
-                subtask_id,
-            )
-        });
+    let tasks = state.task_manager.snapshot().await.unwrap_or_default();
+    let task = tasks.into_iter().find(|task| {
+        crate::cli::plan::plan_task_board::approved_plan_step_task_matches(
+            task,
+            goal,
+            plan_fingerprint,
+            subtask_id,
+        )
+    });
 
     let Some(task) = task else {
         return Ok(());
@@ -1332,7 +1328,7 @@ mod tests {
 
         sync_task_board_from_executing_plan(&state).await;
 
-        let tasks = state.task_manager.snapshot().await;
+        let tasks = state.task_manager.snapshot().await.unwrap();
         let stale_task = tasks
             .iter()
             .find(|task| task.title == "old step")
@@ -1381,7 +1377,7 @@ mod tests {
 
         sync_task_board_from_executing_plan(&state).await;
 
-        let tasks = state.task_manager.snapshot().await;
+        let tasks = state.task_manager.snapshot().await.unwrap();
         let old_task = tasks
             .iter()
             .find(|task| task.title == "shared step")
