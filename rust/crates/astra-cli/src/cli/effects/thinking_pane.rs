@@ -157,12 +157,6 @@ impl ThinkingPreviewPane {
         self.region.clear();
         self.buffer.clear();
     }
-
-    /// Return the number of lines currently displayed.
-    #[allow(dead_code)]
-    pub fn height(&self) -> usize {
-        self.region.height()
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════ Helpers ══

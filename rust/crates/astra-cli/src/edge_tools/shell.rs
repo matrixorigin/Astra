@@ -3457,7 +3457,6 @@ fn run_command_streaming(
 }
 
 /// Result from streaming command execution.
-#[allow(dead_code)]
 struct StreamingResult {
     output: String,
     exit_code: i32,
