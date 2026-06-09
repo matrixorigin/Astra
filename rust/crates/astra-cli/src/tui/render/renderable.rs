@@ -6,8 +6,6 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use super::{Insets, RectExt as _};
-
 pub(crate) trait Renderable {
     fn render(&self, area: Rect, buf: &mut Buffer);
     fn desired_height(&self, width: u16) -> u16;
@@ -165,40 +163,5 @@ impl<'a> Renderable for FlexRenderable<'a> {
             .into_iter()
             .zip(self.children.iter())
             .find_map(|(rect, child)| child.child.cursor_pos(rect))
-    }
-}
-
-// ── InsetRenderable (from Codex) ────────────────────────────────────────────
-
-pub(crate) struct InsetRenderable<'a> {
-    child: RenderableItem<'a>,
-    insets: Insets,
-}
-
-impl<'a> Renderable for InsetRenderable<'a> {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.child.render(area.inset(self.insets), buf);
-    }
-    fn desired_height(&self, width: u16) -> u16 {
-        self.child
-            .desired_height(width.saturating_sub(self.insets.left + self.insets.right))
-            + self.insets.top
-            + self.insets.bottom
-    }
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        self.child.cursor_pos(area.inset(self.insets))
-    }
-}
-
-pub(crate) trait RenderableExt<'a> {
-    fn inset(self, insets: Insets) -> RenderableItem<'a>;
-}
-
-impl<'a> RenderableExt<'a> for RenderableItem<'a> {
-    fn inset(self, insets: Insets) -> RenderableItem<'a> {
-        RenderableItem::Owned(Box::new(InsetRenderable {
-            child: self,
-            insets,
-        }))
     }
 }
