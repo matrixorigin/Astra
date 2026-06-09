@@ -848,7 +848,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         \n\
         ## When to Use\n\
         - 3 or more distinct outcomes, files, or phases.\n\
-        - Approved plans or delegated/background work.\n\
+        - Approved plans or delegated work with deliverables.\n\
         - Scope expands.\n\
         \n\
         1. Create one task per outcome or phase — NOT one umbrella task for the whole request.\n\
