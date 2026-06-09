@@ -355,7 +355,7 @@ mod tests {
             ("interruption_kind", serde_json::json!("budget_exhausted")),
             (
                 "persistence_error",
-                serde_json::json!("write task output: permission denied"),
+                serde_json::json!("write job output: permission denied"),
             ),
         ]);
         let surface = task_checkpoint_surface(&checkpoint);
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(surface.interruption_kind, Some("budget_exhausted"));
         assert_eq!(
             surface.persistence_error,
-            Some("write task output: permission denied")
+            Some("write job output: permission denied")
         );
     }
 

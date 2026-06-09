@@ -66,7 +66,7 @@ pub(crate) enum BgTaskEvent {
     },
 }
 
-/// Result collected when a background task's future completes.
+/// Result collected when a background job's future completes.
 struct TaskCompletion {
     id: String,
     status: BgTaskStatus,
@@ -303,7 +303,7 @@ impl BackgroundTaskRegistry {
         id
     }
 
-    /// Kill a background task by ID.
+    /// Kill a background job by ID.
     pub fn kill(&mut self, id: &str) -> Result<(), String> {
         // Drain any completed futures into pending_completions so we
         // have accurate status. Use the internal drain helper that
@@ -313,9 +313,9 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background job with id '{id}'"))?;
         if handle.status().is_terminal() {
-            return Err(format!("task '{id}' already terminated"));
+            return Err(format!("job '{id}' already terminated"));
         }
         // Only signal cancellation. The runner observes this via
         // `cancel.cancelled()`, kills the child, and emits its own
@@ -353,7 +353,7 @@ impl BackgroundTaskRegistry {
                     self.pending_completions.push(event);
                 }
                 Err(e) => {
-                    tracing::warn!("background task join error: {e}");
+                    tracing::warn!("background job join error: {e}");
                 }
             }
         }
@@ -378,7 +378,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background job with id '{id}'"))?;
         read_tail_str(&handle.stdout_path, tail_bytes)
     }
 
@@ -393,7 +393,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background job with id '{id}'"))?;
         read_from_str(&handle.stdout_path, offset, max_bytes)
     }
 
@@ -402,7 +402,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background job with id '{id}'"))?;
         read_tail_str(&handle.stderr_path, tail_bytes)
     }
 
@@ -457,7 +457,7 @@ impl BackgroundTaskRegistry {
                     stall_events.push(BgTaskEvent::Failed {
                         id: handle.id.clone(),
                         error: format!(
-                            "background task output exceeded {} bytes; task was terminated",
+                            "background job output exceeded {} bytes; job was terminated",
                             MAX_OUTPUT_BYTES
                         ),
                     });
@@ -1236,7 +1236,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("yes 'aaaaaaaaaa'", "large output");
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
-            let handle = reg.tasks.get(&id).expect("background task handle");
+            let handle = reg.tasks.get(&id).expect("background job handle");
             let stdout_size = std::fs::metadata(&handle.stdout_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -1246,7 +1246,7 @@ mod tests {
             stdout_size.saturating_add(stderr_size) > MAX_OUTPUT_BYTES
         })
         .await
-        .expect("background task should exceed output cap");
+        .expect("background job should exceed output cap");
         reg.stall_check();
 
         let events = reg.poll_completions();
@@ -1323,7 +1323,7 @@ mod tests {
             Ok(stat) => !stat.contains(") Z "),
             Err(_) => nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok(),
         };
-        assert!(!alive, "descendant pid {pid} survived background task kill");
+        assert!(!alive, "descendant pid {pid} survived background job kill");
     }
 
     // ── TDD: progress events ────────────────────────────────────

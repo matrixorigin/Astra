@@ -65,7 +65,7 @@ async fn persist_background_task_result(
                     svc,
                     task_id,
                     "persistence_error",
-                    format!("failed to mark background task finalized: {error}"),
+                    format!("failed to mark background job finalized: {error}"),
                 )
                 .await);
             }
@@ -79,7 +79,7 @@ async fn persist_background_task_result(
                     svc,
                     task_id,
                     "persistence_error",
-                    format!("failed to mark background task finalized: {error}"),
+                    format!("failed to mark background job finalized: {error}"),
                 )
                 .await);
             }
@@ -314,7 +314,7 @@ pub(crate) async fn handle_task_command(
             };
             let short_id = task_id[..8.min(task_id.len())].to_string();
 
-            // Clone owned values for the background task
+            // Clone owned values for the background job
             let api_clone = api.clone();
             let prompt = sub_arg.to_string();
             let bg_profile = profile.map(ToString::to_string);
@@ -352,7 +352,7 @@ pub(crate) async fn handle_task_command(
                 "Use /job status or /job result to check progress.".dim()
             );
 
-            // Spawn background task
+            // Spawn background job
             let bg_task_id = task_id.clone();
             tokio::spawn(async move {
                 // Mark in-progress
@@ -974,7 +974,7 @@ mod tests {
                 ),
                 (
                     "persistence_error".to_string(),
-                    serde_json::json!("write task output: permission denied"),
+                    serde_json::json!("write job output: permission denied"),
                 ),
             ]),
         };
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(checkpoint.interruption_kind, Some("budget_exhausted"));
         assert_eq!(
             checkpoint.persistence_error,
-            Some("write task output: permission denied")
+            Some("write job output: permission denied")
         );
     }
 

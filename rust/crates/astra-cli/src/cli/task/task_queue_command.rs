@@ -1,5 +1,5 @@
 use crate::cli::arg_render::join_words;
-use crate::cli::cli_config::cli_args::TaskQueueArgs;
+use crate::cli::cli_config::cli_args::JobQueueArgs;
 use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::cli_config::cli_utils::{cli_user_id, prefix_chars};
 use crate::cli::exit_code::ExitCode;
@@ -8,13 +8,13 @@ use crate::cli::task::task_command_utils::task_run_title;
 use crate::cli::theme;
 use crossterm::style::Stylize;
 
-pub(crate) async fn execute_task_queue(
-    args: TaskQueueArgs,
+pub(crate) async fn execute_job_queue(
+    args: JobQueueArgs,
     cli_context: &CliContext,
 ) -> Result<ExitCode, String> {
     let prompt = join_words(&args.text);
     if prompt.trim().is_empty() {
-        return Err("task prompt cannot be empty".to_string());
+        return Err("job prompt cannot be empty".to_string());
     }
 
     // This CLI subcommand has no profile in scope. Token resolution is env-only;
@@ -52,7 +52,7 @@ pub(crate) async fn execute_task_queue(
         );
     } else {
         eprintln!(
-            "  {} Cloud task queued: {} ({})",
+            "  {} Cloud job queued: {} ({})",
             theme::icon_ok(),
             prompt.chars().take(50).collect::<String>(),
             prefix_chars(&task_id, 8).dim()

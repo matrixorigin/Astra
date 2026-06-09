@@ -1276,7 +1276,7 @@ pub(crate) async fn handle_session_command(
                     if task_board_restore == ForkTaskBoardRestore::SkippedCloudObserver {
                         eprintln!(
                             "  {}",
-                            "Cloud task board was not copied into the fork; use task(action='list_user') and task(action='adopt', source_session_id=..., task_id=...) to bring open work into this child session."
+                            "Session task board was not copied into the fork; use task(action='list_user') and task(action='adopt', source_session_id=..., task_id=...) to bring open work into this child session."
                                 .yellow()
                         );
                     } else if task_board_restore == ForkTaskBoardRestore::PreservedExistingChild {
@@ -5312,7 +5312,7 @@ async fn apply_prepared_fork_restore(
             None
         }
     } else {
-        // Cloud task inheritance belongs behind the server write surface;
+        // Session task-board inheritance belongs behind the server write surface;
         // the CLI's HttpTaskStore is a read-only observer.
         None
     };
@@ -8449,7 +8449,7 @@ mod resume_tests {
             .await;
         assert!(
             child_list.starts_with("No tasks"),
-            "cloud task inheritance must be handled by the server write surface, not the read-only observer: {child_list}"
+            "session task-board inheritance must be handled by the server write surface, not the read-only observer: {child_list}"
         );
     }
 }

@@ -156,7 +156,7 @@ async fn cloud_task_notify_only_fires_for_successful_mutations() {
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ),
-        "refused cloud task.update must not wake the task-board observer"
+        "refused session task-board update must not wake the observer"
     );
 
     let updated = exe

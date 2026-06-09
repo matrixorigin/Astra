@@ -564,13 +564,13 @@ pub struct ToolExecutor {
     /// In-memory task manager for the current session.
     task_manager: std::sync::Arc<task_mgmt::TaskManager>,
     /// Broadcast sender that signals the TaskBoardObserver after a
-    /// successful cloud task mutation. Payload is the session_id that
+    /// successful session task-board mutation. Payload is the session_id that
     /// changed. `None` when offline (in-memory store handles its own
     /// notifications via `InMemoryTaskStore::subscribe`).
     pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
-    /// Command queue for background task operations. Drained by the
+    /// Command queue for background job operations. Drained by the
     /// TUI event loop each tick. Allows the tool executor (which runs
-    /// inside the agentic loop) to spawn/kill background tasks without
+    /// inside the agentic loop) to spawn/kill background jobs without
     /// owning the registry directly.
     ///
     /// `None` when no TUI/REPL is attached — in that case background
@@ -2107,7 +2107,7 @@ impl ToolExecutor {
 
     async fn task_background_shell(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
+            return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
                     Use the regular `bash` tool for foreground shell commands, or run inside the interactive REPL \
                     (`astra`) to access background_shell."
                 .to_string();
@@ -2133,9 +2133,9 @@ impl ToolExecutor {
         }
         match rx.await {
             Ok(id) => format!(
-                "Background task started: {id}\nUse agent_job(action='output', task_id='{id}') to check progress or agent_job(action='kill', task_id='{id}') to stop."
+                "Background job started: {id}\nUse agent_job(action='output', task_id='{id}') to check progress or agent_job(action='kill', task_id='{id}') to stop."
             ),
-            Err(_) => "Error: background task registry not available".to_string(),
+            Err(_) => "Error: background job registry not available".to_string(),
         }
     }
 
@@ -2172,7 +2172,7 @@ impl ToolExecutor {
 
     async fn task_output(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
+            return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
                     `agent_job(action='output')` only works for jobs spawned via `agent_job(action='shell')` \
                     inside the interactive REPL."
                 .to_string();
@@ -2211,7 +2211,7 @@ impl ToolExecutor {
                 let is_terminal = match status_rx.await {
                     Ok(Ok(t)) => t,
                     Ok(Err(e)) => return format!("Error: {e}"),
-                    Err(_) => return "Error: background task registry not available".to_string(),
+                    Err(_) => return "Error: background job registry not available".to_string(),
                 };
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2236,11 +2236,11 @@ impl ToolExecutor {
                         }
                     }
                     Ok(Err(e)) => return format!("Error: {e}"),
-                    Err(_) => return "Error: background task registry not available".to_string(),
+                    Err(_) => return "Error: background job registry not available".to_string(),
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return format!(
-                        "<task_output task_id=\"{task_id}\" status=\"timeout\">\nTask still running after {timeout_ms}ms.\n</task_output>"
+                        "<task_output task_id=\"{task_id}\" status=\"timeout\">\nJob still running after {timeout_ms}ms.\n</task_output>"
                     );
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2263,14 +2263,14 @@ impl ToolExecutor {
                     )
                 }
                 Ok(Err(e)) => format!("Error: {e}"),
-                Err(_) => "Error: background task registry not available".to_string(),
+                Err(_) => "Error: background job registry not available".to_string(),
             }
         }
     }
 
     async fn task_kill_bg(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
+            return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
                     Nothing to kill — background_shell is unavailable outside the interactive REPL."
                 .to_string();
         };
@@ -2287,9 +2287,9 @@ impl ToolExecutor {
             });
         }
         match rx.await {
-            Ok(Ok(())) => format!("Background task {task_id} killed."),
+            Ok(Ok(())) => format!("Background job {task_id} killed."),
             Ok(Err(e)) => format!("Error: {e}"),
-            Err(_) => "Error: background task registry not available".to_string(),
+            Err(_) => "Error: background job registry not available".to_string(),
         }
     }
 

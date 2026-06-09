@@ -884,7 +884,7 @@ pub(crate) async fn run_tui_session(
         chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
     }
 
-    // Resume-time summary: surface background tasks that reached
+    // Resume-time summary: surface background jobs that reached
     // terminal state while the user was away. One ResumeSummary
     // rollup becomes a single banner cell at the top of scrollback
     // — it comes AFTER the replay so the banner is the last thing
@@ -3183,7 +3183,7 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
-                // Drain background task commands from the tool executor.
+                // Drain background job commands from the tool executor.
                 {
                     let cmds: Vec<_> = {
                         state.bg_task_commands.lock_recover().drain(..).collect()
@@ -3223,7 +3223,7 @@ pub(crate) async fn run_tui_session(
                                             | crate::tui::background_tasks::BgTaskStatus::Failed
                                             | crate::tui::background_tasks::BgTaskStatus::Killed
                                     )),
-                                    None => Err(format!("no background task with id '{task_id}'")),
+                                    None => Err(format!("no background job with id '{task_id}'")),
                                 };
                                 let _ = reply.send(result);
                             }
@@ -3231,7 +3231,7 @@ pub(crate) async fn run_tui_session(
                     }
                 }
 
-                // Poll background task completions.
+                // Poll background job completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
                     let notification = super::background_tasks::format_notification_xml(ev);
@@ -3240,16 +3240,16 @@ pub(crate) async fn run_tui_session(
                     }
                     let msg = match ev {
                         super::background_tasks::BgTaskEvent::Completed { id, summary, .. } => {
-                            Some(format!("Background task {id} completed: {summary}"))
+                            Some(format!("Background job {id} completed: {summary}"))
                         }
                         super::background_tasks::BgTaskEvent::Failed { id, error } => {
-                            Some(format!("Background task {id} failed: {error}"))
+                            Some(format!("Background job {id} failed: {error}"))
                         }
                         super::background_tasks::BgTaskEvent::Stalled { id, .. } => {
-                            Some(format!("Background task {id} may be stalled (waiting for input)"))
+                            Some(format!("Background job {id} may be stalled (waiting for input)"))
                         }
                         super::background_tasks::BgTaskEvent::Killed { id } => {
-                            Some(format!("Background task {id} killed"))
+                            Some(format!("Background job {id} killed"))
                         }
                         _ => None,
                     };
@@ -3294,7 +3294,7 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
-    // Clean up background tasks on exit.
+    // Clean up background jobs on exit.
     background_registry.kill_all();
     drop(guard);
     result

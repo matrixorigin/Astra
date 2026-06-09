@@ -439,7 +439,7 @@ pub trait TaskService: Send + Sync {
 
     /// Mark a non-plan task as completed with an explicit outcome.
     ///
-    /// Used by one-shot and background task runs where the task has no
+    /// Used by one-shot and background job runs where the task has no
     /// subtask progress but may still finish partially.
     async fn complete_task_with_outcome(
         &self,
@@ -450,7 +450,7 @@ pub trait TaskService: Send + Sync {
     /// Mark a plan-run task finished with explicit progress and learning outcome.
     ///
     /// Sets `status = completed`, `completed_at`, and `outcome` (e.g. `success` vs `partial`).
-    /// Used when the background plan executor finishes so `/task list` matches delivery state.
+    /// Used when the background plan executor finishes so job status matches delivery state.
     async fn complete_plan_run(
         &self,
         task_id: &str,

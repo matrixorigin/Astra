@@ -410,7 +410,7 @@ mod tests {
                 ),
                 (
                     "persistence_error".to_string(),
-                    serde_json::json!("write task output: permission denied"),
+                    serde_json::json!("write job output: permission denied"),
                 ),
             ]),
         });

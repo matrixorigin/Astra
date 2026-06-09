@@ -477,9 +477,9 @@ mod tests {
     use cli::auth_flow::{do_login, do_register};
     use cli::cli_config::cli_args::{
         AgentSubcommand, AuditCmd, AuditShowArgs, AuditToolsArgs, BugSubcommand, Command,
-        ConfigCmd, DiffSubcommand, McpCmd, MemorySubcommand, MessagingArgs, MessagingSubcommand,
-        PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd, SessionShowArgs,
-        TaskSubcommand, TeamSubcommand,
+        ConfigCmd, DiffSubcommand, JobSubcommand, McpCmd, MemorySubcommand, MessagingArgs,
+        MessagingSubcommand, PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd,
+        SessionShowArgs, TeamSubcommand,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, prefix_chars, save_credentials,
@@ -2901,7 +2901,7 @@ total_tokens_out: 500
         let cli = Cli::try_parse_from(["astra", "job", "run", "fix", "login", "page"]).unwrap();
         match cli.command {
             Some(Command::Job(args)) => match args.command {
-                Some(TaskSubcommand::Run(run)) => {
+                Some(JobSubcommand::Run(run)) => {
                     assert_eq!(run.text, vec!["fix", "login", "page"]);
                 }
                 other => panic!("unexpected job subcommand: {other:?}"),

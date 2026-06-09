@@ -1,12 +1,12 @@
 use crate::cli::arg_render::{
     apply_system_prompt, join_words, render_agent_args, render_bug_args, render_debug_args,
-    render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
-    render_permissions_args, render_review_args, render_task_args, render_team_args,
+    render_diff_args, render_grep_args, render_job_args, render_memory_args, render_messaging_args,
+    render_permissions_args, render_review_args, render_team_args,
 };
 use crate::cli::auth_flow::{clear_profile_auth, do_login, do_register, is_auth_error};
 use crate::cli::cli_config::cli_args::{
-    AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
-    TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
+    AuditCmd, Cli, Command, JobRunArgs, JobSubcommand, JobWorkerArgs, JournalCmd, ModelCmd,
+    SessionCaptureCmd, SessionCmd, SkillCmd,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -629,8 +629,8 @@ async fn execute_headless_task_body(
     Ok(exit_code)
 }
 
-async fn execute_headless_task_run(
-    args: TaskRunArgs,
+async fn execute_headless_job_run(
+    args: JobRunArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -640,7 +640,7 @@ async fn execute_headless_task_run(
 
     let prompt = join_words(&args.text);
     if prompt.trim().is_empty() {
-        return Err("task prompt cannot be empty".to_string());
+        return Err("job prompt cannot be empty".to_string());
     }
 
     let session_routing =
@@ -691,15 +691,15 @@ async fn execute_headless_task_run(
 
 /// Outcome of a single worker poll. `Interrupted` lets the outer
 /// `--loop` driver tell a user-initiated Ctrl+C apart from a normal
-/// "task done" cycle, so the loop exits promptly instead of requiring
+/// "job done" cycle, so the loop exits promptly instead of requiring
 /// a second Ctrl+C during the poll-interval sleep.
 enum WorkerOutcome {
     Completed(ExitCode),
     Interrupted,
 }
 
-async fn execute_task_worker_once(
-    args: &TaskWorkerArgs,
+async fn execute_job_worker_once(
+    args: &JobWorkerArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -727,7 +727,7 @@ async fn execute_task_worker_once(
                     );
                 } else if !args.quiet {
                     eprintln!(
-                        "  {} Claimed cloud task {} as {}",
+                        "  {} Claimed cloud job {} as {}",
                         "▶".cyan(),
                         prefix_chars(&grant.task_id, 8).dim(),
                         agent_id.as_str().cyan()
@@ -788,10 +788,10 @@ async fn execute_task_worker_once(
             metrics: None,
         });
 
-    // Honour Ctrl+C during long-running task execution. Without this the
-    // worker has to wait for the task body to finish, which can be
+    // Honour Ctrl+C during long-running job execution. Without this the
+    // worker has to wait for the job body to finish, which can be
     // minutes; users expect interrupt to be prompt. On Ctrl+C we fall
-    // through to release_lease so the task is freed for another worker.
+    // through to release_lease so the job is freed for another worker.
     // `interrupted` lets the outer --loop driver exit cleanly instead
     // of requiring a second Ctrl+C during the poll-interval sleep.
     let (body_result, interrupted): (Result<ExitCode, String>, bool) = tokio::select! {
@@ -824,7 +824,7 @@ async fn execute_task_worker_once(
         } => (res, false),
         _ = tokio::signal::ctrl_c() => {
             if !args.quiet && !args.json {
-                eprintln!("  {}", "Task interrupted — releasing lease.".dim());
+                eprintln!("  {}", "Job interrupted — releasing lease.".dim());
             }
             (Ok(ExitCode::Success), true)
         }
@@ -855,8 +855,8 @@ async fn execute_task_worker_once(
     })
 }
 
-async fn execute_task_worker(
-    args: TaskWorkerArgs,
+async fn execute_job_worker(
+    args: JobWorkerArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -866,15 +866,14 @@ async fn execute_task_worker(
         return Err("choose --once or --loop for job worker".to_string());
     }
     if args.once {
-        return match execute_task_worker_once(&args, profile, global_model, api, cli_context)
-            .await?
+        return match execute_job_worker_once(&args, profile, global_model, api, cli_context).await?
         {
             WorkerOutcome::Completed(code) => Ok(code),
             WorkerOutcome::Interrupted => Ok(ExitCode::Success),
         };
     }
     loop {
-        match execute_task_worker_once(&args, profile, global_model, api, cli_context).await? {
+        match execute_job_worker_once(&args, profile, global_model, api, cli_context).await? {
             WorkerOutcome::Completed(code) if code != ExitCode::Success => return Ok(code),
             WorkerOutcome::Completed(_) => {}
             // User Ctrl+C'd mid-task — exit the loop now so they don't
@@ -1412,8 +1411,8 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Job(mut args)) => match args.command.take() {
-            Some(TaskSubcommand::Run(run_args)) => {
-                execute_headless_task_run(
+            Some(JobSubcommand::Run(run_args)) => {
+                execute_headless_job_run(
                     run_args,
                     profile.as_deref(),
                     global_model.as_deref(),
@@ -1422,12 +1421,12 @@ pub(crate) async fn execute_cli_command(
                 )
                 .await
             }
-            Some(TaskSubcommand::Queue(queue_args)) => {
-                crate::cli::task::task_queue_command::execute_task_queue(queue_args, cli_context)
+            Some(JobSubcommand::Queue(queue_args)) => {
+                crate::cli::task::task_queue_command::execute_job_queue(queue_args, cli_context)
                     .await
             }
-            Some(TaskSubcommand::Worker(worker_args)) => {
-                execute_task_worker(
+            Some(JobSubcommand::Worker(worker_args)) => {
+                execute_job_worker(
                     worker_args,
                     profile.as_deref(),
                     global_model.as_deref(),
@@ -1436,13 +1435,13 @@ pub(crate) async fn execute_cli_command(
                 )
                 .await
             }
-            Some(TaskSubcommand::Result(result_args)) => {
-                crate::cli::task::task_result_command::execute_task_result(result_args).await
+            Some(JobSubcommand::Result(result_args)) => {
+                crate::cli::task::task_result_command::execute_job_result(result_args).await
             }
             _ => {
                 execute_repl_bridge_command(
                     "/job",
-                    &render_task_args(&args),
+                    &render_job_args(&args),
                     profile.as_deref(),
                     global_model.as_deref(),
                     api,
@@ -3659,10 +3658,10 @@ mod task_run_projection_tests {
     fn failed_task_notification_payload_carries_failure_detail() {
         let payload = failed_task_notification_payload(
             "task-12345678",
-            "write task output: permission denied",
+            "write job output: permission denied",
             "persistence_error",
             None,
-            Some("write task output: permission denied"),
+            Some("write job output: permission denied"),
         );
 
         assert_eq!(payload["type"], "task_notification");
@@ -3670,10 +3669,10 @@ mod task_run_projection_tests {
         assert_eq!(payload["status"], "persistence_error");
         assert_eq!(payload["success"], false);
         assert_eq!(payload["error_kind"], "persistence_error");
-        assert_eq!(payload["summary"], "write task output: permission denied");
+        assert_eq!(payload["summary"], "write job output: permission denied");
         assert_eq!(
             payload["persistence_error"],
-            "write task output: permission denied"
+            "write job output: permission denied"
         );
         assert!(payload.get("output_file").is_none());
     }

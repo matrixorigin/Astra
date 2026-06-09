@@ -81,7 +81,7 @@ pub(crate) async fn finalize_effective_line(
             .collect::<Vec<_>>()
             .join("\n");
         effective_line = format!(
-            "<system-reminder>\nBackground task updates since your last turn:\n{notifications}\n</system-reminder>\n\n{effective_line}"
+            "<system-reminder>\nBackground job updates since your last turn:\n{notifications}\n</system-reminder>\n\n{effective_line}"
         );
     }
 
@@ -579,7 +579,7 @@ mod tests {
         .await;
 
         assert!(finalized.starts_with("Resume the interrupted task."));
-        assert!(finalized.contains("Background task updates since your last turn:"));
+        assert!(finalized.contains("Background job updates since your last turn:"));
         assert!(finalized.contains("job-1 done"));
         assert!(finalized.contains("job-2 failed"));
         assert!(state.pending_bg_notifications.is_empty());

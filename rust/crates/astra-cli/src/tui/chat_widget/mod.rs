@@ -668,7 +668,7 @@ impl ChatWidget {
         // the in-flight set so a follow-up Ctrl+C is a no-op (count=0,
         // no banner). Pre-fix the same ids stayed visible to the next
         // press; the task service rejected re-cancels and the user
-        // saw "Cancelled 1 background task." printed once per press
+        // saw "Cancelled 1 background job." printed once per press
         // until they all settled. Cancelling badges (the cancelling
         // map above) keep the strip showing "Cancelling…" until the
         // worker's terminal event prunes the rest.
@@ -678,7 +678,7 @@ impl ChatWidget {
     }
 
     /// Commit a single-line banner into scrollback confirming how
-    /// many background tasks were cancelled by the latest Ctrl+C.
+    /// many background jobs were cancelled by the latest Ctrl+C.
     /// No-op when `count == 0` so a normal Ctrl+C (no live tasks)
     /// doesn't clutter the transcript. Called by the event loop
     /// right after `cancel_fanout::fanout`.
@@ -692,7 +692,7 @@ impl ChatWidget {
     }
 
     /// Commit a resume-time summary banner telling the user what
-    /// background tasks finished while they were gone. Called once
+    /// background jobs finished while they were gone. Called once
     /// after replay_session_into_widget finishes, with the message
     /// pre-rendered by `resume_summary::ResumeSummary::render`.
     /// Info-styled because it's neutral history, not an alert.
@@ -2489,7 +2489,7 @@ mod tests {
 
     /// CRITICAL: a single Ctrl+C must take ALL live ids out of the
     /// in-flight set so a follow-up press doesn't re-target the same
-    /// tasks. Pre-fix users saw "Cancelled 1 background task." print
+    /// tasks. Pre-fix users saw "Cancelled 1 background job." print
     /// six times for one Ctrl+C burst — every press kept finding the
     /// same ids and the durable task service rejected the
     /// already-cancelled ones, so only one new acked-success per

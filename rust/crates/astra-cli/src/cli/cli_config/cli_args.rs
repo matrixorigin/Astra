@@ -213,7 +213,7 @@ pub(crate) enum Command {
     #[command(alias = "teams")]
     Team(TeamArgs),
     /// Local/cloud background job management
-    Job(TaskArgs),
+    Job(JobArgs),
     /// Memory search and inspection
     #[command(alias = "memories")]
     Memory(MemoryArgs),
@@ -505,40 +505,40 @@ pub(crate) struct TeamRestoreArgs {
 #[command(
     after_help = "Examples:\n  astra job list\n  astra job pending\n  astra job run 在当前目录补一个最小登录页\n  astra job result abc12345"
 )]
-pub(crate) struct TaskArgs {
+pub(crate) struct JobArgs {
     #[command(subcommand)]
-    pub command: Option<TaskSubcommand>,
+    pub command: Option<JobSubcommand>,
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum TaskSubcommand {
+pub(crate) enum JobSubcommand {
     /// List recent background jobs
     List,
     /// List claimable job queue (oldest first)
     Pending,
     /// Show job status and details
-    Status(TaskQueryArgs),
+    Status(JobQueryArgs),
     /// Run a headless background job with the agent
-    Run(TaskRunArgs),
+    Run(JobRunArgs),
     /// Queue an API-backed cloud job without executing it locally (cloud-agent ops)
     #[command(hide = true)]
-    Queue(TaskQueueArgs),
+    Queue(JobQueueArgs),
     /// Claim and execute queued API-backed cloud jobs (cloud-agent ops)
     #[command(hide = true)]
-    Worker(TaskWorkerArgs),
+    Worker(JobWorkerArgs),
     /// Show the result of a background job
-    Result(TaskResultArgs),
+    Result(JobResultArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskTextArgs {
+pub(crate) struct JobTextArgs {
     /// Job text or prompt
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub text: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskRunArgs {
+pub(crate) struct JobRunArgs {
     /// Output job result and metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -554,8 +554,8 @@ pub(crate) struct TaskRunArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskQueueArgs {
-    /// Output queued task metadata as JSON
+pub(crate) struct JobQueueArgs {
+    /// Output queued job metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
     /// Job prompt to queue
@@ -564,11 +564,11 @@ pub(crate) struct TaskQueueArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskWorkerArgs {
-    /// Edge agent identifier used for task leases
+pub(crate) struct JobWorkerArgs {
+    /// Edge agent identifier used for job leases
     #[arg(long)]
     pub agent_id: Option<String>,
-    /// Claim and execute at most one task, then exit
+    /// Claim and execute at most one job, then exit
     #[arg(long, default_value_t = false)]
     pub once: bool,
     /// Keep polling for work until interrupted
@@ -583,25 +583,25 @@ pub(crate) struct TaskWorkerArgs {
     /// Output lifecycle metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Suppress task output while the worker runs
+    /// Suppress job output while the worker runs
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
     /// Emit structured JSONL lifecycle/stream events to stderr while
-    /// executing the claimed task. Useful for a supervising process
+    /// executing the claimed job. Useful for a supervising process
     /// (e.g. cloud agent) to tail worker progress.
     #[arg(long = "stream-events", hide = true, default_value_t = false)]
     pub stream_events: bool,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskQueryArgs {
+pub(crate) struct JobQueryArgs {
     /// Job id or title query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskResultArgs {
+pub(crate) struct JobResultArgs {
     /// Output result as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
