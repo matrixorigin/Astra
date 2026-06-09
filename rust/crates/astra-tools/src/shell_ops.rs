@@ -426,9 +426,7 @@ struct SearchIgnoreRule {
 /// paths in any order.
 fn is_rm_recursive_force(lower: &str) -> bool {
     // Split into individual commands by shell operators.
-    let commands: Vec<&str> = lower
-        .split(|c: char| c == ';' || c == '|' || c == '&' || c == '\n' || c == '\r')
-        .collect();
+    let commands: Vec<&str> = lower.split([';', '|', '&', '\n', '\r']).collect();
 
     for cmd in commands {
         let args: Vec<&str> = cmd.split_ascii_whitespace().collect();

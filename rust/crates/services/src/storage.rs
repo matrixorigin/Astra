@@ -3274,6 +3274,14 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .await?;
 
+    run_migration(
+        pool,
+        17,
+        "add session_todo_counters.version for task-board CAS rollback",
+        "ALTER TABLE session_todo_counters ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
+    )
+    .await?;
+
     Ok(())
 }
 

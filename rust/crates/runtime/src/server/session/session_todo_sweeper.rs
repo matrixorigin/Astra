@@ -130,13 +130,19 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     // excluded: their lifecycle is managed by the plan orchestrator, not
     // this sweeper. Directly pausing a plan step task would break plan ↔
     // task-board consistency.
+    //
+    // SELECT … FOR UPDATE serialises with mutator transactions (which
+    // also lock all rows for a session via FOR UPDATE). Without this,
+    // a mutator DELETE+INSERT that restores an in_progress row from its
+    // stale in-memory snapshot can silently overwrite a sweeper pause.
     let rows: Vec<(String, String, Option<String>)> = sqlx::query(
         "SELECT session_id, todo_id, metadata FROM session_todos \
          WHERE status = 'in_progress' \
            AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
            AND (metadata IS NULL \
                 OR JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.plan_subtask_id')) IS NULL) \
-         LIMIT ?",
+         LIMIT ? \
+         FOR UPDATE",
     )
     .bind(STALE_THRESHOLD_HOURS as i64)
     .bind(STALE_BATCH_LIMIT)
@@ -494,15 +500,6 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
 
         let mut consecutive_failures: u32 = 0;
         loop {
-            // Exponential backoff: if we've failed too many times, sleep
-            // before the next tick to avoid burning CPU on deterministic
-            // panics (e.g., corrupt DB rows). Cap at 1 hour.
-            if consecutive_failures > STALE_SWEEP_ALERT_THRESHOLD {
-                let backoff_secs = (300u64
-                    << (consecutive_failures - STALE_SWEEP_ALERT_THRESHOLD).min(6))
-                .min(3600);
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            }
             interval.tick().await;
             let tick_result = AssertUnwindSafe(async {
                 match lease.check_leader().await {
@@ -574,6 +571,11 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
                     );
                 }
             }
+            // No exponential backoff: sleeping after a failure delays
+            // recovery when the DB comes back mid-backoff.  The 5-minute
+            // tick interval provides natural spacing; a deterministic
+            // corrupt-row panic is already logged above and pauses until
+            // human remediation anyway.
         }
     });
 }
@@ -1177,8 +1179,10 @@ mod tests {
         cleanup().await;
 
         let store: std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> = std::sync::Arc::new(
-            astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::from_shared(&shared)
-                .with_user_id(&user_id),
+            astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::from_shared_for_user(
+                &shared, &user_id,
+            )
+            .unwrap(),
         );
         let manager = astra_tools::task_mgmt::TaskManager::new(session_id.clone(), store);
         let create = manager

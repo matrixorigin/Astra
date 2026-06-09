@@ -28,9 +28,7 @@ use serde::de::DeserializeOwned;
 use std::sync::Arc;
 
 use crate::task_mgmt::{
-    InMemoryTaskStore, SESSION_TASK_STATUS_ARCHIVED, SESSION_TASK_STATUS_CANCELLED,
-    SESSION_TASK_STATUS_COMPLETED, SESSION_TASK_STATUS_DELETED, SESSION_TASK_STATUS_FAILED,
-    SESSION_TASK_STATUS_IN_PROGRESS, SESSION_TASK_STATUS_MIGRATED, SESSION_TASK_STATUS_PAUSED,
+    InMemoryTaskStore, SESSION_TASK_STATUS_IN_PROGRESS, SESSION_TASK_STATUS_PAUSED,
     SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
     TaskStore,
 };
@@ -207,10 +205,11 @@ fn to_mo_datetime(rfc3339: &str) -> String {
 /// sessions; each `TaskManager` scopes reads/writes by `session_id`.
 pub fn select_task_store(
     pool: Option<astra_core::sqlx::Pool<astra_core::sqlx::MySql>>,
-) -> Arc<dyn TaskStore> {
+    user_id: impl Into<String>,
+) -> Result<Arc<dyn TaskStore>, String> {
     match pool {
-        Some(pool) => Arc::new(MatrixOneTaskStore::new(pool)),
-        None => Arc::new(InMemoryTaskStore::new()),
+        Some(pool) => Ok(Arc::new(MatrixOneTaskStore::new_for_user(pool, user_id)?)),
+        None => Ok(Arc::new(InMemoryTaskStore::new())),
     }
 }
 
@@ -221,30 +220,37 @@ pub struct MatrixOneTaskStore {
     /// User who owns rows written through this store. Threaded into
     /// every INSERT so cross-session user-scoped queries
     /// (`idx_session_todos_user_status_updated`) can find them
-    /// without a join. Empty string means the store is
-    /// "anonymous" — only test paths should construct that shape.
+    /// without a join. Production construction must bind a real user_id.
     user_id: String,
 }
 
 impl MatrixOneTaskStore {
-    pub fn new(pool: Pool<MySql>) -> Self {
-        Self {
+    pub fn new_for_user(pool: Pool<MySql>, user_id: impl Into<String>) -> Result<Self, String> {
+        let user_id = user_id.into();
+        if user_id.trim().is_empty() {
+            return Err(
+                "MatrixOne task store requires a non-empty user_id for durable task access"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
             pool,
             changed_tx: tokio::sync::broadcast::channel(16).0,
-            user_id: String::new(),
-        }
+            user_id,
+        })
     }
 
-    pub fn from_shared(shared: &astra_core::SharedPool) -> Self {
-        Self::new(shared.get().clone())
+    pub fn from_shared_for_user(
+        shared: &astra_core::SharedPool,
+        user_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::new_for_user(shared.get().clone(), user_id)
     }
 
-    /// Bind the user that owns subsequent writes. Must be set before
-    /// any `save()` / `mutate()` so the user_id column has a real
-    /// owner for cross-session queries.
-    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
-        self.user_id = user_id.into();
-        self
+    #[cfg(test)]
+    pub fn new_for_test(pool: Pool<MySql>, user_id: impl Into<String>) -> Self {
+        Self::new_for_user(pool, user_id)
+            .expect("test MatrixOneTaskStore user_id must be non-empty")
     }
 
     async fn load_rows(&self, session_id: &str) -> Result<Vec<SessionTask>, sqlx::Error> {
@@ -421,6 +427,21 @@ impl TaskStore for MatrixOneTaskStore {
         // on the other node never see a partial update.
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
+        if let Err(e) = sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
+             ON DUPLICATE KEY UPDATE next_id = next_id",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
             .bind(session_id)
             .execute(&mut *tx)
@@ -450,6 +471,20 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
+        if let Err(e) = sqlx::query(
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(())
@@ -459,7 +494,7 @@ impl TaskStore for MatrixOneTaskStore {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         if let Err(e) = sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 1) \
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
              ON DUPLICATE KEY UPDATE next_id = next_id",
         )
         .bind(session_id)
@@ -589,6 +624,20 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
+        if let Err(e) = sqlx::query(
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(result.response)
@@ -641,7 +690,7 @@ impl TaskStore for MatrixOneTaskStore {
             None => {
                 // First allocation: seed counter to 2 (reserves id 1).
                 if let Err(e) = sqlx::query(
-                    "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 2)",
+                    "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 2, 1)",
                 )
                 .bind(session_id)
                 .execute(&mut *tx)
@@ -668,7 +717,7 @@ impl TaskStore for MatrixOneTaskStore {
                 // Persist the bump (may store the exhausted sentinel;
                 // `allocated_task_id_from_counter` rejects it on next read).
                 if let Err(e) =
-                    sqlx::query("UPDATE session_todo_counters SET next_id = ? WHERE session_id = ?")
+                    sqlx::query("UPDATE session_todo_counters SET next_id = ?, version = version + 1 WHERE session_id = ?")
                         .bind(next_stored as i64)
                         .bind(session_id)
                         .execute(&mut *tx)
@@ -689,8 +738,8 @@ impl TaskStore for MatrixOneTaskStore {
 
     async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
         sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, ?) \
-             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id)",
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, 1) \
+             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
         )
         .bind(session_id)
         .bind(counter_bind_value(next))
@@ -709,7 +758,7 @@ impl TaskStore for MatrixOneTaskStore {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         if let Err(e) = sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, ?) \
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, 0) \
              ON DUPLICATE KEY UPDATE next_id = VALUES(next_id)",
         )
         .bind(session_id)
@@ -749,6 +798,20 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
+        if let Err(e) = sqlx::query(
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(())
@@ -770,37 +833,44 @@ impl TaskStore for MatrixOneTaskStore {
         peek_task_id_from_counter(row.map(|(v,)| v), session_id)
     }
 
+    async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT version FROM session_todo_counters WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        match row {
+            Some((version,)) if version >= 0 => u64::try_from(version)
+                .map_err(|_| format!("session_todo_counters.version overflow for {session_id}")),
+            Some((version,)) => Err(format!(
+                "session_todo_counters.version out of range for {session_id}: {version}"
+            )),
+            None => Ok(0),
+        }
+    }
+
     async fn load_all_sessions(&self) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+        if self.user_id.trim().is_empty() {
+            return Err("load_all_sessions requires a user-scoped MatrixOneTaskStore".to_string());
+        }
         // One SQL round-trip across the whole table — the multi-
         // session board is a low-frequency power-user surface so
         // we favour simplicity over a per-session fan-out. Order
         // by `(session_id, ordinal)` so the group grouping below
         // is a single linear pass instead of a HashMap build.
-        let rows = if self.user_id.is_empty() {
-            sqlx::query(
-                "SELECT session_id, todo_id, title, description, active_form, status, owner, \
-                        metadata, blocks, blocked_by, subtasks, \
-                        CAST(created_at AS CHAR) AS created_at, \
-                        CAST(updated_at AS CHAR) AS updated_at \
-                 FROM session_todos \
-                 ORDER BY session_id ASC, ordinal ASC",
-            )
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query(
-                "SELECT session_id, todo_id, title, description, active_form, status, owner, \
-                        metadata, blocks, blocked_by, subtasks, \
-                        CAST(created_at AS CHAR) AS created_at, \
-                        CAST(updated_at AS CHAR) AS updated_at \
-                 FROM session_todos \
-                 WHERE user_id = ? \
-                 ORDER BY session_id ASC, ordinal ASC",
-            )
-            .bind(&self.user_id)
-            .fetch_all(&self.pool)
-            .await
-        }
+        let rows = sqlx::query(
+            "SELECT session_id, todo_id, title, description, active_form, status, owner, \
+                    metadata, blocks, blocked_by, subtasks, \
+                    CAST(created_at AS CHAR) AS created_at, \
+                    CAST(updated_at AS CHAR) AS updated_at \
+             FROM session_todos \
+             WHERE user_id = ? \
+             ORDER BY session_id ASC, ordinal ASC",
+        )
+        .bind(&self.user_id)
+        .fetch_all(&self.pool)
+        .await
         .map_err(|e| e.to_string())?;
 
         let mut out: Vec<(String, Vec<SessionTask>)> = Vec::new();
@@ -823,66 +893,32 @@ impl TaskStore for MatrixOneTaskStore {
         &self,
         limit: usize,
     ) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+        if self.user_id.trim().is_empty() {
+            return Err("load_open_sessions requires a user-scoped MatrixOneTaskStore".to_string());
+        }
         let limit = i64::try_from(limit.min(200)).unwrap_or(200).max(0);
         if limit == 0 {
             return Ok(Vec::new());
         }
 
-        let rows = if self.user_id.is_empty() {
-            sqlx::query(
-                "SELECT session_id, todo_id, title, description, active_form, status, owner, \
-                        metadata, blocks, blocked_by, subtasks, \
-                        CAST(created_at AS CHAR) AS created_at, \
-                        CAST(updated_at AS CHAR) AS updated_at \
-                 FROM session_todos \
-                 WHERE status IN (?, ?, ?) OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                 ORDER BY updated_at DESC, session_id ASC, ordinal ASC \
-                 LIMIT ?",
-            )
-            .bind(SESSION_TASK_STATUS_PENDING.to_string())
-            .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
-            .bind(SESSION_TASK_STATUS_PAUSED.to_string())
-            .bind(SESSION_TASK_STATUS_PENDING.to_string())
-            .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
-            .bind(SESSION_TASK_STATUS_PAUSED.to_string())
-            .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-            .bind(SESSION_TASK_STATUS_FAILED.to_string())
-            .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
-            .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-            .bind(SESSION_TASK_STATUS_DELETED.to_string())
-            .bind(SESSION_TASK_STATUS_MIGRATED.to_string())
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query(
-                "SELECT session_id, todo_id, title, description, active_form, status, owner, \
-                        metadata, blocks, blocked_by, subtasks, \
-                        CAST(created_at AS CHAR) AS created_at, \
-                        CAST(updated_at AS CHAR) AS updated_at \
-                 FROM session_todos \
-                 WHERE user_id = ? \
-                   AND (status IN (?, ?, ?) OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?)) \
-                 ORDER BY updated_at DESC, session_id ASC, ordinal ASC \
-                 LIMIT ?",
-            )
-            .bind(&self.user_id)
-            .bind(SESSION_TASK_STATUS_PENDING.to_string())
-            .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
-            .bind(SESSION_TASK_STATUS_PAUSED.to_string())
-            .bind(SESSION_TASK_STATUS_PENDING.to_string())
-            .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
-            .bind(SESSION_TASK_STATUS_PAUSED.to_string())
-            .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-            .bind(SESSION_TASK_STATUS_FAILED.to_string())
-            .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
-            .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-            .bind(SESSION_TASK_STATUS_DELETED.to_string())
-            .bind(SESSION_TASK_STATUS_MIGRATED.to_string())
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-        }
+        let rows = sqlx::query(
+            "SELECT session_id, todo_id, title, description, active_form, status, owner, \
+                    metadata, blocks, blocked_by, subtasks, \
+                    CAST(created_at AS CHAR) AS created_at, \
+                    CAST(updated_at AS CHAR) AS updated_at \
+             FROM session_todos \
+             WHERE user_id = ? \
+               AND status IN (?, ?, ?) \
+             ORDER BY updated_at DESC, session_id ASC, ordinal ASC \
+             LIMIT ?",
+        )
+        .bind(&self.user_id)
+        .bind(SESSION_TASK_STATUS_PENDING.to_string())
+        .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
+        .bind(SESSION_TASK_STATUS_PAUSED.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
         .map_err(|e| e.to_string())?;
 
         let mut out: Vec<(String, Vec<SessionTask>)> = Vec::new();

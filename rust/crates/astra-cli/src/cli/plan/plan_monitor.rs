@@ -1130,9 +1130,9 @@ async fn sync_task_board_subtask_status(
 ) -> Result<(), String> {
     let tasks = state.task_manager.snapshot().await.unwrap_or_default();
     let task = tasks.into_iter().find(|task| {
-        crate::cli::plan::plan_task_board::approved_plan_step_task_matches(
+        astra_tools::plan_task_mirror::approved_plan_step_task_matches(
             task,
-            goal,
+            goal, // plan_id == goal in CLI context
             plan_fingerprint,
             subtask_id,
         )
@@ -1162,8 +1162,15 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     let Some(goal) = state.executing_plan_goal.as_deref() else {
         return;
     };
-    if let Err(error) =
-        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
+    if let Err(error) = astra_tools::plan_task_mirror::mirror_approved_plan_to_task_board(
+        &state.task_manager,
+        "cli",
+        state.session_id.as_deref().unwrap_or(""),
+        goal,
+        goal,
+        plan,
+    )
+    .await
     {
         tracing::warn!(
             goal = %goal,
@@ -1171,7 +1178,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
             "failed to ensure executing plan is mirrored into task board"
         );
     }
-    let plan_fingerprint = crate::cli::plan::plan_task_board::plan_task_board_fingerprint(plan);
+    let plan_fingerprint = astra_tools::plan_task_mirror::plan_task_board_fingerprint(plan);
     for subtask in &plan.subtasks {
         if let Err(error) = sync_task_board_subtask_status(
             state,
@@ -1253,14 +1260,14 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plan_fingerprint =
-            crate::cli::plan::plan_task_board::plan_task_board_fingerprint(&plan);
+        let plan_fingerprint = astra_tools::plan_task_mirror::plan_task_board_fingerprint(&plan);
         let create = state
             .task_manager
             .create(&serde_json::json!({
                 "title": "Handle unhappy paths",
                 "metadata": {
                     "source": "approved_plan",
+                    "plan_id": "Ship plan UX",
                     "plan_goal": "Ship plan UX",
                     "plan_fingerprint": plan_fingerprint,
                     "plan_subtask_id": "s2"
@@ -1283,6 +1290,7 @@ mod tests {
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .find(|task| task.title == "Handle unhappy paths")
             .expect("plan step task should exist");

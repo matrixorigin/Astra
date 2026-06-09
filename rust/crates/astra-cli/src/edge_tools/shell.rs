@@ -105,8 +105,10 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
 
 /// Extract the base command name from the last segment of a pipeline.
 fn last_pipeline_command(command: &str) -> &str {
-    let last = command.rsplit('|').next().unwrap_or(command);
-    last.split_whitespace().next().unwrap_or("")
+    astra_tools::exit_semantics::last_pipeline_segment(command)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
 }
 
 // ---------------------------------------------------------------------------
@@ -4116,7 +4118,15 @@ impl ToolExecutor {
                     return if out.status.success() {
                         "(no output)".to_string()
                     } else {
-                        format!("Error: command failed (exit code {exit_code})")
+                        // Use command semantics to interpret exit code
+                        let sem = interpret_exit_code(command, exit_code);
+                        if let Some(note) = sem.note {
+                            note.to_string()
+                        } else if sem.is_error {
+                            format!("Error: command failed (exit code {exit_code})")
+                        } else {
+                            format!("(exit code {exit_code})")
+                        }
                     };
                 }
 
@@ -4133,7 +4143,10 @@ impl ToolExecutor {
                 }
 
                 if !out.status.success() {
-                    result.push_str(&format!("\n(exit code {exit_code})"));
+                    let sem = interpret_exit_code(command, exit_code);
+                    if sem.is_error {
+                        result.push_str(&format!("\n(exit code {exit_code})"));
+                    }
                 }
 
                 result

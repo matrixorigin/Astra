@@ -379,7 +379,7 @@ async fn build_one_shot_job_manager(
     } else {
         std::sync::Arc::new(crate::edge_tools::TaskManager::new(
             NON_CANONICAL_JOB_SCOPE.to_string(),
-            std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
+            std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation()),
         ))
     }
 }
@@ -3757,9 +3757,9 @@ mod task_run_projection_tests {
             .create(&serde_json::json!({ "title": "ephemeral" }))
             .await;
         assert!(created.contains("ephemeral"));
-        assert_eq!(first.snapshot().await.len(), 1);
+        assert_eq!(first.snapshot().await.unwrap().len(), 1);
         assert!(
-            second.snapshot().await.is_empty(),
+            second.snapshot().await.unwrap().is_empty(),
             "non-canonical one-shot managers must not share a durable session store"
         );
     }

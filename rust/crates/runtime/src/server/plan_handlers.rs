@@ -507,7 +507,7 @@ fn status_counts(plan: &TaskPlan) -> (usize, usize) {
     (completed, failed)
 }
 
-use super::plan_task_mirror;
+use astra_tools::plan_task_mirror;
 
 async fn mirror_approved_plan_to_task_board_if_configured(
     state: &AppState,
@@ -520,10 +520,15 @@ async fn mirror_approved_plan_to_task_board_if_configured(
         return Ok(());
     };
     let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
+        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
     let manager = TaskManager::new(session_id.to_string(), store);
     plan_task_mirror::mirror_approved_plan_to_task_board(
-        &manager, user_id, session_id, plan_id, plan_state,
+        &manager,
+        user_id,
+        session_id,
+        plan_id,
+        &plan_state.goal,
+        &plan_state.plan,
     )
     .await
 }
@@ -545,7 +550,6 @@ async fn sync_plan_task_board_subtask_status(
             plan_task_mirror::approved_plan_step_task_identity_matches(
                 task,
                 plan_id,
-                "",
                 &plan_fingerprint,
                 subtask_id,
             )
@@ -590,7 +594,7 @@ async fn sync_plan_task_board_subtask_status_if_configured(
         return Ok(());
     };
     let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
+        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
     let manager = TaskManager::new(session_id.to_string(), store);
     if let Err(error) =
         sync_plan_task_board_subtask_status(&manager, plan_id, plan, subtask_id, status).await
@@ -614,6 +618,12 @@ struct TaskBoardRollback {
 }
 
 impl TaskBoardRollback {
+    async fn seal(&mut self) -> Result<(), String> {
+        self.manager
+            .seal_snapshot_for_restore(&mut self.snapshot)
+            .await
+    }
+
     async fn restore(self) -> Result<(), String> {
         self.manager.restore_snapshot(&self.snapshot).await
     }
@@ -631,7 +641,7 @@ async fn capture_task_board_rollback_if_configured(
         return Ok(None);
     };
     let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
+        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
     let manager = TaskManager::new(session_id.to_string(), store);
     let snapshot = manager
         .try_snapshot_state()
@@ -994,6 +1004,16 @@ pub(super) async fn execute_plan_handler(
             )
         })?;
     }
+    if let Some(rollback) = task_board_rollback.as_mut() {
+        rollback.seal().await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "execute_plan: failed to seal task-board rollback — plan was NOT saved. Error: {error}"
+                ),
+            )
+        })?;
+    }
 
     let expected = resolve_expected_version(&plan_state, req.expected_version);
     if let Err(error) = state
@@ -1280,6 +1300,16 @@ pub(super) async fn rewind_plan_handler(
             ),
         )
     })?;
+    if let Some(rollback) = task_board_rollback.as_mut() {
+        rollback.seal().await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "rewind_plan: failed to seal task-board rollback — plan state was NOT saved. Error: {error}"
+                ),
+            )
+        })?;
+    }
 
     let expected_version = expected.unwrap_or(plan_state.version);
     let aborted_runs = match state
@@ -1391,6 +1421,16 @@ pub(super) async fn redo_step_handler(
             ),
         )
     })?;
+    if let Some(rollback) = task_board_rollback.as_mut() {
+        rollback.seal().await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "redo_step: failed to seal task-board rollback — plan state was NOT saved. Error: {error}"
+                ),
+            )
+        })?;
+    }
 
     // Compute the next attempt number by counting prior runs for this subtask.
     // In-memory/test repos start empty too, so the first attempt is 1 there.
@@ -1537,6 +1577,16 @@ pub(super) async fn start_step_run_handler(
             ),
         )
     })?;
+    if let Some(rollback) = task_board_rollback.as_mut() {
+        rollback.seal().await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "start_step_run: failed to seal task-board rollback — step run was NOT recorded. Error: {error}"
+                ),
+            )
+        })?;
+    }
 
     let run_id = match state
         .plan_repo
@@ -1672,6 +1722,16 @@ pub(super) async fn post_completed_step_run_handler(
             ),
         )
     })?;
+    if let Some(rollback) = task_board_rollback.as_mut() {
+        rollback.seal().await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "post_completed_step_run: failed to seal task-board rollback — step run was NOT recorded. Error: {error}"
+                ),
+            )
+        })?;
+    }
 
     let run_id = match state
         .plan_repo
@@ -1793,6 +1853,16 @@ pub(super) async fn finish_step_run_handler(
             ),
         )
     })?;
+    if let Some(rollback) = task_board_rollback.as_mut() {
+        rollback.seal().await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "finalize_step_run: failed to seal task-board rollback — step run was NOT finalized. Error: {error}"
+                ),
+            )
+        })?;
+    }
 
     if let Err(error) = state
         .plan_repo
@@ -2145,7 +2215,8 @@ mod tests {
             "alice",
             "session-cloud",
             "plan-cloud-visible",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2233,7 +2304,8 @@ mod tests {
             "alice",
             "session-cloud",
             "plan-cloud-oversized",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .expect_err("oversized approved plans should not create one huge batch of step tasks");
@@ -2265,7 +2337,8 @@ mod tests {
             "alice",
             "session-load-fails",
             "plan-load-fails",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .expect_err("task-board load failure should abort approved-plan mirror");
@@ -2301,7 +2374,8 @@ mod tests {
             "alice",
             "session-cloud-rollback",
             "plan-cloud-rollback",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .expect_err("invalid later step should abort approved-plan mirror");
@@ -2346,7 +2420,8 @@ mod tests {
             "alice",
             "session-cloud",
             "plan-collision",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2410,7 +2485,8 @@ mod tests {
             "alice",
             "session-hybrid",
             "plan-http-reuses-cli-tree",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2460,7 +2536,8 @@ mod tests {
             "alice",
             "session-repeat",
             "plan-repeat",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2477,7 +2554,8 @@ mod tests {
             "alice",
             "session-repeat",
             "plan-repeat",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2512,7 +2590,8 @@ mod tests {
             "alice",
             "session-cloud",
             "plan-sync-visible",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2560,7 +2639,8 @@ mod tests {
             "alice",
             "session-cloud",
             "plan-redo-visible",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2674,7 +2754,7 @@ mod tests {
         cleanup_session_todos(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let mut state =
             PlanModeState::new_with_owner("ship MatrixOne visible plan".into(), user_id.clone());
@@ -2688,7 +2768,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-matrixone-visible",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2732,7 +2813,7 @@ mod tests {
         cleanup_session_todos(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let existing = manager
             .create(&serde_json::json!({
@@ -2756,7 +2837,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-rollback",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .expect_err("invalid later step should abort MatrixOne approved-plan mirror");
@@ -2796,7 +2878,7 @@ mod tests {
         cleanup_session_todos(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let mut state =
             PlanModeState::new_with_owner("ship hybrid MatrixOne plan".into(), user_id.clone());
@@ -2827,7 +2909,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-reuses-cli-tree",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2874,7 +2957,7 @@ mod tests {
         cleanup_session_todos(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let mut state =
             PlanModeState::new_with_owner("repeat MatrixOne plan".into(), user_id.clone());
@@ -2889,7 +2972,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-repeat",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2909,7 +2993,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-repeat",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();
@@ -2942,7 +3027,7 @@ mod tests {
         cleanup_session_todos(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let mut first_state =
             PlanModeState::new_with_owner("handoff MatrixOne plan".into(), user_id.clone());
@@ -2964,7 +3049,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-handoff-1",
-            &first_state,
+            &first_state.goal,
+            &first_state.plan,
         )
         .await
         .unwrap();
@@ -2973,7 +3059,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-handoff-2",
-            &second_state,
+            &second_state.goal,
+            &second_state.plan,
         )
         .await
         .unwrap();
@@ -3015,7 +3102,7 @@ mod tests {
         cleanup_session_todos(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let mut state =
             PlanModeState::new_with_owner("redo MatrixOne plan".into(), user_id.clone());
@@ -3029,7 +3116,8 @@ mod tests {
             &user_id,
             &session_id,
             "plan-http-matrixone-redo",
-            &state,
+            &state.goal,
+            &state.plan,
         )
         .await
         .unwrap();

@@ -36,7 +36,6 @@ mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
 mod plan_handlers;
-pub(crate) mod plan_task_mirror;
 mod platform_handlers;
 mod preferences_handlers;
 mod product_harness_handlers;

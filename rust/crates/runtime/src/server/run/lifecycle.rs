@@ -3495,7 +3495,18 @@ impl AgenticRunLifecycleService {
             return None;
         };
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(shared).with_user_id(user_id));
+            match MatrixOneTaskStore::from_shared_for_user(shared, user_id) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        user_id = %user_id,
+                        error = %error,
+                        "failed to construct user-scoped task store for resume hint"
+                    );
+                    return None;
+                }
+            };
         let manager = TaskManager::new(session_id.to_string(), store);
         match manager.load_active_tasks().await {
             Ok(tasks) => format_task_board_resume_hint(&tasks),
@@ -4196,7 +4207,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
-            );
+                user_id.clone(),
+            )
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
             let mut executor = server_tool_executor::ServerToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
@@ -4767,7 +4780,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
-            );
+                user_id.clone(),
+            )
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
             let mut executor = server_tool_executor::ServerToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
@@ -6303,7 +6318,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
-            );
+                config.user_id.clone(),
+            )?;
             let mut executor = server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 config.user_id.clone(),

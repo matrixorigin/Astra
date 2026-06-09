@@ -553,11 +553,17 @@ async fn adopt_task_into_session_atomic(
 /// `idx_session_todos_user_status_updated` index. Returns `None`
 /// when no SQL pool is wired (server is in in-memory-only mode for
 /// tests).
-fn build_task_manager(state: &AppState, session_id: &str, user_id: &str) -> Option<TaskManager> {
-    let pool = state.shared_pool.as_ref()?;
+fn build_task_manager(
+    state: &AppState,
+    session_id: &str,
+    user_id: &str,
+) -> Result<Option<TaskManager>, String> {
+    let Some(pool) = state.shared_pool.as_ref() else {
+        return Ok(None);
+    };
     let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
-    Some(TaskManager::new(session_id.to_string(), store))
+        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
+    Ok(Some(TaskManager::new(session_id.to_string(), store)))
 }
 
 fn validate_execute_todo_args_action(action: &str, args: &serde_json::Value) -> Result<(), String> {
@@ -598,12 +604,14 @@ pub(crate) async fn execute_todo_handler(
         }));
     }
 
-    let manager = build_task_manager(&state, &session_id, &user.user_id).ok_or_else(|| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "session_todos store not configured on this server",
-        )
-    })?;
+    let manager = build_task_manager(&state, &session_id, &user.user_id)
+        .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_todos store not configured on this server",
+            )
+        })?;
 
     let output = match action {
         "create" => manager.create(&req.args).await,
@@ -674,12 +682,14 @@ async fn copy_task_board_into_fork(
     }
 
     let source_manager = match build_task_manager(state, &source_session, user_id) {
-        Some(manager) => manager,
-        None => return "Error: session_todos store not configured on this server".to_string(),
+        Ok(Some(manager)) => manager,
+        Ok(None) => return "Error: session_todos store not configured on this server".to_string(),
+        Err(error) => return format!("Error: {error}"),
     };
     let target_manager = match build_task_manager(state, target_session, user_id) {
-        Some(manager) => manager,
-        None => return "Error: session_todos store not configured on this server".to_string(),
+        Ok(Some(manager)) => manager,
+        Ok(None) => return "Error: session_todos store not configured on this server".to_string(),
+        Err(error) => return format!("Error: {error}"),
     };
 
     let target_tasks = match target_manager.load_tasks().await {
@@ -787,7 +797,8 @@ pub(crate) async fn load_todos_handler(
             "session_todos store not configured on this server",
         )
     })?;
-    let store = MatrixOneTaskStore::from_shared(pool);
+    let store = MatrixOneTaskStore::from_shared_for_user(pool, &user.user_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let tasks = store
         .load(&session_id)
         .await
@@ -1430,9 +1441,9 @@ mod tests {
         cleanup_session_rows(&pool, &target_session).await;
 
         let source_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let target_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let source = TaskManager::new(source_session.clone(), source_store);
         let target = TaskManager::new(target_session.clone(), target_store);
         let source_create = source
@@ -1498,7 +1509,7 @@ mod tests {
         cleanup_session_rows(&pool, &target_session).await;
 
         let source_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let source = TaskManager::new(source_session.clone(), source_store);
         let source_create = source
             .create(&serde_json::json!({
@@ -1606,7 +1617,7 @@ mod tests {
 
         let make_manager = |session_id: &str| {
             let store: Arc<dyn TaskStore> =
-                Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+                Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
             TaskManager::new(session_id.to_string(), store)
         };
         let pending = make_manager(&pending_session);
@@ -1698,7 +1709,7 @@ mod tests {
         cleanup_session_rows(&pool, &session_id).await;
 
         let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let manager = TaskManager::new(session_id.clone(), store);
         let created = manager
             .create(&serde_json::json!({"title": "corrupt cross-session status"}))
@@ -1755,7 +1766,7 @@ mod tests {
         cleanup_session_rows(&pool, &target_session).await;
 
         let source_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let source = TaskManager::new(source_session.clone(), source_store);
         let created = source
             .create(&serde_json::json!({"title": "Adopt me without description"}))
@@ -1828,7 +1839,7 @@ mod tests {
         cleanup_session_rows(&pool, &target_session).await;
 
         let source_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let source = TaskManager::new(source_session.clone(), source_store);
         let created = source
             .create(&serde_json::json!({"title": "Adopt me with corrupt subtasks"}))
@@ -1916,7 +1927,7 @@ mod tests {
         cleanup_session_rows(&pool, &target_session).await;
 
         let source_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let source = TaskManager::new(source_session.clone(), source_store);
         let producer = source
             .create(&serde_json::json!({"title": "Adopt producer"}))
@@ -2517,9 +2528,9 @@ mod tests {
         cleanup_session_rows(&pool, &target_session).await;
 
         let source_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let target_store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
         let source = TaskManager::new(source_session.clone(), source_store);
         let target = TaskManager::new(target_session.clone(), target_store);
         let created = source

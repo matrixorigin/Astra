@@ -104,7 +104,7 @@ pub(crate) async fn resolve_task_store(
         return (store, Some(notify_tx));
     }
     (
-        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
+        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation()),
         None,
     )
 }

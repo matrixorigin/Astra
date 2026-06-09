@@ -1,17 +1,28 @@
 //! Shared plan → task-board mirror logic.
 //!
-//! Extracted to avoid ~260 lines of duplicate code between [`plan_handlers`]
-//! and [`server_tool_executor`]. Both callers provide a [`TaskManager`] and
-//! relevant metadata; the pure functions and async operations below are the
-//! single source of truth.
+//! Single source of truth used by both the cloud runtime
+//! ([`plan_handlers`]) and the edge CLI ([`plan_task_board`]).
+//!
+//! ## Idempotency
+//!
+//! Every function is safe to retry. Step tasks carry a `plan_subtask_id` in
+//! their metadata, and identity checks reuse existing tasks that match the
+//! same plan/step identity. Failed mirrors are still rolled back: from the
+//! user's perspective, approving a plan is one handoff transaction, not a
+//! request to leave half-created board state behind.
+//!
+//! ## Concurrent safety
+//!
+//! The session tool executor serializes all tool calls per session, so only
+//! one caller can enter the mirror at a time. If that ever changes, the
+//! identity checks inside `ensure_plan_step_task` must be made atomic at the
+//! database level.
 
 use std::collections::HashMap;
 
-use astra_plan::PlanModeState;
-use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
-use astra_tools::task_mgmt::{
-    MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, TaskManager,
-};
+use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+
+use crate::task_mgmt::{MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, TaskManager};
 
 // ---------------------------------------------------------------------------
 // Pure utility functions
@@ -21,6 +32,8 @@ use astra_tools::task_mgmt::{
 ///
 /// When the plan changes its subtask structure the fingerprint changes, which
 /// tells the mirror to re-create task-board entries from scratch.
+/// On serialization failure (practically impossible for these simple types),
+/// returns an error string that will never match any real plan fingerprint.
 pub fn plan_task_board_fingerprint(plan: &TaskPlan) -> String {
     let parts: Vec<serde_json::Value> = plan
         .subtasks
@@ -41,19 +54,19 @@ pub fn plan_task_board_fingerprint(plan: &TaskPlan) -> String {
         Err(error) => {
             tracing::error!(
                 error = %error,
-                "plan task-board fingerprint serialization failed"
+                step_count = plan.subtasks.len(),
+                "plan task-board fingerprint serialization failed — \
+                 this should be impossible for simple string types"
             );
             format!("__fingerprint_serialization_error__:{error}")
         }
     }
 }
 
-/// Does `task` already represent the approved plan identified by `plan_id`
-/// / `goal` / `plan_fingerprint`?
+/// Does `task` already represent the approved plan (open-work check)?
 pub fn approved_plan_task_matches(
     task: &SessionTask,
     plan_id: &str,
-    _goal: &str,
     plan_fingerprint: &str,
 ) -> bool {
     if !task.status.is_open_work() {
@@ -80,11 +93,10 @@ pub fn approved_plan_task_matches(
 pub fn approved_plan_step_task_matches(
     task: &SessionTask,
     plan_id: &str,
-    goal: &str,
     plan_fingerprint: &str,
     plan_subtask_id: &str,
 ) -> bool {
-    if !approved_plan_task_matches(task, plan_id, goal, plan_fingerprint) {
+    if !approved_plan_task_matches(task, plan_id, plan_fingerprint) {
         return false;
     }
     task.metadata
@@ -94,12 +106,11 @@ pub fn approved_plan_step_task_matches(
         == Some(plan_subtask_id)
 }
 
-/// Strict identity check (ignores `is_open_work` filter) — used for
-/// post-create verification where the task may already be in `in_progress`.
+/// Strict identity check — ignores `is_open_work` filter. Used for
+/// post-create verification where the task may already be `in_progress`.
 pub fn approved_plan_task_identity_matches(
     task: &SessionTask,
     plan_id: &str,
-    _goal: &str,
     plan_fingerprint: &str,
 ) -> bool {
     let metadata = task.metadata.as_ref();
@@ -122,11 +133,10 @@ pub fn approved_plan_task_identity_matches(
 pub fn approved_plan_step_task_identity_matches(
     task: &SessionTask,
     plan_id: &str,
-    goal: &str,
     plan_fingerprint: &str,
     plan_subtask_id: &str,
 ) -> bool {
-    if !approved_plan_task_identity_matches(task, plan_id, goal, plan_fingerprint) {
+    if !approved_plan_task_identity_matches(task, plan_id, plan_fingerprint) {
         return false;
     }
     task.metadata
@@ -149,92 +159,95 @@ pub fn task_status_to_session_status(status: TaskStatus) -> SessionTaskStatusKin
 }
 
 // ---------------------------------------------------------------------------
-// Async mirror operations (takes `&TaskManager` directly — callers pass the
-// manager and metadata they already own.)
+// Async mirror operations
 // ---------------------------------------------------------------------------
 
-/// Mirror an approved plan into the task board: create / reuse step tasks,
-/// wire up dependency edges, pause the previous in-progress task, and start
-/// the first runnable step.
+/// Mirror an approved plan into the session's task board so the user sees
+/// actionable step-by-step work items.
 ///
-/// Returns `Ok(())` on success or a user-readable error. On failure the task
-/// board is rolled back via `TaskManager::try_snapshot_state` / `restore_snapshot`.
-/// Mirror an approved plan into the session's task board so the user
-/// sees actionable step-by-step work items.
+/// Returns `Ok(())` on success or a user-readable error.
 ///
 /// ## Idempotency
 ///
-/// This function is safe to retry after failure. Each step task carries a
-/// `plan_subtask_id` in its metadata, and `ensure_approved_plan_step_task`
-/// reuses existing tasks that match the same plan/step identity.  Edges
-/// (`blocked_by`) are set only when missing.  No snapshot or rollback is
-/// needed — partial progress from a failed mirror is valid state that the
-/// next call will complete.
-///
-/// ## Concurrent safety
-///
-/// The session tool executor serializes all tool calls per session, so only
-/// one caller can enter this function at a time. If that ever changes, the
-/// identity check inside `ensure_approved_plan_step_task` must be made
-/// atomic at the database level.
+/// Safe to retry after failure. Each step task carries a `plan_subtask_id`
+/// in its metadata, and `ensure_plan_step_task` reuses existing tasks that
+/// match the same plan/step identity.
 pub async fn mirror_approved_plan_to_task_board(
     manager: &TaskManager,
     owner: &str,
     session_id: &str,
     plan_id: &str,
-    plan_state: &PlanModeState,
+    goal: &str,
+    plan: &TaskPlan,
 ) -> Result<(), String> {
-    if plan_state.plan.subtasks.is_empty() {
+    if plan.subtasks.is_empty() {
         return Ok(());
     }
-    if plan_state.plan.subtasks.len() > MAX_CREATE_SUBTASKS {
+    if plan.subtasks.len() > MAX_CREATE_SUBTASKS {
         return Err(format!(
             "approved plan has {} step(s); maximum is {MAX_CREATE_SUBTASKS}. \
              Split oversized subtasks into separate plans.",
-            plan_state.plan.subtasks.len()
+            plan.subtasks.len()
         ));
     }
 
-    mirror_approved_plan_to_task_board_inner(manager, owner, session_id, plan_id, plan_state)
+    let mut snapshot = manager
+        .try_snapshot_state()
         .await
-        .map_err(|error| {
-            // Mirror failures are surfaced as-is. The caller can retry
-            // because partial progress (tasks already created, edges
-            // already linked) will be picked up by the idempotent
-            // identity checks inside ensure_approved_plan_step_task.
-            format!("failed to mirror approved plan into task board: {error}")
-        })
+        .map_err(|error| format!("snapshot task board before approved-plan mirror: {error}"))?;
+
+    match mirror_approved_plan_to_task_board_inner(manager, owner, session_id, plan_id, goal, plan)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(seal_error) = manager.seal_snapshot_for_restore(&mut snapshot).await {
+                return Err(format!(
+                    "failed to mirror approved plan into task board: {error}; additionally failed to seal rollback snapshot: {seal_error}"
+                ));
+            }
+            if let Err(restore_error) = manager.restore_snapshot(&snapshot).await {
+                return Err(format!(
+                    "failed to mirror approved plan into task board: {error}; additionally failed to roll back task board: {restore_error}"
+                ));
+            }
+            Err(format!(
+                "failed to mirror approved plan into task board: {error}"
+            ))
+        }
+    }
 }
 
-/// Inner mirror implementation — callers go through
-/// [`mirror_approved_plan_to_task_board`] which adds snapshot/rollback.
-pub async fn mirror_approved_plan_to_task_board_inner(
+/// Inner mirror implementation.
+async fn mirror_approved_plan_to_task_board_inner(
     manager: &TaskManager,
     owner: &str,
     session_id: &str,
     plan_id: &str,
-    plan_state: &PlanModeState,
+    goal: &str,
+    plan: &TaskPlan,
 ) -> Result<(), String> {
-    let plan_fingerprint = plan_task_board_fingerprint(&plan_state.plan);
+    let plan_fingerprint = plan_task_board_fingerprint(plan);
 
     let mut step_task_ids = HashMap::new();
-    for (index, subtask) in plan_state.plan.subtasks.iter().enumerate() {
-        let task_id = ensure_approved_plan_step_task(
+    for (index, subtask) in plan.subtasks.iter().enumerate() {
+        let task_id = ensure_plan_step_task(PlanStepTaskRequest {
             manager,
             owner,
             session_id,
             plan_id,
-            &plan_state.goal,
-            &plan_fingerprint,
-            plan_state.plan.subtasks.len(),
-            index,
+            goal,
+            plan_fingerprint: &plan_fingerprint,
+            step_count: plan.subtasks.len(),
+            step_index: index,
             subtask,
-        )
+        })
         .await?;
         step_task_ids.insert(subtask.id.clone(), task_id);
     }
 
-    for subtask in &plan_state.plan.subtasks {
+    // Link dependency edges
+    for subtask in &plan.subtasks {
         let Some(task_id) = step_task_ids.get(&subtask.id) else {
             continue;
         };
@@ -268,20 +281,15 @@ pub async fn mirror_approved_plan_to_task_board_inner(
         }
     }
 
-    let first_runnable_task_id = plan_state
-        .plan
+    // Find first runnable step and start it
+    let first_runnable_task_id = plan
         .subtasks
         .iter()
         .find(|subtask| subtask.depends_on.is_empty())
-        .or_else(|| plan_state.plan.subtasks.first())
+        .or_else(|| plan.subtasks.first())
         .and_then(|subtask| step_task_ids.get(&subtask.id))
         .cloned()
-        .ok_or_else(|| {
-            format!(
-                "approved plan '{}' did not produce any task-board steps",
-                plan_state.goal
-            )
-        })?;
+        .ok_or_else(|| format!("approved plan '{goal}' did not produce any task-board steps"))?;
 
     pause_other_in_progress_tasks_for_plan_handoff(manager, &first_runnable_task_id).await?;
 
@@ -292,10 +300,10 @@ pub async fn mirror_approved_plan_to_task_board_inner(
             "metadata": {
                 "source": "approved_plan",
                 "plan_id": plan_id,
-                "plan_goal": plan_state.goal,
+                "plan_goal": goal,
                 "plan_fingerprint": plan_fingerprint,
                 "session_id": session_id,
-                "step_count": plan_state.plan.subtasks.len(),
+                "step_count": plan.subtasks.len(),
             }
         }))
         .await;
@@ -305,42 +313,51 @@ pub async fn mirror_approved_plan_to_task_board_inner(
     Ok(())
 }
 
-/// Create or re-use a single task-board entry for a plan step.
-#[allow(clippy::too_many_arguments)]
-/// Create or return an existing task for an approved plan step.
+/// Create or reuse a single task-board entry for a plan step.
 ///
 /// # Concurrency safety
 ///
 /// The check-then-create pattern is safe because the session tool executor
-/// serializes all tool calls (including `exit_plan_mode`) per session. No
-/// two goroutines can call this function for the same session concurrently.
-/// If the execution model ever changes to allow concurrent plan-mode tool
-/// calls, this function MUST be replaced with a DB-level uniqueness
-/// constraint on `(session_id, plan_subtask_id)` to prevent TOCTOU races.
-pub async fn ensure_approved_plan_step_task(
-    manager: &TaskManager,
-    owner: &str,
-    session_id: &str,
-    plan_id: &str,
-    goal: &str,
-    plan_fingerprint: &str,
-    step_count: usize,
-    step_index: usize,
-    subtask: &astra_services::task_orchestrator::SubtaskPlan,
-) -> Result<String, String> {
+/// serializes all tool calls per session. If the execution model ever changes
+/// to allow concurrent plan-mode tool calls, this function MUST be replaced
+/// with a DB-level uniqueness constraint on `(session_id, plan_subtask_id)`.
+pub struct PlanStepTaskRequest<'a> {
+    pub manager: &'a TaskManager,
+    pub owner: &'a str,
+    pub session_id: &'a str,
+    pub plan_id: &'a str,
+    pub goal: &'a str,
+    pub plan_fingerprint: &'a str,
+    pub step_count: usize,
+    pub step_index: usize,
+    pub subtask: &'a SubtaskPlan,
+}
+
+pub async fn ensure_plan_step_task(request: PlanStepTaskRequest<'_>) -> Result<String, String> {
+    let PlanStepTaskRequest {
+        manager,
+        owner,
+        session_id,
+        plan_id,
+        goal,
+        plan_fingerprint,
+        step_count,
+        step_index,
+        subtask,
+    } = request;
+    // Check for existing matching task
     let existing_task_id = manager
         .load_active_tasks()
         .await
         .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
         .into_iter()
-        .find(|task| {
-            approved_plan_step_task_matches(task, plan_id, goal, plan_fingerprint, &subtask.id)
-        })
+        .find(|task| approved_plan_step_task_matches(task, plan_id, plan_fingerprint, &subtask.id))
         .map(|task| task.id);
     if let Some(task_id) = existing_task_id {
         return Ok(task_id);
     }
 
+    // Create new task
     let mut create_args = serde_json::json!({
         "title": subtask.title,
         "description": subtask.description.clone().unwrap_or_else(|| {
@@ -370,24 +387,21 @@ pub async fn ensure_approved_plan_step_task(
         return Err(output);
     }
 
+    // Post-create verification: ensure the task is visible.
+    // Uses identity match (no is_open_work filter) because the task
+    // may already be in_progress after creation.
     let matching: Vec<_> = manager
         .load_active_tasks()
         .await
         .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
         .into_iter()
         .filter(|task| {
-            approved_plan_step_task_identity_matches(
-                task,
-                plan_id,
-                goal,
-                plan_fingerprint,
-                &subtask.id,
-            )
+            approved_plan_step_task_identity_matches(task, plan_id, plan_fingerprint, &subtask.id)
         })
         .collect();
     if matching.len() > 1 {
         tracing::warn!(
-            target: "astra_runtime::plan_task_mirror",
+            target: "astra_tools::plan_task_mirror",
             step_id = %subtask.id,
             goal = %goal,
             count = matching.len(),
@@ -408,7 +422,8 @@ pub async fn ensure_approved_plan_step_task(
         })
 }
 
-/// Pause every task that is currently `in_progress` except `target_task_id`.
+/// Pause every task that is currently `in_progress` except `target_task_id`,
+/// recording the reason in metadata for auditability.
 pub async fn pause_other_in_progress_tasks_for_plan_handoff(
     manager: &TaskManager,
     target_task_id: &str,
@@ -437,4 +452,69 @@ pub async fn pause_other_in_progress_tasks_for_plan_handoff(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_different_for_different_depends_on() {
+        let plan_a = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "a".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "b".into(),
+                    depends_on: vec!["s1".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut plan_b = plan_a.clone();
+        plan_b.subtasks[1].depends_on.clear();
+
+        let fp_a = plan_task_board_fingerprint(&plan_a);
+        let fp_b = plan_task_board_fingerprint(&plan_b);
+        assert_ne!(
+            fp_a, fp_b,
+            "dependency changes must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn fingerprint_identical_for_same_shape() {
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "step".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_task_board_fingerprint(&plan),
+            plan_task_board_fingerprint(&plan)
+        );
+    }
+
+    #[test]
+    fn task_status_to_session_status_maps_all_variants() {
+        use TaskStatus::*;
+        for (ts, expected) in [
+            (Pending, SessionTaskStatusKind::Pending),
+            (InProgress, SessionTaskStatusKind::InProgress),
+            (Paused, SessionTaskStatusKind::Paused),
+            (Completed, SessionTaskStatusKind::Completed),
+            (Failed, SessionTaskStatusKind::Failed),
+            (Cancelled, SessionTaskStatusKind::Cancelled),
+        ] {
+            assert_eq!(task_status_to_session_status(ts), expected);
+        }
+    }
 }

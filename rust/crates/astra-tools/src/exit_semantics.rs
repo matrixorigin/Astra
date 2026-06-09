@@ -137,8 +137,42 @@ pub fn classify_command_result(
     }
 }
 
+/// Return the last segment of a shell pipeline.
+///
+/// This is a small shell lexer, not a full parser: it tracks quotes and
+/// backslash escapes so only an unquoted `|` separates pipeline commands.
+/// That covers the cases exit semantics care about (`grep -E 'a|b'`,
+/// `python -c "print('a|b')" | head`) without treating regex alternation as a
+/// pipeline.
+pub fn last_pipeline_segment(command: &str) -> &str {
+    let bytes = command.as_bytes();
+    let mut last_start = 0;
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !in_single && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                last_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    &command[last_start..]
+}
+
 fn command_family(command: &str) -> Option<String> {
-    let mut tokens = command
+    // Extract the *last* command in a pipeline — the last segment determines
+    // the exit code, not the first (e.g. `ls | grep foo` → `grep`).
+    // Skip escaped `\|` used in regex patterns like `grep 'foo\|bar'`.
+    let mut tokens = last_pipeline_segment(command)
         .split_whitespace()
         .skip_while(|t| is_env_assignment(t));
     let family = tokens
@@ -259,6 +293,35 @@ mod tests {
     #[test]
     fn grep_no_match_is_informational_not_execution_error() {
         let semantics = classify_exit("grep missing src/main.rs", 1);
+        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn grep_escaped_pipe_no_match_is_informational() {
+        // Regression: `grep 'version\|Version' file` has an escaped `|` in the
+        // regex, not a pipeline separator. It must still be classified as grep.
+        let semantics = classify_exit("grep -n 'version\\|Version' crates/foo/src/file.rs", 1);
+        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn grep_quoted_regex_pipe_no_match_is_informational() {
+        for command in [
+            "grep -E 'foo|bar' crates/foo/src/file.rs",
+            "grep -E \"foo|bar\" crates/foo/src/file.rs",
+        ] {
+            let semantics = classify_exit(command, 1);
+            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert!(!semantics.is_tool_error(), "{command}");
+        }
+    }
+
+    #[test]
+    fn pipeline_last_command_determines_exit_semantics() {
+        // `ls | grep foo`: exit code comes from grep, not ls.
+        let semantics = classify_exit("ls -la | grep missing", 1);
         assert_eq!(semantics, ExitSemantics::InformationalFailure);
         assert!(!semantics.is_tool_error());
     }

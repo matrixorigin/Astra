@@ -547,6 +547,7 @@ mod tests {
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .next()
             .expect("task")
@@ -582,6 +583,7 @@ mod tests {
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .next()
             .expect("task")

@@ -48,7 +48,7 @@ use crate::tool_sandbox::{
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
-use super::plan_task_mirror;
+use astra_tools::plan_task_mirror;
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
@@ -595,7 +595,18 @@ fn json_usize_arg(args: &Value, key: &str, default: usize, min: usize, max: usiz
     let value = args
         .get(key)
         .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
+        .and_then(|value| {
+            usize::try_from(value)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        key,
+                        value,
+                        error = %e,
+                        "json_usize_arg: type overflow, falling back to default={default}"
+                    );
+                })
+                .ok()
+        })
         .unwrap_or(default);
     value.clamp(min, max)
 }
@@ -992,7 +1003,7 @@ impl ServerToolExecutor {
             Duration::from_secs(15),
         );
 
-        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new().with_validation());
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();
@@ -1427,9 +1438,13 @@ impl ServerToolExecutor {
                 source: "transcript".to_string(),
                 role,
                 content,
-                run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
+                run_id: row.try_get::<Option<String>, _>("run_id")
+                    .inspect_err(|e| tracing::warn!(column="run_id", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
+                    .ok()
+                    .flatten(),
                 created_at: row
                     .try_get::<Option<String>, _>("created_at")
+                    .inspect_err(|e| tracing::warn!(column="created_at", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
                     .ok()
                     .flatten(),
             });
@@ -1497,9 +1512,13 @@ impl ServerToolExecutor {
                 source: "history_chunk".to_string(),
                 role: chunk_type,
                 content,
-                run_id: row.try_get::<Option<String>, _>("source_id").ok().flatten(),
+                run_id: row.try_get::<Option<String>, _>("source_id")
+                    .inspect_err(|e| tracing::warn!(column="source_id", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
+                    .ok()
+                    .flatten(),
                 created_at: row
                     .try_get::<Option<String>, _>("created_at")
+                    .inspect_err(|e| tracing::warn!(column="created_at", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
                     .ok()
                     .flatten(),
             });
@@ -2978,9 +2997,25 @@ impl ServerToolExecutor {
         let timestamp_ms = entry
             .timestamp
             .duration_since(SystemTime::UNIX_EPOCH)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "rollback timestamp predates UNIX_EPOCH, using 0"
+                );
+            })
             .ok()
             .map(|duration| duration.as_millis())
-            .and_then(|millis| u64::try_from(millis).ok());
+            .and_then(|millis| {
+                u64::try_from(millis)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            millis,
+                            error = %e,
+                            "rollback timestamp u64 overflow, using 0"
+                        );
+                    })
+                    .ok()
+            });
         let mut value = serde_json::Map::from_iter([
             ("label".to_string(), Value::String(entry.label.clone())),
             (
@@ -3219,7 +3254,7 @@ impl ServerToolExecutor {
     }
 
     async fn task_action_create(&self, args: &Value) -> String {
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -3227,6 +3262,13 @@ impl ServerToolExecutor {
         };
         let output = self.task_manager.create(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -3247,7 +3289,7 @@ impl ServerToolExecutor {
     }
 
     async fn task_action_update(&self, args: &Value) -> String {
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -3255,6 +3297,13 @@ impl ServerToolExecutor {
         };
         let output = self.task_manager.update(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -3269,7 +3318,7 @@ impl ServerToolExecutor {
     }
 
     async fn task_action_stop(&self, args: &Value) -> String {
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -3277,6 +3326,13 @@ impl ServerToolExecutor {
         };
         let output = self.task_manager.stop(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -3337,7 +3393,7 @@ impl ServerToolExecutor {
     }
 
     async fn task_archive(&self, args: &Value) -> String {
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -3345,6 +3401,13 @@ impl ServerToolExecutor {
         };
         let output = self.task_manager.archive(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -3367,24 +3430,21 @@ impl ServerToolExecutor {
     fn approved_plan_task_matches(
         task: &SessionTask,
         plan_id: &str,
-        goal: &str,
         plan_fingerprint: &str,
     ) -> bool {
-        plan_task_mirror::approved_plan_task_matches(task, plan_id, goal, plan_fingerprint)
+        plan_task_mirror::approved_plan_task_matches(task, plan_id, plan_fingerprint)
     }
 
     #[allow(dead_code)]
     fn approved_plan_step_task_matches(
         task: &SessionTask,
         plan_id: &str,
-        goal: &str,
         plan_fingerprint: &str,
         plan_subtask_id: &str,
     ) -> bool {
         plan_task_mirror::approved_plan_step_task_matches(
             task,
             plan_id,
-            goal,
             plan_fingerprint,
             plan_subtask_id,
         )
@@ -3481,8 +3541,15 @@ impl ServerToolExecutor {
             .to_string();
         }
 
-        let parse_u32 =
-            |value: &Value| value.as_u64().and_then(|number| u32::try_from(number).ok());
+        let parse_u32 = |value: &Value| {
+            value.as_u64().and_then(|number| {
+                u32::try_from(number)
+                    .inspect_err(|e| {
+                        tracing::warn!("config_drift: u64→u32 overflow converting {number}: {e}");
+                    })
+                    .ok()
+            })
+        };
         let parse_f64 = |value: &Value| value.as_f64();
         let ceiling = constraints.config_drift_ceiling;
         let session_snapshot = session.rollback_snapshot();
@@ -3888,11 +3955,13 @@ impl ServerToolExecutor {
             .unwrap_or("summary");
         let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
 
-        let snapshot = self
-            .introspect_snapshot
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let snapshot = self.introspect_snapshot.read().unwrap_or_else(|poison| {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "introspect_snapshot lock poisoned (writer panicked), recovering with inner data"
+            );
+            poison.into_inner()
+        }).clone();
 
         match snapshot {
             Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
@@ -5421,7 +5490,7 @@ esac
             _request_id: &str,
             _payload_json: &str,
         ) -> Result<i64, String> {
-            panic!("MCP tools must not be routed through edge dispatch");
+            Err("MCP tools must not be routed through edge dispatch".to_string())
         }
 
         async fn poll_pending(
@@ -5429,11 +5498,11 @@ esac
             _user_id: &str,
             _edge_agent_id: &str,
         ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
-            panic!("MCP tools must not poll edge dispatch");
+            Err("MCP tools must not poll edge dispatch".to_string())
         }
 
         async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-            panic!("MCP tools must not mark edge dispatch");
+            Err("MCP tools must not mark edge dispatch".to_string())
         }
 
         async fn deliver_result(
@@ -5442,7 +5511,7 @@ esac
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
-            panic!("MCP tools must not deliver edge dispatch results");
+            Err("MCP tools must not deliver edge dispatch results".to_string())
         }
 
         async fn wait_result(
@@ -5450,11 +5519,11 @@ esac
             _request_id: &str,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
-            panic!("MCP tools must not wait for edge dispatch results");
+            Err("MCP tools must not wait for edge dispatch results".to_string())
         }
 
         async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
-            panic!("MCP tools must not clean edge dispatch");
+            Err("MCP tools must not clean edge dispatch".to_string())
         }
     }
 
@@ -5471,7 +5540,7 @@ esac
             _worktree_path: Option<&str>,
             _capabilities: Option<serde_json::Value>,
         ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
-            panic!("MCP tools must not update edge registry");
+            Err("MCP tools must not update edge registry".to_string())
         }
 
         async fn heartbeat(
@@ -5480,18 +5549,18 @@ esac
             _edge_agent_id: &str,
             _edge_id_header: &str,
         ) -> Result<(), String> {
-            panic!("MCP tools must not heartbeat edge registry");
+            Err("MCP tools must not heartbeat edge registry".to_string())
         }
 
         async fn list_by_user(
             &self,
             _user_id: &str,
         ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
-            panic!("MCP tools must not list edge registry");
+            Err("MCP tools must not list edge registry".to_string())
         }
 
         async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
-            panic!("MCP tools must not unregister edge registry");
+            Err("MCP tools must not unregister edge registry".to_string())
         }
     }
 
@@ -7811,6 +7880,7 @@ esac
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -7901,6 +7971,7 @@ esac
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -7984,6 +8055,7 @@ esac
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -8101,6 +8173,7 @@ esac
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -8228,6 +8301,7 @@ esac
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -8519,6 +8593,8 @@ esac
             TaskManagerSnapshot {
                 tasks: vec![],
                 next_task_id: 1,
+                version: 0,
+                restore_version: None,
             },
             "seed",
         );
@@ -8552,6 +8628,8 @@ esac
             TaskManagerSnapshot {
                 tasks: vec![],
                 next_task_id: 1,
+                version: 0,
+                restore_version: None,
             },
             "task-seed",
         );

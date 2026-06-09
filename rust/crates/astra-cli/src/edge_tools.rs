@@ -1927,7 +1927,7 @@ impl ToolExecutor {
             self.record_task_lifecycle_event("create", args, &output);
             return output;
         }
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -1935,6 +1935,13 @@ impl ToolExecutor {
         };
         let output = self.task_manager.create(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -1963,7 +1970,7 @@ impl ToolExecutor {
             self.record_task_lifecycle_event("update", args, &output);
             return output;
         }
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -1971,6 +1978,13 @@ impl ToolExecutor {
         };
         let output = self.task_manager.update(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -1989,7 +2003,7 @@ impl ToolExecutor {
             self.record_task_lifecycle_event("stop", args, &output);
             return output;
         }
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -1997,6 +2011,13 @@ impl ToolExecutor {
         };
         let output = self.task_manager.stop(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -2083,7 +2104,7 @@ impl ToolExecutor {
             self.record_task_lifecycle_event("archive", args, &output);
             return output;
         }
-        let snapshot = match self.task_manager.try_snapshot_state().await {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
@@ -2091,6 +2112,13 @@ impl ToolExecutor {
         };
         let output = self.task_manager.archive(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
