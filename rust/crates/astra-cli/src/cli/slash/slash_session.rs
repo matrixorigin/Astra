@@ -5314,10 +5314,13 @@ async fn apply_prepared_fork_restore(
                 .peek_next_task_id(parent_id)
                 .await
                 .unwrap_or(fallback_next_id);
-            Some(astra_tools::task_mgmt::TaskManagerSnapshot {
+            let snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
                 tasks: parent_tasks,
                 next_task_id,
-            })
+            };
+            Some(astra_tools::task_mgmt::prepare_task_snapshot_for_fork(
+                snapshot,
+            ))
         } else {
             None
         }
@@ -8196,6 +8199,11 @@ mod resume_tests {
             .create(&serde_json::json!({"title": "continue forked work"}))
             .await;
         assert!(created.contains("created"), "{created}");
+        let started = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
 
         let child_state = session_runtime::RestoredSessionState {
             history: vec![("child-q".into(), "child-a".into())],
@@ -8232,6 +8240,20 @@ mod resume_tests {
         assert!(
             child_list.contains("continue forked work"),
             "forked child should inherit the parent task board snapshot: {child_list}"
+        );
+        assert!(
+            child_list.contains("\"status\":\"paused\""),
+            "forked child should inherit active parent work as paused, not in_progress: {child_list}"
+        );
+        let child_snapshot = state.task_manager.snapshot().await;
+        assert_eq!(
+            child_snapshot[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("fork_copied_from_status"))
+                .and_then(serde_json::Value::as_str),
+            Some("in_progress"),
+            "forked child should explain active parent work was paused: {child_snapshot:?}"
         );
     }
 

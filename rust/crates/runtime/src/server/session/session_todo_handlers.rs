@@ -19,7 +19,9 @@
 //! to skip ownership checks.
 
 use super::*;
-use astra_tools::task_mgmt::{TaskManager, TaskStore, normalize_title};
+use astra_tools::task_mgmt::{
+    TaskManager, TaskStore, normalize_title, prepare_task_snapshot_for_fork,
+};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -508,6 +510,7 @@ async fn copy_task_board_into_fork(
         }
     };
     let copied = snapshot.tasks.len();
+    let snapshot = prepare_task_snapshot_for_fork(snapshot);
     if let Err(error) = target_manager.restore_snapshot(&snapshot).await {
         return format!("Error: copy fork task board into {target_session}: {error}");
     }
@@ -1510,8 +1513,8 @@ mod tests {
             "fork_copy must not migrate or otherwise alter the parent task"
         );
 
-        let target_status: String = sqlx::query_scalar(
-            "SELECT status FROM session_todos WHERE session_id = ? AND todo_id = ? AND user_id = ?",
+        let (target_status, target_metadata): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, metadata FROM session_todos WHERE session_id = ? AND todo_id = ? AND user_id = ?",
         )
         .bind(&target_session)
         .bind("task-1")
@@ -1519,7 +1522,17 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("target status");
-        assert_eq!(target_status, "in_progress");
+        assert_eq!(
+            target_status, "paused",
+            "forked child should inherit work, not parent live execution state"
+        );
+        let target_metadata: serde_json::Value =
+            serde_json::from_str(target_metadata.as_deref().unwrap_or("{}"))
+                .expect("target metadata json");
+        assert_eq!(
+            target_metadata["fork_copied_from_status"], "in_progress",
+            "fork copy should retain why the child task was paused"
+        );
 
         let preserve = copy_task_board_into_fork(
             &state,

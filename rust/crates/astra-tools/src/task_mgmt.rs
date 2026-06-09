@@ -505,6 +505,31 @@ pub struct TaskManagerSnapshot {
     pub next_task_id: u32,
 }
 
+/// Prepare a task-board snapshot for a forked child session.
+///
+/// A fork inherits the work board, not the parent's live execution state.
+/// Anything that was `in_progress` in the parent is copied as `paused` so
+/// the child can explicitly resume or reprioritize without showing two
+/// sessions as actively running the same task.
+pub fn prepare_task_snapshot_for_fork(mut snapshot: TaskManagerSnapshot) -> TaskManagerSnapshot {
+    for task in &mut snapshot.tasks {
+        if task.status == SessionTaskStatusKind::InProgress {
+            task.status = SessionTaskStatusKind::Paused;
+            let metadata = task.metadata.get_or_insert_with(serde_json::Map::new);
+            metadata.insert(
+                "fork_copied_from_status".to_string(),
+                Value::String("in_progress".to_string()),
+            );
+        }
+        for subtask in &mut task.subtasks {
+            if subtask.status == SessionTaskStatusKind::InProgress {
+                subtask.status = SessionTaskStatusKind::Paused;
+            }
+        }
+    }
+    snapshot
+}
+
 pub struct TaskMutationResult {
     pub tasks: Vec<SessionTask>,
     pub next_task_id: Option<u32>,
@@ -4744,6 +4769,68 @@ mod tests {
         };
         assert_eq!(max_task_id(std::slice::from_ref(&t)), 7);
         assert_eq!(max_task_id(std::slice::from_ref(&nonnum)), 0);
+    }
+
+    #[test]
+    fn prepare_task_snapshot_for_fork_pauses_live_parent_work() {
+        let snapshot = TaskManagerSnapshot {
+            tasks: vec![
+                SessionTask {
+                    id: "task-1".into(),
+                    title: "active parent work".into(),
+                    description: None,
+                    status: SessionTaskStatusKind::InProgress,
+                    subtasks: vec![SessionSubtask {
+                        id: "step-1".into(),
+                        title: "active child step".into(),
+                        description: None,
+                        status: SessionTaskStatusKind::InProgress,
+                        depends_on: vec![],
+                        owner: None,
+                    }],
+                    created_at: "".into(),
+                    updated_at: "".into(),
+                    active_form: Some("Working".into()),
+                    owner: None,
+                    metadata: None,
+                    blocks: vec![],
+                    blocked_by: vec![],
+                },
+                SessionTask {
+                    id: "task-2".into(),
+                    title: "completed parent work".into(),
+                    description: None,
+                    status: SessionTaskStatusKind::Completed,
+                    subtasks: vec![],
+                    created_at: "".into(),
+                    updated_at: "".into(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: vec![],
+                    blocked_by: vec![],
+                },
+            ],
+            next_task_id: 3,
+        };
+
+        let forked = prepare_task_snapshot_for_fork(snapshot);
+
+        assert_eq!(forked.next_task_id, 3);
+        assert_eq!(forked.tasks[0].status, SessionTaskStatusKind::Paused);
+        assert_eq!(
+            forked.tasks[0].subtasks[0].status,
+            SessionTaskStatusKind::Paused
+        );
+        assert_eq!(
+            forked.tasks[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("fork_copied_from_status"))
+                .and_then(Value::as_str),
+            Some("in_progress")
+        );
+        assert_eq!(forked.tasks[1].status, SessionTaskStatusKind::Completed);
     }
 
     #[tokio::test]
