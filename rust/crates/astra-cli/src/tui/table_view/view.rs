@@ -146,7 +146,7 @@ use crate::cli::effects::truncate_label;
 #[cfg(test)]
 mod tests {
     use super::super::parser::parse;
-    use super::{desired_height, render, truncate};
+    use super::{desired_height, render, truncate_label};
     use crate::tui::table_view::{MysqlTable, TableNav};
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use ratatui::buffer::Buffer;
