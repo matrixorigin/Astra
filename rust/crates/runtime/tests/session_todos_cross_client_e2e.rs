@@ -696,6 +696,50 @@ async fn blocked_task_cannot_start_until_dependency_completes_in_matrixone() {
 
 #[tokio::test]
 #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
+async fn in_progress_task_rejects_new_unresolved_blocker_in_matrixone() {
+    let pool = bootstrap_pool().await;
+    let session_id = format!("s-running-blocker-{}", uuid::Uuid::new_v4());
+    cleanup(&pool, &session_id).await;
+
+    let user_id = format!("u-running-blocker-{}", uuid::Uuid::new_v4());
+    let edge_store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new(pool.clone()).with_user_id(&user_id));
+    let cloud_store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new(pool.clone()).with_user_id(&user_id));
+    let edge = TaskManager::new(session_id.clone(), edge_store);
+    let cloud = TaskManager::new(session_id.clone(), cloud_store);
+
+    edge.create(&json!({"title": "prepare"})).await;
+    edge.create(&json!({"title": "already running"})).await;
+    let started = edge
+        .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+        .await;
+    assert!(!started.starts_with("Error:"), "{started}");
+
+    let blocked_while_running = cloud
+        .update(&json!({"task_id": "task-2", "add_blocked_by": ["task-1"]}))
+        .await;
+    assert!(
+        blocked_while_running.starts_with("Error:")
+            && blocked_while_running.contains("cannot start")
+            && blocked_while_running.contains("task-1")
+            && blocked_while_running.contains("pending"),
+        "MatrixOne must reject adding an unresolved blocker to an in_progress task: {blocked_while_running}"
+    );
+
+    let task: SessionTask =
+        serde_json::from_str(&edge.get(&json!({"task_id": "task-2"})).await).unwrap();
+    assert_eq!(task.status, SessionTaskStatusKind::InProgress);
+    assert!(
+        task.blocked_by.is_empty(),
+        "rejected MatrixOne blocker edge must not persist: {task:?}"
+    );
+
+    cleanup(&pool, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
 async fn dangling_blocked_by_dependency_blocks_start_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-dangling-blocked-by-{}", uuid::Uuid::new_v4());

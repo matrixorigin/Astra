@@ -1,4 +1,4 @@
-//! MatrixOne-backed [`TaskStore`] for the session scratchpad.
+//! MatrixOne-backed [`TaskStore`] for the durable session task board.
 //!
 //! Authoritative store for the Tier 1 task board, per Plan
 //! `docs/plans/task-system-design.md` §2.1. Each edge and cloud loop host

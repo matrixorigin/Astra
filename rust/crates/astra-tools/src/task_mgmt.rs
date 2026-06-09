@@ -1,8 +1,8 @@
-//! Session scratchpad task management.
+//! Durable per-session task board management.
 //!
-//! Runtime-owned continuity state is the authoritative source for agent progress.
-//! These tools are only an explicit user/model scratchpad and must not be relied
-//! on for multi-turn continuity or resume.
+//! Runtime-owned continuity state remains authoritative for agent execution
+//! progress. This module owns the user/model checklist: concrete outcomes,
+//! dependencies, status transitions, and resume/fork-visible work tracking.
 //!
 //! ## Storage model
 //!
@@ -37,7 +37,7 @@ pub const MAX_SUBTASK_ID_CHARS: usize = 128;
 pub const MAX_SUBTASK_TITLE_CHARS: usize = 512;
 pub const MAX_SUBTASK_DESCRIPTION_CHARS: usize = 10_000;
 
-/// A scratchpad task tracked within the current CLI session.
+/// A durable checklist task tracked within the current CLI session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionTask {
     pub id: String,
@@ -2251,8 +2251,10 @@ impl TaskManager {
                             return Err(format!("task '{}' cannot be blocked by itself", task_id));
                         }
                     }
-                    if new_status == Some(SessionTaskStatusKind::InProgress) {
-                        validate_single_in_progress_slot(&tasks, &task_id)?;
+                    if projected_status.is_in_progress() {
+                        if new_status == Some(SessionTaskStatusKind::InProgress) {
+                            validate_single_in_progress_slot(&tasks, &task_id)?;
+                        }
                         validate_task_can_start_after_projected_edges(
                             &tasks,
                             &task_id,
@@ -4169,6 +4171,39 @@ mod tests {
         assert!(
             start.contains("\"success\":true") && start.contains("\"status\":\"in_progress\""),
             "{start}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_rejects_new_unresolved_blocker_edge() {
+        let m = mgr();
+        m.create(&json!({"title": "setup"})).await;
+        m.create(&json!({"title": "already running"})).await;
+        let started = m
+            .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
+
+        let blocked_while_running = m
+            .update(&json!({"task_id": "task-2", "add_blocked_by": ["task-1"]}))
+            .await;
+        assert!(
+            blocked_while_running.starts_with("Error:"),
+            "{blocked_while_running}"
+        );
+        assert!(
+            blocked_while_running.contains("cannot start")
+                && blocked_while_running.contains("task-1")
+                && blocked_while_running.contains("pending"),
+            "adding an unresolved blocker to an in_progress task should explain the inconsistent state: {blocked_while_running}"
+        );
+
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(task.status, SessionTaskStatusKind::InProgress);
+        assert!(
+            task.blocked_by.is_empty(),
+            "rejected blocker edge must not be persisted: {task:?}"
         );
     }
 

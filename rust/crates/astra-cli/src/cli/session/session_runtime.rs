@@ -64,7 +64,7 @@ pub(crate) fn resolve_cloud_base() -> Option<String> {
         .map(|s| s.trim_end_matches('/').to_string())
 }
 
-/// Task store for the Tier 1 session scratchpad (`session_todos`).
+/// Task store for the durable per-session task board (`session_todos`).
 ///
 /// When cloud is configured, returns an [`crate::cli::session::session_todo_client::HttpTaskStore`]
 /// that polls the server's `GET /sessions/{sid}/todos` endpoint and
