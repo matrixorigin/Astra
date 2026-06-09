@@ -1727,16 +1727,14 @@ impl ToolExecutor {
             .map(str::trim)
             .filter(|plan| !plan.is_empty())
             .map(str::to_string);
-        let explicit_approved = args.get("approved").and_then(Value::as_bool);
-
         let cloud_plan_id = self.lookup_active_authoring_cloud_plan_id().await;
         match cloud_plan_id {
             Some(plan_id) => {
-                self.exit_plan_mode_cloud_path(plan_id, plan_markdown.as_deref(), explicit_approved)
+                self.exit_plan_mode_cloud_path(plan_id, plan_markdown.as_deref())
                     .await
             }
             None => {
-                self.exit_plan_mode_local_path(plan_markdown.as_deref(), explicit_approved)
+                self.exit_plan_mode_local_path(plan_markdown.as_deref())
                     .await
             }
         }
@@ -1769,7 +1767,6 @@ impl ToolExecutor {
         &self,
         plan_id: String,
         plan_markdown: Option<&str>,
-        explicit_approved: Option<bool>,
     ) -> String {
         let Some(token) = self.cloud_token() else {
             return "Error: exit_plan_mode lost the cloud token mid-flight.".to_string();
@@ -1779,13 +1776,11 @@ impl ToolExecutor {
             Err(err) => return err,
         };
 
-        let (approved, follow_up_mode) = match explicit_approved {
-            Some(value) => (value, None),
-            None => match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
+        let (approved, follow_up_mode) =
+            match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
                 Ok(decision) => decision,
                 Err(message) => return message,
-            },
-        };
+            };
 
         let mut body = json!({ "approved": approved });
         if let Some(plan_markdown) = plan_markdown {
@@ -1840,18 +1835,12 @@ impl ToolExecutor {
     /// the overlay + `pending_permission_mode_change` slot. This is
     /// `exit_plan_mode` here is a permission-state pivot driven by
     /// user choice — no cloud row is required for it to succeed.
-    async fn exit_plan_mode_local_path(
-        &self,
-        plan_markdown: Option<&str>,
-        explicit_approved: Option<bool>,
-    ) -> String {
-        let (approved, follow_up_mode) = match explicit_approved {
-            Some(value) => (value, None),
-            None => match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
+    async fn exit_plan_mode_local_path(&self, plan_markdown: Option<&str>) -> String {
+        let (approved, follow_up_mode) =
+            match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
                 Ok(decision) => decision,
                 Err(message) => return message,
-            },
-        };
+            };
 
         if approved {
             let next_mode =
@@ -1907,7 +1896,7 @@ impl ToolExecutor {
             .and_then(|guard| guard.clone());
         let Some(tx) = tx else {
             return Err(
-                "Error: exit_plan_mode requires an interactive TUI overlay. Re-call with `approved=true` or `approved=false` for headless mode."
+                "Error: exit_plan_mode requires a trusted interactive plan-review overlay; model-supplied approval arguments are ignored."
                     .to_string(),
             );
         };

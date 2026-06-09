@@ -221,11 +221,10 @@ async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
 }
 
 #[tokio::test]
-async fn exit_plan_mode_with_approved_bypasses_overlay() {
-    // Explicit `approved: true` is the headless / harness escape hatch:
-    // it bypasses the interactive Approve / Keep-planning overlay and
-    // commits the plan directly. Works for any plan status and both
-    // cloud-backed and offline plans.
+async fn exit_plan_mode_ignores_model_supplied_approval_without_overlay() {
+    // LLM/tool arguments are not a trusted approval source. Even if the
+    // model passes `approved: true`, exit_plan_mode must require the
+    // interactive plan-review overlay before unlocking writes.
     for (label, use_cloud, status, plan_id) in [
         ("cloud planning", true, "planning", "plan-cloud-plan"),
         ("cloud refining", true, "refining", "plan-cloud-ref"),
@@ -236,19 +235,6 @@ async fn exit_plan_mode_with_approved_bypasses_overlay() {
         if use_cloud {
             let server = MockServer::start().await;
             mock_authoring_plan_present(&server, &session_id, plan_id, status).await;
-            Mock::given(method("POST"))
-                .and(path(format!("/plans/{plan_id}/exit-plan-mode")))
-                .and(header("authorization", "Bearer token"))
-                .and(body_json(json!({
-                    "approved": true,
-                    "plan_md": "1. Ship auth"
-                })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "plan_id": plan_id,
-                    "phase": "refining"
-                })))
-                .mount(&server)
-                .await;
 
             let temp = tempfile::tempdir().unwrap();
             let executor = ToolExecutor::new(temp.path().to_path_buf())
@@ -263,21 +249,13 @@ async fn exit_plan_mode_with_approved_bypasses_overlay() {
                 .await;
 
             assert!(
-                result.starts_with("Exited plan mode."),
-                "[{label}] must exit. Got: {result}"
-            );
-            assert!(
-                result.contains(plan_id),
-                "[{label}] result should mention plan id ({plan_id}). Got: {result}"
-            );
-            assert!(
-                result.contains("auto"),
-                "[{label}] explicit approval should default to auto mode. Got: {result}"
+                result.contains("trusted interactive plan-review overlay"),
+                "[{label}] model-supplied approval must not bypass UI review. Got: {result}"
             );
             assert_eq!(
                 executor.take_pending_permission_mode_change(),
-                Some(crate::cli::permission_manager::PermissionMode::Auto),
-                "[{label}] explicit approval must stage a non-plan permission mode"
+                None,
+                "[{label}] no trusted approval means no permission-mode change"
             );
         } else {
             let temp = tempfile::tempdir().unwrap();
@@ -304,17 +282,13 @@ async fn exit_plan_mode_with_approved_bypasses_overlay() {
                 )
                 .await;
             assert!(
-                exit_result.starts_with("Exited plan mode"),
-                "[{label}] offline approval should succeed. Got: {exit_result}"
-            );
-            assert!(
-                exit_result.contains("auto"),
-                "[{label}] offline approval should default to auto. Got: {exit_result}"
+                exit_result.contains("trusted interactive plan-review overlay"),
+                "[{label}] model-supplied approval must not bypass local UI review. Got: {exit_result}"
             );
             assert_eq!(
                 executor.take_pending_permission_mode_change(),
-                Some(crate::cli::permission_manager::PermissionMode::Auto),
-                "[{label}] offline approval must leave plan mode"
+                None,
+                "[{label}] no trusted approval means local plan mode stays active"
             );
         }
     }
@@ -416,7 +390,7 @@ async fn exit_plan_mode_overlay_paths() {
             install_overlay: false,
             decision: None,
             expect_starts_with: "Error:",
-            expect_contains: &["interactive TUI overlay", "approved"],
+            expect_contains: &["trusted interactive plan-review overlay"],
             expect_not_contains: &[],
             expect_pending_mode: None,
             expect_tool_boost: None,
@@ -841,13 +815,26 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         "precondition: writes must be blocked before exit. Got: {blocked}"
     );
 
-    // Approve exit.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
+    let overlay_task = tokio::spawn(async move {
+        let request = rx.recv().await.expect("overlay request");
+        let _ = request
+            .response_tx
+            .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
+                mode: crate::cli::permission_manager::PermissionMode::Auto,
+            });
+    });
+
+    // Approve exit through the trusted overlay.
     let exit = executor
-        .execute("exit_plan_mode", &json!({"approved": true}))
+        .execute("exit_plan_mode", &json!({"plan": "1. Ship"}))
         .await;
+    overlay_task.await.unwrap();
     assert!(
         exit.starts_with("Exited plan mode."),
-        "exit_plan_mode(approved=true) must succeed. Got: {exit}"
+        "trusted overlay approval must succeed. Got: {exit}"
     );
 
     // After approval, writes go through.
@@ -859,7 +846,7 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         .await;
     assert!(
         !unblocked.contains("blocked while plan mode is active"),
-        "after exit_plan_mode(approved=true), writes must be unblocked. Got: {unblocked}"
+        "after trusted exit_plan_mode approval, writes must be unblocked. Got: {unblocked}"
     );
 }
 

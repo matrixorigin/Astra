@@ -1019,7 +1019,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         2. Explore with read tools and identify existing patterns to follow.\n\
         3. Produce executable leaf steps: each step should map to one concrete artifact, API surface, or validation target.\n\
         4. Avoid umbrella steps like \"build the whole system\" when code, API, UI, and verification are separate outcomes.\n\
-        5. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval. Approval unlocks edits and seeds executable plan items.\n\
+        5. Call `exit_plan_mode(plan='<markdown>')` to submit the plan for user approval. Approval is produced by the UI/control plane, not by model-supplied tool arguments.\n\
         \n\
         ## When NOT to Use This Tool\n\
         Do not enter plan mode when normal execution is clearer:\n\
@@ -1050,7 +1050,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "exit_plan_mode",
-                "description": "Present the plan for user approval and exit plan mode. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects. On approval, write tools unlock and the approved work appears in the session task board. On rejection (`approved=false`), the plan stays open for another authoring pass.\n\
+                "description": "Submit the plan for user approval. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects in the trusted UI. The model cannot approve its own plan; approval unlocks writes only after the UI/control plane returns the user's decision. After trusted approval, the approved work appears in the session task board.\n\
         \n\
         ## Plan structure (what makes a good plan)\n\
         - Numbered list of concrete, executable leaf steps — each step maps to ONE artifact, API surface, or validation target.\n\
@@ -1068,11 +1068,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "plan": {
                             "type": "string",
                             "description": "The plan markdown to present for approval. Numbered list of steps; nested bullets ok. The user reads this verbatim."
-                        },
-                        "approved": {
-                            "type": "boolean",
-                            "default": true,
-                            "description": "True to commit the plan and unlock writes. False to keep planning."
                         }
                     },
                     "required": ["plan"]
@@ -1533,10 +1528,21 @@ mod tests {
         let exit =
             find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
         let desc = exit["function"]["description"].as_str().unwrap();
+        let properties = exit["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("exit_plan_mode properties must be an object");
 
         assert!(
             desc.contains("session task board"),
             "approved plans should surface through the user-visible task board: {desc}"
+        );
+        assert!(
+            desc.contains("model cannot approve its own plan"),
+            "schema must make user approval ownership explicit: {desc}"
+        );
+        assert!(
+            !properties.contains_key("approved"),
+            "model-facing exit_plan_mode schema must not expose an approval parameter"
         );
         assert!(
             !desc.contains("session_plan_todos"),

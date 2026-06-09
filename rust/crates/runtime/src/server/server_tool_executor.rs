@@ -3358,21 +3358,6 @@ impl ServerToolExecutor {
         output
     }
 
-    async fn mirror_approved_plan_to_task_board(
-        &self,
-        plan_id: &str,
-        plan_state: &astra_plan::PlanModeState,
-    ) -> Result<(), String> {
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &self.task_manager,
-            &self.user_id,
-            &self.session_id,
-            plan_id,
-            plan_state,
-        )
-        .await
-    }
-
     #[allow(dead_code)]
     fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
         plan_task_mirror::plan_task_board_fingerprint(plan)
@@ -4258,19 +4243,12 @@ impl ServerToolExecutor {
         )
     }
 
-    /// `exit_plan_mode` tool — flip the current session out of authoring so
-    /// write tools unlock. Does NOT start execution; the caller still needs
-    /// `POST /plans/{id}/execute` (or the next turn can proceed with writes
-    /// directly — approved plans are advisory, not a hard requirement for
-    /// subsequent bash/file ops).
+    /// `exit_plan_mode` tool — submit the authored plan for trusted user
+    /// approval. Model-supplied tool arguments must not unlock writes.
     async fn tool_exit_plan_mode(&self, args: &Value) -> String {
         let Some(repo) = self.plan_repo.clone() else {
             return "Error: plan repository not configured on this executor".to_string();
         };
-        let approved = args
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
 
         let active = match repo.active_plan_for_session(&self.session_id).await {
             Ok(Some(id)) => id,
@@ -4280,78 +4258,37 @@ impl ServerToolExecutor {
             Err(e) => return format!("Error: lookup active plan: {e}"),
         };
 
-        // We unlock writes by clearing `active_plan_id`. The `plans` row
-        // stays around so the approved plan can drive execution via
-        // /plans/{id}/execute. Rejecting keeps the plan linked for another
-        // authoring pass.
-        if approved {
-            let approved_plan_state = match repo.load(&active).await {
+        if let Some(plan_md) = args
+            .get("plan")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("plan_md").and_then(Value::as_str))
+        {
+            let mut state = match repo.load(&active).await {
                 Ok(state) => state,
-                Err(e) => {
-                    return format!("Error: load approved plan for task synchronization: {e}");
-                }
+                Err(e) => return format!("Error: load active plan: {e}"),
             };
-
-            // Unlock writes FIRST — if the mirror fails, the session is
-            // already usable. The idempotent mirror will pick up partial
-            // progress on the next exit_plan_mode call.
-            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
-                return format!(
-                    "Error: clear active plan failed: {e}\n\
-                     Session remains in plan mode (write tools blocked). \
-                     Manual intervention may be needed to clear active_plan_id."
-                );
-            }
-
-            // Mirror the approved plan into the user-visible task board.
-            // This is best-effort after unlock — if it fails, the session
-            // is out of plan mode and the user can retry or proceed via
-            // /plans/{id}/execute.
-            if let Err(e) = self
-                .mirror_approved_plan_to_task_board(&active, &approved_plan_state)
-                .await
-            {
-                return format!(
-                    "Error: session unlocked but failed to mirror approved plan into task board: {e}\n\
-                     The plan is approved and unlocked. Options: \
-                     (1) retry exit_plan_mode to sync the task board (idempotent), \
-                     (2) use task(action=list) to inspect current state, \
-                     (3) use /plans/{active}/execute to proceed without task board sync."
-                );
+            state.plan_md = Some(plan_md.to_string());
+            let expected = Some(state.version);
+            if let Err(e) = repo.save(&active, &mut state, expected).await {
+                return format!("Error: save submitted plan markdown: {e}");
             }
         }
 
-        // Always invalidate on exit — even a rejection mutates nothing but
-        // clients often immediately retry in-plan editing afterward, and
-        // a stale cache is cheap to avoid.
         self.invalidate_plan_mode_cache().await;
 
         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&self.session_id) {
             let _ = writer.append(
                 &astra_services::session_journal::JournalEvent::plan_lifecycle(
                     Some(&self.session_id),
-                    if approved {
-                        "plan_approved"
-                    } else {
-                        "plan_rejected"
-                    },
+                    "plan_submitted_for_approval",
                     Some(serde_json::json!({ "plan_id": active })),
                 ),
             );
         }
 
-        if approved {
-            format!(
-                "Exited plan mode. plan_id={} is approved; write tools unlocked. \
-                 Use `/plans/{}/execute` to start step-by-step execution.",
-                active, active
-            )
-        } else {
-            format!(
-                "Plan {} left open for another authoring pass. Write tools remain blocked.",
-                active
-            )
-        }
+        format!(
+            "Plan {active} submitted for trusted user approval. Write tools remain blocked until the UI/control plane records the user's approval."
+        )
     }
 
     // File operations (sandboxed to workspace_root)
@@ -7367,27 +7304,24 @@ esac
             "write_file must be blocked during authoring, got: {result}"
         );
 
-        // ── Phase 2: exit_plan_mode(approved=true) unblocks ──────────────
-        // Phase 2 split (2026-05): plan-mode actions promoted from
-        // `session` sub-actions to top-level `enter_plan_mode` /
-        // `exit_plan_mode` tools (claudecode parity). The legacy
-        // session.exit_plan path now returns an Error: redirect, so
-        // this test calls the new top-level surface directly.
+        // ── Phase 2: model-supplied approval must not unblock ────────────
+        // The model may submit a plan, but it cannot approve its own plan.
+        // Write unlock is owned by the trusted UI/control plane.
         let exit_result = exec
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            exit_result.contains("unlocked"),
-            "exit_plan_mode must confirm write tools are unlocked, got: {exit_result}"
+            exit_result.contains("submitted for trusted user approval"),
+            "exit_plan_mode must submit, not self-approve, got: {exit_result}"
         );
 
-        // bash now succeeds (or at least isn't blocked by the guard).
+        // bash remains blocked until a trusted approval clears active_plan_id.
         let result = exec
             .execute("bash", &json!({"command": "echo hello"}))
             .await;
         assert!(
-            !result.contains("blocked while plan mode is active"),
-            "bash must NOT be blocked after exit_plan_mode, got: {result}"
+            result.contains("blocked while plan mode is active"),
+            "bash must remain blocked after model-supplied exit_plan_mode, got: {result}"
         );
     }
 
