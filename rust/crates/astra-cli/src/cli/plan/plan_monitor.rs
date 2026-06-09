@@ -317,14 +317,10 @@ fn display_plan_updates_live(
                 elapsed,
                 eta,
             } => {
-                if state.plan_run_task_id.is_some() {
-                    let pct = (done * 100).checked_div(total).unwrap_or(0) as u32;
-                    state.plan_run_task_last_progress = Some((pct, done as u32, total as u32));
-                }
                 if let Some(PlanSpinner::Activity(spinner)) = plan_spinner.as_ref() {
                     spinner.set_eta_secs(eta.map(|d| d.as_secs()).unwrap_or(0));
                 }
-                let _ = (elapsed, eta);
+                let _ = (done, total, elapsed, eta);
                 continue;
             }
             PlanUpdate::PlanFinished {
@@ -335,21 +331,7 @@ fn display_plan_updates_live(
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
                 }
-                if state.plan_run_task_id.is_some() {
-                    let progress = state
-                        .executing_plan
-                        .as_ref()
-                        .map(|plan| (plan.items_done(), plan.subtasks.len() as u32))
-                        .or_else(|| {
-                            state
-                                .plan_run_task_last_progress
-                                .map(|(_, done, total)| (done, total))
-                        });
-                    if let Some((done, total)) = progress {
-                        state.plan_run_task_last_progress = Some((pct, done, total));
-                    }
-                    state.plan_run_task_last_outcome = Some(outcome);
-                }
+                state.plan_execution_last_error = None;
                 if let Some(mut h) = state.plan_handle.take() {
                     while let Some(trailing) = h.try_recv() {
                         apply_trailing_update(trailing, state);
@@ -439,8 +421,7 @@ fn display_plan_updates_live(
                 return PlanMonitorOutcome::Finished;
             }
             PlanUpdate::PlanError { error } => {
-                state.plan_run_task_last_error = Some(error.clone());
-                state.plan_run_task_last_outcome = None;
+                state.plan_execution_last_error = Some(error.clone());
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
                 }
@@ -871,59 +852,6 @@ fn display_plan_updates_live(
     outcome
 }
 
-/// Push latest plan progress to [`SessionState::task_service`] for `/task list`.
-pub(crate) async fn sync_plan_run_task_progress(state: &mut SessionState) {
-    let Some(ref tid) = state.plan_run_task_id else {
-        return;
-    };
-    let Some((pct, done, total)) = state.plan_run_task_last_progress else {
-        return;
-    };
-    let Some(ref svc) = state.task_service else {
-        return;
-    };
-    let _ = svc.update_progress(tid, pct, done, total).await;
-}
-
-/// Terminal sync: `/task list` stays `pending` unless we mark the row completed here.
-pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut SessionState) {
-    let Some(tid) = state.plan_run_task_id.clone() else {
-        return;
-    };
-    let Some(ref svc) = state.task_service else {
-        return;
-    };
-    if let Some(ref err) = state.plan_run_task_last_error {
-        let err = err.clone();
-        let _ = svc.fail_task(&tid, &err).await;
-    } else if let Some(ref report) = state.last_delivery_report {
-        let (outcome, pct, done, total) =
-            durable_bridge::plan_run_finish_from_delivery_report(report);
-        let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
-    } else if let Some(outcome) = state.plan_run_task_last_outcome {
-        if let Some((pct, done, total)) = state.plan_run_task_last_progress {
-            let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
-        } else {
-            let _ = svc
-                .fail_task(
-                    &tid,
-                    "Plan executor exited without terminal progress state.",
-                )
-                .await;
-        }
-    } else if state.plan_run_task_last_progress.is_some() {
-        let _ = svc
-            .fail_task(&tid, "Plan executor exited without terminal outcome.")
-            .await;
-    } else {
-        let _ = svc.complete_task(&tid).await;
-    }
-    state.plan_run_task_id = None;
-    state.plan_run_task_last_progress = None;
-    state.plan_run_task_last_outcome = None;
-    state.plan_run_task_last_error = None;
-}
-
 /// Returns `true` when the executor sent a terminal event (`PlanFinished` / `PlanError`).
 pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bool {
     if state.plan_handle.is_none() {
@@ -1029,11 +957,9 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
 
         sync_task_board_from_executing_plan(state).await;
-        sync_plan_run_task_progress(state).await;
 
         match outcome {
             PlanMonitorOutcome::Finished => {
-                finalize_plan_run_task_after_executor(state).await;
                 break;
             }
             PlanMonitorOutcome::Paused => {
@@ -1049,13 +975,6 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
 
         if state.plan_handle.as_ref().is_some_and(|h| h.is_finished()) {
             cleanup_orphan_plan_executor(state, &mut plan_spinner);
-            sync_plan_run_task_progress(state).await;
-            if state.plan_run_task_id.is_some() {
-                state.plan_run_task_last_error.get_or_insert(
-                    "Plan executor stopped without PlanFinished/PlanError (channel closed).".into(),
-                );
-                finalize_plan_run_task_after_executor(state).await;
-            }
             break;
         }
 
@@ -1280,14 +1199,12 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
-        sync_task_board_from_executing_plan, sync_task_board_subtask_status,
+        flush_plan_updates_between_prompts, sync_task_board_from_executing_plan,
+        sync_task_board_subtask_status,
     };
     use crate::cli::plan::plan_executor;
     use crate::cli::session::session_state::SessionState;
-    use astra_services::task_orchestrator::{
-        LocalTaskService, SubtaskPlan, TaskCreateRequest, TaskOutcome, TaskPlan, TaskStatus,
-    };
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskOutcome, TaskPlan, TaskStatus};
 
     #[test]
     fn flush_plan_updates_syncs_status_into_executing_plan() {
@@ -1499,92 +1416,6 @@ mod tests {
             new_task.subtasks[0].status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
             "new goal should receive current plan progress"
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_plan_run_task_after_executor_uses_partial_terminal_outcome() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc: std::sync::Arc<dyn astra_services::TaskService> =
-            std::sync::Arc::new(LocalTaskService::new(tmp.path().join("tasks")));
-        let task_id = svc
-            .create_task(
-                "user-1",
-                "session-1",
-                TaskCreateRequest {
-                    title: "Run plan".into(),
-                    description: None,
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-        let mut state = SessionState {
-            task_service: Some(svc.clone()),
-            plan_run_task_id: Some(task_id.clone()),
-            plan_run_task_last_progress: Some((67, 2, 3)),
-            plan_run_task_last_outcome: Some(TaskOutcome::Partial),
-            ..Default::default()
-        };
-
-        finalize_plan_run_task_after_executor(&mut state).await;
-
-        let task = svc
-            .get_task(&task_id)
-            .await
-            .unwrap()
-            .expect("task should exist");
-        assert_eq!(task.status, TaskStatus::Completed);
-        assert_eq!(task.progress_pct, 67);
-        assert_eq!(task.items_done, 2);
-        assert_eq!(task.items_total, 3);
-        assert_eq!(task.outcome, Some(TaskOutcome::Partial));
-        assert!(state.plan_run_task_id.is_none());
-        assert!(state.plan_run_task_last_progress.is_none());
-        assert!(state.plan_run_task_last_outcome.is_none());
-    }
-
-    #[tokio::test]
-    async fn finalize_plan_run_task_after_executor_fails_without_terminal_outcome() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc: std::sync::Arc<dyn astra_services::TaskService> =
-            std::sync::Arc::new(LocalTaskService::new(tmp.path().join("tasks")));
-        let task_id = svc
-            .create_task(
-                "user-1",
-                "session-1",
-                TaskCreateRequest {
-                    title: "Run plan".into(),
-                    description: None,
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-        let mut state = SessionState {
-            task_service: Some(svc.clone()),
-            plan_run_task_id: Some(task_id.clone()),
-            plan_run_task_last_progress: Some((100, 3, 3)),
-            ..Default::default()
-        };
-
-        finalize_plan_run_task_after_executor(&mut state).await;
-
-        let task = svc
-            .get_task(&task_id)
-            .await
-            .unwrap()
-            .expect("task should exist");
-        assert_eq!(task.status, TaskStatus::Failed);
-        assert_eq!(
-            task.error_message.as_deref(),
-            Some("Plan executor exited without terminal outcome.")
         );
     }
 

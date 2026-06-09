@@ -278,6 +278,11 @@ fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
 }
 
+fn parse_persisted_step_run_status(status: &str) -> Result<TaskStatus, PlanLoadError> {
+    TaskStatus::parse_status(status)
+        .ok_or_else(|| PlanLoadError::Corrupt(format!("unknown step_run status: {status}")))
+}
+
 fn validate_plan_id(plan_id: &str) -> Result<(), PlanLoadError> {
     if plan_id.is_empty() {
         return Err(PlanLoadError::InvalidId("plan ID must not be empty".into()));
@@ -777,7 +782,9 @@ impl PlanRepository for CloudPlanRepository {
             plan_id: r.try_get("plan_id").map_err(map_sqlx)?,
             subtask_id: r.try_get("subtask_id").map_err(map_sqlx)?,
             attempt: r.try_get("attempt").map_err(map_sqlx)?,
-            status: TaskStatus::parse_status(&r.try_get::<String, _>("status").map_err(map_sqlx)?),
+            status: parse_persisted_step_run_status(
+                &r.try_get::<String, _>("status").map_err(map_sqlx)?,
+            )?,
             session_id: r.try_get("session_id").map_err(map_sqlx)?,
             started_at: r.try_get("started_at").map_err(map_sqlx)?,
             finished_at: r.try_get("finished_at").map_err(map_sqlx)?,
@@ -835,9 +842,9 @@ impl PlanRepository for CloudPlanRepository {
                 plan_id: r.try_get("plan_id").map_err(map_sqlx)?,
                 subtask_id: r.try_get("subtask_id").map_err(map_sqlx)?,
                 attempt: r.try_get("attempt").map_err(map_sqlx)?,
-                status: TaskStatus::parse_status(
+                status: parse_persisted_step_run_status(
                     &r.try_get::<String, _>("status").map_err(map_sqlx)?,
-                ),
+                )?,
                 session_id: r.try_get("session_id").map_err(map_sqlx)?,
                 started_at: r.try_get("started_at").map_err(map_sqlx)?,
                 finished_at: r.try_get("finished_at").map_err(map_sqlx)?,
@@ -1226,6 +1233,19 @@ mod tests {
         for id in ["abc", "plan-123", "my_plan_v2", "ABC-xyz_01"] {
             assert!(validate_plan_id(id).is_ok(), "should accept {id}");
         }
+    }
+
+    #[test]
+    fn persisted_step_run_status_rejects_unknown_values() {
+        assert_eq!(
+            parse_persisted_step_run_status("in_progress").unwrap(),
+            TaskStatus::InProgress
+        );
+        let err = parse_persisted_step_run_status("unknown_status").unwrap_err();
+        assert!(
+            matches!(err, PlanLoadError::Corrupt(_)),
+            "unknown persisted step-run status must fail closed: {err}"
+        );
     }
 
     #[tokio::test]

@@ -355,6 +355,8 @@ pub(crate) struct SessionState {
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     /// Last delivery report — kept after plan completion so `/report` works post-plan.
     pub last_delivery_report: Option<astra_services::durable_task::TaskDeliveryReport>,
+    /// Last terminal error from the plan executor, used for prompt/TUI recovery messaging.
+    pub plan_execution_last_error: Option<String>,
     /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
     pub plan_execution_corrections: Vec<String>,
     /// Delegation engine for multi-agent coordination.
@@ -372,16 +374,6 @@ pub(crate) struct SessionState {
     /// When Some, a plan executor is alive (either actively running or paused
     /// waiting for Resume/Cancel).
     pub plan_handle: Option<plan_executor::PlanExecutorHandle>,
-
-    /// `agent_tasks` row created when plan execution starts (`go`); used to sync
-    /// `/task list` with the background executor (progress + terminal status).
-    pub plan_run_task_id: Option<String>,
-    /// Latest `(progress_pct, items_done, items_total)` from [`PlanUpdate::PlanProgress`].
-    pub plan_run_task_last_progress: Option<(u32, u32, u32)>,
-    /// Terminal outcome reported by the plan executor when it exits cleanly.
-    pub plan_run_task_last_outcome: Option<astra_services::task_orchestrator::TaskOutcome>,
-    /// Set when the executor exits with [`PlanUpdate::PlanError`].
-    pub plan_run_task_last_error: Option<String>,
 
     /// When Some, a plan-executor tool is waiting for user approval.
     /// In blocking mode this is handled inline; kept for edge-case fallback.
@@ -656,6 +648,7 @@ impl Default for SessionState {
             )),
             durable_task_state: None,
             last_delivery_report: None,
+            plan_execution_last_error: None,
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
             team_registry: slash_team::TeamRegistry::new(),
@@ -663,10 +656,6 @@ impl Default for SessionState {
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             ),
             plan_handle: None,
-            plan_run_task_id: None,
-            plan_run_task_last_progress: None,
-            plan_run_task_last_outcome: None,
-            plan_run_task_last_error: None,
             pending_approval: None,
             plan_in_token_stream: false,
             plan_md_renderer: None,
@@ -807,12 +796,9 @@ impl SessionState {
         self.latest_context_assembly_trace = None;
         self.durable_task_state = None;
         self.last_delivery_report = None;
+        self.plan_execution_last_error = None;
         self.plan_execution_corrections.clear();
         self.plan_handle = None;
-        self.plan_run_task_id = None;
-        self.plan_run_task_last_progress = None;
-        self.plan_run_task_last_outcome = None;
-        self.plan_run_task_last_error = None;
         self.pending_approval = None;
         self.plan_in_token_stream = false;
         self.plan_md_renderer = None;
@@ -1128,12 +1114,7 @@ mod default_tests {
             pinned_skills: ["skill-a".to_string()].into_iter().collect(),
             discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             executing_plan_id: Some("plan-1".into()),
-            plan_run_task_id: Some("task-1".into()),
-            plan_run_task_last_progress: Some((10, 1, 9)),
-            plan_run_task_last_outcome: Some(
-                astra_services::task_orchestrator::TaskOutcome::Partial,
-            ),
-            plan_run_task_last_error: Some("stale".into()),
+            plan_execution_last_error: Some("stale".into()),
             plan_mode_sync_error: Some("sync".into()),
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -1150,10 +1131,7 @@ mod default_tests {
         assert!(state.pinned_skills.is_empty());
         assert!(state.discovered_skills.is_empty());
         assert!(state.executing_plan_id.is_none());
-        assert!(state.plan_run_task_id.is_none());
-        assert!(state.plan_run_task_last_progress.is_none());
-        assert!(state.plan_run_task_last_outcome.is_none());
-        assert!(state.plan_run_task_last_error.is_none());
+        assert!(state.plan_execution_last_error.is_none());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());

@@ -1557,7 +1557,7 @@ pub(crate) async fn run_tui_session(
                                                                 {
                                                                     "Plan run paused. Use `show`, `rewind …`, `correct …`, or `go` to continue.".to_string()
                                                                 } else if state
-                                                                    .plan_run_task_last_error
+                                                                    .plan_execution_last_error
                                                                     .is_some()
                                                                 {
                                                                     "Plan run ended with an error. Rewind or adjust it before trying `go` again.".to_string()
