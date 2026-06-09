@@ -41,6 +41,8 @@ use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
 };
 use astra_services::{EdgeContext, LlmTokenServiceConfig};
+use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskStore};
+use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
@@ -1102,6 +1104,38 @@ fn restore_session_state_compact(
     if ss.consecutive_ctx_errors > 0 {
         loop_state.consecutive_context_window_errors = ss.consecutive_ctx_errors;
     }
+}
+
+fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<String> {
+    let open: Vec<&SessionTask> = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+
+    let next = open
+        .iter()
+        .copied()
+        .find(|task| task.status.is_in_progress())
+        .or_else(|| open.iter().copied().find(|task| task.status.is_pending()))
+        .or_else(|| open.first().copied())?;
+    let title = next.title.chars().take(120).collect::<String>();
+    let more = open.len().saturating_sub(1);
+    let more_suffix = if more > 0 {
+        format!(" · +{more} more open")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "open={} · next=[{}] {}: {}{}",
+        open.len(),
+        next.status,
+        next.id,
+        title,
+        more_suffix
+    ))
 }
 
 fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
@@ -3398,6 +3432,7 @@ impl AgenticRunLifecycleService {
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
         plan_resume_hint: Option<String>,
+        task_board_resume_hint: Option<String>,
     ) -> server_loop_host::ServerAgenticLoopHost {
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
@@ -3416,7 +3451,8 @@ impl AgenticRunLifecycleService {
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(request.interaction_mode)
         .with_interactive_client(request.interactive_client)
-        .with_plan_resume_hint(plan_resume_hint);
+        .with_plan_resume_hint(plan_resume_hint)
+        .with_task_board_resume_hint(task_board_resume_hint);
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -3448,6 +3484,31 @@ impl AgenticRunLifecycleService {
             builder = builder.with_test_llm_rounds(rounds);
         }
         builder.build()
+    }
+
+    async fn task_board_resume_hint_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        let Some(shared) = &self.shared_pool else {
+            return None;
+        };
+        let store: Arc<dyn TaskStore> =
+            Arc::new(MatrixOneTaskStore::from_shared(shared).with_user_id(user_id));
+        let manager = TaskManager::new(session_id.to_string(), store);
+        match manager.load_active_tasks().await {
+            Ok(tasks) => format_task_board_resume_hint(&tasks),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    user_id = %user_id,
+                    error = %error,
+                    "failed to load task board resume hint for Cloud turn"
+                );
+                None
+            }
+        }
     }
 
     /// Build the initial [`AgenticLoopState`] from a chat request.
@@ -4048,6 +4109,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let task_board_resume_hint = self
+            .task_board_resume_hint_for_session(&user_id, &session_id)
+            .await;
         let mut host = self.build_host(
             &user_id,
             &session_id,
@@ -4055,6 +4119,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile,
             plan_resume_hint,
+            task_board_resume_hint,
         );
         if let Some(ref bundle) = mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone());
@@ -4628,6 +4693,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let task_board_resume_hint = self
+            .task_board_resume_hint_for_session(&user_id, &session_id)
+            .await;
         let mut host = self.build_host(
             &user_id,
             &session_id,
@@ -4635,6 +4703,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile,
             plan_resume_hint,
+            task_board_resume_hint,
         );
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
@@ -6432,7 +6501,64 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
+    fn test_session_task(
+        id: &str,
+        title: &str,
+        status: astra_tools::task_mgmt::SessionTaskStatusKind,
+    ) -> SessionTask {
+        SessionTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            description: None,
+            status,
+            subtasks: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: vec![],
+            blocked_by: vec![],
+        }
+    }
+
     // ── extract_prev_assistant_text + implicit feedback wiring ──
+
+    #[test]
+    fn task_board_resume_hint_is_bounded_and_prefers_running_work() {
+        use astra_tools::task_mgmt::SessionTaskStatusKind;
+
+        let tasks = vec![
+            test_session_task("task-1", "pending setup", SessionTaskStatusKind::Pending),
+            test_session_task(
+                "task-2",
+                "active implementation",
+                SessionTaskStatusKind::InProgress,
+            ),
+            test_session_task("task-3", "already done", SessionTaskStatusKind::Completed),
+            test_session_task("task-4", "waiting review", SessionTaskStatusKind::Paused),
+        ];
+
+        let hint = format_task_board_resume_hint(&tasks).expect("open task hint");
+
+        assert_eq!(
+            hint,
+            "open=3 · next=[in_progress] task-2: active implementation · +2 more open"
+        );
+    }
+
+    #[test]
+    fn task_board_resume_hint_is_absent_without_open_work() {
+        use astra_tools::task_mgmt::SessionTaskStatusKind;
+
+        let tasks = vec![test_session_task(
+            "task-1",
+            "already done",
+            SessionTaskStatusKind::Completed,
+        )];
+
+        assert!(format_task_board_resume_hint(&tasks).is_none());
+    }
 
     #[test]
     fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
