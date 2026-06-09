@@ -912,10 +912,7 @@ async fn job_actions_dispatch_through_executor() {
     // shell — needs `command`; without the registry wired we expect
     // the unwired-fast-fail path, not the missing-arg path.
     let result = executor
-        .execute(
-            "job",
-            &json!({"action": "shell", "command": "echo hi"}),
-        )
+        .execute("job", &json!({"action": "shell", "command": "echo hi"}))
         .await;
     assert!(
         result.contains("background_shell")
@@ -929,10 +926,7 @@ async fn job_actions_dispatch_through_executor() {
     // output — must reach the same handler that returns the unwired
     // message; both kill and output share the registry dependency.
     let result = executor
-        .execute(
-            "job",
-            &json!({"action": "kill", "job_id": "bg-shell-1"}),
-        )
+        .execute("job", &json!({"action": "kill", "job_id": "bg-shell-1"}))
         .await;
     assert!(
         result.contains("background")
@@ -947,10 +941,7 @@ async fn job_actions_dispatch_through_executor() {
 async fn job_agent_action_is_rejected_with_agent_tool_guidance() {
     let executor = test_executor();
     let result = executor
-        .execute(
-            "job",
-            &json!({"action": "agent", "prompt": "audit TODOs"}),
-        )
+        .execute("job", &json!({"action": "agent", "prompt": "audit TODOs"}))
         .await;
 
     assert!(result.contains("not a supported user journey"), "{result}");

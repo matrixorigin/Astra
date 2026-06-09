@@ -44,6 +44,15 @@ fn context_panel_hint_mentions_close() {
     hint_contains(&v, &["Esc"]);
 }
 
+// ─── Help ─────────────────────────────────────────────────────────
+
+#[test]
+fn help_hint_mentions_ctrl_b_backgrounding() {
+    use super::help_view::HelpView;
+    let v = HelpView::new();
+    hint_contains(&v, &["Ctrl+B", "background", "Esc"]);
+}
+
 // ─── Timeline ─────────────────────────────────────────────────────
 
 #[test]

@@ -1,4 +1,5 @@
 use crate::cli::session::session_state::SessionState;
+use astra_tools::task_mgmt::MAX_CREATE_SUBTASKS;
 
 pub(crate) async fn mirror_plan_to_task_board(
     state: &SessionState,
@@ -8,122 +9,79 @@ pub(crate) async fn mirror_plan_to_task_board(
     if plan.subtasks.is_empty() {
         return Ok(());
     }
+    if plan.subtasks.len() > MAX_CREATE_SUBTASKS {
+        return Err(format!(
+            "approved plan has {} step(s); maximum is {MAX_CREATE_SUBTASKS}. Split oversized subtasks into separate plans.",
+            plan.subtasks.len()
+        ));
+    }
     let plan_fingerprint = plan_task_board_fingerprint(plan);
 
-    let existing_task_id = state
-        .task_manager
-        .load_active_tasks()
-        .await
-        .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
-        .into_iter()
-        .find(|task| approved_plan_task_matches(task, goal, &plan_fingerprint))
-        .map(|task| task.id);
+    let mut step_task_ids = std::collections::HashMap::new();
+    for (index, subtask) in plan.subtasks.iter().enumerate() {
+        let task_id = ensure_plan_step_task(
+            state,
+            goal,
+            &plan_fingerprint,
+            plan.subtasks.len(),
+            index,
+            subtask,
+        )
+        .await?;
+        step_task_ids.insert(subtask.id.clone(), task_id);
+    }
 
-    let task_id = if let Some(task_id) = existing_task_id {
-        task_id
-    } else {
-        let subtasks: Vec<serde_json::Value> = plan
-            .subtasks
+    for subtask in &plan.subtasks {
+        let Some(task_id) = step_task_ids.get(&subtask.id) else {
+            continue;
+        };
+        let blockers: Vec<String> = subtask
+            .depends_on
             .iter()
-            .map(|subtask| {
-                let mut value = serde_json::json!({
-                    "id": subtask.id,
-                    "title": subtask.title,
-                    "depends_on": subtask.depends_on,
-                });
-                if let Some(description) = subtask.description.as_deref() {
-                    value["description"] = serde_json::json!(description);
-                }
-                value
-            })
+            .filter_map(|dep_id| step_task_ids.get(dep_id).cloned())
             .collect();
-        let output = state
-            .task_manager
-            .create(&serde_json::json!({
-                "title": goal,
-                "description": format!(
-                    "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
-                    plan.subtasks.len()
-                ),
-                "active_form": "Executing approved plan",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_goal": goal,
-                    "plan_fingerprint": plan_fingerprint,
-                    "step_count": plan.subtasks.len(),
-                },
-                "subtasks": subtasks,
-            }))
-            .await;
-        if output.starts_with("Error:") {
-            return Err(output);
+        if blockers.is_empty() {
+            continue;
         }
-        let created_task_id = state
+        let needs_edges = state
             .task_manager
             .load_active_tasks()
             .await
-            .map_err(|error| format!("load task board after approved-plan create: {error}"))?
+            .map_err(|error| {
+                format!("load task board before approved-plan dependency sync: {error}")
+            })?
             .into_iter()
-            .find(|task| approved_plan_task_matches(task, goal, &plan_fingerprint))
-            .map(|task| task.id);
-        if let Some(task_id) = created_task_id {
-            task_id
-        } else if output.contains("already has this title") || output.contains("duplicate_of") {
-            let suffix: String = plan_fingerprint.chars().take(16).collect();
-            let disambiguated_title = if suffix.is_empty() {
-                format!("{goal} (new plan)")
-            } else {
-                format!("{goal} ({suffix})")
-            };
+            .find(|task| task.id == *task_id)
+            .is_none_or(|task| blockers.iter().any(|id| !task.blocked_by.contains(id)));
+        if needs_edges {
             let output = state
                 .task_manager
-                .create(&serde_json::json!({
-                    "title": disambiguated_title,
-                    "description": format!(
-                        "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
-                        plan.subtasks.len()
-                    ),
-                    "active_form": "Executing approved plan",
-                    "metadata": {
-                        "source": "approved_plan",
-                        "plan_goal": goal,
-                        "plan_fingerprint": plan_fingerprint,
-                        "step_count": plan.subtasks.len(),
-                    },
-                    "subtasks": subtasks,
+                .update(&serde_json::json!({
+                    "task_id": task_id,
+                    "add_blocked_by": blockers,
                 }))
                 .await;
             if output.starts_with("Error:") {
                 return Err(output);
             }
-            state
-                .task_manager
-                .load_active_tasks()
-                .await
-                .map_err(|error| {
-                    format!("load task board after approved-plan duplicate-title retry: {error}")
-                })?
-                .into_iter()
-                .find(|task| approved_plan_task_matches(task, goal, &plan_fingerprint))
-                .map(|task| task.id)
-                .ok_or_else(|| {
-                    format!(
-                        "approved plan '{goal}' was not visible in task board after duplicate-title retry"
-                    )
-                })?
-        } else {
-            return Err(format!(
-                "approved plan '{goal}' was not visible in task board after task.create"
-            ));
         }
-    };
+    }
 
-    pause_other_in_progress_tasks_for_plan_handoff(state, &task_id).await?;
+    let first_runnable_task_id = plan
+        .subtasks
+        .iter()
+        .find(|subtask| subtask.depends_on.is_empty())
+        .or_else(|| plan.subtasks.first())
+        .and_then(|subtask| step_task_ids.get(&subtask.id))
+        .cloned()
+        .ok_or_else(|| format!("approved plan '{goal}' did not produce any task-board steps"))?;
+
+    pause_other_in_progress_tasks_for_plan_handoff(state, &first_runnable_task_id).await?;
 
     let output = state
         .task_manager
         .update(&serde_json::json!({
-            "task_id": task_id,
+            "task_id": first_runnable_task_id,
             "new_status": "in_progress",
             "metadata": {
                 "source": "approved_plan",
@@ -137,6 +95,68 @@ pub(crate) async fn mirror_plan_to_task_board(
         return Err(output);
     }
     Ok(())
+}
+
+async fn ensure_plan_step_task(
+    state: &SessionState,
+    goal: &str,
+    plan_fingerprint: &str,
+    step_count: usize,
+    step_index: usize,
+    subtask: &astra_services::task_orchestrator::SubtaskPlan,
+) -> Result<String, String> {
+    let existing_task_id = state
+        .task_manager
+        .load_active_tasks()
+        .await
+        .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
+        .into_iter()
+        .find(|task| approved_plan_step_task_matches(task, goal, plan_fingerprint, &subtask.id))
+        .map(|task| task.id);
+    if let Some(task_id) = existing_task_id {
+        return Ok(task_id);
+    }
+
+    let mut create_args = serde_json::json!({
+        "title": subtask.title,
+        "description": subtask.description.clone().unwrap_or_else(|| {
+            format!("Approved plan step {} of {step_count} for: {goal}", step_index + 1)
+        }),
+        "active_form": format!("Executing: {}", subtask.title),
+        "metadata": {
+            "source": "approved_plan",
+            "plan_goal": goal,
+            "plan_fingerprint": plan_fingerprint,
+            "plan_subtask_id": subtask.id,
+            "plan_step_index": step_index,
+            "step_count": step_count,
+        },
+    });
+    let output = state.task_manager.create(&create_args).await;
+    if output.contains("already has this title") || output.contains("duplicate_of") {
+        create_args["title"] = serde_json::json!(format!("{} ({})", subtask.title, subtask.id));
+        let retry = state.task_manager.create(&create_args).await;
+        if retry.starts_with("Error:") {
+            return Err(retry);
+        }
+    } else if output.starts_with("Error:") {
+        return Err(output);
+    }
+
+    state
+        .task_manager
+        .load_active_tasks()
+        .await
+        .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
+        .into_iter()
+        .find(|task| approved_plan_step_task_matches(task, goal, plan_fingerprint, &subtask.id))
+        .map(|task| task.id)
+        .ok_or_else(|| {
+            format!(
+                "approved plan step '{}' for '{goal}' was not visible in task board after task.create",
+                subtask.id
+            )
+        })
 }
 
 async fn pause_other_in_progress_tasks_for_plan_handoff(
@@ -198,6 +218,22 @@ pub(crate) fn approved_plan_task_matches(
         }
 }
 
+pub(crate) fn approved_plan_step_task_matches(
+    task: &astra_tools::task_mgmt::SessionTask,
+    goal: &str,
+    plan_fingerprint: &str,
+    plan_subtask_id: &str,
+) -> bool {
+    if !approved_plan_task_matches(task, goal, plan_fingerprint) {
+        return false;
+    }
+    task.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("plan_subtask_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(plan_subtask_id)
+}
+
 pub(crate) fn plan_task_board_fingerprint(
     plan: &astra_services::task_orchestrator::TaskPlan,
 ) -> String {
@@ -257,6 +293,86 @@ mod tests {
         }
     }
 
+    fn is_approved_plan_goal(task: &SessionTask, goal: &str) -> bool {
+        task.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("source"))
+            .and_then(serde_json::Value::as_str)
+            == Some("approved_plan")
+            && task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_goal"))
+                .and_then(serde_json::Value::as_str)
+                == Some(goal)
+    }
+
+    #[tokio::test]
+    async fn mirror_plan_to_task_board_creates_one_top_level_task_per_plan_step() {
+        let state = SessionState::default();
+        let plan = astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "Build backend".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "Verify API".into(),
+                    depends_on: vec!["s1".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        mirror_plan_to_task_board(&state, "Ship reimbursements", &plan)
+            .await
+            .unwrap();
+
+        let tasks = state.task_manager.snapshot().await;
+        let approved: Vec<_> = tasks
+            .iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved.len(),
+            2,
+            "approved plan should create one top-level task per plan step, not one umbrella task: {tasks:?}"
+        );
+        assert!(
+            approved.iter().all(|task| task.subtasks.is_empty()),
+            "plan steps should be top-level tasks; approved-plan umbrella subtasks are not user-visible enough: {approved:?}"
+        );
+        assert!(approved.iter().any(|task| {
+            task.title == "Build backend"
+                && task.status == SessionTaskStatusKind::InProgress
+                && task
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("s1")
+        }));
+        let verify = approved
+            .iter()
+            .find(|task| task.title == "Verify API")
+            .expect("second plan step task");
+        assert_eq!(verify.status, SessionTaskStatusKind::Pending);
+        assert_eq!(
+            verify.blocked_by.len(),
+            1,
+            "task dependencies should mirror plan step dependencies: {verify:?}"
+        );
+    }
+
     #[tokio::test]
     async fn mirror_plan_to_task_board_does_not_reuse_same_goal_with_different_steps() {
         let state = SessionState::default();
@@ -289,12 +405,12 @@ mod tests {
             .snapshot()
             .await
             .into_iter()
-            .filter(|task| task.title.starts_with("same goal"))
+            .filter(|task| is_approved_plan_goal(task, "same goal"))
             .collect();
         assert_eq!(
             tasks.len(),
             2,
-            "same goal text with a different plan shape should create a separate visible task tree"
+            "same goal text with a different plan shape should create separate visible step tasks"
         );
         assert_eq!(
             tasks
@@ -355,14 +471,14 @@ mod tests {
 
         let err = mirror_plan_to_task_board(&state, "oversized approved plan", &plan)
             .await
-            .expect_err("oversized approved plans should not create one huge task tree");
+            .expect_err("oversized approved plans should not create one huge batch of step tasks");
         assert!(
             err.contains("subtasks") && err.contains("maximum"),
             "oversized approved plan should surface the task fan-out limit: {err}"
         );
         assert!(
             state.task_manager.snapshot().await.is_empty(),
-            "rejected oversized plan should not leave a partial task tree"
+            "rejected oversized plan should not leave partial task-board work"
         );
     }
 
@@ -387,12 +503,16 @@ mod tests {
 
         let tasks = state.task_manager.snapshot().await;
         assert!(
-            tasks.iter().any(|task| task.title == "ship task UX"),
+            tasks
+                .iter()
+                .any(|task| is_approved_plan_goal(task, "ship task UX")),
             "first plan goal should remain visible: {tasks:?}"
         );
         assert!(
-            tasks.iter().any(|task| task.title == "ship plan UX"),
-            "second plan goal should create its own visible task tree: {tasks:?}"
+            tasks
+                .iter()
+                .any(|task| is_approved_plan_goal(task, "ship plan UX")),
+            "second plan goal should create its own visible step task: {tasks:?}"
         );
     }
 
@@ -430,12 +550,12 @@ mod tests {
             .snapshot()
             .await
             .into_iter()
-            .filter(|task| task.title.starts_with("ship dependency-sensitive plan"))
+            .filter(|task| is_approved_plan_goal(task, "ship dependency-sensitive plan"))
             .collect();
         assert_eq!(
             tasks.len(),
-            2,
-            "dependency changes must create a fresh visible task tree instead of reusing stale ordering: {tasks:?}"
+            4,
+            "dependency changes must create fresh visible step tasks instead of reusing stale ordering: {tasks:?}"
         );
     }
 
@@ -472,7 +592,7 @@ mod tests {
             .snapshot()
             .await
             .into_iter()
-            .filter(|task| task.title == "repeatable plan")
+            .filter(|task| is_approved_plan_goal(task, "repeatable plan"))
             .collect();
         assert_eq!(
             tasks.len(),

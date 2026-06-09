@@ -508,9 +508,7 @@ fn job_schema_exists_with_expected_actions() {
     let job = schemas
         .iter()
         .find(|s| s["function"]["name"].as_str() == Some("job"))
-        .expect(
-            "job schema must exist — it owns background shell/output/kill",
-        );
+        .expect("job schema must exist — it owns background shell/output/kill");
     assert!(
         schemas
             .iter()

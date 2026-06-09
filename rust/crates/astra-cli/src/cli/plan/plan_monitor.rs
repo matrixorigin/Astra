@@ -1134,11 +1134,12 @@ async fn sync_task_board_subtask_status(
         .await
         .into_iter()
         .find(|task| {
-            crate::cli::plan::plan_task_board::approved_plan_task_matches(
+            crate::cli::plan::plan_task_board::approved_plan_step_task_matches(
                 task,
                 goal,
                 plan_fingerprint,
-            ) && task.subtasks.iter().any(|subtask| subtask.id == subtask_id)
+                subtask_id,
+            )
         });
 
     let Some(task) = task else {
@@ -1149,7 +1150,6 @@ async fn sync_task_board_subtask_status(
         .task_manager
         .update(&serde_json::json!({
             "task_id": task.id,
-            "subtask_id": subtask_id,
             "new_status": status.as_str(),
         }))
         .await;
@@ -1262,16 +1262,13 @@ mod tests {
         let create = state
             .task_manager
             .create(&serde_json::json!({
-                "title": "Ship plan UX",
+                "title": "Handle unhappy paths",
                 "metadata": {
                     "source": "approved_plan",
-                    "plan_id": "plan-1",
-                    "plan_fingerprint": plan_fingerprint
-                },
-                "subtasks": [
-                    { "id": "s1", "title": "Design state model" },
-                    { "id": "s2", "title": "Handle unhappy paths" }
-                ]
+                    "plan_goal": "Ship plan UX",
+                    "plan_fingerprint": plan_fingerprint,
+                    "plan_subtask_id": "s2"
+                }
             }))
             .await;
         assert!(create.contains("created"), "{create}");
@@ -1291,20 +1288,15 @@ mod tests {
             .snapshot()
             .await
             .into_iter()
-            .find(|task| task.title == "Ship plan UX")
-            .expect("plan task should exist");
+            .find(|task| task.title == "Handle unhappy paths")
+            .expect("plan step task should exist");
         assert_eq!(
             task.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
         );
-        let subtask = task
-            .subtasks
-            .iter()
-            .find(|subtask| subtask.id == "s2")
-            .expect("subtask should exist");
-        assert_eq!(
-            subtask.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        assert!(
+            task.subtasks.is_empty(),
+            "plan step should be top-level: {task:?}"
         );
     }
 
@@ -1343,27 +1335,19 @@ mod tests {
         let tasks = state.task_manager.snapshot().await;
         let stale_task = tasks
             .iter()
-            .find(|task| {
-                task.subtasks
-                    .iter()
-                    .any(|subtask| subtask.title == "old step")
-            })
+            .find(|task| task.title == "old step")
             .expect("stale task exists");
         assert_eq!(
-            stale_task.subtasks[0].status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+            stale_task.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Paused
         );
 
         let current_task = tasks
             .iter()
-            .find(|task| {
-                task.subtasks
-                    .iter()
-                    .any(|subtask| subtask.title == "new step")
-            })
+            .find(|task| task.title == "new step")
             .expect("current task exists");
         assert_eq!(
-            current_task.subtasks[0].status,
+            current_task.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
         );
     }
@@ -1400,20 +1384,26 @@ mod tests {
         let tasks = state.task_manager.snapshot().await;
         let old_task = tasks
             .iter()
-            .find(|task| task.title == "old goal")
+            .find(|task| task.title == "shared step")
             .expect("old goal task exists");
         assert_eq!(
-            old_task.subtasks[0].status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
+            old_task.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
             "old goal must not receive current plan progress"
         );
 
         let new_task = tasks
             .iter()
-            .find(|task| task.title == "new goal")
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_goal"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("new goal")
+            })
             .expect("new goal task exists");
         assert_eq!(
-            new_task.subtasks[0].status,
+            new_task.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
             "new goal should receive current plan progress"
         );

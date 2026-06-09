@@ -11,6 +11,8 @@ use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
 use crate::cli::command_registry::{self, CommandGroup, CommandMeta};
 
 const MAX_CMD_ROWS: usize = 10;
+const HELP_HINT: &str =
+    "←/→ switch group  ↑/↓ browse  Enter select  Ctrl+B background bash  Esc close";
 
 struct GroupData {
     group: CommandGroup,
@@ -149,10 +151,7 @@ impl BottomPaneView for HelpView {
             y += 1;
         }
         if y < area.bottom() {
-            let hint = Line::from(Span::styled(
-                "  ←/→ switch group  ↑/↓ browse  Enter select  Esc close",
-                dim,
-            ));
+            let hint = Line::from(Span::styled(format!("  {HELP_HINT}"), dim));
             Widget::render(hint, Rect::new(area.x, y, area.width, 1), buf);
         }
     }
@@ -225,5 +224,9 @@ impl BottomPaneView for HelpView {
         } else {
             None
         }
+    }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some(HELP_HINT.to_string())
     }
 }

@@ -26,6 +26,7 @@ use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use astra_tools::task_mgmt::{MAX_CREATE_SUBTASKS, SessionTask, TaskManager, TaskStore};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const MAX_GOAL_LENGTH: usize = 10_000;
@@ -552,6 +553,23 @@ fn approved_plan_task_matches(
         }
 }
 
+fn approved_plan_step_task_matches(
+    task: &SessionTask,
+    plan_id: &str,
+    goal: &str,
+    plan_fingerprint: &str,
+    plan_subtask_id: &str,
+) -> bool {
+    if !approved_plan_task_matches(task, plan_id, goal, plan_fingerprint) {
+        return false;
+    }
+    task.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("plan_subtask_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(plan_subtask_id)
+}
+
 fn approved_plan_task_identity_matches(
     task: &SessionTask,
     plan_id: &str,
@@ -580,6 +598,23 @@ fn approved_plan_task_identity_matches(
         }
 }
 
+fn approved_plan_step_task_identity_matches(
+    task: &SessionTask,
+    plan_id: &str,
+    goal: &str,
+    plan_fingerprint: &str,
+    plan_subtask_id: &str,
+) -> bool {
+    if !approved_plan_task_identity_matches(task, plan_id, goal, plan_fingerprint) {
+        return false;
+    }
+    task.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("plan_subtask_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(plan_subtask_id)
+}
+
 async fn mirror_approved_plan_to_task_board(
     manager: &TaskManager,
     owner: &str,
@@ -590,133 +625,90 @@ async fn mirror_approved_plan_to_task_board(
     if plan_state.plan.subtasks.is_empty() {
         return Ok(());
     }
+    if plan_state.plan.subtasks.len() > MAX_CREATE_SUBTASKS {
+        return Err(format!(
+            "approved plan has {} step(s); maximum is {MAX_CREATE_SUBTASKS}. Split oversized subtasks into separate plans.",
+            plan_state.plan.subtasks.len()
+        ));
+    }
     let plan_fingerprint = plan_task_board_fingerprint(&plan_state.plan);
-    let existing_task_id = manager
-        .load_active_tasks()
-        .await
-        .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
-        .into_iter()
-        .find(|task| approved_plan_task_matches(task, plan_id, &plan_state.goal, &plan_fingerprint))
-        .map(|task| task.id);
 
-    let task_id = if let Some(task_id) = existing_task_id {
-        task_id
-    } else {
-        let subtasks: Vec<serde_json::Value> = plan_state
-            .plan
-            .subtasks
+    let mut step_task_ids = HashMap::new();
+    for (index, subtask) in plan_state.plan.subtasks.iter().enumerate() {
+        let task_id = ensure_approved_plan_step_task(
+            manager,
+            owner,
+            session_id,
+            plan_id,
+            &plan_state.goal,
+            &plan_fingerprint,
+            plan_state.plan.subtasks.len(),
+            index,
+            subtask,
+        )
+        .await?;
+        step_task_ids.insert(subtask.id.clone(), task_id);
+    }
+
+    for subtask in &plan_state.plan.subtasks {
+        let Some(task_id) = step_task_ids.get(&subtask.id) else {
+            continue;
+        };
+        let blockers: Vec<String> = subtask
+            .depends_on
             .iter()
-            .map(|subtask| {
-                let mut value = serde_json::json!({
-                    "id": subtask.id,
-                    "title": subtask.title,
-                    "depends_on": subtask.depends_on,
-                });
-                if let Some(description) = subtask.description.as_deref() {
-                    value["description"] = serde_json::json!(description);
-                }
-                value
-            })
+            .filter_map(|dep_id| step_task_ids.get(dep_id).cloned())
             .collect();
-
-        let create_output = manager
-            .create(&serde_json::json!({
-                "title": plan_state.goal,
-                "description": format!(
-                    "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
-                    plan_state.plan.subtasks.len()
-                ),
-                "active_form": "Executing approved plan",
-                "owner": owner,
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": plan_id,
-                    "plan_fingerprint": plan_fingerprint,
-                    "session_id": session_id,
-                    "step_count": plan_state.plan.subtasks.len(),
-                },
-                "subtasks": subtasks,
-            }))
-            .await;
-        if create_output.starts_with("Error:") {
-            return Err(create_output);
+        if blockers.is_empty() {
+            continue;
         }
-
-        let snapshot_after_create = manager
+        let needs_edges = manager
             .load_active_tasks()
             .await
-            .map_err(|error| format!("load task board after approved-plan create: {error}"))?;
-        if let Some(task_id) = snapshot_after_create
-            .iter()
-            .find(|task| {
-                approved_plan_task_matches(task, plan_id, &plan_state.goal, &plan_fingerprint)
-            })
-            .map(|task| task.id.clone())
-        {
-            task_id
-        } else if create_output.contains("already has this title")
-            || create_output.contains("duplicate_of")
-        {
-            let suffix: String = plan_id.chars().take(16).collect();
-            let disambiguated_title = if suffix.is_empty() {
-                format!("{} (new plan)", plan_state.goal)
-            } else {
-                format!("{} ({suffix})", plan_state.goal)
-            };
-            let retry_output = manager
-                .create(&serde_json::json!({
-                    "title": disambiguated_title,
-                    "description": format!(
-                        "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
-                        plan_state.plan.subtasks.len()
-                    ),
-                    "active_form": "Executing approved plan",
-                    "owner": owner,
-                    "metadata": {
-                        "source": "approved_plan",
-                        "plan_id": plan_id,
-                        "plan_fingerprint": plan_fingerprint,
-                        "session_id": session_id,
-                        "step_count": plan_state.plan.subtasks.len(),
-                    },
-                    "subtasks": subtasks,
+            .map_err(|error| {
+                format!("load task board before approved-plan dependency sync: {error}")
+            })?
+            .into_iter()
+            .find(|task| task.id == *task_id)
+            .is_none_or(|task| blockers.iter().any(|id| !task.blocked_by.contains(id)));
+        if needs_edges {
+            let output = manager
+                .update(&serde_json::json!({
+                    "task_id": task_id,
+                    "add_blocked_by": blockers,
                 }))
                 .await;
-            if retry_output.starts_with("Error:") {
-                return Err(retry_output);
+            if output.starts_with("Error:") {
+                return Err(output);
             }
-            manager
-                .load_active_tasks()
-                .await
-                .map_err(|error| {
-                    format!("load task board after approved-plan duplicate-title retry: {error}")
-                })?
-                .into_iter()
-                .find(|task| {
-                    approved_plan_task_matches(task, plan_id, &plan_state.goal, &plan_fingerprint)
-                })
-                .map(|task| task.id)
-                .ok_or_else(|| {
-                    format!(
-                        "approved plan {plan_id} was not visible in task board after duplicate-title retry"
-                    )
-                })?
-        } else {
-            return Err(format!(
-                "approved plan {plan_id} was not visible in task board after task.create; output={create_output}; snapshot={snapshot_after_create:?}"
-            ));
         }
-    };
+    }
 
-    pause_other_in_progress_tasks_for_plan_handoff(&manager, &task_id).await?;
+    let first_runnable_task_id = plan_state
+        .plan
+        .subtasks
+        .iter()
+        .find(|subtask| subtask.depends_on.is_empty())
+        .or_else(|| plan_state.plan.subtasks.first())
+        .and_then(|subtask| step_task_ids.get(&subtask.id))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "approved plan '{}' did not produce any task-board steps",
+                plan_state.goal
+            )
+        })?;
+
+    pause_other_in_progress_tasks_for_plan_handoff(&manager, &first_runnable_task_id).await?;
 
     let output = manager
         .update(&serde_json::json!({
-            "task_id": task_id,
+            "task_id": first_runnable_task_id,
             "new_status": "in_progress",
             "metadata": {
                 "source": "approved_plan",
                 "plan_id": plan_id,
+                "plan_goal": plan_state.goal,
                 "plan_fingerprint": plan_fingerprint,
                 "session_id": session_id,
                 "step_count": plan_state.plan.subtasks.len(),
@@ -727,6 +719,77 @@ async fn mirror_approved_plan_to_task_board(
         return Err(output);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_approved_plan_step_task(
+    manager: &TaskManager,
+    owner: &str,
+    session_id: &str,
+    plan_id: &str,
+    goal: &str,
+    plan_fingerprint: &str,
+    step_count: usize,
+    step_index: usize,
+    subtask: &astra_services::task_orchestrator::SubtaskPlan,
+) -> Result<String, String> {
+    let existing_task_id = manager
+        .load_active_tasks()
+        .await
+        .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
+        .into_iter()
+        .find(|task| {
+            approved_plan_step_task_matches(task, plan_id, goal, plan_fingerprint, &subtask.id)
+        })
+        .map(|task| task.id);
+    if let Some(task_id) = existing_task_id {
+        return Ok(task_id);
+    }
+
+    let mut create_args = serde_json::json!({
+        "title": subtask.title,
+        "description": subtask.description.clone().unwrap_or_else(|| {
+            format!("Approved plan step {} of {step_count} for: {goal}", step_index + 1)
+        }),
+        "active_form": format!("Executing: {}", subtask.title),
+        "owner": owner,
+        "metadata": {
+            "source": "approved_plan",
+            "plan_id": plan_id,
+            "plan_goal": goal,
+            "plan_fingerprint": plan_fingerprint,
+            "plan_subtask_id": subtask.id,
+            "plan_step_index": step_index,
+            "session_id": session_id,
+            "step_count": step_count,
+        },
+    });
+    let output = manager.create(&create_args).await;
+    if output.contains("already has this title") || output.contains("duplicate_of") {
+        create_args["title"] = serde_json::json!(format!("{} ({})", subtask.title, subtask.id));
+        let retry = manager.create(&create_args).await;
+        if retry.starts_with("Error:") {
+            return Err(retry);
+        }
+    } else if output.starts_with("Error:") {
+        return Err(output);
+    }
+
+    manager
+        .load_active_tasks()
+        .await
+        .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
+        .into_iter()
+        .find(|task| {
+            approved_plan_step_task_matches(task, plan_id, goal, plan_fingerprint, &subtask.id)
+        })
+        .map(|task| task.id)
+        .ok_or_else(|| {
+            format!(
+                "approved plan step '{}' for '{goal}' was not visible in task board after task.create",
+                subtask.id
+            )
+        })
 }
 
 async fn pause_other_in_progress_tasks_for_plan_handoff(
@@ -798,8 +861,13 @@ async fn sync_plan_task_board_subtask_status(
         .map_err(|error| format!("load task board before plan subtask sync: {error}"))?
         .into_iter()
         .find(|task| {
-            approved_plan_task_identity_matches(task, plan_id, "", &plan_fingerprint)
-                && task.subtasks.iter().any(|subtask| subtask.id == subtask_id)
+            approved_plan_step_task_identity_matches(
+                task,
+                plan_id,
+                "",
+                &plan_fingerprint,
+                subtask_id,
+            )
         });
 
     let Some(task) = task else {
@@ -809,7 +877,6 @@ async fn sync_plan_task_board_subtask_status(
     let output = manager
         .update(&serde_json::json!({
             "task_id": task.id,
-            "subtask_id": subtask_id,
             "new_status": status.as_str(),
         }))
         .await;
@@ -2117,7 +2184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_approved_plan_mirror_creates_user_visible_task_tree() {
+    async fn http_approved_plan_mirror_creates_user_visible_step_tasks() {
         let manager = TaskManager::in_memory();
         let mut state = PlanModeState::new_with_owner("ship cloud plan".into(), "alice".into());
         state.plan = task_plan(vec![
@@ -2136,25 +2203,59 @@ mod tests {
         .unwrap();
 
         let tasks = manager.snapshot().await;
-        assert_eq!(tasks.len(), 1, "{tasks:?}");
-        let task = &tasks[0];
-        assert_eq!(task.title, "ship cloud plan");
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        let first = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("step-1")
+            })
+            .expect("step-1 should be a top-level task");
+        assert_eq!(first.title, "Design API");
         assert_eq!(
-            task.status,
+            first.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
         );
-        assert_eq!(task.owner.as_deref(), Some("alice"));
-        assert_eq!(task.subtasks.len(), 2);
-        assert_eq!(task.subtasks[0].id, "step-1");
+        assert_eq!(first.owner.as_deref(), Some("alice"));
+        assert!(first.subtasks.is_empty(), "{first:?}");
         assert_eq!(
-            task.metadata
+            first
+                .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("source"))
                 .and_then(serde_json::Value::as_str),
             Some("approved_plan")
         );
         assert_eq!(
-            task.metadata
+            first
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("plan-cloud-visible")
+        );
+        let second = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("step-2")
+            })
+            .expect("step-2 should be a top-level task");
+        assert_eq!(second.title, "Verify unhappy path");
+        assert_eq!(
+            second.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+        );
+        assert!(second.subtasks.is_empty(), "{second:?}");
+        assert_eq!(
+            second
+                .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("plan_id"))
                 .and_then(serde_json::Value::as_str),
@@ -2187,14 +2288,14 @@ mod tests {
             &state,
         )
         .await
-        .expect_err("oversized approved plans should not create one huge task tree");
+        .expect_err("oversized approved plans should not create one huge batch of step tasks");
         assert!(
             err.contains("subtasks") && err.contains("maximum"),
             "oversized approved plan should surface the task fan-out limit: {err}"
         );
         assert!(
             manager.snapshot().await.is_empty(),
-            "rejected oversized plan should not leave a partial task tree"
+            "rejected oversized plan should not leave partial task-board work"
         );
     }
 
@@ -2233,7 +2334,7 @@ mod tests {
         let manager = TaskManager::in_memory();
         let unrelated = manager
             .create(&serde_json::json!({
-                "title": "ship cloud plan",
+                "title": "Design API",
                 "metadata": { "source": "manual" }
             }))
             .await;
@@ -2256,7 +2357,7 @@ mod tests {
         assert_eq!(tasks.len(), 2, "{tasks:?}");
         assert!(
             tasks.iter().any(|task| {
-                task.title == "ship cloud plan"
+                task.title == "Design API"
                     && task
                         .metadata
                         .as_ref()
@@ -2268,7 +2369,7 @@ mod tests {
         );
         assert!(
             tasks.iter().any(|task| {
-                task.title == "ship cloud plan (plan-collision)"
+                task.title == "Design API (step-1)"
                     && task
                         .metadata
                         .as_ref()
@@ -2281,7 +2382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_approved_plan_mirror_reuses_cli_style_tree_with_matching_fingerprint() {
+    async fn http_approved_plan_mirror_does_not_reuse_legacy_cli_style_tree() {
         let manager = TaskManager::in_memory();
         let mut state = PlanModeState::new_with_owner("ship hybrid plan".into(), "alice".into());
         state.plan = task_plan(vec![subtask(
@@ -2319,10 +2420,19 @@ mod tests {
         let tasks = manager.snapshot().await;
         assert_eq!(
             tasks.len(),
-            1,
-            "HTTP approval should reuse the CLI-style mirrored tree instead of duplicating it: {tasks:?}"
+            2,
+            "HTTP approval should leave legacy tree-shaped task history alone and create a clean step task: {tasks:?}"
         );
-        let task = &tasks[0];
+        let task = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("step-1")
+            })
+            .expect("approved plan step task");
         assert_eq!(
             task.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
@@ -2334,6 +2444,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("plan-http-reuses-cli-tree")
         );
+        assert!(task.subtasks.is_empty(), "{task:?}");
     }
 
     #[tokio::test]
@@ -2390,7 +2501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_plan_task_board_subtask_status_updates_existing_tree() {
+    async fn sync_plan_task_board_subtask_status_updates_existing_step_task() {
         let manager = TaskManager::in_memory();
         let mut state = PlanModeState::new_with_owner("execute cloud plan".into(), "alice".into());
         state.plan = task_plan(vec![
@@ -2419,25 +2530,26 @@ mod tests {
         .unwrap();
 
         let tasks = manager.snapshot().await;
-        assert_eq!(tasks.len(), 1, "{tasks:?}");
-        let task = &tasks[0];
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        let task = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("step-2")
+            })
+            .expect("step-2 task");
         assert_eq!(
             task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        let step_2 = task
-            .subtasks
-            .iter()
-            .find(|subtask| subtask.id == "step-2")
-            .expect("step-2 should remain visible");
-        assert_eq!(
-            step_2.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::Completed
         );
+        assert!(task.subtasks.is_empty(), "{task:?}");
     }
 
     #[tokio::test]
-    async fn sync_plan_task_board_subtask_status_reopens_auto_completed_tree_on_redo() {
+    async fn sync_plan_task_board_subtask_status_does_not_reopen_completed_step_history() {
         let manager = TaskManager::in_memory();
         let mut state = PlanModeState::new_with_owner("redo cloud plan".into(), "alice".into());
         state.plan = task_plan(vec![
@@ -2475,12 +2587,15 @@ mod tests {
 
         let completed = manager.snapshot().await;
         assert_eq!(
-            completed[0].status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Completed,
-            "all completed plan steps should auto-complete the parent task: {completed:?}"
+            completed
+                .iter()
+                .filter(|task| task.status.is_completed())
+                .count(),
+            2,
+            "completed plan steps should be terminal task history: {completed:?}"
         );
 
-        sync_plan_task_board_subtask_status(
+        let error = sync_plan_task_board_subtask_status(
             &manager,
             "plan-redo-visible",
             &state.plan,
@@ -2488,22 +2603,20 @@ mod tests {
             TaskStatus::Pending,
         )
         .await
-        .unwrap();
-
-        let reopened = manager.snapshot().await;
-        assert_eq!(
-            reopened[0].status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-            "redoing a completed plan step should reopen the visible task tree: {reopened:?}"
+        .expect_err("sync should not reopen completed task-board history");
+        assert!(
+            error.contains("already terminal"),
+            "redo of completed task-board history should fail closed: {error}"
         );
-        let step_2 = reopened[0]
-            .subtasks
-            .iter()
-            .find(|subtask| subtask.id == "step-2")
-            .expect("step-2 should remain visible");
+
+        let after_redo = manager.snapshot().await;
         assert_eq!(
-            step_2.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+            after_redo
+                .iter()
+                .filter(|task| task.status.is_completed())
+                .count(),
+            2,
+            "completed task-board history should remain terminal: {after_redo:?}"
         );
     }
 
@@ -2524,7 +2637,7 @@ mod tests {
 
         assert!(
             manager.snapshot().await.is_empty(),
-            "status sync should not auto-create a task board tree"
+            "status sync should not auto-create task-board work"
         );
     }
 
@@ -2568,8 +2681,8 @@ mod tests {
         let mut state =
             PlanModeState::new_with_owner("ship MatrixOne visible plan".into(), user_id.clone());
         state.plan = task_plan(vec![
-            subtask("step-1", "Persist task tree", TaskStatus::Pending),
-            subtask("step-2", "Verify task tree", TaskStatus::Pending),
+            subtask("step-1", "Persist step task", TaskStatus::Pending),
+            subtask("step-2", "Verify step task", TaskStatus::Pending),
         ]);
 
         mirror_approved_plan_to_task_board(
@@ -2583,28 +2696,37 @@ mod tests {
         .unwrap();
 
         let tasks = manager.snapshot().await;
-        assert_eq!(tasks.len(), 1, "{tasks:?}");
-        assert_eq!(tasks[0].title, "ship MatrixOne visible plan");
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        let first = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("step-1")
+            })
+            .expect("step-1 task");
+        assert_eq!(first.title, "Persist step task");
         assert_eq!(
-            tasks[0].status,
+            first.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
         );
-        assert_eq!(tasks[0].subtasks.len(), 2);
-        assert_eq!(
-            tasks[0]
-                .metadata
+        assert!(first.subtasks.is_empty(), "{first:?}");
+        assert!(tasks.iter().all(|task| {
+            task.metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("plan-matrixone-visible")
-        );
+                .and_then(serde_json::Value::as_str)
+                == Some("plan-matrixone-visible")
+        }));
 
         cleanup_session_todos(&pool, &session_id).await;
     }
 
     #[tokio::test]
     #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn http_approved_plan_mirror_reuses_cli_style_tree_in_matrixone() {
+    async fn http_approved_plan_mirror_does_not_reuse_legacy_cli_style_tree_in_matrixone() {
         let shared = bootstrap_shared_pool().await;
         let pool = shared.get().clone();
         let user_id = format!("u-plan-reuse-cli-{}", uuid::Uuid::new_v4());
@@ -2618,7 +2740,7 @@ mod tests {
             PlanModeState::new_with_owner("ship hybrid MatrixOne plan".into(), user_id.clone());
         state.plan = task_plan(vec![subtask(
             "step-1",
-            "Reuse MatrixOne task tree",
+            "Mirror MatrixOne step task",
             TaskStatus::Pending,
         )]);
         let fingerprint = plan_task_board_fingerprint(&state.plan);
@@ -2632,7 +2754,7 @@ mod tests {
                     "plan_fingerprint": fingerprint,
                 },
                 "subtasks": [
-                    { "id": "step-1", "title": "Reuse MatrixOne task tree" }
+                    { "id": "step-1", "title": "Mirror MatrixOne step task" }
                 ]
             }))
             .await;
@@ -2651,21 +2773,31 @@ mod tests {
         let tasks = manager.snapshot().await;
         assert_eq!(
             tasks.len(),
-            1,
-            "HTTP MatrixOne approval should reuse a CLI-style mirrored tree: {tasks:?}"
+            2,
+            "HTTP MatrixOne approval should leave legacy tree-shaped history alone and create a clean step task: {tasks:?}"
         );
+        let task = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_subtask_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("step-1")
+            })
+            .expect("approved plan step task");
         assert_eq!(
-            tasks[0].status,
+            task.status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
         );
         assert_eq!(
-            tasks[0]
-                .metadata
+            task.metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("plan_id"))
                 .and_then(serde_json::Value::as_str),
             Some("plan-http-matrixone-reuses-cli-tree")
         );
+        assert!(task.subtasks.is_empty(), "{task:?}");
 
         cleanup_session_todos(&pool, &session_id).await;
     }
@@ -2686,7 +2818,7 @@ mod tests {
             PlanModeState::new_with_owner("repeat MatrixOne plan".into(), user_id.clone());
         state.plan = task_plan(vec![subtask(
             "step-1",
-            "Repeat MatrixOne task tree",
+            "Repeat MatrixOne step task",
             TaskStatus::Pending,
         )]);
 
@@ -2754,14 +2886,14 @@ mod tests {
             PlanModeState::new_with_owner("handoff MatrixOne plan".into(), user_id.clone());
         first_state.plan = task_plan(vec![subtask(
             "step-1",
-            "First MatrixOne task tree",
+            "First MatrixOne step task",
             TaskStatus::Pending,
         )]);
         let mut second_state =
             PlanModeState::new_with_owner("handoff MatrixOne plan".into(), user_id.clone());
         second_state.plan = task_plan(vec![subtask(
             "step-2",
-            "Second MatrixOne task tree",
+            "Second MatrixOne step task",
             TaskStatus::Pending,
         )]);
 
@@ -2813,7 +2945,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn plan_task_board_redo_reopens_completed_tree_in_matrixone() {
+    async fn plan_task_board_redo_does_not_reopen_completed_step_history_in_matrixone() {
         let shared = bootstrap_shared_pool().await;
         let pool = shared.get().clone();
         let user_id = format!("u-plan-redo-{}", uuid::Uuid::new_v4());
@@ -2853,12 +2985,15 @@ mod tests {
 
         let completed = manager.snapshot().await;
         assert_eq!(
-            completed[0].status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Completed,
-            "MatrixOne plan tree should auto-complete after all steps finish: {completed:?}"
+            completed
+                .iter()
+                .filter(|task| task.status.is_completed())
+                .count(),
+            2,
+            "MatrixOne completed plan steps should be terminal task history: {completed:?}"
         );
 
-        sync_plan_task_board_subtask_status(
+        let error = sync_plan_task_board_subtask_status(
             &manager,
             "plan-http-matrixone-redo",
             &state.plan,
@@ -2866,22 +3001,20 @@ mod tests {
             TaskStatus::Pending,
         )
         .await
-        .unwrap();
-
-        let reopened = manager.snapshot().await;
-        assert_eq!(
-            reopened[0].status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-            "MatrixOne redo should reopen the completed plan task tree: {reopened:?}"
+        .expect_err("MatrixOne sync should not reopen completed task-board history");
+        assert!(
+            error.contains("already terminal"),
+            "MatrixOne redo of completed task-board history should fail closed: {error}"
         );
-        let step_2 = reopened[0]
-            .subtasks
-            .iter()
-            .find(|subtask| subtask.id == "step-2")
-            .expect("step-2 should remain visible");
+
+        let after_redo = manager.snapshot().await;
         assert_eq!(
-            step_2.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+            after_redo
+                .iter()
+                .filter(|task| task.status.is_completed())
+                .count(),
+            2,
+            "MatrixOne completed task-board history should remain terminal: {after_redo:?}"
         );
 
         cleanup_session_todos(&pool, &session_id).await;
