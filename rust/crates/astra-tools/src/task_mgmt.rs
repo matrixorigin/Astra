@@ -816,7 +816,7 @@ pub trait TaskStore: Send + Sync {
         Ok(())
     }
     /// Read the next id WITHOUT consuming or mutating the counter.
-    /// Used by `snapshot_state` to capture the counter for rollback
+    /// Used by `try_snapshot_state` to capture the counter for rollback
     /// without leaving a hole in the id sequence.
     ///
     /// No default impl: the original alloc-then-rewind fallback was a
@@ -1777,18 +1777,6 @@ impl TaskManager {
             tasks,
             next_task_id: peeked,
         })
-    }
-
-    /// Capture a best-effort snapshot for diagnostics/tests that explicitly
-    /// prefer a placeholder over an error. Mutation/rollback call sites should
-    /// use [`TaskManager::try_snapshot_state`] so load failures fail closed.
-    pub async fn snapshot_state(&self) -> TaskManagerSnapshot {
-        self.try_snapshot_state()
-            .await
-            .unwrap_or_else(|_| TaskManagerSnapshot {
-                tasks: Vec::new(),
-                next_task_id: 1,
-            })
     }
 
     /// Restore a previously captured snapshot.
@@ -2868,7 +2856,10 @@ mod tests {
         task_id: &str,
         status: SessionTaskStatusKind,
     ) {
-        let mut snapshot = manager.snapshot_state().await;
+        let mut snapshot = manager
+            .try_snapshot_state()
+            .await
+            .expect("snapshot in test fixture");
         let task = snapshot
             .tasks
             .iter_mut()
@@ -4346,7 +4337,7 @@ mod tests {
     async fn snapshot_restores_tasks_and_next_id() {
         let m = mgr();
         m.create(&json!({"title": "t1"})).await;
-        let snap = m.snapshot_state().await;
+        let snap = m.try_snapshot_state().await.expect("snapshot in test");
         m.create(&json!({"title": "t2"})).await;
         let list_before: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
@@ -4561,7 +4552,7 @@ mod tests {
         let m = mgr();
         m.create(&json!({"title": "legacy dangling dependency"}))
             .await;
-        let mut snapshot = m.snapshot_state().await;
+        let mut snapshot = m.try_snapshot_state().await.expect("snapshot in test");
         snapshot.tasks[0].blocked_by = vec!["task-missing".to_string()];
         m.restore_snapshot(&snapshot)
             .await
@@ -5001,7 +4992,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_state_is_race_safe_against_concurrent_allocation() {
-        // Regression for A1: the old alloc/rewind dance in snapshot_state
+        // Regression for A1: the old alloc/rewind dance in try_snapshot_state
         // could clobber a concurrent next_task_id bump, handing the same
         // id out twice. This test runs many snapshots interleaved with
         // allocations and asserts every allocated id is unique.
@@ -5016,7 +5007,7 @@ mod tests {
         let mut set: JoinSet<u32> = JoinSet::new();
 
         // 200 concurrent next_task_id calls + 200 concurrent snapshots.
-        // If snapshot_state still rewinds the counter, at least one
+        // If try_snapshot_state still rewinds the counter, at least one
         // allocation will duplicate.
         for _ in 0..200 {
             let s = store.clone();
@@ -5025,7 +5016,7 @@ mod tests {
         for _ in 0..200 {
             let m = manager.clone();
             set.spawn(async move {
-                let _ = m.snapshot_state().await;
+                let _ = m.try_snapshot_state().await;
                 0 // snapshot branch returns sentinel; filtered out below
             });
         }
@@ -5043,7 +5034,7 @@ mod tests {
         assert_eq!(
             before,
             ids.len(),
-            "duplicate ids handed out; snapshot_state raced the allocator"
+            "duplicate ids handed out; try_snapshot_state raced the allocator"
         );
     }
 
@@ -5140,7 +5131,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_peek_failure_fallback_avoids_counter_rewind() {
         // Regression for the A1-related concern: if peek_next_task_id
-        // fails, snapshot_state used to fall back to 1, which on
+        // fails, try_snapshot_state used to fall back to 1, which on
         // restore would rewind the counter and collide with surviving
         // task ids. Verify the fallback now derives from max(task id).
         struct FlakyPeekStore {
@@ -5190,7 +5181,10 @@ mod tests {
             .unwrap();
         let store: Arc<dyn TaskStore> = Arc::new(FlakyPeekStore { inner });
         let mgr = TaskManager::new("sess-fallback", store);
-        let snap = mgr.snapshot_state().await;
+        let snap = mgr
+            .try_snapshot_state()
+            .await
+            .expect("snapshot with peek fallback");
         assert_eq!(
             snap.next_task_id, 43,
             "peek failure must fall back to max(task id) + 1, not 1"
@@ -5682,7 +5676,7 @@ mod tests {
         m.create(&json!({"title": "still-open"})).await;
         m.create(&json!({"title": "old-failed"})).await;
         m.create(&json!({"title": "old-cancelled"})).await;
-        let mut snapshot = m.snapshot_state().await;
+        let mut snapshot = m.try_snapshot_state().await.expect("snapshot in test");
         let old_ts = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
         for task in &mut snapshot.tasks {
             if matches!(task.id.as_str(), "task-1" | "task-4" | "task-5") {
@@ -5749,7 +5743,7 @@ mod tests {
         assert!(!linked.starts_with("Error:"), "{linked}");
         set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
 
-        let mut snapshot = m.snapshot_state().await;
+        let mut snapshot = m.try_snapshot_state().await.expect("snapshot in test");
         let old_ts = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
         for task in &mut snapshot.tasks {
             if task.id == "task-1" {

@@ -4292,26 +4292,31 @@ impl ServerToolExecutor {
                 }
             };
 
-            // Keep the user-visible task board aligned with the approved
-            // plan. The task board is the single user-visible execution
-            // surface for approved plan work.
+            // Unlock writes FIRST — if the mirror fails, the session is
+            // already usable. The idempotent mirror will pick up partial
+            // progress on the next exit_plan_mode call.
+            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
+                return format!(
+                    "Error: clear active plan failed: {e}\n\
+                     Session remains in plan mode (write tools blocked). \
+                     Manual intervention may be needed to clear active_plan_id."
+                );
+            }
+
+            // Mirror the approved plan into the user-visible task board.
+            // This is best-effort after unlock — if it fails, the session
+            // is out of plan mode and the user can retry or proceed via
+            // /plans/{id}/execute.
             if let Err(e) = self
                 .mirror_approved_plan_to_task_board(&active, &approved_plan_state)
                 .await
             {
                 return format!(
-                    "Error: failed to mirror approved plan into task board: {e}\n\
-                     Session remains in plan mode (write tools blocked). \
-                     Options: (1) retry exit_plan_mode, (2) manually inspect task board via task(action=list), \
+                    "Error: session unlocked but failed to mirror approved plan into task board: {e}\n\
+                     The plan is approved and unlocked. Options: \
+                     (1) retry exit_plan_mode to sync the task board (idempotent), \
+                     (2) use task(action=list) to inspect current state, \
                      (3) use /plans/{active}/execute to proceed without task board sync."
-                );
-            }
-
-            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
-                return format!(
-                    "Error: clear active plan failed: {e}\n\
-                     Plan was mirrored to task board but session lock could not be released. \
-                     Manual intervention may be needed to clear active_plan_id."
                 );
             }
         }
@@ -5111,6 +5116,16 @@ esac
             created.contains("\"success\":true"),
             "create precondition failed: {created}"
         );
+        let started = exec
+            .execute(
+                "task",
+                &json!({"action": "update", "task_id": "task-1", "new_status": "in_progress"}),
+            )
+            .await;
+        assert!(
+            started.contains("\"status\":\"in_progress\""),
+            "start precondition failed: {started}"
+        );
         let completed = exec
             .execute(
                 "task",
@@ -5270,6 +5285,9 @@ esac
             .await;
         manager_b
             .create(&json!({"title": "completed cross-session task"}))
+            .await;
+        manager_b
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
         manager_b
             .update(&json!({"task_id": "task-1", "new_status": "completed"}))
@@ -7513,13 +7531,17 @@ esac
         let tasks = exec.task_manager.snapshot().await;
         assert_eq!(
             tasks.len(),
-            1,
-            "failed server approved-plan mirror must roll back earlier step tasks: {tasks:?}"
+            2,
+            "failed approved-plan mirror preserves partial progress (step-1) \
+             alongside existing tasks; idempotent retry completes the mirror: {tasks:?}"
         );
-        assert_eq!(tasks[0].title, "Existing server task");
         assert!(
-            tasks[0].metadata.is_none(),
-            "rollback must preserve unrelated user task exactly: {tasks:?}"
+            tasks.iter().any(|t| t.title == "Existing server task"),
+            "existing server task must survive mirror failure: {tasks:?}"
+        );
+        assert!(
+            tasks.iter().any(|t| t.title == "create first server step"),
+            "step-1 task (valid) must be preserved for retry: {tasks:?}"
         );
         let active = repo
             .active_plan_for_session("rollback-session")
@@ -7527,8 +7549,9 @@ esac
             .expect("active plan lookup after failed approval");
         assert_eq!(
             active.as_deref(),
-            Some("plan-rollback-task-board"),
-            "failed task-board mirror must keep plan mode active so writes stay guarded"
+            None,
+            "session unlocks (exits plan mode) before mirror; \
+             mirror failure does not re-lock the session: {active:?}"
         );
     }
 
@@ -7618,14 +7641,15 @@ esac
             .await;
         assert!(
             result.starts_with("Error:")
-                && result.contains("load task board before approved-plan mirror")
+                && result.contains("load task board")
                 && result.contains("simulated task board reload failure"),
-            "exit_plan_mode must fail closed when task-board reload fails after snapshot: {result}"
+            "exit_plan_mode must fail closed when task-board reload fails: {result}"
         );
         assert_eq!(
             mutate_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "server approved-plan mirror must not create tasks after a failed task-board reload"
+            1,
+            "server approved-plan mirror creates step-1 task before the reload failure; \
+             it is preserved as valid partial progress for idempotent retry"
         );
         let active = repo
             .active_plan_for_session("reload-fails-session")
@@ -7633,8 +7657,9 @@ esac
             .expect("active plan lookup after failed reload");
         assert_eq!(
             active.as_deref(),
-            Some("plan-reload-fails"),
-            "failed task-board reload must keep plan mode active so writes stay guarded"
+            None,
+            "session unlocks (exits plan mode) before mirror; \
+             mirror reload failure does not re-lock the session: {active:?}"
         );
     }
 

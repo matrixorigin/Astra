@@ -1594,10 +1594,8 @@ impl ToolExecutor {
             .get("goal")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|goal| !goal.is_empty());
-        let Some(goal) = goal else {
-            return "Error: missing required parameter `goal`.".to_string();
-        };
+            .filter(|goal| !goal.is_empty())
+            .unwrap_or("(pending)");
 
         let cloud_outcome = self.try_enter_plan_mode_cloud_path(goal).await;
         match cloud_outcome {
@@ -4698,6 +4696,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    #[tokio::test]
+    async fn enter_plan_mode_without_goal_uses_default_label() {
+        let (_dir, executor) = temp_executor();
+        let output = executor
+            .execute("enter_plan_mode", &serde_json::json!({}))
+            .await;
+        assert!(
+            !output.contains("missing required parameter"),
+            "goal is optional in the public schema and must not fail empty-args calls: {output}"
+        );
+        assert!(
+            output.contains("Entered plan mode") && output.contains("(pending)"),
+            "missing goal should enter local plan mode with the default label: {output}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

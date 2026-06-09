@@ -39,6 +39,9 @@ use std::sync::Arc;
 const STALE_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
 const STALE_THRESHOLD_HOURS: u64 = 24;
 const STALE_BATCH_LIMIT: i64 = 500;
+/// Consecutive sweep failures before emitting a heightened alert.
+/// At 5-min ticks, 3 failures = 15 min of silent DB degradation.
+const STALE_SWEEP_ALERT_THRESHOLD: u32 = 3;
 
 const ARCHIVE_SWEEP_INTERVAL_SECS: u64 = 7 * 24 * 3600; // 1 week
 const COMPLETED_AUTO_ARCHIVE_DAYS_DEFAULT: i64 = 7;
@@ -122,10 +125,17 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     // (auto_paused_reason). A bulk UPDATE without metadata would be
     // faster but the audit context matters more here than the SQL
     // round-trips — sweeps are 5min apart and N is small.
+    //
+    // Plan-derived tasks (those with `plan_subtask_id` in metadata) are
+    // excluded: their lifecycle is managed by the plan orchestrator, not
+    // this sweeper. Directly pausing a plan step task would break plan ↔
+    // task-board consistency.
     let rows: Vec<(String, String, Option<String>)> = sqlx::query(
         "SELECT session_id, todo_id, metadata FROM session_todos \
          WHERE status = 'in_progress' \
            AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
+           AND (metadata IS NULL \
+                OR JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.plan_subtask_id')) IS NULL) \
          LIMIT ?",
     )
     .bind(STALE_THRESHOLD_HOURS as i64)
@@ -147,6 +157,21 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
 
     let mut affected = 0u64;
     for (session_id, todo_id, metadata) in &rows {
+        // Defense-in-depth: skip plan-derived tasks even if the SQL
+        // JSON filter missed them (e.g. due to MatrixOne JSON function
+        // differences). The plan orchestrator owns their lifecycle.
+        if let Some(meta) = metadata {
+            if meta.contains("\"plan_subtask_id\"") {
+                tracing::warn!(
+                    target: "astra_runtime::session_todo_sweeper",
+                    session_id = %session_id,
+                    todo_id = %todo_id,
+                    "Stale-sweep: plan-derived task passed SQL filter — \
+                     skipping to preserve plan consistency"
+                );
+                continue;
+            }
+        }
         // CAS on status: re-check inside the UPDATE so a row that
         // raced to `completed` between our SELECT and now isn't
         // clobbered back to `paused`. status must STILL be
@@ -439,6 +464,8 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
         // Skip the immediate first tick — give the server a chance
         // to finish startup before the first sweep.
         interval.tick().await;
+
+        let mut consecutive_failures: u32 = 0;
         loop {
             interval.tick().await;
             let tick_result = AssertUnwindSafe(async {
@@ -455,32 +482,61 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
                     }
                 }
                 match run_stale_in_progress_sweep(pool.clone()).await {
-                    Ok(0) => {} // quiet success: nothing to do this tick
-                    Ok(n) => tracing::info!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        rows = n,
-                        "auto-paused {n} stale in_progress task(s)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        error = %e,
-                        "stale-in_progress sweep failed"
-                    ),
+                    Ok(0) => {
+                        consecutive_failures = 0;
+                    }
+                    Ok(n) => {
+                        consecutive_failures = 0;
+                        tracing::info!(
+                            target: "astra_runtime::session_todo_sweeper",
+                            rows = n,
+                            "auto-paused {n} stale in_progress task(s)"
+                        );
+                    }
+                    Err(e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= STALE_SWEEP_ALERT_THRESHOLD {
+                            tracing::error!(
+                                target: "astra_runtime::session_todo_sweeper",
+                                consecutive_failures = consecutive_failures,
+                                error = %e,
+                                "stale-in_progress sweeper has failed {consecutive_failures} \
+                                 consecutive times — DB or infrastructure may be degraded"
+                            );
+                        } else {
+                            tracing::error!(
+                                target: "astra_runtime::session_todo_sweeper",
+                                error = %e,
+                                "stale-in_progress sweep failed"
+                            );
+                        }
+                    }
                 }
             })
             .catch_unwind()
             .await;
             if let Err(panic_err) = tick_result {
+                consecutive_failures = consecutive_failures.saturating_add(1);
                 let msg = panic_err
                     .downcast_ref::<&str>()
                     .copied()
                     .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
                     .unwrap_or("unknown panic");
-                tracing::error!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    panic = %msg,
-                    "stale-in_progress sweeper panicked; will retry on next tick"
-                );
+                if consecutive_failures >= STALE_SWEEP_ALERT_THRESHOLD {
+                    tracing::error!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        consecutive_failures = consecutive_failures,
+                        panic = %msg,
+                        "stale-in_progress sweeper has panicked {consecutive_failures} \
+                         consecutive times — DB or infrastructure may be degraded"
+                    );
+                } else {
+                    tracing::error!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        panic = %msg,
+                        "stale-in_progress sweeper panicked; will retry on next tick"
+                    );
+                }
             }
         }
     });

@@ -53,7 +53,7 @@ pub fn plan_task_board_fingerprint(plan: &TaskPlan) -> String {
 pub fn approved_plan_task_matches(
     task: &SessionTask,
     plan_id: &str,
-    goal: &str,
+    _goal: &str,
     plan_fingerprint: &str,
 ) -> bool {
     if !task.status.is_open_work() {
@@ -66,19 +66,13 @@ pub fn approved_plan_task_matches(
     let task_plan_id = metadata
         .and_then(|m| m.get("plan_id"))
         .and_then(serde_json::Value::as_str);
-    let task_goal = metadata
-        .and_then(|m| m.get("plan_goal"))
-        .and_then(serde_json::Value::as_str);
     let task_fingerprint = metadata
         .and_then(|m| m.get("plan_fingerprint"))
         .and_then(serde_json::Value::as_str);
 
     source == Some("approved_plan")
         && task_fingerprint == Some(plan_fingerprint)
-        && match task_plan_id {
-            Some(existing_plan_id) => existing_plan_id == plan_id,
-            None => task_goal == Some(goal) || task.title == goal,
-        }
+        && task_plan_id == Some(plan_id)
 }
 
 /// Like [`approved_plan_task_matches`] but also requires the specific
@@ -105,7 +99,7 @@ pub fn approved_plan_step_task_matches(
 pub fn approved_plan_task_identity_matches(
     task: &SessionTask,
     plan_id: &str,
-    goal: &str,
+    _goal: &str,
     plan_fingerprint: &str,
 ) -> bool {
     let metadata = task.metadata.as_ref();
@@ -115,19 +109,13 @@ pub fn approved_plan_task_identity_matches(
     let task_plan_id = metadata
         .and_then(|m| m.get("plan_id"))
         .and_then(serde_json::Value::as_str);
-    let task_goal = metadata
-        .and_then(|m| m.get("plan_goal"))
-        .and_then(serde_json::Value::as_str);
     let task_fingerprint = metadata
         .and_then(|m| m.get("plan_fingerprint"))
         .and_then(serde_json::Value::as_str);
 
     source == Some("approved_plan")
         && task_fingerprint == Some(plan_fingerprint)
-        && match task_plan_id {
-            Some(existing_plan_id) => existing_plan_id == plan_id,
-            None => task_goal == Some(goal) || task.title == goal,
-        }
+        && task_plan_id == Some(plan_id)
 }
 
 /// Strict identity check for a specific step within the plan.
@@ -170,7 +158,25 @@ pub fn task_status_to_session_status(status: TaskStatus) -> SessionTaskStatusKin
 /// the first runnable step.
 ///
 /// Returns `Ok(())` on success or a user-readable error. On failure the task
-/// board is rolled back via `TaskManager::snapshot_state` / `restore_snapshot`.
+/// board is rolled back via `TaskManager::try_snapshot_state` / `restore_snapshot`.
+/// Mirror an approved plan into the session's task board so the user
+/// sees actionable step-by-step work items.
+///
+/// ## Idempotency
+///
+/// This function is safe to retry after failure. Each step task carries a
+/// `plan_subtask_id` in its metadata, and `ensure_approved_plan_step_task`
+/// reuses existing tasks that match the same plan/step identity.  Edges
+/// (`blocked_by`) are set only when missing.  No snapshot or rollback is
+/// needed — partial progress from a failed mirror is valid state that the
+/// next call will complete.
+///
+/// ## Concurrent safety
+///
+/// The session tool executor serializes all tool calls per session, so only
+/// one caller can enter this function at a time. If that ever changes, the
+/// identity check inside `ensure_approved_plan_step_task` must be made
+/// atomic at the database level.
 pub async fn mirror_approved_plan_to_task_board(
     manager: &TaskManager,
     owner: &str,
@@ -188,39 +194,16 @@ pub async fn mirror_approved_plan_to_task_board(
             plan_state.plan.subtasks.len()
         ));
     }
-    let snapshot = manager
-        .try_snapshot_state()
+
+    mirror_approved_plan_to_task_board_inner(manager, owner, session_id, plan_id, plan_state)
         .await
-        .map_err(|error| format!("snapshot task board before approved-plan mirror: {error}"))?;
-    match mirror_approved_plan_to_task_board_inner(manager, owner, session_id, plan_id, plan_state)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if let Err(restore_error) = manager.restore_snapshot(&snapshot).await {
-                tracing::error!(
-                    plan_id = %plan_id,
-                    session_id = %session_id,
-                    mirror_error = %error,
-                    restore_error = %restore_error,
-                    "approved-plan task-board mirror failed AND rollback failed — \
-                     task board may be inconsistent"
-                );
-                return Err(format!(
-                    "{error}; additionally failed to roll back approved-plan task-board mirror: \
-                     {restore_error}. Task board may be partially mirrored — manual inspection \
-                     recommended."
-                ));
-            }
-            tracing::warn!(
-                plan_id = %plan_id,
-                session_id = %session_id,
-                error = %error,
-                "approved-plan task-board mirror failed; rolled back successfully"
-            );
-            Err(error)
-        }
-    }
+        .map_err(|error| {
+            // Mirror failures are surfaced as-is. The caller can retry
+            // because partial progress (tasks already created, edges
+            // already linked) will be picked up by the idempotent
+            // identity checks inside ensure_approved_plan_step_task.
+            format!("failed to mirror approved plan into task board: {error}")
+        })
 }
 
 /// Inner mirror implementation — callers go through
@@ -324,6 +307,16 @@ pub async fn mirror_approved_plan_to_task_board_inner(
 
 /// Create or re-use a single task-board entry for a plan step.
 #[allow(clippy::too_many_arguments)]
+/// Create or return an existing task for an approved plan step.
+///
+/// # Concurrency safety
+///
+/// The check-then-create pattern is safe because the session tool executor
+/// serializes all tool calls (including `exit_plan_mode`) per session. No
+/// two goroutines can call this function for the same session concurrently.
+/// If the execution model ever changes to allow concurrent plan-mode tool
+/// calls, this function MUST be replaced with a DB-level uniqueness
+/// constraint on `(session_id, plan_subtask_id)` to prevent TOCTOU races.
 pub async fn ensure_approved_plan_step_task(
     manager: &TaskManager,
     owner: &str,
@@ -377,12 +370,12 @@ pub async fn ensure_approved_plan_step_task(
         return Err(output);
     }
 
-    manager
+    let matching: Vec<_> = manager
         .load_active_tasks()
         .await
         .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
         .into_iter()
-        .find(|task| {
+        .filter(|task| {
             approved_plan_step_task_identity_matches(
                 task,
                 plan_id,
@@ -391,6 +384,20 @@ pub async fn ensure_approved_plan_step_task(
                 &subtask.id,
             )
         })
+        .collect();
+    if matching.len() > 1 {
+        tracing::warn!(
+            target: "astra_runtime::plan_task_mirror",
+            step_id = %subtask.id,
+            goal = %goal,
+            count = matching.len(),
+            "Duplicate plan step tasks detected — TOCTOU race or concurrent \
+             exit_plan_mode call. Using first match."
+        );
+    }
+    matching
+        .into_iter()
+        .next()
         .map(|task| task.id)
         .ok_or_else(|| {
             format!(

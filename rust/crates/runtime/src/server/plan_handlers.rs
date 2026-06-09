@@ -929,19 +929,11 @@ pub(super) async fn execute_plan_handler(
     plan_state.session_hint = Some(req.session_id.clone());
 
     let goal = plan_state.goal.clone();
-    let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
-        .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
-        .await
-        .map_err(map_plan_load_err)?;
 
-    state
-        .plan_repo
-        .set_active_plan(&req.session_id, Some(&plan_id))
-        .await
-        .map_err(map_plan_load_err)?;
-
+    // ── Sync to task board FIRST ──────────────────────────────────
+    // If the task-board sync fails, we bail out before persisting
+    // the plan mutation so the repo never records an InProgress state
+    // that the task board doesn't reflect.
     if let Some(subtask_id) = started_subtask_id.as_deref() {
         sync_plan_task_board_subtask_status_if_configured(
             &state,
@@ -957,11 +949,25 @@ pub(super) async fn execute_plan_handler(
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
-                    "execute_plan: plan state saved but failed to sync started subtask into task board — session may show stale status. Error: {error}"
+                    "execute_plan: failed to sync started subtask into task board — \
+                     plan was NOT saved. Error: {error}"
                 ),
             )
         })?;
     }
+
+    let expected = resolve_expected_version(&plan_state, req.expected_version);
+    state
+        .plan_repo
+        .save(&plan_id, &mut plan_state, expected)
+        .await
+        .map_err(map_plan_load_err)?;
+
+    state
+        .plan_repo
+        .set_active_plan(&req.session_id, Some(&plan_id))
+        .await
+        .map_err(map_plan_load_err)?;
 
     emit_plan_journal(
         Some(&req.session_id),
@@ -2076,7 +2082,7 @@ mod tests {
         .expect_err("task-board load failure should abort approved-plan mirror");
 
         assert!(
-            error.contains("snapshot task board before approved-plan mirror")
+            error.contains("load task board before approved-plan mirror")
                 && error.contains("forced task-board load failure"),
             "approved-plan mirror must not treat task-board load failure as an empty board: {error}"
         );
@@ -2118,13 +2124,17 @@ mod tests {
         let tasks = manager.snapshot().await;
         assert_eq!(
             tasks.len(),
-            1,
-            "failed HTTP approved-plan mirror must roll back earlier step tasks: {tasks:?}"
+            2,
+            "failed HTTP approved-plan mirror preserves partial progress (step-1) \
+             alongside existing tasks; idempotent retry completes the mirror: {tasks:?}"
         );
-        assert_eq!(tasks[0].title, "Existing cloud task");
         assert!(
-            tasks[0].metadata.is_none(),
-            "rollback must preserve unrelated user task exactly: {tasks:?}"
+            tasks.iter().any(|t| t.title == "Existing cloud task"),
+            "existing cloud task must survive mirror failure: {tasks:?}"
+        );
+        assert!(
+            tasks.iter().any(|t| t.title == "Create first cloud step"),
+            "step-1 task (valid) must be preserved for retry: {tasks:?}"
         );
     }
 
@@ -2569,13 +2579,19 @@ mod tests {
         let tasks = manager.snapshot().await;
         assert_eq!(
             tasks.len(),
-            1,
-            "failed MatrixOne approved-plan mirror must roll back earlier step tasks: {tasks:?}"
+            2,
+            "failed MatrixOne approved-plan mirror preserves partial progress (step-1) \
+             alongside existing tasks; idempotent retry completes the mirror: {tasks:?}"
         );
-        assert_eq!(tasks[0].title, "Existing MatrixOne task");
         assert!(
-            tasks[0].metadata.is_none(),
-            "rollback must preserve unrelated MatrixOne task exactly: {tasks:?}"
+            tasks.iter().any(|t| t.title == "Existing MatrixOne task"),
+            "existing MatrixOne task must survive mirror failure: {tasks:?}"
+        );
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.title == "Create first MatrixOne step"),
+            "step-1 task (valid) must be preserved for retry: {tasks:?}"
         );
 
         cleanup_session_todos(&pool, &session_id).await;

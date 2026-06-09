@@ -189,7 +189,10 @@ async fn snapshot_restore_roundtrips_through_mo() {
     let store: Arc<dyn TaskStore> = Arc::new(MatrixOneTaskStore::new(pool.clone()));
     let mgr = TaskManager::new(session_id.clone(), store);
     mgr.create(&json!({"title": "t1"})).await;
-    let snap = mgr.snapshot_state().await;
+    let snap = mgr
+        .try_snapshot_state()
+        .await
+        .expect("snapshot in cross-client test");
     mgr.create(&json!({"title": "t2"})).await;
     let pre_restore = mgr.list(&json!({"status_filter": "all"})).await;
     assert!(pre_restore.contains("\"count\":2"), "{pre_restore}");
@@ -228,10 +231,13 @@ async fn snapshot_restore_uses_existing_rows_when_matrixone_counter_is_zero() {
     .await
     .expect("corrupt counter to zero");
 
-    let snap = mgr.snapshot_state().await;
+    let snap = mgr
+        .try_snapshot_state()
+        .await
+        .expect("snapshot with corrupt counter");
     assert_eq!(
         snap.next_task_id, 2,
-        "snapshot_state must derive from existing task ids when MatrixOne counter is corrupt"
+        "try_snapshot_state must derive from existing task ids when MatrixOne counter is corrupt"
     );
 
     mgr.restore_snapshot(&snap)
@@ -455,7 +461,10 @@ async fn snapshot_restore_after_cross_client_allocations_reuses_ids_without_coll
 
     let t1 = edge.create(&json!({"title": "snapshot survivor"})).await;
     assert!(t1.contains("task-1"), "{t1}");
-    let snap = edge.snapshot_state().await;
+    let snap = edge
+        .try_snapshot_state()
+        .await
+        .expect("snapshot for edge-cloud test");
 
     let t2 = cloud.create(&json!({"title": "rolled back t2"})).await;
     let t3 = cloud.create(&json!({"title": "rolled back t3"})).await;

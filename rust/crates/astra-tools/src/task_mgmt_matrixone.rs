@@ -761,7 +761,7 @@ impl TaskStore for MatrixOneTaskStore {
         // Pure read — no side effect, so concurrent allocators can't
         // race the snapshot. Missing row → 1 (matches next_task_id's
         // "first allocation" semantics). If a row exists but contains
-        // 0/negative, fail loudly so snapshot_state falls back to
+        // 0/negative, fail loudly so try_snapshot_state falls back to
         // max(existing task id) + 1 instead of capturing a corrupt
         // counter and later restoring it.
         let row: Option<(i64,)> =

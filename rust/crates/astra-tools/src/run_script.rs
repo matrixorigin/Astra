@@ -615,7 +615,8 @@ pub fn build_run_script_schema(
     };
 
     let script_param_desc = if tool_lines.is_empty() {
-        "Python code to execute. No tool bindings are available this session — \
+        "Required Python code to execute; never call run_script with empty arguments. \
+         No tool bindings are available this session — \
          use only Python stdlib. Print your final result to stdout."
             .to_string()
     } else {
@@ -627,7 +628,8 @@ pub fn build_run_script_schema(
             import_examples.join(", ")
         };
         format!(
-            "Python code to execute. Import tools with \
+            "Required Python code to execute; never call run_script with empty arguments. \
+             Import tools with \
              `from astra_tools import {example}, ...` and print your \
              final result to stdout. Tool functions are synchronous — call \
              them directly (no `await`). They return text output and raise \
@@ -637,6 +639,7 @@ pub fn build_run_script_schema(
 
     let description = format!(
         "Run a Python script that can call agent tools programmatically. \
+         Always provide the required `script` string parameter. \
          Use when you need 3+ tool calls with processing logic between them, \
          need to filter/reduce large outputs before they enter context, \
          need conditional branching, or need to loop.\n\n\
@@ -1631,6 +1634,29 @@ mod tests {
             "timeout desc missing DEFAULT={}: {}",
             DEFAULT_TIMEOUT.as_secs(),
             timeout_desc
+        );
+    }
+
+    #[test]
+    fn schema_marks_script_required_and_discourages_empty_args() {
+        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        assert_eq!(
+            schema["function"]["parameters"]["required"],
+            serde_json::json!(["script"])
+        );
+        let desc = schema["function"]["description"].as_str().unwrap();
+        let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("required `script` string parameter"),
+            "schema should make the required argument visible in the top-level description: {desc}"
+        );
+        assert!(
+            script_desc.contains("never call run_script with empty arguments"),
+            "script description should discourage empty-args calls: {script_desc}"
         );
     }
 

@@ -1200,6 +1200,12 @@ mod tests {
         manager
             .update(&serde_json::json!({
                 "task_id": "task-1",
+                "new_status": "in_progress"
+            }))
+            .await;
+        manager
+            .update(&serde_json::json!({
+                "task_id": "task-1",
                 "new_status": "completed"
             }))
             .await;
