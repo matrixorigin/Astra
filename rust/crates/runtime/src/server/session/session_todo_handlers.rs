@@ -23,6 +23,7 @@ use astra_tools::task_mgmt::{
     TaskManager, TaskStore, normalize_title, prepare_task_snapshot_for_fork,
 };
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
+use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -140,67 +141,6 @@ fn adopt_duplicate_refusal(
             ),
         })
     )
-}
-
-fn find_json_body_start(output: &str) -> Option<usize> {
-    // task_mgmt prefixes responses with a one-line summary followed by a JSON body.
-    // The JSON body starts on its own line, so look for `{` at the start of a line.
-    if output.starts_with('{') {
-        return Some(0);
-    }
-    output.find("\n{").map(|pos| pos + 1)
-}
-
-fn task_tool_output_success(output: &str) -> bool {
-    if output.starts_with("Error:") {
-        return false;
-    }
-    if let Some(pos) = find_json_body_start(output)
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&output[pos..])
-        && value.get("success").and_then(serde_json::Value::as_bool) == Some(false)
-    {
-        return false;
-    }
-    true
-}
-
-/// Extract task_id from a successful create output.
-/// Format: "Task #task-N created: {title}\n{\"success\": true, \"task_id\": \"task-N\", ...}"
-fn extract_task_id_from_output(output: &str) -> Option<String> {
-    if output.starts_with("Error:") {
-        return None;
-    }
-    find_json_body_start(output)
-        .and_then(|pos| serde_json::from_str::<serde_json::Value>(&output[pos..]).ok())
-        .and_then(|value| {
-            value
-                .get("task_id")
-                .and_then(serde_json::Value::as_str)
-                .map(|s| s.to_string())
-        })
-}
-
-async fn delete_adopted_clone(
-    manager: &TaskManager,
-    create_output: &str,
-    reason: &str,
-) -> Result<(String, String), String> {
-    let clone_id = extract_task_id_from_output(create_output).ok_or_else(|| {
-        format!("could not extract clone id for adopt cleanup; clone output: {create_output}")
-    })?;
-    let delete_output = manager
-        .update(&serde_json::json!({
-            "action": "update",
-            "task_id": clone_id,
-            "new_status": "deleted",
-        }))
-        .await;
-    if !task_tool_output_success(&delete_output) {
-        return Err(format!(
-            "failed to delete adopt clone {clone_id} after {reason}: {delete_output}"
-        ));
-    }
-    Ok((clone_id, delete_output))
 }
 
 fn adoptable_source_status(status: &str) -> bool {
@@ -394,6 +334,217 @@ fn clean_adopted_subtasks(subtasks_json: &str) -> Result<Option<serde_json::Valu
             .map(|(clean, _)| clean)
             .collect(),
     )))
+}
+
+fn todo_to_mo_datetime(rfc3339: &str) -> String {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        return dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%d %H:%M:%S%.6f")
+            .to_string();
+    }
+    rfc3339
+        .replacen('T', " ", 1)
+        .split(&['+', 'Z'][..])
+        .next()
+        .unwrap_or(rfc3339)
+        .to_string()
+}
+
+fn task_created_output(
+    task_id: &str,
+    title: &str,
+    source_session: &str,
+    source_task_id: &str,
+) -> String {
+    format!(
+        "Task #{task_id} created: {title}\n{}",
+        serde_json::json!({
+            "success": true,
+            "task_id": task_id,
+            "source_session_id": source_session,
+            "source_task_id": source_task_id,
+            "message": format!("Task '{title}' adopted successfully"),
+        })
+    )
+}
+
+fn parse_next_task_counter(raw: i64, session_id: &str) -> Result<(u32, i64), String> {
+    if raw <= 0 {
+        return Err(format!(
+            "session_todo_counters.next_id out of range for {session_id}: {raw}"
+        ));
+    }
+    let current = u32::try_from(raw as u64)
+        .map_err(|_| format!("session_todo_counters.next_id overflow for {session_id}"))?;
+    let next_stored = u64::from(current) + 1;
+    if next_stored > u64::from(u32::MAX) + 1 {
+        return Err(format!("session_todo_counters exhausted for {session_id}"));
+    }
+    Ok((current, next_stored as i64))
+}
+
+async fn adopt_task_into_session_atomic(
+    shared: &astra_core::SharedPool,
+    user_id: &str,
+    source_session: &str,
+    source_task_id: &str,
+    target_session: &str,
+) -> Result<String, String> {
+    let mut tx = shared.get().begin().await.map_err(|e| e.to_string())?;
+
+    let source_row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT title, description, subtasks, status FROM session_todos \
+             WHERE session_id = ? AND todo_id = ? AND user_id = ? \
+               AND status NOT IN ('migrated', 'deleted') \
+             LIMIT 1 FOR UPDATE",
+    )
+    .bind(source_session)
+    .bind(source_task_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("source lookup failed: {e}"))?;
+    let Some((title, description, subtasks_json, source_status)) = source_row else {
+        return Err(format!(
+            "source task {source_session}:{source_task_id} not found, not owned by you, or already migrated"
+        ));
+    };
+    if !adoptable_source_status(&source_status) {
+        return Err(format!(
+            "source task {source_session}:{source_task_id} is '{source_status}' — only pending, in_progress, or paused tasks can be adopted"
+        ));
+    }
+    let cleaned_subtasks = match subtasks_json.as_deref().map(clean_adopted_subtasks) {
+        Some(Ok(cleaned)) => cleaned,
+        Some(Err(error)) => {
+            return Err(format!(
+                "source task {source_session}:{source_task_id} has invalid subtasks: {error}"
+            ));
+        }
+        None => None,
+    };
+
+    sqlx::query(
+        "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 1) \
+         ON DUPLICATE KEY UPDATE next_id = next_id",
+    )
+    .bind(target_session)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("initialize target task counter failed: {e}"))?;
+
+    let raw_next: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT next_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+    )
+    .bind(target_session)
+    .fetch_one(&mut *tx)
+    .await
+    .map(|(next,)| next)
+    .map_err(|e| format!("lock target task counter failed: {e}"))?;
+    let (allocated, next_stored) = parse_next_task_counter(raw_next, target_session)?;
+    let target_task_id = format!("task-{allocated}");
+
+    let target_rows = sqlx::query(
+        "SELECT todo_id, title, status, ordinal FROM session_todos \
+         WHERE session_id = ? AND user_id = ? \
+         ORDER BY ordinal ASC FOR UPDATE",
+    )
+    .bind(target_session)
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("target duplicate preflight failed: {e}"))?;
+    let normalized_source_title = normalize_title(&title);
+    for row in &target_rows {
+        let todo_id: String = row.try_get("todo_id").map_err(|e| e.to_string())?;
+        let target_title: String = row.try_get("title").map_err(|e| e.to_string())?;
+        let status: String = row.try_get("status").map_err(|e| e.to_string())?;
+        if matches!(status.as_str(), "pending" | "in_progress" | "paused")
+            && normalize_title(&target_title) == normalized_source_title
+        {
+            return Err(adopt_duplicate_refusal(
+                source_session,
+                source_task_id,
+                &todo_id,
+                &target_title,
+            ));
+        }
+        if todo_id == target_task_id {
+            return Err(format!(
+                "task counter desync — id '{target_task_id}' already exists in target session {target_session}"
+            ));
+        }
+    }
+
+    let migrate = sqlx::query(
+        "UPDATE session_todos SET status = 'migrated', updated_at = NOW(6) \
+         WHERE session_id = ? AND todo_id = ? AND user_id = ? AND status = ?",
+    )
+    .bind(source_session)
+    .bind(source_task_id)
+    .bind(user_id)
+    .bind(&source_status)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("migrate source task failed: {e}"))?;
+    if migrate.rows_affected() != 1 {
+        return Err(format!(
+            "source task {source_session}:{source_task_id} was already migrated by a concurrent adopt"
+        ));
+    }
+
+    let metadata = serde_json::to_string(&serde_json::json!({
+        "forked_from": format!("{source_session}:{source_task_id}"),
+    }))
+    .map_err(|e| format!("encode adopted metadata failed: {e}"))?;
+    let subtasks = cleaned_subtasks
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("encode adopted subtasks failed: {e}"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let ordinal = i32::try_from(target_rows.len())
+        .map_err(|_| format!("target task board {target_session} has too many rows"))?;
+
+    sqlx::query(
+        "INSERT INTO session_todos (\
+            session_id, todo_id, user_id, ordinal, title, description, active_form, \
+            status, owner, metadata, blocks, blocked_by, subtasks, archived_at, \
+            created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, ?, NULL, NULL, ?, NULL, ?, ?)",
+    )
+    .bind(target_session)
+    .bind(&target_task_id)
+    .bind(user_id)
+    .bind(ordinal)
+    .bind(&title)
+    .bind(&description)
+    .bind(metadata)
+    .bind(subtasks)
+    .bind(todo_to_mo_datetime(&now))
+    .bind(todo_to_mo_datetime(&now))
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert adopted target task failed: {e}"))?;
+
+    sqlx::query("UPDATE session_todo_counters SET next_id = ? WHERE session_id = ?")
+        .bind(next_stored)
+        .bind(target_session)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("advance target task counter failed: {e}"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit adopt transaction failed: {e}"))?;
+
+    Ok(task_created_output(
+        &target_task_id,
+        &title,
+        source_session,
+        source_task_id,
+    ))
 }
 
 /// Build a session-scoped TaskManager backed by the configured pool.
@@ -604,253 +755,19 @@ async fn adopt_task_into_session(
         return "Error: session_todos store not configured on this server".to_string();
     };
 
-    // U-1 race fix: CAS-first. The source-migration UPDATE doubles
-    // as the concurrency gate — if `rows_affected == 0`, another
-    // concurrent `adopt` got there first (or the source vanished /
-    // was already migrated / wrong owner). Without the CAS, two
-    // concurrent adopts could both SELECT successfully, both
-    // create clones in different sessions, and we'd end up with
-    // two duplicate tasks linked to one (now-migrated) source.
-    //
-    // The source lookup and migration-CAS share one transaction so
-    // the duplicate preflight and status transition see a coherent
-    // source row.
-    let mut tx = match pool.get().begin().await {
-        Ok(tx) => tx,
-        Err(e) => return format!("Error: begin tx for adopt: {e}"),
-    };
-
-    // 1. Snapshot the source row inside the tx so the read and
-    //    the migrate-CAS share a snapshot. Pinning by status NOT
-    //    IN ('migrated','deleted') — if it's already in either
-    //    state, we abort cleanly.
-    let source_row: Option<(String, Option<String>, Option<String>, String)> = match sqlx::query_as(
-        "SELECT title, description, subtasks, status FROM session_todos \
-         WHERE session_id = ? AND todo_id = ? AND user_id = ? \
-           AND status NOT IN ('migrated', 'deleted') \
-         LIMIT 1",
+    match adopt_task_into_session_atomic(
+        pool,
+        user_id,
+        &source_session,
+        &source_task_id,
+        target_session,
     )
-    .bind(&source_session)
-    .bind(&source_task_id)
-    .bind(user_id)
-    .fetch_optional(&mut *tx)
     .await
     {
-        Ok(opt) => opt,
-        Err(e) => {
-            let _ = tx.rollback().await;
-            return format!("Error: source lookup failed: {e}");
-        }
-    };
-    let Some((title, description, subtasks_json, source_status)) = source_row else {
-        let _ = tx.rollback().await;
-        return format!(
-            "Error: source task {source_session}:{source_task_id} not found, not owned by you, or already migrated"
-        );
-    };
-    if !adoptable_source_status(&source_status) {
-        let _ = tx.rollback().await;
-        return format!(
-            "Error: source task {source_session}:{source_task_id} is '{source_status}' — only pending, in_progress, or paused tasks can be adopted"
-        );
+        Ok(output) => output,
+        Err(error) if error.starts_with("Refused:") => error,
+        Err(error) => format!("Error: {error}"),
     }
-
-    let target_active_rows: Vec<(String, String)> = match sqlx::query_as(
-        "SELECT todo_id, title FROM session_todos \
-         WHERE session_id = ? AND user_id = ? \
-           AND status IN ('pending', 'in_progress', 'paused')",
-    )
-    .bind(target_session)
-    .bind(user_id)
-    .fetch_all(&mut *tx)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            let _ = tx.rollback().await;
-            return format!("Error: target duplicate preflight failed: {e}");
-        }
-    };
-    let normalized_source_title = normalize_title(&title);
-    if let Some((duplicate_id, duplicate_title)) = target_active_rows
-        .iter()
-        .find(|(_, target_title)| normalize_title(target_title) == normalized_source_title)
-    {
-        let _ = tx.rollback().await;
-        return adopt_duplicate_refusal(
-            &source_session,
-            &source_task_id,
-            duplicate_id,
-            duplicate_title,
-        );
-    }
-    let cleaned_subtasks = match subtasks_json.as_deref().map(clean_adopted_subtasks) {
-        Some(Ok(cleaned)) => cleaned,
-        Some(Err(error)) => {
-            let _ = tx.rollback().await;
-            return format!(
-                "Error: source task {source_session}:{source_task_id} has invalid subtasks: {error}"
-            );
-        }
-        None => None,
-    };
-
-    // 2. Rollback the read-tx — we're done validating. Clone creation
-    //    happens outside any source-tx because the manager opens its own.
-    //    We CAS the source AFTER clone succeeds to avoid the "clone failed
-    //    + restore failed = task lost" window.
-    if let Err(e) = tx.rollback().await {
-        tracing::warn!(
-            source_session,
-            source_task_id,
-            "adopt: rollback read-tx failed (benign): {e}"
-        );
-    }
-
-    // 3. Create the clone in the target session. If this fails, the
-    //    source remains unchanged — no CAS was attempted, no task lost.
-    let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
-    let manager = TaskManager::new(target_session.to_string(), store);
-
-    let mut create_args = serde_json::json!({
-        "title": title,
-        "metadata": {
-            "forked_from": format!("{source_session}:{source_task_id}"),
-        },
-    });
-    if let Some(description) = description {
-        create_args["description"] = serde_json::json!(description);
-    }
-    if let Some(cleaned_subtasks) = cleaned_subtasks {
-        create_args["subtasks"] = cleaned_subtasks;
-    }
-    let create_output = manager.create(&create_args).await;
-    if !task_tool_output_success(&create_output) {
-        // Clone failed; source is untouched. Return error to caller.
-        return create_output;
-    }
-
-    // 4. Clone succeeded. Now CAS-mark the source as migrated. If this
-    //    fails (rows_affected == 0), a concurrent adopt won the race.
-    //    Delete the clone we just created to avoid duplicates.
-    let mut tx2 = match pool.get().begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            match delete_adopted_clone(&manager, &create_output, "CAS transaction begin failure")
-                .await
-            {
-                Ok((clone_id, delete_output)) => {
-                    tracing::warn!(
-                        source_session,
-                        source_task_id,
-                        clone_id,
-                        "adopt: clone succeeded but begin CAS-tx failed; clone deleted: {delete_output}"
-                    );
-                }
-                Err(cleanup_error) => {
-                    tracing::error!(
-                        source_session,
-                        source_task_id,
-                        error = %e,
-                        cleanup_error = %cleanup_error,
-                        "adopt: clone succeeded, begin CAS-tx failed, and clone cleanup failed"
-                    );
-                    return format!(
-                        "Error: adopt CAS-tx begin failed: {e}; clone cleanup failed: {cleanup_error}"
-                    );
-                }
-            }
-            tracing::error!(
-                source_session,
-                source_task_id,
-                "adopt: clone succeeded but begin CAS-tx failed: {e}; clone was deleted"
-            );
-            return format!("Error: adopt CAS-tx begin failed: {e}; clone was deleted");
-        }
-    };
-    let migrate_result = sqlx::query(
-        "UPDATE session_todos SET status = 'migrated', updated_at = NOW(6) \
-         WHERE session_id = ? AND todo_id = ? AND user_id = ? \
-           AND status NOT IN ('migrated', 'deleted')",
-    )
-    .bind(&source_session)
-    .bind(&source_task_id)
-    .bind(user_id)
-    .execute(&mut *tx2)
-    .await;
-    let migrate_rows = match migrate_result {
-        Ok(r) => r.rows_affected(),
-        Err(e) => {
-            let _ = tx2.rollback().await;
-            match delete_adopted_clone(&manager, &create_output, "CAS update failure").await {
-                Ok((clone_id, delete_output)) => {
-                    tracing::warn!(
-                        source_session,
-                        source_task_id,
-                        clone_id,
-                        "adopt: CAS-UPDATE failed; clone deleted: {delete_output}"
-                    );
-                }
-                Err(cleanup_error) => {
-                    tracing::error!(
-                        source_session,
-                        source_task_id,
-                        error = %e,
-                        cleanup_error = %cleanup_error,
-                        "adopt: clone succeeded, CAS-UPDATE failed, and clone cleanup failed"
-                    );
-                    return format!(
-                        "Error: adopt CAS-UPDATE failed: {e}; clone cleanup failed: {cleanup_error}"
-                    );
-                }
-            }
-            tracing::error!(
-                source_session,
-                source_task_id,
-                "adopt: clone succeeded but CAS-UPDATE failed: {e}; clone was deleted"
-            );
-            return format!("Error: adopt CAS-UPDATE failed: {e}; clone was deleted");
-        }
-    };
-    if migrate_rows == 0 {
-        // Concurrent adopt won the race. Delete the clone we created.
-        let _ = tx2.rollback().await;
-        match delete_adopted_clone(&manager, &create_output, "concurrent CAS miss").await {
-            Ok((clone_id, delete_output)) => {
-                tracing::warn!(
-                    source_session,
-                    source_task_id,
-                    clone_id,
-                    "adopt: concurrent CAS detected; deleted clone: {delete_output}"
-                );
-            }
-            Err(cleanup_error) => {
-                tracing::error!(
-                    source_session,
-                    source_task_id,
-                    cleanup_error = %cleanup_error,
-                    "adopt: concurrent CAS detected and clone cleanup failed"
-                );
-                return format!(
-                    "Error: source task {source_session}:{source_task_id} was already migrated by a concurrent adopt; clone cleanup failed: {cleanup_error}"
-                );
-            }
-        }
-        return format!(
-            "Error: source task {source_session}:{source_task_id} was already migrated by a concurrent adopt"
-        );
-    }
-    if let Err(e) = tx2.commit().await {
-        tracing::error!(
-            source_session,
-            source_task_id,
-            "adopt: clone succeeded, CAS succeeded, but commit failed: {e}; clone output: {create_output}"
-        );
-        return format!("Error: commit adopt CAS failed: {e}; clone exists in target session");
-    }
-
-    create_output
 }
 
 /// `GET /sessions/{session_id}/todos` — load the full task list.
@@ -1107,7 +1024,6 @@ mod tests {
         let output = adopt_duplicate_refusal("source-s", "task-7", "task-2", "Ship feature");
         assert!(output.starts_with("Refused:"), "{output}");
         assert!(output.contains("open task"), "{output}");
-        assert!(!task_tool_output_success(&output), "{output}");
         let body = output
             .find('{')
             .and_then(|pos| serde_json::from_str::<serde_json::Value>(&output[pos..]).ok())
