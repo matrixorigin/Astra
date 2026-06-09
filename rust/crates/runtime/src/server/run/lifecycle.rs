@@ -1537,6 +1537,15 @@ fn build_llm_round_trace_events(
     model_name: Option<&str>,
     rounds: &[crate::turn::agentic_loop::host::RecentRoundSummary],
 ) -> Vec<TraceEvent> {
+    // Hoist repeated per-round allocations. session_id/user_id in new() are
+    // overwritten by with_turn_context, so pass empty strings to skip 2 clones.
+    let run_id_owned = run_id.to_string();
+    let agent_str = agent_id.unwrap_or("root-agent");
+    let parent_run_str = parent_run_id.map(|s| s.to_string());
+    let parent_agent_str = parent_agent_id.map(|s| s.to_string());
+    let root_event_id = trace.root_event_id.clone();
+    let model_default = model_name.map(|s| s.to_string());
+
     rounds
         .iter()
         .enumerate()
@@ -1545,20 +1554,20 @@ fn build_llm_round_trace_events(
             let round_key = round_index.to_string();
             let mut event = TraceEvent::new(
                 trace_event_id("round_done", &[run_id, &round_key, &trace.turn_id]),
-                trace.session_id.clone(),
-                trace.user_id.clone(),
+                "",
+                "",
                 "llm_round_completed",
                 "llm_round",
             )
             .with_turn_context(trace);
-            event.run_id = Some(run_id.to_string());
-            event.parent_run_id = parent_run_id.map(ToString::to_string);
-            event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
-            event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+            event.run_id = Some(run_id_owned.clone());
+            event.parent_run_id = parent_run_str.clone();
+            event.agent_id = Some(agent_str.to_string());
+            event.parent_agent_id = parent_agent_str.clone();
             event.round_index = Some(round_index);
             event.llm_model_used = (!round.model.is_empty())
                 .then(|| round.model.clone())
-                .or_else(|| model_name.map(ToString::to_string));
+                .or_else(|| model_default.clone());
             event.meta_duration_ms = i32::try_from(round.duration_ms).ok();
             event.token_usage = Some(json!({
                 "prompt": round.prompt_tokens,
@@ -1570,7 +1579,7 @@ fn build_llm_round_trace_events(
                     + round.cache_read_tokens
                     + round.cache_creation_tokens,
             }));
-            event.parent_event_id = Some(trace.root_event_id.clone());
+            event.parent_event_id = Some(root_event_id.clone());
             event.metadata = json!({
                 "finish_reason": round.finish_reason,
                 "tool_calls_returned": round.tool_calls_returned,
@@ -1604,6 +1613,15 @@ fn build_tool_trace_events(
     parent_agent_id: Option<&str>,
     records: &[astra_services::session_journal::ToolCallRecord],
 ) -> Vec<TraceEvent> {
+    // Hoist repeated per-record allocations. session_id/user_id in new() are
+    // overwritten by with_turn_context, so pass empty strings to skip 4 clones
+    // per record (2 events x 2 fields).
+    let run_id_owned = run_id.to_string();
+    let agent_str = agent_id.unwrap_or("root-agent");
+    let parent_run_str = parent_run_id.map(|s| s.to_string());
+    let parent_agent_str = parent_agent_id.map(|s| s.to_string());
+    let root_event_id = trace.root_event_id.clone();
+
     let mut events = Vec::with_capacity(records.len().saturating_mul(2));
     for (index, record) in records.iter().enumerate() {
         if record.is_synthetic_placeholder() {
@@ -1621,23 +1639,26 @@ fn build_tool_trace_events(
         let child_run_id = child_run_id_from_tool_result(result_json.as_ref());
         let round_index = record.round.map(i64::from);
         let started_at = chrono::Utc::now();
+        // Clone call_id once, share for both events.
+        let call_id_clone = call_id.clone();
+        let tool_name = record.name.clone();
 
         let mut started = TraceEvent::new(
             trace_event_id("tool_start", &[run_id, &call_id]),
-            trace.session_id.clone(),
-            trace.user_id.clone(),
+            "",
+            "",
             "tool_call_started",
             "tool_call",
         )
         .with_turn_context(trace);
-        started.run_id = Some(run_id.to_string());
-        started.parent_run_id = parent_run_id.map(ToString::to_string);
-        started.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
-        started.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        started.run_id = Some(run_id_owned.clone());
+        started.parent_run_id = parent_run_str.clone();
+        started.agent_id = Some(agent_str.to_string());
+        started.parent_agent_id = parent_agent_str.clone();
         started.round_index = round_index;
-        started.tool_call_id = Some(call_id.clone());
-        started.meta_tool_name = Some(record.name.clone());
-        started.parent_event_id = Some(trace.root_event_id.clone());
+        started.tool_call_id = Some(call_id_clone);
+        started.meta_tool_name = Some(tool_name.clone());
+        started.parent_event_id = Some(root_event_id.clone());
         started.created_at = started_at;
         started.metadata = json!({
             "args_preview": record.args_preview,
@@ -1654,21 +1675,21 @@ fn build_tool_trace_events(
         };
         let mut completed = TraceEvent::new(
             trace_event_id(terminal_type, &[run_id, &call_id]),
-            trace.session_id.clone(),
-            trace.user_id.clone(),
+            "",
+            "",
             terminal_type,
             "tool_call",
         )
         .with_turn_context(trace);
-        completed.run_id = Some(run_id.to_string());
-        completed.parent_run_id = parent_run_id.map(ToString::to_string);
-        completed.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
-        completed.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        completed.run_id = Some(run_id_owned.clone());
+        completed.parent_run_id = parent_run_str.clone();
+        completed.agent_id = Some(agent_str.to_string());
+        completed.parent_agent_id = parent_agent_str.clone();
         completed.round_index = round_index;
         completed.tool_call_id = Some(call_id);
-        completed.meta_tool_name = Some(record.name.clone());
+        completed.meta_tool_name = Some(tool_name);
         completed.meta_duration_ms = i32::try_from(record.ms).ok();
-        completed.parent_event_id = Some(trace.root_event_id.clone());
+        completed.parent_event_id = Some(root_event_id.clone());
         completed.metadata = json!({
             "ok": record.ok,
             "action": action,
