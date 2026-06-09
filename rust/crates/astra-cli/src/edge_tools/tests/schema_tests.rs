@@ -498,10 +498,10 @@ fn task_schema_does_not_advertise_background_actions() {
     }
 }
 
-/// `agent_job` is the new home for background execution: shell processes
-/// and durable agent runs. The actions mirror what was on `task` before
-/// the split (background_shell/background_agent/output/kill) but with the
-/// `background_` prefix dropped — there's no other kind of agent_job.
+/// `agent_job` is the new home for local background shell execution.
+/// Background sub-agents keep their own lifecycle on `agent(spawn)` /
+/// `agent(get_result)` because their IDs and result collection are not
+/// managed by the TUI shell registry.
 #[test]
 fn agent_job_schema_exists_with_expected_actions() {
     let schemas = all_tool_schemas();
@@ -510,7 +510,7 @@ fn agent_job_schema_exists_with_expected_actions() {
         .find(|s| s["function"]["name"].as_str() == Some("agent_job"))
         .expect(
             "agent_job schema must exist — it's the new tool that owns \
-             background_shell/background_agent/output/kill after the Phase 1 split",
+             background_shell/output/kill after the Phase 1 split",
         );
     let actions: Vec<&str> = agent_job["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
@@ -518,10 +518,25 @@ fn agent_job_schema_exists_with_expected_actions() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    for expected in &["shell", "agent", "output", "kill"] {
+    for expected in &["shell", "list", "output", "kill"] {
         assert!(
             actions.contains(expected),
             "agent_job.action must include `{expected}`. Got: {actions:?}"
+        );
+    }
+    assert!(
+        !actions.contains(&"agent"),
+        "agent_job.action must not advertise agent: sub-agent lifecycle uses \
+         agent(action='spawn', run_in_background=true) plus get_result. Got: {actions:?}"
+    );
+
+    let properties = agent_job["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("agent_job properties must be an object");
+    for removed_agent_field in ["prompt", "agent_type", "model"] {
+        assert!(
+            !properties.contains_key(removed_agent_field),
+            "agent_job schema must not expose sub-agent field `{removed_agent_field}`"
         );
     }
 }
@@ -537,20 +552,15 @@ fn agent_job_schema_per_action_required_fields() {
          has no command to run and the model would silently no-op"
     );
     assert_eq!(
-        conditional_required_for(agent_job, "agent"),
-        vec!["prompt".to_string()],
-        "agent_job.agent must require `prompt`"
-    );
-    assert_eq!(
         conditional_required_for(agent_job, "output"),
-        vec!["task_id".to_string()],
-        "agent_job.output must require `task_id` — there's no implicit \
-         most-recent-job; the model must name the job it's reading from"
+        Vec::<String>::new(),
+        "agent_job.output should default to the most recent job so the model \
+         does not have to remember an ID just to read the common case"
     );
     assert_eq!(
         conditional_required_for(agent_job, "kill"),
-        vec!["task_id".to_string()],
-        "agent_job.kill must require `task_id` — never bulk-kill all jobs"
+        vec!["job_id".to_string()],
+        "agent_job.kill must require `job_id` — never bulk-kill all jobs"
     );
 }
 

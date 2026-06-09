@@ -449,25 +449,31 @@ pub enum BgTaskCommand {
         reply: tokio::sync::oneshot::Sender<String>,
     },
     Kill {
-        task_id: String,
+        job_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     GetOutput {
-        task_id: String,
+        job_id: String,
         tail_bytes: usize,
         reply: tokio::sync::oneshot::Sender<Result<(String, u64), String>>,
     },
     GetOutputSince {
-        task_id: String,
+        job_id: String,
         offset: u64,
         max_bytes: usize,
         reply: tokio::sync::oneshot::Sender<Result<(String, u64, u64), String>>,
     },
-    /// Returns whether the task has reached terminal status. Used by
+    List {
+        reply: tokio::sync::oneshot::Sender<String>,
+    },
+    Latest {
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Returns whether the job has reached terminal status. Used by
     /// `agent_job(action='output', block=true)` so an empty-output job
     /// that completed doesn't spin until the timeout.
     IsTerminal {
-        task_id: String,
+        job_id: String,
         reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
     },
 }
@@ -2133,41 +2139,36 @@ impl ToolExecutor {
         }
         match rx.await {
             Ok(id) => format!(
-                "Background job started: {id}\nUse agent_job(action='output', task_id='{id}') to check progress or agent_job(action='kill', task_id='{id}') to stop."
+                "<background_job_started job_id=\"{id}\">\nUse agent_job(action='output') to read the most recent job, agent_job(action='list') to see all jobs, or agent_job(action='kill', job_id='{id}') to stop it.\n</background_job_started>"
             ),
             Err(_) => "Error: background job registry not available".to_string(),
         }
     }
 
-    async fn task_background_agent(&self, args: &Value) -> String {
-        let prompt = match args.get("prompt").and_then(Value::as_str) {
-            Some(p) if !p.trim().is_empty() => p.to_string(),
-            _ => return "Error: 'prompt' is required for background_agent".to_string(),
-        };
-        let description = args
-            .get("description")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| astra_text_utils::str_preview::truncate_line(&prompt, 60));
-
-        let Some(ctx) = self.spawn_context.as_ref() else {
-            return "Error: background_agent requires agent spawning context; use `agent(action='spawn', ...)` when available".to_string();
-        };
-
-        let mut spawn_args = json!({
-            "description": description,
-            "prompt": prompt,
-            "agent_type": args
-                .get("agent_type")
-                .and_then(Value::as_str)
-                .unwrap_or("general-purpose"),
-            "run_in_background": true,
-        });
-        if let Some(model) = args.get("model").and_then(Value::as_str) {
-            spawn_args["model"] = json!(model);
+    async fn resolve_latest_background_job_id(
+        bg_commands: &std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+    ) -> Result<String, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut cmds = bg_commands.lock_recover();
+            cmds.push(BgTaskCommand::Latest { reply: tx });
         }
+        rx.await
+            .map_err(|_| "Error: background job registry not available".to_string())?
+    }
 
-        agent_spawning::handle_agent_spawn_action(&spawn_args, Some(ctx)).await
+    async fn task_list_bg(&self) -> String {
+        let Some(ref bg_commands) = self.bg_task_commands else {
+            return "Error: background job subsystem not active in this session (no TUI/REPL attached)."
+                .to_string();
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut cmds = bg_commands.lock_recover();
+            cmds.push(BgTaskCommand::List { reply: tx });
+        }
+        rx.await
+            .unwrap_or_else(|_| "Error: background job registry not available".to_string())
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -2177,9 +2178,13 @@ impl ToolExecutor {
                     inside the interactive REPL."
                 .to_string();
         };
-        let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(id) => id.to_string(),
-            None => return "Error: 'task_id' is required for output".to_string(),
+        let job_id = match args.get("job_id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            Some(_) => return "Error: 'job_id' must not be empty".to_string(),
+            None => match Self::resolve_latest_background_job_id(bg_commands).await {
+                Ok(id) => id,
+                Err(error) => return error,
+            },
         };
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(true);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
@@ -2204,7 +2209,7 @@ impl ToolExecutor {
                 {
                     let mut cmds = bg_commands.lock_recover();
                     cmds.push(BgTaskCommand::IsTerminal {
-                        task_id: task_id.clone(),
+                        job_id: job_id.clone(),
                         reply: status_tx,
                     });
                 }
@@ -2218,7 +2223,7 @@ impl ToolExecutor {
                 {
                     let mut cmds = bg_commands.lock_recover();
                     cmds.push(BgTaskCommand::GetOutputSince {
-                        task_id: task_id.clone(),
+                        job_id: job_id.clone(),
                         offset,
                         max_bytes,
                         reply: tx,
@@ -2231,7 +2236,7 @@ impl ToolExecutor {
                             || tokio::time::Instant::now() >= deadline
                         {
                             return format!(
-                                "<task_output task_id=\"{task_id}\" start_offset=\"{offset}\" end_offset=\"{end_offset}\" total_bytes=\"{total_bytes}\" terminal=\"{is_terminal}\">\n{output}\n</task_output>"
+                                "<job_output job_id=\"{job_id}\" start_offset=\"{offset}\" end_offset=\"{end_offset}\" total_bytes=\"{total_bytes}\" terminal=\"{is_terminal}\">\n{output}\n</job_output>"
                             );
                         }
                     }
@@ -2240,7 +2245,7 @@ impl ToolExecutor {
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return format!(
-                        "<task_output task_id=\"{task_id}\" status=\"timeout\">\nJob still running after {timeout_ms}ms.\n</task_output>"
+                        "<job_output job_id=\"{job_id}\" status=\"timeout\">\nJob still running after {timeout_ms}ms.\n</job_output>"
                     );
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2250,7 +2255,7 @@ impl ToolExecutor {
             {
                 let mut cmds = bg_commands.lock_recover();
                 cmds.push(BgTaskCommand::GetOutputSince {
-                    task_id: task_id.clone(),
+                    job_id: job_id.clone(),
                     offset,
                     max_bytes,
                     reply: tx,
@@ -2259,7 +2264,7 @@ impl ToolExecutor {
             match rx.await {
                 Ok(Ok((output, end_offset, total_bytes))) => {
                     format!(
-                        "<task_output task_id=\"{task_id}\" start_offset=\"{offset}\" end_offset=\"{end_offset}\" total_bytes=\"{total_bytes}\">\n{output}\n</task_output>"
+                        "<job_output job_id=\"{job_id}\" start_offset=\"{offset}\" end_offset=\"{end_offset}\" total_bytes=\"{total_bytes}\">\n{output}\n</job_output>"
                     )
                 }
                 Ok(Err(e)) => format!("Error: {e}"),
@@ -2274,20 +2279,21 @@ impl ToolExecutor {
                     Nothing to kill — background_shell is unavailable outside the interactive REPL."
                 .to_string();
         };
-        let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(id) => id.to_string(),
-            None => return "Error: 'task_id' is required for kill".to_string(),
+        let job_id = match args.get("job_id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            Some(_) => return "Error: 'job_id' must not be empty".to_string(),
+            None => return "Error: 'job_id' is required for kill".to_string(),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::Kill {
-                task_id: task_id.clone(),
+                job_id: job_id.clone(),
                 reply: tx,
             });
         }
         match rx.await {
-            Ok(Ok(())) => format!("Background job {task_id} killed."),
+            Ok(Ok(())) => format!("Background job {job_id} killed."),
             Ok(Err(e)) => format!("Error: {e}"),
             Err(_) => "Error: background job registry not available".to_string(),
         }
@@ -3961,7 +3967,7 @@ impl ToolExecutor {
                         }
                         "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool instead.".to_string(),
                         other => match Self::validate_task_tool_args_for_action(other, args) {
-                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool (actions: shell, agent, output, kill)."),
+                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background shell processes use the `agent_job` tool (actions: shell, list, output, kill). For background sub-agents use `agent(action='spawn', run_in_background=true)` and collect with `agent(action='get_result', agent_id=...)`."),
                             Err(error) => format!("Error: {error}"),
                         },
                     }
@@ -3970,11 +3976,12 @@ impl ToolExecutor {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
                         "shell" => self.task_background_shell(args).await,
-                        "agent" => self.task_background_agent(args).await,
+                        "list" => self.task_list_bg().await,
                         "output" => self.task_output(args).await,
                         "kill" => self.task_kill_bg(args).await,
-                        "" => "Error: missing required parameter `action` for `agent_job`. Use one of: shell, agent, output, kill.".to_string(),
-                        other => format!("Error: unknown `agent_job` action '{other}'. Valid: shell, agent, output, kill."),
+                        "agent" => "Error: `agent_job(action='agent')` is not a supported user journey. Use `agent(action='spawn', description='...', prompt='...', run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the returned agent_id. Use `agent_job` only for local background shell jobs.".to_string(),
+                        "" => "Error: missing required parameter `action` for `agent_job`. Use one of: shell, list, output, kill.".to_string(),
+                        other => format!("Error: unknown `agent_job` action '{other}'. Valid: shell, list, output, kill."),
                     }
                 }
                 "web_search" => self.web_search(args),

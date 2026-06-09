@@ -1790,7 +1790,8 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
-                                    let mut ctrl_b_pressed = false;
+                                    let mut ctrl_b_promoted_job_id: Option<String> = None;
+                                    let mut ctrl_b_fallback_cancelled = false;
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
                                     // we keep the listener so a Ctrl+B keypress can
@@ -1933,6 +1934,7 @@ pub(crate) async fn run_tui_session(
                                                                                     format!("⏎ Backgrounded as {id} — output continues; poll with agent_job(action='output')")
                                                                                 ),
                                                                             );
+                                                                            ctrl_b_promoted_job_id = Some(id);
                                                                             // The turn is over from the
                                                                             // model's perspective; cancel
                                                                             // gracefully so it sees the
@@ -1940,7 +1942,6 @@ pub(crate) async fn run_tui_session(
                                                                             // already returned by the bash
                                                                             // tool and ends cleanly.
                                                                             tui_cancel_token.cancel();
-                                                                            ctrl_b_pressed = true;
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
@@ -1957,7 +1958,7 @@ pub(crate) async fn run_tui_session(
                                                                     ),
                                                                 );
                                                                 tui_cancel_token.cancel();
-                                                                ctrl_b_pressed = true;
+                                                                ctrl_b_fallback_cancelled = true;
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
@@ -2479,10 +2480,18 @@ pub(crate) async fn run_tui_session(
                                         }
                                     }
 
-                                    // Ctrl+B notification: inject hint for the next turn.
-                                    if ctrl_b_pressed {
+                                    // Ctrl+B notification: tell the next turn
+                                    // which path actually happened. A true
+                                    // promotion must not suggest re-running the
+                                    // command; doing so risks duplicate side
+                                    // effects.
+                                    if let Some(job_id) = ctrl_b_promoted_job_id {
+                                        state.pending_bg_notifications.push(format!(
+                                            "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use agent_job(action='output') for the latest job, agent_job(action='output', job_id='{job_id}') for this job, or agent_job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
+                                        ));
+                                    } else if ctrl_b_fallback_cancelled {
                                         state.pending_bg_notifications.push(
-                                            "<background_task_notification>\n<status>user_backgrounded</status>\n<hint>The user pressed Ctrl+B to background the current operation. If it was long-running (build, test, server), re-run it with agent_job(action='shell', command='...').</hint>\n</background_task_notification>".to_string()
+                                            "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with agent_job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
                                         );
                                     }
 
@@ -3194,36 +3203,45 @@ pub(crate) async fn run_tui_session(
                                 let id = background_registry.spawn_shell(&command, &description);
                                 let _ = reply.send(id);
                             }
-                            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                                let _ = reply.send(background_registry.kill(&task_id));
+                            crate::edge_tools::BgTaskCommand::Kill { job_id, reply } => {
+                                let _ = reply.send(background_registry.kill(&job_id));
                             }
-                            crate::edge_tools::BgTaskCommand::GetOutput { task_id, tail_bytes, reply } => {
-                                let output = background_registry.get_combined_output(&task_id, tail_bytes);
+                            crate::edge_tools::BgTaskCommand::GetOutput { job_id, tail_bytes, reply } => {
+                                let output = background_registry.get_combined_output(&job_id, tail_bytes);
                                 let _ = reply.send(output);
                             }
                             crate::edge_tools::BgTaskCommand::GetOutputSince {
-                                task_id,
+                                job_id,
                                 offset,
                                 max_bytes,
                                 reply,
                             } => {
                                 let output =
-                                    background_registry.get_output_since(&task_id, offset, max_bytes);
+                                    background_registry.get_output_since(&job_id, offset, max_bytes);
                                 let _ = reply.send(output);
                             }
-                            crate::edge_tools::BgTaskCommand::IsTerminal { task_id, reply } => {
+                            crate::edge_tools::BgTaskCommand::List { reply } => {
+                                let _ = reply.send(background_registry.render_job_list_xml());
+                            }
+                            crate::edge_tools::BgTaskCommand::Latest { reply } => {
+                                let result = background_registry
+                                    .latest_job_id()
+                                    .ok_or_else(|| "no background jobs".to_string());
+                                let _ = reply.send(result);
+                            }
+                            crate::edge_tools::BgTaskCommand::IsTerminal { job_id, reply } => {
                                 // Drain join_set so terminal status is current.
                                 // Use drain_join_set (not poll_completions) to
                                 // preserve pending_completions for the next tick.
                                 background_registry.drain_join_set();
-                                let result = match background_registry.get(&task_id) {
+                                let result = match background_registry.get(&job_id) {
                                     Some(h) => Ok(matches!(
                                         h.status(),
                                         crate::tui::background_tasks::BgTaskStatus::Completed
                                             | crate::tui::background_tasks::BgTaskStatus::Failed
                                             | crate::tui::background_tasks::BgTaskStatus::Killed
                                     )),
-                                    None => Err(format!("no background job with id '{task_id}'")),
+                                    None => Err(format!("no background job with id '{job_id}'")),
                                 };
                                 let _ = reply.send(result);
                             }

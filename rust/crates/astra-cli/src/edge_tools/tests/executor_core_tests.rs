@@ -880,9 +880,9 @@ async fn write_guard_is_inactive_when_no_authoring_plan() {
     }
 }
 
-/// `agent_job` is the new entry point. It must dispatch the four
-/// background actions to the same handlers that previously sat on
-/// `task` — verified here with the cheapest possible smoke: an
+/// `agent_job` is the new entry point. It must dispatch the background
+/// shell actions to the same handlers that previously sat on `task` —
+/// verified here with the cheapest possible smoke: an
 /// unwired CLI executor returns a known fail-fast string for each
 /// action (the BackgroundTaskRegistry is wired only inside the TUI
 /// REPL — see `task_background_shell_fails_fast_when_unwired`).
@@ -911,7 +911,7 @@ async fn agent_job_actions_dispatch_through_executor() {
     let result = executor
         .execute(
             "agent_job",
-            &json!({"action": "kill", "task_id": "bg-shell-1"}),
+            &json!({"action": "kill", "job_id": "bg-shell-1"}),
         )
         .await;
     assert!(
@@ -920,6 +920,25 @@ async fn agent_job_actions_dispatch_through_executor() {
             || result.contains("Nothing to kill"),
         "agent_job.kill should reach the registry-unwired fail-fast path. \
          Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn agent_job_agent_action_is_rejected_with_agent_tool_guidance() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "agent_job",
+            &json!({"action": "agent", "prompt": "audit TODOs"}),
+        )
+        .await;
+
+    assert!(result.contains("not a supported user journey"), "{result}");
+    assert!(result.contains("agent(action='spawn'"), "{result}");
+    assert!(result.contains("agent(action='get_result'"), "{result}");
+    assert!(
+        !result.contains("background_agent requires"),
+        "agent_job.agent must not route into the old background_agent shim. Got: {result}"
     );
 }
 

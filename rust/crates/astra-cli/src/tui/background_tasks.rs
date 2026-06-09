@@ -40,6 +40,16 @@ impl BgTaskStatus {
     fn is_terminal(self) -> bool {
         !matches!(self, Self::Running | Self::Stalled)
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Killed => "killed",
+            Self::Stalled => "stalled",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +334,36 @@ impl BackgroundTaskRegistry {
         // no duplicate event.
         handle.cancel_token.cancel();
         Ok(())
+    }
+
+    pub fn latest_job_id(&mut self) -> Option<String> {
+        self.drain_join_set();
+        self.tasks
+            .values()
+            .max_by_key(|handle| handle.started_at)
+            .map(|handle| handle.id.clone())
+    }
+
+    pub fn render_job_list_xml(&mut self) -> String {
+        self.drain_join_set();
+        let mut jobs: Vec<_> = self.tasks.values().collect();
+        jobs.sort_by_key(|handle| handle.started_at);
+        if jobs.is_empty() {
+            return "<background_jobs count=\"0\" />".to_string();
+        }
+
+        let mut out = format!("<background_jobs count=\"{}\">", jobs.len());
+        for handle in jobs {
+            out.push_str(&format!(
+                "\n<job id=\"{}\" status=\"{}\" elapsed_ms=\"{}\">{}</job>",
+                xml_escape(&handle.id),
+                handle.status().as_str(),
+                handle.started_at.elapsed().as_millis(),
+                xml_escape(&handle.description),
+            ));
+        }
+        out.push_str("\n</background_jobs>");
+        out
     }
 
     /// Drain the JoinSet without consuming pending_completions.
@@ -900,32 +940,32 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
             summary,
         } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>completed</status>\n\
                  <exit_code>{}</exit_code>\n\
                  <summary>{}</summary>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
                 exit_code.unwrap_or(0),
                 xml_escape(summary),
             )
         }
         BgTaskEvent::Failed { id, error } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>failed</status>\n\
                  <error>{}</error>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
                 xml_escape(error),
             )
         }
         BgTaskEvent::Killed { id } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>killed</status>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
             )
         }
         BgTaskEvent::Stalled {
@@ -933,12 +973,12 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
             last_output_tail,
         } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>stalled</status>\n\
                  <hint>Process may be waiting for interactive input. Consider killing and re-running with non-interactive flags.</hint>\n\
                  <last_output>{}</last_output>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
                 xml_escape(last_output_tail),
             )
         }
@@ -1127,6 +1167,34 @@ mod tests {
         let (output, _) = reg.get_output(&id, 4096).unwrap();
         assert!(output.contains("line1"));
         assert!(output.contains("line2"));
+    }
+
+    #[tokio::test]
+    async fn latest_job_id_returns_most_recent_background_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let first = reg.spawn_shell("sleep 1", "first");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = reg.spawn_shell("sleep 1", "second");
+
+        assert_eq!(reg.latest_job_id().as_deref(), Some(second.as_str()));
+        assert_ne!(first, second);
+        let _ = reg.kill(&first);
+        let _ = reg.kill(&second);
+    }
+
+    #[tokio::test]
+    async fn render_job_list_xml_reports_ids_status_and_escaped_descriptions() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("sleep 1", "build <all> & test");
+
+        let xml = reg.render_job_list_xml();
+        assert!(xml.contains("<background_jobs count=\"1\">"), "{xml}");
+        assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
+        assert!(xml.contains("status=\"running\""), "{xml}");
+        assert!(xml.contains("build &lt;all&gt; &amp; test"), "{xml}");
+        let _ = reg.kill(&id);
     }
 
     #[tokio::test]

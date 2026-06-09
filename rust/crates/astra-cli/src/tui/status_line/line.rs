@@ -183,9 +183,8 @@ impl StatusLine {
             }
         }
 
-        // BackgroundTaskRegistry chip. Surfaces fire-and-poll work
-        // (agent_job.shell / agent_job.agent) so the user knows how
-        // many bg jobs are live without opening a separate view.
+        // BackgroundTaskRegistry chip. Surfaces local shell jobs so the
+        // user knows how many bg jobs are live without opening a separate view.
         // Style:
         //   - any stalled → yellow (alarm: process likely waiting on
         //     interactive input; user should kill or acknowledge)
