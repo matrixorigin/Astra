@@ -202,43 +202,43 @@ pub const MEMORY_SEARCH: &str = "/memory/search";
 pub const MEMORY_RETRIEVE: &str = "/memory/retrieve";
 pub const MEMORY_PURGE: &str = "/memory/purge";
 
-/// Task API (`router_builder`: list/create, detail, progress, status update).
-pub const TASKS: &str = "/tasks";
+/// Agent background job API (`router_builder`: list/create, detail, progress, status update).
+pub const AGENT_JOBS: &str = "/agent-jobs";
 
 #[inline]
-pub fn task(id: &str) -> String {
-    format!("/tasks/{id}")
+pub fn agent_job(id: &str) -> String {
+    format!("/agent-jobs/{id}")
 }
 
 #[inline]
-pub fn task_progress(id: &str) -> String {
-    format!("/tasks/{id}/progress")
+pub fn agent_job_progress(id: &str) -> String {
+    format!("/agent-jobs/{id}/progress")
 }
 
 #[inline]
-pub fn task_status(id: &str) -> String {
-    format!("/tasks/{id}/status")
+pub fn agent_job_status(id: &str) -> String {
+    format!("/agent-jobs/{id}/status")
 }
 
-/// `GET /tasks/{id}/lease` — current lease row (or null).
+/// `GET /agent-jobs/{id}/lease` — current lease row (or null).
 #[inline]
-pub fn task_lease(id: &str) -> String {
-    format!("/tasks/{id}/lease")
-}
-
-#[inline]
-pub fn task_lease_claim(id: &str) -> String {
-    format!("/tasks/{id}/lease/claim")
+pub fn agent_job_lease(id: &str) -> String {
+    format!("/agent-jobs/{id}/lease")
 }
 
 #[inline]
-pub fn task_lease_release(id: &str) -> String {
-    format!("/tasks/{id}/lease/release")
+pub fn agent_job_lease_claim(id: &str) -> String {
+    format!("/agent-jobs/{id}/lease/claim")
 }
 
 #[inline]
-pub fn task_lease_renew(id: &str) -> String {
-    format!("/tasks/{id}/lease/renew")
+pub fn agent_job_lease_release(id: &str) -> String {
+    format!("/agent-jobs/{id}/lease/release")
+}
+
+#[inline]
+pub fn agent_job_lease_renew(id: &str) -> String {
+    format!("/agent-jobs/{id}/lease/renew")
 }
 
 /// Context snapshots (`GET/POST /context`, `GET /context/{id}`).
@@ -391,7 +391,7 @@ mod tests {
             MEMORY_SEARCH,
             MEMORY_RETRIEVE,
             MEMORY_PURGE,
-            TASKS,
+            AGENT_JOBS,
             CONTEXT,
             CHAT_ROUTE,
             COMPLETIONS,
@@ -572,41 +572,44 @@ mod tests {
         assert_eq!(skill_versions("bash"), "/skills/bash/versions");
     }
 
-    // --- Task paths ---
+    // --- Agent job paths ---
 
     #[test]
-    fn task_path() {
-        assert_eq!(task("t1"), "/tasks/t1");
+    fn job_path() {
+        assert_eq!(agent_job("t1"), "/agent-jobs/t1");
     }
 
     #[test]
-    fn task_progress_path() {
-        assert_eq!(task_progress("t1"), "/tasks/t1/progress");
+    fn job_progress_path() {
+        assert_eq!(agent_job_progress("t1"), "/agent-jobs/t1/progress");
     }
 
     #[test]
-    fn task_status_path() {
-        assert_eq!(task_status("t1"), "/tasks/t1/status");
+    fn job_status_path() {
+        assert_eq!(agent_job_status("t1"), "/agent-jobs/t1/status");
     }
 
     #[test]
-    fn task_lease_path() {
-        assert_eq!(task_lease("t1"), "/tasks/t1/lease");
+    fn job_lease_path() {
+        assert_eq!(agent_job_lease("t1"), "/agent-jobs/t1/lease");
     }
 
     #[test]
-    fn task_lease_claim_path() {
-        assert_eq!(task_lease_claim("t1"), "/tasks/t1/lease/claim");
+    fn job_lease_claim_path() {
+        assert_eq!(agent_job_lease_claim("t1"), "/agent-jobs/t1/lease/claim");
     }
 
     #[test]
-    fn task_lease_release_path() {
-        assert_eq!(task_lease_release("t1"), "/tasks/t1/lease/release");
+    fn job_lease_release_path() {
+        assert_eq!(
+            agent_job_lease_release("t1"),
+            "/agent-jobs/t1/lease/release"
+        );
     }
 
     #[test]
-    fn task_lease_renew_path() {
-        assert_eq!(task_lease_renew("t1"), "/tasks/t1/lease/renew");
+    fn job_lease_renew_path() {
+        assert_eq!(agent_job_lease_renew("t1"), "/agent-jobs/t1/lease/renew");
     }
 
     // --- Context path ---
@@ -655,6 +658,6 @@ mod tests {
 
     #[test]
     fn id_with_special_chars() {
-        assert_eq!(task("a/b"), "/tasks/a/b");
+        assert_eq!(agent_job("a/b"), "/agent-jobs/a/b");
     }
 }

@@ -7,7 +7,7 @@ use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TaskListQuery {
+pub(super) struct JobListQuery {
     /// Optional status filter: pending, in_progress, paused, completed, failed, cancelled
     pub status: Option<String>,
     /// Optional session filter.
@@ -16,7 +16,7 @@ pub(super) struct TaskListQuery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TaskProgressQuery {
+pub(super) struct JobProgressQuery {
     /// Session ID to read plan-progress journal events from.
     pub session_id: Option<String>,
 }
@@ -24,8 +24,8 @@ pub(super) struct TaskProgressQuery {
 // ─── Response types ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-pub(super) struct TaskListResponse {
-    pub tasks: Vec<astra_services::TaskListItem>,
+pub(super) struct JobListResponse {
+    pub jobs: Vec<astra_services::TaskListItem>,
     pub total: usize,
 }
 
@@ -41,24 +41,24 @@ pub(super) struct PlanProgressEventResponse {
 }
 
 #[derive(Serialize)]
-pub(super) struct TaskProgressResponse {
-    pub task: astra_services::TaskRecord,
+pub(super) struct JobProgressResponse {
+    pub job: astra_services::TaskRecord,
     pub progress_events: Vec<PlanProgressEventResponse>,
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-/// `GET /tasks` — list tasks for the authenticated user.
-pub(super) async fn list_tasks_handler(
+/// `GET /agent-jobs` — list background jobs for the authenticated user.
+pub(super) async fn list_jobs_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<TaskListQuery>,
-) -> Result<Json<TaskListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Query(query): Query<JobListQuery>,
+) -> Result<Json<JobListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
     let status_filter = parse_task_status_filter("status", query.status.as_deref())?;
 
-    let tasks = if let Some(session_id) = query.session_id.as_deref() {
+    let jobs = if let Some(session_id) = query.session_id.as_deref() {
         state
             .execution
             .task_service
@@ -74,12 +74,12 @@ pub(super) async fn list_tasks_handler(
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
     };
 
-    let total = tasks.len();
-    Ok(Json(TaskListResponse { tasks, total }))
+    let total = jobs.len();
+    Ok(Json(JobListResponse { jobs, total }))
 }
 
-/// `GET /tasks/{task_id}` — get a single task with its plan.
-pub(super) async fn get_task_handler(
+/// `GET /agent-jobs/{task_id}` — get a single background job with its plan.
+pub(super) async fn get_job_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
@@ -92,23 +92,23 @@ pub(super) async fn get_task_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
 
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     Ok(Json(task))
 }
 
-/// `GET /tasks/{task_id}/progress` — get task + plan progress events from
+/// `GET /agent-jobs/{task_id}/progress` — get job + plan progress events from
 /// the session journal.
-pub(super) async fn task_progress_handler(
+pub(super) async fn job_progress_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
-    Query(query): Query<TaskProgressQuery>,
-) -> Result<Json<TaskProgressResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Query(query): Query<JobProgressQuery>,
+) -> Result<Json<JobProgressResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
     let task = state
@@ -117,10 +117,10 @@ pub(super) async fn task_progress_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
 
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     // Read plan-progress events from the session journal.
@@ -135,17 +135,17 @@ pub(super) async fn task_progress_handler(
         extract_plan_progress_events(&session_id)
     };
 
-    Ok(Json(TaskProgressResponse {
-        task,
+    Ok(Json(JobProgressResponse {
+        job: task,
         progress_events,
     }))
 }
 
-/// `POST /tasks` — create a new task.
-pub(super) async fn create_task_handler(
+/// `POST /agent-jobs` — create a new background job.
+pub(super) async fn create_job_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<CreateTaskRequest>,
+    Json(payload): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<astra_services::TaskRecord>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
@@ -175,15 +175,15 @@ pub(super) async fn create_task_handler(
         .ok_or_else(|| {
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "task created but not found",
+                "job created but not found",
             )
         })?;
 
     Ok((StatusCode::CREATED, Json(task)))
 }
 
-/// `PUT /tasks/{task_id}/status` — update a task's status.
-pub(super) async fn update_task_status_handler(
+/// `PUT /agent-jobs/{task_id}/status` — update a job's status.
+pub(super) async fn update_job_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
@@ -197,9 +197,9 @@ pub(super) async fn update_task_status_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     let status =
@@ -217,7 +217,7 @@ pub(super) async fn update_task_status_handler(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-// ─── Phase 3 task leases ─────────────────────────────────────────────────────
+// ─── Phase 3 job leases ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,8 +235,8 @@ fn edge_id_header(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// `GET /tasks/{task_id}/lease`
-pub(super) async fn get_task_lease_handler(
+/// `GET /agent-jobs/{task_id}/lease`
+pub(super) async fn get_job_lease_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
@@ -248,9 +248,9 @@ pub(super) async fn get_task_lease_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     let view = state
@@ -265,8 +265,8 @@ pub(super) async fn get_task_lease_handler(
     }))
 }
 
-/// `POST /tasks/{task_id}/lease/claim`
-pub(super) async fn post_task_lease_claim_handler(
+/// `POST /agent-jobs/{task_id}/lease/claim`
+pub(super) async fn post_job_lease_claim_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
@@ -285,9 +285,9 @@ pub(super) async fn post_task_lease_claim_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     let edge_id = edge_id_header(&headers);
@@ -303,8 +303,8 @@ pub(super) async fn post_task_lease_claim_handler(
     ))
 }
 
-/// `POST /tasks/lease/claim-next`
-pub(super) async fn post_task_lease_claim_next_handler(
+/// `POST /agent-jobs/lease/claim-next`
+pub(super) async fn post_job_lease_claim_next_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<LeaseClaimRequest>,
@@ -330,8 +330,8 @@ pub(super) async fn post_task_lease_claim_next_handler(
     ))
 }
 
-/// `POST /tasks/{task_id}/lease/release`
-pub(super) async fn post_task_lease_release_handler(
+/// `POST /agent-jobs/{task_id}/lease/release`
+pub(super) async fn post_job_lease_release_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
@@ -350,9 +350,9 @@ pub(super) async fn post_task_lease_release_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     let released = state
@@ -364,8 +364,8 @@ pub(super) async fn post_task_lease_release_handler(
     Ok(Json(serde_json::json!({ "released": released })))
 }
 
-/// `POST /tasks/{task_id}/lease/renew`
-pub(super) async fn post_task_lease_renew_handler(
+/// `POST /agent-jobs/{task_id}/lease/renew`
+pub(super) async fn post_job_lease_renew_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
@@ -384,9 +384,9 @@ pub(super) async fn post_task_lease_renew_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
     if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+        return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
     }
 
     let edge_id = edge_id_header(&headers);
@@ -407,7 +407,7 @@ pub(super) async fn post_task_lease_renew_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CreateTaskRequest {
+pub(super) struct CreateJobRequest {
     pub title: String,
     pub description: Option<String>,
     pub session_id: Option<String>,
@@ -676,27 +676,27 @@ fn extract_plan_progress_events(session_id: &str) -> Vec<PlanProgressEventRespon
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TaskRpcRequest {
+pub(super) struct JobRpcRequest {
     pub method: String,
     #[serde(default)]
     pub args: serde_json::Value,
 }
 
 #[derive(Serialize)]
-pub(super) struct TaskRpcResponse {
+pub(super) struct JobRpcResponse {
     pub result: serde_json::Value,
 }
 
-/// `POST /tasks:rpc` — proxy entry point for `TaskService` trait
+/// `POST /agent-jobs:rpc` — proxy entry point for `TaskService` trait
 /// methods. CLI's `HttpTaskService` impl posts here; server-side
 /// `state.execution.task_service` (MatrixOneTaskService in production) does
 /// the work. Every method scopes to the authenticated user; methods
 /// that take a `task_id` verify ownership before mutating.
-pub(super) async fn task_rpc_handler(
+pub(super) async fn job_rpc_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<TaskRpcRequest>,
-) -> Result<Json<TaskRpcResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Json(req): Json<JobRpcRequest>,
+) -> Result<Json<JobRpcResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let method = validate_task_rpc_method(req.method.as_str())?;
 
@@ -717,9 +717,9 @@ pub(super) async fn task_rpc_handler(
             .get_task(&task_id)
             .await
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job not found"))?;
         if task.user_id != user_id {
-            return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+            return Err(error_response(StatusCode::NOT_FOUND, "job not found"));
         }
         Ok(task_id)
     }
@@ -991,7 +991,7 @@ pub(super) async fn task_rpc_handler(
         }
     };
 
-    Ok(Json(TaskRpcResponse { result }))
+    Ok(Json(JobRpcResponse { result }))
 }
 
 #[cfg(test)]
@@ -1019,30 +1019,30 @@ mod tests {
     }
 
     #[test]
-    fn task_rest_requests_reject_unknown_fields() {
-        let list_query = serde_json::from_value::<TaskListQuery>(serde_json::json!({
+    fn job_rest_requests_reject_unknown_fields() {
+        let list_query = serde_json::from_value::<JobListQuery>(serde_json::json!({
             "stats": "completed"
         }));
         assert!(
             list_query.is_err(),
-            "GET /tasks should reject unknown query fields instead of defaulting the status filter"
+            "GET /agent-jobs should reject unknown query fields instead of defaulting the status filter"
         );
 
-        let progress_query = serde_json::from_value::<TaskProgressQuery>(serde_json::json!({
+        let progress_query = serde_json::from_value::<JobProgressQuery>(serde_json::json!({
             "session": "s1"
         }));
         assert!(
             progress_query.is_err(),
-            "GET /tasks/:id/progress should reject unknown query fields"
+            "GET /agent-jobs/:id/progress should reject unknown query fields"
         );
 
-        let create = serde_json::from_value::<CreateTaskRequest>(serde_json::json!({
-            "title": "new task",
+        let create = serde_json::from_value::<CreateJobRequest>(serde_json::json!({
+            "title": "new job",
             "titel": "typo"
         }));
         assert!(
             create.is_err(),
-            "POST /tasks should reject typo fields instead of silently dropping them"
+            "POST /agent-jobs should reject typo fields instead of silently dropping them"
         );
 
         let status = serde_json::from_value::<UpdateStatusRequest>(serde_json::json!({
@@ -1051,7 +1051,7 @@ mod tests {
         }));
         assert!(
             status.is_err(),
-            "PUT /tasks/:id/status should reject unknown fields"
+            "PUT /agent-jobs/:id/status should reject unknown fields"
         );
     }
 
@@ -1067,14 +1067,14 @@ mod tests {
             "lease requests should reject typo fields instead of using defaults"
         );
 
-        let rpc = serde_json::from_value::<TaskRpcRequest>(serde_json::json!({
+        let rpc = serde_json::from_value::<JobRpcRequest>(serde_json::json!({
             "method": "list_recent_tasks",
             "args": {},
             "status_filter": "completed"
         }));
         assert!(
             rpc.is_err(),
-            "tasks:rpc should reject top-level fields outside method/args"
+            "agent-jobs:rpc should reject top-level fields outside method/args"
         );
     }
 

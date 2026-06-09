@@ -15,7 +15,7 @@ use super::harness::{
     E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role, post_empty, post_json,
     put_json, revoke_astra_admin_role,
 };
-use super::journey_tasks_runs;
+use super::journey_jobs_runs;
 use astra_services::ADMIN_CONFIG_KEY_REASONING_MODEL;
 use astra_services::session_journal::{JournalEventType, read_journal};
 
@@ -1019,7 +1019,7 @@ pub async fn run_saas_approval_respond_deny_path() {
 
 /// Headless run pause/resume happy path (§4.3) — delegates to shared journey.
 pub async fn run_saas_chat_run_pause_resume_positive() {
-    journey_tasks_runs::run_chat_run_pause_resume_http().await;
+    journey_jobs_runs::run_chat_run_pause_resume_http().await;
 }
 
 /// Admin tokens smoke + non-admin forbidden (§5.2).
@@ -1488,9 +1488,9 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     ctx.pool.close().await;
 }
 
-/// Task lease claim → renew → release (§4.2).
+/// Job lease claim → renew → release (§4.2).
 pub async fn run_saas_task_lease_renew_release_positive() {
-    journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
+    journey_jobs_runs::run_jobs_lease_with_db_assertions().await;
 }
 
 /// GET /platform/snapshot (§5.1).

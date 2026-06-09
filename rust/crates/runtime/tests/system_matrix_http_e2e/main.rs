@@ -4,9 +4,9 @@
 //! - **`product_matrix_api_journey_hits_multiple_tables`** — full product journey (sessions → agents →
 //!   events → jobs → `chat/turn` SSE + `agent_events` assertions → logout), including
 //!   `GET /platform/snapshot` after session activity.
-//! - **`e2e_matrix_tasks_lease_and_db_assertions`** — `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`,
+//! - **`e2e_matrix_jobs_lease_and_db_assertions`** — `POST /agent-jobs`, `GET /agent-jobs`, `GET /agent-jobs/{id}`,
 //!   `GET .../progress`, edge register, lease claim / `GET` lease / renew / release, `task_leases` +
-//!   `PUT /tasks/{id}/status` + `agent_tasks`.
+//!   `PUT /agent-jobs/{id}/status` + `agent_tasks`.
 //! - **`e2e_matrix_chat_run_pause_resume_http`** — `POST /chat` (background run), immediate
 //!   pause/resume + `GET /chat/runs/{run_id}` (run state is in-memory + optional engine; no Matrix
 //!   table assertion today).
@@ -124,6 +124,7 @@ mod journey_evaluation_reads_matrix;
 mod journey_extended;
 mod journey_full;
 mod journey_full_capture_matrix;
+mod journey_jobs_runs;
 mod journey_meta_matrix;
 mod journey_remote_skills;
 mod journey_saas_negative_matrix;
@@ -131,7 +132,6 @@ mod journey_saas_platform_matrix;
 mod journey_session_artifacts_matrix;
 mod journey_session_http_db_matrix;
 mod journey_stream_persistence;
-mod journey_tasks_runs;
 mod journey_team_crud_matrix;
 mod journey_team_data_fidelity_matrix;
 mod journey_team_http_negatives_matrix;
@@ -158,16 +158,16 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_tasks_lease_and_db_assertions() {
+async fn e2e_matrix_jobs_lease_and_db_assertions() {
     require_system_e2e_env();
-    journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
+    journey_jobs_runs::run_jobs_lease_with_db_assertions().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn e2e_matrix_chat_run_pause_resume_http() {
     require_system_e2e_env();
-    journey_tasks_runs::run_chat_run_pause_resume_http().await;
+    journey_jobs_runs::run_chat_run_pause_resume_http().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

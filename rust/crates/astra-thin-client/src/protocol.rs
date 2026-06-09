@@ -248,7 +248,7 @@ pub struct EdgeHeartbeatRequest {
     pub last_seen_request_ids: Vec<String>,
 }
 
-/// `POST /tasks/{id}/lease/{claim,release,renew}` — matches server lease handlers.
+/// `POST /agent-jobs/{id}/lease/{claim,release,renew}` — matches server lease handlers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TaskLeaseMutationRequest {
     pub edge_agent_id: String,
