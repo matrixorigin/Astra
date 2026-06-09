@@ -9,7 +9,8 @@
 //! Endpoints:
 //! - `POST /sessions/{session_id}/todos:execute` — run a TaskManager
 //!   action (create/update/list/get/stop/archive) and return its string
-//!   output.
+//!   output. Internal action `fork_copy` copies a parent task board
+//!   into a newly forked child session.
 //! - `GET /sessions/{session_id}/todos` — load the full task list.
 //!
 //! User isolation: every request resolves the user via the auth header
@@ -27,6 +28,8 @@ use std::sync::Arc;
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteTodoRequest {
     /// `task` tool action: `create | update | list | get | stop | archive`.
+    /// Internal callers may also use `fork_copy`; it is not advertised
+    /// in the model-facing task schema.
     pub action: String,
     /// Action arguments — same shape the LLM emits to the `task` tool.
     /// Unknown fields are rejected by action-specific validation.
@@ -409,12 +412,116 @@ pub(crate) async fn execute_todo_handler(
         "stop" => manager.stop(&req.args).await,
         "adopt" => adopt_task_into_session(&state, &user.user_id, &session_id, &req.args).await,
         "archive" => manager.archive(&req.args).await,
+        "fork_copy" => {
+            copy_task_board_into_fork(&state, &user.user_id, &session_id, &req.args).await
+        }
         other => format!(
             "Error: unknown todo action '{other}'. Valid: create, update, list, get, stop, adopt, archive"
         ),
     };
 
     Ok(Json(ExecuteTodoResponse { output }))
+}
+
+fn required_fork_copy_source_session(args: &serde_json::Value) -> Result<String, String> {
+    let Some(obj) = args.as_object() else {
+        return Err("task fork_copy arguments must be an object".to_string());
+    };
+    for key in obj.keys() {
+        if !["action", "source_session_id"].contains(&key.as_str()) {
+            return Err(format!(
+                "unknown field '{key}' for task fork_copy (valid: action, source_session_id)"
+            ));
+        }
+    }
+    let Some(raw) = obj.get("source_session_id") else {
+        return Err("'source_session_id' is required for task fork_copy".to_string());
+    };
+    let Some(value) = raw.as_str() else {
+        return Err("'source_session_id' must be a string for task fork_copy".to_string());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "'source_session_id' must be a non-empty string for task fork_copy".to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Internal fork support: copy the source session task board into an
+/// empty forked child without migrating the source. This is intentionally
+/// distinct from `adopt`, which is a user-facing cross-session move.
+async fn copy_task_board_into_fork(
+    state: &AppState,
+    user_id: &str,
+    target_session: &str,
+    args: &serde_json::Value,
+) -> String {
+    let source_session = match required_fork_copy_source_session(args) {
+        Ok(source_session) => source_session,
+        Err(error) => return format!("Error: {error}"),
+    };
+    if source_session == target_session {
+        return "Error: source_session_id matches the fork target session".to_string();
+    }
+    if let Err((status, body)) = verify_session_owner(state, user_id, &source_session).await {
+        return format!(
+            "Error: source session ownership check failed for task fork_copy: {} {}",
+            status, body.detail
+        );
+    }
+
+    let source_manager = match build_task_manager(state, &source_session, user_id) {
+        Some(manager) => manager,
+        None => return "Error: session_todos store not configured on this server".to_string(),
+    };
+    let target_manager = match build_task_manager(state, target_session, user_id) {
+        Some(manager) => manager,
+        None => return "Error: session_todos store not configured on this server".to_string(),
+    };
+
+    let target_tasks = match target_manager.load_tasks().await {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            return format!("Error: load fork target task board {target_session}: {error}");
+        }
+    };
+    if !target_tasks.is_empty() {
+        return format!(
+            "Fork task board preserved: target already has {} task(s)\n{}",
+            target_tasks.len(),
+            serde_json::json!({
+                "success": true,
+                "status": "preserved_existing_child",
+                "source_session_id": source_session,
+                "target_session_id": target_session,
+                "count": target_tasks.len(),
+            })
+        );
+    }
+
+    let snapshot = match source_manager.try_snapshot_state().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return format!("Error: load fork source task board {source_session}: {error}");
+        }
+    };
+    let copied = snapshot.tasks.len();
+    if let Err(error) = target_manager.restore_snapshot(&snapshot).await {
+        return format!("Error: copy fork task board into {target_session}: {error}");
+    }
+
+    format!(
+        "Fork task board copied: {copied} task(s)\n{}",
+        serde_json::json!({
+            "success": true,
+            "status": "copied",
+            "source_session_id": source_session,
+            "target_session_id": target_session,
+            "count": copied,
+        })
+    )
 }
 
 /// `adopt`: copy a task from another of the user's sessions into the
@@ -841,6 +948,37 @@ mod tests {
         assert!(
             typo.is_err(),
             "unknown /users/me/todos query parameters should not be ignored"
+        );
+    }
+
+    #[test]
+    fn fork_copy_required_source_session_rejects_bad_shapes() {
+        for (args, expected) in [
+            (serde_json::json!(null), "arguments must be an object"),
+            (serde_json::json!({}), "source_session_id"),
+            (
+                serde_json::json!({"source_session_id": true}),
+                "must be a string",
+            ),
+            (serde_json::json!({"source_session_id": "   "}), "non-empty"),
+            (
+                serde_json::json!({"source_session_id": "s1", "task_id": "task-1"}),
+                "unknown field 'task_id'",
+            ),
+        ] {
+            let err = required_fork_copy_source_session(&args)
+                .expect_err("bad fork_copy args should be rejected");
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in error for {args}: {err}"
+            );
+        }
+        assert_eq!(
+            required_fork_copy_source_session(&serde_json::json!({
+                "source_session_id": "  parent-session  ",
+            }))
+            .expect("valid fork_copy source"),
+            "parent-session"
         );
     }
 
@@ -1307,6 +1445,95 @@ mod tests {
         .await
         .expect("source status");
         assert_eq!(status, "pending", "source must remain adoptable");
+
+        cleanup_session_rows(&pool, &source_session).await;
+        cleanup_session_rows(&pool, &target_session).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
+    async fn fork_copy_clones_parent_task_board_without_migrating_source_in_matrixone() {
+        let shared = bootstrap_shared_pool().await;
+        let pool = shared.get().clone();
+        let user_id = format!("u-fork-copy-{}", uuid::Uuid::new_v4());
+        let source_session = format!("s-fork-copy-source-{}", uuid::Uuid::new_v4());
+        let target_session = format!("s-fork-copy-target-{}", uuid::Uuid::new_v4());
+        cleanup_session_rows(&pool, &source_session).await;
+        cleanup_session_rows(&pool, &target_session).await;
+
+        let source_store: Arc<dyn TaskStore> =
+            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+        let source = TaskManager::new(source_session.clone(), source_store);
+        let source_create = source
+            .create(&serde_json::json!({
+                "title": "Carry forked work",
+                "subtasks": [{ "id": "step-1", "title": "Do first step" }]
+            }))
+            .await;
+        assert!(
+            source_create.contains("\"success\":true"),
+            "{source_create}"
+        );
+        let source_start = source
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(source_start.contains("\"success\":true"), "{source_start}");
+
+        let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
+            .with_shared_pool(shared.clone())
+            .with_session_service(Arc::new(TestSessionService));
+        let out = copy_task_board_into_fork(
+            &state,
+            &user_id,
+            &target_session,
+            &serde_json::json!({
+                "source_session_id": source_session,
+            }),
+        )
+        .await;
+        assert!(
+            out.contains("\"success\":true") && out.contains("\"status\":\"copied\""),
+            "fork_copy should report copied: {out}"
+        );
+
+        let source_status: String = sqlx::query_scalar(
+            "SELECT status FROM session_todos WHERE session_id = ? AND todo_id = ? AND user_id = ?",
+        )
+        .bind(&source_session)
+        .bind("task-1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("source status");
+        assert_eq!(
+            source_status, "in_progress",
+            "fork_copy must not migrate or otherwise alter the parent task"
+        );
+
+        let target_status: String = sqlx::query_scalar(
+            "SELECT status FROM session_todos WHERE session_id = ? AND todo_id = ? AND user_id = ?",
+        )
+        .bind(&target_session)
+        .bind("task-1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("target status");
+        assert_eq!(target_status, "in_progress");
+
+        let preserve = copy_task_board_into_fork(
+            &state,
+            &user_id,
+            &target_session,
+            &serde_json::json!({
+                "source_session_id": source_session,
+            }),
+        )
+        .await;
+        assert!(
+            preserve.contains("\"status\":\"preserved_existing_child\""),
+            "second fork_copy must preserve existing child board: {preserve}"
+        );
 
         cleanup_session_rows(&pool, &source_session).await;
         cleanup_session_rows(&pool, &target_session).await;

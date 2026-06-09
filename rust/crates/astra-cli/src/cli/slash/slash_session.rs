@@ -1226,11 +1226,21 @@ pub(crate) async fn handle_session_command(
                     };
 
                     let mut fork_guard = ForkStateGuard::new(state);
+                    let cloud_task_board_copy =
+                        fork_guard
+                            .state()
+                            .task_notify_tx
+                            .as_ref()
+                            .map(|_| CloudTaskBoardCopy {
+                                cloud_base: api.api_origin(),
+                                token: session_runtime::current_access_token(profile),
+                            });
                     let task_board_restore = match apply_prepared_fork_restore(
                         fork_guard.state(),
                         &parent_id,
                         &new_sid,
                         restored_child,
+                        cloud_task_board_copy,
                     )
                     .await
                     {
@@ -1273,13 +1283,7 @@ pub(crate) async fn handle_session_command(
                         "REPL context is now the forked session (same history; new cloud lineage)."
                             .dim()
                     );
-                    if task_board_restore == ForkTaskBoardRestore::SkippedCloudObserver {
-                        eprintln!(
-                            "  {}",
-                            "Session task board was not copied into the fork; use task(action='list_user') and task(action='adopt', source_session_id=..., task_id=...) to bring open work into this child session."
-                                .yellow()
-                        );
-                    } else if task_board_restore == ForkTaskBoardRestore::PreservedExistingChild {
+                    if task_board_restore == ForkTaskBoardRestore::PreservedExistingChild {
                         eprintln!(
                             "  {}",
                             "Forked child already has a task board; preserved child tasks and skipped copying the parent board."
@@ -5056,10 +5060,15 @@ struct PreparedForkRestore {
     last_turn_event: Option<session_journal::JournalEvent>,
 }
 
+#[derive(Debug, Clone)]
+struct CloudTaskBoardCopy {
+    cloud_base: String,
+    token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForkTaskBoardRestore {
     Copied,
-    SkippedCloudObserver,
     PreservedExistingChild,
 }
 
@@ -5279,6 +5288,7 @@ async fn apply_prepared_fork_restore(
     parent_id: &str,
     new_sid: &str,
     restored_child: PreparedForkRestore,
+    cloud_task_board_copy: Option<CloudTaskBoardCopy>,
 ) -> Result<ForkTaskBoardRestore, String> {
     let task_restore_plan = if state.task_notify_tx.is_none() {
         let store = state.task_manager.store();
@@ -5312,11 +5322,42 @@ async fn apply_prepared_fork_restore(
             None
         }
     } else {
-        // Session task-board inheritance belongs behind the server write surface;
-        // the CLI's HttpTaskStore is a read-only observer.
         None
     };
     let preserved_existing_child = state.task_notify_tx.is_none() && task_restore_plan.is_none();
+    let cloud_task_board_restore = if state.task_notify_tx.is_some() {
+        let copy = cloud_task_board_copy.ok_or_else(|| {
+            "cloud task board fork copy is unavailable: missing cloud endpoint configuration"
+                .to_string()
+        })?;
+        let output = crate::cli::session::session_todo_client::copy_todos_for_fork(
+            &copy.cloud_base,
+            copy.token.as_deref(),
+            parent_id,
+            new_sid,
+        )
+        .await?;
+        let status = output
+            .find('{')
+            .and_then(|pos| serde_json::from_str::<serde_json::Value>(&output[pos..]).ok())
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        match status.as_deref() {
+            Some("copied") => Some(ForkTaskBoardRestore::Copied),
+            Some("preserved_existing_child") => Some(ForkTaskBoardRestore::PreservedExistingChild),
+            _ => {
+                return Err(format!(
+                    "cloud task board fork copy returned an invalid response: {output}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     state.set_session_id(new_sid.to_string());
     session_startup::initialize_journal_pub(state, new_sid);
@@ -5337,10 +5378,12 @@ async fn apply_prepared_fork_restore(
     let task_board_restore = if let Some(task_snapshot) = task_restore_plan {
         state.task_manager.restore_snapshot(&task_snapshot).await?;
         ForkTaskBoardRestore::Copied
+    } else if let Some(task_board_restore) = cloud_task_board_restore {
+        task_board_restore
     } else if preserved_existing_child {
         ForkTaskBoardRestore::PreservedExistingChild
     } else {
-        ForkTaskBoardRestore::SkippedCloudObserver
+        ForkTaskBoardRestore::Copied
     };
     Ok(task_board_restore)
 }
@@ -8093,6 +8136,7 @@ mod resume_tests {
                 "parent-session",
                 "child-session",
                 restored_child,
+                None,
             )
             .await
             .unwrap();
@@ -8175,6 +8219,7 @@ mod resume_tests {
             "parent-session",
             "child-session",
             restored_child,
+            None,
         )
         .await
         .unwrap();
@@ -8226,6 +8271,7 @@ mod resume_tests {
             "parent-session",
             "child-session",
             restored_child,
+            None,
         )
         .await
         .unwrap();
@@ -8276,6 +8322,7 @@ mod resume_tests {
             "parent-session",
             "child-session",
             restored_child,
+            None,
         )
         .await
         .unwrap();
@@ -8336,6 +8383,7 @@ mod resume_tests {
             "parent-session",
             "child-session",
             restored_child,
+            None,
         )
         .await
         .unwrap();
@@ -8388,6 +8436,7 @@ mod resume_tests {
             "parent-session",
             "child-session",
             restored_child,
+            None,
         )
         .await
         .expect_err("task load failure should abort fork restore");
@@ -8405,9 +8454,10 @@ mod resume_tests {
     }
 
     #[tokio::test]
-    async fn apply_prepared_fork_restore_skips_task_copy_for_cloud_observer_store() {
+    async fn apply_prepared_fork_restore_requires_cloud_copy_client_for_cloud_task_board() {
         let mut state = SessionState::default();
         state.set_session_id("parent-session");
+        state.turn = 7;
         let (notify_tx, _) = tokio::sync::broadcast::channel(1);
         state.task_notify_tx = Some(notify_tx);
         let created = state
@@ -8433,23 +8483,20 @@ mod resume_tests {
             last_turn_event: None,
         };
 
-        let outcome = apply_prepared_fork_restore(
+        let error = apply_prepared_fork_restore(
             &mut state,
             "parent-session",
             "child-session",
             restored_child,
+            None,
         )
         .await
-        .expect("cloud observer task store should not be written during fork restore");
-        assert_eq!(outcome, ForkTaskBoardRestore::SkippedCloudObserver);
-
-        let child_list = state
-            .task_manager
-            .list(&serde_json::json!({"status_filter": "all"}))
-            .await;
+        .expect_err("cloud fork must fail closed when copy client is missing");
         assert!(
-            child_list.starts_with("No tasks"),
-            "session task-board inheritance must be handled by the server write surface, not the read-only observer: {child_list}"
+            error.contains("cloud task board fork copy is unavailable"),
+            "{error}"
         );
+        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
+        assert_eq!(state.turn, 7);
     }
 }

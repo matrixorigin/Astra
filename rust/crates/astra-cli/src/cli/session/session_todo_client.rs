@@ -123,6 +123,29 @@ pub async fn execute_todo_action(
     Err("execute_todo_action: retry loop exhausted".to_string())
 }
 
+/// Internal fork support: copy the parent session task board into an
+/// empty child session without migrating the parent tasks. Uses the
+/// same server-side TaskManager/MatrixOne write surface as model-facing
+/// task actions, but `fork_copy` is intentionally not exposed in the
+/// tool schema.
+pub async fn copy_todos_for_fork(
+    cloud_base: &str,
+    token: Option<&str>,
+    source_session_id: &str,
+    target_session_id: &str,
+) -> Result<String, String> {
+    execute_todo_action(
+        cloud_base,
+        token,
+        target_session_id,
+        "fork_copy",
+        &json!({
+            "source_session_id": source_session_id,
+        }),
+    )
+    .await
+}
+
 /// `GET /users/me/todos?status=...` — cross-session active list for
 /// the authenticated user. Returns a JSON-stringified payload
 /// formatted as the model-facing `task` tool's output convention so
@@ -269,7 +292,7 @@ impl TaskStore for HttpTaskStore {
 
 #[cfg(test)]
 mod wiring_e2e {
-    use super::{HttpTaskStore, execute_todo_action, list_user_todos};
+    use super::{HttpTaskStore, copy_todos_for_fork, execute_todo_action, list_user_todos};
     use crate::lock_recovery::LockRecovery;
     use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
     use astra_tools::task_mgmt::{SessionTask, TaskStore};
@@ -444,6 +467,28 @@ mod wiring_e2e {
             output.starts_with("Cross-session todos: 2 completed item(s)"),
             "summary should name the requested status, not always active: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn copy_todos_for_fork_posts_internal_action_to_child_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/child-session/todos:execute"))
+            .respond_with(|req: &Request| {
+                let body: Value = serde_json::from_slice(&req.body).expect("json body");
+                assert_eq!(body["action"], "fork_copy", "{body}");
+                assert_eq!(body["args"]["source_session_id"], "parent-session", "{body}");
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "output": "Fork task board copied: 1 task(s)\n{\"success\":true,\"status\":\"copied\",\"count\":1}"
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let output = copy_todos_for_fork(&server.uri(), None, "parent-session", "child-session")
+            .await
+            .expect("mock fork copy");
+        assert!(output.contains("\"status\":\"copied\""), "{output}");
     }
 
     #[tokio::test]
