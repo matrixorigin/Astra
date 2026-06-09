@@ -314,6 +314,7 @@ fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> 
         metadata,
         blocks,
         blocked_by,
+        archived_at: None, // populated on load from column below
     })
 }
 
@@ -991,6 +992,7 @@ mod tests {
             metadata: None,
             blocks: vec![],
             blocked_by: vec![],
+            archived_at: None,
         };
 
         let encoded = encode_task_json_fields(&task);
@@ -1025,6 +1027,7 @@ mod tests {
             )])),
             blocks: vec!["task-3".into()],
             blocked_by: vec!["task-0".into()],
+            archived_at: None,
         };
 
         let encoded = encode_task_json_fields(&task);

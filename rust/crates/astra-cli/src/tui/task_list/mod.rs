@@ -1070,6 +1070,7 @@ mod tests {
 
     fn mk_task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {
+            archived_at: None,
             id: id.into(),
             title: title.into(),
             description: None,

@@ -531,13 +531,6 @@ pub(crate) enum JobSubcommand {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct JobTextArgs {
-    /// Job text or prompt
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub text: Vec<String>,
-}
-
-#[derive(Args, Debug)]
 pub(crate) struct JobRunArgs {
     /// Output job result and metadata as JSON
     #[arg(long, default_value_t = false)]

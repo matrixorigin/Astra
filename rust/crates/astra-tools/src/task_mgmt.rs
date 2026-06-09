@@ -22,7 +22,7 @@
 // #![allow(dead_code)] -- removed; narrow with per-item attrs if needed
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 pub const MAX_CREATE_SUBTASKS: usize = 20;
@@ -39,6 +39,7 @@ pub const MAX_SUBTASK_DESCRIPTION_CHARS: usize = 10_000;
 
 /// A durable checklist task tracked within the current CLI session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionTask {
     pub id: String,
     pub title: String,
@@ -62,6 +63,12 @@ pub struct SessionTask {
     /// Task IDs that must complete before this task can start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+
+    /// Timestamp when the task was archived. Set when transitioning to
+    /// Archived status; stays None otherwise. Preserved across InMemory →
+    /// MatrixOne migration so the GC sweeper can expire old archived tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
 }
 
 pub fn detach_dependency_edges_for_task_ids(
@@ -129,15 +136,66 @@ fn add_dependency_edge(
         return Err(format!("task '{}' not found", blocked_id));
     };
 
-    let blocker_changed = push_unique_string(&mut tasks[blocker_index].blocks, blocked_id);
-    let blocked_changed = push_unique_string(&mut tasks[blocked_index].blocked_by, blocker_id);
-    if blocker_changed {
-        tasks[blocker_index].updated_at = now.to_string();
+    // Idempotent: already exists, skip
+    if tasks[blocker_index]
+        .blocks
+        .iter()
+        .any(|id| id == blocked_id)
+    {
+        return Ok(());
     }
-    if blocked_changed {
-        tasks[blocked_index].updated_at = now.to_string();
+
+    // Cycle detection: adding blocker_id → blocked_id must not create a path
+    // from blocked_id back to blocker_id.
+    if would_create_cycle(tasks, blocker_id, blocked_id) {
+        return Err(format!(
+            "adding dependency '{}' → '{}' would create a cycle. Review the dependency graph",
+            blocker_id, blocked_id
+        ));
     }
+
+    push_unique_string(&mut tasks[blocker_index].blocks, blocked_id);
+    push_unique_string(&mut tasks[blocked_index].blocked_by, blocker_id);
+    tasks[blocker_index].updated_at = now.to_string();
+    tasks[blocked_index].updated_at = now.to_string();
     Ok(())
+}
+
+/// BFS check: does a path already exist from `from_id` to `to_id`?
+/// If so, adding `to_id → from_id` would create a cycle.
+fn would_create_cycle(tasks: &[SessionTask], from_id: &str, to_id: &str) -> bool {
+    let id_to_index: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| (task.id.as_str(), i))
+        .collect();
+
+    let Some(&to_idx) = id_to_index.get(to_id) else {
+        return false;
+    };
+
+    // BFS from to_id: can we reach from_id through existing blocks edges?
+    let mut visited = vec![false; tasks.len()];
+    let mut queue = VecDeque::new();
+    queue.push_back(to_idx);
+    visited[to_idx] = true;
+
+    while let Some(u) = queue.pop_front() {
+        // Follow blocks edges: u blocks → these are reachable from u
+        for blocked_id in &tasks[u].blocks {
+            if blocked_id == from_id {
+                return true; // Path from to_id reaches from_id → cycle
+            }
+            if let Some(&v) = id_to_index.get(blocked_id.as_str())
+                && !visited[v]
+            {
+                visited[v] = true;
+                queue.push_back(v);
+            }
+        }
+    }
+
+    false
 }
 
 fn remove_dependency_edge(
@@ -307,6 +365,7 @@ fn validate_subtask_dependencies_resolved(
 
 /// A subtask within a SessionTask.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSubtask {
     pub id: String,
     pub title: String,
@@ -648,6 +707,7 @@ pub trait TaskStore: Send + Sync {
 
                     tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
                     tasks[task_index].updated_at = now_rfc3339.clone();
+                    tasks[task_index].archived_at = Some(now_rfc3339.clone());
                     let archived_ids = HashSet::from([task_id.clone()]);
                     detach_task_dependency_edges(&mut tasks, &archived_ids);
                     return Ok(TaskMutationResult {
@@ -669,7 +729,7 @@ pub trait TaskStore: Send + Sync {
 
                 let mut archived_ids: HashSet<String> = HashSet::new();
                 for task in &mut tasks {
-                    if !task.status.is_completed() {
+                    if !task.status.can_be_archived() {
                         continue;
                     }
                     let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
@@ -683,6 +743,7 @@ pub trait TaskStore: Send + Sync {
                     if updated_at < cutoff {
                         task.status = SessionTaskStatusKind::Archived;
                         task.updated_at = now_rfc3339.clone();
+                        task.archived_at = Some(now_rfc3339.clone());
                         archived_ids.insert(task.id.clone());
                     }
                 }
@@ -693,7 +754,7 @@ pub trait TaskStore: Send + Sync {
                     next_task_id: None,
                     response: prefix_summary(
                         format!(
-                            "Archived {archived} completed task(s) older than {days} days in session {session_label}"
+                            "Archived {archived} terminal task(s) older than {days} days in session {session_label}"
                         ),
                         json!({
                             "success": true,
@@ -702,7 +763,7 @@ pub trait TaskStore: Send + Sync {
                             "scope": "session",
                             "session_id": session_label,
                             "message": format!(
-                                "Archived {} completed task(s) older than {} days in session '{}'",
+                                "Archived {} terminal task(s) older than {} days in session '{}'",
                                 archived, days, session_label
                             ),
                         })
@@ -891,7 +952,25 @@ impl TaskStore for InMemoryTaskStore {
             let next = if entry.next_id == 0 { 1 } else { entry.next_id };
             let next = u32::try_from(next)
                 .map_err(|_| format!("task id counter exhausted for session {session_id}"))?;
-            let result = mutation(entry.tasks.clone(), next)?;
+            // catch_unwind: a panicking mutation closure must not poison
+            // the global session map Mutex, which would kill all concurrent
+            // sessions' task boards.
+            let cloned_tasks = entry.tasks.clone();
+            drop(sessions); // release lock before calling user code
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mutation(cloned_tasks, next)
+            }))
+            .map_err(|_| {
+                format!(
+                    "task mutation closure panicked for session {session_id}; \
+                     task board unchanged"
+                )
+            })??;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "task store: session map poisoned after re-acquire".to_string())?;
+            let entry = sessions.entry(session_id.to_string()).or_default();
             entry.tasks = result.tasks;
             if let Some(next_task_id) = result.next_task_id {
                 entry.next_id = u64::from(next_task_id);
@@ -1355,7 +1434,79 @@ fn parse_create_subtasks(
         }
     }
 
+    // Cycle detection: subtask depends_on edges must not form a cycle.
+    // Uses DFS with three-color marking (Kahn's algorithm overkill for ≤20 nodes).
+    detect_subtask_dependency_cycles(&subtasks)?;
+
     Ok(subtasks)
+}
+
+/// DFS-based cycle detection for subtask `depends_on` edges.
+/// WHITE = unvisited, GRAY = in current recursion path, BLACK = fully explored.
+fn detect_subtask_dependency_cycles(subtasks: &[SessionSubtask]) -> Result<(), String> {
+    let n = subtasks.len();
+    if n <= 1 {
+        return Ok(());
+    }
+
+    // Build adjacency list: maps subtask index → dependent subtask indices.
+    let id_to_index: HashMap<&str, usize> = subtasks
+        .iter()
+        .enumerate()
+        .map(|(i, st)| (st.id.as_str(), i))
+        .collect();
+
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, st) in subtasks.iter().enumerate() {
+        for dep_id in &st.depends_on {
+            if let Some(&j) = id_to_index.get(dep_id.as_str()) {
+                adj[j].push(i); // j → i means "j must complete before i can start"
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    use Color::*;
+
+    let mut color = vec![White; n];
+
+    fn dfs(
+        u: usize,
+        adj: &[Vec<usize>],
+        color: &mut [Color],
+        subtasks: &[SessionSubtask],
+    ) -> Result<(), String> {
+        color[u] = Gray;
+        for &v in &adj[u] {
+            match color[v] {
+                Gray => {
+                    return Err(format!(
+                        "subtask dependency cycle detected: '{}' and '{}' form a circular dependency",
+                        subtasks[u].id, subtasks[v].id
+                    ));
+                }
+                White => {
+                    dfs(v, adj, color, subtasks)?;
+                }
+                Black => {}
+            }
+        }
+        color[u] = Black;
+        Ok(())
+    }
+
+    for u in 0..n {
+        if color[u] == White {
+            dfs(u, &adj, &mut color, subtasks)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn required_non_empty_string_field(args: &Value, field: &str) -> Result<String, String> {
@@ -1539,11 +1690,13 @@ impl TaskManager {
     }
 
     /// Session id this manager currently points at.
+    /// Panics only if the session-id mutex is poisoned (a thread panicked
+    /// while holding it), which indicates a bug elsewhere.
     pub fn session_id(&self) -> String {
         self.session_id
             .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Handle to the underlying store. Exposed so callers outside
@@ -1555,23 +1708,40 @@ impl TaskManager {
 
     /// Rebind the session id. Also swaps the store if a new one is supplied
     /// (for the offline → MO upgrade path).
+    /// Panics only if the session-id mutex is poisoned (a thread panicked
+    /// while holding it), which indicates a bug elsewhere.
     pub fn rebind(&self, session_id: impl Into<String>) {
-        if let Ok(mut guard) = self.session_id.lock() {
-            *guard = session_id.into();
-        }
+        let mut guard = self.session_id.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = session_id.into();
     }
 
     fn sid(&self) -> String {
         self.session_id
             .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get a snapshot of all tasks (for brief/diagnostics). This is async
     /// because the store may be remote (MatrixOne).
+    ///
+    /// Best-effort: logs an error and returns empty on storage failure
+    /// rather than propagating. Callers that need error awareness should
+    /// use [`TaskManager::load_tasks`] instead.
     pub async fn snapshot(&self) -> Vec<SessionTask> {
-        self.store.load(&self.sid()).await.unwrap_or_default()
+        let sid = self.sid();
+        match self.store.load(&sid).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::error!(
+                    session_id = %sid,
+                    error = %e,
+                    "task snapshot load failed — returning empty; \
+                     callers that need error awareness should use load_tasks()"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Load all tasks and surface backend errors to callers that must not
@@ -1795,6 +1965,7 @@ impl TaskManager {
                         metadata,
                         blocks: Vec::new(),
                         blocked_by: Vec::new(),
+                        archived_at: None,
                     };
                     tasks.push(task);
                     let response = prefix_summary(
@@ -2494,6 +2665,78 @@ impl TaskManager {
         }
     }
 
+    /// Sync an approved-plan mirror task to a terminal status.
+    ///
+    /// Approved-plan tasks mirror the plan state machine. They can move from
+    /// pending directly to a terminal state without weakening user task rules.
+    pub async fn sync_approved_plan_mirror_terminal_status(
+        &self,
+        task_id: &str,
+        status: SessionTaskStatusKind,
+    ) -> Result<(), String> {
+        if !status.can_be_archived() {
+            return Err(format!(
+                "approved-plan mirror sync only supports terminal statuses, got '{status}'"
+            ));
+        }
+        let task_id = task_id.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        self.store
+            .mutate(
+                &self.sid(),
+                Box::new(move |mut tasks, _next_task_id| {
+                    let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) else {
+                        return Err(format!("task '{}' not found", task_id));
+                    };
+                    let metadata = task
+                        .metadata
+                        .as_ref()
+                        .ok_or_else(|| format!("task '{}' is not an approved-plan mirror", task_id))?;
+                    let source = metadata.get("source").and_then(Value::as_str);
+                    let has_subtask_id = metadata
+                        .get("plan_subtask_id")
+                        .and_then(Value::as_str)
+                        .is_some();
+                    if source != Some("approved_plan") || !has_subtask_id {
+                        return Err(format!("task '{}' is not an approved-plan step mirror", task_id));
+                    }
+                    let previous_status = task.status;
+                    if previous_status == status {
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response: String::new(),
+                        });
+                    }
+                    if matches!(
+                        previous_status,
+                        SessionTaskStatusKind::Completed
+                            | SessionTaskStatusKind::Failed
+                            | SessionTaskStatusKind::Cancelled
+                            | SessionTaskStatusKind::Archived
+                    ) {
+                        return Err(format!(
+                            "task '{}' is already terminal ({previous_status}); refusing to rewrite plan history",
+                            task_id
+                        ));
+                    }
+                    task.status = status;
+                    task.updated_at = now.clone();
+                    if status == SessionTaskStatusKind::Archived {
+                        task.archived_at = Some(now);
+                    }
+                    Ok(TaskMutationResult {
+                        tasks,
+                        next_task_id: None,
+                        response: String::new(),
+                    })
+                }),
+            )
+            .await
+            .map(|_| ())
+    }
+
     /// Stop/cancel a running task.
     pub async fn stop(&self, args: &Value) -> String {
         if let Err(error) = validate_allowed_fields(args, "stop", &["action", "task_id", "reason"])
@@ -2618,6 +2861,24 @@ mod tests {
 
     fn mgr() -> TaskManager {
         TaskManager::in_memory()
+    }
+
+    async fn set_task_status_fixture(
+        manager: &TaskManager,
+        task_id: &str,
+        status: SessionTaskStatusKind,
+    ) {
+        let mut snapshot = manager.snapshot_state().await;
+        let task = snapshot
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .expect("fixture task exists");
+        task.status = status;
+        manager
+            .restore_snapshot(&snapshot)
+            .await
+            .expect("restore fixture task status");
     }
 
     #[test]
@@ -4702,6 +4963,7 @@ mod tests {
                     metadata: None,
                     blocks: vec![],
                     blocked_by: vec![],
+                    archived_at: None,
                 }],
             )
             .await
@@ -4801,6 +5063,7 @@ mod tests {
             metadata: None,
             blocks: vec![],
             blocked_by: vec![],
+            archived_at: None,
         };
         let nonnum = SessionTask {
             id: "not-numeric".into(),
@@ -4834,6 +5097,7 @@ mod tests {
                     metadata: None,
                     blocks: vec![],
                     blocked_by: vec![],
+                    archived_at: None,
                 },
                 SessionTask {
                     id: "task-2".into(),
@@ -4848,6 +5112,7 @@ mod tests {
                     metadata: None,
                     blocks: vec![],
                     blocked_by: vec![],
+                    archived_at: None,
                 },
             ],
             next_task_id: 3,
@@ -4918,6 +5183,7 @@ mod tests {
                     metadata: None,
                     blocks: vec![],
                     blocked_by: vec![],
+                    archived_at: None,
                 }],
             )
             .await
@@ -5305,8 +5571,7 @@ mod tests {
         assert!(refused.contains("Refused"), "{refused}");
         assert!(refused.contains("pending"), "{refused}");
 
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
+        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
         let archived = m.archive(&json!({"task_id": "task-1"})).await;
         let archived_json = archived.split_once('\n').unwrap().1;
         let archived_parsed: Value = serde_json::from_str(archived_json).unwrap();
@@ -5337,8 +5602,7 @@ mod tests {
             .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
             .await;
         assert!(!linked.starts_with("Error:"), "{linked}");
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
+        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
 
         let archived = m.archive(&json!({"task_id": "task-1"})).await;
         assert!(!archived.starts_with("Error:"), "{archived}");
@@ -5362,8 +5626,7 @@ mod tests {
     async fn archive_rejects_bad_parameter_types_before_mutating() {
         let m = mgr();
         m.create(&json!({"title": "done"})).await;
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
+        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
 
         for (field, args) in [
             ("task_id", json!({"task_id": true})),
@@ -5391,8 +5654,7 @@ mod tests {
     async fn archive_rejects_single_task_and_bulk_parameters_together() {
         let m = mgr();
         m.create(&json!({"title": "done"})).await;
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
+        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
 
         let out = m
             .archive(&json!({"task_id": "task-1", "older_than_days": 7}))
@@ -5413,21 +5675,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_bulk_only_moves_old_completed_tasks() {
+    async fn archive_bulk_moves_old_terminal_tasks() {
         let m = mgr();
         m.create(&json!({"title": "old-done"})).await;
         m.create(&json!({"title": "recent-done"})).await;
         m.create(&json!({"title": "still-open"})).await;
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
-        m.update(&json!({"task_id": "task-2", "new_status": "completed"}))
-            .await;
-
+        m.create(&json!({"title": "old-failed"})).await;
+        m.create(&json!({"title": "old-cancelled"})).await;
         let mut snapshot = m.snapshot_state().await;
         let old_ts = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
         for task in &mut snapshot.tasks {
-            if task.id == "task-1" {
+            if matches!(task.id.as_str(), "task-1" | "task-4" | "task-5") {
                 task.updated_at = old_ts.clone();
+            }
+            if matches!(task.id.as_str(), "task-1" | "task-2") {
+                task.status = SessionTaskStatusKind::Completed;
+            }
+            if task.id == "task-4" {
+                task.status = SessionTaskStatusKind::Failed;
+            }
+            if task.id == "task-5" {
+                task.status = SessionTaskStatusKind::Cancelled;
             }
         }
         m.restore_snapshot(&snapshot)
@@ -5437,7 +5705,7 @@ mod tests {
         let archived = m.archive(&json!({"older_than_days": 7})).await;
         let archived_parsed: Value =
             serde_json::from_str(archived.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(archived_parsed["archived"], 1, "{archived}");
+        assert_eq!(archived_parsed["archived"], 3, "{archived}");
 
         let archived_list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "archived"})).await).unwrap();
@@ -5448,6 +5716,11 @@ mod tests {
             .map(|t| t["title"].as_str().unwrap())
             .collect();
         assert!(archived_titles.contains(&"old-done"), "{archived_list}");
+        assert!(archived_titles.contains(&"old-failed"), "{archived_list}");
+        assert!(
+            archived_titles.contains(&"old-cancelled"),
+            "{archived_list}"
+        );
         assert!(!archived_titles.contains(&"recent-done"), "{archived_list}");
 
         let completed_list: Value =
@@ -5474,8 +5747,7 @@ mod tests {
             .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
             .await;
         assert!(!linked.starts_with("Error:"), "{linked}");
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
+        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
 
         let mut snapshot = m.snapshot_state().await;
         let old_ts = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();

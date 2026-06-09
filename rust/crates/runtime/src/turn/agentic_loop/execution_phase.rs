@@ -3634,6 +3634,7 @@ mod tests {
         state.hooks.task_board_snapshot =
             crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
                 astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
@@ -3678,6 +3679,7 @@ mod tests {
         let mut state = make_state();
         state.hooks.task_board_snapshot =
             TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "finish validation".to_string(),
                 description: None,
@@ -3778,6 +3780,7 @@ mod tests {
         let mut state = make_state();
         state.hooks.task_board_snapshot =
             TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "finish validation".to_string(),
                 description: None,
@@ -3889,6 +3892,7 @@ mod tests {
     fn task_board_corrective_uses_cache_stable_counts_only() {
         let snapshot =
             TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "very specific changing task title".to_string(),
                 description: None,

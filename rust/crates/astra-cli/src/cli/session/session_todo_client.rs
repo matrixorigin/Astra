@@ -347,6 +347,7 @@ mod wiring_e2e {
                             .unwrap_or("untitled")
                             .to_string();
                         tasks.push(SessionTask {
+                            archived_at: None,
                             id: id.clone(),
                             title: title.clone(),
                             description: None,

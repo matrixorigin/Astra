@@ -110,7 +110,7 @@ impl ReasoningCell {
 }
 
 impl HistoryCell for ReasoningCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         // Empty + still live → nothing to show yet. The widget's
         // StatusIndicator handles the "thinking but no content"
         // case; we don't invent a placeholder here.

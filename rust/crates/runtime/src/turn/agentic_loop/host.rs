@@ -2805,6 +2805,7 @@ pub(crate) mod tests {
     fn task_board_snapshot_summarizes_active_tasks_stably() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
+                archived_at: None,
                 id: "task-2".to_string(),
                 title: "add runtime tests".to_string(),
                 description: None,
@@ -2819,6 +2820,7 @@ pub(crate) mod tests {
                 blocked_by: vec!["task-1".to_string()],
             },
             SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "wire completion guard".to_string(),
                 description: None,
@@ -2833,6 +2835,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-3".to_string(),
                 title: "already done".to_string(),
                 description: None,
@@ -2871,6 +2874,7 @@ pub(crate) mod tests {
     fn task_board_snapshot_ignores_terminal_and_archived_tasks() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "waiting".to_string(),
                 description: None,
@@ -2885,6 +2889,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-2".to_string(),
                 title: "done".to_string(),
                 description: None,
@@ -2899,6 +2904,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-3".to_string(),
                 title: "cancelled".to_string(),
                 description: None,
@@ -2913,6 +2919,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-4".to_string(),
                 title: "archived".to_string(),
                 description: None,
@@ -2971,6 +2978,7 @@ pub(crate) mod tests {
             Arc::new(LoadFailsTaskStore),
         )));
         state.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
             id: "task-1".to_string(),
             title: "finish cloud runtime task guard".to_string(),
             description: None,

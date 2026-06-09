@@ -10,8 +10,9 @@
 //!    a permanent `in_progress` row violating the "exactly one
 //!    in_progress at a time" invariant the schema prose enforces.
 //!
-//! 2. **Completed auto-archive** (U-18): every week move a bounded batch
-//!    of stale `completed` rows to `archived` after `COMPLETED_AUTO_ARCHIVE_DAYS`.
+//! 2. **Terminal auto-archive** (U-18): every week move a bounded batch
+//!    of stale `completed` / `failed` / `cancelled` rows to `archived` after
+//!    `COMPLETED_AUTO_ARCHIVE_DAYS`.
 //!    This keeps the live board focused on actionable work even when the
 //!    model forgets to call `task(action='archive')`.
 //!
@@ -28,9 +29,11 @@
 
 use astra_core::SharedPool;
 use astra_tools::task_mgmt::detach_dependency_edges_for_task_ids;
+use futures_util::FutureExt;
 use serde_json::{Map, Value};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 const STALE_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
@@ -67,11 +70,24 @@ fn auto_pause_metadata_json(existing: Option<&str>, paused_at: &str) -> String {
         (None, Some(raw)) => !raw.trim().is_empty(),
         (None, None) => false,
     };
+    let metadata_before_auto_pause = if needs_repair_marker {
+        Some(match (&parsed, existing) {
+            (Some(value), _) => value.clone(),
+            (None, Some(raw)) => Value::String(raw.to_string()),
+            (None, None) => Value::Null,
+        })
+    } else {
+        None
+    };
     let mut metadata = match parsed {
         Some(Value::Object(map)) => map,
         Some(_) | None => Map::new(),
     };
     if needs_repair_marker {
+        metadata.insert(
+            "metadata_before_auto_pause".to_string(),
+            metadata_before_auto_pause.unwrap_or(Value::Null),
+        );
         metadata.insert(
             "metadata_repair_reason".to_string(),
             Value::String("invalid_or_non_object_metadata_before_auto_pause".to_string()),
@@ -161,7 +177,7 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     Ok(affected)
 }
 
-/// Run a single completed→archived pass. Returns the number of rows
+/// Run a single terminal→archived pass. Returns the number of rows
 /// transitioned. Weekly cadence is enough because this is purely a
 /// hygiene sweep for stale history, not a user-facing real-time state
 /// change.
@@ -191,7 +207,7 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
 
         let rows: Vec<(String, String)> = sqlx::query(
             "SELECT session_id, todo_id FROM session_todos \
-             WHERE status = 'completed' \
+             WHERE status IN ('completed', 'failed', 'cancelled') \
                AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
              ORDER BY updated_at ASC \
              LIMIT ?",
@@ -222,7 +238,8 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
             let result = sqlx::query(
                 "UPDATE session_todos \
                  SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE session_id = ? AND todo_id = ? AND status = 'completed' \
+                 WHERE session_id = ? AND todo_id = ? \
+                   AND status IN ('completed', 'failed', 'cancelled') \
                    AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
             .bind(session_id)
@@ -275,9 +292,13 @@ fn decode_edge_ids(
     })
 }
 
-fn encode_edge_ids(ids: &[String]) -> Option<String> {
-    (!ids.is_empty())
-        .then(|| serde_json::to_string(ids).expect("Vec<String> serialization cannot fail"))
+fn encode_edge_ids(ids: &[String]) -> Result<Option<String>, String> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(ids)
+        .map(Some)
+        .map_err(|e| format!("dependency edge serialization failed: {e}"))
 }
 
 async fn detach_auto_archived_dependency_edges(
@@ -321,13 +342,16 @@ async fn detach_auto_archived_dependency_edges(
             continue;
         }
 
+        let blocks_json = encode_edge_ids(&blocks)?;
+        let blocked_by_json = encode_edge_ids(&blocked_by)?;
+
         sqlx::query(
             "UPDATE session_todos \
              SET blocks = ?, blocked_by = ? \
              WHERE session_id = ? AND todo_id = ?",
         )
-        .bind(encode_edge_ids(&blocks))
-        .bind(encode_edge_ids(&blocked_by))
+        .bind(blocks_json)
+        .bind(blocked_by_json)
         .bind(session_id)
         .bind(&todo_id)
         .execute(&mut **tx)
@@ -417,30 +441,46 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
         interval.tick().await;
         loop {
             interval.tick().await;
-            match lease.check_leader().await {
-                crate::server::sweeper_lease::LeaderStatus::Leader => {}
-                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
-                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
-                    tracing::warn!(
+            let tick_result = AssertUnwindSafe(async {
+                match lease.check_leader().await {
+                    crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                    crate::server::sweeper_lease::LeaderStatus::NotLeader => return,
+                    crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                        tracing::warn!(
+                            target: "astra_runtime::session_todo_sweeper",
+                            error = %e,
+                            "stale sweep lease check unavailable, skipping"
+                        );
+                        return;
+                    }
+                }
+                match run_stale_in_progress_sweep(pool.clone()).await {
+                    Ok(0) => {} // quiet success: nothing to do this tick
+                    Ok(n) => tracing::info!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        rows = n,
+                        "auto-paused {n} stale in_progress task(s)"
+                    ),
+                    Err(e) => tracing::warn!(
                         target: "astra_runtime::session_todo_sweeper",
                         error = %e,
-                        "stale sweep lease check unavailable, skipping"
-                    );
-                    continue;
+                        "stale-in_progress sweep failed"
+                    ),
                 }
-            }
-            match run_stale_in_progress_sweep(pool.clone()).await {
-                Ok(0) => {} // quiet success: nothing to do this tick
-                Ok(n) => tracing::info!(
+            })
+            .catch_unwind()
+            .await;
+            if let Err(panic_err) = tick_result {
+                let msg = panic_err
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("unknown panic");
+                tracing::error!(
                     target: "astra_runtime::session_todo_sweeper",
-                    rows = n,
-                    "auto-paused {n} stale in_progress task(s)"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    error = %e,
-                    "stale-in_progress sweep failed"
-                ),
+                    panic = %msg,
+                    "stale-in_progress sweeper panicked; will retry on next tick"
+                );
             }
         }
     });
@@ -460,45 +500,61 @@ pub(crate) fn spawn_session_todo_archive_sweeper(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match lease.check_leader().await {
-                crate::server::sweeper_lease::LeaderStatus::Leader => {}
-                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
-                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
-                    tracing::warn!(
+            let tick_result = AssertUnwindSafe(async {
+                match lease.check_leader().await {
+                    crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                    crate::server::sweeper_lease::LeaderStatus::NotLeader => return,
+                    crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                        tracing::warn!(
+                            target: "astra_runtime::session_todo_sweeper",
+                            error = %e,
+                            "archive sweep lease check unavailable, skipping"
+                        );
+                        return;
+                    }
+                }
+                let auto_archive_days = completed_auto_archive_days();
+                match run_completed_auto_archive_once(pool.clone()).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        rows = n,
+                        older_than_days = auto_archive_days,
+                        "auto-archived {n} completed task(s) older than {auto_archive_days} days"
+                    ),
+                    Err(e) => tracing::warn!(
                         target: "astra_runtime::session_todo_sweeper",
                         error = %e,
-                        "archive sweep lease check unavailable, skipping"
-                    );
-                    continue;
+                        "completed-auto-archive sweep failed"
+                    ),
                 }
-            }
-            let auto_archive_days = completed_auto_archive_days();
-            match run_completed_auto_archive_once(pool.clone()).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
+                match run_archive_gc_once(pool.clone()).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        rows = n,
+                        "garbage-collected {n} archived task row(s)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        error = %e,
+                        "archive-gc failed"
+                    ),
+                }
+            })
+            .catch_unwind()
+            .await;
+            if let Err(panic_err) = tick_result {
+                let msg = panic_err
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("unknown panic");
+                tracing::error!(
                     target: "astra_runtime::session_todo_sweeper",
-                    rows = n,
-                    older_than_days = auto_archive_days,
-                    "auto-archived {n} completed task(s) older than {auto_archive_days} days"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    error = %e,
-                    "completed-auto-archive sweep failed"
-                ),
-            }
-            match run_archive_gc_once(pool.clone()).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    rows = n,
-                    "garbage-collected {n} archived task row(s)"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    error = %e,
-                    "archive-gc failed"
-                ),
+                    panic = %msg,
+                    "archive sweeper panicked; will retry on next tick"
+                );
             }
         }
     });
@@ -542,11 +598,18 @@ mod tests {
 
     #[test]
     fn auto_pause_metadata_repairs_invalid_or_non_object_metadata() {
-        for existing in [Some("not-json"), Some("[1,2]")] {
+        for (existing, expected_original) in [
+            (Some("not-json"), Value::String("not-json".to_string())),
+            (Some("[1,2]"), serde_json::json!([1, 2])),
+        ] {
             let metadata = auto_pause_metadata_json(existing, "paused-at");
             let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
             assert_eq!(parsed["auto_paused_reason"], "stale_in_progress > 24h");
             assert_eq!(parsed["auto_paused_at"], "paused-at");
+            assert_eq!(
+                parsed["metadata_before_auto_pause"], expected_original,
+                "{parsed}"
+            );
             assert_eq!(
                 parsed["metadata_repair_reason"],
                 "invalid_or_non_object_metadata_before_auto_pause"
@@ -692,7 +755,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
     #[serial_test::serial(session_todo_sweeper_db)]
-    async fn completed_auto_archive_only_moves_old_completed_rows() {
+    async fn completed_auto_archive_moves_old_terminal_rows() {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
@@ -724,8 +787,14 @@ mod tests {
              ) VALUES \
                  (?, 'task-1', ?, 0, 'old done', 'completed', '[\"task-3\"]', NULL, NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 8 DAY)), \
                  (?, 'task-2', ?, 1, 'recent done', 'completed', NULL, NULL, NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 2 DAY)), \
-                 (?, 'task-3', ?, 2, 'old in progress', 'in_progress', NULL, '[\"task-1\"]', NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 8 DAY))",
+                 (?, 'task-3', ?, 2, 'old in progress', 'in_progress', NULL, '[\"task-1\"]', NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 8 DAY)), \
+                 (?, 'task-4', ?, 3, 'old failed', 'failed', NULL, NULL, NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 8 DAY)), \
+                 (?, 'task-5', ?, 4, 'old cancelled', 'cancelled', NULL, NULL, NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 8 DAY))",
         )
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&user_id)
         .bind(&session_id)
         .bind(&user_id)
         .bind(&session_id)
@@ -743,7 +812,7 @@ mod tests {
             .await
             .expect("auto archive");
         assert!(
-            archived >= 1,
+            archived >= 3,
             "global sweeper may also archive unrelated stale rows; got {archived}"
         );
 
@@ -765,6 +834,10 @@ mod tests {
         assert!(rows[2].1.is_none(), "{rows:?}");
         assert!(rows[2].2.is_none(), "{rows:?}");
         assert!(rows[2].3.is_none(), "{rows:?}");
+        assert_eq!(rows[3].0, "archived");
+        assert!(rows[3].1.is_some(), "{rows:?}");
+        assert_eq!(rows[4].0, "archived");
+        assert!(rows[4].1.is_some(), "{rows:?}");
 
         cleanup().await;
     }

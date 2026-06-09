@@ -267,6 +267,7 @@ async fn matrixone_restore_snapshot_rolls_back_counter_when_task_insert_fails() 
 
     let bad_snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
         tasks: vec![SessionTask {
+            archived_at: None,
             id: "task-99".to_string(),
             title: "bad restore row".to_string(),
             description: None,

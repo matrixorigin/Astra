@@ -48,6 +48,8 @@ use crate::tool_sandbox::{
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
+use super::plan_task_mirror;
+
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut acc, component| {
@@ -3361,296 +3363,32 @@ impl ServerToolExecutor {
         plan_id: &str,
         plan_state: &astra_plan::PlanModeState,
     ) -> Result<(), String> {
-        if plan_state.plan.subtasks.is_empty() {
-            return Ok(());
-        }
-        if plan_state.plan.subtasks.len() > MAX_CREATE_SUBTASKS {
-            return Err(format!(
-                "approved plan has {} step(s); maximum is {MAX_CREATE_SUBTASKS}. Split oversized subtasks into separate plans.",
-                plan_state.plan.subtasks.len()
-            ));
-        }
-        let snapshot = self
-            .task_manager
-            .try_snapshot_state()
-            .await
-            .map_err(|error| format!("snapshot task board before approved-plan mirror: {error}"))?;
-        match self
-            .mirror_approved_plan_to_task_board_inner(plan_id, plan_state)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if let Err(restore_error) = self.task_manager.restore_snapshot(&snapshot).await {
-                    return Err(format!(
-                        "{error}; additionally failed to roll back approved-plan task-board mirror: {restore_error}"
-                    ));
-                }
-                Err(error)
-            }
-        }
+        plan_task_mirror::mirror_approved_plan_to_task_board(
+            &self.task_manager,
+            &self.user_id,
+            &self.session_id,
+            plan_id,
+            plan_state,
+        )
+        .await
     }
 
-    async fn mirror_approved_plan_to_task_board_inner(
-        &self,
-        plan_id: &str,
-        plan_state: &astra_plan::PlanModeState,
-    ) -> Result<(), String> {
-        let plan_fingerprint = Self::plan_task_board_fingerprint(&plan_state.plan);
-
-        let mut step_task_ids = HashMap::new();
-        for (index, subtask) in plan_state.plan.subtasks.iter().enumerate() {
-            let task_id = self
-                .ensure_approved_plan_step_task(
-                    plan_id,
-                    &plan_state.goal,
-                    &plan_fingerprint,
-                    plan_state.plan.subtasks.len(),
-                    index,
-                    subtask,
-                )
-                .await?;
-            step_task_ids.insert(subtask.id.clone(), task_id);
-        }
-
-        for subtask in &plan_state.plan.subtasks {
-            let Some(task_id) = step_task_ids.get(&subtask.id) else {
-                continue;
-            };
-            let blockers: Vec<String> = subtask
-                .depends_on
-                .iter()
-                .filter_map(|dep_id| step_task_ids.get(dep_id).cloned())
-                .collect();
-            if blockers.is_empty() {
-                continue;
-            }
-            let needs_edges = self
-                .task_manager
-                .load_active_tasks()
-                .await
-                .map_err(|error| {
-                    format!("load task board before approved-plan dependency sync: {error}")
-                })?
-                .into_iter()
-                .find(|task| task.id == *task_id)
-                .is_none_or(|task| blockers.iter().any(|id| !task.blocked_by.contains(id)));
-            if needs_edges {
-                let output = self
-                    .task_manager
-                    .update(&json!({
-                        "task_id": task_id,
-                        "add_blocked_by": blockers,
-                    }))
-                    .await;
-                if output.starts_with("Error:") {
-                    return Err(output);
-                }
-            }
-        }
-
-        let first_runnable_task_id = plan_state
-            .plan
-            .subtasks
-            .iter()
-            .find(|subtask| subtask.depends_on.is_empty())
-            .or_else(|| plan_state.plan.subtasks.first())
-            .and_then(|subtask| step_task_ids.get(&subtask.id))
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "approved plan '{}' did not produce any task-board steps",
-                    plan_state.goal
-                )
-            })?;
-
-        self.pause_other_in_progress_tasks_for_plan_handoff(&first_runnable_task_id)
-            .await?;
-
-        let update_output = self
-            .task_manager
-            .update(&json!({
-                "task_id": first_runnable_task_id,
-                "new_status": "in_progress",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": plan_id,
-                    "plan_goal": plan_state.goal,
-                    "plan_fingerprint": plan_fingerprint,
-                    "session_id": self.session_id,
-                    "step_count": plan_state.plan.subtasks.len(),
-                }
-            }))
-            .await;
-        if update_output.starts_with("Error:") {
-            return Err(update_output);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_approved_plan_step_task(
-        &self,
-        plan_id: &str,
-        goal: &str,
-        plan_fingerprint: &str,
-        step_count: usize,
-        step_index: usize,
-        subtask: &astra_services::task_orchestrator::SubtaskPlan,
-    ) -> Result<String, String> {
-        let existing_task_id = self
-            .task_manager
-            .load_active_tasks()
-            .await
-            .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
-            .into_iter()
-            .find(|task| {
-                Self::approved_plan_step_task_matches(
-                    task,
-                    plan_id,
-                    goal,
-                    plan_fingerprint,
-                    &subtask.id,
-                )
-            })
-            .map(|task| task.id);
-        if let Some(task_id) = existing_task_id {
-            return Ok(task_id);
-        }
-
-        let mut create_args = json!({
-            "title": subtask.title,
-            "description": subtask.description.clone().unwrap_or_else(|| {
-                format!("Approved plan step {} of {step_count} for: {goal}", step_index + 1)
-            }),
-            "active_form": format!("Executing: {}", subtask.title),
-            "owner": self.user_id,
-            "metadata": {
-                "source": "approved_plan",
-                "plan_id": plan_id,
-                "plan_goal": goal,
-                "plan_fingerprint": plan_fingerprint,
-                "plan_subtask_id": subtask.id,
-                "plan_step_index": step_index,
-                "session_id": self.session_id,
-                "step_count": step_count,
-            },
-        });
-        let output = self.task_manager.create(&create_args).await;
-        if output.contains("already has this title") || output.contains("duplicate_of") {
-            create_args["title"] = json!(format!("{} ({})", subtask.title, subtask.id));
-            let retry = self.task_manager.create(&create_args).await;
-            if retry.starts_with("Error:") {
-                return Err(retry);
-            }
-        } else if output.starts_with("Error:") {
-            return Err(output);
-        }
-
-        self.task_manager
-            .load_active_tasks()
-            .await
-            .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
-            .into_iter()
-            .find(|task| {
-                Self::approved_plan_step_task_matches(
-                    task,
-                    plan_id,
-                    goal,
-                    plan_fingerprint,
-                    &subtask.id,
-                )
-            })
-            .map(|task| task.id)
-            .ok_or_else(|| {
-                format!(
-                    "approved plan step '{}' for '{goal}' was not visible in task board after task.create",
-                    subtask.id
-                )
-            })
-    }
-
-    async fn pause_other_in_progress_tasks_for_plan_handoff(
-        &self,
-        target_task_id: &str,
-    ) -> Result<(), String> {
-        let running_task_ids: Vec<String> = self
-            .task_manager
-            .load_active_tasks()
-            .await
-            .map_err(|error| format!("load task board before approved-plan handoff: {error}"))?
-            .into_iter()
-            .filter(|task| task.id != target_task_id && task.status.is_in_progress())
-            .map(|task| task.id)
-            .collect();
-        for running_task_id in running_task_ids {
-            let output = self
-                .task_manager
-                .update(&json!({
-                    "task_id": running_task_id,
-                    "new_status": "paused",
-                    "metadata": {
-                        "auto_paused_reason": "approved_plan_handoff",
-                        "handoff_to_task_id": target_task_id,
-                    }
-                }))
-                .await;
-            if output.starts_with("Error:") {
-                return Err(output);
-            }
-        }
-        Ok(())
-    }
-
+    #[allow(dead_code)]
     fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
-        let parts: Vec<Value> = plan
-            .subtasks
-            .iter()
-            .map(|subtask| {
-                let mut depends_on = subtask.depends_on.clone();
-                depends_on.sort();
-                json!({
-                    "id": subtask.id,
-                    "title": subtask.title,
-                    "description": subtask.description,
-                    "depends_on": depends_on,
-                })
-            })
-            .collect();
-        serde_json::to_string(&parts).expect("fingerprint serialization of Vec<Value> cannot fail")
+        plan_task_mirror::plan_task_board_fingerprint(plan)
     }
 
+    #[allow(dead_code)]
     fn approved_plan_task_matches(
         task: &SessionTask,
         plan_id: &str,
         goal: &str,
         plan_fingerprint: &str,
     ) -> bool {
-        if !task.status.is_open_work() {
-            return false;
-        }
-        let metadata = task.metadata.as_ref();
-        let source = metadata
-            .and_then(|metadata| metadata.get("source"))
-            .and_then(Value::as_str);
-        let task_plan_id = metadata
-            .and_then(|metadata| metadata.get("plan_id"))
-            .and_then(Value::as_str);
-        let task_goal = metadata
-            .and_then(|metadata| metadata.get("plan_goal"))
-            .and_then(Value::as_str);
-        let task_fingerprint = metadata
-            .and_then(|metadata| metadata.get("plan_fingerprint"))
-            .and_then(Value::as_str);
-
-        source == Some("approved_plan")
-            && task_fingerprint == Some(plan_fingerprint)
-            && match task_plan_id {
-                Some(existing_plan_id) => existing_plan_id == plan_id,
-                None => task_goal == Some(goal) || task.title == goal,
-            }
+        plan_task_mirror::approved_plan_task_matches(task, plan_id, goal, plan_fingerprint)
     }
 
+    #[allow(dead_code)]
     fn approved_plan_step_task_matches(
         task: &SessionTask,
         plan_id: &str,
@@ -3658,14 +3396,13 @@ impl ServerToolExecutor {
         plan_fingerprint: &str,
         plan_subtask_id: &str,
     ) -> bool {
-        if !Self::approved_plan_task_matches(task, plan_id, goal, plan_fingerprint) {
-            return false;
-        }
-        task.metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("plan_subtask_id"))
-            .and_then(Value::as_str)
-            == Some(plan_subtask_id)
+        plan_task_mirror::approved_plan_step_task_matches(
+            task,
+            plan_id,
+            goal,
+            plan_fingerprint,
+            plan_subtask_id,
+        )
     }
 
     fn server_get_agent_info(&self, args: &Value) -> String {

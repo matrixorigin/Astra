@@ -180,6 +180,29 @@ fn extract_task_id_from_output(output: &str) -> Option<String> {
         })
 }
 
+async fn delete_adopted_clone(
+    manager: &TaskManager,
+    create_output: &str,
+    reason: &str,
+) -> Result<(String, String), String> {
+    let clone_id = extract_task_id_from_output(create_output).ok_or_else(|| {
+        format!("could not extract clone id for adopt cleanup; clone output: {create_output}")
+    })?;
+    let delete_output = manager
+        .update(&serde_json::json!({
+            "action": "update",
+            "task_id": clone_id,
+            "new_status": "deleted",
+        }))
+        .await;
+    if !task_tool_output_success(&delete_output) {
+        return Err(format!(
+            "failed to delete adopt clone {clone_id} after {reason}: {delete_output}"
+        ));
+    }
+    Ok((clone_id, delete_output))
+}
+
 fn adoptable_source_status(status: &str) -> bool {
     matches!(status, "pending" | "in_progress" | "paused")
 }
@@ -714,14 +737,36 @@ async fn adopt_task_into_session(
     let mut tx2 = match pool.get().begin().await {
         Ok(tx) => tx,
         Err(e) => {
+            match delete_adopted_clone(&manager, &create_output, "CAS transaction begin failure")
+                .await
+            {
+                Ok((clone_id, delete_output)) => {
+                    tracing::warn!(
+                        source_session,
+                        source_task_id,
+                        clone_id,
+                        "adopt: clone succeeded but begin CAS-tx failed; clone deleted: {delete_output}"
+                    );
+                }
+                Err(cleanup_error) => {
+                    tracing::error!(
+                        source_session,
+                        source_task_id,
+                        error = %e,
+                        cleanup_error = %cleanup_error,
+                        "adopt: clone succeeded, begin CAS-tx failed, and clone cleanup failed"
+                    );
+                    return format!(
+                        "Error: adopt CAS-tx begin failed: {e}; clone cleanup failed: {cleanup_error}"
+                    );
+                }
+            }
             tracing::error!(
                 source_session,
                 source_task_id,
-                "adopt: clone succeeded but begin CAS-tx failed: {e}; clone output: {create_output}"
+                "adopt: clone succeeded but begin CAS-tx failed: {e}; clone was deleted"
             );
-            return format!(
-                "Error: adopt CAS-tx begin failed: {e}; clone may exist in target session"
-            );
+            return format!("Error: adopt CAS-tx begin failed: {e}; clone was deleted");
         }
     };
     let migrate_result = sqlx::query(
@@ -738,32 +783,59 @@ async fn adopt_task_into_session(
         Ok(r) => r.rows_affected(),
         Err(e) => {
             let _ = tx2.rollback().await;
+            match delete_adopted_clone(&manager, &create_output, "CAS update failure").await {
+                Ok((clone_id, delete_output)) => {
+                    tracing::warn!(
+                        source_session,
+                        source_task_id,
+                        clone_id,
+                        "adopt: CAS-UPDATE failed; clone deleted: {delete_output}"
+                    );
+                }
+                Err(cleanup_error) => {
+                    tracing::error!(
+                        source_session,
+                        source_task_id,
+                        error = %e,
+                        cleanup_error = %cleanup_error,
+                        "adopt: clone succeeded, CAS-UPDATE failed, and clone cleanup failed"
+                    );
+                    return format!(
+                        "Error: adopt CAS-UPDATE failed: {e}; clone cleanup failed: {cleanup_error}"
+                    );
+                }
+            }
             tracing::error!(
                 source_session,
                 source_task_id,
-                "adopt: clone succeeded but CAS-UPDATE failed: {e}; clone output: {create_output}"
+                "adopt: clone succeeded but CAS-UPDATE failed: {e}; clone was deleted"
             );
-            return format!("Error: adopt CAS-UPDATE failed: {e}; clone exists in target session");
+            return format!("Error: adopt CAS-UPDATE failed: {e}; clone was deleted");
         }
     };
     if migrate_rows == 0 {
         // Concurrent adopt won the race. Delete the clone we created.
         let _ = tx2.rollback().await;
-        let clone_id = extract_task_id_from_output(&create_output);
-        if let Some(clone_id) = clone_id {
-            let delete_output = manager.update(&serde_json::json!({"action": "update", "task_id": clone_id, "new_status": "deleted"})).await;
-            tracing::warn!(
-                source_session,
-                source_task_id,
-                clone_id,
-                "adopt: concurrent CAS detected; deleted clone: {delete_output}"
-            );
-        } else {
-            tracing::error!(
-                source_session,
-                source_task_id,
-                "adopt: concurrent CAS detected but could not extract clone id to delete: {create_output}"
-            );
+        match delete_adopted_clone(&manager, &create_output, "concurrent CAS miss").await {
+            Ok((clone_id, delete_output)) => {
+                tracing::warn!(
+                    source_session,
+                    source_task_id,
+                    clone_id,
+                    "adopt: concurrent CAS detected; deleted clone: {delete_output}"
+                );
+            }
+            Err(cleanup_error) => {
+                tracing::error!(
+                    source_session,
+                    source_task_id,
+                    cleanup_error = %cleanup_error,
+                    "adopt: concurrent CAS detected and clone cleanup failed"
+                );
+                return format!(
+                    "Error: source task {source_session}:{source_task_id} was already migrated by a concurrent adopt; clone cleanup failed: {cleanup_error}"
+                );
+            }
         }
         return format!(
             "Error: source task {source_session}:{source_task_id} was already migrated by a concurrent adopt"

@@ -1162,6 +1162,7 @@ mod tests {
         state.hooks.task_board_snapshot =
             crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
                 astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
@@ -1210,6 +1211,7 @@ mod tests {
         state.hooks.task_board_snapshot =
             crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
                 astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
@@ -1297,6 +1299,7 @@ mod tests {
         state.hooks.task_board_snapshot =
             crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
                 astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,

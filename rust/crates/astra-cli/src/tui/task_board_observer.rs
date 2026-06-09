@@ -791,6 +791,7 @@ mod tests {
             async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
                 if self.loads.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
                     Ok(vec![SessionTask {
+                        archived_at: None,
                         id: "task-1".to_string(),
                         title: "visible work".to_string(),
                         description: None,
@@ -1507,6 +1508,7 @@ mod tests {
                     Ok(vec![(
                         "sess-a".to_string(),
                         vec![SessionTask {
+                            archived_at: None,
                             id: "task-1".to_string(),
                             title: "visible cross-session work".to_string(),
                             description: None,

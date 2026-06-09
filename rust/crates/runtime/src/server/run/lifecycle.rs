@@ -3506,7 +3506,10 @@ impl AgenticRunLifecycleService {
                     error = %error,
                     "failed to load task board resume hint for Cloud turn"
                 );
-                None
+                Some(format!(
+                    "Task board state could not be loaded for this turn: {error}. \
+                     Do not assume the task board is empty; avoid creating duplicate tasks and surface the load failure to the user."
+                ))
             }
         }
     }
@@ -6507,6 +6510,7 @@ mod tests {
         status: astra_tools::task_mgmt::SessionTaskStatusKind,
     ) -> SessionTask {
         SessionTask {
+            archived_at: None,
             id: id.to_string(),
             title: title.to_string(),
             description: None,
