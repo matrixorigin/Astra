@@ -25,22 +25,30 @@ pub(crate) fn format_summary(tasks: &[SessionTask]) -> Option<String> {
     if tasks.is_empty() {
         return None;
     }
-    let (pending, in_progress, completed, other) = counts(tasks);
+    let counts = counts(tasks);
     // Pure informational summary; skip when the only tasks are
-    // historical completions with no active work.
-    if pending == 0 && in_progress == 0 && other == 0 {
+    // terminal history with no open work.
+    if counts.open_work() == 0 {
         return None;
     }
     let mut lines = Vec::new();
     lines.push(format!(
-        "### Active task board\n{in_progress} in progress · {pending} pending · {completed} completed"
+        "### Active task board\n{} in progress · {} pending · {} paused · {} completed",
+        counts.in_progress, counts.pending, counts.paused, counts.completed
     ));
 
-    // Up to 3 concrete entries, in_progress first then pending, so
-    // the model sees what it SHOULD still be doing.
+    // Up to 3 concrete entries, in_progress first then pending, then
+    // paused open work that should not silently disappear on resume.
     let mut picks: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_in_progress()).collect();
     if picks.len() < 3 {
         picks.extend(tasks.iter().filter(|t| t.status.is_pending()));
+    }
+    if picks.len() < 3 {
+        picks.extend(
+            tasks
+                .iter()
+                .filter(|t| t.status.is_open_work() && !t.status.is_active()),
+        );
     }
     picks.truncate(3);
 
@@ -84,23 +92,36 @@ fn task_line(task: &SessionTask) -> String {
     line
 }
 
-fn counts(tasks: &[SessionTask]) -> (usize, usize, usize, usize) {
-    let mut pending = 0;
-    let mut in_progress = 0;
-    let mut completed = 0;
-    let mut other = 0;
+#[derive(Default)]
+struct TaskSummaryCounts {
+    pending: usize,
+    in_progress: usize,
+    paused: usize,
+    completed: usize,
+}
+
+impl TaskSummaryCounts {
+    fn open_work(&self) -> usize {
+        self.pending + self.in_progress + self.paused
+    }
+}
+
+fn counts(tasks: &[SessionTask]) -> TaskSummaryCounts {
+    let mut counts = TaskSummaryCounts::default();
     for t in tasks {
         match t.status {
-            SessionTaskStatusKind::Pending => pending += 1,
-            SessionTaskStatusKind::InProgress => in_progress += 1,
-            SessionTaskStatusKind::Completed => completed += 1,
-            SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled => other += 1,
+            SessionTaskStatusKind::Pending => counts.pending += 1,
+            SessionTaskStatusKind::InProgress => counts.in_progress += 1,
+            SessionTaskStatusKind::Paused => counts.paused += 1,
+            SessionTaskStatusKind::Completed => counts.completed += 1,
+            SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled => {}
             SessionTaskStatusKind::Archived
             | SessionTaskStatusKind::Deleted
-            | SessionTaskStatusKind::Other => other += 1,
+            | SessionTaskStatusKind::Migrated
+            | SessionTaskStatusKind::Other => {}
         }
     }
-    (pending, in_progress, completed, other)
+    counts
 }
 
 #[cfg(test)]
@@ -153,6 +174,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_unsuccessful_tasks_do_not_create_active_prompt_block() {
+        let tasks = vec![
+            task("task-1", "failed", "failed"),
+            task("task-2", "cancelled", "cancelled"),
+        ];
+        assert!(format_summary(&tasks).is_none());
+    }
+
+    #[test]
+    fn paused_open_work_is_summarized_with_a_concrete_entry() {
+        let tasks = vec![task("task-1", "paused investigation", "paused")];
+        let out = format_summary(&tasks).unwrap();
+        assert!(out.contains("1 paused"), "{out}");
+        assert!(out.contains("⏸ paused investigation"), "{out}");
+    }
+
+    #[test]
     fn active_work_produces_header_with_counts() {
         let tasks = vec![
             task("task-1", "work", "in_progress"),
@@ -162,6 +200,7 @@ mod tests {
         assert!(out.contains("### Active task board"));
         assert!(out.contains("1 in progress"));
         assert!(out.contains("1 pending"));
+        assert!(out.contains("0 paused"));
     }
 
     #[test]

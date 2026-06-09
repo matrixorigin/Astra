@@ -150,22 +150,14 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
     );
 }
 
-/// REGRESSION: after the Phase 1 split, `task.background_shell` and
-/// the other 3 background actions live on the new `agent_job` tool.
-/// Calling them on `task` is a sign the model is on a stale schema or
-/// hallucinating a path that no longer exists. The executor must
-/// surface this as an Error: with a redirect — same shape as the
-/// `agent.delegate` rejection — so the model self-corrects on the
-/// next turn instead of silently failing.
+/// `task` is only the durable checklist surface. Background process
+/// actions belong to `agent_job`; if they arrive on `task`, treat them
+/// as ordinary unknown task actions rather than preserving per-action
+/// migration branches.
 #[tokio::test]
-async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
+async fn task_background_actions_are_plain_unknown_task_actions() {
     let executor = test_executor();
-    for (action, redirect_action) in &[
-        ("background_shell", "shell"),
-        ("background_agent", "agent"),
-        ("output", "output"),
-        ("kill", "kill"),
-    ] {
+    for action in ["background_shell", "background_agent", "output", "kill"] {
         let result = executor
             .execute(
                 "task",
@@ -183,16 +175,10 @@ async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
              a red banner — got: {result}"
         );
         assert!(
-            result.contains("agent_job"),
-            "task.{action} error must name `agent_job` as the new home — \
-             without that, the model has no path to recovery. Got: {result}"
+            result.contains("unknown `task` action") && result.contains(action),
+            "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
-        assert!(
-            result.contains(&format!("agent_job(action='{redirect_action}')"))
-                || result.contains(redirect_action),
-            "task.{action} error must point at the specific replacement \
-             action `agent_job(action='{redirect_action}')`. Got: {result}"
-        );
+        assert!(!result.contains("agent_job(action='"), "{result}");
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
             "task.{action} rejection must classify as an error so cloud \

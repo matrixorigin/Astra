@@ -26,6 +26,24 @@ struct LoadTodosResponse {
     tasks: Vec<astra_tools::task_mgmt::SessionTask>,
 }
 
+fn format_cloud_error(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("detail")
+                .and_then(|detail| detail.as_str())
+                .map(str::to_string)
+        })
+        .filter(|detail| !detail.trim().is_empty())
+        .unwrap_or_else(|| body.to_string());
+    if detail.is_empty() {
+        format!("cloud {status}")
+    } else {
+        format!("cloud {status}: {detail}")
+    }
+}
+
 fn build_request(
     method: reqwest::Method,
     url: &str,
@@ -46,7 +64,7 @@ fn build_request(
 /// `POST /sessions/{sid}/todos:execute` — server-side TaskManager
 /// runs the action against MO and returns the same string output the
 /// in-memory manager would produce. Action is one of
-/// `create | update | list | get | stop`; `args` mirrors the
+/// `create | update | list | get | stop | adopt | archive`; `args` mirrors the
 /// model-emitted `task` tool args.
 ///
 /// U-15: transient cloud failures (5xx response, connection drop)
@@ -87,7 +105,7 @@ pub async fn execute_todo_action(
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
-                return Err(format!("cloud {status}: {body}"));
+                return Err(format_cloud_error(status, &body));
             }
             Err(e) => {
                 // Connection-failed counts as transient. Retry once;
@@ -126,7 +144,7 @@ pub async fn list_user_todos(
     let status_code = resp.status();
     if !status_code.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("cloud {status_code}: {body}"));
+        return Err(format_cloud_error(status_code, &body));
     }
     let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
     let summary_count = serde_json::from_str::<serde_json::Value>(&body)
@@ -134,7 +152,7 @@ pub async fn list_user_todos(
         .and_then(|v| v.get("total").and_then(|t| t.as_u64()))
         .unwrap_or(0);
     Ok(format!(
-        "Cross-session todos: {summary_count} active item(s)\n{body}"
+        "Cross-session todos: {summary_count} {status} item(s)\n{body}"
     ))
 }
 
@@ -157,7 +175,7 @@ pub async fn load_todos(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("cloud {status}: {body}"));
+        return Err(format_cloud_error(status, &body));
     }
     let parsed: LoadTodosResponse = resp
         .json()
@@ -251,7 +269,7 @@ impl TaskStore for HttpTaskStore {
 
 #[cfg(test)]
 mod wiring_e2e {
-    use super::{HttpTaskStore, execute_todo_action};
+    use super::{HttpTaskStore, execute_todo_action, list_user_todos};
     use crate::lock_recovery::LockRecovery;
     use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
     use astra_tools::task_mgmt::{SessionTask, TaskStore};
@@ -259,7 +277,7 @@ mod wiring_e2e {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
-    use wiremock::matchers::method;
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     /// Build a stub server that:
@@ -324,8 +342,7 @@ mod wiring_e2e {
                     "update" => {
                         let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
                         let new_status = args
-                            .get("status")
-                            .or_else(|| args.get("new_status"))
+                            .get("new_status")
                             .and_then(|v| v.as_str())
                             .unwrap_or("pending");
                         if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
@@ -366,7 +383,7 @@ mod wiring_e2e {
     /// dirty/FAST_POLL window (≤ 200ms even on slow CI). This is the
     /// "dashboard appears mid-turn" SLA.
     #[tokio::test]
-    async fn task_create_lands_in_observer_within_sla() {
+    async fn task_action_create_lands_in_observer_within_sla() {
         let (server, _state) = spawn_mock_server().await;
         let (store, notify_tx) = HttpTaskStore::new(server.uri(), None);
         let store_dyn: Arc<dyn TaskStore> = store.clone();
@@ -405,6 +422,85 @@ mod wiring_e2e {
         let snap = observer.snapshot();
         assert_eq!(snap.tasks.len(), 1);
         assert_eq!(snap.tasks[0].title, "first task");
+    }
+
+    #[tokio::test]
+    async fn list_user_todos_summary_names_requested_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/me/todos"))
+            .and(query_param("status", "completed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tasks": [],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let output = list_user_todos(&server.uri(), None, "completed")
+            .await
+            .expect("mock list_user_todos");
+        assert!(
+            output.starts_with("Cross-session todos: 2 completed item(s)"),
+            "summary should name the requested status, not always active: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_user_todos_surfaces_cloud_error_detail_without_json_noise() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/me/todos"))
+            .and(query_param("status", "cancelledd"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "detail": "invalid status 'cancelledd' (valid: pending|in_progress|paused|completed|failed|cancelled)"
+            })))
+            .mount(&server)
+            .await;
+
+        let err = list_user_todos(&server.uri(), None, "cancelledd")
+            .await
+            .expect_err("invalid status should surface as a cloud error");
+        assert!(
+            err.contains("cloud 400 Bad Request: invalid status 'cancelledd'"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("\"detail\""),
+            "CLI-facing error should show the detail, not raw JSON: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_todo_action_surfaces_cloud_error_detail_without_json_noise() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(
+                r"^/sessions/[^/]+/todos:execute$",
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "detail": "field 'status_filter' must be a string"
+            })))
+            .mount(&server)
+            .await;
+
+        let err = execute_todo_action(
+            &server.uri(),
+            None,
+            "sess-bad-filter",
+            "list",
+            &json!({"status_filter": true}),
+        )
+        .await
+        .expect_err("invalid task list args should surface as a cloud error");
+        assert!(
+            err.contains("cloud 400 Bad Request: field 'status_filter' must be a string"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("\"detail\""),
+            "CLI-facing error should show the detail, not raw JSON: {err}"
+        );
     }
 
     /// REGRESSION: TUI starts with an empty `session_id` (server allocates
@@ -485,7 +581,7 @@ mod wiring_e2e {
             None,
             sid,
             "update",
-            &json!({ "task_id": "task-1", "status": "completed" }),
+            &json!({ "task_id": "task-1", "new_status": "completed" }),
         )
         .await
         .unwrap();

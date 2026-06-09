@@ -1758,9 +1758,9 @@ pub(crate) async fn execute_cli_command(
                 astra_harness::SessionTrace::new(None),
             ));
             // Wire the MO-backed task store for `astra chat -m` single-shot
-            // runs so `task_create` / `task_list` in this path write through
-            // to `session_todos`. Without this the tool runs against a
-            // throwaway in-memory manager and the Tier 1 board is invisible
+            // runs so unified `task(action=...)` calls in this path write
+            // through to `session_todos`. Without this the tool runs against
+            // a throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
             let chat_task_manager = build_one_shot_task_manager(
                 profile.as_deref(),

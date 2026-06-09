@@ -1226,7 +1226,26 @@ pub(crate) async fn handle_session_command(
                     };
 
                     let mut fork_guard = ForkStateGuard::new(state);
-                    apply_prepared_fork_restore(fork_guard.state(), &new_sid, restored_child);
+                    let task_board_restore = match apply_prepared_fork_restore(
+                        fork_guard.state(),
+                        &parent_id,
+                        &new_sid,
+                        restored_child,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    "  ✗ Forked child session could not restore task board: {error}"
+                                )
+                                .red()
+                            );
+                            return;
+                        }
+                    };
 
                     if let Err(error) =
                         crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
@@ -1254,6 +1273,19 @@ pub(crate) async fn handle_session_command(
                         "REPL context is now the forked session (same history; new cloud lineage)."
                             .dim()
                     );
+                    if task_board_restore == ForkTaskBoardRestore::SkippedCloudObserver {
+                        eprintln!(
+                            "  {}",
+                            "Cloud task board was not copied into the fork; use task(action='list_user') and task(action='adopt', source_session_id=..., task_id=...) to bring open work into this child session."
+                                .yellow()
+                        );
+                    } else if task_board_restore == ForkTaskBoardRestore::PreservedExistingChild {
+                        eprintln!(
+                            "  {}",
+                            "Forked child already has a task board; preserved child tasks and skipped copying the parent board."
+                                .yellow()
+                        );
+                    }
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
             }
@@ -5024,6 +5056,13 @@ struct PreparedForkRestore {
     last_turn_event: Option<session_journal::JournalEvent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkTaskBoardRestore {
+    Copied,
+    SkippedCloudObserver,
+    PreservedExistingChild,
+}
+
 struct ForkStateSnapshot {
     session_id: Option<String>,
     root_mailbox: Option<astra_messaging::router::AgentMailbox>,
@@ -5235,11 +5274,50 @@ async fn load_prepared_fork_restore(
     }
 }
 
-fn apply_prepared_fork_restore(
+async fn apply_prepared_fork_restore(
     state: &mut SessionState,
+    parent_id: &str,
     new_sid: &str,
     restored_child: PreparedForkRestore,
-) {
+) -> Result<ForkTaskBoardRestore, String> {
+    let task_restore_plan = if state.task_notify_tx.is_none() {
+        let store = state.task_manager.store();
+        let child_tasks = store.load(new_sid).await.map_err(|error| {
+            format!("load existing task board for forked child {new_sid}: {error}")
+        })?;
+        if child_tasks.is_empty() {
+            let parent_tasks = store.load(parent_id).await.map_err(|error| {
+                format!("load parent task board for forked child {new_sid}: {error}")
+            })?;
+            let fallback_next_id = parent_tasks
+                .iter()
+                .filter_map(|task| {
+                    task.id
+                        .strip_prefix("task-")
+                        .and_then(|suffix| suffix.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+            let next_task_id = store
+                .peek_next_task_id(parent_id)
+                .await
+                .unwrap_or(fallback_next_id);
+            Some(astra_tools::task_mgmt::TaskManagerSnapshot {
+                tasks: parent_tasks,
+                next_task_id,
+            })
+        } else {
+            None
+        }
+    } else {
+        // Cloud task inheritance belongs behind the server write surface;
+        // the CLI's HttpTaskStore is a read-only observer.
+        None
+    };
+    let preserved_existing_child = state.task_notify_tx.is_none() && task_restore_plan.is_none();
+
     state.set_session_id(new_sid.to_string());
     session_startup::initialize_journal_pub(state, new_sid);
     state.turn = restored_child.journal_state.turn;
@@ -5254,6 +5332,17 @@ fn apply_prepared_fork_restore(
     state.csl_manager = restored_child.csl_manager;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.continuation_anchor = None;
+    state.turns_since_task_use = 0;
+    state.turns_since_task_reminder = 0;
+    let task_board_restore = if let Some(task_snapshot) = task_restore_plan {
+        state.task_manager.restore_snapshot(&task_snapshot).await?;
+        ForkTaskBoardRestore::Copied
+    } else if preserved_existing_child {
+        ForkTaskBoardRestore::PreservedExistingChild
+    } else {
+        ForkTaskBoardRestore::SkippedCloudObserver
+    };
+    Ok(task_board_restore)
 }
 
 async fn restore_journal_history_if_available(
@@ -5942,24 +6031,55 @@ pub(crate) async fn handle_resume_command(
 #[cfg(test)]
 mod resume_tests {
     use super::{
-        ForkStateGuard, ForkStateSnapshot, PreparedForkRestore, SessionListFilterOptions,
-        SessionListFilterOutcome, apply_heavy_checkpoint_fallback, apply_prepared_fork_restore,
-        apply_restored_session, apply_resume_recovery_state, build_session_list_entries,
-        build_step_resume_guidance, filter_session_list_entries, load_prepared_fork_restore,
-        load_resumable_session_candidates, restore_journal_history_if_available,
-        restore_session_into_state, resume_persistence_warning, session_restore_client,
-        session_runtime, session_startup, switch_session_into_state, workspace_summary_line,
+        ForkStateGuard, ForkStateSnapshot, ForkTaskBoardRestore, PreparedForkRestore,
+        SessionListFilterOptions, SessionListFilterOutcome, apply_heavy_checkpoint_fallback,
+        apply_prepared_fork_restore, apply_restored_session, apply_resume_recovery_state,
+        build_session_list_entries, build_step_resume_guidance, filter_session_list_entries,
+        load_prepared_fork_restore, load_resumable_session_candidates,
+        restore_journal_history_if_available, restore_session_into_state,
+        resume_persistence_warning, session_restore_client, session_runtime, session_startup,
+        switch_session_into_state, workspace_summary_line,
     };
     use crate::cli::session::session_state::SessionState;
     use astra_services::session_journal::{self, JournalDirGuard};
     use astra_services::session_restore::RestoredSession;
     use astra_services::session_workspace;
+    use astra_tools::task_mgmt::{SessionTask, TaskMutation, TaskStore};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
         key: &'static str,
         old: Option<String>,
+    }
+
+    struct FailingLoadTaskStore;
+
+    #[async_trait::async_trait]
+    impl TaskStore for FailingLoadTaskStore {
+        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+            Err(format!("forced load failure for {session_id}"))
+        }
+
+        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn mutate(
+            &self,
+            session_id: &str,
+            _mutation: TaskMutation,
+        ) -> Result<String, String> {
+            Err(format!("forced mutate failure for {session_id}"))
+        }
+
+        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
+            Err(format!("forced next id failure for {session_id}"))
+        }
+
+        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+            Ok(1)
+        }
     }
 
     impl EnvGuard {
@@ -7299,6 +7419,20 @@ mod resume_tests {
             discovered_skills: ["obsolete".to_string()].into_iter().collect(),
             ..Default::default()
         };
+        state.set_session_id("current-session");
+        let old_created = state
+            .task_manager
+            .create(&serde_json::json!({"title": "old session task"}))
+            .await;
+        assert!(old_created.contains("created"), "{old_created}");
+        let restored_task_manager = astra_tools::task_mgmt::TaskManager::new(
+            session_id.clone(),
+            state.task_manager.store(),
+        );
+        let restored_created = restored_task_manager
+            .create(&serde_json::json!({"title": "restored session task"}))
+            .await;
+        assert!(restored_created.contains("created"), "{restored_created}");
 
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await
@@ -7320,6 +7454,18 @@ mod resume_tests {
         assert!(
             state.journal.is_some(),
             "switch should initialize a journal"
+        );
+        let task_list = state
+            .task_manager
+            .list(&serde_json::json!({"status_filter": "all"}))
+            .await;
+        assert!(
+            task_list.contains("restored session task"),
+            "switch must rebind task manager to restored session: {task_list}"
+        );
+        assert!(
+            !task_list.contains("old session task"),
+            "switch must not leave task manager bound to old session: {task_list}"
         );
     }
 
@@ -7913,8 +8059,8 @@ mod resume_tests {
         assert_eq!(state.continuation_anchor.as_deref(), Some("anchor"));
     }
 
-    #[test]
-    fn fork_state_guard_restores_original_state_on_drop_without_commit() {
+    #[tokio::test]
+    async fn fork_state_guard_restores_original_state_on_drop_without_commit() {
         let mut state = SessionState::default();
         state.set_session_id("parent-session");
         session_startup::initialize_journal_pub(&mut state, "parent-session");
@@ -7942,7 +8088,15 @@ mod resume_tests {
                 journal_state: child_state,
                 last_turn_event: None,
             };
-            apply_prepared_fork_restore(guard.state(), "child-session", restored_child);
+            let outcome = apply_prepared_fork_restore(
+                guard.state(),
+                "parent-session",
+                "child-session",
+                restored_child,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForkTaskBoardRestore::Copied);
         }
 
         assert_eq!(state.session_id.as_deref(), Some("parent-session"));
@@ -7987,5 +8141,315 @@ mod resume_tests {
             .register(root_addr, None)
             .await
             .expect("explicit unregister should release restored root mailbox route");
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_fork_restore_copies_parent_task_board_to_child() {
+        let mut state = SessionState::default();
+        state.set_session_id("parent-session");
+        let created = state
+            .task_manager
+            .create(&serde_json::json!({"title": "continue forked work"}))
+            .await;
+        assert!(created.contains("created"), "{created}");
+
+        let child_state = session_runtime::RestoredSessionState {
+            history: vec![("child-q".into(), "child-a".into())],
+            turn: 1,
+            recent_tools: vec!["task".into()],
+            total_prompt_tokens: 10,
+            total_completion_tokens: 20,
+            total_cache_read_tokens: 30,
+            total_cache_creation_tokens: 40,
+        };
+        let restored_child = PreparedForkRestore {
+            history: child_state.history.clone(),
+            recent_tools: child_state.recent_tools.clone(),
+            csl_manager: None,
+            journal_state: child_state,
+            last_turn_event: None,
+        };
+
+        let outcome = apply_prepared_fork_restore(
+            &mut state,
+            "parent-session",
+            "child-session",
+            restored_child,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForkTaskBoardRestore::Copied);
+
+        let child_list = state
+            .task_manager
+            .list(&serde_json::json!({"status_filter": "all"}))
+            .await;
+        assert!(
+            child_list.contains("continue forked work"),
+            "forked child should inherit the parent task board snapshot: {child_list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_fork_restore_resets_task_reminder_counters() {
+        let mut state = SessionState {
+            turns_since_task_use: 9,
+            turns_since_task_reminder: 9,
+            ..SessionState::default()
+        };
+        state.set_session_id("parent-session");
+        let created = state
+            .task_manager
+            .create(&serde_json::json!({"title": "continue forked work"}))
+            .await;
+        assert!(created.contains("created"), "{created}");
+
+        let child_state = session_runtime::RestoredSessionState {
+            history: vec![("child-q".into(), "child-a".into())],
+            turn: 1,
+            recent_tools: vec![],
+            total_prompt_tokens: 10,
+            total_completion_tokens: 20,
+            total_cache_read_tokens: 30,
+            total_cache_creation_tokens: 40,
+        };
+        let restored_child = PreparedForkRestore {
+            history: child_state.history.clone(),
+            recent_tools: child_state.recent_tools.clone(),
+            csl_manager: None,
+            journal_state: child_state,
+            last_turn_event: None,
+        };
+
+        apply_prepared_fork_restore(
+            &mut state,
+            "parent-session",
+            "child-session",
+            restored_child,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state.turns_since_task_use, 0,
+            "forked child must not inherit stale parent task-use reminder age"
+        );
+        assert_eq!(
+            state.turns_since_task_reminder, 0,
+            "forked child must not immediately inject a task reminder from parent counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn forked_child_first_turn_does_not_inject_stale_parent_task_reminder() {
+        let mut state = SessionState {
+            turns_since_task_use: 9,
+            turns_since_task_reminder: 9,
+            ..SessionState::default()
+        };
+        state.set_session_id("parent-session");
+        let created = state
+            .task_manager
+            .create(&serde_json::json!({"title": "continue forked work"}))
+            .await;
+        assert!(created.contains("created"), "{created}");
+
+        let child_state = session_runtime::RestoredSessionState {
+            history: vec![("child-q".into(), "child-a".into())],
+            turn: 1,
+            recent_tools: vec![],
+            total_prompt_tokens: 10,
+            total_completion_tokens: 20,
+            total_cache_read_tokens: 30,
+            total_cache_creation_tokens: 40,
+        };
+        let restored_child = PreparedForkRestore {
+            history: child_state.history.clone(),
+            recent_tools: child_state.recent_tools.clone(),
+            csl_manager: None,
+            journal_state: child_state,
+            last_turn_event: None,
+        };
+
+        apply_prepared_fork_restore(
+            &mut state,
+            "parent-session",
+            "child-session",
+            restored_child,
+        )
+        .await
+        .unwrap();
+
+        let finalized = crate::cli::session::session_input::finalize_effective_line(
+            "continue".into(),
+            None,
+            &mut state,
+        )
+        .await;
+
+        assert!(
+            !finalized.contains("The task tools haven't been used recently."),
+            "new forked child should not immediately inherit parent reminder pressure: {finalized}"
+        );
+        assert_eq!(state.turns_since_task_use, 1);
+        assert_eq!(state.turns_since_task_reminder, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_fork_restore_preserves_existing_child_task_board() {
+        let mut state = SessionState::default();
+        state.set_session_id("parent-session");
+        let parent_created = state
+            .task_manager
+            .create(&serde_json::json!({"title": "parent open work"}))
+            .await;
+        assert!(parent_created.contains("created"), "{parent_created}");
+
+        let child_manager = astra_tools::task_mgmt::TaskManager::new(
+            "child-session".to_string(),
+            state.task_manager.store(),
+        );
+        let child_created = child_manager
+            .create(&serde_json::json!({"title": "child existing work"}))
+            .await;
+        assert!(child_created.contains("created"), "{child_created}");
+
+        let child_state = session_runtime::RestoredSessionState {
+            history: vec![("child-q".into(), "child-a".into())],
+            turn: 1,
+            recent_tools: vec!["task".into()],
+            total_prompt_tokens: 10,
+            total_completion_tokens: 20,
+            total_cache_read_tokens: 30,
+            total_cache_creation_tokens: 40,
+        };
+        let restored_child = PreparedForkRestore {
+            history: child_state.history.clone(),
+            recent_tools: child_state.recent_tools.clone(),
+            csl_manager: None,
+            journal_state: child_state,
+            last_turn_event: None,
+        };
+
+        let outcome = apply_prepared_fork_restore(
+            &mut state,
+            "parent-session",
+            "child-session",
+            restored_child,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForkTaskBoardRestore::PreservedExistingChild);
+
+        let child_list = state
+            .task_manager
+            .list(&serde_json::json!({"status_filter": "all"}))
+            .await;
+        assert!(
+            child_list.contains("child existing work"),
+            "fork restore must not overwrite an existing child task board: {child_list}"
+        );
+        assert!(
+            !child_list.contains("parent open work"),
+            "parent task board should only be copied into an empty child session: {child_list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_fork_restore_fails_before_switching_when_task_load_fails() {
+        let mut state = SessionState::default();
+        state.task_manager = std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(
+            "parent-session",
+            std::sync::Arc::new(FailingLoadTaskStore),
+        ));
+        state.set_session_id("parent-session");
+        state.turn = 7;
+        state.history = vec![("parent-q".into(), "parent-a".into())];
+
+        let child_state = session_runtime::RestoredSessionState {
+            history: vec![("child-q".into(), "child-a".into())],
+            turn: 1,
+            recent_tools: vec!["task".into()],
+            total_prompt_tokens: 10,
+            total_completion_tokens: 20,
+            total_cache_read_tokens: 30,
+            total_cache_creation_tokens: 40,
+        };
+        let restored_child = PreparedForkRestore {
+            history: child_state.history.clone(),
+            recent_tools: child_state.recent_tools.clone(),
+            csl_manager: None,
+            journal_state: child_state,
+            last_turn_event: None,
+        };
+
+        let error = apply_prepared_fork_restore(
+            &mut state,
+            "parent-session",
+            "child-session",
+            restored_child,
+        )
+        .await
+        .expect_err("task load failure should abort fork restore");
+
+        assert!(
+            error.contains("load existing task board for forked child child-session"),
+            "{error}"
+        );
+        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
+        assert_eq!(state.turn, 7);
+        assert_eq!(
+            state.history,
+            vec![("parent-q".to_string(), "parent-a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_fork_restore_skips_task_copy_for_cloud_observer_store() {
+        let mut state = SessionState::default();
+        state.set_session_id("parent-session");
+        let (notify_tx, _) = tokio::sync::broadcast::channel(1);
+        state.task_notify_tx = Some(notify_tx);
+        let created = state
+            .task_manager
+            .create(&serde_json::json!({"title": "cloud-owned task"}))
+            .await;
+        assert!(created.contains("created"), "{created}");
+
+        let child_state = session_runtime::RestoredSessionState {
+            history: vec![("child-q".into(), "child-a".into())],
+            turn: 1,
+            recent_tools: vec!["task".into()],
+            total_prompt_tokens: 10,
+            total_completion_tokens: 20,
+            total_cache_read_tokens: 30,
+            total_cache_creation_tokens: 40,
+        };
+        let restored_child = PreparedForkRestore {
+            history: child_state.history.clone(),
+            recent_tools: child_state.recent_tools.clone(),
+            csl_manager: None,
+            journal_state: child_state,
+            last_turn_event: None,
+        };
+
+        let outcome = apply_prepared_fork_restore(
+            &mut state,
+            "parent-session",
+            "child-session",
+            restored_child,
+        )
+        .await
+        .expect("cloud observer task store should not be written during fork restore");
+        assert_eq!(outcome, ForkTaskBoardRestore::SkippedCloudObserver);
+
+        let child_list = state
+            .task_manager
+            .list(&serde_json::json!({"status_filter": "all"}))
+            .await;
+        assert!(
+            child_list.starts_with("No tasks"),
+            "cloud task inheritance must be handled by the server write surface, not the read-only observer: {child_list}"
+        );
     }
 }

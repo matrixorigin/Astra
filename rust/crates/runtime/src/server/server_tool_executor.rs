@@ -707,9 +707,9 @@ fn render_session_history_rows(
 /// Code's `prepareContextForPlanMode` behaviour: the model must call
 /// ExitPlanMode before writing anything.
 ///
-/// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search,
-/// task_*, memory_retrieve, …) stay available so the agent can continue
-/// exploring while authoring a plan.
+/// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search)
+/// and session-scoped authoring tools (`task`, memory_retrieve, …) stay
+/// available so the agent can continue exploring while authoring a plan.
 fn is_plan_mode_blocked_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -2037,21 +2037,58 @@ impl ServerToolExecutor {
             "rollback_session_state" => {
                 tool_result_from_output(self.rollback_session_state(args).await)
             }
-            "task_create" => tool_result_from_output(self.task_create(args).await),
-            "task_list" => tool_result_from_output(self.task_list(args).await),
-            "task_get" => tool_result_from_output(self.task_get(args).await),
-            "task_update" => tool_result_from_output(self.task_update(args).await),
-            "task_stop" => tool_result_from_output(self.task_stop(args).await),
             "task" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+                let action_value = args.get("action");
+                let action = match action_value {
+                    Some(Value::String(action)) => action.as_str(),
+                    Some(_) => {
+                        return tool_result_from_output(
+                            "Error: field 'action' must be a string".to_string(),
+                        );
+                    }
+                    None => {
+                        return tool_result_from_output(
+                            "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive.".to_string(),
+                        );
+                    }
+                };
                 match action {
-                    "create" => tool_result_from_output(self.task_create(args).await),
-                    "list" => tool_result_from_output(self.task_list(args).await),
-                    "get" => tool_result_from_output(self.task_get(args).await),
-                    "update" => tool_result_from_output(self.task_update(args).await),
-                    "stop" => tool_result_from_output(self.task_stop(args).await),
+                    "create" => match Self::validate_task_tool_args_for_action("create", args) {
+                        Ok(()) => tool_result_from_output(self.task_action_create(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "list" => match Self::validate_task_tool_args_for_action("list", args) {
+                        Ok(()) => tool_result_from_output(self.task_list(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "get" => match Self::validate_task_tool_args_for_action("get", args) {
+                        Ok(()) => tool_result_from_output(self.task_get(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "update" => match Self::validate_task_tool_args_for_action("update", args) {
+                        Ok(()) => tool_result_from_output(self.task_action_update(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
+                        Ok(()) => tool_result_from_output(self.task_action_stop(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "list_user" => {
+                        match Self::validate_task_tool_args_for_action("list_user", args) {
+                            Ok(()) => tool_result_from_output(self.task_list_user(args).await),
+                            Err(error) => tool_result_from_output(format!("Error: {error}")),
+                        }
+                    }
+                    "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
+                        Ok(()) => tool_result_from_output(self.task_adopt(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "archive" => match Self::validate_task_tool_args_for_action("archive", args) {
+                        Ok(()) => tool_result_from_output(self.task_archive(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
                     other => tool_result_from_output(format!(
-                        "Unknown task action: '{other}'. Use: create, list, get, update, stop"
+                        "Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive."
                     )),
                 }
             }
@@ -2217,7 +2254,7 @@ impl ServerToolExecutor {
                     "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, compress_context, \
-                     rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
+                     rollback_session_state, task, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
@@ -3062,7 +3099,7 @@ impl ServerToolExecutor {
         }
     }
 
-    /// Decide whether a `task_*` tool's output represents a successful
+    /// Decide whether a `task(action=...)` tool output represents a successful
     /// mutation worth snapshotting for rollback.
     ///
     /// Conservative policy (C-SRV-1 fix): the **default is "yes"**, with
@@ -3072,7 +3109,7 @@ impl ServerToolExecutor {
     ///
     /// Pre-fix this returned `false` when the body had no `{`, which
     /// silently dropped the rollback snapshot for every successful
-    /// task_create / task_update / task_stop whose response was a plain
+    /// `task(action=create|update|stop)` response that was a plain
     /// human-readable summary (e.g. just `"Created task #5: foo"`).
     /// That made `rollback_session_state` a no-op on the most common path.
     fn task_output_success(output: &str) -> bool {
@@ -3095,14 +3132,103 @@ impl ServerToolExecutor {
         true
     }
 
-    async fn task_create(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state().await;
+    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
+        let allowed: &[&str] = match action {
+            "create" => &[
+                "action",
+                "title",
+                "description",
+                "subtasks",
+                "active_form",
+                "owner",
+                "metadata",
+            ],
+            "list" => &["action", "status_filter"],
+            "get" => &["action", "task_id"],
+            "update" => &[
+                "action",
+                "task_id",
+                "new_status",
+                "title",
+                "description",
+                "subtask_id",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+                "remove_blocks",
+                "remove_blocked_by",
+                "error_message",
+            ],
+            "stop" => &["action", "task_id", "reason"],
+            "list_user" => &["action", "user_status"],
+            "adopt" => &["action", "source_session_id", "task_id"],
+            "archive" => &["action", "task_id", "older_than_days"],
+            _ => return Ok(()),
+        };
+        let Some(obj) = args.as_object() else {
+            return Err(format!("task.{action} arguments must be an object"));
+        };
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "unknown field '{key}' for task.{action} (valid: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
+        let Some(raw) = args.get("user_status") else {
+            return Ok("active");
+        };
+        let Some(status) = raw.as_str() else {
+            return Err("Error: field 'user_status' must be a string".to_string());
+        };
+        if astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.contains(&status) {
+            Ok(status)
+        } else {
+            Err(format!(
+                "Error: invalid user_status '{}' (valid: {})",
+                status,
+                astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.join("|")
+            ))
+        }
+    }
+
+    fn task_user_status_matches(
+        status_filter: &str,
+        status: astra_tools::task_mgmt::SessionTaskStatusKind,
+    ) -> bool {
+        match status_filter {
+            // Cross-session active means open work the user may need to
+            // resume or adopt. Keep this aligned with single-session
+            // task.list(status_filter="active"): pending + in_progress +
+            // paused.
+            "active" => status.blocks_duplicate_create(),
+            "all" => true,
+            status_filter => {
+                status == astra_tools::task_mgmt::SessionTaskStatusKind::from(status_filter)
+            }
+        }
+    }
+
+    async fn task_action_create(&self, args: &Value) -> String {
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.create(args).await;
         if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_create:{}",
+                    "task:create:{}",
                     args.get("title").and_then(Value::as_str).unwrap_or("task")
                 ),
             );
@@ -3118,14 +3244,19 @@ impl ServerToolExecutor {
         self.task_manager.get(args).await
     }
 
-    async fn task_update(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state().await;
+    async fn task_action_update(&self, args: &Value) -> String {
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.update(args).await;
         if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_update:{}",
+                    "task:update:{}",
                     args.get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
@@ -3135,17 +3266,90 @@ impl ServerToolExecutor {
         output
     }
 
-    async fn task_stop(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state().await;
+    async fn task_action_stop(&self, args: &Value) -> String {
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.stop(args).await;
         if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_stop:{}",
+                    "task:stop:{}",
                     args.get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
+                ),
+            );
+        }
+        output
+    }
+
+    async fn task_list_user(&self, args: &Value) -> String {
+        let status_filter = match Self::normalize_task_user_status(args) {
+            Ok(status) => status,
+            Err(err) => return err,
+        };
+        let sessions = match self.task_manager.store().load_all_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let mut rows = Vec::new();
+        for (session_id, tasks) in sessions {
+            for task in tasks {
+                let include = Self::task_user_status_matches(status_filter, task.status);
+                if include {
+                    rows.push(json!({
+                        "session_id": session_id,
+                        "todo_id": task.id,
+                        "title": task.title,
+                        "status": task.status.to_string(),
+                        "updated_at": task.updated_at,
+                    }));
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            let a_updated = a.get("updated_at").and_then(Value::as_str).unwrap_or("");
+            let b_updated = b.get("updated_at").and_then(Value::as_str).unwrap_or("");
+            b_updated.cmp(a_updated)
+        });
+        rows.truncate(200);
+        let total = rows.len();
+        format!(
+            "Cross-session todos: {total} item(s)\n{}",
+            json!({
+                "tasks": rows,
+                "total": total,
+            })
+        )
+    }
+
+    async fn task_adopt(&self, _args: &Value) -> String {
+        "Error: task(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
+            .to_string()
+    }
+
+    async fn task_archive(&self, args: &Value) -> String {
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
+        let output = self.task_manager.archive(args).await;
+        if Self::task_output_success(&output) {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task:archive:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("bulk")
                 ),
             );
         }
@@ -3167,7 +3371,9 @@ impl ServerToolExecutor {
             .snapshot()
             .await
             .into_iter()
-            .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
+            .find(|task| {
+                Self::approved_plan_task_matches(task, plan_id, &plan_state.goal, &plan_fingerprint)
+            })
             .map(|task| task.id);
 
         let task_id = if let Some(task_id) = existing_task_id {
@@ -3178,12 +3384,15 @@ impl ServerToolExecutor {
                 .subtasks
                 .iter()
                 .map(|subtask| {
-                    json!({
+                    let mut value = json!({
                         "id": subtask.id,
                         "title": subtask.title,
-                        "description": subtask.description,
                         "depends_on": subtask.depends_on,
-                    })
+                    });
+                    if let Some(description) = subtask.description.as_deref() {
+                        value["description"] = json!(description);
+                    }
+                    value
                 })
                 .collect();
             let create_output = self
@@ -3215,7 +3424,14 @@ impl ServerToolExecutor {
                 .snapshot()
                 .await
                 .into_iter()
-                .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
+                .find(|task| {
+                    Self::approved_plan_task_matches(
+                        task,
+                        plan_id,
+                        &plan_state.goal,
+                        &plan_fingerprint,
+                    )
+                })
                 .map(|task| task.id);
             if let Some(task_id) = created_task_id {
                 task_id
@@ -3255,7 +3471,14 @@ impl ServerToolExecutor {
                     .snapshot()
                     .await
                     .into_iter()
-                    .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
+                    .find(|task| {
+                        Self::approved_plan_task_matches(
+                            task,
+                            plan_id,
+                            &plan_state.goal,
+                            &plan_fingerprint,
+                        )
+                    })
                     .map(|task| task.id)
                     .ok_or_else(|| {
                         format!(
@@ -3268,6 +3491,9 @@ impl ServerToolExecutor {
                 ));
             }
         };
+
+        self.pause_other_in_progress_tasks_for_plan_handoff(&task_id)
+            .await?;
 
         let update_output = self
             .task_manager
@@ -3289,25 +3515,73 @@ impl ServerToolExecutor {
         Ok(())
     }
 
-    fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
-        let mut parts = Vec::new();
-        for subtask in &plan.subtasks {
-            parts.push(format!("{}:{}", subtask.id, subtask.title));
+    async fn pause_other_in_progress_tasks_for_plan_handoff(
+        &self,
+        target_task_id: &str,
+    ) -> Result<(), String> {
+        let running_task_ids: Vec<String> = self
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|task| task.id != target_task_id && task.status.is_in_progress())
+            .map(|task| task.id)
+            .collect();
+        for running_task_id in running_task_ids {
+            let output = self
+                .task_manager
+                .update(&json!({
+                    "task_id": running_task_id,
+                    "new_status": "paused",
+                    "metadata": {
+                        "auto_paused_reason": "approved_plan_handoff",
+                        "handoff_to_task_id": target_task_id,
+                    }
+                }))
+                .await;
+            if output.starts_with("Error:") {
+                return Err(output);
+            }
         }
-        parts.join("|")
+        Ok(())
+    }
+
+    fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
+        let parts: Vec<Value> = plan
+            .subtasks
+            .iter()
+            .map(|subtask| {
+                let mut depends_on = subtask.depends_on.clone();
+                depends_on.sort();
+                json!({
+                    "id": subtask.id,
+                    "title": subtask.title,
+                    "description": subtask.description,
+                    "depends_on": depends_on,
+                })
+            })
+            .collect();
+        serde_json::to_string(&parts).unwrap_or_default()
     }
 
     fn approved_plan_task_matches(
         task: &SessionTask,
         plan_id: &str,
+        goal: &str,
         plan_fingerprint: &str,
     ) -> bool {
+        if !task.status.is_open_work() {
+            return false;
+        }
         let metadata = task.metadata.as_ref();
         let source = metadata
             .and_then(|metadata| metadata.get("source"))
             .and_then(Value::as_str);
         let task_plan_id = metadata
             .and_then(|metadata| metadata.get("plan_id"))
+            .and_then(Value::as_str);
+        let task_goal = metadata
+            .and_then(|metadata| metadata.get("plan_goal"))
             .and_then(Value::as_str);
         let task_fingerprint = metadata
             .and_then(|metadata| metadata.get("plan_fingerprint"))
@@ -3317,7 +3591,7 @@ impl ServerToolExecutor {
             && task_fingerprint == Some(plan_fingerprint)
             && match task_plan_id {
                 Some(existing_plan_id) => existing_plan_id == plan_id,
-                None => true,
+                None => task_goal == Some(goal) || task.title == goal,
             }
     }
 
@@ -5073,6 +5347,322 @@ esac
             None,
         );
         (exec, dir)
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_routes_archive_on_server_executor() {
+        let (exec, _dir) = test_executor();
+
+        let created = exec
+            .execute(
+                "task",
+                &json!({"action": "create", "title": "server archive"}),
+            )
+            .await;
+        assert!(
+            created.contains("\"success\":true"),
+            "create precondition failed: {created}"
+        );
+        let completed = exec
+            .execute(
+                "task",
+                &json!({"action": "update", "task_id": "task-1", "new_status": "completed"}),
+            )
+            .await;
+        assert!(
+            completed.contains("\"status\":\"completed\""),
+            "complete precondition failed: {completed}"
+        );
+
+        let archived = exec
+            .execute("task", &json!({"action": "archive", "task_id": "task-1"}))
+            .await;
+        assert!(
+            !archived.contains("Unknown task action"),
+            "archive must be routed by the consolidated task tool: {archived}"
+        );
+        assert!(
+            archived.contains("\"status\":\"archived\""),
+            "archive should move the task to archived: {archived}"
+        );
+
+        let list = exec
+            .execute(
+                "task",
+                &json!({"action": "list", "status_filter": "archived"}),
+            )
+            .await;
+        assert!(
+            list.contains("\"count\":1") && list.contains("server archive"),
+            "archived task should be queryable through the same server executor: {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_task_tool_names_are_not_executable_on_server_executor() {
+        let (exec, _dir) = test_executor();
+
+        let legacy = exec
+            .execute("task_create", &json!({"title": "old surface"}))
+            .await;
+        assert!(
+            legacy.contains("not available") || legacy.contains("Unknown tool"),
+            "legacy task_create must not remain an executable task surface: {legacy}"
+        );
+
+        let unified = exec
+            .execute("task", &json!({"action": "create", "title": "new surface"}))
+            .await;
+        assert!(
+            unified.contains("\"success\":true") && unified.contains("task-1"),
+            "unified task(action=create) should remain the executable surface: {unified}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_rejects_bad_action_shape_on_server_executor() {
+        let (exec, _dir) = test_executor();
+
+        let missing = exec.execute("task", &json!({})).await;
+        assert!(
+            missing.starts_with("Error:")
+                && missing.contains("missing required parameter")
+                && missing.contains("action")
+                && !missing.contains("\"count\""),
+            "server task tool must not default missing action to list: {missing}"
+        );
+
+        let wrong_type = exec.execute("task", &json!({"action": true})).await;
+        assert!(
+            wrong_type.starts_with("Error:")
+                && wrong_type.contains("field 'action'")
+                && wrong_type.contains("string"),
+            "server task tool should reject non-string action: {wrong_type}"
+        );
+
+        let unknown = exec.execute("task", &json!({"action": "complete"})).await;
+        assert!(
+            unknown.starts_with("Error:")
+                && unknown.contains("unknown `task` action")
+                && unknown.contains("update"),
+            "server task tool should mark unknown actions as tool errors: {unknown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_rejects_unknown_server_only_action_fields() {
+        let (exec, _dir) = test_executor();
+
+        let list_user_typo = exec
+            .execute(
+                "task",
+                &json!({"action": "list_user", "user_status": "active", "limit": 10}),
+            )
+            .await;
+        assert!(
+            list_user_typo.starts_with("Error:")
+                && list_user_typo.contains("unknown field")
+                && list_user_typo.contains("limit"),
+            "server list_user should reject unknown fields before returning a filtered list: {list_user_typo}"
+        );
+
+        let update_status_field = exec
+            .execute(
+                "task",
+                &json!({"action": "update", "task_id": "task-1", "status": "paused"}),
+            )
+            .await;
+        assert!(
+            update_status_field.starts_with("Error:")
+                && update_status_field.contains("unknown field")
+                && update_status_field.contains("status")
+                && !update_status_field.contains("new_status, status"),
+            "server task.update must not recognize the old status argument: {update_status_field}"
+        );
+
+        let list_status_field = exec
+            .execute("task", &json!({"action": "list", "status": "active"}))
+            .await;
+        assert!(
+            list_status_field.starts_with("Error:")
+                && list_status_field.contains("unknown field")
+                && list_status_field.contains("status")
+                && !list_status_field.contains("status_filter, status"),
+            "server task.list must not recognize the old status argument: {list_status_field}"
+        );
+
+        let adopt_typo = exec
+            .execute(
+                "task",
+                &json!({
+                    "action": "adopt",
+                    "source_session_id": "source",
+                    "task_id": "task-1",
+                    "copy_edges": true
+                }),
+            )
+            .await;
+        assert!(
+            adopt_typo.starts_with("Error:")
+                && adopt_typo.contains("unknown field")
+                && adopt_typo.contains("copy_edges")
+                && !adopt_typo.contains("todos:execute"),
+            "server adopt should reject typo fields before endpoint routing guidance: {adopt_typo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_routes_list_user_on_server_executor() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let manager_a = TaskManager::new("list-user-a", store.clone());
+        let manager_b = TaskManager::new("list-user-b", store.clone());
+        let manager_c = TaskManager::new("list-user-c", store.clone());
+        manager_a
+            .create(&json!({"title": "active cross-session task"}))
+            .await;
+        manager_b
+            .create(&json!({"title": "completed cross-session task"}))
+            .await;
+        manager_b
+            .update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        manager_c
+            .create(&json!({"title": "paused cross-session task"}))
+            .await;
+        manager_c
+            .update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_task_store(store);
+
+        let active = exec.execute("task", &json!({"action": "list_user"})).await;
+        assert!(
+            active.contains("\"total\":2")
+                && active.contains("active cross-session task")
+                && active.contains("paused cross-session task"),
+            "list_user should include open tasks across known sessions, including paused: {active}"
+        );
+        assert!(
+            !active.contains("completed cross-session task"),
+            "default list_user view should not include completed tasks: {active}"
+        );
+
+        let completed = exec
+            .execute(
+                "task",
+                &json!({"action": "list_user", "user_status": "completed"}),
+            )
+            .await;
+        assert!(
+            completed.contains("\"total\":1") && completed.contains("completed cross-session task"),
+            "completed list_user view should be status-filtered: {completed}"
+        );
+
+        let typo = exec
+            .execute(
+                "task",
+                &json!({"action": "list_user", "user_status": "cancelledd"}),
+            )
+            .await;
+        assert!(
+            typo.contains("invalid user_status") && typo.contains("cancelled"),
+            "invalid list_user status must not silently return an empty list: {typo}"
+        );
+
+        let wrong_type = exec
+            .execute("task", &json!({"action": "list_user", "user_status": true}))
+            .await;
+        assert!(
+            wrong_type.contains("user_status") && wrong_type.contains("string"),
+            "wrong-type user_status should be actionable: {wrong_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_task_mutation_refuses_when_rollback_snapshot_load_fails() {
+        struct LoadFailMutateWouldSucceedStore {
+            mutate_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl TaskStore for LoadFailMutateWouldSucceedStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Err("simulated task board load failure".to_string())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn mutate(
+                &self,
+                _session_id: &str,
+                mutation: astra_tools::task_mgmt::TaskMutation,
+            ) -> Result<String, String> {
+                self.mutate_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = mutation(Vec::new(), 1)?;
+                Ok(result.response)
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let mutate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn TaskStore> = Arc::new(LoadFailMutateWouldSucceedStore {
+            mutate_calls: Arc::clone(&mutate_calls),
+        });
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_task_store(store);
+
+        let out = exec
+            .execute(
+                "task",
+                &json!({"action": "create", "title": "must not mutate"}),
+            )
+            .await;
+
+        assert!(
+            out.starts_with("Error:")
+                && out.contains("rollback snapshot")
+                && out.contains("simulated task board load failure"),
+            "server task mutation should fail closed when rollback snapshot cannot be captured: {out}"
+        );
+        assert_eq!(
+            mutate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "server task mutation must not run after rollback snapshot capture fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_adopt_returns_actionable_server_executor_error() {
+        let (exec, _dir) = test_executor();
+        let out = exec
+            .execute(
+                "task",
+                &json!({
+                    "action": "adopt",
+                    "source_session_id": "source",
+                    "task_id": "task-1"
+                }),
+            )
+            .await;
+        assert!(
+            out.starts_with("Error:") && out.contains("todos:execute"),
+            "adopt must be a known action with an actionable transactional endpoint error: {out}"
+        );
     }
 
     struct PanicEdgeDispatch;
@@ -7339,6 +7929,186 @@ esac
     }
 
     #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_reopen_completed_plan_history() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("repeat server plan".into(), "alice".into());
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "repeatable server step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-repeat-server", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "repeat-server-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "first approval must announce unlock; got: {result}"
+        );
+        let completed = exec
+            .task_manager
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "completed",
+            }))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+
+        repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
+            .await
+            .unwrap();
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "repeat approval must announce unlock; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            2,
+            "completed approved-plan history must not be reopened: {approved_plan_tasks:?}"
+        );
+        assert!(
+            approved_plan_tasks
+                .iter()
+                .any(|task| task.status.is_completed()),
+            "completed history should remain completed: {approved_plan_tasks:?}"
+        );
+        assert!(
+            approved_plan_tasks
+                .iter()
+                .any(|task| task.status.is_in_progress()),
+            "repeat approval should create a fresh in-progress task: {approved_plan_tasks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_reuse_cli_style_tree_for_different_goal() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("new visible goal".into(), "alice".into());
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "shared step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-new-visible-goal", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("different-goal-session", Some("plan-new-visible-goal"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "different-goal-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let old_cli_style = exec
+            .task_manager
+            .create(&json!({
+                "title": "old visible goal",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_goal": "old visible goal",
+                    "plan_fingerprint": fingerprint
+                },
+                "subtasks": [
+                    { "id": "step-1", "title": "shared step" }
+                ]
+            }))
+            .await;
+        assert!(old_cli_style.contains("created"), "{old_cli_style}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "exit_plan_mode approved must announce unlock; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            2,
+            "matching fingerprints must not merge different plan goals: {approved_plan_tasks:?}"
+        );
+        let old_task = approved_plan_tasks
+            .iter()
+            .find(|task| task.title == "old visible goal")
+            .expect("old CLI-style task remains distinct");
+        assert!(
+            old_task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_id"))
+                .is_none(),
+            "old different-goal task must not be claimed by the new plan: {old_task:?}"
+        );
+        assert!(
+            approved_plan_tasks.iter().any(|task| {
+                task.title == "new visible goal"
+                    && task
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("plan_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("plan-new-visible-goal")
+            }),
+            "new plan should create and claim its own task tree: {approved_plan_tasks:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn exit_plan_mode_approved_does_not_reuse_stale_server_tree_when_fingerprint_changes() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
@@ -7448,6 +8218,119 @@ esac
                         .any(|subtask| subtask.title == "old task board sync")
             }),
             "stale tree should remain distinct rather than being silently mutated: {approved_plan_tasks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_reuse_stale_server_tree_when_dependencies_change() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "ship dependency-aware plan".into(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "build core".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-2".into(),
+                title: "verify core".into(),
+                depends_on: vec!["step-1".into()],
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        let stale_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        repo.save("plan-same-id-new-deps", &mut state, None)
+            .await
+            .unwrap();
+
+        state.plan.subtasks[1].depends_on.clear();
+        let fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        assert_ne!(
+            stale_fingerprint, fresh_fingerprint,
+            "dependency changes must affect task-board fingerprint"
+        );
+        repo.save("plan-same-id-new-deps", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("same-deps-session", Some("plan-same-id-new-deps"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "same-deps-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let stale_tree = exec
+            .task_manager
+            .create(&json!({
+                "title": "ship dependency-aware plan",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-same-id-new-deps",
+                    "plan_fingerprint": stale_fingerprint,
+                },
+                "subtasks": [
+                    { "id": "step-1", "title": "build core" },
+                    { "id": "step-2", "title": "verify core", "depends_on": ["step-1"] }
+                ]
+            }))
+            .await;
+        assert!(stale_tree.contains("created"), "{stale_tree}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "exit_plan_mode approved must announce unlock; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            2,
+            "a changed dependency graph must create a fresh mirrored tree: {approved_plan_tasks:?}"
+        );
+        let fresh = approved_plan_tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_fingerprint"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(fresh_fingerprint.as_str())
+            })
+            .expect("fresh mirrored plan tree");
+        let verify = fresh
+            .subtasks
+            .iter()
+            .find(|subtask| subtask.id == "step-2")
+            .expect("verify step");
+        assert!(
+            verify.depends_on.is_empty(),
+            "fresh mirrored tree must reflect changed dependencies: {fresh:?}"
         );
     }
 

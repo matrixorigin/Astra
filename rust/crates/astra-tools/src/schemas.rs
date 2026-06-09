@@ -44,6 +44,7 @@ pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
 pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
     let _ = env; // reserved for future env-gated tools
     let mut schemas = all_tool_schemas_core();
+    enforce_task_schema_unknown_field_contract(&mut schemas);
     // run_script is Unix-only (UDS RPC transport). Always exposed on Unix —
     // no env gate, this is the production tool.
     #[cfg(unix)]
@@ -66,6 +67,35 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
         }
     }));
     schemas
+}
+
+fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
+    if let Some(task) = schemas.iter_mut().find(|schema| {
+        schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some("task")
+    }) {
+        if let Some(parameters) = task
+            .get_mut("function")
+            .and_then(|function| function.get_mut("parameters"))
+            .and_then(Value::as_object_mut)
+        {
+            parameters.insert("additionalProperties".to_string(), Value::Bool(false));
+            if let Some(subtasks) = parameters
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.get_mut("subtasks"))
+                .and_then(Value::as_object_mut)
+            {
+                subtasks.insert(
+                    "maxItems".to_string(),
+                    Value::from(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
+                );
+            }
+        }
+    }
 }
 
 /// Default `run_script` schema exposed when the caller has not yet wired
@@ -101,6 +131,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Publish a file that was already generated in the current session workspace or /tmp so the web UI can preview and download it. Use this after creating images, PDFs, CSVs, Markdown, HTML, or other files with bash/write_file/run_script. Do not use this to generate content directly; first create the file, then publish its path.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
@@ -122,6 +153,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Execute a shell command in the project root. PREFER dedicated tools: git for VCS, glob for file search, grep for content search, read_file for file reading, write_file/str_replace for edits. Use bash only for bespoke scripting, chain pipelines, builds/tests/installs, or actions with no dedicated tool. Shell commands bypass safety validations (no path-traversal or shell-meta guards) — prefer dedicated tools whenever they cover the operation. Identical commands are cached per session; use `force: true` to bypass the cache.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
                         "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Use a larger value for long builds/tests, e.g. cargo build or full test suites."},
@@ -138,6 +170,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Read file contents. Use start_line/end_line for large files. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based)"},
@@ -817,74 +850,68 @@ fn all_tool_schemas_core() -> Vec<Value> {
         ## When to Use\n\
         - 3 or more distinct outcomes, files, or phases.\n\
         - Approved plans or delegated/background work.\n\
-        - Scope expands mid-flight.\n\
+        - Scope expands.\n\
         \n\
-        1. Create one task per concrete outcome or phase — NOT one umbrella task for the whole request.\n\
+        1. Create one task per outcome or phase — NOT one umbrella task for the whole request.\n\
         2. For broad work, split into 3-7 leaf tasks sized to one artifact or validation step.\n\
-        3. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
+        3. Mark first actionable task `in_progress` BEFORE beginning work.\n\
         4. Keep exactly ONE task as `in_progress` at a time.\n\
         5. Finish tasks immediately: `completed` on success, `failed` + `error_message` on failure, use `archive` when old history should leave the board.\n\
         \n\
         ## When NOT to Use\n\
         - Single edit / single command / answer.\n\
         - Pure information request.\n\
-        - Trivial work.\n\
+        - Trivial.\n\
         \n\
-        ## Field Conventions\n\
-        - `title`: specific outcome.\n\
-        - `active_form`: spinner text while in_progress.\n\
-        - `description`: definition of done.\n\
-        - `subtasks`: optional nested steps; use `depends_on` for order.\n\
-        - `metadata`: free-form state; on update, `{key: null}` deletes that key.\n\
+        Field notes: `title` is the concrete outcome, `description` is done criteria, `active_form` is spinner text, `metadata` null deletes a key.\n\
         \n\
-        <example>\n\
-        User: Build an employee reimbursement system.\n\
-        Assistant: Create tasks like `scaffold backend`, `expense API`, `frontend flows`, `verify startup`; do NOT create one umbrella task `build reimbursement system`. Mark the first task `in_progress` BEFORE beginning work.\n\
-        </example>",
+        <example>User: Build reimbursements. Assistant: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation to perform"},
                         "source_session_id": {"type": "string", "description": "(adopt) Source session id."},
-                        "older_than_days": {"type": "integer", "description": "(archive bulk) Archive completed tasks older than N days. Default 30."},
-                        "user_status": {"type": "string", "enum": ["active","completed","failed","archived","all"], "description": "(list_user) Cross-session filter. Default active."},
+                        "older_than_days": {"type": "integer", "description": "(archive bulk; omit task_id) Archive completed tasks older than N days. Default 30."},
+                        "user_status": {"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Cross-session filter. Default active = open work: pending + in_progress + paused."},
                         "title": {"type": "string", "description": "(create/update) Imperative title."},
                         "description": {"type": "string", "description": "(create/update) Definition of done."},
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in the current session."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status. `deleted` permanently removes the task."},
-                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) Legacy alias for new_status."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","archived","all","active"], "description": "(list) Result filter. `active` = pending + in_progress."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Status. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list) `active` = pending + in_progress + paused."},
                         "subtask_id": {"type": "string", "description": "(update) Specific subtask id."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Task owner."},
                         "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs; null deletes a key on update."},
-                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids blocked by this task."},
-                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids that must finish before this task starts."},
-                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from blocks."},
-                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from blocked_by."},
+                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids this task blocks; edge is symmetric. Blocked tasks wait for completed blockers."},
+                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids blocking this task. It cannot start until every blocker is completed or removed."},
+                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove symmetric blocks edges."},
+                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove symmetric blocked_by edges."},
                         "subtasks": {
                             "type": "array",
                             "description": "(create) Optional subtasks.",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": false,
                                 "properties": {
                                     "id": {"type": "string"},
                                     "title": {"type": "string"},
                                     "description": {"type": "string"},
-                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Sibling ids completed before this subtask starts or completes."},
+                                    "owner": {"type": "string"}
                                 },
                                 "required": ["id", "title"]
                             }
                         },
                         "reason": {"type": "string", "description": "(stop) Why the task is being stopped."},
-                        "error_message": {"type": "string", "description": "(update) Failure reason."}
+                        "error_message": {"type": "string", "description": "(update) Failure reason to include when setting new_status='failed'."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "create": ["title"],
                         "update": ["task_id"],
                         "get": ["task_id"],
-                        "stop": ["task_id"]
+                        "stop": ["task_id"],
+                        "adopt": ["source_session_id", "task_id"]
                     }
                 }
             }
@@ -1334,13 +1361,29 @@ mod tests {
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task["function"]["description"].as_str().unwrap();
         let properties = &task["function"]["parameters"]["properties"];
+        assert_eq!(
+            task["function"]["parameters"]["additionalProperties"], false,
+            "task schema should reject unknown top-level fields"
+        );
 
-        for field in ["active_form", "add_blocks", "add_blocked_by"] {
+        for field in [
+            "active_form",
+            "add_blocks",
+            "add_blocked_by",
+            "error_message",
+        ] {
             assert!(
                 properties.get(field).is_some(),
                 "task schema must expose {field} to the model"
             );
         }
+        let error_message_desc = properties["error_message"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            error_message_desc.contains("new_status='failed'"),
+            "error_message should be explicitly tied to failed task updates: {error_message_desc}"
+        );
         assert!(
             properties["active_form"]["description"]
                 .as_str()
@@ -1360,6 +1403,120 @@ mod tests {
                 .and_then(|_| properties["status_filter"]["enum"].as_array())
                 .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("archived"))),
             "task schema should let the model query archived tasks explicitly"
+        );
+        assert!(
+            properties["status_filter"]
+                .as_object()
+                .and_then(|_| properties["status_filter"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
+            "task schema should let the model query cancelled tasks explicitly"
+        );
+        assert!(
+            properties["status_filter"]
+                .as_object()
+                .and_then(|_| properties["status_filter"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
+            "task schema should let the model query auto-paused tasks explicitly"
+        );
+        let status_filter_desc = properties["status_filter"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            status_filter_desc.contains("active")
+                && status_filter_desc.contains("pending + in_progress + paused"),
+            "task schema should explain task.list active includes paused open work: {status_filter_desc}"
+        );
+        assert!(
+            properties.get("status").is_none(),
+            "task schema must not expose the old status field; use new_status/status_filter"
+        );
+        assert!(
+            properties["new_status"]
+                .as_object()
+                .and_then(|_| properties["new_status"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
+            "task schema should let the model intentionally pause/resume stale work"
+        );
+        let new_status_desc = properties["new_status"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            new_status_desc.contains("Only one parent task may be in_progress"),
+            "new_status should teach the single in_progress task invariant: {new_status_desc}"
+        );
+        let add_blocked_by_desc = properties["add_blocked_by"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            add_blocked_by_desc.contains("completed or removed"),
+            "blocked_by should explain blockers must resolve before start: {add_blocked_by_desc}"
+        );
+        let add_blocks_desc = properties["add_blocks"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            add_blocks_desc.contains("edge is symmetric"),
+            "blocks should explain task dependency edges are symmetric: {add_blocks_desc}"
+        );
+        let depends_on_desc =
+            properties["subtasks"]["items"]["properties"]["depends_on"]["description"]
+                .as_str()
+                .unwrap_or_default();
+        assert!(
+            depends_on_desc.contains("before this subtask starts or completes"),
+            "subtask depends_on should explain execution order constraints: {depends_on_desc}"
+        );
+        let subtask_item = &properties["subtasks"]["items"];
+        assert_eq!(
+            properties["subtasks"]["maxItems"].as_u64(),
+            Some(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
+            "task schema should expose the same subtask fan-out limit as TaskManager"
+        );
+        assert_eq!(
+            subtask_item["additionalProperties"], false,
+            "subtask schema should reject unknown fields"
+        );
+        assert!(
+            subtask_item["properties"].get("owner").is_some(),
+            "subtask schema should expose the supported owner field"
+        );
+        assert!(
+            properties["user_status"]
+                .as_object()
+                .and_then(|_| properties["user_status"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
+            "task schema should let the model query cancelled cross-session tasks explicitly"
+        );
+        assert!(
+            properties["user_status"]
+                .as_object()
+                .and_then(|_| properties["user_status"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
+            "task schema should let the model query paused cross-session tasks explicitly"
+        );
+        let user_status_desc = properties["user_status"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            user_status_desc.contains("Default active")
+                && user_status_desc.contains("pending + in_progress + paused"),
+            "task schema should explain list_user active includes paused open work: {user_status_desc}"
+        );
+        let per_action_required = task["function"]["parameters"]["x-astra-per-action-required"]
+            .as_object()
+            .expect("task schema must expose per-action required fields");
+        let adopt_required = per_action_required
+            .get("adopt")
+            .and_then(|value| value.as_array())
+            .expect("adopt should list required fields");
+        assert!(
+            adopt_required
+                .iter()
+                .any(|value| value.as_str() == Some("source_session_id"))
+                && adopt_required
+                    .iter()
+                    .any(|value| value.as_str() == Some("task_id")),
+            "adopt requires both source_session_id and task_id: {adopt_required:?}"
         );
     }
 

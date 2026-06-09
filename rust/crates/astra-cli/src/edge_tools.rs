@@ -102,8 +102,9 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// in `phase=planning` these tools must be short-circuited: they all
 /// mutate the world (filesystem, DB, git, GitHub), so allowing them
 /// would let the model execute a plan it has not yet had approved.
-/// Read-only tools (read_file, grep, glob, git_status/diff/log,
-/// task_*, memory_*) stay available so the agent can keep authoring.
+/// Read-only tools (read_file, grep, glob, git_status/diff/log) and
+/// session-scoped authoring tools (`task`, memory_*) stay available so the
+/// agent can keep authoring without mutating the external world.
 fn is_plan_mode_blocked_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -563,9 +564,9 @@ pub struct ToolExecutor {
     /// In-memory task manager for the current session.
     task_manager: std::sync::Arc<task_mgmt::TaskManager>,
     /// Broadcast sender that signals the TaskBoardObserver after a
-    /// successful cloud `route_task_action`. Payload is the session_id
-    /// that changed. `None` when offline (in-memory store handles its
-    /// own notifications via `InMemoryTaskStore::subscribe`).
+    /// successful cloud task mutation. Payload is the session_id that
+    /// changed. `None` when offline (in-memory store handles its own
+    /// notifications via `InMemoryTaskStore::subscribe`).
     pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Command queue for background task operations. Drained by the
     /// TUI event loop each tick. Allows the tool executor (which runs
@@ -1335,20 +1336,53 @@ impl ToolExecutor {
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
-    /// Phase 1 split (2026-05): the four background actions moved off
-    /// `task` onto the dedicated `agent_job` tool. When a stale model
-    /// (or a hallucination) calls the old path, return an actionable
-    /// Error: redirect — same shape as the `agent.delegate` rejection
-    /// — so `tool_result_semantics::is_tool_error` flags it red and
-    /// the model corrects on the next turn instead of silently
-    /// no-op'ing.
-    fn redirect_to_agent_job(old_action: &str, new_action: &str) -> String {
-        format!(
-            "Error: `task(action='{old_action}')` was removed in the agent_job split. \
-             Use `agent_job(action='{new_action}')` instead — same arguments, \
-             new tool name. The `task` tool is now exclusively for the durable \
-             session checklist (create/update/list/get/stop)."
-        )
+    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
+        let allowed: &[&str] = match action {
+            "create" => &[
+                "action",
+                "title",
+                "description",
+                "subtasks",
+                "active_form",
+                "owner",
+                "metadata",
+            ],
+            "list" => &["action", "status_filter"],
+            "get" => &["action", "task_id"],
+            "update" => &[
+                "action",
+                "task_id",
+                "new_status",
+                "title",
+                "description",
+                "subtask_id",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+                "remove_blocks",
+                "remove_blocked_by",
+                "error_message",
+            ],
+            "stop" => &["action", "task_id", "reason"],
+            "list_user" => &["action", "user_status"],
+            "adopt" => &["action", "source_session_id", "task_id"],
+            "archive" => &["action", "task_id", "older_than_days"],
+            _ => return Ok(()),
+        };
+        let Some(obj) = args.as_object() else {
+            return Err(format!("task.{action} arguments must be an object"));
+        };
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "unknown field '{key}' for task.{action} (valid: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -1374,6 +1408,10 @@ impl ToolExecutor {
             .unwrap_or(false)
     }
 
+    fn task_action_mutates_board(action: &str) -> bool {
+        matches!(action, "create" | "update" | "stop" | "adopt" | "archive")
+    }
+
     fn task_lifecycle_summary(action: &str, payload: &Value) -> &'static str {
         if payload.get("subtask_id").and_then(Value::as_str).is_some() {
             return "subtask_updated";
@@ -1381,6 +1419,7 @@ impl ToolExecutor {
         match action {
             "create" => "task_created",
             "stop" => "task_cancelled",
+            "archive" => "task_archived",
             "update" => match payload.get("status").and_then(Value::as_str) {
                 Some("completed") => "task_completed",
                 Some("failed") => "task_failed",
@@ -1432,6 +1471,9 @@ impl ToolExecutor {
         }
         if let Some(value) = payload.get("cancelled_subtasks").cloned() {
             detail.insert("cancelled_subtasks".to_string(), value);
+        }
+        if let Some(value) = payload.get("archived").cloned() {
+            detail.insert("archived".to_string(), value);
         }
         Value::Object(detail)
     }
@@ -1488,7 +1530,10 @@ impl ToolExecutor {
         .await
         {
             Ok(output) => {
-                if let Some(tx) = &self.task_notify_tx {
+                if Self::task_action_mutates_board(action)
+                    && Self::task_output_success(&output)
+                    && let Some(tx) = &self.task_notify_tx
+                {
                     let _ = tx.send(session_id);
                 }
                 Some(output)
@@ -1877,18 +1922,23 @@ impl ToolExecutor {
         }
     }
 
-    async fn task_create(&self, args: &Value) -> String {
+    async fn task_action_create(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("create", args).await {
             self.record_task_lifecycle_event("create", args, &output);
             return output;
         }
-        let snapshot = self.task_manager.snapshot_state().await;
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.create(args).await;
         if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_create:{}",
+                    "task:create:{}",
                     args.get("title").and_then(Value::as_str).unwrap_or("task")
                 ),
             );
@@ -1908,18 +1958,23 @@ impl ToolExecutor {
         }
         self.task_manager.get(args).await
     }
-    async fn task_update(&self, args: &Value) -> String {
+    async fn task_action_update(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("update", args).await {
             self.record_task_lifecycle_event("update", args, &output);
             return output;
         }
-        let snapshot = self.task_manager.snapshot_state().await;
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.update(args).await;
         if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_update:{}",
+                    "task:update:{}",
                     args.get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
@@ -1929,18 +1984,23 @@ impl ToolExecutor {
         }
         output
     }
-    async fn task_stop(&self, args: &Value) -> String {
+    async fn task_action_stop(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("stop", args).await {
             self.record_task_lifecycle_event("stop", args, &output);
             return output;
         }
-        let snapshot = self.task_manager.snapshot_state().await;
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.stop(args).await;
         if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_stop:{}",
+                    "task:stop:{}",
                     args.get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
@@ -1956,16 +2016,16 @@ impl ToolExecutor {
     /// the cross-session question is meaningless without a backing
     /// store that aggregates across users.
     async fn task_list_user(&self, args: &Value) -> String {
+        let status = match Self::normalize_task_user_status(args) {
+            Ok(status) => status,
+            Err(err) => return err,
+        };
         let Some(cloud_base) = self.cloud_base.clone() else {
             return "Error: task(action='list_user') requires a cloud connection. \
                     The cross-session view is server-side only — set ASTRA_API_URL \
                     or sign in with `astra login` to enable it."
                 .to_string();
         };
-        let status = args
-            .get("user_status")
-            .and_then(Value::as_str)
-            .unwrap_or("active");
         let token = self.cloud_token();
         match crate::cli::session::session_todo_client::list_user_todos(
             &cloud_base,
@@ -1976,6 +2036,24 @@ impl ToolExecutor {
         {
             Ok(output) => output,
             Err(err) => format!("Error: list_user todos failed: {err}"),
+        }
+    }
+
+    fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
+        let Some(raw) = args.get("user_status") else {
+            return Ok("active");
+        };
+        let Some(status) = raw.as_str() else {
+            return Err("Error: field 'user_status' must be a string".to_string());
+        };
+        if astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.contains(&status) {
+            Ok(status)
+        } else {
+            Err(format!(
+                "Error: invalid user_status '{}' (valid: {})",
+                status,
+                astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.join("|")
+            ))
         }
     }
 
@@ -1999,16 +2077,32 @@ impl ToolExecutor {
 
     /// `task(action='archive', task_id?)` — either archive one
     /// current-session task immediately, or bulk-archive stale
-    /// completed history (cloud-backed stores may widen bulk scope
-    /// to the current user's sessions).
+    /// completed history in the current session.
     async fn task_archive(&self, args: &Value) -> String {
-        if self.cloud_base.is_none() {
-            return "Error: task(action='archive') requires a cloud connection.".to_string();
+        if let Some(output) = self.route_task_action("archive", args).await {
+            self.record_task_lifecycle_event("archive", args, &output);
+            return output;
         }
-        match self.route_task_action("archive", args).await {
-            Some(output) => output,
-            None => "Error: cannot archive without an active session id".to_string(),
+        let snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
+        let output = self.task_manager.archive(args).await;
+        if Self::task_output_success(&output) {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task:archive:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("bulk")
+                ),
+            );
+            self.record_task_lifecycle_event("archive", args, &output);
         }
+        output
     }
 
     async fn task_background_shell(&self, args: &Value) -> String {
@@ -2286,14 +2380,8 @@ impl ToolExecutor {
             Some(s) if !s.trim().is_empty() => s,
             _ => return "Error: no active session.".to_string(),
         };
-        let journal_path = std::path::PathBuf::from(
-            dirs::home_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".to_string()),
-        )
-        .join(".astra")
-        .join("sessions")
-        .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::local_sessions_dir()
+            .join(format!("{session_id}.jsonl"));
 
         let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
             Ok(content) => content
@@ -2347,31 +2435,43 @@ impl ToolExecutor {
                 "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
             ));
         }
-        // Task status nudge: if there are active tasks, remind the
+        // Task status nudge: if there is open work, remind the
         // agent to update them (Claude Code parity: proactive nudge).
-        let tasks = self.task_manager.snapshot().await;
-        let active_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_active()).collect();
-        if !active_tasks.is_empty() {
-            out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
-            for t in active_tasks.iter().take(5) {
-                let status_icon = if t.status.is_in_progress() {
-                    "▶"
-                } else {
-                    "○"
-                };
-                let blocked = if !t.blocked_by.is_empty() {
-                    format!(" [blocked by: {}]", t.blocked_by.join(","))
-                } else {
-                    String::new()
-                };
+        match self.task_manager.load_tasks().await {
+            Ok(tasks) => {
+                let open_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_open_work()).collect();
+                if !open_tasks.is_empty() {
+                    out.push_str(&format!("\nOpen tasks: {}\n", open_tasks.len()));
+                    for t in open_tasks.iter().take(5) {
+                        let status_icon = if t.status.is_in_progress() {
+                            "▶"
+                        } else if t.status == astra_tools::task_mgmt::SessionTaskStatusKind::Paused
+                        {
+                            "⏸"
+                        } else {
+                            "○"
+                        };
+                        let blocked = if !t.blocked_by.is_empty() {
+                            format!(" [blocked by: {}]", t.blocked_by.join(","))
+                        } else {
+                            String::new()
+                        };
+                        out.push_str(&format!(
+                            "  {status_icon} {} — {}{}\n",
+                            t.id, t.title, blocked
+                        ));
+                    }
+                    out.push_str(
+                        "Hint: update task status with `task(action=\"update\", task_id=\"...\", new_status=\"...\")` as you make progress.\n",
+                    );
+                }
+            }
+            Err(error) => {
                 out.push_str(&format!(
-                    "  {status_icon} {} — {}{}\n",
-                    t.id, t.title, blocked
+                    "\nTask board unavailable: {error}\n\
+                     Do not assume there are no open tasks; retry `task(action=\"list\")` before creating duplicate work.\n"
                 ));
             }
-            out.push_str(
-                "Hint: update task status with `task(action=\"update\", task_id=\"...\", status=\"...\")` as you make progress.\n",
-            );
         }
         out
     }
@@ -3810,31 +3910,60 @@ impl ToolExecutor {
                 }
                 // Task management (unified tool with action param)
                 "task" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action_value = args.get("action");
+                    let action = match action_value {
+                        Some(Value::String(action)) => action.as_str(),
+                        Some(_) => return "Error: field 'action' must be a string".to_string(),
+                        None => "",
+                    };
                     match action {
-                        "create" => self.task_create(args).await,
-                        "list" => self.task_list(args).await,
-                        "get" => self.task_get(args).await,
-                        "update" => self.task_update(args).await,
-                        "stop" => self.task_stop(args).await,
+                        "create" => match Self::validate_task_tool_args_for_action("create", args)
+                        {
+                            Ok(()) => self.task_action_create(args).await,
+                            Err(error) => format!("Error: {error}"),
+                        },
+                        "list" => match Self::validate_task_tool_args_for_action("list", args) {
+                            Ok(()) => self.task_list(args).await,
+                            Err(error) => format!("Error: {error}"),
+                        },
+                        "get" => match Self::validate_task_tool_args_for_action("get", args) {
+                            Ok(()) => self.task_get(args).await,
+                            Err(error) => format!("Error: {error}"),
+                        },
+                        "update" => match Self::validate_task_tool_args_for_action("update", args)
+                        {
+                            Ok(()) => self.task_action_update(args).await,
+                            Err(error) => format!("Error: {error}"),
+                        },
+                        "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
+                            Ok(()) => self.task_action_stop(args).await,
+                            Err(error) => format!("Error: {error}"),
+                        },
                         // Cross-session views (Phase 7): user_id-indexed
                         // queries served by the server. Cloud-only;
                         // offline mode returns an error since there's
                         // nothing to aggregate across sessions.
-                        "list_user" => self.task_list_user(args).await,
-                        "adopt" => self.task_adopt(args).await,
-                        "archive" => self.task_archive(args).await,
-                        // Background actions moved to the dedicated `agent_job`
-                        // tool in the Phase 1 split (2026-05). The model may
-                        // still emit `task.background_*` from a stale schema
-                        // or hallucination — surface an Error: with the new
-                        // path so it self-corrects on the next turn.
-                        "background_shell" => Self::redirect_to_agent_job("background_shell", "shell"),
-                        "background_agent" => Self::redirect_to_agent_job("background_agent", "agent"),
-                        "output" => Self::redirect_to_agent_job("output", "output"),
-                        "kill" => Self::redirect_to_agent_job("kill", "kill"),
+                        "list_user" => {
+                            match Self::validate_task_tool_args_for_action("list_user", args) {
+                                Ok(()) => self.task_list_user(args).await,
+                                Err(error) => format!("Error: {error}"),
+                            }
+                        }
+                        "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
+                            Ok(()) => self.task_adopt(args).await,
+                            Err(error) => format!("Error: {error}"),
+                        },
+                        "archive" => {
+                            match Self::validate_task_tool_args_for_action("archive", args) {
+                                Ok(()) => self.task_archive(args).await,
+                                Err(error) => format!("Error: {error}"),
+                            }
+                        }
                         "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool instead.".to_string(),
-                        other => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool (actions: shell, agent, output, kill)."),
+                        other => match Self::validate_task_tool_args_for_action(other, args) {
+                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool (actions: shell, agent, output, kill)."),
+                            Err(error) => format!("Error: {error}"),
+                        },
                     }
                 }
                 "agent_job" => {
@@ -3848,12 +3977,6 @@ impl ToolExecutor {
                         other => format!("Error: unknown `agent_job` action '{other}'. Valid: shell, agent, output, kill."),
                     }
                 }
-                // Legacy separate task_* names (backward compat)
-                "task_create" => self.task_create(args).await,
-                "task_list" => self.task_list(args).await,
-                "task_get" => self.task_get(args).await,
-                "task_update" => self.task_update(args).await,
-                "task_stop" => self.task_stop(args).await,
                 "web_search" => self.web_search(args),
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
                 "notify" => {

@@ -124,11 +124,13 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
             let (icon, icon_color) = match sub.status {
                 SessionTaskStatusKind::Completed => ("✓", Color::Green),
                 SessionTaskStatusKind::InProgress => ("◦", Color::Yellow),
+                SessionTaskStatusKind::Paused => ("⏸", Color::Yellow),
                 SessionTaskStatusKind::Pending => ("·", Color::DarkGray),
                 SessionTaskStatusKind::Failed => ("✗", Color::Red),
                 SessionTaskStatusKind::Cancelled => ("⏹", Color::Yellow),
                 SessionTaskStatusKind::Archived
                 | SessionTaskStatusKind::Deleted
+                | SessionTaskStatusKind::Migrated
                 | SessionTaskStatusKind::Other => ("·", Color::DarkGray),
             };
             out.push(Line::from(vec![

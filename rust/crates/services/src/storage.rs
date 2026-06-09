@@ -2453,10 +2453,10 @@ pub async fn ensure_core_schema(
             active_form VARCHAR(512) NULL,
             status VARCHAR(16) NOT NULL,
             owner VARCHAR(128) NULL,
-            metadata JSON NULL,
-            blocks JSON NULL,
-            blocked_by JSON NULL,
-            subtasks JSON NULL,
+            metadata LONGTEXT NULL,
+            blocks LONGTEXT NULL,
+            blocked_by LONGTEXT NULL,
+            subtasks LONGTEXT NULL,
             archived_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL,
             updated_at DATETIME(6) NOT NULL,
@@ -3257,6 +3257,19 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
             "DROP TABLE IF EXISTS governance_runs",
             "DROP TABLE IF EXISTS eval_llm_feedback",
             "DROP TABLE IF EXISTS user_preference_history",
+        ],
+    )
+    .await?;
+
+    run_migration_batch(
+        pool,
+        16,
+        "store session_todos structured fields as LONGTEXT for MatrixOne parameter writes",
+        &[
+            "ALTER TABLE session_todos MODIFY COLUMN metadata LONGTEXT NULL",
+            "ALTER TABLE session_todos MODIFY COLUMN blocks LONGTEXT NULL",
+            "ALTER TABLE session_todos MODIFY COLUMN blocked_by LONGTEXT NULL",
+            "ALTER TABLE session_todos MODIFY COLUMN subtasks LONGTEXT NULL",
         ],
     )
     .await?;

@@ -1204,6 +1204,7 @@ fn sync_subtask_status(
 
 async fn sync_task_board_subtask_status(
     state: &SessionState,
+    goal: &str,
     plan_fingerprint: &str,
     subtask_id: &str,
     status: astra_services::task_orchestrator::TaskStatus,
@@ -1214,21 +1215,11 @@ async fn sync_task_board_subtask_status(
         .await
         .into_iter()
         .find(|task| {
-            let is_plan_task = task
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("source"))
-                .and_then(serde_json::Value::as_str)
-                == Some("approved_plan");
-            let fingerprint_matches = task
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_fingerprint"))
-                .and_then(serde_json::Value::as_str)
-                == Some(plan_fingerprint);
-            is_plan_task
-                && fingerprint_matches
-                && task.subtasks.iter().any(|subtask| subtask.id == subtask_id)
+            crate::cli::plan::plan_task_board::approved_plan_task_matches(
+                task,
+                goal,
+                plan_fingerprint,
+            ) && task.subtasks.iter().any(|subtask| subtask.id == subtask_id)
         });
 
     let Some(task) = task else {
@@ -1253,9 +1244,11 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     let Some(plan) = state.executing_plan.as_ref() else {
         return;
     };
-    if let Some(goal) = state.executing_plan_goal.as_deref()
-        && let Err(error) =
-            crate::cli::plan::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
+    let Some(goal) = state.executing_plan_goal.as_deref() else {
+        return;
+    };
+    if let Err(error) =
+        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
     {
         tracing::warn!(
             goal = %goal,
@@ -1265,9 +1258,14 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     }
     let plan_fingerprint = crate::cli::plan::plan_task_board::plan_task_board_fingerprint(plan);
     for subtask in &plan.subtasks {
-        if let Err(error) =
-            sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
-                .await
+        if let Err(error) = sync_task_board_subtask_status(
+            state,
+            goal,
+            &plan_fingerprint,
+            &subtask.id,
+            subtask.status,
+        )
+        .await
         {
             tracing::warn!(
                 subtask_id = %subtask.id,
@@ -1361,9 +1359,15 @@ mod tests {
             .await;
         assert!(create.contains("created"), "{create}");
 
-        sync_task_board_subtask_status(&state, &plan_fingerprint, "s2", TaskStatus::InProgress)
-            .await
-            .unwrap();
+        sync_task_board_subtask_status(
+            &state,
+            "Ship plan UX",
+            &plan_fingerprint,
+            "s2",
+            TaskStatus::InProgress,
+        )
+        .await
+        .unwrap();
 
         let task = state
             .task_manager
@@ -1444,6 +1448,57 @@ mod tests {
         assert_eq!(
             current_task.subtasks[0].status,
             astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn executing_plan_sync_does_not_update_different_goal_with_same_steps() {
+        let mut state = SessionState::default();
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "shared step".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(&state, "old goal", &plan)
+            .await
+            .unwrap();
+
+        let current = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "shared step".into(),
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        state.executing_plan = Some(current);
+        state.executing_plan_goal = Some("new goal".into());
+
+        sync_task_board_from_executing_plan(&state).await;
+
+        let tasks = state.task_manager.snapshot().await;
+        let old_task = tasks
+            .iter()
+            .find(|task| task.title == "old goal")
+            .expect("old goal task exists");
+        assert_eq!(
+            old_task.subtasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
+            "old goal must not receive current plan progress"
+        );
+
+        let new_task = tasks
+            .iter()
+            .find(|task| task.title == "new goal")
+            .expect("new goal task exists");
+        assert_eq!(
+            new_task.subtasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+            "new goal should receive current plan progress"
         );
     }
 

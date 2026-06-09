@@ -87,6 +87,7 @@ async fn setup_app() -> Option<(Router, sqlx::Pool<sqlx::MySql>)> {
     let pool = shared.get().clone();
     let state = AppState::new(ServiceInfo::default(), Arc::new(HealthyStub))
         .with_auth_service(Arc::new(BearerAuthService))
+        .with_shared_pool(shared.clone())
         .with_plan_repository(Arc::new(CloudPlanRepository::new(pool.clone())));
     Some((build_app(state), pool))
 }
@@ -203,6 +204,17 @@ async fn cleanup_plan(pool: &sqlx::Pool<sqlx::MySql>, plan_id: &str) {
         .await;
     let _ = sqlx::query("UPDATE agent_sessions SET active_plan_id = NULL WHERE active_plan_id = ?")
         .bind(plan_id)
+        .execute(pool)
+        .await;
+}
+
+async fn cleanup_session_todos(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+    let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+        .bind(session_id)
         .execute(pool)
         .await;
 }
@@ -929,6 +941,56 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
          was still {active_after_approve:?}"
     );
 
+    let todo_row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT title, status, metadata, subtasks FROM session_todos \
+         WHERE session_id = ? AND user_id = ? ORDER BY ordinal ASC LIMIT 1",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let Some((title, status, metadata, subtasks)) = todo_row else {
+        panic!("approved HTTP plan should be mirrored into session_todos task board");
+    };
+    assert_eq!(title, "http-exit-clears");
+    assert_eq!(status, "in_progress");
+    let metadata: Value = serde_json::from_str(metadata.as_deref().unwrap_or("{}")).unwrap();
+    assert_eq!(metadata["source"], "approved_plan");
+    assert_eq!(metadata["plan_id"], plan_id);
+    let subtasks: Value = serde_json::from_str(subtasks.as_deref().unwrap_or("[]")).unwrap();
+    assert_eq!(subtasks.as_array().map(Vec::len), Some(1));
+
+    let (s, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs/completed"),
+        Some(json!({
+            "subtask_id": "s1",
+            "attempt": 1,
+            "status": "completed",
+            "session_id": session_id,
+            "request_id": "req-task-board-sync"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+
+    let synced_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, subtasks FROM session_todos \
+         WHERE session_id = ? AND user_id = ? ORDER BY ordinal ASC LIMIT 1",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(synced_row.0, "completed");
+    let synced_subtasks: Value =
+        serde_json::from_str(synced_row.1.as_deref().unwrap_or("[]")).unwrap();
+    assert_eq!(synced_subtasks[0]["status"], "completed");
+
+    cleanup_session_todos(&pool, &session_id).await;
     cleanup_plan(&pool, &plan_id).await;
 }
 

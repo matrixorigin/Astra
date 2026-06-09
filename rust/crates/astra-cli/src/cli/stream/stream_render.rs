@@ -5305,31 +5305,7 @@ impl StreamRenderState {
                 .get("query")
                 .and_then(Value::as_str)
                 .map(|query| format!("\"{}\"", truncate_line(query, 40))),
-            "task_create" => args
-                .get("title")
-                .and_then(Value::as_str)
-                .map(|title| truncate_line(title, 48)),
-            "task_list" => args
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|status| truncate_line(status, 24)),
-            "task_get" | "task_stop" => args
-                .get("task_id")
-                .and_then(Value::as_str)
-                .map(|task_id| truncate_line(task_id, 36)),
-            "task_update" => {
-                let task_id = args.get("task_id").and_then(Value::as_str);
-                let status = args.get("status").and_then(Value::as_str);
-                match (task_id, status) {
-                    (Some(task_id), Some(status)) => Some(format!(
-                        "{} -> {}",
-                        truncate_line(task_id, 24),
-                        truncate_line(status, 16)
-                    )),
-                    (Some(task_id), None) => Some(truncate_line(task_id, 36)),
-                    _ => None,
-                }
-            }
+            "task" => task_preview_from_args(args),
             "mo_query" => args
                 .get("sql")
                 .or_else(|| args.get("query"))
@@ -6416,6 +6392,75 @@ fn is_agent_control_preview(preview: &str) -> bool {
     .any(|prefix| preview.starts_with(prefix))
 }
 
+fn task_preview_from_args(args: &Value) -> Option<String> {
+    match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+        "create" => args
+            .get("title")
+            .and_then(Value::as_str)
+            .map(|title| format!("create \"{}\"", truncate_line(title, 48))),
+        "list" => Some(
+            args.get("status_filter")
+                .and_then(Value::as_str)
+                .map(|status| format!("list {}", truncate_line(status, 24)))
+                .unwrap_or_else(|| "list".to_string()),
+        ),
+        "list_user" => Some(
+            args.get("user_status")
+                .and_then(Value::as_str)
+                .map(|status| format!("list_user {}", truncate_line(status, 24)))
+                .unwrap_or_else(|| "list_user active".to_string()),
+        ),
+        "get" | "stop" | "archive" | "adopt" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("get");
+            args.get("task_id")
+                .and_then(Value::as_str)
+                .map(|task_id| format!("{action} {}", truncate_line(task_id, 36)))
+        }
+        "update" => {
+            let task_id = args.get("task_id").and_then(Value::as_str);
+            let status = args.get("new_status").and_then(Value::as_str);
+            match (task_id, status) {
+                (Some(task_id), Some(status)) => Some(format!(
+                    "update {} -> {}",
+                    truncate_line(task_id, 24),
+                    truncate_line(status, 16)
+                )),
+                (Some(task_id), None) => Some(format!("update {}", truncate_line(task_id, 36))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn format_task_display_from_preview(preview: &str) -> String {
+    if let Some(rest) = preview.strip_prefix("create ") {
+        return format!("Creating task: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("update ") {
+        return format!("Updating task: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("stop ") {
+        return format!("Stopping task: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("get ") {
+        return format!("Getting task: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("archive ") {
+        return format!("Archiving task: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("adopt ") {
+        return format!("Adopting task: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("list ") {
+        return format!("Listing tasks: {rest}");
+    }
+    if let Some(rest) = preview.strip_prefix("list_user ") {
+        return format!("Listing cross-session tasks: {rest}");
+    }
+    "Listing tasks".to_string()
+}
+
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
 /// Mirrors `format_tool_description_with_output` but works without full args JSON.
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
@@ -6509,17 +6554,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "tool_search" => format!("Searching tools: {preview}"),
         "enter_plan_mode" => format!("Enter plan mode: \"{preview}\""),
         "exit_plan_mode" => "Exit plan mode".to_string(),
-        "task_create" => format!("Creating task: \"{preview}\""),
-        "task_list" => {
-            if preview.is_empty() {
-                "Listing tasks".to_string()
-            } else {
-                format!("Listing tasks: {preview}")
-            }
-        }
-        "task_get" => format!("Getting task: {preview}"),
-        "task_update" => format!("Updating task: {preview}"),
-        "task_stop" => format!("Stopping task: {preview}"),
+        "task" => format_task_display_from_preview(preview),
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
         "mo_snapshot" => format!("MatrixOne snapshot: {preview}"),
         "mo_branch" => format!("MatrixOne branch: {preview}"),
@@ -6828,7 +6863,7 @@ mod tests {
         execute_with_metadata_responsive, extract_cli_diff_block, format_tool_display_from_preview,
         is_edge_auth_failure, merge_edge_tool_rounds, path_mtime_ms, reusable_speculative_output,
         style_tool_description, sync_incremental_accum_state, sync_incremental_tool_result_state,
-        theme, tool_completion_icon, tool_dedup_signature,
+        task_preview_from_args, theme, tool_completion_icon, tool_dedup_signature,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -8347,16 +8382,31 @@ mod tests {
     #[test]
     fn format_task_preview_display_names() {
         assert_eq!(
-            format_tool_display_from_preview("task_create", Some("Fix renderer drift")),
+            format_tool_display_from_preview("task", Some("create \"Fix renderer drift\"")),
             "Creating task: \"Fix renderer drift\""
         );
         assert_eq!(
-            format_tool_display_from_preview("task_update", Some("render-pass -> in_progress")),
+            format_tool_display_from_preview("task", Some("update render-pass -> in_progress")),
             "Updating task: render-pass -> in_progress"
         );
         assert_eq!(
-            format_tool_display_from_preview("task_list", Some("active")),
+            format_tool_display_from_preview("task", Some("list active")),
             "Listing tasks: active"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("task", Some("list_user paused")),
+            "Listing cross-session tasks: paused"
+        );
+        assert_eq!(
+            task_preview_from_args(&serde_json::json!({"action": "list_user"})).as_deref(),
+            Some("list_user active")
+        );
+        assert_eq!(
+            task_preview_from_args(
+                &serde_json::json!({"action": "list_user", "user_status": "paused"})
+            )
+            .as_deref(),
+            Some("list_user paused")
         );
     }
 

@@ -1,6 +1,7 @@
 use crate::cli::project_instructions::format_project_instructions;
 use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 use astra_runtime::prompts;
+use astra_tools::task_mgmt::SessionTask;
 use astra_turn_core::input_classifier;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +13,7 @@ pub(crate) struct ActiveTaskAttachment {
 impl ActiveTaskAttachment {
     pub(crate) fn render(&self, effective_line: &str) -> String {
         let task_board_reanchor = if self.anchor.has_active_task_board() {
-            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, set the current task to in_progress before doing the work, and update statuses as tasks complete.\n"
+            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, call task(action='update', task_id='...', new_status='in_progress') before doing the work, and update with new_status='completed' as tasks complete.\n"
         } else {
             ""
         };
@@ -34,7 +35,7 @@ If the follow-up asks to fix / patch / test / continue, apply that action to thi
         }
         if !self.anchor.active_task_board.is_empty() {
             parts.push(format!(
-                "Active tasks: {}",
+                "Open tasks: {}",
                 self.anchor.active_task_board.join(" | ")
             ));
         }
@@ -86,11 +87,7 @@ pub(crate) async fn finalize_effective_line(
 
     const TURNS_SINCE_TASK_USE_THRESHOLD: u32 = 10;
     const TURNS_BETWEEN_REMINDERS: u32 = 10;
-    if state
-        .recent_tools
-        .iter()
-        .any(|tool| tool == "task" || tool.starts_with("task_"))
-    {
+    if state.recent_tools.iter().any(|tool| tool == "task") {
         state.turns_since_task_use = 0;
     } else {
         state.turns_since_task_use += 1;
@@ -100,26 +97,62 @@ pub(crate) async fn finalize_effective_line(
     if state.turns_since_task_use >= TURNS_SINCE_TASK_USE_THRESHOLD
         && state.turns_since_task_reminder >= TURNS_BETWEEN_REMINDERS
     {
-        let task_list = state
-            .task_manager
-            .list(&serde_json::json!({"status_filter": "active"}))
-            .await;
-        let nudge = format!(
-            "<system-reminder>\n\
-            The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
-            consider using task(action='create') to add new tasks and task(action='update') to update task status \
-            (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale. \
-            Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
-            Make sure that you NEVER mention this reminder to the user\n\
-            \n\
-            Here are the existing tasks:\n{task_list}\n\
-            </system-reminder>"
-        );
-        effective_line = format!("{nudge}\n\n{effective_line}");
+        let nudge = match state.task_manager.load_active_tasks().await {
+            Ok(tasks) => format_open_task_reminder_list(&tasks).map(|task_list| {
+                format!(
+                    "<system-reminder>\n\
+                The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
+                consider using task(action='create') to add new tasks and task(action='update', task_id='...', new_status='...') to update task status \
+                (set new_status='in_progress' when starting, new_status='completed' when done, or new_status='paused' when waiting). Also consider cleaning up the task list if it has become stale. \
+                Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
+                Make sure that you NEVER mention this reminder to the user\n\
+                \n\
+                Here is the open task board:\n{task_list}\n\
+                </system-reminder>"
+                )
+            }),
+            Err(error) => Some(format!(
+                "<system-reminder>\n\
+                Task board state could not be loaded while checking whether a task reminder is needed: {error}\n\
+                Do not assume there are no open tasks. If task tracking is relevant to the current work, retry task(action='list') or continue without task updates if unrelated. \
+                This reminder is throttled; never mention it to the user.\n\
+                </system-reminder>"
+            )),
+        };
+        if let Some(nudge) = nudge {
+            effective_line = format!("{nudge}\n\n{effective_line}");
+        }
         state.turns_since_task_reminder = 0;
     }
 
     apply_resume_context(effective_line, resume_guidance)
+}
+
+fn format_open_task_reminder_list(tasks: &[SessionTask]) -> Option<String> {
+    let mut lines: Vec<String> = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .take(10)
+        .map(|task| {
+            let title = task.title.chars().take(120).collect::<String>();
+            format!("- [{}] {}: {}", task.status, task.id, title)
+        })
+        .collect();
+    let open_total = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .count();
+    if open_total > lines.len() {
+        lines.push(format!(
+            "- ... {} more open task(s)",
+            open_total - lines.len()
+        ));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 pub(crate) fn active_task_attachment(
@@ -215,6 +248,36 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
     use crate::cli::session::session_state::SkillDevState;
     use astra_runtime::prompts;
+    use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskMutation, TaskStore};
+
+    struct FailingTaskLoadStore;
+
+    #[async_trait::async_trait]
+    impl TaskStore for FailingTaskLoadStore {
+        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+            Err(format!("forced task load failure for {session_id}"))
+        }
+
+        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn mutate(
+            &self,
+            session_id: &str,
+            _mutation: TaskMutation,
+        ) -> Result<String, String> {
+            Err(format!("forced task mutate failure for {session_id}"))
+        }
+
+        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
+            Err(format!("forced next task id failure for {session_id}"))
+        }
+
+        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+    }
 
     #[test]
     fn detect_correction_signal_handles_english_and_chinese_redirects() {
@@ -287,6 +350,8 @@ mod tests {
         );
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("reconcile it before proceeding"));
+        assert!(effective.contains("new_status='in_progress'"));
+        assert!(effective.contains("new_status='completed'"));
         assert!(effective.contains("Active task board:"));
         assert!(effective.contains("[User follow-up]\n还有什么？"));
     }
@@ -535,11 +600,133 @@ mod tests {
             .create(&serde_json::json!({"title": "Track the recovery cleanup"}))
             .await;
         assert!(!create.starts_with("Error:"), "{create}");
+        let paused = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Wait for operator input"}))
+            .await;
+        assert!(!paused.starts_with("Error:"), "{paused}");
+        let pause_update = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": "task-2", "new_status": "paused"}))
+            .await;
+        assert!(!pause_update.starts_with("Error:"), "{pause_update}");
+        let done = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Already finished"}))
+            .await;
+        assert!(!done.starts_with("Error:"), "{done}");
+        let done_update = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": "task-3", "new_status": "completed"}))
+            .await;
+        assert!(!done_update.starts_with("Error:"), "{done_update}");
 
         let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
 
         assert!(finalized.contains("The task tools haven't been used recently."));
+        assert!(finalized.contains("new_status='in_progress'"));
+        assert!(finalized.contains("new_status='completed'"));
+        assert!(finalized.contains("new_status='paused'"));
+        assert!(finalized.contains("Here is the open task board:"));
         assert!(finalized.contains("Track the recovery cleanup"));
+        assert!(finalized.contains("[paused] task-2: Wait for operator input"));
+        assert!(
+            !finalized.contains("Already finished"),
+            "terminal completed history should not clutter the open-work reminder: {finalized}"
+        );
+        assert_eq!(state.turns_since_task_use, 10);
+        assert_eq!(state.turns_since_task_reminder, 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_effective_line_skips_task_tool_reminder_when_no_open_work() {
+        let mut state = SessionState {
+            recent_tools: vec!["read_file".into()],
+            turns_since_task_use: 9,
+            turns_since_task_reminder: 9,
+            ..SessionState::default()
+        };
+        state.task_manager.rebind("sess-task-no-open-nudge");
+        let done = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Already finished"}))
+            .await;
+        assert!(!done.starts_with("Error:"), "{done}");
+        let done_update = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        assert!(!done_update.starts_with("Error:"), "{done_update}");
+
+        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+
+        assert!(
+            !finalized.contains("The task tools haven't been used recently."),
+            "no-open-work sessions should not get noisy task reminders: {finalized}"
+        );
+        assert!(
+            !finalized.contains("Here is the open task board:"),
+            "no-open-work sessions should not render an empty board reminder: {finalized}"
+        );
+        assert_eq!(state.turns_since_task_use, 10);
+        assert_eq!(
+            state.turns_since_task_reminder, 0,
+            "no-open-work checks should still be throttled"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_effective_line_surfaces_task_reminder_load_failure_boundedly() {
+        let mut state = SessionState {
+            recent_tools: vec!["read_file".into()],
+            turns_since_task_use: 9,
+            turns_since_task_reminder: 9,
+            ..SessionState::default()
+        };
+        state.task_manager = std::sync::Arc::new(TaskManager::new(
+            "sess-task-load-fails",
+            std::sync::Arc::new(FailingTaskLoadStore),
+        ));
+
+        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+
+        assert!(
+            finalized.contains("Task board state could not be loaded"),
+            "task reminder load failures must not be silently treated as no open work: {finalized}"
+        );
+        assert!(
+            finalized.contains("Do not assume there are no open tasks"),
+            "load failure reminder should preserve the task-board uncertainty: {finalized}"
+        );
+        assert_eq!(state.turns_since_task_use, 10);
+        assert_eq!(
+            state.turns_since_task_reminder, 0,
+            "load failure reminders should still be throttled"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_effective_line_does_not_treat_legacy_task_tool_names_as_recent_use() {
+        let mut state = SessionState {
+            recent_tools: vec!["task_create".into()],
+            turns_since_task_use: 9,
+            turns_since_task_reminder: 9,
+            ..SessionState::default()
+        };
+        state.task_manager.rebind("sess-task-legacy-nudge");
+        let create = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Open work"}))
+            .await;
+        assert!(!create.starts_with("Error:"), "{create}");
+
+        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+
+        assert!(
+            finalized.contains("The task tools haven't been used recently.")
+                && finalized.contains("Open work"),
+            "legacy task_* tool names should not suppress the canonical task reminder: {finalized}"
+        );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(state.turns_since_task_reminder, 0);
     }

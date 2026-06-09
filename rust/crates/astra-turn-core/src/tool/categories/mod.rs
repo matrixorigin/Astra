@@ -297,12 +297,8 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
     // ── Mutating — task management ───────────────────────────────────
-    tool("task_create", MU, OR),
-    tool("task_update", MU, OR),
-    tool("task_stop", MU, OR),
-    tool("task_list", RO, OR),
-    tool("task_get", RO, OR),
     tool("task", MU, OR),
+    tool("agent_job", MU, OR),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("BashTool", SH, AE.union(AL)),
@@ -641,15 +637,28 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
 
     if name == "task" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some("list" | "get" | "output") => {
+            Some("list" | "get" | "list_user") => {
                 meta_category = ToolCategory::ReadOnly;
                 meta_flags = OR;
             }
-            Some("background_shell") => {
+            _ => {
+                meta_category = ToolCategory::Mutating;
+                meta_flags = OR;
+            }
+        }
+    }
+
+    if name == "agent_job" {
+        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+            Some("shell") => {
                 meta_category = ToolCategory::Shell;
                 meta_flags = AE.union(OR);
             }
-            _ => {
+            Some("output") => {
+                meta_category = ToolCategory::ReadOnly;
+                meta_flags = OR;
+            }
+            Some("agent" | "kill") | None | Some(_) => {
                 meta_category = ToolCategory::Mutating;
                 meta_flags = OR;
             }
@@ -716,7 +725,12 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         ToolIdempotency::PureRead
     } else if name == "task" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some("list" | "get" | "output") => ToolIdempotency::PureRead,
+            Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        }
+    } else if name == "agent_job" {
+        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+            Some("output") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
         }
     } else if name == "git" {
@@ -918,32 +932,55 @@ mod tests {
     }
 
     #[test]
-    fn consolidated_task_tool_is_action_aware_for_shell_approval() {
+    fn consolidated_task_tool_is_action_aware_for_read_vs_mutating_actions() {
         use serde_json::json;
 
-        let shell = classify(
-            "task",
-            Some(&json!({"action": "background_shell", "command": "npm run dev"})),
-        );
-        assert_eq!(shell.category, ToolCategory::Shell);
-        assert!(shell.approval_required);
-        assert!(!shell.parallelizable);
-
-        let read_only_shell = classify(
-            "task",
-            Some(&json!({"action": "background_shell", "command": "git status"})),
-        );
-        assert_eq!(read_only_shell.category, ToolCategory::ReadOnly);
-        assert!(!read_only_shell.approval_required);
-        assert!(read_only_shell.parallelizable);
-
-        let output = classify("task", Some(&json!({"action": "output"})));
-        assert_eq!(output.category, ToolCategory::ReadOnly);
-        assert!(!output.approval_required);
+        for action in ["list", "get", "list_user"] {
+            let read = classify("task", Some(&json!({"action": action})));
+            assert_eq!(read.category, ToolCategory::ReadOnly);
+            assert!(!read.approval_required);
+            assert!(read.parallelizable);
+        }
 
         let update = classify("task", Some(&json!({"action": "update"})));
         assert_eq!(update.category, ToolCategory::Mutating);
         assert!(!update.approval_required);
+
+        let stale_background = classify(
+            "task",
+            Some(&json!({"action": "background_shell", "command": "npm run dev"})),
+        );
+        assert_eq!(stale_background.category, ToolCategory::Mutating);
+        assert!(!stale_background.approval_required);
+    }
+
+    #[test]
+    fn agent_job_tool_is_action_aware_for_shell_vs_read_actions() {
+        use serde_json::json;
+
+        let mutating_shell = classify(
+            "agent_job",
+            Some(&json!({"action": "shell", "command": "npm run dev"})),
+        );
+        assert_eq!(mutating_shell.category, ToolCategory::Shell);
+        assert!(mutating_shell.approval_required);
+        assert!(!mutating_shell.parallelizable);
+
+        let read_shell = classify(
+            "agent_job",
+            Some(&json!({"action": "shell", "command": "git status"})),
+        );
+        assert_eq!(read_shell.category, ToolCategory::ReadOnly);
+        assert!(!read_shell.approval_required);
+        assert!(read_shell.parallelizable);
+
+        let output = classify("agent_job", Some(&json!({"action": "output"})));
+        assert_eq!(output.category, ToolCategory::ReadOnly);
+        assert!(!output.approval_required);
+
+        let agent = classify("agent_job", Some(&json!({"action": "agent"})));
+        assert_eq!(agent.category, ToolCategory::Mutating);
+        assert!(!agent.approval_required);
     }
 
     #[test]
@@ -2271,11 +2308,7 @@ mod tests {
             "compress_context",
             "env",
             "notebook_edit",
-            "task_create",
-            "task_update",
-            "task_stop",
-            "task_list",
-            "task_get",
+            "task",
             "context_analysis",
             "diagnose",
             "rollback_file_edits",

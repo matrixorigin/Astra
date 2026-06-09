@@ -86,9 +86,11 @@ fn status_icon_and_color(
     match status {
         SessionTaskStatusKind::Completed => ("✔", colors.success),
         SessionTaskStatusKind::InProgress => ("•", colors.accent),
+        SessionTaskStatusKind::Paused => ("⏸", Color::Yellow),
         SessionTaskStatusKind::Pending
         | SessionTaskStatusKind::Archived
         | SessionTaskStatusKind::Deleted
+        | SessionTaskStatusKind::Migrated
         | SessionTaskStatusKind::Other => ("◻", colors.dim),
         SessionTaskStatusKind::Failed => ("✖", Color::Red),
         SessionTaskStatusKind::Cancelled => ("■", Color::Yellow),
@@ -147,11 +149,66 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
     out
 }
 
-fn counts(tasks: &[SessionTask]) -> (usize, usize, usize) {
-    let completed = tasks.iter().filter(|t| t.status.is_completed()).count();
-    let pending = tasks.iter().filter(|t| t.status.is_pending()).count();
-    let in_progress = tasks.len().saturating_sub(completed + pending);
-    (completed, in_progress, pending)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TaskStatusCounts {
+    completed: usize,
+    in_progress: usize,
+    pending: usize,
+    paused: usize,
+    failed: usize,
+    cancelled: usize,
+    other: usize,
+}
+
+impl TaskStatusCounts {
+    fn open_work(self) -> usize {
+        self.in_progress + self.pending + self.paused
+    }
+
+    fn status_parts(self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.in_progress > 0 {
+            parts.push(format!("{} working", self.in_progress));
+        }
+        if self.pending > 0 {
+            parts.push(format!("{} queued", self.pending));
+        }
+        if self.paused > 0 {
+            parts.push(format!("{} paused", self.paused));
+        }
+        if self.completed > 0 {
+            parts.push(format!("{} done", self.completed));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if self.cancelled > 0 {
+            parts.push(format!("{} cancelled", self.cancelled));
+        }
+        if self.other > 0 {
+            parts.push(format!("{} other", self.other));
+        }
+        parts
+    }
+}
+
+fn counts(tasks: &[SessionTask]) -> TaskStatusCounts {
+    let mut counts = TaskStatusCounts::default();
+    for task in tasks {
+        match task.status {
+            SessionTaskStatusKind::Completed => counts.completed += 1,
+            SessionTaskStatusKind::InProgress => counts.in_progress += 1,
+            SessionTaskStatusKind::Pending => counts.pending += 1,
+            SessionTaskStatusKind::Paused => counts.paused += 1,
+            SessionTaskStatusKind::Failed => counts.failed += 1,
+            SessionTaskStatusKind::Cancelled => counts.cancelled += 1,
+            SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
+            | SessionTaskStatusKind::Other => counts.other += 1,
+        }
+    }
+    counts
 }
 
 /// Aggregate (done, total) over every subtask across `tasks`. Used by
@@ -187,7 +244,8 @@ fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
 }
 
 /// Order `tasks` by the reference TUI's display priority:
-/// in_progress → pending (open blockers last) → completed.
+/// in_progress → pending (open blockers last) → paused → completed →
+/// terminal/archival history.
 fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec<&'a SessionTask> {
     let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
     let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_pending()).collect();
@@ -207,11 +265,44 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
             }
         }
     });
+    let paused = sort_by_id_asc(
+        tasks
+            .iter()
+            .filter(|t| t.status == SessionTaskStatusKind::Paused)
+            .collect(),
+    );
     let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_completed()).collect());
+    let terminal = sort_by_id_asc(
+        tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled
+                )
+            })
+            .collect(),
+    );
+    let archival = sort_by_id_asc(
+        tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    SessionTaskStatusKind::Archived
+                        | SessionTaskStatusKind::Deleted
+                        | SessionTaskStatusKind::Other
+                )
+            })
+            .collect(),
+    );
     let mut out: Vec<&SessionTask> = Vec::with_capacity(tasks.len());
     out.extend(in_progress);
     out.extend(pending);
+    out.extend(paused);
     out.extend(completed);
+    out.extend(terminal);
+    out.extend(archival);
     out
 }
 
@@ -247,9 +338,11 @@ fn render_task_line(
         }
         SessionTaskStatusKind::Failed => Style::default().fg(color).add_modifier(Modifier::BOLD),
         SessionTaskStatusKind::Cancelled => Style::default().fg(color).add_modifier(Modifier::BOLD),
+        SessionTaskStatusKind::Paused => Style::default().fg(color).add_modifier(Modifier::BOLD),
         SessionTaskStatusKind::Pending
         | SessionTaskStatusKind::Archived
         | SessionTaskStatusKind::Deleted
+        | SessionTaskStatusKind::Migrated
         | SessionTaskStatusKind::Other => Style::default().fg(color).add_modifier(Modifier::DIM),
     };
     spans.push(Span::styled(format!("{} ", icon), icon_style));
@@ -337,9 +430,13 @@ fn render_subtask_lines(
             SessionTaskStatusKind::Cancelled => {
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
             }
+            SessionTaskStatusKind::Paused => {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            }
             SessionTaskStatusKind::Pending
             | SessionTaskStatusKind::Archived
             | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
             | SessionTaskStatusKind::Other => {
                 Style::default().fg(color).add_modifier(Modifier::DIM)
             }
@@ -371,24 +468,28 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
     if hidden.is_empty() {
         return None;
     }
-    let (completed, in_progress, pending) = {
-        let c = hidden.iter().filter(|t| t.status.is_completed()).count();
-        let p = hidden.iter().filter(|t| t.status.is_pending()).count();
-        let ip = hidden.len().saturating_sub(c + p);
-        (c, ip, p)
-    };
-    let mut parts: Vec<String> = Vec::new();
-    if in_progress > 0 {
-        parts.push(format!("{} working", in_progress));
-    }
-    if pending > 0 {
-        parts.push(format!("{} queued", pending));
-    }
-    if completed > 0 {
-        parts.push(format!("{} done", completed));
-    }
+    let counts = hidden
+        .iter()
+        .fold(TaskStatusCounts::default(), |mut counts, task| {
+            match task.status {
+                SessionTaskStatusKind::Completed => counts.completed += 1,
+                SessionTaskStatusKind::InProgress => counts.in_progress += 1,
+                SessionTaskStatusKind::Pending => counts.pending += 1,
+                SessionTaskStatusKind::Paused => counts.paused += 1,
+                SessionTaskStatusKind::Failed => counts.failed += 1,
+                SessionTaskStatusKind::Cancelled => counts.cancelled += 1,
+                SessionTaskStatusKind::Archived
+                | SessionTaskStatusKind::Deleted
+                | SessionTaskStatusKind::Migrated
+                | SessionTaskStatusKind::Other => counts.other += 1,
+            }
+            counts
+        });
+    let parts = counts.status_parts();
     let text = if parts.len() == 1 {
         format!("… {} more {}", hidden.len(), parts[0])
+    } else if parts.is_empty() {
+        format!("… {} more", hidden.len())
     } else {
         format!("… {} more: {}", hidden.len(), parts.join(", "))
     };
@@ -487,6 +588,7 @@ where
                 || first_text == "• "
                 || first_text == "◻ "
                 || first_text == "· "
+                || first_text == "⏸ "
                 || first_text == "✖ "
                 || first_text == "■ ";
             if !is_task_row {
@@ -552,12 +654,29 @@ pub fn render_multi_with_colors(
         // across sessions are not actionable and would clutter the
         // cross-session overview. The single-session board still
         // shows its own completed history.
-        let active: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_active()).collect();
+        let active: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_open_work()).collect();
         if active.is_empty() {
             continue;
         }
 
         // Header row: calm session label + working count.
+        let counts = active
+            .iter()
+            .fold(TaskStatusCounts::default(), |mut counts, task| {
+                match task.status {
+                    SessionTaskStatusKind::InProgress => counts.in_progress += 1,
+                    SessionTaskStatusKind::Pending => counts.pending += 1,
+                    SessionTaskStatusKind::Paused => counts.paused += 1,
+                    _ => {}
+                }
+                counts
+            });
+        let header_parts = counts.status_parts();
+        let header_status = if header_parts.is_empty() {
+            format!(" · {} open", active.len())
+        } else {
+            format!(" · {}", header_parts.join(" · "))
+        };
         let short: String = session_id.chars().take(8).collect();
         let header = Line::from(vec![
             Span::styled(
@@ -565,7 +684,7 @@ pub fn render_multi_with_colors(
                 Style::default().fg(colors.dim).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" · {} working", active.len()),
+                header_status,
                 Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
             ),
         ]);
@@ -637,7 +756,7 @@ pub fn render_with_colors(
     if cap == 0 || tasks.is_empty() {
         return Vec::new();
     }
-    let (completed, in_progress, pending) = counts(tasks);
+    let counts = counts(tasks);
     let unresolved: HashSet<String> = tasks
         .iter()
         .filter(|t| !t.status.is_completed())
@@ -662,12 +781,82 @@ pub fn render_with_colors(
             Style::default().add_modifier(Modifier::BOLD),
         ));
 
+        let has_classic_counts =
+            counts.in_progress > 0 || counts.pending > 0 || counts.completed > 0;
+        let full_suffix = if has_classic_counts {
+            let mut suffix = format!(
+                " · {} working · {} queued · {} done",
+                counts.in_progress, counts.pending, counts.completed
+            );
+            for part in (TaskStatusCounts {
+                in_progress: 0,
+                pending: 0,
+                completed: 0,
+                ..counts
+            })
+            .status_parts()
+            {
+                suffix.push_str(&format!(" · {part}"));
+            }
+            suffix
+        } else {
+            let parts = counts.status_parts();
+            if parts.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", parts.join(" · "))
+            }
+        };
+        let open_parts = {
+            let mut parts = Vec::new();
+            if counts.in_progress > 0 {
+                parts.push(format!("{} working", counts.in_progress));
+            }
+            if counts.pending > 0 {
+                parts.push(format!("{} queued", counts.pending));
+            }
+            if counts.paused > 0 {
+                parts.push(format!("{} paused", counts.paused));
+            }
+            parts
+        };
+        let queued_done = {
+            let mut parts = Vec::new();
+            if counts.pending > 0 {
+                parts.push(format!("{} queued", counts.pending));
+            }
+            if counts.completed > 0 {
+                parts.push(format!("{} done", counts.completed));
+            }
+            if counts.paused > 0 {
+                parts.push(format!("{} paused", counts.paused));
+            }
+            parts
+        };
         let header_variants = [
-            format!(" · {in_progress} working · {pending} queued · {completed} done"),
-            format!(" · {in_progress} working · {pending} queued"),
-            format!(" · {pending} queued · {completed} done"),
-            format!(" · {in_progress} working"),
-            format!(" · {pending} queued"),
+            full_suffix,
+            if open_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", open_parts.join(" · "))
+            },
+            if queued_done.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", queued_done.join(" · "))
+            },
+            if counts.in_progress > 0 {
+                format!(" · {} working", counts.in_progress)
+            } else {
+                String::new()
+            },
+            if counts.pending > 0 {
+                format!(" · {} queued", counts.pending)
+            } else if counts.paused > 0 {
+                format!(" · {} paused", counts.paused)
+            } else {
+                String::new()
+            },
         ];
         let prefix_width = "Tasks".width();
         let suffix = header_variants
@@ -753,25 +942,34 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     if tasks.is_empty() {
         return None;
     }
-    let (completed, in_progress, _pending) = counts(tasks);
+    let counts = counts(tasks);
     let total = tasks.len();
     let current_task = tasks
         .iter()
         .find(|t| t.status.is_in_progress())
-        .or_else(|| tasks.iter().find(|t| t.status.is_pending()));
+        .or_else(|| tasks.iter().find(|t| t.status.is_pending()))
+        .or_else(|| {
+            tasks
+                .iter()
+                .find(|t| t.status == SessionTaskStatusKind::Paused)
+        });
     let (sub_done, sub_total) = subtask_counts(tasks);
 
     let theme = crate::tui::theme::current();
-    let icon = if in_progress > 0 {
+    let icon = if counts.in_progress > 0 {
         "•"
-    } else if completed == total {
+    } else if counts.paused > 0 {
+        "⏸"
+    } else if counts.completed == total {
         "✔"
     } else {
         "·"
     };
-    let icon_color = if in_progress > 0 {
+    let icon_color = if counts.in_progress > 0 {
         theme.accent
-    } else if completed == total {
+    } else if counts.paused > 0 {
+        Color::Yellow
+    } else if counts.completed == total {
         theme.success
     } else {
         theme.dim
@@ -786,14 +984,32 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         "Tasks",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    if in_progress > 0 {
+    if counts.in_progress > 0 {
         spans.push(Span::styled(
-            format!(" · {in_progress} working"),
+            format!(" · {} working", counts.in_progress),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if counts.paused > 0 {
+        spans.push(Span::styled(
+            format!(" · {} paused", counts.paused),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if counts.failed > 0 {
+        spans.push(Span::styled(
+            format!(" · {} failed", counts.failed),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if counts.cancelled > 0 {
+        spans.push(Span::styled(
+            format!(" · {} cancelled", counts.cancelled),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
     spans.push(Span::styled(
-        format!(" · {completed} done"),
+        format!(" · {} done", counts.completed),
         Style::default().add_modifier(Modifier::DIM),
     ));
 
@@ -922,6 +1138,21 @@ mod tests {
     }
 
     #[test]
+    fn standalone_header_does_not_count_paused_or_terminal_as_working() {
+        let tasks = vec![
+            mk_task("task-1", "paused-work", "paused"),
+            mk_task("task-2", "failed-work", "failed"),
+            mk_task("task-3", "cancelled-work", "cancelled"),
+        ];
+        let lines = render(&tasks, 100, 40, true);
+        let header = spans_text(&lines[0]);
+        assert!(header.contains("1 paused"), "header: {header}");
+        assert!(header.contains("1 failed"), "header: {header}");
+        assert!(header.contains("1 cancelled"), "header: {header}");
+        assert!(!header.contains("working"), "header: {header}");
+    }
+
+    #[test]
     fn owner_badge_is_rendered_inline() {
         let mut task = mk_task("task-1", "delegate audit", "in_progress");
         task.owner = Some("agent-7".into());
@@ -933,19 +1164,21 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_is_in_progress_then_pending_then_completed() {
+    fn priority_order_is_in_progress_then_pending_then_paused_then_completed() {
         let tasks = vec![
             mk_task("task-1", "first-completed", "completed"),
             mk_task("task-2", "first-pending", "pending"),
             mk_task("task-3", "first-in-progress", "in_progress"),
+            mk_task("task-4", "first-paused", "paused"),
         ];
         let lines = render(&tasks, 80, 40, false);
         // Three visible lines, no header (standalone=false), no truncation.
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         let texts: Vec<String> = lines.iter().map(spans_text).collect();
         let pos = |needle: &str| texts.iter().position(|l| l.contains(needle)).unwrap();
         assert!(pos("first-in-progress") < pos("first-pending"));
-        assert!(pos("first-pending") < pos("first-completed"));
+        assert!(pos("first-pending") < pos("first-paused"));
+        assert!(pos("first-paused") < pos("first-completed"));
     }
 
     #[test]
@@ -959,6 +1192,24 @@ mod tests {
         let summary = spans_text(&lines[10]);
         assert!(summary.contains("more"), "summary: {summary}");
         assert!(summary.contains("5 queued"), "summary: {summary}");
+    }
+
+    #[test]
+    fn hidden_summary_names_paused_and_terminal_statuses() {
+        let tasks = vec![
+            mk_task("task-1", "visible", "in_progress"),
+            mk_task("task-2", "visible-pending-a", "pending"),
+            mk_task("task-3", "visible-pending-b", "pending"),
+            mk_task("task-4", "hidden-paused", "paused"),
+            mk_task("task-5", "hidden-failed", "failed"),
+            mk_task("task-6", "hidden-cancelled", "cancelled"),
+        ];
+        let lines = render(&tasks, 80, 11, false);
+        let summary = spans_text(lines.last().expect("hidden summary"));
+        assert!(summary.contains("1 paused"), "summary: {summary}");
+        assert!(summary.contains("1 failed"), "summary: {summary}");
+        assert!(summary.contains("1 cancelled"), "summary: {summary}");
+        assert!(!summary.contains("working"), "summary: {summary}");
     }
 
     #[test]
@@ -1039,6 +1290,16 @@ mod tests {
         assert!(text.contains("beta-running"), "{text}");
         assert!(!text.contains("alpha-done"), "{text}");
         assert!(!text.contains("Ctrl+T"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_summary_surfaces_paused_without_calling_it_working() {
+        let tasks = vec![mk_task("task-1", "paused-thing", "paused")];
+        let line = render_collapsed_summary(&tasks, 100).expect("non-empty");
+        let text = spans_text(&line);
+        assert!(text.contains("1 paused"), "{text}");
+        assert!(text.contains("paused-thing"), "{text}");
+        assert!(!text.contains("working"), "{text}");
     }
 
     #[test]
@@ -1221,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn render_multi_skips_sessions_with_no_active_work() {
+    fn render_multi_skips_sessions_with_no_open_work() {
         // All-completed sessions are still open on disk but contribute
         // nothing actionable; the cross-session view prunes them so
         // the row budget isn't burned on dim history.
@@ -1238,13 +1499,14 @@ mod tests {
     }
 
     #[test]
-    fn render_multi_emits_session_header_then_active_tasks() {
+    fn render_multi_emits_session_header_then_open_tasks() {
         let input = vec![(
             "0123456789ab".to_string(),
             vec![
                 mk_task("task-1", "open one", "pending"),
                 mk_task("task-2", "done one", "completed"),
                 mk_task("task-3", "busy one", "in_progress"),
+                mk_task("task-4", "paused one", "paused"),
             ],
         )];
         let out = render_multi_with_colors(&input, 80, 40, fixture_colors());
@@ -1254,11 +1516,14 @@ mod tests {
             "short session id header missing: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("2 working")),
-            "working count missing from header: {texts:?}"
+            texts.iter().any(|t| t.contains("1 working")
+                && t.contains("1 queued")
+                && t.contains("1 paused")),
+            "open-work counts missing from header: {texts:?}"
         );
         assert!(texts.iter().any(|t| t.contains("open one")));
         assert!(texts.iter().any(|t| t.contains("busy one")));
+        assert!(texts.iter().any(|t| t.contains("paused one")));
         assert!(
             !texts.iter().any(|t| t.contains("done one")),
             "completed task must not appear on cross-session view: {texts:?}"

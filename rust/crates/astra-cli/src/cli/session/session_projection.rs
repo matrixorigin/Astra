@@ -131,15 +131,27 @@ fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
     if active_tasks.is_empty() {
         return None;
     }
-    let mut lines = vec!["Active task board:".to_string()];
-    for item in active_task_anchor_items(active_tasks) {
-        lines.push(format!("- {item}"));
-    }
+    let items = active_task_anchor_items(active_tasks);
+    let mut lines = active_task_anchor_section_from_items(&items)?
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     if active_tasks.len() > 3 {
         lines.push(format!(
             "- ... {} more active task(s)",
             active_tasks.len() - 3
         ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn active_task_anchor_section_from_items(items: &[String]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["Active task board:".to_string()];
+    for item in items {
+        lines.push(format!("- {item}"));
     }
     Some(lines.join("\n"))
 }
@@ -229,15 +241,12 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
     ))
 }
 
-async fn load_active_tasks_for_anchor(state: &SessionState) -> Vec<SessionTask> {
-    let session_id = state.task_manager.session_id();
-    let tasks = state
+async fn load_active_tasks_for_anchor(state: &SessionState) -> Result<Vec<SessionTask>, String> {
+    state
         .task_manager
-        .store()
-        .load_active(&session_id)
+        .load_active_tasks()
         .await
-        .unwrap_or_default();
-    prioritize_active_tasks_for_anchor(tasks)
+        .map(prioritize_active_tasks_for_anchor)
 }
 
 fn build_continuation_anchor_with_active_tasks(
@@ -295,6 +304,16 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
     state: &mut SessionState,
     active_tasks: &[SessionTask],
 ) {
+    rebuild_continuation_anchor_from_state_with_active_task_items(
+        state,
+        active_task_anchor_items(active_tasks),
+    );
+}
+
+fn rebuild_continuation_anchor_from_state_with_active_task_items(
+    state: &mut SessionState,
+    active_task_board: Vec<String>,
+) {
     state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
 
     let Some((user_line, assistant_text)) = state.history.last() else {
@@ -308,8 +327,7 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
 
     let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
-    let active_task_board = active_task_anchor_items(active_tasks);
-    if let Some(task_section) = active_task_anchor_section(active_tasks) {
+    if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
         sections.push(task_section);
     }
 
@@ -333,8 +351,27 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
 }
 
 pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
-    let active_tasks = load_active_tasks_for_anchor(state).await;
-    rebuild_continuation_anchor_from_state_with_active_tasks(state, &active_tasks);
+    match load_active_tasks_for_anchor(state).await {
+        Ok(active_tasks) => {
+            rebuild_continuation_anchor_from_state_with_active_tasks(state, &active_tasks);
+        }
+        Err(error) => {
+            let preserved_task_board = state
+                .continuation_anchor
+                .as_ref()
+                .map(|anchor| anchor.active_task_board.clone())
+                .unwrap_or_default();
+            tracing::warn!(
+                session_id = %state.task_manager.session_id(),
+                error = %error,
+                "failed to refresh active task board for continuation anchor; preserving previous anchor task board"
+            );
+            rebuild_continuation_anchor_from_state_with_active_task_items(
+                state,
+                preserved_task_board,
+            );
+        }
+    }
 }
 
 pub(crate) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_json::Value> {
@@ -414,7 +451,7 @@ mod tests {
         rebuild_continuation_anchor_from_live_state,
     };
     use crate::cli::session::session_input::build_effective_line;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
     use crate::cli::turn::turn_reporting::build_history_text;
     use astra_services::session_journal;
 
@@ -526,6 +563,103 @@ mod tests {
         assert!(anchor.contains("Active task board:"), "{anchor}");
         assert!(anchor.contains("Finish slash command repair"), "{anchor}");
         assert!(anchor.contains("[in_progress]"), "{anchor}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_continuation_anchor_from_live_state_includes_paused_open_work() {
+        let mut state = SessionState::default();
+        state.task_manager.rebind("sess-anchor-paused");
+        state.history.push((
+            "继续".into(),
+            "Paused investigation for operator input.".into(),
+        ));
+        let create = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Wait for API credentials"}))
+            .await;
+        assert!(!create.starts_with("Error:"), "{create}");
+        let task_id = state
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .next()
+            .expect("task")
+            .id;
+        let update = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": task_id, "new_status": "paused"}))
+            .await;
+        assert!(!update.starts_with("Error:"), "{update}");
+
+        rebuild_continuation_anchor_from_live_state(&mut state).await;
+
+        let anchor = state.continuation_anchor.expect("anchor");
+        assert!(anchor.contains("Active task board:"), "{anchor}");
+        assert!(anchor.contains("Wait for API credentials"), "{anchor}");
+        assert!(anchor.contains("[paused]"), "{anchor}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_continuation_anchor_preserves_previous_task_board_when_load_fails() {
+        struct LoadFailsTaskStore;
+
+        #[async_trait::async_trait]
+        impl astra_tools::task_mgmt::TaskStore for LoadFailsTaskStore {
+            async fn load(
+                &self,
+                _session_id: &str,
+            ) -> Result<Vec<astra_tools::task_mgmt::SessionTask>, String> {
+                Err("forced active-task load failure".to_string())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<astra_tools::task_mgmt::SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let mut state = SessionState {
+            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new(
+                "sess-anchor-fail",
+                std::sync::Arc::new(LoadFailsTaskStore),
+            )),
+            continuation_anchor: Some(ContinuationAnchor::from_parts(
+                "Latest user task: 继续\nActive task board:\n- [in_progress] task-1: Preserve me",
+                Some("继续".into()),
+                None,
+                vec!["[in_progress] task-1: Preserve me".into()],
+            )),
+            ..SessionState::default()
+        };
+        state.history.push((
+            "继续".into(),
+            "Kept working on the task board recovery path.".into(),
+        ));
+
+        rebuild_continuation_anchor_from_live_state(&mut state).await;
+
+        let anchor = state.continuation_anchor.expect("anchor");
+        assert!(anchor.contains("Active task board:"), "{anchor}");
+        assert!(
+            anchor.contains("[in_progress] task-1: Preserve me"),
+            "{anchor}"
+        );
+        assert_eq!(
+            anchor.active_task_board,
+            vec!["[in_progress] task-1: Preserve me".to_string()]
+        );
     }
 
     #[test]

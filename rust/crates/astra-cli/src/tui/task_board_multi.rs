@@ -31,10 +31,9 @@ pub(crate) struct MultiSessionRow {
 }
 
 /// Flatten a list of `(session_id, tasks)` pairs into the
-/// cross-session view. Filters to "active" tasks (pending /
-/// in_progress) by default — the board has always been
-/// active-work-focused; completed cross-session work is a
-/// different surface.
+/// cross-session view. Filters to open work (pending / in_progress /
+/// paused) by default; completed cross-session work is a different
+/// surface.
 pub(crate) fn flatten_active<'a, I>(per_session: I) -> Vec<MultiSessionRow>
 where
     I: IntoIterator<Item = (&'a str, &'a [SessionTask])>,
@@ -43,7 +42,7 @@ where
     for (sid, tasks) in per_session {
         let short = sid.chars().take(8).collect::<String>();
         for t in tasks {
-            if !t.status.is_active() {
+            if !t.status.is_open_work() {
                 continue;
             }
             rows.push(MultiSessionRow {
@@ -111,17 +110,24 @@ mod tests {
     }
 
     #[test]
-    fn flatten_filters_to_active_only() {
+    fn flatten_filters_to_open_work_only() {
         let sid_a: Vec<SessionTask> = vec![
             task("t1", "open", "pending", "2025-05-10T12:00:00Z"),
             task("t2", "done", "completed", "2025-05-10T12:00:00Z"),
             task("t3", "mid", "in_progress", "2025-05-10T12:00:00Z"),
+            task("t4", "paused", "paused", "2025-05-10T12:00:00Z"),
+            task("t5", "failed", "failed", "2025-05-10T12:00:00Z"),
         ];
         let rows = flatten_active([("sess-a", sid_a.as_slice())]);
-        assert_eq!(rows.len(), 2, "completed must be filtered out: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            3,
+            "terminal statuses must be filtered out: {rows:?}"
+        );
         let ids: Vec<&str> = rows.iter().map(|r| r.task_id.as_str()).collect();
         assert!(ids.contains(&"t1"));
         assert!(ids.contains(&"t3"));
+        assert!(ids.contains(&"t4"));
     }
 
     #[test]
