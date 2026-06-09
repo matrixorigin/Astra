@@ -894,7 +894,7 @@ pub(crate) async fn run_tui_session(
         chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
     }
 
-    // Resume-time summary: surface background jobs that reached
+    // Resume-time summary: surface background commands that reached
     // terminal state while the user was away. One ResumeSummary
     // rollup becomes a single banner cell at the top of scrollback
     // — it comes AFTER the replay so the banner is the last thing
@@ -3202,7 +3202,7 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
-                // Drain background job commands from the tool executor.
+                // Drain background shell commands from the tool executor.
                 {
                     let cmds: Vec<_> = {
                         state.bg_task_commands.lock_recover().drain(..).collect()
@@ -3236,7 +3236,7 @@ pub(crate) async fn run_tui_session(
                             crate::edge_tools::BgTaskCommand::Latest { reply } => {
                                 let result = background_registry
                                     .latest_job_id()
-                                    .ok_or_else(|| "no background jobs".to_string());
+                                    .ok_or_else(|| "no background commands".to_string());
                                 let _ = reply.send(result);
                             }
                             crate::edge_tools::BgTaskCommand::IsTerminal { job_id, reply } => {
@@ -3251,7 +3251,7 @@ pub(crate) async fn run_tui_session(
                                             | crate::tui::background_tasks::BgTaskStatus::Failed
                                             | crate::tui::background_tasks::BgTaskStatus::Killed
                                     )),
-                                    None => Err(format!("no background job with id '{job_id}'")),
+                                    None => Err(format!("no background command with id '{job_id}'")),
                                 };
                                 let _ = reply.send(result);
                             }
@@ -3259,7 +3259,7 @@ pub(crate) async fn run_tui_session(
                     }
                 }
 
-                // Poll background job completions.
+                // Poll background command completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
                     let notification = super::background_tasks::format_notification_xml(ev);
@@ -3268,16 +3268,16 @@ pub(crate) async fn run_tui_session(
                     }
                     let msg = match ev {
                         super::background_tasks::BgTaskEvent::Completed { id, summary, .. } => {
-                            Some(format!("Background job {id} completed: {summary}"))
+                            Some(format!("Background command {id} completed: {summary}"))
                         }
                         super::background_tasks::BgTaskEvent::Failed { id, error } => {
-                            Some(format!("Background job {id} failed: {error}"))
+                            Some(format!("Background command {id} failed: {error}"))
                         }
                         super::background_tasks::BgTaskEvent::Stalled { id, .. } => {
-                            Some(format!("Background job {id} may be stalled (waiting for input)"))
+                            Some(format!("Background command {id} may be stalled (waiting for input)"))
                         }
                         super::background_tasks::BgTaskEvent::Killed { id } => {
-                            Some(format!("Background job {id} killed"))
+                            Some(format!("Background command {id} killed"))
                         }
                         _ => None,
                     };
@@ -3322,7 +3322,7 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
-    // Clean up background jobs on exit.
+    // Clean up background commands on exit.
     background_registry.kill_all();
     drop(guard);
     result
@@ -3473,7 +3473,7 @@ mod tests {
         assert!(notification.contains("job(action='shell', command='...')"));
         assert!(
             !notification.contains("<job_id>"),
-            "fallback cancellation should not invent a background job id: {notification}"
+            "fallback cancellation should not invent a background command id: {notification}"
         );
     }
 

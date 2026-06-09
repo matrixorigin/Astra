@@ -183,8 +183,8 @@ impl StatusLine {
             }
         }
 
-        // BackgroundTaskRegistry chip. Surfaces local shell jobs so the
-        // user knows how many bg jobs are live without opening a separate view.
+        // BackgroundTaskRegistry chip. Surfaces local shell commands so the
+        // user knows how many are live without opening a separate view.
         // Style:
         //   - any stalled → yellow (alarm: process likely waiting on
         //     interactive input; user should kill or acknowledge)
@@ -193,9 +193,9 @@ impl StatusLine {
         if let Some((running, stalled)) = ctx.bg_task_counts {
             if running > 0 || stalled > 0 {
                 let mut text = if running == 1 {
-                    "1 background job".to_string()
+                    "1 background command".to_string()
                 } else {
-                    format!("{running} background jobs")
+                    format!("{running} background commands")
                 };
                 if stalled > 0 {
                     text.push_str(&format!(" · {stalled} waiting"));
