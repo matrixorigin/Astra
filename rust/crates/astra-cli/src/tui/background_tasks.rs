@@ -841,7 +841,7 @@ fn read_tail_str(path: &Path, max_bytes: usize) -> Result<(String, u64), String>
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(max_bytes.min(len as usize));
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buf).to_string();
+    let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, len))
 }
 
@@ -856,7 +856,7 @@ fn read_from_str(path: &Path, offset: u64, max_bytes: usize) -> Result<(String, 
         .map(|m| m.len())
         .unwrap_or(end_offset);
     Ok((
-        String::from_utf8_lossy(&buf).to_string(),
+        String::from_utf8_lossy(&buf).into_owned(),
         end_offset,
         total_bytes,
     ))

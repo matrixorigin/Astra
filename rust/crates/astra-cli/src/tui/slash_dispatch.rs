@@ -647,7 +647,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .current_dir(&cwd)
                     .output();
                 let porcelain = match out {
-                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
                     _ => String::new(),
                 };
                 let mut entries = parse(&porcelain);

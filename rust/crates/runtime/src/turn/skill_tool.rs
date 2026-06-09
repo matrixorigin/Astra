@@ -1897,7 +1897,7 @@ async fn execute_remote_skill(
         });
     }
     Ok(RemoteSkillExecutionResult {
-        text: String::from_utf8_lossy(&body).to_string(),
+        text: String::from_utf8_lossy(&body).into_owned(),
         payload_json: None,
     })
 }

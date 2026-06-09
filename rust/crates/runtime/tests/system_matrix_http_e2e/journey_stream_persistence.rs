@@ -43,7 +43,7 @@ async fn collect_full_sse_stream(
         let chunk = chunk.expect("body chunk");
         acc.extend_from_slice(&chunk);
     }
-    (status, String::from_utf8_lossy(&acc).to_string())
+    (status, String::from_utf8_lossy(&acc).into_owned())
 }
 
 /// Stream a chat, wait for the full stream to end, return (status, raw_body).

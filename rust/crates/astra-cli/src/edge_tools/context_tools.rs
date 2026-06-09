@@ -92,7 +92,7 @@ impl ToolExecutor {
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default();
 
             let mut modified = 0usize;

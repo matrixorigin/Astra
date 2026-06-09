@@ -1394,8 +1394,8 @@ async fn run_shell_cmd_buffered(
             .output()
             .map_err(|e| format!("command failed: {e}"))?;
         let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         Ok::<(i32, String, String), String>((code, stdout, stderr))
     });
     match tokio::time::timeout(BUFFERED_CMD_TIMEOUT, join).await {

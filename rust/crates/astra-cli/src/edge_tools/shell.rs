@@ -3335,7 +3335,7 @@ fn run_command_streaming(
             match stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let _ = tx.send(OutputChunk::Stdout(s));
                 }
                 Err(_) => break,
@@ -3349,7 +3349,7 @@ fn run_command_streaming(
             match stderr.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let _ = tx2.send(OutputChunk::Stderr(s));
                 }
                 Err(_) => break,
@@ -3540,7 +3540,7 @@ fn run_readonly_command_with_partial(
             match stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
                 }
                 Err(_) => break,
             }
@@ -4352,7 +4352,7 @@ impl ToolExecutor {
         // Use 15s timeout for glob/find (directory traversal)
         match run_command_with_cleanup(&mut cmd, 15.0) {
             Ok(o) => {
-                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                let text = String::from_utf8_lossy(&o.stdout).into_owned();
                 if text.trim().is_empty() {
                     "No files found".to_string()
                 } else {

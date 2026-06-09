@@ -3092,7 +3092,7 @@ mod tests {
                     }
                 }
             }
-            let full = String::from_utf8_lossy(&buf).to_string();
+            let full = String::from_utf8_lossy(&buf).into_owned();
             let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
             *captured_cl.lock().unwrap() = full[body_start..].to_string();
             let payload = b"{\"purged\": 3}";
@@ -3178,7 +3178,7 @@ mod tests {
                     }
                 }
             }
-            let full = String::from_utf8_lossy(&buf).to_string();
+            let full = String::from_utf8_lossy(&buf).into_owned();
             let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
             *captured_cl.lock().unwrap() = full[body_start..].to_string();
             let payload = b"{\"memories\":[]}";

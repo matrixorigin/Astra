@@ -303,8 +303,8 @@ async fn run_judger_call(
         .map_err(|_| format!("judger timeout after {}s", timeout.as_secs()))?
         .map_err(|e| format!("judger wait: {e}"))?;
 
-    let stdout_body = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr_body = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout_body = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr_body = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code();
     parse_score_from_response(&stdout_body).map_err(|parse_err| {
         // Carry the subprocess's stderr + exit code into the error

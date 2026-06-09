@@ -110,7 +110,7 @@ async fn git_show_stage(repo_root: &Path, stage: u8, path: &str) -> Option<Strin
         .ok()?;
 
     if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         None
     }

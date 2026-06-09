@@ -1124,8 +1124,8 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
         }
     }
 
-    let head = String::from_utf8_lossy(&head_buf).to_string();
-    let tail = String::from_utf8_lossy(&tail_ring).to_string();
+    let head = String::from_utf8_lossy(&head_buf).into_owned();
+    let tail = String::from_utf8_lossy(&tail_ring).into_owned();
 
     if total_bytes > max_bytes && !tail.is_empty() {
         let omitted = total_bytes.saturating_sub(head.len() + tail.len());
@@ -1158,7 +1158,7 @@ async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> Stri
             Err(_) => break,
         }
     }
-    let mut out = String::from_utf8_lossy(&buf).to_string();
+    let mut out = String::from_utf8_lossy(&buf).into_owned();
     if total > STDERR_CAP_BYTES {
         let omitted = total.saturating_sub(STDERR_CAP_BYTES);
         // Ensure a blank line before the notice — stderr sometimes lacks a

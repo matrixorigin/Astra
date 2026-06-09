@@ -36,7 +36,7 @@ async fn collect_full_sse_stream(
         let chunk = chunk.expect("body chunk");
         acc.extend_from_slice(&chunk);
     }
-    (status, String::from_utf8_lossy(&acc).to_string())
+    (status, String::from_utf8_lossy(&acc).into_owned())
 }
 
 async fn read_full_http_request(socket: &mut tokio::net::TcpStream) -> String {
@@ -78,7 +78,7 @@ async fn read_full_http_request(socket: &mut tokio::net::TcpStream) -> String {
         }
     }
 
-    String::from_utf8_lossy(&acc).to_string()
+    String::from_utf8_lossy(&acc).into_owned()
 }
 
 async fn stream_chat_full_nonbridge(
