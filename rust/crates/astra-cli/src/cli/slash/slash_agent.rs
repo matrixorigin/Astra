@@ -1548,13 +1548,7 @@ fn delegation_parent_lifecycle_note(status: &str) -> &'static str {
     }
 }
 
-fn truncate_display(text: &str, limit: usize) -> String {
-    if text.chars().count() > limit {
-        format!("{}…", text.chars().take(limit).collect::<String>())
-    } else {
-        text.to_string()
-    }
-}
+
 
 fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Option<String> {
     match event.event_type {
@@ -1594,7 +1588,7 @@ fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Optio
         JournalEventType::DelegationSubRunCompleted => {
             let projection = project_delegation_sub_run_completed(event.metadata.as_ref());
             let detail = delegation_sub_run_detail(&projection)
-                .map(|msg| truncate_display(msg, 120))
+                .map(|msg| crate::cli::effects::truncate_label(msg, 120))
                 .unwrap_or_default();
             Some(format!(
                 "[{}] {} {} [{}]{}",
@@ -1614,7 +1608,7 @@ fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Optio
             let preview = projection
                 .aggregated_output_preview
                 .as_deref()
-                .map(|msg| truncate_display(msg, 120))
+                .map(|msg| crate::cli::effects::truncate_label(msg, 120))
                 .unwrap_or_default();
             Some(format!(
                 "[{}] {} completed [{} ok / {} failed, status={}]{}",
@@ -1706,7 +1700,7 @@ fn render_delegation_status_lines(
                 sub_run
                     .error
                     .as_deref()
-                    .map(|error| truncate_display(error, 160))
+                    .map(|error| crate::cli::effects::truncate_label(error, 160))
                     .unwrap_or_else(|| {
                         "No explicit error recorded; inspect /agent logs for details.".to_string()
                     })
@@ -1728,7 +1722,7 @@ fn render_delegation_status_lines(
             if !retry.reason.is_empty() {
                 lines.push(format!(
                     "    reason: {}",
-                    truncate_display(&retry.reason, 160)
+                    crate::cli::effects::truncate_label(&retry.reason, 160)
                 ));
             }
         }
@@ -1770,14 +1764,14 @@ fn render_delegation_status_lines(
             if let Some(retry_reason) = &sub_run.retry_reason {
                 lines.push(format!(
                     "    retry reason: {}",
-                    truncate_display(retry_reason, 160)
+                    crate::cli::effects::truncate_label(retry_reason, 160)
                 ));
             }
             if let Some(preview) = &sub_run.output_preview {
-                lines.push(format!("    output: {}", truncate_display(preview, 160)));
+                lines.push(format!("    output: {}", crate::cli::effects::truncate_label(preview, 160)));
             }
             if let Some(error) = &sub_run.error {
-                lines.push(format!("    error: {}", truncate_display(error, 160)));
+                lines.push(format!("    error: {}", crate::cli::effects::truncate_label(error, 160)));
             }
         }
     }
