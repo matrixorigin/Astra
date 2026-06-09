@@ -645,6 +645,33 @@ mod tests {
     }
 
     #[test]
+    fn server_executed_tool_descriptions_do_not_reference_unavailable_job_tool() {
+        let caps = lifecycle_server_capabilities(true);
+        let server_tools = server_runtime_tool_schemas(&caps);
+        let remote_tools = cli_remote_tool_schemas(Vec::new(), &caps);
+
+        for (surface, schemas) in [("web", server_tools), ("remote", remote_tools)] {
+            let names = names(schemas.clone());
+            assert!(
+                !names.contains(&"job".to_string()),
+                "{surface} must not advertise local TUI job tool: {names:?}"
+            );
+            for schema in schemas {
+                let name = tool_schema_name(&schema).unwrap_or("<unknown>");
+                let desc = schema
+                    .get("function")
+                    .and_then(|function| function.get("description"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    !desc.contains("job(action='") && !desc.contains("use `job`"),
+                    "{surface} schema `{name}` must not direct the model to unavailable local job tool: {desc}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lifecycle_capabilities_include_agent_spawner() {
         let caps = lifecycle_server_capabilities(true);
         assert!(

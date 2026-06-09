@@ -697,10 +697,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.
 
-         ## agent vs job vs task
+         ## agent vs shell work vs task
          - `agent(spawn)` + `agent(get_result)`: synchronous or background sub-agents you plan to collect results from. Supports fan-out coalescing.
-         - `job(action='shell', ...)`: background shell processes (builds, test suites, servers).
-         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; job runs shell processes.",
+         - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
+         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -844,7 +844,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "task",
                 "description": "Durable task list. Use this tool proactively for multi-step work.\n\
         \n\
-        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; use `job` for background shell work.\n\
+        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; not for shell commands or agents.\n\
         \n\
         ## When to Use\n\
         - 3 or more distinct outcomes, files, or phases.\n\
