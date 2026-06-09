@@ -595,7 +595,7 @@ fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
     Ok(text.lines().map(|line| line.to_string()).collect())
 }
 
-fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
+pub fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     match String::from_utf8(bytes) {
         Ok(content) => Ok(content),
