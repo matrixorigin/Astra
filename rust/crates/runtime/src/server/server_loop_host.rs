@@ -297,6 +297,7 @@ type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 #[derive(Debug, Clone)]
 struct RequestAwareSummaryClient {
     model_name: String,
+    wire_model_name: Option<String>,
     api_key: String,
     base_url: String,
     provider: String,
@@ -325,6 +326,7 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryCli
             &self.provider,
             Some(self.max_output_tokens),
             llm_fallback_timeout(),
+            self.wire_model_name.as_deref(),
             (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
             self.request_body_overrides.as_ref(),
             self.completions_url_override.as_deref(),
@@ -2296,6 +2298,7 @@ impl ServerAgenticLoopHost {
         let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = RequestAwareSummaryClient {
             model_name: llm_cfg.model_name.clone(),
+            wire_model_name: llm_cfg.wire_model_name.clone(),
             api_key: llm_cfg.api_key.clone(),
             base_url: llm_cfg.base_url.clone(),
             provider: llm_cfg.provider.clone(),
@@ -6254,6 +6257,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RequestAwareSummaryClient {
             model_name: "gpt-4o-mini".to_string(),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),

@@ -1133,10 +1133,10 @@ fn validate_allowed_fields(args: &Value, action: &str, allowed: &[&str]) -> Resu
             ));
         }
     }
-    if let Some(action_value) = obj.get("action") {
-        if !action_value.is_string() {
-            return Err("field 'action' must be a string".to_string());
-        }
+    if let Some(action_value) = obj.get("action")
+        && !action_value.is_string()
+    {
+        return Err("field 'action' must be a string".to_string());
     }
     Ok(())
 }
@@ -1621,12 +1621,11 @@ impl TaskManager {
             Ok(description) => description,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(description) = description.as_deref() {
-            if let Err(error) =
+        if let Some(description) = description.as_deref()
+            && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
-            {
-                return format!("Error: {error}");
-            }
+        {
+            return format!("Error: {error}");
         }
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1634,21 +1633,20 @@ impl TaskManager {
             Ok(active_form) => active_form,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(active_form) = active_form.as_deref() {
-            if let Err(error) =
+        if let Some(active_form) = active_form.as_deref()
+            && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
-            {
-                return format!("Error: {error}");
-            }
+        {
+            return format!("Error: {error}");
         }
         let owner = match optional_non_empty_string_field(args, "owner") {
             Ok(owner) => owner,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(owner) = owner.as_deref() {
-            if let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS) {
-                return format!("Error: {error}");
-            }
+        if let Some(owner) = owner.as_deref()
+            && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
+        {
+            return format!("Error: {error}");
         }
         // U-7: subtasks inherit parent's `owner` when they don't
         // declare one explicitly. Without inheritance a sub-agent
@@ -1959,12 +1957,11 @@ impl TaskManager {
             Ok(error_message) => error_message,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(error_message) = error_message.as_deref() {
-            if let Err(error) =
+        if let Some(error_message) = error_message.as_deref()
+            && let Err(error) =
                 validate_string_chars(error_message, "error_message", MAX_TASK_ERROR_MESSAGE_CHARS)
-            {
-                return format!("Error: {error}");
-            }
+        {
+            return format!("Error: {error}");
         }
         if error_message.is_some() {
             if subtask_id.is_some() {
@@ -1980,50 +1977,48 @@ impl TaskManager {
             Ok(title_update) => title_update,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(title) = title_update.as_deref() {
-            if let Err(error) = validate_string_chars(title, "title", MAX_TASK_TITLE_CHARS) {
-                return format!("Error: {error}");
-            }
+        if let Some(title) = title_update.as_deref()
+            && let Err(error) = validate_string_chars(title, "title", MAX_TASK_TITLE_CHARS)
+        {
+            return format!("Error: {error}");
         }
         let desc_update = match optional_string_field(args, "description") {
             Ok(desc_update) => desc_update,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(description) = desc_update.as_deref() {
-            if let Err(error) =
+        if let Some(description) = desc_update.as_deref()
+            && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
-            {
-                return format!("Error: {error}");
-            }
+        {
+            return format!("Error: {error}");
         }
         let active_form_update = match optional_non_empty_string_field(args, "active_form") {
             Ok(active_form_update) => active_form_update,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(active_form) = active_form_update.as_deref() {
-            if let Err(error) =
+        if let Some(active_form) = active_form_update.as_deref()
+            && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
-            {
-                return format!("Error: {error}");
-            }
+        {
+            return format!("Error: {error}");
         }
         let owner_update = match optional_non_empty_string_field(args, "owner") {
             Ok(owner_update) => owner_update,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(owner) = owner_update.as_deref() {
-            if let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS) {
-                return format!("Error: {error}");
-            }
+        if let Some(owner) = owner_update.as_deref()
+            && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
+        {
+            return format!("Error: {error}");
         }
         let metadata_update = match optional_object_field(args, "metadata") {
             Ok(metadata_update) => metadata_update,
             Err(error) => return format!("Error: {error}"),
         };
-        if let Some(metadata_update) = metadata_update.as_ref() {
-            if let Err(error) = validate_metadata_size(metadata_update, "metadata") {
-                return format!("Error: {error}");
-            }
+        if let Some(metadata_update) = metadata_update.as_ref()
+            && let Err(error) = validate_metadata_size(metadata_update, "metadata")
+        {
+            return format!("Error: {error}");
         }
         let proposed_blocks = match optional_string_array_field(args, "add_blocks") {
             Ok(proposed_blocks) => proposed_blocks,

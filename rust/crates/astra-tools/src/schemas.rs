@@ -76,24 +76,22 @@ fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
             == Some("task")
-    }) {
-        if let Some(parameters) = task
-            .get_mut("function")
-            .and_then(|function| function.get_mut("parameters"))
+    }) && let Some(parameters) = task
+        .get_mut("function")
+        .and_then(|function| function.get_mut("parameters"))
+        .and_then(Value::as_object_mut)
+    {
+        parameters.insert("additionalProperties".to_string(), Value::Bool(false));
+        if let Some(subtasks) = parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("subtasks"))
             .and_then(Value::as_object_mut)
         {
-            parameters.insert("additionalProperties".to_string(), Value::Bool(false));
-            if let Some(subtasks) = parameters
-                .get_mut("properties")
-                .and_then(Value::as_object_mut)
-                .and_then(|properties| properties.get_mut("subtasks"))
-                .and_then(Value::as_object_mut)
-            {
-                subtasks.insert(
-                    "maxItems".to_string(),
-                    Value::from(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
-                );
-            }
+            subtasks.insert(
+                "maxItems".to_string(),
+                Value::from(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
+            );
         }
     }
 }

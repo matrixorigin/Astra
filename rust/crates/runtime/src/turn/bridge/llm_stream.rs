@@ -451,7 +451,8 @@ async fn anthropic_stream_with_retry(
             let client_for_fallback = client.clone();
             let messages_for_fallback: Arc<[Value]> = Arc::from(messages);
             let tools_for_fallback: Arc<[Value]> = Arc::from(tools);
-            let model_for_fallback = upstream_name.to_string();
+            let model_for_fallback = model_name.to_string();
+            let wire_model_for_fallback = wire_model_name.map(str::to_string);
             let api_key_for_fallback = api_key.to_string();
             let base_url_for_fallback = base_url.to_string();
             let provider_for_fallback = provider.to_string();
@@ -505,6 +506,7 @@ async fn anthropic_stream_with_retry(
                                         &provider_for_fallback,
                                         max_out_for_fallback,
                                         fb_timeout,
+                                        wire_model_for_fallback.as_deref(),
                                         None,
                                         request_body_overrides_for_fallback.as_ref(),
                                         None,
@@ -603,6 +605,7 @@ async fn anthropic_stream_with_retry(
                                             &provider_for_fallback,
                                             max_out_for_fallback,
                                             fb_timeout,
+                                            wire_model_for_fallback.as_deref(),
                                             None,
                                             request_body_overrides_for_fallback.as_ref(),
                                             None,
@@ -1126,6 +1129,7 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
             cooldown.with(model_key, |c| c.record_success());
             let byte_stream = response.bytes_stream();
             let model_name = model_name.to_string();
+            let wire_model_for_fallback = wire_model_name.map(str::to_string);
 
             let client_for_fallback = client.clone();
             let messages_for_fallback: Arc<[Value]> = Arc::from(messages.as_slice());
@@ -1179,7 +1183,7 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                     let streamed_reasoning = reasoning.clone();
                                     let existing_tool_calls = tool_calls_map.clone();
                                     let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
-                                    match crate::turn::llm::client::call_llm_nonstream_fallback(
+                                    match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
                                         &client_for_fallback,
                                         &messages_for_fallback,
                                         &tools_for_fallback,
@@ -1189,6 +1193,12 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                         &provider_for_fallback,
                                         max_out_for_fallback,
                                         fb_timeout,
+                                        wire_model_for_fallback.as_deref(),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
                                     )
                                     .await
                                     {
@@ -1269,7 +1279,7 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                         let streamed_reasoning = reasoning.clone();
                                         let existing_tool_calls = tool_calls_map.clone();
                                         let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
-                                        match crate::turn::llm::client::call_llm_nonstream_fallback(
+                                        match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
                                             &client_for_fallback,
                                             &messages_for_fallback,
                                             &tools_for_fallback,
@@ -1279,6 +1289,12 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                             &provider_for_fallback,
                                             max_out_for_fallback,
                                             fb_timeout,
+                                            wire_model_for_fallback.as_deref(),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            &astra_turn_core::thinking_config::ThinkingConfig::Off,
                                         )
                                         .await
                                         {

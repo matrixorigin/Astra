@@ -725,7 +725,7 @@ async fn mirror_approved_plan_to_task_board_inner(
             )
         })?;
 
-    pause_other_in_progress_tasks_for_plan_handoff(&manager, &first_runnable_task_id).await?;
+    pause_other_in_progress_tasks_for_plan_handoff(manager, &first_runnable_task_id).await?;
 
     let output = manager
         .update(&serde_json::json!({
