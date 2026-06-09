@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 /// Retention: fallback handler for `/debug` — called from slash_router.rs.
 /// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
 /// Kept for headless / non-interactive execution paths.
-#[allow(dead_code)]
 pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {

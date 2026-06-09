@@ -263,7 +263,6 @@ async fn show_help(state: &SessionState) {
 /// In TUI mode, common read-only forms are handled natively by
 /// `tui::slash_dispatch`; advanced mutating forms still fall back here.
 /// Kept for headless / non-interactive execution paths.
-#[allow(dead_code)]
 pub(crate) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
     match parse_mcp_command(arg) {
         ParsedMcpCommand::Help => show_help(state).await,
@@ -1726,7 +1725,7 @@ async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedMcpCommand, extract_prompt_message_text, format_state, parse_mcp_command};
+    use super::{extract_prompt_message_text, format_state, parse_mcp_command, ParsedMcpCommand};
     use crate::cli::slash::slash_agent::format_duration;
     use crate::mcp_client::ConnectionState;
 
@@ -2000,18 +1999,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("github");
-        assert!(
-            !config["mcpServers"]
-                .as_object()
-                .unwrap()
-                .contains_key("github")
-        );
-        assert!(
-            config["mcpServers"]
-                .as_object()
-                .unwrap()
-                .contains_key("other")
-        );
+        assert!(!config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("github"));
+        assert!(config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("other"));
     }
 
     #[test]

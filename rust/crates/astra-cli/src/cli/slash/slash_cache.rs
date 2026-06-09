@@ -22,7 +22,6 @@ struct CacheTurnSummary {
     cache_alert_message: Option<String>,
 }
 
-#[allow(dead_code)]
 pub(crate) fn handle_cache_command(arg: &str, state: &SessionState) {
     let Some(session_id) = state.session_id.as_deref() else {
         eprintln!(
