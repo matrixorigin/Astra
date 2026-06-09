@@ -602,7 +602,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     // sibling runner so Ctrl+B can transfer child + streams to the
     // BackgroundTaskRegistry. Without a slot OR with an empty slot
     // we fall through to the legacy reader (zero hot-path overhead).
-    let detach_handle = if let Some(slot) = ctx.detach_shell_handle.as_ref() {
+    let detach_slot = ctx.detach_shell_handle.as_ref().cloned();
+    let detach_handle = if let Some(slot) = detach_slot.as_ref() {
         slot.lock().await.take()
     } else {
         None
@@ -620,7 +621,12 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         )
         .await
         {
-            Ok(BashRunOutcome::Completed(output)) => output,
+            Ok(BashRunOutcome::Completed(output)) => {
+                if let Some(slot) = detach_slot.as_ref() {
+                    *slot.lock().await = Some(detach_handle);
+                }
+                output
+            }
             Ok(BashRunOutcome::Detached(payload)) => {
                 // Hand the live child + streams back to the host
                 // through the one-shot reply channel. The host drains
@@ -4969,6 +4975,29 @@ printf 'probe.txt:1:needle\n'
         // The child is still alive in the payload; clean up so the
         // test doesn't leak a sleeping shell.
         drop(payload);
+    }
+
+    #[tokio::test]
+    async fn bash_detach_slot_is_reusable_after_normal_completion() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, _listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot.clone());
+
+        let first = execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})).await;
+        assert!(first.output.contains("first"), "{}", first.output);
+        assert!(
+            slot.lock().await.is_some(),
+            "normal bash completion must return the detach handle so later bash calls in the same turn can still be backgrounded"
+        );
+
+        let second =
+            execute_bash(&ctx, &serde_json::json!({"command": "printf 'second\\n'"})).await;
+        assert!(second.output.contains("second"), "{}", second.output);
+        assert!(
+            slot.lock().await.is_some(),
+            "second normal bash completion must also return the detach handle"
+        );
     }
 
     /// Sanity: when no detach handle is wired, the bash tool falls

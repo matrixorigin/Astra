@@ -1833,6 +1833,8 @@ pub(crate) async fn run_tui_session(
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
                                             state.active_turn_local_run_control.clone();
+                                        let bash_detach_slot_for_ctrl_b =
+                                            state.bash_detach_slot.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
@@ -1959,7 +1961,11 @@ pub(crate) async fn run_tui_session(
                                                                         // or completed normally before
                                                                         // detach landed. Fall through to
                                                                         // legacy cancel-and-advise.
-                                                                        _ => {}
+                                                                        _ => {
+                                                                            if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
+                                                                                *slot = None;
+                                                                            }
+                                                                        }
                                                                     }
                                                                 }
                                                                 chat_widget.commit_system(
