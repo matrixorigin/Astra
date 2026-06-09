@@ -383,6 +383,12 @@ impl TaskStore for MatrixOneTaskStore {
     /// U-8: SQL-pushdown path for open-work `active` queries.
     /// Uses `idx_session_todos_session_status_updated` so only matching
     /// rows are returned instead of shipping the whole table to Rust.
+    ///
+    /// **Security fix**: removed fail-open `OR status NOT IN (...)` clause.
+    /// From first principles: load_active must return ONLY known active
+    /// statuses (pending, in_progress, paused). Treating unknown/corrupted
+    /// status values as active violates the fail-closed principle and could
+    /// expose inactive tasks to orchestration logic.
     async fn load_active(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
         let rows = sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
@@ -391,22 +397,13 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
              WHERE session_id = ? \
-               AND (status IN (?, ?, ?) OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?)) \
+               AND status IN (?, ?, ?) \
              ORDER BY ordinal ASC",
         )
         .bind(session_id)
         .bind(SESSION_TASK_STATUS_PENDING.to_string())
         .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
         .bind(SESSION_TASK_STATUS_PAUSED.to_string())
-        .bind(SESSION_TASK_STATUS_PENDING.to_string())
-        .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
-        .bind(SESSION_TASK_STATUS_PAUSED.to_string())
-        .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-        .bind(SESSION_TASK_STATUS_FAILED.to_string())
-        .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
-        .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-        .bind(SESSION_TASK_STATUS_DELETED.to_string())
-        .bind(SESSION_TASK_STATUS_MIGRATED.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
