@@ -9,8 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Widget};
 
-use super::TableNav;
 use super::parser::MysqlTable;
+use super::TableNav;
 
 pub(crate) const MAX_CELL_WIDTH: u16 = 24;
 
@@ -54,7 +54,7 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
     let header_cells: Vec<Cell<'static>> = visible_cols
         .iter()
         .map(|&c| {
-            Cell::from(truncate(&table.headers[c], MAX_CELL_WIDTH as usize)).style(
+            Cell::from(truncate_label(&table.headers[c], MAX_CELL_WIDTH as usize)).style(
                 Style::default()
                     .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
@@ -71,7 +71,7 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
                 .iter()
                 .map(|&c| {
                     let v = r.get(c).cloned().unwrap_or_default();
-                    Cell::from(truncate(&v, MAX_CELL_WIDTH as usize))
+                    Cell::from(truncate_label(&v, MAX_CELL_WIDTH as usize))
                 })
                 .collect();
             Row::new(cells)
@@ -141,17 +141,7 @@ fn visible_cols(table: &MysqlTable, nav: &TableNav, width: u16) -> Vec<usize> {
     (start..end).collect()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".into();
-    }
-    let out: String = s.chars().take(max - 1).collect();
-    format!("{out}…")
-}
+use crate::cli::effects::truncate_label;
 
 #[cfg(test)]
 mod tests {
@@ -251,9 +241,9 @@ mod tests {
 
     #[test]
     fn truncate_produces_ellipsis() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 5), "hell…");
-        assert_eq!(truncate("", 3), "");
+        assert_eq!(truncate_label("hello", 10), "hello");
+        assert_eq!(truncate_label("hello world", 5), "hell…");
+        assert_eq!(truncate_label("", 3), "");
     }
 
     #[test]

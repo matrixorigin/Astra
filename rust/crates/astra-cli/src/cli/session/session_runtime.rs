@@ -769,7 +769,7 @@ fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
             Err(error) => {
                 line.push_str(&format!(
                     " [workspace metadata unreadable: {}]",
-                    truncate_status_detail(&error.to_string(), 96)
+                    truncate_label(&error.to_string(), 96)
                 ));
             }
         }
@@ -777,15 +777,7 @@ fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
     })
 }
 
-fn truncate_status_detail(detail: &str, max_chars: usize) -> String {
-    let total = detail.chars().count();
-    if total <= max_chars {
-        return detail.to_string();
-    }
-    let keep = max_chars.saturating_sub(1);
-    let truncated: String = detail.chars().take(keep).collect();
-    format!("{truncated}…")
-}
+use crate::cli::effects::truncate_label;
 
 fn workspace_matches_current_project(
     workspace: &astra_services::session_workspace::WorkspaceMetadata,

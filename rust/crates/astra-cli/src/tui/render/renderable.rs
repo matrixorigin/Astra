@@ -16,28 +16,20 @@ pub(crate) trait Renderable {
 
 pub(crate) enum RenderableItem<'a> {
     Owned(Box<dyn Renderable + 'a>),
-    #[allow(dead_code)]
-    Borrowed(&'a dyn Renderable),
 }
 
 impl<'a> Renderable for RenderableItem<'a> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        match self {
-            RenderableItem::Owned(c) => c.render(area, buf),
-            RenderableItem::Borrowed(c) => c.render(area, buf),
-        }
+        let RenderableItem::Owned(c) = self;
+        c.render(area, buf);
     }
     fn desired_height(&self, width: u16) -> u16 {
-        match self {
-            RenderableItem::Owned(c) => c.desired_height(width),
-            RenderableItem::Borrowed(c) => c.desired_height(width),
-        }
+        let RenderableItem::Owned(c) = self;
+        c.desired_height(width)
     }
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        match self {
-            RenderableItem::Owned(c) => c.cursor_pos(area),
-            RenderableItem::Borrowed(c) => c.cursor_pos(area),
-        }
+        let RenderableItem::Owned(c) = self;
+        c.cursor_pos(area)
     }
 }
 

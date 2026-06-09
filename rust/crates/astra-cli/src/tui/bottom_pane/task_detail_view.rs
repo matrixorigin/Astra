@@ -24,7 +24,7 @@ pub(crate) struct TaskDetailView {
 
 impl TaskDetailView {
     pub fn from_task_cell(cell: &TaskCell) -> Self {
-        let title = format!("Task details · {}", truncate(&cell.description, 50));
+        let title = format!("Task details · {}", truncate_label(&cell.description, 50));
         let lines = build_detail_lines(cell);
         Self {
             title,
@@ -37,7 +37,7 @@ impl TaskDetailView {
     }
 
     pub fn from_session_task(task: &SessionTask) -> Self {
-        let title = format!("Task details · {}", truncate(&task.title, 50));
+        let title = format!("Task details · {}", truncate_label(&task.title, 50));
         let lines = build_session_task_lines(task);
         Self {
             title,
@@ -62,7 +62,7 @@ impl TaskDetailView {
     fn refresh_from_task_cell(&mut self, cell: &TaskCell) {
         let old_max_scroll = self.lines.len().saturating_sub(MAX_VISIBLE);
         let was_pinned_to_bottom = self.scroll >= old_max_scroll;
-        self.title = format!("Task details · {}", truncate(&cell.description, 50));
+        self.title = format!("Task details · {}", truncate_label(&cell.description, 50));
         self.lines = build_detail_lines(cell);
         let new_max_scroll = self.lines.len().saturating_sub(MAX_VISIBLE);
         self.scroll = if was_pinned_to_bottom {
@@ -152,17 +152,7 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
     out
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    // Char-aware truncation: avoids slicing mid-codepoint for CJK / emoji.
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max == 0 {
-        String::new()
-    } else {
-        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{truncated}…")
-    }
-}
+use crate::cli::effects::truncate_label;
 
 fn status_style(status: &TaskStatus) -> Style {
     match status {
@@ -265,7 +255,7 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
             ];
             if !child.description.is_empty() {
                 spans.push(Span::styled(
-                    format!(" · {}", truncate(&child.description, 54)),
+                    format!(" · {}", truncate_label(&child.description, 54)),
                     dim,
                 ));
             }
@@ -414,8 +404,8 @@ impl BottomPaneView for TaskDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::history_cell::HistoryCell;
     use crate::tui::history_cell::task::TaskCell;
+    use crate::tui::history_cell::HistoryCell;
     use astra_tools::task_mgmt::SessionTask;
 
     fn mk_session_task(id: &str, title: &str) -> SessionTask {
@@ -541,7 +531,7 @@ mod tests {
         let s = "abcd日本語abcd日本語abcd日本語";
         // Should not panic regardless of max value
         for max in [10, 25, 50, 100] {
-            let result = truncate(s, max);
+            let result = truncate_label(s, max);
             assert!(!result.is_empty() || s.is_empty());
         }
     }
