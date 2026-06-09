@@ -953,13 +953,19 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     let Some((title, status, metadata, subtasks)) = todo_row else {
         panic!("approved HTTP plan should be mirrored into session_todos task board");
     };
-    assert_eq!(title, "http-exit-clears");
+    assert_eq!(title, "step s1");
     assert_eq!(status, "in_progress");
     let metadata: Value = serde_json::from_str(metadata.as_deref().unwrap_or("{}")).unwrap();
     assert_eq!(metadata["source"], "approved_plan");
     assert_eq!(metadata["plan_id"], plan_id);
+    assert_eq!(metadata["plan_goal"], "http-exit-clears");
+    assert_eq!(metadata["plan_subtask_id"], "s1");
     let subtasks: Value = serde_json::from_str(subtasks.as_deref().unwrap_or("[]")).unwrap();
-    assert_eq!(subtasks.as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        subtasks.as_array().map(Vec::len),
+        Some(0),
+        "approved HTTP plan step should be a top-level task, not a hidden subtask tree"
+    );
 
     let (s, body) = request_json(
         app.clone(),
@@ -988,7 +994,11 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     assert_eq!(synced_row.0, "completed");
     let synced_subtasks: Value =
         serde_json::from_str(synced_row.1.as_deref().unwrap_or("[]")).unwrap();
-    assert_eq!(synced_subtasks[0]["status"], "completed");
+    assert_eq!(
+        synced_subtasks.as_array().map(Vec::len),
+        Some(0),
+        "step completion should update the top-level approved-plan task"
+    );
 
     cleanup_session_todos(&pool, &session_id).await;
     cleanup_plan(&pool, &plan_id).await;
