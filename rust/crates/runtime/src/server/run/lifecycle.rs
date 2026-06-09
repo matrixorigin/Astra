@@ -1540,7 +1540,7 @@ fn build_llm_round_trace_events(
     // Hoist repeated per-round allocations. session_id/user_id in new() are
     // overwritten by with_turn_context, so pass empty strings to skip 2 clones.
     let run_id_owned = run_id.to_string();
-    let agent_str = agent_id.unwrap_or("root-agent");
+    let agent_str = agent_id.unwrap_or("root-agent").to_string();
     let parent_run_str = parent_run_id.map(|s| s.to_string());
     let parent_agent_str = parent_agent_id.map(|s| s.to_string());
     let root_event_id = trace.root_event_id.clone();
@@ -1562,7 +1562,7 @@ fn build_llm_round_trace_events(
             .with_turn_context(trace);
             event.run_id = Some(run_id_owned.clone());
             event.parent_run_id = parent_run_str.clone();
-            event.agent_id = Some(agent_str.to_string());
+            event.agent_id = Some(agent_str.clone());
             event.parent_agent_id = parent_agent_str.clone();
             event.round_index = Some(round_index);
             event.llm_model_used = (!round.model.is_empty())
@@ -1617,7 +1617,7 @@ fn build_tool_trace_events(
     // overwritten by with_turn_context, so pass empty strings to skip 4 clones
     // per record (2 events x 2 fields).
     let run_id_owned = run_id.to_string();
-    let agent_str = agent_id.unwrap_or("root-agent");
+    let agent_str = agent_id.unwrap_or("root-agent").to_string();
     let parent_run_str = parent_run_id.map(|s| s.to_string());
     let parent_agent_str = parent_agent_id.map(|s| s.to_string());
     let root_event_id = trace.root_event_id.clone();
@@ -1653,7 +1653,7 @@ fn build_tool_trace_events(
         .with_turn_context(trace);
         started.run_id = Some(run_id_owned.clone());
         started.parent_run_id = parent_run_str.clone();
-        started.agent_id = Some(agent_str.to_string());
+        started.agent_id = Some(agent_str.clone());
         started.parent_agent_id = parent_agent_str.clone();
         started.round_index = round_index;
         started.tool_call_id = Some(call_id_clone);
@@ -1683,7 +1683,7 @@ fn build_tool_trace_events(
         .with_turn_context(trace);
         completed.run_id = Some(run_id_owned.clone());
         completed.parent_run_id = parent_run_str.clone();
-        completed.agent_id = Some(agent_str.to_string());
+        completed.agent_id = Some(agent_str.clone());
         completed.parent_agent_id = parent_agent_str.clone();
         completed.round_index = round_index;
         completed.tool_call_id = Some(call_id);
