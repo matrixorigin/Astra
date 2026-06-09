@@ -463,7 +463,6 @@ impl ToolExecutor {
     }
 
     /// Clear all file state (call after compaction to avoid stale dedup).
-    #[allow(dead_code)] // Public API for compaction cleanup
     pub fn clear_file_state(&self) {
         if let Ok(mut state) = self.file_state.lock() {
             state.clear();
@@ -482,7 +481,6 @@ impl ToolExecutor {
     /// Return recently-read file paths sorted by recency (most recent first).
     /// Used for post-compact file restoration — re-inject the N most recently
     /// accessed files so the LLM retains working context after compaction.
-    #[allow(dead_code)] // Public API for post-compact file restoration
     pub fn recently_read_files(&self, max: usize) -> Vec<PathBuf> {
         if let Ok(state) = self.file_state.lock() {
             let mut entries: Vec<_> = state.iter().filter(|(_, fs)| fs.from_read).collect();

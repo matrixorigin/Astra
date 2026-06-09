@@ -41,7 +41,6 @@ impl TerminalRegion {
     }
 
     /// Number of logical lines currently on screen.
-    #[allow(dead_code)]
     pub(crate) fn height(&self) -> usize {
         self.lines.len()
     }
@@ -150,7 +149,6 @@ impl TerminalRegion {
     }
 
     /// Append lines without diffing (for content that only grows).
-    #[allow(dead_code)]
     pub(crate) fn append(&mut self, new_lines: &[String]) {
         for line in new_lines {
             println!("{line}");
@@ -252,7 +250,7 @@ fn strip_ansi_codes(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalRegion, char_display_width, strip_ansi_codes, visible_char_width};
+    use super::{char_display_width, strip_ansi_codes, visible_char_width, TerminalRegion};
 
     #[test]
     fn new_region_is_empty() {

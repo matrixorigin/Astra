@@ -19,8 +19,6 @@ pub(crate) struct PartialTurnData {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub tool_calls_count: u32,
-    #[allow(dead_code)]
-    pub tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
@@ -193,7 +191,7 @@ impl Default for StreamResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartialTurnData, apply_partial_turn_data_to_error_event};
+    use super::{apply_partial_turn_data_to_error_event, PartialTurnData};
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {

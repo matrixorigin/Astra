@@ -4319,7 +4319,6 @@ pub(crate) struct StreamRenderState {
     /// Incremental markdown renderer — `None` when `render_md` is false.
     md: Option<streaming_md::StreamingMarkdown>,
     /// Stderr lines written between tool calls (thinking duration, tool notices).
-    #[allow(dead_code)]
     stderr_lines: usize,
     /// Tool status region + lines (non-markdown); mutex so a worker thread can animate the running line.
     tool_ui: Arc<Mutex<ToolRegionState>>,

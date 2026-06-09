@@ -1146,7 +1146,6 @@ impl PermissionSettings {
             |settings| settings.save_user_in_home(home),
         )
     }
-    #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
             .iter()
@@ -1154,7 +1153,6 @@ impl PermissionSettings {
             .collect()
     }
 
-    #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_deny_rules(&self) -> Vec<PermissionRule> {
         self.deny
             .iter()
