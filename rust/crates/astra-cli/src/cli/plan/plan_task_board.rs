@@ -15,6 +15,29 @@ pub(crate) async fn mirror_plan_to_task_board(
             plan.subtasks.len()
         ));
     }
+    let snapshot = state
+        .task_manager
+        .try_snapshot_state()
+        .await
+        .map_err(|error| format!("snapshot task board before approved-plan mirror: {error}"))?;
+    match mirror_plan_to_task_board_inner(state, goal, plan).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(restore_error) = state.task_manager.restore_snapshot(&snapshot).await {
+                return Err(format!(
+                    "{error}; additionally failed to roll back approved-plan task-board mirror: {restore_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn mirror_plan_to_task_board_inner(
+    state: &SessionState,
+    goal: &str,
+    plan: &astra_services::task_orchestrator::TaskPlan,
+) -> Result<(), String> {
     let plan_fingerprint = plan_task_board_fingerprint(plan);
 
     let mut step_task_ids = std::collections::HashMap::new();
@@ -260,8 +283,8 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
     use astra_services::task_orchestrator::SubtaskPlan;
     use astra_tools::task_mgmt::{
-        MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, TaskManager, TaskMutation,
-        TaskStore,
+        MAX_CREATE_SUBTASKS, MAX_TASK_TITLE_CHARS, SessionTask, SessionTaskStatusKind, TaskManager,
+        TaskMutation, TaskStore,
     };
 
     struct FailingLoadTaskStore;
@@ -449,7 +472,7 @@ mod tests {
             .expect_err("task-board load failure should abort approved-plan mirror");
 
         assert!(
-            error.contains("load task board before approved-plan mirror")
+            error.contains("snapshot task board before approved-plan mirror")
                 && error.contains("forced task-board load failure"),
             "approved-plan mirror must not treat task-board load failure as an empty board: {error}"
         );
@@ -479,6 +502,53 @@ mod tests {
         assert!(
             state.task_manager.snapshot().await.is_empty(),
             "rejected oversized plan should not leave partial task-board work"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_plan_to_task_board_rolls_back_partial_step_create_failure() {
+        let state = SessionState::default();
+        let existing = state
+            .task_manager
+            .create(&serde_json::json!({
+                "title": "Existing user task",
+            }))
+            .await;
+        assert!(!existing.starts_with("Error:"), "{existing}");
+        let plan = astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "Create first mirrored step".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "x".repeat(MAX_TASK_TITLE_CHARS + 1),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let err = mirror_plan_to_task_board(&state, "rollback partial plan", &plan)
+            .await
+            .expect_err("invalid later step should abort approved-plan mirror");
+
+        assert!(
+            err.contains("title") && err.contains("exceeds"),
+            "original create validation error should be surfaced: {err}"
+        );
+        let tasks = state.task_manager.snapshot().await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "failed approved-plan mirror must roll back tasks created by earlier steps: {tasks:?}"
+        );
+        assert_eq!(tasks[0].title, "Existing user task");
+        assert!(
+            tasks[0].metadata.is_none(),
+            "rollback must preserve unrelated user task exactly: {tasks:?}"
         );
     }
 
