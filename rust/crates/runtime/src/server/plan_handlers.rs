@@ -25,7 +25,8 @@ use crate::plan::{PlanLoadError, PlanModeState};
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use astra_tools::task_mgmt::{
-    MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, TaskManager, TaskStore,
+    MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, TaskManager, TaskManagerSnapshot,
+    TaskStore,
 };
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use std::collections::HashMap;
@@ -607,6 +608,38 @@ async fn sync_plan_task_board_subtask_status_if_configured(
     Ok(())
 }
 
+struct TaskBoardRollback {
+    manager: TaskManager,
+    snapshot: TaskManagerSnapshot,
+}
+
+impl TaskBoardRollback {
+    async fn restore(self) -> Result<(), String> {
+        self.manager.restore_snapshot(&self.snapshot).await
+    }
+}
+
+async fn capture_task_board_rollback_if_configured(
+    state: &AppState,
+    user_id: &str,
+    session_id: Option<&str>,
+) -> Result<Option<TaskBoardRollback>, String> {
+    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(pool) = state.shared_pool.as_ref() else {
+        return Ok(None);
+    };
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
+    let manager = TaskManager::new(session_id.to_string(), store);
+    let snapshot = manager
+        .try_snapshot_state()
+        .await
+        .map_err(|error| format!("snapshot task board before plan mutation: {error}"))?;
+    Ok(Some(TaskBoardRollback { manager, snapshot }))
+}
+
 async fn sync_plan_task_board_subtasks_status_if_configured(
     state: &AppState,
     user_id: &str,
@@ -887,6 +920,7 @@ pub(super) async fn execute_plan_handler(
         .load_owned(&plan_id, &user.user_id)
         .await
         .map_err(map_plan_load_err)?;
+    let original_plan_state = plan_state.clone();
 
     check_version(&plan_state, req.expected_version)?;
 
@@ -930,6 +964,11 @@ pub(super) async fn execute_plan_handler(
 
     let goal = plan_state.goal.clone();
 
+    let mut task_board_rollback =
+        capture_task_board_rollback_if_configured(&state, &user.user_id, Some(&req.session_id))
+            .await
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
     // ── Sync to task board FIRST ──────────────────────────────────
     // If the task-board sync fails, we bail out before persisting
     // the plan mutation so the repo never records an InProgress state
@@ -957,17 +996,54 @@ pub(super) async fn execute_plan_handler(
     }
 
     let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
+    if let Err(error) = state
         .plan_repo
         .save(&plan_id, &mut plan_state, expected)
         .await
-        .map_err(map_plan_load_err)?;
+    {
+        if let Some(rollback) = task_board_rollback.take() {
+            rollback.restore().await.map_err(|restore_error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "execute_plan: plan save failed ({error}) and task-board rollback failed: {restore_error}"
+                    ),
+                )
+            })?;
+        }
+        return Err(map_plan_load_err(error));
+    }
 
-    state
+    if let Err(error) = state
         .plan_repo
         .set_active_plan(&req.session_id, Some(&plan_id))
         .await
-        .map_err(map_plan_load_err)?;
+    {
+        let mut restore_errors = Vec::new();
+        if let Some(rollback) = task_board_rollback.take() {
+            if let Err(restore_error) = rollback.restore().await {
+                restore_errors.push(format!("task-board rollback failed: {restore_error}"));
+            }
+        }
+        let mut rollback_plan = original_plan_state;
+        if let Err(restore_error) = state
+            .plan_repo
+            .save(&plan_id, &mut rollback_plan, Some(plan_state.version))
+            .await
+        {
+            restore_errors.push(format!("plan rollback failed: {restore_error}"));
+        }
+        if !restore_errors.is_empty() {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "execute_plan: active-plan link failed ({error}); {}",
+                    restore_errors.join("; ")
+                ),
+            ));
+        }
+        return Err(map_plan_load_err(error));
+    }
 
     emit_plan_journal(
         Some(&req.session_id),
@@ -1170,12 +1246,6 @@ pub(super) async fn rewind_plan_handler(
 
     let reset_count = rewind_plan_from_subtask(&mut plan_state.plan, idx);
 
-    let aborted_runs = state
-        .plan_repo
-        .abort_open_step_runs(&plan_id, &affected_subtask_ids)
-        .await
-        .map_err(map_plan_load_err)?;
-
     plan_state
         .timeline
         .record(crate::plan::TimelineEventKind::SubtaskRewound {
@@ -1187,11 +1257,10 @@ pub(super) async fn rewind_plan_handler(
 
     let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
-        .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
-        .await
-        .map_err(map_plan_load_err)?;
+    let mut task_board_rollback =
+        capture_task_board_rollback_if_configured(&state, &user.user_id, session_hint.as_deref())
+            .await
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     sync_plan_task_board_subtasks_status_if_configured(
         &state,
@@ -1207,10 +1276,37 @@ pub(super) async fn rewind_plan_handler(
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "rewind_plan: plan state saved but failed to sync affected subtasks into task board — session may show stale status. Error: {error}"
+                "rewind_plan: failed to sync affected subtasks into task board — plan state was NOT saved. Error: {error}"
             ),
         )
     })?;
+
+    let expected_version = expected.unwrap_or(plan_state.version);
+    let aborted_runs = match state
+        .plan_repo
+        .save_existing_and_abort_open_step_runs(
+            &plan_id,
+            &mut plan_state,
+            expected_version,
+            &affected_subtask_ids,
+        )
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            if let Some(rollback) = task_board_rollback.take() {
+                rollback.restore().await.map_err(|restore_error| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "rewind_plan: atomic plan/run update failed ({error}) and task-board rollback failed: {restore_error}"
+                        ),
+                    )
+                })?;
+            }
+            return Err(map_plan_load_err(error));
+        }
+    };
 
     emit_plan_journal(
         session_hint.as_deref(),
@@ -1270,25 +1366,54 @@ pub(super) async fn redo_step_handler(
     plan_state.plan.subtasks[idx].reset_for_redo();
     let title = plan_state.plan.subtasks[idx].title.clone();
     let resolved_subtask_id = plan_state.plan.subtasks[idx].id.clone();
+    let session_hint = plan_state.session_hint.clone();
 
-    // Cancel any open step_run for this subtask first — otherwise the
-    // attempt counter below would skip ahead of a still-running row that
-    // later finalizes and creates an attempt-number overlap. Must run
-    // before `list_step_runs` to keep the max-attempt read consistent with
-    // the state we just rolled back to.
-    let aborted_runs = state
-        .plan_repo
-        .abort_open_step_runs(&plan_id, std::slice::from_ref(&resolved_subtask_id))
-        .await
-        .map_err(map_plan_load_err)?;
+    let mut task_board_rollback =
+        capture_task_board_rollback_if_configured(&state, &user.user_id, session_hint.as_deref())
+            .await
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    sync_plan_task_board_subtasks_status_if_configured(
+        &state,
+        &user.user_id,
+        session_hint.as_deref(),
+        &plan_id,
+        &plan_state.plan,
+        std::slice::from_ref(&resolved_subtask_id),
+        TaskStatus::Pending,
+    )
+    .await
+    .map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "redo_step: failed to sync subtask status back to Pending in task board — plan state was NOT saved. Error: {error}"
+            ),
+        )
+    })?;
 
     // Compute the next attempt number by counting prior runs for this subtask.
     // In-memory/test repos start empty too, so the first attempt is 1 there.
-    let prior_runs = state
+    let prior_runs = match state
         .plan_repo
         .list_step_runs(&plan_id, Some(&resolved_subtask_id), DEFAULT_RUNS_LIMIT)
         .await
-        .map_err(map_plan_load_err)?;
+    {
+        Ok(runs) => runs,
+        Err(error) => {
+            if let Some(rollback) = task_board_rollback.take() {
+                rollback.restore().await.map_err(|restore_error| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "redo_step: list prior step-runs failed ({error}) and task-board rollback failed: {restore_error}"
+                        ),
+                    )
+                })?;
+            }
+            return Err(map_plan_load_err(error));
+        }
+    };
     let next_attempt: i32 = prior_runs.iter().map(|r| r.attempt).max().unwrap_or(0) + 1;
 
     plan_state
@@ -1299,34 +1424,33 @@ pub(super) async fn redo_step_handler(
             attempt: next_attempt as u32,
         });
 
-    let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
+    let expected_version = expected.unwrap_or(plan_state.version);
+    let aborted_runs = match state
         .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
-        .await
-        .map_err(map_plan_load_err)?;
-
-    if let Some(session_id) = session_hint.as_deref() {
-        if let Err(error) = sync_plan_task_board_subtask_status_if_configured(
-            &state,
-            &user.user_id,
-            session_id,
+        .save_existing_and_abort_open_step_runs(
             &plan_id,
-            &plan_state.plan,
-            &resolved_subtask_id,
-            TaskStatus::Pending,
+            &mut plan_state,
+            expected_version,
+            std::slice::from_ref(&resolved_subtask_id),
         )
         .await
-        {
-            return Err((
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(format!(
-                    "redo_step: plan state saved but failed to sync subtask status back to Pending in task board — session may show stale status. Error: {error}"
-                ))),
-            ));
+    {
+        Ok(count) => count,
+        Err(error) => {
+            if let Some(rollback) = task_board_rollback.take() {
+                rollback.restore().await.map_err(|restore_error| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "redo_step: atomic plan/run update failed ({error}) and task-board rollback failed: {restore_error}"
+                        ),
+                    )
+                })?;
+            }
+            return Err(map_plan_load_err(error));
         }
-    }
+    };
 
     emit_plan_journal(
         session_hint.as_deref(),
@@ -1391,19 +1515,10 @@ pub(super) async fn start_step_run_handler(
             )
         })?;
 
-    let run_id = state
-        .plan_repo
-        .record_step_run(astra_plan::NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: &req.subtask_id,
-            attempt: req.attempt,
-            status: TaskStatus::InProgress,
-            session_id: &req.session_id,
-            request_id: &req.request_id,
-        })
-        .await
-        .map_err(map_plan_load_err)?;
-
+    let mut task_board_rollback =
+        capture_task_board_rollback_if_configured(&state, &user.user_id, Some(&req.session_id))
+            .await
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     sync_plan_task_board_subtask_status_if_configured(
         &state,
         &user.user_id,
@@ -1418,10 +1533,38 @@ pub(super) async fn start_step_run_handler(
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "start_step_run: step run recorded but failed to sync task board — session may show stale status. Error: {error}"
+                "start_step_run: failed to sync task board — step run was NOT recorded. Error: {error}"
             ),
         )
     })?;
+
+    let run_id = match state
+        .plan_repo
+        .record_step_run(astra_plan::NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: &req.subtask_id,
+            attempt: req.attempt,
+            status: TaskStatus::InProgress,
+            session_id: &req.session_id,
+            request_id: &req.request_id,
+        })
+        .await
+    {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            if let Some(rollback) = task_board_rollback.take() {
+                rollback.restore().await.map_err(|restore_error| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "start_step_run: record step-run failed ({error}) and task-board rollback failed: {restore_error}"
+                        ),
+                    )
+                })?;
+            }
+            return Err(map_plan_load_err(error));
+        }
+    };
 
     let (completed, _) = status_counts(&plan_state.plan);
     emit_plan_journal(
@@ -1506,22 +1649,10 @@ pub(super) async fn post_completed_step_run_handler(
             )
         })?;
 
-    let run_id = state
-        .plan_repo
-        .record_completed_step_run(
-            astra_plan::NewStepRun {
-                plan_id: &plan_id,
-                subtask_id: &req.subtask_id,
-                attempt: req.attempt,
-                status: req.status,
-                session_id: &req.session_id,
-                request_id: &req.request_id,
-            },
-            req.error.as_deref(),
-            req.artifact_ref.as_deref(),
-        )
-        .await
-        .map_err(map_plan_load_err)?;
+    let mut task_board_rollback =
+        capture_task_board_rollback_if_configured(&state, &user.user_id, Some(&req.session_id))
+            .await
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     sync_plan_task_board_subtask_status_if_configured(
         &state,
@@ -1537,10 +1668,42 @@ pub(super) async fn post_completed_step_run_handler(
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "finish_step_run: step run recorded but failed to sync task board — session may show stale status. Error: {error}"
+                "post_completed_step_run: failed to sync task board — step run was NOT recorded. Error: {error}"
             ),
         )
     })?;
+
+    let run_id = match state
+        .plan_repo
+        .record_completed_step_run(
+            astra_plan::NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: &req.subtask_id,
+                attempt: req.attempt,
+                status: req.status,
+                session_id: &req.session_id,
+                request_id: &req.request_id,
+            },
+            req.error.as_deref(),
+            req.artifact_ref.as_deref(),
+        )
+        .await
+    {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            if let Some(rollback) = task_board_rollback.take() {
+                rollback.restore().await.map_err(|restore_error| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "post_completed_step_run: record completed step-run failed ({error}) and task-board rollback failed: {restore_error}"
+                        ),
+                    )
+                })?;
+            }
+            return Err(map_plan_load_err(error));
+        }
+    };
 
     let (completed, _) = status_counts(&plan_state.plan);
     let action = match req.status {
@@ -1598,7 +1761,40 @@ pub(super) async fn finish_step_run_handler(
         .await
         .map_err(map_plan_load_err)?;
 
-    state
+    let existing = state
+        .plan_repo
+        .get_step_run(&plan_id, &run_id)
+        .await
+        .map_err(map_plan_load_err)?;
+
+    let mut task_board_rollback = capture_task_board_rollback_if_configured(
+        &state,
+        &user.user_id,
+        Some(&existing.session_id),
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    sync_plan_task_board_subtask_status_if_configured(
+        &state,
+        &user.user_id,
+        &existing.session_id,
+        &plan_id,
+        &plan_state.plan,
+        &existing.subtask_id,
+        req.status,
+    )
+    .await
+    .map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "finalize_step_run: failed to sync task board — step run was NOT finalized. Error: {error}"
+            ),
+        )
+    })?;
+
+    if let Err(error) = state
         .plan_repo
         .finalize_step_run(
             &plan_id,
@@ -1608,7 +1804,19 @@ pub(super) async fn finish_step_run_handler(
             req.artifact_ref.as_deref(),
         )
         .await
-        .map_err(map_plan_load_err)?;
+    {
+        if let Some(rollback) = task_board_rollback.take() {
+            rollback.restore().await.map_err(|restore_error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "finalize_step_run: finalize failed ({error}) and task-board rollback failed: {restore_error}"
+                    ),
+                )
+            })?;
+        }
+        return Err(map_plan_load_err(error));
+    }
 
     // Look up the finalized row to return it and journal progress with the
     // right subtask context. Direct SELECT by (run_id, plan_id) — O(1) vs
@@ -1618,25 +1826,6 @@ pub(super) async fn finish_step_run_handler(
         .get_step_run(&plan_id, &run_id)
         .await
         .map_err(map_plan_load_err)?;
-
-    sync_plan_task_board_subtask_status_if_configured(
-        &state,
-        &user.user_id,
-        &finalized.session_id,
-        &plan_id,
-        &plan_state.plan,
-        &finalized.subtask_id,
-        req.status,
-    )
-    .await
-    .map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "finalize_step_run: step run finalized but failed to sync task board — session may show stale status. Error: {error}"
-            ),
-        )
-    })?;
 
     let subtask_title = plan_state
         .plan

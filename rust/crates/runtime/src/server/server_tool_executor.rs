@@ -7000,6 +7000,22 @@ esac
         ) -> Result<u64, astra_plan::PlanLoadError> {
             self.inner.abort_open_step_runs(plan_id, subtask_ids).await
         }
+        async fn save_existing_and_abort_open_step_runs(
+            &self,
+            plan_id: &str,
+            state: &mut astra_plan::PlanModeState,
+            expected_version: u64,
+            subtask_ids: &[String],
+        ) -> Result<u64, astra_plan::PlanLoadError> {
+            self.inner
+                .save_existing_and_abort_open_step_runs(
+                    plan_id,
+                    state,
+                    expected_version,
+                    subtask_ids,
+                )
+                .await
+        }
     }
 
     #[tokio::test]
@@ -7253,6 +7269,28 @@ esac
             _plan_id: &str,
             _subtask_ids: &[String],
         ) -> Result<u64, astra_plan::PlanLoadError> {
+            Ok(0)
+        }
+        async fn save_existing_and_abort_open_step_runs(
+            &self,
+            plan_id: &str,
+            state: &mut astra_plan::PlanModeState,
+            expected_version: u64,
+            _subtask_ids: &[String],
+        ) -> Result<u64, astra_plan::PlanLoadError> {
+            let mut guard = self.plan_state.write().await;
+            let actual = match &*guard {
+                Some((stored_plan_id, stored)) if stored_plan_id == plan_id => stored.version,
+                _ => return Err(astra_plan::PlanLoadError::conflict(expected_version, 0)),
+            };
+            if actual != expected_version {
+                return Err(astra_plan::PlanLoadError::conflict(
+                    expected_version,
+                    actual,
+                ));
+            }
+            state.version = actual + 1;
+            *guard = Some((plan_id.to_string(), state.clone()));
             Ok(0)
         }
     }
