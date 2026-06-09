@@ -172,68 +172,94 @@ pub(crate) async fn run_completed_auto_archive_once(pool: SharedPool) -> Result<
 async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Result<u64, String> {
     let days = completed_auto_archive_days();
     let limit = limit.max(1);
-    let mut tx = pool
-        .get()
-        .begin()
-        .await
-        .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
 
-    let rows: Vec<(String, String)> = sqlx::query(
-        "SELECT session_id, todo_id FROM session_todos \
-         WHERE status = 'completed' \
-           AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY updated_at ASC \
-         LIMIT ?",
-    )
-    .bind(days)
-    .bind(limit)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("completed-auto-archive select: {e}"))?
-    .into_iter()
-    .filter_map(|row| {
-        let session_id: Option<String> = row.try_get("session_id").ok();
-        let todo_id: Option<String> = row.try_get("todo_id").ok();
-        match (session_id, todo_id) {
-            (Some(session_id), Some(todo_id)) => Some((session_id, todo_id)),
-            _ => None,
-        }
-    })
-    .collect();
+    // Process in sub-batches of SUB_BATCH_SIZE to avoid a single large
+    // transaction that delays the entire weekly cleanup on transient failure.
+    // Each sub-batch commits independently so partial progress survives.
+    const SUB_BATCH_SIZE: i64 = 50;
 
-    let mut affected = 0u64;
-    let mut archived_by_session: HashMap<String, HashSet<String>> = HashMap::new();
-    for (session_id, todo_id) in &rows {
-        let result = sqlx::query(
-            "UPDATE session_todos \
-             SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-             WHERE session_id = ? AND todo_id = ? AND status = 'completed' \
-               AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+    let mut total_affected = 0u64;
+    let mut remaining = limit;
+
+    while remaining > 0 {
+        let batch_size = remaining.min(SUB_BATCH_SIZE);
+        let mut tx = pool
+            .get()
+            .begin()
+            .await
+            .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
+
+        let rows: Vec<(String, String)> = sqlx::query(
+            "SELECT session_id, todo_id FROM session_todos \
+             WHERE status = 'completed' \
+               AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+             ORDER BY updated_at ASC \
+             LIMIT ?",
         )
-        .bind(session_id)
-        .bind(todo_id)
         .bind(days)
-        .execute(&mut *tx)
+        .bind(batch_size)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| format!("completed-auto-archive update: {e}"))?;
-        let rows_affected = result.rows_affected();
-        affected = affected.saturating_add(rows_affected);
-        if rows_affected > 0 {
-            archived_by_session
-                .entry(session_id.clone())
-                .or_default()
-                .insert(todo_id.clone());
+        .map_err(|e| format!("completed-auto-archive select: {e}"))?
+        .into_iter()
+        .filter_map(|row| {
+            let session_id: Option<String> = row.try_get("session_id").ok();
+            let todo_id: Option<String> = row.try_get("todo_id").ok();
+            match (session_id, todo_id) {
+                (Some(session_id), Some(todo_id)) => Some((session_id, todo_id)),
+                _ => None,
+            }
+        })
+        .collect();
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut affected = 0u64;
+        let mut archived_by_session: HashMap<String, HashSet<String>> = HashMap::new();
+        for (session_id, todo_id) in &rows {
+            let result = sqlx::query(
+                "UPDATE session_todos \
+                 SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                 WHERE session_id = ? AND todo_id = ? AND status = 'completed' \
+                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+            )
+            .bind(session_id)
+            .bind(todo_id)
+            .bind(days)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("completed-auto-archive update: {e}"))?;
+            let rows_affected = result.rows_affected();
+            affected = affected.saturating_add(rows_affected);
+            if rows_affected > 0 {
+                archived_by_session
+                    .entry(session_id.clone())
+                    .or_default()
+                    .insert(todo_id.clone());
+            }
+        }
+
+        for (session_id, archived_ids) in &archived_by_session {
+            detach_auto_archived_dependency_edges(&mut tx, session_id, archived_ids).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("completed-auto-archive commit: {e}"))?;
+
+        total_affected = total_affected.saturating_add(affected);
+        remaining -= batch_size;
+
+        // If this sub-batch returned fewer rows than requested, no more
+        // candidates exist — stop early.
+        if (rows.len() as i64) < batch_size {
+            break;
         }
     }
 
-    for (session_id, archived_ids) in &archived_by_session {
-        detach_auto_archived_dependency_edges(&mut tx, session_id, archived_ids).await?;
-    }
-
-    tx.commit()
-        .await
-        .map_err(|e| format!("completed-auto-archive commit: {e}"))?;
-    Ok(affected)
+    Ok(total_affected)
 }
 
 fn decode_edge_ids(
@@ -250,7 +276,8 @@ fn decode_edge_ids(
 }
 
 fn encode_edge_ids(ids: &[String]) -> Option<String> {
-    (!ids.is_empty()).then(|| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
+    (!ids.is_empty())
+        .then(|| serde_json::to_string(ids).expect("Vec<String> serialization cannot fail"))
 }
 
 async fn detach_auto_archived_dependency_edges(

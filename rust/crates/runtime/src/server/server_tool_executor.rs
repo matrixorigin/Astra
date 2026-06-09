@@ -3103,6 +3103,15 @@ impl ServerToolExecutor {
     /// `task(action=create|update|stop)` response that was a plain
     /// human-readable summary (e.g. just `"Created task #5: foo"`).
     /// That made `rollback_session_state` a no-op on the most common path.
+    fn find_json_body_start(output: &str) -> Option<usize> {
+        // task_mgmt prefixes responses with a one-line summary followed by a JSON body.
+        // The JSON body starts on its own line, so look for `{` at the start of a line.
+        if output.starts_with('{') {
+            return Some(0);
+        }
+        output.find("\n{").map(|pos| pos + 1)
+    }
+
     fn task_output_success(output: &str) -> bool {
         if output.starts_with("Error:") {
             return false;
@@ -3112,7 +3121,7 @@ impl ServerToolExecutor {
         // If we *can* find a JSON body, honor its explicit `success: false`;
         // otherwise treat as a success (conservative — better to snapshot
         // a no-op than to lose a real snapshot).
-        if let Some(pos) = output.find('{') {
+        if let Some(pos) = Self::find_json_body_start(output) {
             if let Ok(value) = serde_json::from_str::<Value>(&output[pos..]) {
                 if let Some(false) = value.get("success").and_then(Value::as_bool) {
                     return false;
@@ -3608,7 +3617,7 @@ impl ServerToolExecutor {
                 })
             })
             .collect();
-        serde_json::to_string(&parts).unwrap_or_default()
+        serde_json::to_string(&parts).expect("fingerprint serialization of Vec<Value> cannot fail")
     }
 
     fn approved_plan_task_matches(
@@ -4553,11 +4562,20 @@ impl ServerToolExecutor {
                 .mirror_approved_plan_to_task_board(&active, &approved_plan_state)
                 .await
             {
-                return format!("Error: failed to mirror approved plan into task board: {e}");
+                return format!(
+                    "Error: failed to mirror approved plan into task board: {e}\n\
+                     Session remains in plan mode (write tools blocked). \
+                     Options: (1) retry exit_plan_mode, (2) manually inspect task board via task(action=list), \
+                     (3) use /plans/{active}/execute to proceed without task board sync."
+                );
             }
 
             if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
-                return format!("Error: clear active plan: {e}");
+                return format!(
+                    "Error: clear active plan failed: {e}\n\
+                     Plan was mirrored to task board but session lock could not be released. \
+                     Manual intervention may be needed to clear active_plan_id."
+                );
             }
         }
 

@@ -1097,6 +1097,7 @@ fn validate_parent_status_transition(
     if new_status == previous_status || new_status == SessionTaskStatusKind::Deleted {
         return Ok(());
     }
+    // Terminal tasks cannot be moved backward.
     if matches!(
         previous_status,
         SessionTaskStatusKind::Completed
@@ -1106,6 +1107,41 @@ fn validate_parent_status_transition(
     ) {
         return Err(format!(
             "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to remove it"
+        ));
+    }
+    // Enforce state machine: Pending must go through InProgress before terminal states.
+    if previous_status == SessionTaskStatusKind::Pending
+        && matches!(
+            new_status,
+            SessionTaskStatusKind::Completed
+                | SessionTaskStatusKind::Failed
+                | SessionTaskStatusKind::Cancelled
+        )
+    {
+        return Err(format!(
+            "cannot transition directly from 'pending' to '{new_status}'; move to 'in_progress' first"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_subtask_status_transition(
+    previous_status: SessionTaskStatusKind,
+    new_status: SessionTaskStatusKind,
+) -> Result<(), String> {
+    if new_status == previous_status || new_status == SessionTaskStatusKind::Deleted {
+        return Ok(());
+    }
+    // Terminal subtasks cannot be moved backward.
+    if matches!(
+        previous_status,
+        SessionTaskStatusKind::Completed
+            | SessionTaskStatusKind::Failed
+            | SessionTaskStatusKind::Cancelled
+            | SessionTaskStatusKind::Archived
+    ) {
+        return Err(format!(
+            "subtask is already terminal ({previous_status}); create a new subtask for follow-up work, or use new_status='deleted' to remove it"
         ));
     }
     Ok(())
@@ -2145,10 +2181,18 @@ impl TaskManager {
                         };
                         let previous_status = subtask.status;
                         if let Some(ref status) = new_status {
+                            validate_subtask_status_transition(previous_status, *status)?;
                             subtask.status = *status;
                         }
+                        // Copy the reconciled parent state from projected_task instead of
+                        // re-running reconcile on the real task. This avoids a race where
+                        // concurrent subtask updates could apply reconcile twice and
+                        // produce inconsistent parent status (e.g., auto-complete reversal
+                        // firing on stale metadata). The projected_task was validated above,
+                        // so its reconciled state is authoritative.
+                        task.status = projected_task.status;
+                        task.metadata = projected_task.metadata;
                         let final_subtask_status = subtask.status;
-                        reconcile_subtask_completion(task);
                         task.updated_at = now;
                         let response = prefix_summary(
                             format!(

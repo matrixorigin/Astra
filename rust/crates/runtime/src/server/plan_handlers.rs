@@ -519,7 +519,7 @@ fn plan_task_board_fingerprint(plan: &TaskPlan) -> String {
             })
         })
         .collect();
-    serde_json::to_string(&parts).unwrap_or_default()
+    serde_json::to_string(&parts).expect("fingerprint serialization of Vec<Value> cannot fail")
 }
 
 fn approved_plan_task_matches(
@@ -641,10 +641,26 @@ async fn mirror_approved_plan_to_task_board(
         Ok(()) => Ok(()),
         Err(error) => {
             if let Err(restore_error) = manager.restore_snapshot(&snapshot).await {
+                // Critical: both operation and rollback failed. Task board is in
+                // inconsistent state. Log at error level for operator attention.
+                tracing::error!(
+                    plan_id = %plan_id,
+                    session_id = %session_id,
+                    mirror_error = %error,
+                    restore_error = %restore_error,
+                    "approved-plan task-board mirror failed AND rollback failed — task board may be inconsistent"
+                );
                 return Err(format!(
-                    "{error}; additionally failed to roll back approved-plan task-board mirror: {restore_error}"
+                    "{error}; additionally failed to roll back approved-plan task-board mirror: {restore_error}. \
+                     Task board may be partially mirrored — manual inspection recommended."
                 ));
             }
+            tracing::warn!(
+                plan_id = %plan_id,
+                session_id = %session_id,
+                error = %error,
+                "approved-plan task-board mirror failed; rolled back successfully"
+            );
             Err(error)
         }
     }
@@ -911,9 +927,9 @@ async fn sync_plan_task_board_subtask_status_if_configured(
     plan: &TaskPlan,
     subtask_id: &str,
     status: TaskStatus,
-) {
+) -> Result<(), String> {
     let Some(pool) = state.shared_pool.as_ref() else {
-        return;
+        return Ok(());
     };
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
@@ -921,15 +937,17 @@ async fn sync_plan_task_board_subtask_status_if_configured(
     if let Err(error) =
         sync_plan_task_board_subtask_status(&manager, plan_id, plan, subtask_id, status).await
     {
-        tracing::warn!(
+        tracing::error!(
             plan_id = %plan_id,
             session_id = %session_id,
             subtask_id = %subtask_id,
             status = status.as_str(),
             error = %error,
-            "plan handler: failed to sync subtask status into task board"
+            "plan handler: failed to sync subtask status into task board — plan and task board may drift"
         );
+        return Err(error);
     }
+    Ok(())
 }
 
 async fn sync_plan_task_board_subtasks_status_if_configured(
@@ -948,7 +966,8 @@ async fn sync_plan_task_board_subtasks_status_if_configured(
         sync_plan_task_board_subtask_status_if_configured(
             state, user_id, session_id, plan_id, plan, subtask_id, status,
         )
-        .await;
+        .await
+        .ok();
     }
 }
 
@@ -1276,7 +1295,8 @@ pub(super) async fn execute_plan_handler(
             subtask_id,
             TaskStatus::InProgress,
         )
-        .await;
+        .await
+        .ok();
     }
 
     emit_plan_journal(
@@ -1347,27 +1367,13 @@ pub(super) async fn exit_plan_mode_handler(
 
     check_version(&plan_state, req.expected_version)?;
 
-    // Persist the rendered markdown alongside plan_json so web, sync, and CLI
-    // consumers can read the same artifact without reviving the removed
-    // turn-history compatibility layer.
-    if let Some(md) = req.plan_md {
-        plan_state.plan_md = Some(md);
-    }
-
     let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
-        .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
-        .await
-        .map_err(map_plan_load_err)?;
 
-    // On approval, lift the write-tool guard by clearing the session's
-    // active_plan_id. The `plans` row stays intact so the approved plan can
-    // still drive execution via `/plans/{id}/execute`; we're only releasing
-    // the guard, not the plan. Mirrors `tool_exit_plan_mode` so web-agent
-    // and server-tool exit paths behave identically. Rejection leaves the
-    // plan pinned so the next authoring pass still sees the guard.
+    // On approval, mirror the plan to the task board BEFORE persisting it.
+    // If mirror fails, we haven't committed the plan yet, avoiding the
+    // three-way inconsistency (plan persisted, task board empty, session locked).
+    // The active_plan_id is cleared AFTER both mirror and save succeed.
     if req.approved {
         if let Some(sid) = session_hint.as_deref() {
             mirror_approved_plan_to_task_board_if_configured(
@@ -1384,6 +1390,26 @@ pub(super) async fn exit_plan_mode_handler(
                     format!("failed to mirror approved plan into task board: {error}"),
                 )
             })?;
+        }
+    }
+
+    // Persist the rendered markdown alongside plan_json so web, sync, and CLI
+    // consumers can read the same artifact without reviving the removed
+    // turn-history compatibility layer.
+    if let Some(md) = req.plan_md {
+        plan_state.plan_md = Some(md);
+    }
+
+    state
+        .plan_repo
+        .save(&plan_id, &mut plan_state, expected)
+        .await
+        .map_err(map_plan_load_err)?;
+
+    // Clear active plan AFTER both mirror and save succeed. This releases
+    // the write-tool guard so execution can proceed.
+    if req.approved {
+        if let Some(sid) = session_hint.as_deref() {
             state
                 .plan_repo
                 .set_active_plan(sid, None)
@@ -1604,7 +1630,7 @@ pub(super) async fn redo_step_handler(
         .map_err(map_plan_load_err)?;
 
     if let Some(session_id) = session_hint.as_deref() {
-        sync_plan_task_board_subtask_status_if_configured(
+        if let Err(error) = sync_plan_task_board_subtask_status_if_configured(
             &state,
             &user.user_id,
             session_id,
@@ -1613,7 +1639,15 @@ pub(super) async fn redo_step_handler(
             &resolved_subtask_id,
             TaskStatus::Pending,
         )
-        .await;
+        .await
+        {
+            return Err((
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(format!(
+                    "redo_step: plan state saved but failed to sync subtask status back to Pending in task board — session may show stale status. Error: {error}"
+                ))),
+            ));
+        }
     }
 
     emit_plan_journal(
@@ -1701,7 +1735,8 @@ pub(super) async fn start_step_run_handler(
         &req.subtask_id,
         TaskStatus::InProgress,
     )
-    .await;
+    .await
+    .ok();
 
     let (completed, _) = status_counts(&plan_state.plan);
     emit_plan_journal(
@@ -1812,7 +1847,8 @@ pub(super) async fn post_completed_step_run_handler(
         &req.subtask_id,
         req.status,
     )
-    .await;
+    .await
+    .ok();
 
     let (completed, _) = status_counts(&plan_state.plan);
     let action = match req.status {
@@ -1900,7 +1936,8 @@ pub(super) async fn finish_step_run_handler(
         &finalized.subtask_id,
         req.status,
     )
-    .await;
+    .await
+    .ok();
 
     let subtask_title = plan_state
         .plan

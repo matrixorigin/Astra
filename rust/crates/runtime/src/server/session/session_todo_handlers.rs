@@ -142,17 +142,42 @@ fn adopt_duplicate_refusal(
     )
 }
 
+fn find_json_body_start(output: &str) -> Option<usize> {
+    // task_mgmt prefixes responses with a one-line summary followed by a JSON body.
+    // The JSON body starts on its own line, so look for `{` at the start of a line.
+    if output.starts_with('{') {
+        return Some(0);
+    }
+    output.find("\n{").map(|pos| pos + 1)
+}
+
 fn task_tool_output_success(output: &str) -> bool {
     if output.starts_with("Error:") {
         return false;
     }
-    if let Some(pos) = output.find('{')
+    if let Some(pos) = find_json_body_start(output)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&output[pos..])
         && value.get("success").and_then(serde_json::Value::as_bool) == Some(false)
     {
         return false;
     }
     true
+}
+
+/// Extract task_id from a successful create output.
+/// Format: "Task #task-N created: {title}\n{\"success\": true, \"task_id\": \"task-N\", ...}"
+fn extract_task_id_from_output(output: &str) -> Option<String> {
+    if output.starts_with("Error:") {
+        return None;
+    }
+    find_json_body_start(output)
+        .and_then(|pos| serde_json::from_str::<serde_json::Value>(&output[pos..]).ok())
+        .and_then(|value| {
+            value
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string())
+        })
 }
 
 fn adoptable_source_status(status: &str) -> bool {
@@ -647,49 +672,24 @@ async fn adopt_task_into_session(
         None => None,
     };
 
-    // 2. CAS-mark the source migrated. If rows_affected == 0,
-    //    another concurrent adopt won the race between our SELECT
-    //    and now — abort without creating a duplicate clone.
-    let migrate_result = sqlx::query(
-        "UPDATE session_todos SET status = 'migrated', updated_at = NOW(6) \
-         WHERE session_id = ? AND todo_id = ? AND user_id = ? \
-           AND status NOT IN ('migrated', 'deleted')",
-    )
-    .bind(&source_session)
-    .bind(&source_task_id)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await;
-    let migrate_rows = match migrate_result {
-        Ok(r) => r.rows_affected(),
-        Err(e) => {
-            let _ = tx.rollback().await;
-            return format!("Error: source migrate failed: {e}");
-        }
-    };
-    if migrate_rows == 0 {
-        let _ = tx.rollback().await;
-        return format!(
-            "Error: source task {source_session}:{source_task_id} was already migrated by a concurrent adopt; nothing to do"
+    // 2. Rollback the read-tx — we're done validating. Clone creation
+    //    happens outside any source-tx because the manager opens its own.
+    //    We CAS the source AFTER clone succeeds to avoid the "clone failed
+    //    + restore failed = task lost" window.
+    if let Err(e) = tx.rollback().await {
+        tracing::warn!(
+            source_session,
+            source_task_id,
+            "adopt: rollback read-tx failed (benign): {e}"
         );
     }
-    if let Err(e) = tx.commit().await {
-        return format!("Error: commit adopt source migrate: {e}");
-    }
 
-    // 3. With the source CAS-claimed, create the clone in the
-    //    target session. We do this OUTSIDE the source-tx because
-    //    the manager opens its own tx and pool re-entrancy on the
-    //    same connection is awkward. If clone creation reports a
-    //    structured failure, restore the source status below so the
-    //    user does not lose the task from cross-session views.
+    // 3. Create the clone in the target session. If this fails, the
+    //    source remains unchanged — no CAS was attempted, no task lost.
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
     let manager = TaskManager::new(target_session.to_string(), store);
 
-    // U-14: carry valid source subtasks across when present, resetting
-    // progress to pending. Source subtask corruption is rejected before
-    // the migration CAS above, so adopt never silently drops checklist work.
     let mut create_args = serde_json::json!({
         "title": title,
         "metadata": {
@@ -704,33 +704,78 @@ async fn adopt_task_into_session(
     }
     let create_output = manager.create(&create_args).await;
     if !task_tool_output_success(&create_output) {
-        let restore = sqlx::query(
-            "UPDATE session_todos SET status = ?, updated_at = NOW(6) \
-             WHERE session_id = ? AND todo_id = ? AND user_id = ? AND status = 'migrated'",
-        )
-        .bind(&source_status)
-        .bind(&source_session)
-        .bind(&source_task_id)
-        .bind(user_id)
-        .execute(pool.get())
-        .await;
-        if let Err(e) = restore {
+        // Clone failed; source is untouched. Return error to caller.
+        return create_output;
+    }
+
+    // 4. Clone succeeded. Now CAS-mark the source as migrated. If this
+    //    fails (rows_affected == 0), a concurrent adopt won the race.
+    //    Delete the clone we just created to avoid duplicates.
+    let mut tx2 = match pool.get().begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
             tracing::error!(
                 source_session,
                 source_task_id,
-                user_id,
-                "adopt: clone failed and restoring source status failed: {e}; create output: {create_output}"
+                "adopt: clone succeeded but begin CAS-tx failed: {e}; clone output: {create_output}"
             );
             return format!(
-                "Error: adopt clone failed and source restore failed: {e}; clone output: {create_output}"
+                "Error: adopt CAS-tx begin failed: {e}; clone may exist in target session"
             );
         }
+    };
+    let migrate_result = sqlx::query(
+        "UPDATE session_todos SET status = 'migrated', updated_at = NOW(6) \
+         WHERE session_id = ? AND todo_id = ? AND user_id = ? \
+           AND status NOT IN ('migrated', 'deleted')",
+    )
+    .bind(&source_session)
+    .bind(&source_task_id)
+    .bind(user_id)
+    .execute(&mut *tx2)
+    .await;
+    let migrate_rows = match migrate_result {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            let _ = tx2.rollback().await;
+            tracing::error!(
+                source_session,
+                source_task_id,
+                "adopt: clone succeeded but CAS-UPDATE failed: {e}; clone output: {create_output}"
+            );
+            return format!("Error: adopt CAS-UPDATE failed: {e}; clone exists in target session");
+        }
+    };
+    if migrate_rows == 0 {
+        // Concurrent adopt won the race. Delete the clone we created.
+        let _ = tx2.rollback().await;
+        let clone_id = extract_task_id_from_output(&create_output);
+        if let Some(clone_id) = clone_id {
+            let delete_output = manager.update(&serde_json::json!({"action": "update", "task_id": clone_id, "new_status": "deleted"})).await;
+            tracing::warn!(
+                source_session,
+                source_task_id,
+                clone_id,
+                "adopt: concurrent CAS detected; deleted clone: {delete_output}"
+            );
+        } else {
+            tracing::error!(
+                source_session,
+                source_task_id,
+                "adopt: concurrent CAS detected but could not extract clone id to delete: {create_output}"
+            );
+        }
+        return format!(
+            "Error: source task {source_session}:{source_task_id} was already migrated by a concurrent adopt"
+        );
+    }
+    if let Err(e) = tx2.commit().await {
         tracing::error!(
             source_session,
             source_task_id,
-            user_id,
-            "adopt: clone failed; source status restored to {source_status}: {create_output}"
+            "adopt: clone succeeded, CAS succeeded, but commit failed: {e}; clone output: {create_output}"
         );
+        return format!("Error: commit adopt CAS failed: {e}; clone exists in target session");
     }
 
     create_output
