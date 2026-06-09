@@ -129,6 +129,17 @@ fn add_dependency_edge(
     blocked_id: &str,
     now: &str,
 ) -> Result<(), String> {
+    // **Self-dependency check**: a task cannot block itself. This would create
+    // a trivial cycle and violate the state machine invariant that a task must
+    // eventually become unblocked. From first principles: dependency graphs must
+    // be DAGs, and self-loops are not acyclic.
+    if blocker_id == blocked_id {
+        return Err(format!(
+            "task '{}' cannot depend on itself. Self-dependency creates an unresolvable cycle",
+            blocker_id
+        ));
+    }
+
     let Some(blocker_index) = tasks.iter().position(|task| task.id == blocker_id) else {
         return Err(format!("task '{}' not found", blocker_id));
     };
