@@ -1047,14 +1047,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
         // ── exit_plan_mode ──────────────────────────────────────────
         // Companion to enter_plan_mode. Surfaces the proposed plan to
         // the user for approval, lifts the write-tool guard on
-        // success, and (server-side) seeds the approved plan items
-        // into `session_plan_todos` so the next turn can execute
-        // step-by-step.
+        // success, and mirrors the approved plan into the session task
+        // board so the next turn can execute step-by-step.
         json!({
             "type": "function",
             "function": {
                 "name": "exit_plan_mode",
-                "description": "Present the plan for user approval and exit plan mode. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects. On approval, write tools unlock and the items seed `session_plan_todos`. On rejection (`approved=false`), the plan stays open for another authoring pass.\n\
+                "description": "Present the plan for user approval and exit plan mode. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects. On approval, write tools unlock and the approved work appears in the session task board. On rejection (`approved=false`), the plan stays open for another authoring pass.\n\
         \n\
         ## Plan structure (what makes a good plan)\n\
         - Numbered list of concrete, executable leaf steps — each step maps to ONE artifact, API surface, or validation target.\n\
@@ -1525,6 +1524,23 @@ mod tests {
                 "plan schema must not encode phrase-list triggers: {desc}"
             );
         }
+    }
+
+    #[test]
+    fn exit_plan_mode_schema_points_to_task_board_not_legacy_plan_todos() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let exit =
+            find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
+        let desc = exit["function"]["description"].as_str().unwrap();
+
+        assert!(
+            desc.contains("session task board"),
+            "approved plans should surface through the user-visible task board: {desc}"
+        );
+        assert!(
+            !desc.contains("session_plan_todos"),
+            "schema must not expose the old internal plan todo queue: {desc}"
+        );
     }
 
     #[test]

@@ -4167,15 +4167,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
-                // Production sink: exit_plan_mode(approved=true) seeds
-                // `session_plan_todos` so the next turn has executable
-                // items without the model manually re-creating each
-                // subtask via `task.create`.
-                executor.set_plan_todo_sink(std::sync::Arc::new(
-                    astra_services::DatabasePlanTodoSink::new(
-                        astra_services::DatabaseStateProjectionStore::new(shared.clone()),
-                    ),
-                ));
             }
             // Share the host's plan-resume hint slot so tool-triggered
             // plan-mode changes refresh the system prompt mid-run.
@@ -4741,15 +4732,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-                // Production sink: exit_plan_mode(approved=true) seeds
-                // `session_plan_todos` so the next turn has executable
-                // items without the model manually re-creating each
-                // subtask via `task.create`.
-                executor.set_plan_todo_sink(std::sync::Arc::new(
-                    astra_services::DatabasePlanTodoSink::new(
-                        astra_services::DatabaseStateProjectionStore::new(shared.clone()),
-                    ),
                 ));
             }
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
@@ -6281,15 +6263,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(shared) = self.shared_pool.as_ref() {
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-                // Production sink: exit_plan_mode(approved=true) seeds
-                // `session_plan_todos` so the next turn has executable
-                // items without the model manually re-creating each
-                // subtask via `task.create`.
-                executor.set_plan_todo_sink(std::sync::Arc::new(
-                    astra_services::DatabasePlanTodoSink::new(
-                        astra_services::DatabaseStateProjectionStore::new(shared.clone()),
-                    ),
                 ));
             }
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());

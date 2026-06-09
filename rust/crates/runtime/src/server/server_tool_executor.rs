@@ -913,14 +913,6 @@ pub struct ServerToolExecutor {
     /// `None` leaves plan-mode unconditionally off (back-compat for tests /
     /// constructor call sites that haven't been updated).
     plan_repo: Option<Arc<dyn astra_plan::PlanRepository>>,
-    /// Sink for seeding `session_plan_todos` after a plan is approved.
-    /// `None` skips the seed step (e.g. tests or runtime init that
-    /// hasn't wired the cloud DB yet); when present, `tool_exit_plan_mode`
-    /// inserts one row per subtask after `set_active_plan(None)`. The
-    /// trait indirection lets tests capture seeds in-memory without a
-    /// real MatrixOne. Production wiring goes through
-    /// [`astra_services::DatabasePlanTodoSink`].
-    plan_todo_sink: Option<Arc<dyn astra_services::PlanTodoSink>>,
     /// Cache for `plan_mode_authoring_active()` so a typical session with
     /// 20-50 tool calls doesn't incur 40-100 DB round-trips. Invalidated
     /// explicitly on `enter_plan_mode` / `exit_plan_mode`. Holds the latest
@@ -1028,7 +1020,6 @@ impl ServerToolExecutor {
             workspace_artifact_store: None,
             context_manifest_pool: None,
             plan_repo: None,
-            plan_todo_sink: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -1114,13 +1105,6 @@ impl ServerToolExecutor {
     /// can check `active_plan_id` and flip plan phase.
     pub fn set_plan_repository(&mut self, repo: Arc<dyn astra_plan::PlanRepository>) {
         self.plan_repo = Some(repo);
-    }
-
-    /// Inject the `session_plan_todos` sink so `exit_plan_mode(approved=true)`
-    /// can seed one row per subtask. `None` skips the seed step (back-compat
-    /// for test executors and non-DB runtime paths).
-    pub fn set_plan_todo_sink(&mut self, sink: Arc<dyn astra_services::PlanTodoSink>) {
-        self.plan_todo_sink = Some(sink);
     }
 
     /// Inject the host's plan-resume hint handle so tool-driven plan-mode
@@ -4422,25 +4406,6 @@ impl ServerToolExecutor {
             return format!("Error: link plan to session: {e}");
         }
 
-        // U-6: when the user re-enters plan mode with a fresh plan, mark
-        // any prior plan's seeded `session_plan_todos` rows in this session
-        // as `superseded` so the next `task.list` doesn't show them next
-        // to the new plan's items. Best-effort — failure logs but doesn't
-        // abort the enter (the new plan_id is still pinned, and a stale
-        // active row in the prior plan only causes UI noise, not
-        // correctness loss).
-        if let Some(sink) = self.plan_todo_sink.clone()
-            && let Err(e) = sink.supersede_other_plans(&self.session_id, &plan_id).await
-        {
-            tracing::warn!(
-                session_id = %self.session_id,
-                new_plan_id = %plan_id,
-                error = %e,
-                "enter_plan_mode: failed to supersede prior plans' seeded todos; \
-                 list may show stale items"
-            );
-        }
-
         // Invalidate so the next write tool and the next system-prompt build
         // both observe the freshly-linked plan instead of reading a stale
         // "no active plan" cache entry populated before the tool fired.
@@ -4511,49 +4476,9 @@ impl ServerToolExecutor {
                 }
             };
 
-            // Seed `session_plan_todos` so the next turn has executable
-            // items without the model manually re-creating each subtask.
-            // The sink is optional: when `None`, the seed step is a no-op
-            // (test executors, runtime paths with no cloud DB wired).
-            //
-            // Failures here are non-fatal: the plan is approved either
-            // way, and the model can still re-create todos via the
-            // `task` tool. We log via the journal but don't roll back
-            // the unlock.
-            if let (Some(sink), Some(plan_state)) =
-                (self.plan_todo_sink.clone(), approved_plan_state.as_ref())
-            {
-                let seeds: Vec<astra_services::PlanTodoSeed> = plan_state
-                    .plan
-                    .subtasks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, subtask)| astra_services::PlanTodoSeed {
-                        todo_id: format!("{active}:{}", subtask.id),
-                        user_id: self.user_id.clone(),
-                        session_id: self.session_id.clone(),
-                        plan_id: active.clone(),
-                        title: subtask.title.clone(),
-                        priority: i as i32,
-                        depth: 0,
-                    })
-                    .collect();
-                if !seeds.is_empty()
-                    && let Err(e) = sink.seed(seeds).await
-                {
-                    tracing::warn!(
-                        plan_id = %active,
-                        session_id = %self.session_id,
-                        error = %e,
-                        "exit_plan_mode: failed to seed session_plan_todos; \
-                         model can re-create via `task` tool"
-                    );
-                }
-            }
-
             // Keep the user-visible task board aligned with the approved
-            // plan. `session_plan_todos` remains the execution queue; this
-            // task tree is the surface the user and model can inspect.
+            // plan. The task board is the single user-visible execution
+            // surface for approved plan work.
             if let Some(plan_state) = approved_plan_state.as_ref()
                 && let Err(e) = self
                     .mirror_approved_plan_to_task_board(&active, plan_state)
@@ -7605,91 +7530,6 @@ esac
         );
     }
 
-    /// Phase 2.4: when the model approves a plan via `exit_plan_mode`,
-    /// the server must seed `session_plan_todos` with one row per
-    /// subtask so the next turn can execute step-by-step without the
-    /// model manually re-creating each item via `task.create`. This
-    /// test drives the seed-shape contract: each subtask becomes one
-    /// todo with the right title, depth, plan_id, session_id, user_id.
-    /// The actual SQL goes through a `PlanTodoSink` trait so we can
-    /// observe the seed without standing up a real MatrixOne.
-    #[tokio::test]
-    async fn exit_plan_mode_approved_seeds_session_plan_todos() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-
-        // Plan with 3 subtasks — typical "split into steps" output.
-        let mut state =
-            astra_plan::PlanModeState::new_with_owner("ship feature X".into(), "alice".into());
-        for (i, title) in ["wire schema", "implement handler", "write tests"]
-            .iter()
-            .enumerate()
-        {
-            state
-                .plan
-                .subtasks
-                .push(astra_services::task_orchestrator::SubtaskPlan {
-                    id: format!("s{}", i + 1),
-                    title: (*title).into(),
-                    status: astra_services::task_orchestrator::TaskStatus::Pending,
-                    ..Default::default()
-                });
-        }
-        repo.save("plan-seed-test", &mut state, None).await.unwrap();
-        repo.set_active_plan("seed-session", Some("plan-seed-test"))
-            .await
-            .unwrap();
-
-        // In-memory sink captures what the seed step would have written.
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
-        // The executor under test was constructed via `test_executor`,
-        // which uses a default session_id. Override so the seeded
-        // session matches the active plan's pin.
-        exec.session_id = "seed-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
-        );
-
-        let captured = sink.captured();
-        assert_eq!(
-            captured.len(),
-            3,
-            "must seed exactly one todo per subtask. Got {} todos: {captured:?}",
-            captured.len()
-        );
-
-        // Verify shape — order, titles, ownership.
-        for (i, expected_title) in ["wire schema", "implement handler", "write tests"]
-            .iter()
-            .enumerate()
-        {
-            assert_eq!(
-                captured[i].title, *expected_title,
-                "subtask order must be preserved so `depends_on` chains stay valid"
-            );
-            assert_eq!(
-                captured[i].plan_id, "plan-seed-test",
-                "every seeded todo must reference the source plan"
-            );
-            assert_eq!(
-                captured[i].session_id, "seed-session",
-                "every seeded todo must be scoped to the active session"
-            );
-            assert_eq!(
-                captured[i].user_id, "alice",
-                "every seeded todo must inherit the plan owner so isolation holds"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn exit_plan_mode_approved_mirrors_plan_into_user_visible_task_tree() {
         let repo = Arc::new(InMemoryPlanRepo::new());
@@ -8334,11 +8174,10 @@ esac
         );
     }
 
-    /// Rejected plans must NOT seed todos — the plan is still being
-    /// authored. Idempotency: re-exiting an already-rejected plan
-    /// also must not write.
+    /// Rejected plans must NOT create user-visible task-board work:
+    /// the plan is still being authored.
     #[tokio::test]
-    async fn exit_plan_mode_rejected_does_not_seed_todos() {
+    async fn exit_plan_mode_rejected_does_not_create_task_board_work() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state =
             astra_plan::PlanModeState::new_with_owner("still drafting".into(), "alice".into());
@@ -8358,10 +8197,8 @@ esac
             .await
             .unwrap();
 
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
         exec.session_id = "reject-session".to_string();
         exec.user_id = "alice".to_string();
 
@@ -8370,19 +8207,15 @@ esac
             .await;
 
         assert!(
-            sink.captured().is_empty(),
-            "rejected plan must not seed todos — the plan is still authoring. \
-             Got: {:?}",
-            sink.captured()
+            exec.task_manager.snapshot().await.is_empty(),
+            "rejected plan must not create task-board work while still authoring"
         );
     }
 
-    /// Empty-plan defense: if the model approves a plan with no
-    /// subtasks, the seed step is a no-op. Without this defense, a
-    /// 0-row INSERT would still hit the DB and waste a round-trip;
-    /// worse, it could mask a "plan not generated" bug.
+    /// Empty-plan defense: approving a plan with no subtasks should
+    /// unlock writes without creating an empty task-board shell.
     #[tokio::test]
-    async fn exit_plan_mode_with_empty_plan_seeds_nothing() {
+    async fn exit_plan_mode_with_empty_plan_creates_no_task_board_work() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state =
             astra_plan::PlanModeState::new_with_owner("empty plan".into(), "alice".into());
@@ -8393,10 +8226,8 @@ esac
             .await
             .unwrap();
 
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
         exec.session_id = "empty-session".to_string();
         exec.user_id = "alice".to_string();
 
@@ -8405,128 +8236,8 @@ esac
             .await;
 
         assert!(
-            sink.captured().is_empty(),
-            "empty plan approval must not seed anything"
-        );
-    }
-
-    /// Test sink that captures seed + supersede calls instead of
-    /// hitting the DB. The supersede capture lets U-6 tests verify
-    /// the call shape (session_id, keep_plan_id) without standing
-    /// up MatrixOne.
-    #[derive(Debug, Default)]
-    struct InMemoryPlanTodoSink {
-        captured: tokio::sync::Mutex<Vec<astra_services::PlanTodoSeed>>,
-        supersede_calls: tokio::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    impl InMemoryPlanTodoSink {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        fn captured(&self) -> Vec<astra_services::PlanTodoSeed> {
-            self.captured.try_lock().expect("sink contention").clone()
-        }
-
-        fn supersede_log(&self) -> Vec<(String, String)> {
-            self.supersede_calls
-                .try_lock()
-                .expect("sink contention")
-                .clone()
-        }
-    }
-
-    #[async_trait]
-    impl astra_services::PlanTodoSink for InMemoryPlanTodoSink {
-        async fn seed(&self, todos: Vec<astra_services::PlanTodoSeed>) -> Result<(), String> {
-            self.captured.lock().await.extend(todos);
-            Ok(())
-        }
-
-        async fn supersede_other_plans(
-            &self,
-            session_id: &str,
-            keep_plan_id: &str,
-        ) -> Result<u64, String> {
-            self.supersede_calls
-                .lock()
-                .await
-                .push((session_id.to_string(), keep_plan_id.to_string()));
-            // Tests don't simulate prior rows; return 0 affected.
-            Ok(0)
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct FailingPlanTodoSink {
-        fail_seed: bool,
-        fail_supersede: bool,
-    }
-
-    #[async_trait]
-    impl astra_services::PlanTodoSink for FailingPlanTodoSink {
-        async fn seed(&self, _todos: Vec<astra_services::PlanTodoSeed>) -> Result<(), String> {
-            if self.fail_seed {
-                Err("synthetic seed failure".to_string())
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn supersede_other_plans(
-            &self,
-            _session_id: &str,
-            _keep_plan_id: &str,
-        ) -> Result<u64, String> {
-            if self.fail_supersede {
-                Err("synthetic supersede failure".to_string())
-            } else {
-                Ok(0)
-            }
-        }
-    }
-
-    /// U-6 (unhappy path): when the user re-enters plan mode with a
-    /// new plan, the prior plan's seeded `session_plan_todos` rows
-    /// must be marked `superseded` so `task.list` doesn't show
-    /// stale items mixed with the new plan's seeds. We can't observe
-    /// the SQL effect from a unit test (no MO), but we CAN observe
-    /// the sink call shape — pre-fix the sink was never called from
-    /// `tool_enter_plan_mode` at all.
-    #[tokio::test]
-    async fn enter_plan_mode_supersedes_prior_plans_seeded_todos() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
-        exec.session_id = "supersede-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let result = exec
-            .execute("enter_plan_mode", &json!({"goal": "ship feature X"}))
-            .await;
-        assert!(
-            !result.starts_with("Error"),
-            "enter_plan_mode must succeed; got: {result}"
-        );
-
-        // The supersede call must have fired with the just-created
-        // plan_id — that pin ensures the prior plan's rows (if any)
-        // get superseded but the current plan's seeds will not.
-        let log = sink.supersede_log();
-        assert_eq!(
-            log.len(),
-            1,
-            "enter_plan_mode must call supersede_other_plans exactly once; got {log:?}"
-        );
-        let (sid, keep_id) = &log[0];
-        assert_eq!(sid, "supersede-session");
-        assert!(
-            !keep_id.is_empty(),
-            "keep_plan_id must be the new plan's id, not empty"
+            exec.task_manager.snapshot().await.is_empty(),
+            "empty plan approval must not create task-board work"
         );
     }
 
@@ -8614,77 +8325,6 @@ esac
         assert!(
             bash.contains("blocked while plan mode is active"),
             "write guard must still block after rejection, got: {bash}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_seed_failure_is_non_fatal_and_unlocks_writes() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state =
-            astra_plan::PlanModeState::new_with_owner("seed failure plan".into(), "alice".into());
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "s1".into(),
-                title: "step 1".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        repo.save("plan-seed-fail-test", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan("seed-fail-session", Some("plan-seed-fail-test"))
-            .await
-            .unwrap();
-
-        let sink = Arc::new(FailingPlanTodoSink {
-            fail_seed: true,
-            fail_supersede: false,
-        });
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink as Arc<dyn astra_services::PlanTodoSink>);
-        exec.session_id = "seed-fail-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let exit = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            exit.contains("unlocked"),
-            "seed failure must not roll back approval, got: {exit}"
-        );
-
-        let bash = exec
-            .execute("bash", &json!({"command": "echo hello"}))
-            .await;
-        assert!(
-            !bash.contains("blocked while plan mode is active"),
-            "writes should still unlock even when seeding fails, got: {bash}"
-        );
-    }
-
-    #[tokio::test]
-    async fn enter_plan_mode_supersede_failure_is_non_fatal() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let sink = Arc::new(FailingPlanTodoSink {
-            fail_seed: false,
-            fail_supersede: true,
-        });
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink as Arc<dyn astra_services::PlanTodoSink>);
-        exec.session_id = "supersede-fail-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let result = exec
-            .execute("enter_plan_mode", &json!({"goal": "ship feature Y"}))
-            .await;
-        assert!(
-            result.contains("Entered plan mode"),
-            "supersede failure must not abort plan entry, got: {result}"
         );
     }
 
