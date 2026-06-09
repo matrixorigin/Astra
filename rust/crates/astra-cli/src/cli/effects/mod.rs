@@ -133,6 +133,9 @@ pub const ICON_RUNNING: &str = "○";
 
 /// Truncate a label string, adding ellipsis if it exceeds max_chars.
 pub(crate) fn truncate_label(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let t = s.trim();
     if t.chars().count() <= max_chars {
         return t.to_string();

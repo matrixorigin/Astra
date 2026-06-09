@@ -139,26 +139,6 @@ pub(crate) fn push_owned_lines(src: &[Line<'_>], out: &mut Vec<Line<'static>>) {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn prefix_lines<'a>(
-    lines: impl IntoIterator<Item = Line<'a>>,
-    initial: Line<'a>,
-    subsequent: Line<'a>,
-) -> Vec<Line<'a>> {
-    let mut result = Vec::new();
-    for (i, mut line) in lines.into_iter().enumerate() {
-        let prefix = if i == 0 {
-            initial.clone()
-        } else {
-            subsequent.clone()
-        };
-        let mut spans = prefix.spans;
-        spans.append(&mut line.spans);
-        result.push(Line::from(spans));
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::{sanitize_line_for_terminal, sanitize_terminal_text};
