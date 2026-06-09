@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
+use super::truncate_by_width;
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;
@@ -433,26 +434,6 @@ fn trimmed_desc(desc: &str, max_w: usize) -> String {
         return String::from("(no description)");
     }
     truncate_by_width(desc, max_w)
-}
-
-fn truncate_by_width(s: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    let mut width = 0;
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw + 1 > max_width {
-            break;
-        }
-        width += cw;
-        end = i + c.len_utf8();
-    }
-    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

@@ -24,16 +24,16 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::time::Instant;
 
-use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
-
+use super::truncate_by_width;
 use super::HistoryCell;
 use crate::cli::cli_config::cli_formatting::extract_cli_diff_block;
 use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
-use crate::tui::wrapping::{RtOptions, word_wrap_lines};
+use crate::tui::wrapping::{word_wrap_lines, RtOptions};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// Live status. `Running` is intentionally separate from the
 /// persisted `TurnEvent::Tool.status` enum — a still-running tool
@@ -705,23 +705,6 @@ fn pad_line_background(mut line: Line<'static>, width: u16) -> Line<'static> {
         Style::default().bg(bg),
     ));
     line
-}
-
-fn truncate_by_width(s: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    let mut width = 0;
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw + 1 > max_width {
-            break;
-        }
-        width += cw;
-        end = i + c.len_utf8();
-    }
-    format!("{}…", &s[..end])
 }
 
 fn is_placeholder_capture_summary(summary: &str) -> bool {

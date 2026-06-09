@@ -42,6 +42,7 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use super::SlashMenu;
 use crate::cli::command_registry::CommandGroup;
+use crate::tui::truncate_ellipsis;
 
 /// Maximum number of **data rows** shown at once. Does not include the
 /// scroll-indicator rows (↑ N more / ↓ N more).
@@ -378,21 +379,6 @@ fn pad_right_chars(s: &str, width: usize) -> String {
     for _ in n..width {
         out.push(' ');
     }
-    out
-}
-
-fn truncate_ellipsis(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    if width == 1 {
-        return "…".to_string();
-    }
-    let mut out: String = s.chars().take(width - 1).collect();
-    out.push('…');
     out
 }
 

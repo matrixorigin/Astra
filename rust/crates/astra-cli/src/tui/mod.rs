@@ -48,6 +48,22 @@ pub(crate) fn score_slash_token(needle: &str, haystack: &str) -> Option<u32> {
     slash_menu::score_token(needle, haystack)
 }
 
+/// Width-aware string truncation that appends `…` when the string
+/// exceeds `max_chars`. Used by slash and mention popups.
+pub(crate) fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let out: String = s.chars().take(max_chars - 1).collect();
+    format!("{out}…")
+}
+
 mod status_indicator;
 mod status_line;
 mod stream_bridge;
