@@ -212,8 +212,8 @@ pub(crate) enum Command {
     /// Team orchestration and shared context management
     #[command(alias = "teams")]
     Team(TeamArgs),
-    /// Local/cloud task management
-    Task(TaskArgs),
+    /// Local/cloud background job management
+    Job(TaskArgs),
     /// Memory search and inspection
     #[command(alias = "memories")]
     Memory(MemoryArgs),
@@ -503,7 +503,7 @@ pub(crate) struct TeamRestoreArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra task list\n  astra task pending\n  astra task run 在当前目录补一个最小登录页\n  astra task result abc12345"
+    after_help = "Examples:\n  astra job list\n  astra job pending\n  astra job run 在当前目录补一个最小登录页\n  astra job result abc12345"
 )]
 pub(crate) struct TaskArgs {
     #[command(subcommand)]
@@ -512,34 +512,34 @@ pub(crate) struct TaskArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TaskSubcommand {
-    /// List recent task history
+    /// List recent background jobs
     List,
-    /// List claimable task queue (oldest first)
+    /// List claimable job queue (oldest first)
     Pending,
-    /// Show task status and details
+    /// Show job status and details
     Status(TaskQueryArgs),
-    /// Run a headless task with the agent
+    /// Run a headless background job with the agent
     Run(TaskRunArgs),
-    /// Queue an API-backed cloud task without executing it locally (cloud-agent ops)
+    /// Queue an API-backed cloud job without executing it locally (cloud-agent ops)
     #[command(hide = true)]
     Queue(TaskQueueArgs),
-    /// Claim and execute queued API-backed cloud tasks (cloud-agent ops)
+    /// Claim and execute queued API-backed cloud jobs (cloud-agent ops)
     #[command(hide = true)]
     Worker(TaskWorkerArgs),
-    /// Show the result of a task run
+    /// Show the result of a background job
     Result(TaskResultArgs),
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct TaskTextArgs {
-    /// Task text or prompt
+    /// Job text or prompt
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub text: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct TaskRunArgs {
-    /// Output task result and metadata as JSON
+    /// Output job result and metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
     /// Suppress progress output; only print the final answer
@@ -548,7 +548,7 @@ pub(crate) struct TaskRunArgs {
     /// Emit structured JSONL lifecycle/stream events to stderr
     #[arg(long = "stream-events", hide = true, default_value_t = false)]
     pub stream_events: bool,
-    /// Task prompt
+    /// Job prompt
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub text: Vec<String>,
 }
@@ -558,7 +558,7 @@ pub(crate) struct TaskQueueArgs {
     /// Output queued task metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Task prompt to queue
+    /// Job prompt to queue
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub text: Vec<String>,
 }
@@ -595,7 +595,7 @@ pub(crate) struct TaskWorkerArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct TaskQueryArgs {
-    /// Task id or title query
+    /// Job id or title query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
 }
@@ -605,7 +605,7 @@ pub(crate) struct TaskResultArgs {
     /// Output result as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Task id or title query
+    /// Job id or title query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
 }

@@ -53,7 +53,7 @@ async fn persist_background_task_result(
             svc,
             task_id,
             "persistence_error",
-            format!("failed to save background task result: {error}"),
+            format!("failed to save background job result: {error}"),
         )
         .await);
     }
@@ -1015,10 +1015,10 @@ mod tests {
             ),
             (
                 Some("persistence_error"),
-                "failed to save background task result: disk full"
+                "failed to save background job result: disk full"
             )
         );
-        assert!(err.contains("failed to save background task result"));
+        assert!(err.contains("failed to save background job result"));
     }
 
     #[tokio::test]

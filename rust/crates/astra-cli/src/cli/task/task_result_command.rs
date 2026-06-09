@@ -57,7 +57,7 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
                 .await?;
         }
         ExitCode::Unfinished => {
-            unreachable!("unfinished exit code is only valid for task result lookup")
+            unreachable!("unfinished exit code is only valid for job result lookup")
         }
         ExitCode::ToolFailure
         | ExitCode::ForceStop
@@ -79,7 +79,7 @@ pub(crate) async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode
 
     // No profile in this CLI subcommand context; HttpTaskService
     // falls back to env-only token resolution which is fine for
-    // one-shot `astra task result <query>` invocations.
+    // one-shot `astra job result <query>` invocations.
     let svc = session_runtime::resolve_task_service(None).await;
     let task_id = resolve_task_result_task_id(&*svc, &query).await?;
     let task = svc

@@ -863,7 +863,7 @@ async fn execute_task_worker(
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     if !args.once && !args.loop_mode {
-        return Err("choose --once or --loop for task worker".to_string());
+        return Err("choose --once or --loop for job worker".to_string());
     }
     if args.once {
         return match execute_task_worker_once(&args, profile, global_model, api, cli_context)
@@ -1411,7 +1411,7 @@ pub(crate) async fn execute_cli_command(
             .await
         }
 
-        Some(Command::Task(mut args)) => match args.command.take() {
+        Some(Command::Job(mut args)) => match args.command.take() {
             Some(TaskSubcommand::Run(run_args)) => {
                 execute_headless_task_run(
                     run_args,

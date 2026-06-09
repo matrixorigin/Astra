@@ -131,7 +131,7 @@ pub(crate) fn install_task_store(
         std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
 }
 
-/// Resolve the durable cloud task runtime (TaskService + lease).
+/// Resolve the durable cloud background-job runtime (TaskService + lease).
 ///
 /// Edge-cloud contract: no direct MO connection from the CLI. Both
 /// services proxy through their REST surfaces:
@@ -150,7 +150,7 @@ pub(crate) async fn resolve_cloud_task_runtime(
     String,
 > {
     let cloud_base = resolve_cloud_base().ok_or_else(|| {
-        "Cloud task runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
+        "Cloud job runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
             .to_string()
     })?;
     let token = current_access_token(profile);

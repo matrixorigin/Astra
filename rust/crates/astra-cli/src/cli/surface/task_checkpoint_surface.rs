@@ -412,7 +412,7 @@ mod tests {
         task.status = TaskStatus::Failed;
         task.error_message = Some(encode_task_failure_message(
             "persistence_error",
-            "failed to save background task result: disk full",
+            "failed to save background job result: disk full",
         ));
         task.checkpoint = Some(checkpoint([
             ("error_kind", serde_json::Value::Null),
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(task_record_error_kind(&task), Some("persistence_error"));
         assert_eq!(
             task_record_error_detail(&task),
-            Some("failed to save background task result: disk full")
+            Some("failed to save background job result: disk full")
         );
     }
 

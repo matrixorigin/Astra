@@ -2897,14 +2897,14 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn cli_task_command_parses_structured_run_subcommand() {
-        let cli = Cli::try_parse_from(["astra", "task", "run", "fix", "login", "page"]).unwrap();
+    fn cli_job_command_parses_structured_run_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "job", "run", "fix", "login", "page"]).unwrap();
         match cli.command {
-            Some(Command::Task(args)) => match args.command {
+            Some(Command::Job(args)) => match args.command {
                 Some(TaskSubcommand::Run(run)) => {
                     assert_eq!(run.text, vec!["fix", "login", "page"]);
                 }
-                other => panic!("unexpected task subcommand: {other:?}"),
+                other => panic!("unexpected job subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3479,7 +3479,7 @@ total_tokens_out: 500
         let tmp = tempfile::tempdir().unwrap();
         let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
 
-        // Create a task record (simulates what `astra task run` does).
+        // Create a task record (simulates what `astra job run` does).
         let tid = svc
             .create_task(
                 "test-user",
@@ -3526,7 +3526,7 @@ total_tokens_out: 500
         // Complete the task
         svc.complete_task(&tid).await.unwrap();
 
-        // Read back and verify (simulates `astra task result`).
+        // Read back and verify (simulates `astra job result`).
         let record = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         let cp = record.checkpoint.unwrap();

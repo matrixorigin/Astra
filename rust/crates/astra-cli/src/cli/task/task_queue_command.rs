@@ -18,7 +18,7 @@ pub(crate) async fn execute_task_queue(
     }
 
     // This CLI subcommand has no profile in scope. Token resolution is env-only;
-    // per-user sessions should use `astra task worker`, which threads profile.
+    // per-user sessions should use `astra job worker`, which threads profile.
     let (svc, _) = session_runtime::resolve_cloud_task_runtime(None).await?;
     let session_id = cli_context
         .session_id
@@ -59,7 +59,7 @@ pub(crate) async fn execute_task_queue(
         );
         eprintln!(
             "  {}",
-            "Run `astra task worker --once` from a cloud agent/worker to claim it.".dim()
+            "Run `astra job worker --once` from a cloud agent/worker to claim it.".dim()
         );
     }
     Ok(ExitCode::Success)
