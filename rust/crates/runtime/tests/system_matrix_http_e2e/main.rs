@@ -4,9 +4,9 @@
 //! - **`product_matrix_api_journey_hits_multiple_tables`** — full product journey (sessions → agents →
 //!   events → jobs → `chat/turn` SSE + `agent_events` assertions → logout), including
 //!   `GET /platform/snapshot` after session activity.
-//! - **`e2e_matrix_jobs_lease_and_db_assertions`** — `POST /agent-jobs`, `GET /agent-jobs`, `GET /agent-jobs/{id}`,
+//! - **`e2e_matrix_jobs_lease_and_db_assertions`** — `POST /jobs`, `GET /jobs`, `GET /jobs/{id}`,
 //!   `GET .../progress`, edge register, lease claim / `GET` lease / renew / release, `task_leases` +
-//!   `PUT /agent-jobs/{id}/status` + `agent_tasks`.
+//!   `PUT /jobs/{id}/status` + `agent_tasks`.
 //! - **`e2e_matrix_chat_run_pause_resume_http`** — `POST /chat` (background run), immediate
 //!   pause/resume + `GET /chat/runs/{run_id}` (run state is in-memory + optional engine; no Matrix
 //!   table assertion today).

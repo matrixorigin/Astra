@@ -48,7 +48,7 @@ pub(super) struct JobProgressResponse {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-/// `GET /agent-jobs` — list background jobs for the authenticated user.
+/// `GET /jobs` — list background jobs for the authenticated user.
 pub(super) async fn list_jobs_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -78,7 +78,7 @@ pub(super) async fn list_jobs_handler(
     Ok(Json(JobListResponse { jobs, total }))
 }
 
-/// `GET /agent-jobs/{task_id}` — get a single background job with its plan.
+/// `GET /jobs/{job_id}` — get a single background job with its plan.
 pub(super) async fn get_job_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -101,7 +101,7 @@ pub(super) async fn get_job_handler(
     Ok(Json(task))
 }
 
-/// `GET /agent-jobs/{task_id}/progress` — get job + plan progress events from
+/// `GET /jobs/{job_id}/progress` — get job + plan progress events from
 /// the session journal.
 pub(super) async fn job_progress_handler(
     State(state): State<AppState>,
@@ -141,7 +141,7 @@ pub(super) async fn job_progress_handler(
     }))
 }
 
-/// `POST /agent-jobs` — create a new background job.
+/// `POST /jobs` — create a new background job.
 pub(super) async fn create_job_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -182,7 +182,7 @@ pub(super) async fn create_job_handler(
     Ok((StatusCode::CREATED, Json(task)))
 }
 
-/// `PUT /agent-jobs/{task_id}/status` — update a job's status.
+/// `PUT /jobs/{job_id}/status` — update a job's status.
 pub(super) async fn update_job_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -235,7 +235,7 @@ fn edge_id_header(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// `GET /agent-jobs/{task_id}/lease`
+/// `GET /jobs/{job_id}/lease`
 pub(super) async fn get_job_lease_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -265,7 +265,7 @@ pub(super) async fn get_job_lease_handler(
     }))
 }
 
-/// `POST /agent-jobs/{task_id}/lease/claim`
+/// `POST /jobs/{job_id}/lease/claim`
 pub(super) async fn post_job_lease_claim_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -303,7 +303,7 @@ pub(super) async fn post_job_lease_claim_handler(
     ))
 }
 
-/// `POST /agent-jobs/lease/claim-next`
+/// `POST /jobs/lease/claim-next`
 pub(super) async fn post_job_lease_claim_next_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -330,7 +330,7 @@ pub(super) async fn post_job_lease_claim_next_handler(
     ))
 }
 
-/// `POST /agent-jobs/{task_id}/lease/release`
+/// `POST /jobs/{job_id}/lease/release`
 pub(super) async fn post_job_lease_release_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -364,7 +364,7 @@ pub(super) async fn post_job_lease_release_handler(
     Ok(Json(serde_json::json!({ "released": released })))
 }
 
-/// `POST /agent-jobs/{task_id}/lease/renew`
+/// `POST /jobs/{job_id}/lease/renew`
 pub(super) async fn post_job_lease_renew_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -687,7 +687,7 @@ pub(super) struct JobRpcResponse {
     pub result: serde_json::Value,
 }
 
-/// `POST /agent-jobs:rpc` — proxy entry point for `TaskService` trait
+/// `POST /jobs:rpc` — proxy entry point for `TaskService` trait
 /// methods. CLI's `HttpTaskService` impl posts here; server-side
 /// `state.execution.task_service` (MatrixOneTaskService in production) does
 /// the work. Every method scopes to the authenticated user; methods
@@ -1025,7 +1025,7 @@ mod tests {
         }));
         assert!(
             list_query.is_err(),
-            "GET /agent-jobs should reject unknown query fields instead of defaulting the status filter"
+            "GET /jobs should reject unknown query fields instead of defaulting the status filter"
         );
 
         let progress_query = serde_json::from_value::<JobProgressQuery>(serde_json::json!({
@@ -1033,7 +1033,7 @@ mod tests {
         }));
         assert!(
             progress_query.is_err(),
-            "GET /agent-jobs/:id/progress should reject unknown query fields"
+            "GET /jobs/:job_id/progress should reject unknown query fields"
         );
 
         let create = serde_json::from_value::<CreateJobRequest>(serde_json::json!({
@@ -1042,7 +1042,7 @@ mod tests {
         }));
         assert!(
             create.is_err(),
-            "POST /agent-jobs should reject typo fields instead of silently dropping them"
+            "POST /jobs should reject typo fields instead of silently dropping them"
         );
 
         let status = serde_json::from_value::<UpdateStatusRequest>(serde_json::json!({
@@ -1051,7 +1051,7 @@ mod tests {
         }));
         assert!(
             status.is_err(),
-            "PUT /agent-jobs/:id/status should reject unknown fields"
+            "PUT /jobs/:job_id/status should reject unknown fields"
         );
     }
 
@@ -1074,7 +1074,7 @@ mod tests {
         }));
         assert!(
             rpc.is_err(),
-            "agent-jobs:rpc should reject top-level fields outside method/args"
+            "jobs:rpc should reject top-level fields outside method/args"
         );
     }
 

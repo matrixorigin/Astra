@@ -1,4 +1,4 @@
-//! `/agent-jobs` list/get/progress + lease claim/GET/renew/release + `agent_tasks` / `task_leases` SQL;
+//! `/jobs` list/get/progress + lease claim/GET/renew/release + `agent_tasks` / `task_leases` SQL;
 //! `/chat` run pause/resume (HTTP only; run store is in-memory in `build_server_state`).
 use axum::http::StatusCode;
 use serde_json::json;
@@ -21,7 +21,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
 
     let (st_task, task_j) = post_json(
         app,
-        "/agent-jobs",
+        "/jobs",
         Some(auth.as_str()),
         json!({
             "title": "matrix e2e task",
@@ -39,7 +39,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
             .fetch_optional(pool)
             .await
             .expect("agent_tasks select");
-    let row = row.expect("agent_tasks row after POST /agent-jobs");
+    let row = row.expect("agent_tasks row after POST /jobs");
     assert_eq!(
         row.try_get::<String, _>("user_id").ok().as_deref(),
         Some(user_id.as_str())
@@ -60,7 +60,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
         Some("pending")
     );
 
-    let (st_list, list_j) = get_json(app, "/agent-jobs", Some(auth.as_str()), &[]).await;
+    let (st_list, list_j) = get_json(app, "/jobs", Some(auth.as_str()), &[]).await;
     assert_eq!(st_list, StatusCode::OK, "list jobs: {list_j}");
     let jobs = list_j["jobs"].as_array().expect("jobs array");
     assert!(
@@ -69,19 +69,14 @@ pub async fn run_jobs_lease_with_db_assertions() {
         "list should include {task_id}: {list_j}"
     );
 
-    let (st_get, get_j) = get_json(
-        app,
-        &format!("/agent-jobs/{task_id}"),
-        Some(auth.as_str()),
-        &[],
-    )
-    .await;
+    let (st_get, get_j) =
+        get_json(app, &format!("/jobs/{task_id}"), Some(auth.as_str()), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "get job: {get_j}");
     assert_eq!(get_j["task_id"].as_str(), Some(task_id.as_str()));
 
     let (st_prog, prog_j) = get_json(
         app,
-        &format!("/agent-jobs/{task_id}/progress?session_id={session_id}"),
+        &format!("/jobs/{task_id}/progress?session_id={session_id}"),
         Some(auth.as_str()),
         &[],
     )
@@ -112,7 +107,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
 
     let (st_claim, claim_j) = post_json_with_headers(
         app,
-        &format!("/agent-jobs/{task_id}/lease/claim"),
+        &format!("/jobs/{task_id}/lease/claim"),
         Some(auth.as_str()),
         &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 300 }),
@@ -150,7 +145,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
 
     let (st_lease, lease_j) = get_json(
         app,
-        &format!("/agent-jobs/{task_id}/lease"),
+        &format!("/jobs/{task_id}/lease"),
         Some(auth.as_str()),
         &[],
     )
@@ -163,7 +158,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
 
     let (st_renew, renew_j) = post_json_with_headers(
         app,
-        &format!("/agent-jobs/{task_id}/lease/renew"),
+        &format!("/jobs/{task_id}/lease/renew"),
         Some(auth.as_str()),
         &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 600 }),
@@ -173,7 +168,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
 
     let (st_rel, rel_j) = post_json_with_headers(
         app,
-        &format!("/agent-jobs/{task_id}/lease/release"),
+        &format!("/jobs/{task_id}/lease/release"),
         Some(auth.as_str()),
         &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id }),
@@ -184,7 +179,7 @@ pub async fn run_jobs_lease_with_db_assertions() {
 
     let (st_put, put_j) = put_json(
         app,
-        &format!("/agent-jobs/{task_id}/status"),
+        &format!("/jobs/{task_id}/status"),
         Some(auth.as_str()),
         json!({ "status": "in_progress" }),
     )

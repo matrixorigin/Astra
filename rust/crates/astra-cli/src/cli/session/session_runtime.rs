@@ -37,7 +37,7 @@ pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskSer
 /// Edge-cloud contract: the CLI never connects to MatrixOne
 /// directly. When `cloud_base` is configured (via env or the
 /// authenticated session), we return [`crate::cli::http_task_service::HttpTaskService`]
-/// which proxies trait calls through `POST /agent-jobs:rpc`. Otherwise
+/// which proxies trait calls through `POST /jobs:rpc`. Otherwise
 /// we fall back to the local on-disk store so offline / one-shot
 /// CLI and headless tests stay functional.
 ///
@@ -135,8 +135,8 @@ pub(crate) fn install_task_store(
 ///
 /// Edge-cloud contract: no direct MO connection from the CLI. Both
 /// services proxy through their REST surfaces:
-/// - TaskService → `POST /agent-jobs:rpc`
-/// - TaskLeaseService → `/agent-jobs/{id}/lease/*`
+/// - TaskService → `POST /jobs:rpc`
+/// - TaskLeaseService → `/jobs/{id}/lease/*`
 ///
 /// `profile` is forwarded to the access-token resolver so a logged-in
 /// CLI invocation gets bearer auth.

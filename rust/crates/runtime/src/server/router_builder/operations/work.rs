@@ -7,11 +7,11 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::run::handlers::list_runs_handler),
         )
         .route(
-            "/agent-jobs",
+            "/jobs",
             get(task_handlers::list_jobs_handler).post(task_handlers::create_job_handler),
         )
-        .route("/agent-jobs/{task_id}", get(task_handlers::get_job_handler))
-        .route("/agent-jobs:rpc", post(task_handlers::job_rpc_handler))
+        .route("/jobs/{job_id}", get(task_handlers::get_job_handler))
+        .route("/jobs:rpc", post(task_handlers::job_rpc_handler))
         .route(
             "/preferences",
             get(preferences_handlers::list_preferences_handler),
@@ -21,31 +21,31 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             axum::routing::put(preferences_handlers::put_preference_handler),
         )
         .route(
-            "/agent-jobs/{task_id}/lease/claim",
+            "/jobs/{job_id}/lease/claim",
             post(task_handlers::post_job_lease_claim_handler),
         )
         .route(
-            "/agent-jobs/lease/claim-next",
+            "/jobs/lease/claim-next",
             post(task_handlers::post_job_lease_claim_next_handler),
         )
         .route(
-            "/agent-jobs/{task_id}/lease/release",
+            "/jobs/{job_id}/lease/release",
             post(task_handlers::post_job_lease_release_handler),
         )
         .route(
-            "/agent-jobs/{task_id}/lease/renew",
+            "/jobs/{job_id}/lease/renew",
             post(task_handlers::post_job_lease_renew_handler),
         )
         .route(
-            "/agent-jobs/{task_id}/lease",
+            "/jobs/{job_id}/lease",
             get(task_handlers::get_job_lease_handler),
         )
         .route(
-            "/agent-jobs/{task_id}/progress",
+            "/jobs/{job_id}/progress",
             get(task_handlers::job_progress_handler),
         )
         .route(
-            "/agent-jobs/{task_id}/status",
+            "/jobs/{job_id}/status",
             axum::routing::put(task_handlers::update_job_status_handler),
         )
         .route(

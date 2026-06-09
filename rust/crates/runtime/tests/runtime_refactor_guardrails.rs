@@ -188,7 +188,7 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
 
     let jobs = request_status(
         app.clone(),
-        request("GET", "/agent-jobs", auth_headers, Body::empty()),
+        request("GET", "/jobs", auth_headers, Body::empty()),
     )
     .await;
     assert_ne!(jobs, StatusCode::NOT_FOUND);
