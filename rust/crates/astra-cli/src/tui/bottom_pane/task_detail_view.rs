@@ -404,8 +404,8 @@ impl BottomPaneView for TaskDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::history_cell::task::TaskCell;
     use crate::tui::history_cell::HistoryCell;
+    use crate::tui::history_cell::task::TaskCell;
     use astra_tools::task_mgmt::SessionTask;
 
     fn mk_session_task(id: &str, title: &str) -> SessionTask {

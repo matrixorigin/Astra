@@ -24,13 +24,13 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::time::Instant;
 
-use super::truncate_by_width;
 use super::HistoryCell;
+use super::truncate_by_width;
 use crate::cli::cli_config::cli_formatting::extract_cli_diff_block;
 use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
-use crate::tui::wrapping::{word_wrap_lines, RtOptions};
+use crate::tui::wrapping::{RtOptions, word_wrap_lines};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;

@@ -1548,8 +1548,6 @@ fn delegation_parent_lifecycle_note(status: &str) -> &'static str {
     }
 }
 
-
-
 fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Option<String> {
     match event.event_type {
         JournalEventType::DelegationStarted => {
@@ -1768,10 +1766,16 @@ fn render_delegation_status_lines(
                 ));
             }
             if let Some(preview) = &sub_run.output_preview {
-                lines.push(format!("    output: {}", crate::cli::effects::truncate_label(preview, 160)));
+                lines.push(format!(
+                    "    output: {}",
+                    crate::cli::effects::truncate_label(preview, 160)
+                ));
             }
             if let Some(error) = &sub_run.error {
-                lines.push(format!("    error: {}", crate::cli::effects::truncate_label(error, 160)));
+                lines.push(format!(
+                    "    error: {}",
+                    crate::cli::effects::truncate_label(error, 160)
+                ));
             }
         }
     }

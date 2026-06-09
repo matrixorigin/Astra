@@ -5,8 +5,8 @@
 //! - [`ToolStdoutLineAnim`]: stdout animation via TerminalRegion for raw mode
 
 use super::{
-    clear_stderr_line, interruptible_sleep, paint_unified_line, term_width, truncate_label,
-    ICON_RUNNING, SPINNER_FRAMES,
+    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
+    term_width, truncate_label,
 };
 use crate::cli::terminal_region::TerminalRegion;
 use crossterm::style::Stylize;

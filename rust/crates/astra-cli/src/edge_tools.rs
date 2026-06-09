@@ -31,8 +31,8 @@ pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
 use astra_tools::build_test;
-use astra_tools::truncate_output;
 pub use astra_tools::code_intel;
+use astra_tools::truncate_output;
 #[path = "edge_tools/context_sharing.rs"]
 pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
@@ -300,8 +300,6 @@ fn utf16_col_to_char_idx(line: &str, col_utf16: usize) -> usize {
     // Column is past end of line - return line length
     line.chars().count()
 }
-
-
 
 /// Normalize empty/whitespace-only tool output to a short marker.
 /// Prevents model confusion from truly empty tool results.

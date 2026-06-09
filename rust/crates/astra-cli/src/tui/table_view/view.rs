@@ -9,8 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Widget};
 
-use super::parser::MysqlTable;
 use super::TableNav;
+use super::parser::MysqlTable;
 
 pub(crate) const MAX_CELL_WIDTH: u16 = 24;
 

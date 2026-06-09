@@ -29,7 +29,7 @@ pub(crate) fn api_probe_is_healthy(status: &str, database: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_probe_is_healthy, health_status_icon, health_status_kind, HealthStatusKind};
+    use super::{HealthStatusKind, api_probe_is_healthy, health_status_icon, health_status_kind};
 
     #[test]
     fn health_status_helpers_classify_known_statuses() {

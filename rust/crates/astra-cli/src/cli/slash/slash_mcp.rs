@@ -1725,7 +1725,7 @@ async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_prompt_message_text, format_state, parse_mcp_command, ParsedMcpCommand};
+    use super::{ParsedMcpCommand, extract_prompt_message_text, format_state, parse_mcp_command};
     use crate::cli::slash::slash_agent::format_duration;
     use crate::mcp_client::ConnectionState;
 
@@ -1999,14 +1999,18 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("github");
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("github"));
-        assert!(config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("other"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("github")
+        );
+        assert!(
+            config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("other")
+        );
     }
 
     #[test]

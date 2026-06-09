@@ -8,13 +8,13 @@
 //! With ETA: `  ⬢ [subtask] Label              3s/~45s ⣾`
 
 use super::{
-    clear_stderr_line, interruptible_sleep, paint_unified_line, term_width, truncate_label,
-    ICON_RUNNING, SPINNER_FRAMES,
+    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
+    term_width, truncate_label,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Animated spinner for background plan execution.
 ///

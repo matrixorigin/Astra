@@ -4161,35 +4161,32 @@ mod stats_view_tests {
     use super::build_recent_session_history_lines;
     use astra_services::session_journal::{self, JournalDirGuard};
 
-    fn write_stats_session(session_id: &str) {
-        let writer = session_journal::JournalWriter::new(session_id).unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(session_id),
-                Some("gpt-5"),
-            ))
-            .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::turn(
-                Some(session_id),
-                1,
-                Some("gpt-5"),
-                "continue",
-                "restored",
-                0,
-                15,
-                7,
-                8,
-            ))
-            .unwrap();
+    fn write_stats_session(session_id: &str) -> std::io::Result<()> {
+        let writer = session_journal::JournalWriter::new(session_id)?;
+        writer.append(&session_journal::JournalEvent::session_start(
+            Some(session_id),
+            Some("gpt-5"),
+        ))?;
+        writer.append(&session_journal::JournalEvent::turn(
+            Some(session_id),
+            1,
+            Some("gpt-5"),
+            "continue",
+            "restored",
+            0,
+            15,
+            7,
+            8,
+        ))?;
+        Ok(())
     }
 
     #[test]
     #[serial_test::serial(stats_view)]
     fn build_recent_session_history_lines_surfaces_scan_error() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let broken_root = tmp.path().join("broken-sessions-root");
-        std::fs::write(&broken_root, "not-a-directory").unwrap();
+        std::fs::write(&broken_root, "not-a-directory").expect("write broken root file");
         let _guard = JournalDirGuard::new(&broken_root);
 
         let error = build_recent_session_history_lines(10)
@@ -4204,7 +4201,7 @@ mod stats_view_tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let good_session = format!("stats-good-{}", uuid::Uuid::new_v4());
         let bad_session = format!("stats-bad-{}", uuid::Uuid::new_v4());
-        write_stats_session(&good_session);
+        write_stats_session(&good_session).expect("write_stats_session");
         std::fs::create_dir_all(session_journal::journal_file_path(&bad_session)).unwrap();
 
         let rendered = build_recent_session_history_lines(10)

@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use two_face::syntax::extra_newlines;
-use two_face::theme::{extra as extra_themes, EmbeddedLazyThemeSet, EmbeddedThemeName};
+use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName, extra as extra_themes};
 
 use super::super::color::is_light;
 use super::super::terminal_palette::default_bg;

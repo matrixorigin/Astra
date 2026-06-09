@@ -4,8 +4,8 @@
 //! - [`ChatTurnPrepLineGuard`]: RAII guard for chat request preparation
 
 use super::{
-    interruptible_sleep, paint_unified_line, term_width, ICON_RUNNING, SPINNER_FRAMES,
-    SPINNER_SHOW_DELAY_MS,
+    ICON_RUNNING, SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, interruptible_sleep, paint_unified_line,
+    term_width,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal, Write};

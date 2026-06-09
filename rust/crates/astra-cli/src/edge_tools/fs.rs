@@ -6,7 +6,9 @@ use super::{
     ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
-use astra_tools::fs_ops::{check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail};
+use astra_tools::fs_ops::{
+    check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
+};
 use serde_json::{Value, json};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).

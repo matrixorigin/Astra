@@ -191,7 +191,7 @@ impl Default for StreamResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_partial_turn_data_to_error_event, PartialTurnData};
+    use super::{PartialTurnData, apply_partial_turn_data_to_error_event};
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {

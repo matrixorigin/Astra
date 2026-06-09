@@ -23,9 +23,9 @@
 use std::any::Any;
 use std::time::Instant;
 
+use super::truncate_by_width;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use super::truncate_by_width;
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;

@@ -67,5 +67,6 @@ pub(crate) mod tests {
     pub(crate) use super::test_utils::isolated_sessions_dir;
     pub(crate) use super::test_utils::stub_stream_result;
     pub(crate) use super::test_utils::stub_stream_result_with_records;
+    pub(crate) use super::test_utils::test_temp_dir;
     pub(crate) use super::test_utils::wait_until;
 }
