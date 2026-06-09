@@ -82,6 +82,7 @@ pub fn cli_default_capabilities(
         .with(Capability::LSPServer)
         .with(Capability::SkillsCatalog)
         .with(Capability::PlanLifecycle)
+        .with(Capability::LocalBackgroundJobs)
         .with_if(has_agent_spawner, Capability::AgentSpawner)
 }
 
@@ -105,7 +106,13 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// Read-only tools (read_file, grep, glob, git_status/diff/log) and
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
-fn is_plan_mode_blocked_tool(tool: &str) -> bool {
+pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
+    if tool == "job" {
+        return !matches!(
+            args.get("action").and_then(Value::as_str),
+            Some("list" | "output")
+        );
+    }
     matches!(
         tool,
         "bash"
@@ -470,7 +477,7 @@ pub enum BgTaskCommand {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Returns whether the job has reached terminal status. Used by
-    /// `agent_job(action='output', block=true)` so an empty-output job
+    /// `job(action='output', block=true)` so an empty-output job
     /// that completed doesn't spin until the timeout.
     IsTerminal {
         job_id: String,
@@ -2139,7 +2146,7 @@ impl ToolExecutor {
         }
         match rx.await {
             Ok(id) => format!(
-                "<background_job_started job_id=\"{id}\">\nUse agent_job(action='output') to read the most recent job, agent_job(action='list') to see all jobs, or agent_job(action='kill', job_id='{id}') to stop it.\n</background_job_started>"
+                "<background_job_started job_id=\"{id}\">\nUse job(action='output') to read the most recent job, job(action='list') to see all jobs, or job(action='kill', job_id='{id}') to stop it.\n</background_job_started>"
             ),
             Err(_) => "Error: background job registry not available".to_string(),
         }
@@ -2174,7 +2181,7 @@ impl ToolExecutor {
     async fn task_output(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
             return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
-                    `agent_job(action='output')` only works for jobs spawned via `agent_job(action='shell')` \
+                    `job(action='output')` only works for jobs spawned via `job(action='shell')` \
                     inside the interactive REPL."
                 .to_string();
         };
@@ -3588,7 +3595,7 @@ impl ToolExecutor {
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
         {
             error
-        } else if is_plan_mode_blocked_tool(name) && self.plan_mode_authoring_active().await {
+        } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
                  The agent must call `exit_plan_mode` with an approved plan \
@@ -3965,25 +3972,26 @@ impl ToolExecutor {
                                 Err(error) => format!("Error: {error}"),
                             }
                         }
-                        "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool instead.".to_string(),
+                        "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For background shell processes use the `job` tool instead.".to_string(),
                         other => match Self::validate_task_tool_args_for_action(other, args) {
-                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background shell processes use the `agent_job` tool (actions: shell, list, output, kill). For background sub-agents use `agent(action='spawn', run_in_background=true)` and collect with `agent(action='get_result', agent_id=...)`."),
+                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background shell processes use the `job` tool (actions: shell, list, output, kill). For background sub-agents use `agent(action='spawn', run_in_background=true)` and collect with `agent(action='get_result', agent_id=...)`."),
                             Err(error) => format!("Error: {error}"),
                         },
                     }
                 }
-                "agent_job" => {
+                "job" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
                         "shell" => self.task_background_shell(args).await,
                         "list" => self.task_list_bg().await,
                         "output" => self.task_output(args).await,
                         "kill" => self.task_kill_bg(args).await,
-                        "agent" => "Error: `agent_job(action='agent')` is not a supported user journey. Use `agent(action='spawn', description='...', prompt='...', run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the returned agent_id. Use `agent_job` only for local background shell jobs.".to_string(),
-                        "" => "Error: missing required parameter `action` for `agent_job`. Use one of: shell, list, output, kill.".to_string(),
-                        other => format!("Error: unknown `agent_job` action '{other}'. Valid: shell, list, output, kill."),
+                        "agent" => "Error: `job(action='agent')` is not a supported user journey. Use `agent(action='spawn', description='...', prompt='...', run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the returned agent_id. Use `job` only for local background shell jobs.".to_string(),
+                        "" => "Error: missing required parameter `action` for `job`. Use one of: shell, list, output, kill.".to_string(),
+                        other => format!("Error: unknown `job` action '{other}'. Valid: shell, list, output, kill."),
                     }
                 }
+                "agent_job" => "Error: `agent_job` was removed from the user journey. Use `job(action='shell'|'list'|'output'|'kill')` for background shell processes, or `agent(action='spawn', run_in_background=true)` plus `agent(action='get_result', agent_id=...)` for background sub-agents.".to_string(),
                 "web_search" => self.web_search(args),
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
                 "notify" => {

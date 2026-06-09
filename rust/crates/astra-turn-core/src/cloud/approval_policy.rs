@@ -660,13 +660,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_job_shell_is_execute_gated_with_args() {
+    fn job_shell_is_execute_gated_with_args() {
         let args = serde_json::json!({
             "action": "shell",
             "command": "npm run dev"
         });
         assert_eq!(
-            cloud_gated_tool_kind_with_args("agent_job", Some(&args)),
+            cloud_gated_tool_kind_with_args("job", Some(&args)),
             Some(CloudGatedToolKind::Execute)
         );
 
@@ -675,7 +675,7 @@ mod tests {
             "command": "git status"
         });
         assert_eq!(
-            cloud_gated_tool_kind_with_args("agent_job", Some(&read_only)),
+            cloud_gated_tool_kind_with_args("job", Some(&read_only)),
             None
         );
     }

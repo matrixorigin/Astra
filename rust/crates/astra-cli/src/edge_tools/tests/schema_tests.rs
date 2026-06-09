@@ -62,7 +62,7 @@ fn tool_schemas_include_core_tools() {
         "session",
         "mo",
         "agent",
-        "agent_job",
+        "job",
         "introspect",
         "lsp",
         "web_fetch",
@@ -468,7 +468,7 @@ fn task_schema_requires_title_and_task_id() {
 
 /// Phase 1 split: `task` is the durable checklist surface (claudecode v2
 /// alignment). All background-execution actions live on a separate
-/// `agent_job` tool (codex agent_jobs alignment). The `task` schema must
+/// `job` tool. The `task` schema must
 /// no longer advertise background_shell/background_agent/output/kill —
 /// otherwise the model gets two equally-valid paths and picks the wrong
 /// one for ordinary checklist work.
@@ -486,7 +486,7 @@ fn task_schema_does_not_advertise_background_actions() {
         assert!(
             !actions.contains(banned),
             "task.action enum still advertises `{banned}` — it must move to \
-             the `agent_job` tool. Got: {actions:?}"
+             the `job` tool. Got: {actions:?}"
         );
     }
     // Sanity: the checklist verbs are still there.
@@ -498,69 +498,74 @@ fn task_schema_does_not_advertise_background_actions() {
     }
 }
 
-/// `agent_job` is the new home for local background shell execution.
+/// `job` is the home for local background shell execution.
 /// Background sub-agents keep their own lifecycle on `agent(spawn)` /
 /// `agent(get_result)` because their IDs and result collection are not
 /// managed by the TUI shell registry.
 #[test]
-fn agent_job_schema_exists_with_expected_actions() {
+fn job_schema_exists_with_expected_actions() {
     let schemas = all_tool_schemas();
-    let agent_job = schemas
+    let job = schemas
         .iter()
-        .find(|s| s["function"]["name"].as_str() == Some("agent_job"))
+        .find(|s| s["function"]["name"].as_str() == Some("job"))
         .expect(
-            "agent_job schema must exist — it's the new tool that owns \
-             background_shell/output/kill after the Phase 1 split",
+            "job schema must exist — it owns background shell/output/kill",
         );
-    let actions: Vec<&str> = agent_job["function"]["parameters"]["properties"]["action"]["enum"]
+    assert!(
+        schemas
+            .iter()
+            .all(|s| s["function"]["name"].as_str() != Some("agent_job")),
+        "agent_job must not remain in the model-facing schema"
+    );
+    let actions: Vec<&str> = job["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
-        .expect("agent_job.action must be an enum")
+        .expect("job.action must be an enum")
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
     for expected in &["shell", "list", "output", "kill"] {
         assert!(
             actions.contains(expected),
-            "agent_job.action must include `{expected}`. Got: {actions:?}"
+            "job.action must include `{expected}`. Got: {actions:?}"
         );
     }
     assert!(
         !actions.contains(&"agent"),
-        "agent_job.action must not advertise agent: sub-agent lifecycle uses \
+        "job.action must not advertise agent: sub-agent lifecycle uses \
          agent(action='spawn', run_in_background=true) plus get_result. Got: {actions:?}"
     );
 
-    let properties = agent_job["function"]["parameters"]["properties"]
+    let properties = job["function"]["parameters"]["properties"]
         .as_object()
-        .expect("agent_job properties must be an object");
+        .expect("job properties must be an object");
     for removed_agent_field in ["prompt", "agent_type", "model"] {
         assert!(
             !properties.contains_key(removed_agent_field),
-            "agent_job schema must not expose sub-agent field `{removed_agent_field}`"
+            "job schema must not expose sub-agent field `{removed_agent_field}`"
         );
     }
 }
 
 #[test]
-fn agent_job_schema_per_action_required_fields() {
+fn job_schema_per_action_required_fields() {
     let schemas = all_tool_schemas();
-    let agent_job = tool_schema(&schemas, "agent_job");
+    let job = tool_schema(&schemas, "job");
     assert_eq!(
-        conditional_required_for(agent_job, "shell"),
+        conditional_required_for(job, "shell"),
         vec!["command".to_string()],
-        "agent_job.shell must require `command` — without it the executor \
+        "job.shell must require `command` — without it the executor \
          has no command to run and the model would silently no-op"
     );
     assert_eq!(
-        conditional_required_for(agent_job, "output"),
+        conditional_required_for(job, "output"),
         Vec::<String>::new(),
-        "agent_job.output should default to the most recent job so the model \
+        "job.output should default to the most recent job so the model \
          does not have to remember an ID just to read the common case"
     );
     assert_eq!(
-        conditional_required_for(agent_job, "kill"),
+        conditional_required_for(job, "kill"),
         vec!["job_id".to_string()],
-        "agent_job.kill must require `job_id` — never bulk-kill all jobs"
+        "job.kill must require `job_id` — never bulk-kill all jobs"
     );
 }
 

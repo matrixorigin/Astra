@@ -697,10 +697,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.
 
-         ## agent vs agent_job vs task
+         ## agent vs job vs task
          - `agent(spawn)` + `agent(get_result)`: synchronous or background sub-agents you plan to collect results from. Supports fan-out coalescing.
-         - `agent_job(action='shell', ...)`: background shell processes (builds, test suites, servers).
-         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; agent_job runs it.",
+         - `job(action='shell', ...)`: background shell processes (builds, test suites, servers).
+         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; job runs shell processes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -844,7 +844,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "task",
                 "description": "Durable task list. Use this tool proactively for multi-step work.\n\
         \n\
-        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; use `agent_job` for background work.\n\
+        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; use `job` for background shell work.\n\
         \n\
         ## When to Use\n\
         - 3 or more distinct outcomes, files, or phases.\n\
@@ -915,18 +915,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── agent_job ───────────────────────────────────────────────
+        // ── job ─────────────────────────────────────────────────────
         // Background shell execution surface. Split out of `task` in
         // 2026-05 so the model has one
         // tool for the session checklist and a different tool for
         // long-running work — see `task_schema_does_not_advertise_
-        // background_actions`. Inspiration: codex `spawn_agents_on_csv`
-        // + `report_agent_job_result`; claudecode `Bash(run_in_background)`
-        // + `Agent(run_in_background)`.
+        // background_actions`. Inspiration: claudecode
+        // `Bash(run_in_background)`.
         json!({
             "type": "function",
             "function": {
-                "name": "agent_job",
+                "name": "job",
                 "description": "Run local shell commands in the background while continuing to chat. Use this when shell work is long-running, can run independently, or you need to do other things in parallel.\n\
         \n\
         Actions: shell, list, output, kill.\n\
@@ -939,8 +938,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
         \n\
         ## When NOT to Use This Tool\n\
         - Quick commands (< 5s): use `bash` directly — the round-trip overhead isn't worth it.\n\
-        - Sub-agents: use `agent(action='spawn', ..., run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the exact returned `agent_id`. Agent results are not readable through `agent_job(action='output')`.\n\
-        - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `agent_job` is for processes, not progress markers.\n\
+        - Sub-agents: use `agent(action='spawn', ..., run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the exact returned `agent_id`. Agent results are not readable through `job(action='output')`.\n\
+        - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `job` is for shell processes, not progress markers.\n\
         \n\
         ## Notifications\n\
         You will receive `<background_job_notification>` XML when background shell jobs complete, fail, or stall (no output for ~45s + interactive-prompt pattern). When you see one, decide whether to read its output, acknowledge it, or `kill` and retry with non-interactive flags.\n\
@@ -949,7 +948,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         \n\
         <example>\n\
         User: kick off the full test suite, I'll keep working.\n\
-        Assistant: *Calls agent_job(action='shell', command='cargo test --workspace')* — returns job_id `bg-shell-3`. *Continues with other work; later calls agent_job(action='output') to read the latest shell result.*\n\
+        Assistant: *Calls job(action='shell', command='cargo test --workspace')* — returns job_id `bg-shell-3`. *Continues with other work; later calls job(action='output') to read the latest shell result.*\n\
         </example>",
                 "parameters": {
                     "type": "object",
@@ -965,7 +964,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "job_id": {
                             "type": "string",
-                            "description": "(output/kill) The background shell job ID returned by `agent_job(action='shell')`. Optional for output: defaults to the most recent shell job."
+                            "description": "(output/kill) The background shell job ID returned by `job(action='shell')`. Optional for output: defaults to the most recent shell job."
                         },
                         "block": {
                             "type": "boolean",
@@ -1231,10 +1230,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_job_schema_keeps_sub_agents_on_agent_tool_lifecycle() {
+    fn job_schema_keeps_sub_agents_on_agent_tool_lifecycle() {
         let schemas = all_tool_schemas_with_env(|_| None);
-        let agent_job = find_schema(&schemas, "agent_job").expect("agent_job schema must exist");
-        let desc = agent_job
+        let job = find_schema(&schemas, "job").expect("job schema must exist");
+        assert!(
+            find_schema(&schemas, "agent_job").is_none(),
+            "agent_job must not remain in the model-facing schema; use job for background shell work"
+        );
+        let desc = job
             .get("function")
             .and_then(|f| f.get("description"))
             .and_then(Value::as_str)
@@ -1242,11 +1245,11 @@ mod tests {
         assert!(
             desc.contains("agent(action='spawn', ..., run_in_background=true)")
                 && desc.contains("agent(action='get_result', agent_id=...)"),
-            "agent_job description must point sub-agents back to the agent lifecycle"
+            "job description must point sub-agents back to the agent lifecycle"
         );
         assert!(
-            !desc.contains("agent_job(action='agent'"),
-            "agent_job description must not advertise the removed agent action"
+            !desc.contains("job(action='agent'") && !desc.contains("agent_job"),
+            "job description must not advertise the removed agent_job lifecycle"
         );
     }
 

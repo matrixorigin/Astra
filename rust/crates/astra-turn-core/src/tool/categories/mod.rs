@@ -298,7 +298,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("env", MU, OR),
     // ── Mutating — task management ───────────────────────────────────
     tool("task", MU, OR),
-    tool("agent_job", MU, OR),
+    tool("job", MU, OR),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("BashTool", SH, AE.union(AL)),
@@ -648,7 +648,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
-    if name == "agent_job" {
+    if name == "job" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("shell") => {
                 meta_category = ToolCategory::Shell;
@@ -728,7 +728,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
             Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
         }
-    } else if name == "agent_job" {
+    } else if name == "job" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("output") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
@@ -955,11 +955,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_job_tool_is_action_aware_for_shell_vs_read_actions() {
+    fn job_tool_is_action_aware_for_shell_vs_read_actions() {
         use serde_json::json;
 
         let mutating_shell = classify(
-            "agent_job",
+            "job",
             Some(&json!({"action": "shell", "command": "npm run dev"})),
         );
         assert_eq!(mutating_shell.category, ToolCategory::Shell);
@@ -967,18 +967,18 @@ mod tests {
         assert!(!mutating_shell.parallelizable);
 
         let read_shell = classify(
-            "agent_job",
+            "job",
             Some(&json!({"action": "shell", "command": "git status"})),
         );
         assert_eq!(read_shell.category, ToolCategory::ReadOnly);
         assert!(!read_shell.approval_required);
         assert!(read_shell.parallelizable);
 
-        let output = classify("agent_job", Some(&json!({"action": "output"})));
+        let output = classify("job", Some(&json!({"action": "output"})));
         assert_eq!(output.category, ToolCategory::ReadOnly);
         assert!(!output.approval_required);
 
-        let agent = classify("agent_job", Some(&json!({"action": "agent"})));
+        let agent = classify("job", Some(&json!({"action": "agent"})));
         assert_eq!(agent.category, ToolCategory::Mutating);
         assert!(!agent.approval_required);
     }

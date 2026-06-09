@@ -638,7 +638,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 let mut result = ToolResult::text(
                     "<bash_detached>The bash command was promoted to a background task. \
                      The host will resume reading its output via the BackgroundTaskRegistry; \
-                     poll progress with `agent_job(action='output')` or `agent_job(action='output', job_id=<bg-shell-N>)`.\
+                     poll progress with `job(action='output')` or `job(action='output', job_id=<bg-shell-N>)`.\
                      </bash_detached>"
                         .to_string(),
                 );

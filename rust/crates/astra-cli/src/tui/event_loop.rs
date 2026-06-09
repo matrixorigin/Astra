@@ -1931,7 +1931,7 @@ pub(crate) async fn run_tui_session(
                                                                             );
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::info(
-                                                                                    format!("⏎ Backgrounded as {id} — output continues; poll with agent_job(action='output')")
+                                                                                    format!("⏎ Backgrounded as {id} — output continues; poll with job(action='output')")
                                                                                 ),
                                                                             );
                                                                             ctrl_b_promoted_job_id = Some(id);
@@ -1954,7 +1954,7 @@ pub(crate) async fn run_tui_session(
                                                                 }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
-                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with agent_job(action='shell') to run it in the background."
+                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with job(action='shell') to run it in the background."
                                                                     ),
                                                                 );
                                                                 tui_cancel_token.cancel();
@@ -2487,11 +2487,11 @@ pub(crate) async fn run_tui_session(
                                     // effects.
                                     if let Some(job_id) = ctrl_b_promoted_job_id {
                                         state.pending_bg_notifications.push(format!(
-                                            "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use agent_job(action='output') for the latest job, agent_job(action='output', job_id='{job_id}') for this job, or agent_job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
+                                            "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use job(action='output') for the latest job, job(action='output', job_id='{job_id}') for this job, or job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
                                         ));
                                     } else if ctrl_b_fallback_cancelled {
                                         state.pending_bg_notifications.push(
-                                            "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with agent_job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
+                                            "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
                                         );
                                     }
 

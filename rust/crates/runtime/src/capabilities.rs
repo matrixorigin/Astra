@@ -618,6 +618,33 @@ mod tests {
     }
 
     #[test]
+    fn background_job_tool_is_local_cli_only() {
+        use astra_turn_core::capability::{Capability, CapabilitySet};
+        use astra_turn_core::tool_surface::{Surface, resolve};
+
+        let pool = astra_tools::schemas::all_tool_schemas();
+        let server_caps = lifecycle_server_capabilities(true);
+        let local_caps = CapabilitySet::empty()
+            .with(Capability::MemoryService)
+            .with(Capability::SkillsCatalog)
+            .with(Capability::PlanLifecycle)
+            .with(Capability::LocalBackgroundJobs);
+
+        let web = names(resolve(Surface::Web, &server_caps, &pool));
+        let remote = names(resolve(Surface::CliRemote, &server_caps, &pool));
+        let local = names(resolve(Surface::CliLocal, &local_caps, &pool));
+
+        assert!(
+            !web.contains(&"job".to_string()) && !remote.contains(&"job".to_string()),
+            "server-executed turns must not advertise local TUI background jobs: web={web:?}, remote={remote:?}"
+        );
+        assert!(
+            local.contains(&"job".to_string()),
+            "local CLI turns should advertise the background shell job tool: {local:?}"
+        );
+    }
+
+    #[test]
     fn lifecycle_capabilities_include_agent_spawner() {
         let caps = lifecycle_server_capabilities(true);
         assert!(

@@ -151,7 +151,7 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
 }
 
 /// `task` is only the durable checklist surface. Background process
-/// actions belong to `agent_job`; if they arrive on `task`, treat them
+/// actions belong to `job`; if they arrive on `task`, treat them
 /// as ordinary unknown task actions rather than preserving per-action
 /// migration branches.
 #[tokio::test]
@@ -761,6 +761,26 @@ async fn setup_blocked_executor(
     (server, executor, temp)
 }
 
+#[test]
+fn plan_mode_job_guard_blocks_shell_and_kill_but_allows_reads() {
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "shell", "command": "npm run dev"})
+    ));
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "kill", "job_id": "bg-shell-1"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "output", "job_id": "bg-shell-1"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "list"})
+    ));
+}
+
 #[tokio::test]
 async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
     let server = MockServer::start().await;
@@ -880,20 +900,20 @@ async fn write_guard_is_inactive_when_no_authoring_plan() {
     }
 }
 
-/// `agent_job` is the new entry point. It must dispatch the background
+/// `job` is the entry point. It must dispatch the background
 /// shell actions to the same handlers that previously sat on `task` —
 /// verified here with the cheapest possible smoke: an
 /// unwired CLI executor returns a known fail-fast string for each
 /// action (the BackgroundTaskRegistry is wired only inside the TUI
 /// REPL — see `task_background_shell_fails_fast_when_unwired`).
 #[tokio::test]
-async fn agent_job_actions_dispatch_through_executor() {
+async fn job_actions_dispatch_through_executor() {
     let executor = test_executor();
     // shell — needs `command`; without the registry wired we expect
     // the unwired-fast-fail path, not the missing-arg path.
     let result = executor
         .execute(
-            "agent_job",
+            "job",
             &json!({"action": "shell", "command": "echo hi"}),
         )
         .await;
@@ -901,7 +921,7 @@ async fn agent_job_actions_dispatch_through_executor() {
         result.contains("background_shell")
             || result.contains("interactive REPL")
             || result.contains("not available"),
-        "agent_job.shell should reach the same fail-fast path that \
+        "job.shell should reach the same fail-fast path that \
          task.background_shell used to hit (registry only wired inside \
          the TUI). Got: {result}"
     );
@@ -910,7 +930,7 @@ async fn agent_job_actions_dispatch_through_executor() {
     // message; both kill and output share the registry dependency.
     let result = executor
         .execute(
-            "agent_job",
+            "job",
             &json!({"action": "kill", "job_id": "bg-shell-1"}),
         )
         .await;
@@ -918,17 +938,17 @@ async fn agent_job_actions_dispatch_through_executor() {
         result.contains("background")
             || result.contains("interactive REPL")
             || result.contains("Nothing to kill"),
-        "agent_job.kill should reach the registry-unwired fail-fast path. \
+        "job.kill should reach the registry-unwired fail-fast path. \
          Got: {result}"
     );
 }
 
 #[tokio::test]
-async fn agent_job_agent_action_is_rejected_with_agent_tool_guidance() {
+async fn job_agent_action_is_rejected_with_agent_tool_guidance() {
     let executor = test_executor();
     let result = executor
         .execute(
-            "agent_job",
+            "job",
             &json!({"action": "agent", "prompt": "audit TODOs"}),
         )
         .await;
@@ -938,8 +958,23 @@ async fn agent_job_agent_action_is_rejected_with_agent_tool_guidance() {
     assert!(result.contains("agent(action='get_result'"), "{result}");
     assert!(
         !result.contains("background_agent requires"),
-        "agent_job.agent must not route into the old background_agent shim. Got: {result}"
+        "job.agent must not route into the old background_agent shim. Got: {result}"
     );
+}
+
+#[tokio::test]
+async fn legacy_agent_job_tool_is_rejected_with_job_guidance() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "agent_job",
+            &json!({"action": "shell", "command": "echo hi"}),
+        )
+        .await;
+
+    assert!(result.contains("removed from the user journey"), "{result}");
+    assert!(result.contains("job(action='shell'"), "{result}");
+    assert!(result.contains("agent(action='spawn'"), "{result}");
 }
 
 /// The `agent` tool's action enum must NOT advertise "delegate" to
