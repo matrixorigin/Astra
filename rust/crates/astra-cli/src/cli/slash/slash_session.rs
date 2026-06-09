@@ -5314,16 +5314,15 @@ async fn apply_prepared_fork_restore(
                 .peek_next_task_id(parent_id)
                 .await
                 .unwrap_or(fallback_next_id);
-            let version = store.get_session_version(parent_id).await.unwrap_or(1);
-            let snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
+            let child_version = store.get_session_version(new_sid).await.unwrap_or(0);
+            let mut snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
                 tasks: parent_tasks,
                 next_task_id,
-                version,
-                restore_version: None,
+                version: child_version,
+                restore_version: Some(child_version),
             };
-            Some(astra_tools::task_mgmt::prepare_task_snapshot_for_fork(
-                snapshot,
-            ))
+            snapshot = astra_tools::task_mgmt::prepare_task_snapshot_for_fork(snapshot);
+            Some(snapshot)
         } else {
             None
         }

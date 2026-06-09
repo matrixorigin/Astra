@@ -115,6 +115,8 @@ async fn brief_prioritizes_paused_open_work_over_completed_history() {
     let exe = test_executor();
     exe.task_action_create(&json!({"title": "Already done"}))
         .await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
     exe.task_action_create(&json!({"title": "Waiting on operator"}))

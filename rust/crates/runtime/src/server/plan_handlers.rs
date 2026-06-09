@@ -629,6 +629,39 @@ impl TaskBoardRollback {
     }
 }
 
+async fn seal_task_board_rollback_or_restore(
+    rollback: &mut Option<TaskBoardRollback>,
+    context: &str,
+    not_saved_message: &str,
+) -> Result<(), String> {
+    let Some(active) = rollback.as_mut() else {
+        return Ok(());
+    };
+    if let Err(error) = active.seal().await {
+        // We failed to read/seal the post-mutation version guard, so the
+        // normal CAS restore path would reject the snapshot as stale and
+        // leave the task board diverged from the plan state. On this path we
+        // prefer a best-effort restore of the pre-mutation board snapshot.
+        active.snapshot.restore_version = Some(0);
+        let restore_result = rollback
+            .take()
+            .expect("rollback option should still be populated after failed seal")
+            .restore()
+            .await;
+        return match restore_result {
+            Ok(()) => Err(format!(
+                "{context}: failed to seal task-board rollback — {not_saved_message}. \
+                 Task board was rolled back. Error: {error}"
+            )),
+            Err(restore_error) => Err(format!(
+                "{context}: failed to seal task-board rollback — {not_saved_message}. \
+                 Additionally failed to roll back task board: {restore_error}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 async fn capture_task_board_rollback_if_configured(
     state: &AppState,
     user_id: &str,
@@ -1004,16 +1037,13 @@ pub(super) async fn execute_plan_handler(
             )
         })?;
     }
-    if let Some(rollback) = task_board_rollback.as_mut() {
-        rollback.seal().await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "execute_plan: failed to seal task-board rollback — plan was NOT saved. Error: {error}"
-                ),
-            )
-        })?;
-    }
+    seal_task_board_rollback_or_restore(
+        &mut task_board_rollback,
+        "execute_plan",
+        "plan was NOT saved",
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let expected = resolve_expected_version(&plan_state, req.expected_version);
     if let Err(error) = state
@@ -1300,16 +1330,13 @@ pub(super) async fn rewind_plan_handler(
             ),
         )
     })?;
-    if let Some(rollback) = task_board_rollback.as_mut() {
-        rollback.seal().await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "rewind_plan: failed to seal task-board rollback — plan state was NOT saved. Error: {error}"
-                ),
-            )
-        })?;
-    }
+    seal_task_board_rollback_or_restore(
+        &mut task_board_rollback,
+        "rewind_plan",
+        "plan state was NOT saved",
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let expected_version = expected.unwrap_or(plan_state.version);
     let aborted_runs = match state
@@ -1421,16 +1448,13 @@ pub(super) async fn redo_step_handler(
             ),
         )
     })?;
-    if let Some(rollback) = task_board_rollback.as_mut() {
-        rollback.seal().await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "redo_step: failed to seal task-board rollback — plan state was NOT saved. Error: {error}"
-                ),
-            )
-        })?;
-    }
+    seal_task_board_rollback_or_restore(
+        &mut task_board_rollback,
+        "redo_step",
+        "plan state was NOT saved",
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     // Compute the next attempt number by counting prior runs for this subtask.
     // In-memory/test repos start empty too, so the first attempt is 1 there.
@@ -1577,16 +1601,13 @@ pub(super) async fn start_step_run_handler(
             ),
         )
     })?;
-    if let Some(rollback) = task_board_rollback.as_mut() {
-        rollback.seal().await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "start_step_run: failed to seal task-board rollback — step run was NOT recorded. Error: {error}"
-                ),
-            )
-        })?;
-    }
+    seal_task_board_rollback_or_restore(
+        &mut task_board_rollback,
+        "start_step_run",
+        "step run was NOT recorded",
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let run_id = match state
         .plan_repo
@@ -1722,16 +1743,13 @@ pub(super) async fn post_completed_step_run_handler(
             ),
         )
     })?;
-    if let Some(rollback) = task_board_rollback.as_mut() {
-        rollback.seal().await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "post_completed_step_run: failed to seal task-board rollback — step run was NOT recorded. Error: {error}"
-                ),
-            )
-        })?;
-    }
+    seal_task_board_rollback_or_restore(
+        &mut task_board_rollback,
+        "post_completed_step_run",
+        "step run was NOT recorded",
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let run_id = match state
         .plan_repo
@@ -1853,16 +1871,13 @@ pub(super) async fn finish_step_run_handler(
             ),
         )
     })?;
-    if let Some(rollback) = task_board_rollback.as_mut() {
-        rollback.seal().await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "finalize_step_run: failed to seal task-board rollback — step run was NOT finalized. Error: {error}"
-                ),
-            )
-        })?;
-    }
+    seal_task_board_rollback_or_restore(
+        &mut task_board_rollback,
+        "finalize_step_run",
+        "step run was NOT finalized",
+    )
+    .await
+    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     if let Err(error) = state
         .plan_repo
@@ -2027,6 +2042,7 @@ mod tests {
     use super::*;
     use astra_core::{MatrixOneSettings, SharedPool};
     use astra_services::storage::ensure_core_schema;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FailingLoadTaskStore;
 
@@ -2054,6 +2070,58 @@ mod tests {
 
         async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
             Ok(1)
+        }
+    }
+
+    struct FailingSealRollbackStore {
+        inner: Arc<astra_tools::task_mgmt::InMemoryTaskStore>,
+        version_reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskStore for FailingSealRollbackStore {
+        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+            self.inner.load(session_id).await
+        }
+
+        async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
+            self.inner.save(session_id, tasks).await
+        }
+
+        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
+            self.inner.next_task_id(session_id).await
+        }
+
+        async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
+            self.inner.set_next_task_id(session_id, next).await
+        }
+
+        async fn restore_snapshot_state(
+            &self,
+            session_id: &str,
+            tasks: Vec<SessionTask>,
+            next_task_id: u32,
+            expected_version: u64,
+        ) -> Result<(), String> {
+            self.inner
+                .restore_snapshot_state(session_id, tasks, next_task_id, expected_version)
+                .await
+        }
+
+        async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
+            self.inner.peek_next_task_id(session_id).await
+        }
+
+        async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
+            match self.version_reads.fetch_add(1, Ordering::Relaxed) {
+                0 => self.inner.get_session_version(session_id).await,
+                1 => Err("forced seal failure".to_string()),
+                _ => self.inner.get_session_version(session_id).await,
+            }
+        }
+
+        async fn bump_version(&self, session_id: &str) {
+            self.inner.bump_version(session_id).await;
         }
     }
 
@@ -2344,7 +2412,7 @@ mod tests {
         .expect_err("task-board load failure should abort approved-plan mirror");
 
         assert!(
-            error.contains("load task board before approved-plan mirror")
+            error.contains("snapshot task board before approved-plan mirror")
                 && error.contains("forced task-board load failure"),
             "approved-plan mirror must not treat task-board load failure as an empty board: {error}"
         );
@@ -2387,18 +2455,57 @@ mod tests {
         let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
-            2,
-            "failed HTTP approved-plan mirror preserves partial progress (step-1) \
-             alongside existing tasks; idempotent retry completes the mirror: {tasks:?}"
+            1,
+            "failed HTTP approved-plan mirror must roll back the task board to its pre-approval state: {tasks:?}"
         );
         assert!(
             tasks.iter().any(|t| t.title == "Existing cloud task"),
             "existing cloud task must survive mirror failure: {tasks:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn seal_task_board_rollback_failure_restores_task_board() {
+        let inner = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new());
+        let store: Arc<dyn TaskStore> = Arc::new(FailingSealRollbackStore {
+            inner: inner.clone(),
+            version_reads: AtomicUsize::new(0),
+        });
+        let manager = TaskManager::new("rollback-seal-fails", store);
+
+        let first = manager
+            .create(&serde_json::json!({"title": "keep me"}))
+            .await;
+        assert!(!first.starts_with("Error:"), "{first}");
+        let snapshot = manager.try_snapshot_state().await.expect("snapshot");
+
+        let second = manager
+            .create(&serde_json::json!({"title": "must roll back"}))
+            .await;
+        assert!(!second.starts_with("Error:"), "{second}");
+
+        let mut rollback = Some(TaskBoardRollback { manager, snapshot });
+        let err = seal_task_board_rollback_or_restore(
+            &mut rollback,
+            "test_plan_op",
+            "plan state was NOT saved",
+        )
+        .await
+        .expect_err("seal failure should be surfaced");
+
+        assert!(err.contains("forced seal failure"), "{err}");
+        assert!(err.contains("Task board was rolled back"), "{err}");
         assert!(
-            tasks.iter().any(|t| t.title == "Create first cloud step"),
-            "step-1 task (valid) must be preserved for retry: {tasks:?}"
+            rollback.is_none(),
+            "failed seal should consume the rollback handle"
         );
+
+        let tasks = inner
+            .load("rollback-seal-fails")
+            .await
+            .expect("task board after rollback");
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].title, "keep me");
     }
 
     #[tokio::test]
@@ -2850,19 +2957,12 @@ mod tests {
         let tasks = manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
-            2,
-            "failed MatrixOne approved-plan mirror preserves partial progress (step-1) \
-             alongside existing tasks; idempotent retry completes the mirror: {tasks:?}"
+            1,
+            "failed MatrixOne approved-plan mirror must roll back the task board to its pre-approval state: {tasks:?}"
         );
         assert!(
             tasks.iter().any(|t| t.title == "Existing MatrixOne task"),
             "existing MatrixOne task must survive mirror failure: {tasks:?}"
-        );
-        assert!(
-            tasks
-                .iter()
-                .any(|t| t.title == "Create first MatrixOne step"),
-            "step-1 task (valid) must be preserved for retry: {tasks:?}"
         );
 
         cleanup_session_todos(&pool, &session_id).await;

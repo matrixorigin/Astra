@@ -5966,6 +5966,9 @@ fn summarize_web_fetch_output(output: &str) -> Option<String> {
 /// Extracts relevant info from common error patterns.
 fn format_tool_error_summary(tool: &str, output: &str) -> String {
     let output_trimmed = output.trim();
+    if output_trimmed.is_empty() {
+        return format!("{tool} failed before returning output");
+    }
     let first_line = output.lines().next().unwrap_or("").trim();
 
     // Tool-specific error extraction
@@ -8599,6 +8602,16 @@ mod tests {
             .expect("summary");
         assert_eq!(summary.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(summary.text, "4 lines captured");
+    }
+
+    #[test]
+    fn failure_output_summary_never_returns_empty_for_empty_output() {
+        let r = StreamRenderState::new();
+        let summary = r
+            .format_output_summary("bash", "", "failed")
+            .expect("failure summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Error);
+        assert_eq!(summary.text, "bash failed before returning output");
     }
 
     #[test]

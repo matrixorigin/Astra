@@ -828,18 +828,19 @@ pub trait TaskStore: Send + Sync {
     }
     /// Restore task rows and the next-id counter as one logical rollback
     /// operation. Stores that can update both under one lock/transaction
-    /// should override this method. The default is deliberately ordered
-    /// `save -> set counter` so a failed task-row restore cannot leave the
-    /// counter rewound against still-current task rows.
+    /// should override this method. The default returns an error to avoid
+    /// silent snapshot-restore mismatches when the user runs against a store
+    /// that has not implemented atomic snapshot restore.
+    #[allow(async_fn_in_trait)]
     async fn restore_snapshot_state(
         &self,
         session_id: &str,
         tasks: Vec<SessionTask>,
         next_task_id: u32,
+        expected_version: u64,
     ) -> Result<(), String> {
-        self.save(session_id, tasks).await?;
-        self.set_next_task_id(session_id, next_task_id).await?;
-        Ok(())
+        let _ = (session_id, tasks, next_task_id, expected_version);
+        Err("restore_snapshot_state is not supported for this store".to_string())
     }
     /// Read the next id WITHOUT consuming or mutating the counter.
     /// Used by `try_snapshot_state` to capture the counter for rollback
@@ -929,15 +930,15 @@ pub trait TaskStore: Send + Sync {
 /// Broadcasts `session_id` on every successful save so `TaskBoardObserver`
 /// can refresh immediately without waiting for a fallback poll.
 pub struct InMemoryTaskStore {
-    sessions: Mutex<HashMap<String, InMemorySession>>,
+    sessions: tokio::sync::Mutex<HashMap<String, InMemorySession>>,
     /// Broadcast sender for "session X changed" events. Capacity 16 is
     /// generous for the expected subscriber count (one observer per REPL
     /// + occasional test subscribers); slow consumers get dropped events
     ///   (`RecvError::Lagged`) rather than blocking writers.
     changed_tx: tokio::sync::broadcast::Sender<String>,
     /// When enabled, `save()` validates task invariants (unique IDs, non-empty
-    /// titles) before persisting. Disabled by default for backward compat;
-    /// test harnesses should opt in via `with_validation()`.
+    /// titles) before persisting. Enabled by default; tests that intentionally
+    /// inject corrupt state must opt out explicitly.
     validate_on_save: bool,
 }
 
@@ -961,15 +962,21 @@ struct InMemorySession {
 impl InMemoryTaskStore {
     pub fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
             changed_tx: tokio::sync::broadcast::channel(16).0,
-            validate_on_save: false,
+            validate_on_save: true,
         }
     }
 
-    /// Enable save() validation — duplicate IDs and empty titles are rejected.
+    /// Keep save() validation enabled — duplicate IDs and empty titles are rejected.
     pub fn with_validation(mut self) -> Self {
         self.validate_on_save = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn without_validation(mut self) -> Self {
+        self.validate_on_save = false;
         self
     }
 
@@ -986,6 +993,18 @@ impl InMemoryTaskStore {
             if task.title.trim().is_empty() {
                 return Err(format!("task store: task '{}' has empty title", task.id));
             }
+            chrono::DateTime::parse_from_rfc3339(&task.created_at).map_err(|e| {
+                format!(
+                    "task store: task '{}' has invalid created_at '{}': {e}",
+                    task.id, task.created_at
+                )
+            })?;
+            chrono::DateTime::parse_from_rfc3339(&task.updated_at).map_err(|e| {
+                format!(
+                    "task store: task '{}' has invalid updated_at '{}': {e}",
+                    task.id, task.updated_at
+                )
+            })?;
             // Validate subtask IDs are non-empty and unique within task.
             let mut subtask_ids = std::collections::HashSet::new();
             for st in &task.subtasks {
@@ -1036,10 +1055,7 @@ impl InMemoryTaskStore {
 #[async_trait]
 impl TaskStore for InMemoryTaskStore {
     async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let sessions = self.sessions.lock().await;
         Ok(sessions
             .get(session_id)
             .map(|s| s.tasks.clone())
@@ -1051,36 +1067,28 @@ impl TaskStore for InMemoryTaskStore {
             Self::validate_tasks(&tasks)?;
         }
         {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| "task store: session map poisoned".to_string())?;
+            let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
             entry.tasks = tasks;
+            entry.version = entry.version.wrapping_add(1);
         }
         // Best-effort broadcast. `send` errors only when there are no
         // receivers, which is the common "no observer attached" case in
         // tests and headless CLI — not an error.
         let _ = self.changed_tx.send(session_id.to_string());
-        self.bump_version(session_id).await;
         Ok(())
     }
 
     async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
         let response = {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| "task store: session map poisoned".to_string())?;
+            let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
             let next = if entry.next_id == 0 { 1 } else { entry.next_id };
             let next = u32::try_from(next)
                 .map_err(|_| format!("task id counter exhausted for session {session_id}"))?;
-            // catch_unwind: a panicking mutation closure must not poison
-            // the global session map Mutex, which would kill all concurrent
-            // sessions' task boards.
+            // `tokio::sync::Mutex` does not poison on panic, so we can keep the
+            // mutation atomic while still surfacing a panic as a task-store error.
             let cloned_tasks = entry.tasks.clone();
-            drop(sessions); // release lock before calling user code
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 mutation(cloned_tasks, next)
             }))
@@ -1090,29 +1098,25 @@ impl TaskStore for InMemoryTaskStore {
                      task board unchanged"
                 )
             })??;
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| "task store: session map poisoned after re-acquire".to_string())?;
+            if self.validate_on_save {
+                Self::validate_tasks(&result.tasks)?;
+            }
             let entry = sessions.entry(session_id.to_string()).or_default();
             entry.tasks = result.tasks;
             if let Some(next_task_id) = result.next_task_id {
                 entry.next_id = u64::from(next_task_id);
             }
+            entry.version = entry.version.wrapping_add(1);
             result.response
         };
         let _ = self.changed_tx.send(session_id.to_string());
-        self.bump_version(session_id).await;
         Ok(response)
     }
 
     async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
         let task_id;
         {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| "task store: session map poisoned".to_string())?;
+            let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
             if entry.next_id == 0 {
                 entry.next_id = 1;
@@ -1131,17 +1135,13 @@ impl TaskStore for InMemoryTaskStore {
             entry.next_id = id
                 .checked_add(1)
                 .ok_or_else(|| format!("task id counter overflow for session {session_id}"))?;
+            entry.version = entry.version.wrapping_add(1);
         }
-        // Drop lock before calling bump_version (which takes the lock too)
-        self.bump_version(session_id).await;
         Ok(task_id)
     }
 
     async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let mut sessions = self.sessions.lock().await;
         let entry = sessions.entry(session_id.to_string()).or_default();
         entry.next_id = u64::from(next);
         Ok(())
@@ -1152,29 +1152,31 @@ impl TaskStore for InMemoryTaskStore {
         session_id: &str,
         tasks: Vec<SessionTask>,
         next_task_id: u32,
+        expected_version: u64,
     ) -> Result<(), String> {
         if self.validate_on_save {
             Self::validate_tasks(&tasks)?;
         }
         {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| "task store: session map poisoned".to_string())?;
+            let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
+            if expected_version > 0 && entry.version != expected_version {
+                return Err(format!(
+                    "restore_snapshot_state: version conflict (expected={}, current={}) — \
+                     task board changed after rollback snapshot was sealed; retry with fresh state",
+                    expected_version, entry.version
+                ));
+            }
             entry.tasks = tasks;
             entry.next_id = u64::from(next_task_id);
+            entry.version = entry.version.wrapping_add(1);
         }
         let _ = self.changed_tx.send(session_id.to_string());
-        self.bump_version(session_id).await;
         Ok(())
     }
 
     async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let sessions = self.sessions.lock().await;
         let next = sessions
             .get(session_id)
             .map(|s| if s.next_id == 0 { 1 } else { s.next_id })
@@ -1184,18 +1186,14 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let sessions = self.sessions.lock().await;
         Ok(sessions.get(session_id).map(|s| s.version).unwrap_or(0))
     }
 
     async fn bump_version(&self, session_id: &str) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            let entry = sessions.entry(session_id.to_string()).or_default();
-            entry.version = entry.version.wrapping_add(1);
-        }
+        let mut sessions = self.sessions.lock().await;
+        let entry = sessions.entry(session_id.to_string()).or_default();
+        entry.version = entry.version.wrapping_add(1);
     }
 
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
@@ -1203,10 +1201,7 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     async fn load_all_sessions(&self) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let sessions = self.sessions.lock().await;
         let mut out: Vec<(String, Vec<SessionTask>)> = sessions
             .iter()
             .filter(|(_, s)| !s.tasks.is_empty())
@@ -1807,7 +1802,7 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
 
     let all_completed = task.subtasks.iter().all(|st| st.status.is_completed());
     if all_completed {
-        if task.status.is_active() {
+        if task.status.is_active() && task.blocked_by.is_empty() {
             task.status = SessionTaskStatusKind::Completed;
             let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
             meta.insert("auto_completed_by_subtasks".to_string(), json!(true));
@@ -2013,7 +2008,7 @@ impl TaskManager {
             .max(snapshot.next_task_id)
             .max(max_task_id.saturating_add(1));
         self.store
-            .restore_snapshot_state(&sid, snapshot.tasks.clone(), safe_next)
+            .restore_snapshot_state(&sid, snapshot.tasks.clone(), safe_next, expected_version)
             .await
     }
 
@@ -4592,8 +4587,11 @@ mod tests {
     async fn snapshot_restores_tasks_and_next_id() {
         let m = mgr();
         m.create(&json!({"title": "t1"})).await;
-        let snap = m.try_snapshot_state().await.expect("snapshot in test");
+        let mut snap = m.try_snapshot_state().await.expect("snapshot in test");
         m.create(&json!({"title": "t2"})).await;
+        m.seal_snapshot_for_restore(&mut snap)
+            .await
+            .expect("seal snapshot after own mutation");
         let list_before: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(list_before["count"], 2);
@@ -4807,7 +4805,8 @@ mod tests {
 
     #[tokio::test]
     async fn in_progress_rejects_dangling_blocked_by_dependency() {
-        let m = mgr();
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new().without_validation());
+        let m = TaskManager::new("sess-dangling", store);
         m.create(&json!({"title": "legacy dangling dependency"}))
             .await;
         let mut snapshot = m.try_snapshot_state().await.expect("snapshot in test");
@@ -5198,6 +5197,7 @@ mod tests {
         let mut rx = store
             .subscribe()
             .expect("in-memory store supports subscribe");
+        let now = chrono::Utc::now().to_rfc3339();
 
         // No signal yet.
         assert!(rx.try_recv().is_err(), "no events before save");
@@ -5211,8 +5211,8 @@ mod tests {
                     description: None,
                     status: "pending".into(),
                     subtasks: vec![],
-                    created_at: "now".into(),
-                    updated_at: "now".into(),
+                    created_at: now.clone(),
+                    updated_at: now,
                     active_form: None,
                     owner: None,
                     metadata: None,
@@ -5407,8 +5407,8 @@ mod tests {
                     description: None,
                     status: "pending".into(),
                     subtasks: vec![],
-                    created_at: "".into(),
-                    updated_at: "".into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
                     active_form: None,
                     owner: None,
                     metadata: None,
@@ -5519,6 +5519,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_restore_snapshot_state_rejects_version_conflict() {
+        let store = InMemoryTaskStore::new();
+        let now = chrono::Utc::now().to_rfc3339();
+        let original = SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "original".to_string(),
+            description: None,
+            status: SessionTaskStatusKind::Pending,
+            subtasks: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        };
+        store
+            .save("sess-conflict", vec![original.clone()])
+            .await
+            .expect("seed store");
+        let version = store
+            .get_session_version("sess-conflict")
+            .await
+            .expect("version after seed");
+        store.bump_version("sess-conflict").await;
+
+        let err = store
+            .restore_snapshot_state("sess-conflict", vec![original], 2, version)
+            .await
+            .expect_err("stale restore must be rejected");
+        assert!(err.contains("version conflict"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn in_memory_mutate_validates_tasks_when_enabled() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .save(
+                "sess-validate",
+                vec![SessionTask {
+                    archived_at: None,
+                    id: "task-1".to_string(),
+                    title: "valid".to_string(),
+                    description: None,
+                    status: SessionTaskStatusKind::Pending,
+                    subtasks: Vec::new(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                }],
+            )
+            .await
+            .expect("seed store");
+
+        let err = store
+            .mutate(
+                "sess-validate",
+                Box::new(move |mut tasks, next_id| {
+                    tasks.push(SessionTask {
+                        archived_at: None,
+                        id: "task-1".to_string(),
+                        title: "duplicate".to_string(),
+                        description: None,
+                        status: SessionTaskStatusKind::Pending,
+                        subtasks: Vec::new(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                        active_form: None,
+                        owner: None,
+                        metadata: None,
+                        blocks: Vec::new(),
+                        blocked_by: Vec::new(),
+                    });
+                    Ok(TaskMutationResult {
+                        tasks,
+                        next_task_id: Some(next_id + 1),
+                        response: "should fail".to_string(),
+                    })
+                }),
+            )
+            .await
+            .expect_err("invalid mutate result should be rejected");
+
+        assert!(err.contains("duplicate task id"), "{err}");
+        let tasks = store
+            .load("sess-validate")
+            .await
+            .expect("load after failure");
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].title, "valid");
+    }
+
+    #[tokio::test]
     async fn restore_snapshot_does_not_rewind_counter_when_task_save_fails() {
         struct SaveFailsAfterCounterStore {
             counter: tokio::sync::Mutex<u32>,
@@ -5545,6 +5645,16 @@ mod tests {
             async fn set_next_task_id(&self, _session_id: &str, next: u32) -> Result<(), String> {
                 *self.counter.lock().await = next;
                 Ok(())
+            }
+
+            async fn restore_snapshot_state(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+                _next_task_id: u32,
+                _expected_version: u64,
+            ) -> Result<(), String> {
+                Err("simulated save failure".to_string())
             }
 
             async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {

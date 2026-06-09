@@ -199,7 +199,7 @@ async fn snapshot_restore_roundtrips_through_mo() {
     );
     let mgr = TaskManager::new(session_id.clone(), store);
     mgr.create(&json!({"title": "t1"})).await;
-    let snap = mgr
+    let mut snap = mgr
         .try_snapshot_state()
         .await
         .expect("snapshot in cross-client test");
@@ -207,15 +207,19 @@ async fn snapshot_restore_roundtrips_through_mo() {
     let pre_restore = mgr.list(&json!({"status_filter": "all"})).await;
     assert!(pre_restore.contains("\"count\":2"), "{pre_restore}");
 
+    mgr.seal_snapshot_for_restore(&mut snap)
+        .await
+        .expect("seal restore snapshot");
     mgr.restore_snapshot(&snap).await.expect("restore");
     let post = mgr.list(&json!({"status_filter": "all"})).await;
     assert!(
         post.contains("\"count\":1"),
         "restore should drop t2: {post}"
     );
-    // Next id must be reset so t2 reuses the same ordinal (task-2).
+    // Counter is never rewound; restoring t1 still preserves the higher
+    // allocator watermark that t2 already consumed.
     let recreate = mgr.create(&json!({"title": "t2-again"})).await;
-    assert!(recreate.contains("task-2"), "{recreate}");
+    assert!(recreate.contains("task-3"), "{recreate}");
 
     cleanup(&pool, &session_id).await;
 }
@@ -243,22 +247,13 @@ async fn snapshot_restore_uses_existing_rows_when_matrixone_counter_is_zero() {
     .await
     .expect("corrupt counter to zero");
 
-    let snap = mgr
+    let err = mgr
         .try_snapshot_state()
         .await
-        .expect("snapshot with corrupt counter");
-    assert_eq!(
-        snap.next_task_id, 2,
-        "try_snapshot_state must derive from existing task ids when MatrixOne counter is corrupt"
-    );
-
-    mgr.restore_snapshot(&snap)
-        .await
-        .expect("restore should repair counter from snapshot fallback");
-    let recreate = mgr.create(&json!({"title": "after restore"})).await;
+        .expect_err("snapshot with corrupt counter must fail closed");
     assert!(
-        recreate.contains("task-2") && recreate.contains("\"success\":true"),
-        "restore must not rewind MatrixOne counter to task-1 after zero corruption: {recreate}"
+        err.contains("peek_next_task_id failed") && err.contains("out of range"),
+        "corrupt MatrixOne counter should be surfaced explicitly: {err}"
     );
 
     cleanup(&pool, &session_id).await;
@@ -359,9 +354,17 @@ async fn load_open_sessions_is_bounded_open_work_and_user_scoped() {
 
     mgr_a.create(&json!({"title": "pending-a"})).await;
     mgr_a.create(&json!({"title": "completed-a"})).await;
-    mgr_a
+    let completed_a_started = mgr_a
+        .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+        .await;
+    assert!(
+        !completed_a_started.starts_with("Error:"),
+        "{completed_a_started}"
+    );
+    let completed_a = mgr_a
         .update(&json!({"task_id": "task-2", "new_status": "completed"}))
         .await;
+    assert!(!completed_a.starts_with("Error:"), "{completed_a}");
     mgr_b.create(&json!({"title": "paused-b"})).await;
     mgr_b
         .update(&json!({"task_id": "task-1", "new_status": "paused"}))
@@ -437,6 +440,17 @@ async fn active_list_includes_paused_open_work_in_matrixone() {
     assert!(!paused_update.starts_with("Error:"), "{paused_update}");
     let completed = manager.create(&json!({"title": "completed history"})).await;
     assert!(!completed.starts_with("Error:"), "{completed}");
+    let running_pause = manager
+        .update(&json!({"task_id": "task-2", "new_status": "paused"}))
+        .await;
+    assert!(!running_pause.starts_with("Error:"), "{running_pause}");
+    let completed_update = manager
+        .update(&json!({"task_id": "task-4", "new_status": "in_progress"}))
+        .await;
+    assert!(
+        !completed_update.starts_with("Error:"),
+        "{completed_update}"
+    );
     let completed_update = manager
         .update(&json!({"task_id": "task-4", "new_status": "completed"}))
         .await;
@@ -444,6 +458,10 @@ async fn active_list_includes_paused_open_work_in_matrixone() {
         !completed_update.starts_with("Error:"),
         "{completed_update}"
     );
+    let running_resume = manager
+        .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+        .await;
+    assert!(!running_resume.starts_with("Error:"), "{running_resume}");
 
     let active = manager.list(&json!({"status_filter": "active"})).await;
     let parsed: serde_json::Value =
@@ -470,7 +488,8 @@ async fn active_list_includes_paused_open_work_in_matrixone() {
 
 #[tokio::test]
 #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-async fn snapshot_restore_after_cross_client_allocations_reuses_ids_without_collision() {
+async fn snapshot_restore_after_cross_client_allocations_rejects_stale_snapshot_without_collision()
+{
     let pool = bootstrap_pool().await;
     let session_id = format!("s-snap-x-client-{}", uuid::Uuid::new_v4());
     cleanup(&pool, &session_id).await;
@@ -498,26 +517,18 @@ async fn snapshot_restore_after_cross_client_allocations_reuses_ids_without_coll
     let before_restore = cloud.list(&json!({"status_filter": "all"})).await;
     assert!(before_restore.contains("\"count\":3"), "{before_restore}");
 
-    edge.restore_snapshot(&snap).await.expect("restore");
-    let post_restore = cloud.list(&json!({"status_filter": "all"})).await;
-    assert!(
-        post_restore.contains("\"count\":1"),
-        "restore should roll the shared session back to the snapshot: {post_restore}"
-    );
-    assert!(
-        !post_restore.contains("rolled back t2") && !post_restore.contains("rolled back t3"),
-        "post-snapshot rows must not survive the rollback: {post_restore}"
-    );
-
-    let recreate = cloud
-        .create(&json!({"title": "new t2 after restore"}))
-        .await;
-    assert!(recreate.contains("task-2"), "{recreate}");
+    let err = edge
+        .restore_snapshot(&snap)
+        .await
+        .expect_err("stale cross-client snapshot must not clobber later writes");
+    assert!(err.contains("version conflict"), "{err}");
     let final_list = edge.list(&json!({"status_filter": "all"})).await;
-    assert!(final_list.contains("\"count\":2"), "{final_list}");
+    assert!(final_list.contains("\"count\":3"), "{final_list}");
     assert!(
-        final_list.matches("task-2").count() == 1,
-        "task-2 must be reused exactly once after restore, without duplicate ids: {final_list}"
+        final_list.contains("snapshot survivor")
+            && final_list.contains("rolled back t2")
+            && final_list.contains("rolled back t3"),
+        "stale restore rejection must preserve later cross-client writes: {final_list}"
     );
 
     cleanup(&pool, &session_id).await;
@@ -601,12 +612,34 @@ async fn bulk_archive_is_scoped_to_current_session_even_with_user_store() {
     mgr_b
         .create(&json!({"title": "old task in another session"}))
         .await;
-    mgr_a
+    let archived_a_started = mgr_a
+        .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
+    assert!(
+        !archived_a_started.starts_with("Error:"),
+        "{archived_a_started}"
+    );
+    let archived_b_started = mgr_b
+        .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
+    assert!(
+        !archived_b_started.starts_with("Error:"),
+        "{archived_b_started}"
+    );
+    let archived_a_completed = mgr_a
         .update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
-    mgr_b
+    assert!(
+        !archived_a_completed.starts_with("Error:"),
+        "{archived_a_completed}"
+    );
+    let archived_b_completed = mgr_b
         .update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
+    assert!(
+        !archived_b_completed.starts_with("Error:"),
+        "{archived_b_completed}"
+    );
 
     for session_id in [&session_a, &session_b] {
         sqlx::query(
@@ -716,6 +749,10 @@ async fn blocked_task_cannot_start_until_dependency_completes_in_matrixone() {
         "MatrixOne blocked task should not start before blocker completes: {blocked}"
     );
 
+    let blocker_started = edge
+        .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
+    assert!(!blocker_started.starts_with("Error:"), "{blocker_started}");
     let completed = edge
         .update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
@@ -888,15 +925,13 @@ async fn matrixone_load_rejects_unknown_persisted_task_status() {
         "bad MatrixOne status should be surfaced explicitly: {err}"
     );
 
-    let active_err = mgr
+    let active = mgr
         .load_active_tasks()
         .await
-        .expect_err("active MatrixOne loads must not hide unknown persisted statuses");
+        .expect("active MatrixOne loads should stay fail-closed and skip unknown statuses");
     assert!(
-        active_err.contains("session_todos.status")
-            && active_err.contains("invalid status")
-            && active_err.contains("mystery"),
-        "bad MatrixOne status should fail active task-board refresh explicitly: {active_err}"
+        active.is_empty(),
+        "unknown persisted statuses should not leak into active MatrixOne loads: {active:?}"
     );
 
     cleanup(&pool, &session_id).await;
@@ -1030,8 +1065,14 @@ async fn archive_detaches_dependency_edges_through_matrixone_store() {
         .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
         .await;
     assert!(!linked.starts_with("Error:"), "{linked}");
-    mgr.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+    let started = mgr
+        .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
         .await;
+    assert!(!started.starts_with("Error:"), "{started}");
+    let completed = mgr
+        .update(&json!({"task_id": "task-1", "new_status": "completed"}))
+        .await;
+    assert!(!completed.starts_with("Error:"), "{completed}");
 
     let archived = mgr.archive(&json!({"task_id": "task-1"})).await;
     assert!(!archived.starts_with("Error:"), "{archived}");

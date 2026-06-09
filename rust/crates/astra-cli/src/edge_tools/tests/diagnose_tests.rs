@@ -85,6 +85,8 @@ async fn diagnose_tasks_with_items() {
     // Create some tasks
     exe.task_action_create(&json!({"title": "Task 1"})).await;
     exe.task_action_create(&json!({"title": "Task 2"})).await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 

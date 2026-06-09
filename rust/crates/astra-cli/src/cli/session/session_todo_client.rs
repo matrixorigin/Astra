@@ -82,7 +82,15 @@ pub async fn execute_todo_action(
         cloud_base.trim_end_matches('/'),
         session_id
     );
-    let body = json!({ "action": action, "args": args });
+    let body = if action == "create" {
+        json!({
+            "action": action,
+            "args": args,
+            "idempotency_key": format!("todo-create:{}", uuid::Uuid::new_v4()),
+        })
+    } else {
+        json!({ "action": action, "args": args })
+    };
 
     for attempt in 0..2 {
         let resp = build_request(reqwest::Method::POST, &url, token)?
@@ -626,6 +634,15 @@ mod wiring_e2e {
         .await
         .expect("task must surface");
 
+        let _ = execute_todo_action(
+            &server.uri(),
+            None,
+            sid,
+            "update",
+            &json!({ "task_id": "task-1", "new_status": "in_progress" }),
+        )
+        .await
+        .unwrap();
         let _ = execute_todo_action(
             &server.uri(),
             None,

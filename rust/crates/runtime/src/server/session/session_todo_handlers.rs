@@ -26,6 +26,7 @@ use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::time::{Duration, sleep};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +39,11 @@ pub(crate) struct ExecuteTodoRequest {
     /// Unknown fields are rejected by action-specific validation.
     #[serde(default)]
     pub args: serde_json::Value,
+    /// Required for `action=create`. Provides HTTP retry idempotency for
+    /// cloud/edge calls so a connection drop after mutation cannot create
+    /// duplicate tasks on retry.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -336,19 +342,14 @@ fn clean_adopted_subtasks(subtasks_json: &str) -> Result<Option<serde_json::Valu
     )))
 }
 
-fn todo_to_mo_datetime(rfc3339: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        return dt
-            .with_timezone(&chrono::Utc)
-            .format("%Y-%m-%d %H:%M:%S%.6f")
-            .to_string();
-    }
-    rfc3339
-        .replacen('T', " ", 1)
-        .split(&['+', 'Z'][..])
-        .next()
-        .unwrap_or(rfc3339)
-        .to_string()
+fn todo_to_mo_datetime(rfc3339: &str, column: &'static str) -> Result<String, String> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string()
+        })
+        .map_err(|e| format!("invalid adopted task {column} timestamp '{rfc3339}': {e}"))
 }
 
 fn task_created_output(
@@ -426,7 +427,7 @@ async fn adopt_task_into_session_atomic(
     };
 
     sqlx::query(
-        "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 1) \
+        "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
          ON DUPLICATE KEY UPDATE next_id = next_id",
     )
     .bind(target_session)
@@ -522,18 +523,20 @@ async fn adopt_task_into_session_atomic(
     .bind(&description)
     .bind(metadata)
     .bind(subtasks)
-    .bind(todo_to_mo_datetime(&now))
-    .bind(todo_to_mo_datetime(&now))
+    .bind(todo_to_mo_datetime(&now, "created_at")?)
+    .bind(todo_to_mo_datetime(&now, "updated_at")?)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("insert adopted target task failed: {e}"))?;
 
-    sqlx::query("UPDATE session_todo_counters SET next_id = ? WHERE session_id = ?")
-        .bind(next_stored)
-        .bind(target_session)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("advance target task counter failed: {e}"))?;
+    sqlx::query(
+        "UPDATE session_todo_counters SET next_id = ?, version = version + 1 WHERE session_id = ?",
+    )
+    .bind(next_stored)
+    .bind(target_session)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("advance target task counter failed: {e}"))?;
 
     tx.commit()
         .await
@@ -581,6 +584,141 @@ fn validate_execute_todo_args_action(action: &str, args: &serde_json::Value) -> 
     Ok(())
 }
 
+fn todo_idempotency_error_response(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if error.contains("different todo create arguments")
+        || error.contains("already in progress")
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    error_response(status, error)
+}
+
+fn validate_create_idempotency_key(key: Option<&str>) -> Result<&str, String> {
+    let Some(key) = key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return Err("idempotency_key is required for todo action 'create'".to_string());
+    };
+    if key.len() > 128 {
+        return Err("idempotency_key must be at most 128 bytes".to_string());
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+    {
+        return Err(
+            "idempotency_key may contain only ASCII letters, digits, '-', '_', ':' or '.'"
+                .to_string(),
+        );
+    }
+    Ok(key)
+}
+
+enum TodoCreateIdempotency {
+    Reserved,
+    Replay(String),
+}
+
+async fn lookup_todo_idempotency_output(
+    pool: &astra_core::SharedPool,
+    session_id: &str,
+    user_id: &str,
+    action: &str,
+    idempotency_key: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
+    sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT args_json, output FROM session_todo_idempotency \
+         WHERE session_id = ? AND user_id = ? AND action = ? AND idempotency_key = ?",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(action)
+    .bind(idempotency_key)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|e| format!("lookup todo idempotency key failed: {e}"))
+}
+
+async fn claim_todo_create_idempotency(
+    pool: &astra_core::SharedPool,
+    session_id: &str,
+    user_id: &str,
+    idempotency_key: &str,
+    args: &serde_json::Value,
+) -> Result<TodoCreateIdempotency, String> {
+    let args_json =
+        serde_json::to_string(args).map_err(|e| format!("encode todo create args: {e}"))?;
+    let insert_result = sqlx::query(
+        "INSERT INTO session_todo_idempotency \
+            (session_id, user_id, action, idempotency_key, args_json, output, created_at, updated_at) \
+         VALUES (?, ?, 'create', ?, ?, NULL, NOW(6), NOW(6))",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(idempotency_key)
+    .bind(&args_json)
+    .execute(pool.get())
+    .await;
+
+    let insert_error = match insert_result {
+        Ok(_) => return Ok(TodoCreateIdempotency::Reserved),
+        Err(error) => error,
+    };
+
+    let existing =
+        lookup_todo_idempotency_output(pool, session_id, user_id, "create", idempotency_key)
+            .await?;
+    let Some((existing_args, mut output)) = existing else {
+        return Err(format!(
+            "reserve todo create idempotency key failed: {insert_error}"
+        ));
+    };
+    if existing_args != args_json {
+        return Err("idempotency_key already used for different todo create arguments".to_string());
+    }
+
+    for _ in 0..20 {
+        if let Some(output) = output {
+            return Ok(TodoCreateIdempotency::Replay(output));
+        }
+        sleep(Duration::from_millis(50)).await;
+        output =
+            lookup_todo_idempotency_output(pool, session_id, user_id, "create", idempotency_key)
+                .await?
+                .and_then(|(_, output)| output);
+    }
+
+    Err("idempotency_key is already in progress for todo create".to_string())
+}
+
+async fn complete_todo_create_idempotency(
+    pool: &astra_core::SharedPool,
+    session_id: &str,
+    user_id: &str,
+    idempotency_key: &str,
+    output: &str,
+) -> Result<(), String> {
+    let result = sqlx::query(
+        "UPDATE session_todo_idempotency \
+         SET output = ?, updated_at = NOW(6) \
+         WHERE session_id = ? AND user_id = ? AND action = 'create' AND idempotency_key = ?",
+    )
+    .bind(output)
+    .bind(session_id)
+    .bind(user_id)
+    .bind(idempotency_key)
+    .execute(pool.get())
+    .await
+    .map_err(|e| format!("record todo create idempotency output failed: {e}"))?;
+    if result.rows_affected() != 1 {
+        return Err(format!(
+            "record todo create idempotency output affected {} rows",
+            result.rows_affected()
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /sessions/{session_id}/todos:execute` — run a TaskManager action.
 pub(crate) async fn execute_todo_handler(
     State(state): State<AppState>,
@@ -603,6 +741,28 @@ pub(crate) async fn execute_todo_handler(
             output: format!("Error: {error}"),
         }));
     }
+    let create_idempotency_key = if action == "create" {
+        match validate_create_idempotency_key(req.idempotency_key.as_deref()) {
+            Ok(key) => Some(key.to_string()),
+            Err(error) => {
+                return Ok(Json(ExecuteTodoResponse {
+                    output: format!("Error: {error}"),
+                }));
+            }
+        }
+    } else {
+        None
+    };
+    if action != "create"
+        && req
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        return Ok(Json(ExecuteTodoResponse {
+            output: "Error: idempotency_key is only valid for todo action 'create'".to_string(),
+        }));
+    }
 
     let manager = build_task_manager(&state, &session_id, &user.user_id)
         .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?
@@ -614,7 +774,46 @@ pub(crate) async fn execute_todo_handler(
         })?;
 
     let output = match action {
-        "create" => manager.create(&req.args).await,
+        "create" => {
+            let key = create_idempotency_key.expect("create idempotency key validated");
+            let pool = state.shared_pool.as_ref().ok_or_else(|| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session_todos store not configured on this server",
+                )
+            })?;
+            match claim_todo_create_idempotency(pool, &session_id, &user.user_id, &key, &req.args)
+                .await
+                .map_err(todo_idempotency_error_response)?
+            {
+                TodoCreateIdempotency::Replay(output) => output,
+                TodoCreateIdempotency::Reserved => {
+                    let output = manager.create(&req.args).await;
+                    // Best-effort: if this fails the sweeper will clean up the
+                    // stale idempotency row. The client already received the
+                    // task output — don't let idempotency tracking block that.
+                    if let Err(e) = complete_todo_create_idempotency(
+                        pool,
+                        &session_id,
+                        &user.user_id,
+                        &key,
+                        &output,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            target: "astra_runtime::session_todo",
+                            error = %e,
+                            session_id = %session_id,
+                            idempotency_key = %key,
+                            "complete_todo_create_idempotency failed — stale row will be \
+                             cleaned by sweeper; task creation succeeded"
+                        );
+                    }
+                    output
+                }
+            }
+        }
         "update" => manager.update(&req.args).await,
         "list" => manager.list(&req.args).await,
         "get" => manager.get(&req.args).await,
@@ -658,6 +857,16 @@ fn required_fork_copy_source_session(args: &serde_json::Value) -> Result<String,
     Ok(trimmed.to_string())
 }
 
+fn prepare_fork_copy_snapshot_for_target(
+    mut source_snapshot: astra_tools::task_mgmt::TaskManagerSnapshot,
+    target_version: u64,
+) -> astra_tools::task_mgmt::TaskManagerSnapshot {
+    source_snapshot = prepare_task_snapshot_for_fork(source_snapshot);
+    source_snapshot.version = target_version;
+    source_snapshot.restore_version = Some(target_version);
+    source_snapshot
+}
+
 /// Internal fork support: copy the source session task board into an
 /// empty forked child without migrating the source. This is intentionally
 /// distinct from `adopt`, which is a user-facing cross-session move.
@@ -692,22 +901,22 @@ async fn copy_task_board_into_fork(
         Err(error) => return format!("Error: {error}"),
     };
 
-    let target_tasks = match target_manager.load_tasks().await {
-        Ok(tasks) => tasks,
+    let target_snapshot = match target_manager.try_snapshot_state().await {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             return format!("Error: load fork target task board {target_session}: {error}");
         }
     };
-    if !target_tasks.is_empty() {
+    if !target_snapshot.tasks.is_empty() {
         return format!(
             "Fork task board preserved: target already has {} task(s)\n{}",
-            target_tasks.len(),
+            target_snapshot.tasks.len(),
             serde_json::json!({
                 "success": true,
                 "status": "preserved_existing_child",
                 "source_session_id": source_session,
                 "target_session_id": target_session,
-                "count": target_tasks.len(),
+                "count": target_snapshot.tasks.len(),
             })
         );
     }
@@ -719,7 +928,7 @@ async fn copy_task_board_into_fork(
         }
     };
     let copied = snapshot.tasks.len();
-    let snapshot = prepare_task_snapshot_for_fork(snapshot);
+    let snapshot = prepare_fork_copy_snapshot_for_target(snapshot, target_snapshot.version);
     if let Err(error) = target_manager.restore_snapshot(&snapshot).await {
         return format!("Error: copy fork task board into {target_session}: {error}");
     }
@@ -1158,6 +1367,47 @@ mod tests {
     }
 
     #[test]
+    fn prepare_fork_copy_snapshot_for_target_rebases_version_guard_to_child() {
+        let source_snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
+            tasks: vec![astra_tools::task_mgmt::SessionTask {
+                id: "task-1".to_string(),
+                title: "Carry forked work".to_string(),
+                description: None,
+                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+                subtasks: vec![],
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: vec![],
+                blocked_by: vec![],
+                archived_at: None,
+            }],
+            next_task_id: 2,
+            version: 7,
+            restore_version: Some(9),
+        };
+
+        let prepared = prepare_fork_copy_snapshot_for_target(source_snapshot, 3);
+
+        assert_eq!(prepared.version, 3);
+        assert_eq!(prepared.restore_version, Some(3));
+        assert_eq!(
+            prepared.tasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Paused
+        );
+        assert_eq!(
+            prepared.tasks[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("fork_copied_from_status"))
+                .and_then(|value| value.as_str()),
+            Some("in_progress")
+        );
+    }
+
+    #[test]
     fn clean_adopted_subtasks_resets_progress_and_preserves_valid_dependencies() {
         let cleaned = clean_adopted_subtasks(
             r#"[
@@ -1263,6 +1513,7 @@ mod tests {
             Json(ExecuteTodoRequest {
                 action: "   ".to_string(),
                 args: serde_json::json!({}),
+                idempotency_key: None,
             }),
         )
         .await
@@ -1272,6 +1523,73 @@ mod tests {
                 && response.output.contains("action")
                 && response.output.contains("non-empty"),
             "blank action should be rejected before store access: {}",
+            response.output
+        );
+    }
+
+    #[test]
+    fn create_idempotency_key_validation_is_strict() {
+        assert!(validate_create_idempotency_key(Some("todo-create:abc_123.ok")).is_ok());
+        assert!(validate_create_idempotency_key(None).is_err());
+        assert!(validate_create_idempotency_key(Some("   ")).is_err());
+        assert!(validate_create_idempotency_key(Some("bad key")).is_err());
+        assert!(validate_create_idempotency_key(Some(&"x".repeat(129))).is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_todo_handler_rejects_idempotency_key_for_non_create_before_store_access() {
+        let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(TestAuth {
+                user_id: "bad-idempotency-user".to_string(),
+            }))
+            .with_session_service(Arc::new(TestSessionService));
+
+        let Json(response) = execute_todo_handler(
+            State(state),
+            HeaderMap::new(),
+            Path("bad-idempotency-session".to_string()),
+            Json(ExecuteTodoRequest {
+                action: "list".to_string(),
+                args: serde_json::json!({}),
+                idempotency_key: Some("todo-create:wrong-action".to_string()),
+            }),
+        )
+        .await
+        .expect("bad idempotency action returns tool error output");
+        assert!(
+            response.output.starts_with("Error:")
+                && response.output.contains("only valid")
+                && response.output.contains("create"),
+            "non-create idempotency key should be rejected before store access: {}",
+            response.output
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_todo_handler_requires_create_idempotency_key_before_store_access() {
+        let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(TestAuth {
+                user_id: "missing-idempotency-user".to_string(),
+            }))
+            .with_session_service(Arc::new(TestSessionService));
+
+        let Json(response) = execute_todo_handler(
+            State(state),
+            HeaderMap::new(),
+            Path("missing-idempotency-session".to_string()),
+            Json(ExecuteTodoRequest {
+                action: "create".to_string(),
+                args: serde_json::json!({"title": "must not touch store"}),
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("missing create idempotency key returns tool error output");
+        assert!(
+            response.output.starts_with("Error:")
+                && response.output.contains("idempotency_key")
+                && response.output.contains("required"),
+            "missing create idempotency key should be rejected before store access: {}",
             response.output
         );
     }
@@ -1419,6 +1737,10 @@ mod tests {
     }
 
     async fn cleanup_session_rows(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+        let _ = sqlx::query("DELETE FROM session_todo_idempotency WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
         let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
             .bind(session_id)
             .execute(pool)
@@ -1460,6 +1782,10 @@ mod tests {
             target_create.contains("\"success\":true"),
             "{target_create}"
         );
+        let target_start = target
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(target_start.contains("\"success\":true"), "{target_start}");
         let target_pause = target
             .update(&serde_json::json!({"task_id": "task-1", "new_status": "paused"}))
             .await;
@@ -1642,6 +1968,10 @@ mod tests {
             .await;
         assert!(created.contains("\"success\":true"), "{created}");
         let updated = paused
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(updated.contains("\"success\":true"), "{updated}");
+        let updated = paused
             .update(&serde_json::json!({"task_id": "task-1", "new_status": "paused"}))
             .await;
         assert!(updated.contains("\"success\":true"), "{updated}");
@@ -1649,6 +1979,10 @@ mod tests {
             .create(&serde_json::json!({"title": "completed cross-session work"}))
             .await;
         assert!(created.contains("\"success\":true"), "{created}");
+        let updated = completed
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(updated.contains("\"success\":true"), "{updated}");
         let updated = completed
             .update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
@@ -2002,6 +2336,7 @@ mod tests {
             Json(ExecuteTodoRequest {
                 action: "create".to_string(),
                 args: serde_json::json!({"title": "canonical cloud task"}),
+                idempotency_key: Some(format!("test-create:{}", uuid::Uuid::new_v4())),
             }),
         )
         .await
@@ -2022,6 +2357,7 @@ mod tests {
                     "task_id": "task-1",
                     "status": "completed"
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2075,6 +2411,7 @@ mod tests {
             Json(ExecuteTodoRequest {
                 action: "create".to_string(),
                 args: serde_json::json!({"title": "terminal cloud task"}),
+                idempotency_key: Some(format!("test-create:{}", uuid::Uuid::new_v4())),
             }),
         )
         .await
@@ -2083,6 +2420,48 @@ mod tests {
             create_response.output.contains("\"success\":true"),
             "{}",
             create_response.output
+        );
+
+        let Json(start_response) = execute_todo_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+            Json(ExecuteTodoRequest {
+                action: "update".to_string(),
+                args: serde_json::json!({
+                    "task_id": "task-1",
+                    "new_status": "in_progress",
+                }),
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("start todo");
+        assert!(
+            start_response.output.contains("\"success\":true"),
+            "{}",
+            start_response.output
+        );
+
+        let Json(start_response) = execute_todo_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+            Json(ExecuteTodoRequest {
+                action: "update".to_string(),
+                args: serde_json::json!({
+                    "task_id": "task-1",
+                    "new_status": "in_progress",
+                }),
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("start parent");
+        assert!(
+            start_response.output.contains("\"success\":true"),
+            "{}",
+            start_response.output
         );
 
         let Json(complete_response) = execute_todo_handler(
@@ -2095,6 +2474,7 @@ mod tests {
                     "task_id": "task-1",
                     "new_status": "completed",
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2115,6 +2495,7 @@ mod tests {
                     "task_id": "task-1",
                     "new_status": "in_progress",
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2173,6 +2554,7 @@ mod tests {
                         {"id": "s2", "title": "Second step"}
                     ]
                 }),
+                idempotency_key: Some(format!("test-create:{}", uuid::Uuid::new_v4())),
             }),
         )
         .await
@@ -2181,6 +2563,27 @@ mod tests {
             create_response.output.contains("\"success\":true"),
             "{}",
             create_response.output
+        );
+
+        let Json(start_response) = execute_todo_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+            Json(ExecuteTodoRequest {
+                action: "update".to_string(),
+                args: serde_json::json!({
+                    "task_id": "task-1",
+                    "new_status": "in_progress",
+                }),
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("start parent");
+        assert!(
+            start_response.output.contains("\"success\":true"),
+            "{}",
+            start_response.output
         );
 
         let Json(complete_response) = execute_todo_handler(
@@ -2193,6 +2596,7 @@ mod tests {
                     "task_id": "task-1",
                     "new_status": "completed",
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2214,6 +2618,7 @@ mod tests {
                     "subtask_id": "s1",
                     "new_status": "pending",
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2292,6 +2697,7 @@ mod tests {
                         {"id": "s2", "title": "Second step"}
                     ]
                 }),
+                idempotency_key: Some(format!("test-create:{}", uuid::Uuid::new_v4())),
             }),
         )
         .await
@@ -2314,6 +2720,7 @@ mod tests {
                         "subtask_id": subtask_id,
                         "new_status": "completed",
                     }),
+                    idempotency_key: None,
                 }),
             )
             .await
@@ -2355,6 +2762,7 @@ mod tests {
                     "subtask_id": "s1",
                     "new_status": "pending",
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2417,6 +2825,7 @@ mod tests {
             Json(ExecuteTodoRequest {
                 action: "create".to_string(),
                 args: serde_json::json!({"title": "canonical error message task"}),
+                idempotency_key: Some(format!("test-create:{}", uuid::Uuid::new_v4())),
             }),
         )
         .await
@@ -2438,6 +2847,7 @@ mod tests {
                     "new_status": "completed",
                     "error_message": "should not be stored"
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2470,6 +2880,27 @@ mod tests {
             "bad error_message update must not write description/metadata: {row:?}"
         );
 
+        let Json(start_response) = execute_todo_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+            Json(ExecuteTodoRequest {
+                action: "update".to_string(),
+                args: serde_json::json!({
+                    "task_id": "task-1",
+                    "new_status": "in_progress",
+                }),
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("start task before failure");
+        assert!(
+            start_response.output.contains("\"success\":true"),
+            "{}",
+            start_response.output
+        );
+
         let Json(failed_response) = execute_todo_handler(
             State(state),
             HeaderMap::new(),
@@ -2482,6 +2913,7 @@ mod tests {
                     "description": "Cloud verification failed",
                     "error_message": "missing Foo"
                 }),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2537,6 +2969,10 @@ mod tests {
             .create(&serde_json::json!({"title": "Already shipped"}))
             .await;
         assert!(created.contains("\"success\":true"), "{created}");
+        let started = source
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(started.contains("\"success\":true"), "{started}");
         let completed = source
             .update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
             .await;

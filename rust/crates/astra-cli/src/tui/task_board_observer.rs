@@ -872,6 +872,8 @@ mod tests {
         let m = mgr(store, "sess-ttl");
 
         m.create(&json!({"title": "shipping work"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
@@ -1060,6 +1062,8 @@ mod tests {
 
         let a = mgr(store.clone(), "sess-a");
         a.create(&json!({"title": "done in old session"})).await;
+        a.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         a.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
@@ -1082,6 +1086,8 @@ mod tests {
         obs.rebind_session("sess-b");
         let b = mgr(store, "sess-b");
         b.create(&json!({"title": "done in new session"})).await;
+        b.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         b.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
 
@@ -1116,6 +1122,8 @@ mod tests {
         let m = mgr(store, "sess-hide");
 
         m.create(&json!({"title": "done-me"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
 
@@ -1154,6 +1162,8 @@ mod tests {
         let m = mgr(store, "sess-review");
 
         m.create(&json!({"title": "done-me"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
@@ -1194,6 +1204,8 @@ mod tests {
         let m = mgr(store, "sess-pinned-review");
 
         m.create(&json!({"title": "done-me"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
@@ -1247,6 +1259,8 @@ mod tests {
         let m = mgr(store, "sess-grace-review");
 
         m.create(&json!({"title": "done-me"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(

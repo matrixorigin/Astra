@@ -393,6 +393,14 @@ mod tests {
         mirror_plan_to_task_board(&state, "repeatable plan", &plan)
             .await
             .unwrap();
+        let started = state
+            .task_manager
+            .update(&serde_json::json!({
+                "task_id": "task-1",
+                "new_status": "in_progress",
+            }))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
         let completed = state
             .task_manager
             .update(&serde_json::json!({

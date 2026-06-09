@@ -1217,43 +1217,18 @@ impl ServerToolExecutor {
                 "Error: publish_artifact requires a non-empty path".to_string(),
             );
         };
-        let path = match self.resolve_publish_artifact_path(raw_path) {
-            Ok(path) => path,
-            Err(error) => return astra_tools::ToolResult::error(error),
+        let (path, bytes) = match self.resolve_publish_artifact_path(raw_path) {
+            Ok(v) => v,
+            Err(e) => return astra_tools::ToolResult::error(e),
         };
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: failed to inspect artifact file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
-        if !metadata.is_file() {
-            return astra_tools::ToolResult::error(format!(
-                "Error: publish_artifact path is not a regular file: {}",
-                path.display()
-            ));
-        }
-        if metadata.len() > MAX_PUBLISH_ARTIFACT_BYTES {
+        if bytes.len() as u64 > MAX_PUBLISH_ARTIFACT_BYTES {
             return astra_tools::ToolResult::error(format!(
                 "Error: publish_artifact currently supports files up to {} MiB; {} is {} bytes",
                 MAX_PUBLISH_ARTIFACT_BYTES / 1024 / 1024,
                 path.display(),
-                metadata.len()
+                bytes.len()
             ));
         }
-
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: failed to read artifact file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
 
         let content_type = match string_arg(args, "content_type") {
             Some(value) => match validate_content_type(value) {
@@ -2524,17 +2499,85 @@ impl ServerToolExecutor {
         &self.workspace_root
     }
 
-    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
+    fn with_file_journal_mut<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut FileEditJournal) -> T,
+    ) -> T {
         match self.file_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
+            Ok(mut journal) => f(&mut journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "file_journal mutex poisoned; recovering inner journal"
+                );
+                let mut journal = poisoned.into_inner();
+                f(&mut journal)
+            }
         }
     }
 
+    fn with_file_journal<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&FileEditJournal) -> T,
+    ) -> T {
+        match self.file_journal.lock() {
+            Ok(journal) => f(&journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "file_journal mutex poisoned; recovering inner journal"
+                );
+                let journal = poisoned.into_inner();
+                f(&journal)
+            }
+        }
+    }
+
+    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
+        self.with_file_journal("file_journal_checkpoint", |journal| journal.checkpoint())
+    }
+
     pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
+        self.with_database_snapshot_journal("database_snapshot_journal_checkpoint", |journal| {
+            journal.checkpoint()
+        })
+    }
+
+    fn with_database_snapshot_journal_mut<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut DatabaseSnapshotRollbackJournal) -> T,
+    ) -> T {
         match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
+            Ok(mut journal) => f(&mut journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "database_snapshot_journal mutex poisoned; recovering inner journal"
+                );
+                let mut journal = poisoned.into_inner();
+                f(&mut journal)
+            }
+        }
+    }
+
+    fn with_database_snapshot_journal<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&DatabaseSnapshotRollbackJournal) -> T,
+    ) -> T {
+        match self.database_snapshot_journal.lock() {
+            Ok(journal) => f(&journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "database_snapshot_journal mutex poisoned; recovering inner journal"
+                );
+                let journal = poisoned.into_inner();
+                f(&journal)
+            }
         }
     }
 
@@ -2544,29 +2587,22 @@ impl ServerToolExecutor {
         database: Option<String>,
     ) {
         let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
-        match self.database_snapshot_journal.lock() {
-            Ok(mut journal) => journal.record(snapshot_id, database, turn_index),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .record(snapshot_id, database, turn_index),
-        }
+        self.with_database_snapshot_journal_mut("record_database_snapshot_rollback", |journal| {
+            journal.record(snapshot_id, database, turn_index)
+        });
     }
 
     fn database_snapshot_entries(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.list(),
-            Err(poisoned) => poisoned.into_inner().list(),
-        }
+        self.with_database_snapshot_journal("database_snapshot_entries", |journal| journal.list())
     }
 
     fn database_snapshot_entry_for_snapshot(
         &self,
         snapshot_id: &str,
     ) -> Option<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.entry_for_snapshot(snapshot_id),
-            Err(poisoned) => poisoned.into_inner().entry_for_snapshot(snapshot_id),
-        }
+        self.with_database_snapshot_journal("database_snapshot_entry_for_snapshot", |journal| {
+            journal.entry_for_snapshot(snapshot_id)
+        })
     }
 
     fn database_snapshot_restore_plan_for_turn_since(
@@ -2574,23 +2610,16 @@ impl ServerToolExecutor {
         turn_index: u32,
         checkpoint: u64,
     ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
+        self.with_database_snapshot_journal(
+            "database_snapshot_restore_plan_for_turn_since",
+            |journal| journal.restore_plan_for_turn_since(turn_index, checkpoint),
+        )
     }
 
     fn remove_database_snapshot_rollback(&self, snapshot_id: &str) {
-        match self.database_snapshot_journal.lock() {
-            Ok(mut journal) => {
-                journal.remove_snapshot(snapshot_id);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove_snapshot(snapshot_id);
-            }
-        }
+        self.with_database_snapshot_journal_mut("remove_database_snapshot_rollback", |journal| {
+            journal.remove_snapshot(snapshot_id)
+        });
     }
 
     fn rollback_database_snapshot_entry_json(entry: &DatabaseSnapshotRollbackEntry) -> Value {
@@ -2811,10 +2840,10 @@ impl ServerToolExecutor {
                 let plan = if checkpoint > 0 {
                     self.database_snapshot_restore_plan_for_turn_since(turn_index, checkpoint)
                 } else {
-                    match self.database_snapshot_journal.lock() {
-                        Ok(journal) => journal.restore_plan_for_turn(turn_index),
-                        Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
-                    }
+                    self.with_database_snapshot_journal(
+                        "database_snapshot_restore_plan_for_turn",
+                        |journal| journal.restore_plan_for_turn(turn_index),
+                    )
                 };
                 let mut restored = Vec::new();
                 let mut failed = Vec::new();
@@ -2874,18 +2903,52 @@ impl ServerToolExecutor {
     }
 
     pub(crate) fn session_state_journal_checkpoint(&self) -> u64 {
+        self.with_session_state_journal("session_state_journal_checkpoint", |journal| {
+            journal.checkpoint()
+        })
+    }
+
+    fn with_session_state_journal_mut<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut SessionStateRollbackJournal) -> T,
+    ) -> T {
         match self.session_state_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
+            Ok(mut journal) => f(&mut journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "session_state_journal mutex poisoned; recovering inner journal"
+                );
+                let mut journal = poisoned.into_inner();
+                f(&mut journal)
+            }
+        }
+    }
+
+    fn with_session_state_journal<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&SessionStateRollbackJournal) -> T,
+    ) -> T {
+        match self.session_state_journal.lock() {
+            Ok(journal) => f(&journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "session_state_journal mutex poisoned; recovering inner journal"
+                );
+                let journal = poisoned.into_inner();
+                f(&journal)
+            }
         }
     }
 
     fn record_session_state_rollback(&self, label: String, action: SessionStateRollbackAction) {
         let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
-        match self.session_state_journal.lock() {
-            Ok(mut journal) => journal.record(turn_index, label, action),
-            Err(poisoned) => poisoned.into_inner().record(turn_index, label, action),
-        }
+        self.with_session_state_journal_mut("record_session_state_rollback", |journal| {
+            journal.record(turn_index, label, action)
+        });
     }
 
     fn record_tool_preferences_rollback(
@@ -2939,20 +3002,16 @@ impl ServerToolExecutor {
     }
 
     fn session_state_entries(&self) -> Vec<SessionStateRollbackEntry> {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.list(),
-            Err(poisoned) => poisoned.into_inner().list(),
-        }
+        self.with_session_state_journal("session_state_entries", |journal| journal.list())
     }
 
     fn session_state_restore_plan_for_turn(
         &self,
         turn_index: u32,
     ) -> Vec<SessionStateRollbackEntry> {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn(turn_index),
-            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
-        }
+        self.with_session_state_journal("session_state_restore_plan_for_turn", |journal| {
+            journal.restore_plan_for_turn(turn_index)
+        })
     }
 
     fn session_state_restore_plan_for_turn_since(
@@ -2960,23 +3019,15 @@ impl ServerToolExecutor {
         turn_index: u32,
         checkpoint: u64,
     ) -> Vec<SessionStateRollbackEntry> {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
+        self.with_session_state_journal("session_state_restore_plan_for_turn_since", |journal| {
+            journal.restore_plan_for_turn_since(turn_index, checkpoint)
+        })
     }
 
     fn remove_session_state_rollback(&self, sequence: u64) {
-        match self.session_state_journal.lock() {
-            Ok(mut journal) => {
-                journal.remove_sequence(sequence);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove_sequence(sequence);
-            }
-        }
+        self.with_session_state_journal_mut("remove_session_state_rollback", |journal| {
+            journal.remove_sequence(sequence)
+        });
     }
 
     fn restore_observability_snapshot(
@@ -4409,13 +4460,8 @@ impl ServerToolExecutor {
         astra_tools::fs_ops::resolve_path(&self.workspace_root, relative)
     }
 
-    fn resolve_publish_artifact_path(&self, raw_path: &str) -> Result<PathBuf, String> {
-        let requested = Path::new(raw_path);
-        let candidate = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            self.workspace_root.join(requested)
-        };
+    fn resolve_publish_artifact_path(&self, raw_path: &str) -> Result<(PathBuf, Vec<u8>), String> {
+        let candidate = self.workspace_root.join(raw_path);
         let canonical = candidate.canonicalize().map_err(|error| {
             format!(
                 "Error: publish_artifact path does not resolve to an existing file: {} ({error})",
@@ -4424,29 +4470,42 @@ impl ServerToolExecutor {
         })?;
 
         // `publish_artifact` is intentionally narrower than arbitrary file
-        // reads. It can only publish files produced inside the session
-        // workspace or the process temp directory, which are the same roots the
-        // server-side executor allows generated artifacts to land in.
-        let mut allowed_roots = Vec::new();
-        for root in [&self.workspace_root, Path::new("/tmp")] {
+        // access: only files under the session workspace or /tmp are allowed.
+        let mut allowed = false;
+        for root in [&self.workspace_root] {
             if let Ok(canonical_root) = root.canonicalize() {
-                allowed_roots.push(canonical_root);
-            } else {
-                allowed_roots.push(root.to_path_buf());
+                if canonical.starts_with(&canonical_root) {
+                    allowed = true;
+                    break;
+                }
             }
         }
-        if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
-            allowed_roots.push(temp_root);
+        if !allowed {
+            if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
+                if canonical.starts_with(&temp_root) {
+                    allowed = true;
+                }
+            }
         }
-
-        if allowed_roots.iter().any(|root| canonical.starts_with(root)) {
-            Ok(canonical)
-        } else {
-            Err(format!(
+        if !allowed {
+            return Err(format!(
                 "Error: publish_artifact can only publish files under the session workspace or /tmp: {}",
                 canonical.display()
-            ))
+            ));
         }
+
+        // **TOCTOU defense**: open and read the canonical file immediately
+        // while we still hold the resolved path.  Without this, a symlink
+        // swap between canonicalize and tokio::fs::read could redirect the
+        // read to an arbitrary file.
+        let bytes = std::fs::read(&canonical).map_err(|error| {
+            format!(
+                "Error: publish_artifact failed to read resolved file: {} ({error})",
+                canonical.display()
+            )
+        })?;
+
+        Ok((canonical, bytes))
     }
 
     fn server_write_file(&self, args: &Value) -> String {
@@ -4456,16 +4515,16 @@ impl ServerToolExecutor {
         };
 
         // Record journal entry before writing
-        if let Ok(mut journal) = self.file_journal.lock() {
-            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        self.with_file_journal_mut("server_write_file:record_before", |journal| {
             journal.record_before(prepared.path(), "server-write", turn_idx);
-        }
+        });
 
         let result = prepared.apply();
-        if !result.is_error
-            && let Ok(mut journal) = self.file_journal.lock()
-        {
-            journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
+        if !result.is_error {
+            self.with_file_journal_mut("server_write_file:record_after", |journal| {
+                journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
+            });
         }
         result.output
     }
@@ -4485,16 +4544,16 @@ impl ServerToolExecutor {
         let new_content_bytes = prepared.new_content_bytes().to_vec();
 
         // Record journal entry
-        if let Ok(mut journal) = self.file_journal.lock() {
-            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        self.with_file_journal_mut("server_str_replace:record_before", |journal| {
             journal.record_before_patch(&path, "server-str-replace", turn_idx);
-        }
+        });
 
         let result = prepared.apply();
-        if !result.is_error
-            && let Ok(mut journal) = self.file_journal.lock()
-        {
-            journal.record_after(&path, "server-str-replace", &new_content_bytes);
+        if !result.is_error {
+            self.with_file_journal_mut("server_str_replace:record_after", |journal| {
+                journal.record_after(&path, "server-str-replace", &new_content_bytes);
+            });
         }
         result.output
     }
@@ -4509,10 +4568,11 @@ impl ServerToolExecutor {
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            && let Ok(mut journal) = self.file_journal.lock()
         {
             let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
+            self.with_file_journal_mut("server_multi_edit:record_before", |journal| {
+                journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
+            });
         }
 
         let result = prepared.apply();
@@ -4521,13 +4581,14 @@ impl ServerToolExecutor {
                 .get("dry_run")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-            && let Ok(mut journal) = self.file_journal.lock()
         {
-            journal.record_after(
-                prepared.path(),
-                "server-multi-edit",
-                prepared.new_content_bytes(),
-            );
+            self.with_file_journal_mut("server_multi_edit:record_after", |journal| {
+                journal.record_after(
+                    prepared.path(),
+                    "server-multi-edit",
+                    prepared.new_content_bytes(),
+                );
+            });
         }
         result.output
     }
@@ -4541,15 +4602,15 @@ impl ServerToolExecutor {
         let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
 
         let result = prepared.apply();
-        if !result.is_error
-            && let Ok(mut journal) = self.file_journal.lock()
-        {
-            journal.record_delete(
-                &path,
-                "server-delete",
-                turn_idx,
-                prepared.into_before_content(),
-            );
+        if !result.is_error {
+            self.with_file_journal_mut("server_delete_file:record_delete", |journal| {
+                journal.record_delete(
+                    &path,
+                    "server-delete",
+                    turn_idx,
+                    prepared.into_before_content(),
+                );
+            });
         }
         result.output
     }
@@ -4618,10 +4679,8 @@ impl ServerToolExecutor {
 
         match scope {
             "list" => {
-                let summary = match self.file_journal.lock() {
-                    Ok(journal) => journal.summary(),
-                    Err(poisoned) => poisoned.into_inner().summary(),
-                };
+                let summary =
+                    self.with_file_journal("rollback_file_edits:list", |journal| journal.summary());
                 let entries: Vec<Value> = summary
                     .into_iter()
                     .map(|(path, turn_index, edit_type)| {
@@ -4656,12 +4715,9 @@ impl ServerToolExecutor {
                     Err(error) => return error,
                 };
                 let rollback_candidates = self.rollback_path_candidates(raw_path, &path);
-                let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => undo_file_with_candidates(&journal, &rollback_candidates),
-                    Err(poisoned) => {
-                        undo_file_with_candidates(&poisoned.into_inner(), &rollback_candidates)
-                    }
-                };
+                let undo_result = self.with_file_journal("rollback_file_edits:file", |journal| {
+                    undo_file_with_candidates(journal, &rollback_candidates)
+                });
                 match undo_result {
                     Ok(Some((rolled_back_path, edit_type))) => json!({
                         "success": true,
@@ -7515,47 +7571,22 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let tasks = exec.task_manager.snapshot().await.unwrap();
-        let approved_plan_tasks: Vec<_> = tasks
-            .iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .collect();
-        assert_eq!(approved_plan_tasks.len(), 3, "{approved_plan_tasks:?}");
-        let first = approved_plan_tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-1")
-            })
-            .expect("step-1 task");
-        assert_eq!(first.title, "design state model");
-        assert_eq!(
-            first.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert!(first.subtasks.is_empty(), "{first:?}");
         assert!(
-            approved_plan_tasks.iter().all(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("plan-visible-task")
-            }),
-            "approved plan steps should all carry the plan id: {approved_plan_tasks:?}"
+            tasks.is_empty(),
+            "model-submitted exit_plan_mode must not mirror approved-plan tasks locally: {tasks:?}"
+        );
+        let active = repo
+            .active_plan_for_session("visible-session")
+            .await
+            .expect("active plan lookup after submission");
+        assert!(
+            active.as_deref() == Some("plan-visible-task"),
+            "trusted approval is still pending, so the session must remain in plan mode: {active:?}"
         );
     }
 
@@ -7607,34 +7638,28 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("Error:") && result.contains("title") && result.contains("exceeds"),
-            "exit_plan_mode should surface the original task-board mirror failure: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode should submit for trusted approval instead of mirroring immediately: {result}"
         );
 
         let tasks = exec.task_manager.snapshot().await.unwrap();
         assert_eq!(
             tasks.len(),
-            2,
-            "failed approved-plan mirror preserves partial progress (step-1) \
-             alongside existing tasks; idempotent retry completes the mirror: {tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must leave the task board untouched while approval is pending: {tasks:?}"
         );
         assert!(
             tasks.iter().any(|t| t.title == "Existing server task"),
-            "existing server task must survive mirror failure: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|t| t.title == "create first server step"),
-            "step-1 task (valid) must be preserved for retry: {tasks:?}"
+            "existing server task must remain untouched: {tasks:?}"
         );
         let active = repo
             .active_plan_for_session("rollback-session")
             .await
-            .expect("active plan lookup after failed approval");
+            .expect("active plan lookup after submission");
         assert_eq!(
             active.as_deref(),
-            None,
-            "session unlocks (exits plan mode) before mirror; \
-             mirror failure does not re-lock the session: {active:?}"
+            Some("plan-rollback-task-board"),
+            "trusted approval is still pending, so the session must stay in plan mode: {active:?}"
         );
     }
 
@@ -7723,26 +7748,27 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.starts_with("Error:")
-                && result.contains("load task board")
-                && result.contains("simulated task board reload failure"),
-            "exit_plan_mode must fail closed when task-board reload fails: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode must submit for trusted approval instead of touching the task board: {result}"
         );
         assert_eq!(
             mutate_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "server approved-plan mirror creates step-1 task before the reload failure; \
-             it is preserved as valid partial progress for idempotent retry"
+            0,
+            "model-submitted exit_plan_mode must not mutate the task board before trusted approval"
+        );
+        assert_eq!(
+            load_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "model-submitted exit_plan_mode must not even read the task board before trusted approval"
         );
         let active = repo
             .active_plan_for_session("reload-fails-session")
             .await
-            .expect("active plan lookup after failed reload");
+            .expect("active plan lookup after submission");
         assert_eq!(
             active.as_deref(),
-            None,
-            "session unlocks (exits plan mode) before mirror; \
-             mirror reload failure does not re-lock the session: {active:?}"
+            Some("plan-reload-fails"),
+            "trusted approval is still pending, so the session must stay in plan mode: {active:?}"
         );
     }
 
@@ -7791,8 +7817,8 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let tasks = exec.task_manager.snapshot().await.unwrap();
@@ -7807,20 +7833,13 @@ esac
             "pre-existing async/subagent task must remain visible"
         );
         assert!(
-            tasks.iter().any(|task| {
+            tasks.iter().all(|task| {
                 task.metadata
                     .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("plan-title-collision")
+                    .and_then(|metadata| metadata.get("plan_id"))
+                    .is_none()
             }),
-            "approved plan must still create its own step task despite title collision: {tasks:?}"
+            "model-submitted exit_plan_mode must not create or claim approved-plan tasks before trusted approval: {tasks:?}"
         );
     }
 
@@ -7872,8 +7891,8 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
@@ -7892,25 +7911,14 @@ esac
             .collect();
         assert_eq!(
             approved_plan_tasks.len(),
-            2,
-            "server path should leave legacy tree-shaped history alone and create a clean step task: {approved_plan_tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must not create a new approved-plan step task before trusted approval: {approved_plan_tasks:?}"
         );
         assert!(
-            approved_plan_tasks.iter().any(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-1")
-                    && task.subtasks.is_empty()
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_fingerprint"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(fingerprint.as_str())
-            }),
-            "clean step task should be present beside legacy history: {approved_plan_tasks:?}"
+            approved_plan_tasks
+                .iter()
+                .all(|task| task.subtasks.len() == 1),
+            "legacy tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
         );
     }
 
@@ -7940,21 +7948,38 @@ esac
         exec.session_id = "repeat-server-session".to_string();
         exec.user_id = "alice".to_string();
 
+        let existing = exec
+            .task_manager
+            .create(&json!({
+                "title": "repeatable server step",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-repeat-server",
+                    "plan_goal": "repeat server plan",
+                    "plan_subtask_id": "step-1",
+                    "plan_fingerprint": ServerToolExecutor::plan_task_board_fingerprint(&state.plan)
+                }
+            }))
+            .await;
+        assert!(existing.contains("created"), "{existing}");
+        let started = exec
+            .task_manager
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
+        let completed = exec
+            .task_manager
+            .update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+
         let result = exec
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "first approval must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "first submission must stay pending for trusted approval; got: {result}"
         );
-        let completed = exec
-            .task_manager
-            .update(&json!({
-                "task_id": "task-1",
-                "new_status": "completed",
-            }))
-            .await;
-        assert!(!completed.starts_with("Error:"), "{completed}");
 
         repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
             .await
@@ -7963,8 +7988,8 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "repeat approval must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "repeat submission must stay pending for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
@@ -7983,20 +8008,14 @@ esac
             .collect();
         assert_eq!(
             approved_plan_tasks.len(),
-            2,
-            "completed approved-plan history must not be reopened: {approved_plan_tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must not reopen completed approved-plan history before trusted approval: {approved_plan_tasks:?}"
         );
         assert!(
             approved_plan_tasks
                 .iter()
                 .any(|task| task.status.is_completed()),
             "completed history should remain completed: {approved_plan_tasks:?}"
-        );
-        assert!(
-            approved_plan_tasks
-                .iter()
-                .any(|task| task.status.is_in_progress()),
-            "repeat approval should create a fresh in-progress task: {approved_plan_tasks:?}"
         );
     }
 
@@ -8047,8 +8066,8 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
@@ -8067,8 +8086,8 @@ esac
             .collect();
         assert_eq!(
             approved_plan_tasks.len(),
-            2,
-            "matching fingerprints must not merge different plan goals: {approved_plan_tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must not create new approved-plan step tasks before trusted approval: {approved_plan_tasks:?}"
         );
         let old_task = approved_plan_tasks
             .iter()
@@ -8082,31 +8101,7 @@ esac
                 .is_none(),
             "old different-goal task must not be claimed by the new plan: {old_task:?}"
         );
-        assert!(
-            approved_plan_tasks.iter().any(|task| {
-                task.title == "shared step"
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("plan-new-visible-goal")
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_goal"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("new visible goal")
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_subtask_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("step-1")
-                    && task.subtasks.is_empty()
-            }),
-            "new plan should create and claim its own step task: {approved_plan_tasks:?}"
-        );
+        assert_eq!(old_task.subtasks.len(), 1, "{old_task:?}");
     }
 
     #[tokio::test]
@@ -8132,7 +8127,7 @@ esac
             .unwrap();
 
         state.plan.subtasks[0].title = "new task board sync".into();
-        let fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let _fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
         repo.save("plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
@@ -8165,8 +8160,8 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
@@ -8185,26 +8180,8 @@ esac
             .collect();
         assert_eq!(
             approved_plan_tasks.len(),
-            2,
-            "a changed plan fingerprint must create a fresh step task instead of reusing stale history: {approved_plan_tasks:?}"
-        );
-        assert!(
-            approved_plan_tasks.iter().any(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("plan-same-id-new-steps")
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_fingerprint"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(fresh_fingerprint.as_str())
-                    && task.title == "new task board sync"
-                    && task.subtasks.is_empty()
-            }),
-            "fresh mirrored step task missing after plan edit: {approved_plan_tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must not create fresh approved-plan tasks before trusted approval: {approved_plan_tasks:?}"
         );
         assert!(
             approved_plan_tasks.iter().any(|task| {
@@ -8293,8 +8270,8 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
@@ -8313,25 +8290,8 @@ esac
             .collect();
         assert_eq!(
             approved_plan_tasks.len(),
-            3,
-            "a changed dependency graph must create fresh step tasks beside stale history: {approved_plan_tasks:?}"
-        );
-        let fresh_step_ids: Vec<String> = approved_plan_tasks
-            .iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_fingerprint"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(fresh_fingerprint.as_str())
-                    && task.subtasks.is_empty()
-            })
-            .map(|task| task.id.clone())
-            .collect();
-        assert_eq!(
-            fresh_step_ids.len(),
-            2,
-            "fresh mirrored plan should have one top-level task per step: {approved_plan_tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must not create fresh step tasks before trusted approval: {approved_plan_tasks:?}"
         );
         let verify = approved_plan_tasks
             .iter()
@@ -8340,18 +8300,15 @@ esac
                     .as_ref()
                     .and_then(|metadata| metadata.get("plan_fingerprint"))
                     .and_then(serde_json::Value::as_str)
-                    == Some(fresh_fingerprint.as_str())
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_subtask_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("step-2")
+                    == Some(stale_fingerprint.as_str())
             })
-            .expect("fresh verify step task");
+            .expect("stale legacy task remains");
         assert!(
-            verify.blocked_by.is_empty(),
-            "fresh mirrored step task must reflect changed dependencies: {verify:?}"
+            verify
+                .subtasks
+                .iter()
+                .any(|subtask| subtask.depends_on.iter().any(|dep| dep == "step-1")),
+            "stale dependency-bearing history should remain untouched while approval is pending: {verify:?}"
         );
     }
 

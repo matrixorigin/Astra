@@ -440,6 +440,8 @@ async fn task_action_update_changes_status() {
 async fn task_action_update_rejects_reopening_terminal_task() {
     let (_dir, exe) = setup();
     exe.task_action_create(&json!({"title": "Done task"})).await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 
@@ -638,6 +640,8 @@ async fn subtask_update_rejects_explicitly_completed_parent() {
         ]
     }))
     .await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 
@@ -767,6 +771,8 @@ async fn task_action_stop_cancels_task() {
 async fn task_action_stop_rejects_completed_task() {
     let (_dir, exe) = setup();
     exe.task_action_create(&json!({"title": "Done task"})).await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
     let result = exe.task_action_stop(&json!({"task_id": "task-1"})).await;
@@ -806,6 +812,8 @@ async fn task_action_stop_cancels_subtasks() {
 async fn task_archive_works_without_cloud_connection() {
     let (_dir, exe) = setup();
     exe.task_action_create(&json!({"title": "Done task"})).await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 

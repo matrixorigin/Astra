@@ -117,8 +117,9 @@ impl ToolCell {
         if !description.is_empty() {
             self.description = description;
         }
-        self.output_summary = output_summary;
-        self.output = output;
+        self.output_summary = non_empty_tool_text(output_summary);
+        self.output = non_empty_tool_text(output);
+        self.ensure_failure_details();
         self.frozen_at.stamp_now();
     }
 
@@ -154,14 +155,14 @@ impl ToolCell {
         let started_at = Instant::now()
             .checked_sub(std::time::Duration::from_millis(duration_ms))
             .unwrap_or_else(Instant::now);
-        Some(Self {
+        let mut cell = Self {
             name,
             description,
             status,
             started_at,
             duration_ms: Some(duration_ms),
-            output_summary,
-            output,
+            output_summary: non_empty_tool_text(output_summary),
+            output: non_empty_tool_text(output),
             ts,
             progress_lines: 0,
             progress_bytes: 0,
@@ -169,7 +170,27 @@ impl ToolCell {
             // `FreezeStamp::revived` for the launch-independent
             // phase rationale.
             frozen_at: super::FreezeStamp::revived(),
-        })
+        };
+        cell.ensure_failure_details();
+        Some(cell)
+    }
+
+    fn ensure_failure_details(&mut self) {
+        if self.status != ToolStatus::Failed {
+            return;
+        }
+        if self
+            .output_summary
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+            || self
+                .output
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            return;
+        }
+        self.output_summary = Some(failure_detail_fallback(&self.name, &self.description));
     }
 
     fn bullet(&self) -> Span<'static> {
@@ -200,18 +221,7 @@ impl ToolCell {
     }
 
     fn display_name(&self) -> String {
-        match self.name.as_str() {
-            "bash" => "Bash".into(),
-            "read" | "read_file" => "Read".into(),
-            "write_file" => "Write file".into(),
-            "str_replace" => "Replace text".into(),
-            "grep" | "glob" => "Search".into(),
-            "list_dir" => "List directory".into(),
-            "task" => "Task".into(),
-            "memory" => "Memory".into(),
-            "tool_search" => "Tool search".into(),
-            _ => humanize_tool_name(&self.name),
-        }
+        friendly_tool_display_name(&self.name)
     }
 
     fn preview_text(&self) -> Option<&str> {
@@ -494,7 +504,10 @@ impl HistoryCell for ToolCell {
         if missing_failure_details {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", dim),
-                Span::styled("No details returned", Style::default().fg(Color::Red)),
+                Span::styled(
+                    failure_detail_fallback(&self.name, &self.description),
+                    Style::default().fg(Color::Red),
+                ),
             ]));
         }
 
@@ -599,6 +612,9 @@ impl HistoryCell for ToolCell {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
             }
         }
+        self.output_summary = non_empty_tool_text(self.output_summary.take());
+        self.output = non_empty_tool_text(self.output.take());
+        self.ensure_failure_details();
         self.frozen_at.stamp_now();
     }
 
@@ -775,6 +791,41 @@ pub(super) fn humanize_tool_name(name: &str) -> String {
     }
 }
 
+fn non_empty_tool_text(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    })
+}
+
+fn failure_detail_fallback(name: &str, description: &str) -> String {
+    let label = friendly_tool_display_name(name);
+    let description = description.trim();
+    if description.is_empty() {
+        format!("{label} failed before returning output")
+    } else {
+        format!("{label} failed before returning output: {description}")
+    }
+}
+
+fn friendly_tool_display_name(name: &str) -> String {
+    match name {
+        "bash" => "Bash".into(),
+        "read" | "read_file" => "Read".into(),
+        "write_file" => "Write file".into(),
+        "str_replace" => "Replace text".into(),
+        "grep" | "glob" => "Search".into(),
+        "list_dir" => "List directory".into(),
+        "task" => "Task".into(),
+        "memory" => "Memory".into(),
+        "tool_search" => "Tool search".into(),
+        _ => humanize_tool_name(name),
+    }
+}
+
 /// Quick heuristic: does `s` look like a file path that should be
 /// rendered with dimmed directory / bright filename styling?
 fn looks_like_file_path(s: &str) -> bool {
@@ -861,6 +912,10 @@ mod tests {
         t.finalize();
         assert_eq!(t.status, ToolStatus::Failed);
         assert!(t.duration_ms.is_some(), "duration snapshotted on finalize");
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Bash failed before returning output: slow op")
+        );
         assert!(!t.is_live());
     }
 
@@ -943,7 +998,40 @@ mod tests {
     fn failed_tool_without_any_details_says_so_explicitly() {
         let t = err_tool("read", "Reading: missing.txt", 10);
         let out = render(&t, 80, 4);
-        assert!(out.contains("No details returned"), "{out}");
+        assert!(
+            out.contains("Read failed before returning output: Reading: missing.txt"),
+            "{out}"
+        );
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn complete_failed_tool_synthesizes_missing_details() {
+        let mut t = ToolCell::new_running("bash", "$ make check 2>&1");
+        t.complete("failed", 1200, String::new(), None, None);
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Bash failed before returning output: $ make check 2>&1")
+        );
+        let out = render(&t, 100, 4);
+        assert!(out.contains("Bash failed before returning output"), "{out}");
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn complete_failed_tool_treats_blank_output_as_missing_details() {
+        let mut t = ToolCell::new_running("read_file", "Reading: src/main.rs");
+        t.complete(
+            "error",
+            19,
+            String::new(),
+            Some(" \n ".into()),
+            Some("\t".into()),
+        );
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Read failed before returning output: Reading: src/main.rs")
+        );
     }
 
     #[test]

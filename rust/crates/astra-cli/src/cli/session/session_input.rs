@@ -615,6 +615,11 @@ mod tests {
             .create(&serde_json::json!({"title": "Already finished"}))
             .await;
         assert!(!done.starts_with("Error:"), "{done}");
+        let done_start = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": "task-3", "new_status": "in_progress"}))
+            .await;
+        assert!(!done_start.starts_with("Error:"), "{done_start}");
         let done_update = state
             .task_manager
             .update(&serde_json::json!({"task_id": "task-3", "new_status": "completed"}))
@@ -652,6 +657,11 @@ mod tests {
             .create(&serde_json::json!({"title": "Already finished"}))
             .await;
         assert!(!done.starts_with("Error:"), "{done}");
+        let done_start = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(!done_start.starts_with("Error:"), "{done_start}");
         let done_update = state
             .task_manager
             .update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))

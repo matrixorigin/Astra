@@ -864,6 +864,8 @@ mod task_board_draw_tests {
         );
         let mgr = TaskManager::new("draw-hidden", store as Arc<dyn TaskStore>);
         mgr.create(&serde_json::json!({"title": "done"})).await;
+        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
         mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(

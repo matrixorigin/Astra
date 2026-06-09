@@ -3282,6 +3282,24 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .await?;
 
+    run_migration(
+        pool,
+        18,
+        "create session_todo_idempotency ledger",
+        "CREATE TABLE session_todo_idempotency (
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            action VARCHAR(32) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            args_json LONGTEXT NOT NULL,
+            output LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL,
+            updated_at DATETIME(6) NOT NULL,
+            PRIMARY KEY (session_id, user_id, action, idempotency_key)
+        )",
+    )
+    .await?;
+
     Ok(())
 }
 

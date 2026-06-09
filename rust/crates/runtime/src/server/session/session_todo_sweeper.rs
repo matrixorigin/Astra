@@ -1,14 +1,14 @@
 //! Background lifecycle sweepers for `session_todos`.
 //!
-//! Two cron tasks ship together because they share infrastructure:
+//! Two cron tasks ship together because they shared infrastructure:
 //!
 //! 1. **Stale in_progress** (U-16): every 5 minutes scan rows where
 //!    `status='in_progress'` AND `updated_at < now - STALE_THRESHOLD`.
 //!    Transition to `paused` with `metadata.auto_paused_reason` so
-//!    the user / model sees why the slot opened up. Without this,
-//!    a model that crashed or forgot to mark the task done leaves
-//!    a permanent `in_progress` row violating the "exactly one
-//!    in_progress at a time" invariant the schema prose enforces.
+//!    the user / model sees why the slot opened up. Without this, a
+//!    model that crashed or forgot to mark the task done leaves a
+//!    permanent `in_progress` row violating the "exactly one in_progress
+//!    at a time" invariant the schema prose enforces.
 //!
 //! 2. **Terminal auto-archive** (U-18): every week move a bounded batch
 //!    of stale `completed` / `failed` / `cancelled` rows to `archived` after
@@ -21,6 +21,13 @@
 //!    Keeps the table size bounded for long-lived users. Conservative
 //!    default of 90 days — adjust via
 //!    `ASTRA_SESSION_TODO_ARCHIVE_RETENTION_DAYS` when needed.
+//!
+//! 4. **Stale idempotency** (NEW): every 5 minutes UPDATE rows where
+//!    `output IS NULL` AND `updated_at < now - IDEMPOTENCY_STALE_MINUTES`
+//!    to set `output` to an error message. Cleans up orphaned idempotency
+//!    rows where task creation succeeded but the idempotency completion
+//!    update failed. UPDATE (not DELETE) prevents duplicate task creation
+//!    on retry — the client receives an explicit error on replay.
 //!
 //! Both sweepers log a one-line summary per run (rows affected) so
 //! operators can spot anomalies (millions of in_progress → maybe
@@ -43,26 +50,60 @@ const STALE_BATCH_LIMIT: i64 = 500;
 /// At 5-min ticks, 3 failures = 15 min of silent DB degradation.
 const STALE_SWEEP_ALERT_THRESHOLD: u32 = 3;
 
+const IDEMPOTENCY_STALE_MINUTES: u64 = 5;
+const IDEMPOTENCY_BATCH_LIMIT: i64 = 100;
+
 const ARCHIVE_SWEEP_INTERVAL_SECS: u64 = 7 * 24 * 3600; // 1 week
 const COMPLETED_AUTO_ARCHIVE_DAYS_DEFAULT: i64 = 7;
 const ARCHIVE_RETENTION_DAYS_DEFAULT: i64 = 90;
 const ARCHIVE_BATCH_LIMIT: i64 = 500;
 const ARCHIVE_GC_BATCH_LIMIT: i64 = 500;
 
+fn positive_i64_env_or_default(key: &'static str, default: i64) -> i64 {
+    let raw = match std::env::var(key) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return default,
+        Err(error) => {
+            tracing::warn!(key, %error, default, "failed to read session todo sweeper env");
+            return default;
+        }
+    };
+    match raw.parse::<i64>() {
+        Ok(value) if value > 0 => value,
+        Ok(value) => {
+            tracing::warn!(
+                key,
+                value,
+                default,
+                "session todo sweeper env must be a positive integer"
+            );
+            default
+        }
+        Err(error) => {
+            tracing::warn!(
+                key,
+                raw,
+                %error,
+                default,
+                "failed to parse session todo sweeper env"
+            );
+            default
+        }
+    }
+}
+
 fn completed_auto_archive_days() -> i64 {
-    std::env::var("ASTRA_SESSION_TODO_AUTO_ARCHIVE_DAYS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|days: &i64| *days > 0)
-        .unwrap_or(COMPLETED_AUTO_ARCHIVE_DAYS_DEFAULT)
+    positive_i64_env_or_default(
+        "ASTRA_SESSION_TODO_AUTO_ARCHIVE_DAYS",
+        COMPLETED_AUTO_ARCHIVE_DAYS_DEFAULT,
+    )
 }
 
 fn archive_retention_days() -> i64 {
-    std::env::var("ASTRA_SESSION_TODO_ARCHIVE_RETENTION_DAYS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|days: &i64| *days > 0)
-        .unwrap_or(ARCHIVE_RETENTION_DAYS_DEFAULT)
+    positive_i64_env_or_default(
+        "ASTRA_SESSION_TODO_ARCHIVE_RETENTION_DAYS",
+        ARCHIVE_RETENTION_DAYS_DEFAULT,
+    )
 }
 
 fn auto_pause_metadata_json(existing: Option<&str>, paused_at: &str) -> String {
@@ -126,21 +167,14 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     // faster but the audit context matters more here than the SQL
     // round-trips — sweeps are 5min apart and N is small.
     //
-    // Plan-derived tasks (those with `plan_subtask_id` in metadata) are
-    // excluded: their lifecycle is managed by the plan orchestrator, not
-    // this sweeper. Directly pausing a plan step task would break plan ↔
-    // task-board consistency.
-    //
     // SELECT … FOR UPDATE serialises with mutator transactions (which
     // also lock all rows for a session via FOR UPDATE). Without this,
     // a mutator DELETE+INSERT that restores an in_progress row from its
     // stale in-memory snapshot can silently overwrite a sweeper pause.
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query(
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT session_id, todo_id, metadata FROM session_todos \
          WHERE status = 'in_progress' \
            AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
-           AND (metadata IS NULL \
-                OR JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.plan_subtask_id')) IS NULL) \
          LIMIT ? \
          FOR UPDATE",
     )
@@ -148,18 +182,7 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     .bind(STALE_BATCH_LIMIT)
     .fetch_all(&mut *tx)
     .await
-    .map_err(|e| format!("stale-sweep query: {e}"))?
-    .into_iter()
-    .filter_map(|r| {
-        let sid: Option<String> = r.try_get("session_id").ok();
-        let tid: Option<String> = r.try_get("todo_id").ok();
-        let metadata: Option<String> = r.try_get("metadata").ok().flatten();
-        match (sid, tid) {
-            (Some(sid), Some(tid)) => Some((sid, tid, metadata)),
-            _ => None,
-        }
-    })
-    .collect();
+    .map_err(|e| format!("stale-sweep query/decode: {e}"))?;
 
     let mut affected = 0u64;
     for (session_id, todo_id, metadata) in &rows {
@@ -208,6 +231,45 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     Ok(affected)
 }
 
+/// Clean up stale idempotency rows where task creation succeeded but
+/// `complete_todo_create_idempotency` never ran (e.g. DB connection dropped
+/// mid-response).  Instead of deleting rows (which would allow a retry to
+/// create a duplicate task), we set `output` to a clear error message so
+/// the client receives an explicit failure on replay and the poisoned key
+/// cannot create a duplicate.
+///
+/// This is defense-in-depth.  The primary fix makes idempotency completion
+/// non-blocking in the HTTP handler (see session_todo_handlers.rs); this
+/// sweeper handles the rare case where the response never reached the
+/// client AND the idempotency row was left behind.
+pub(crate) async fn run_stale_idempotency_sweep(pool: SharedPool) -> Result<u64, String> {
+    const ERROR_MSG: &str = "Error: task creation was interrupted — idempotency record expired without completion. \
+         Please retry with a new idempotency key.";
+
+    let mut affected: u64 = 0;
+    loop {
+        let result = sqlx::query(
+            "UPDATE session_todo_idempotency \
+             SET output = ?, updated_at = NOW(6) \
+             WHERE output IS NULL \
+               AND updated_at < NOW(6) - INTERVAL ? MINUTE \
+             LIMIT ?",
+        )
+        .bind(ERROR_MSG)
+        .bind(IDEMPOTENCY_STALE_MINUTES as i64)
+        .bind(IDEMPOTENCY_BATCH_LIMIT)
+        .execute(pool.get())
+        .await
+        .map_err(|e| format!("stale idempotency sweep: {e}"))?;
+        let n = result.rows_affected();
+        if n == 0 {
+            break;
+        }
+        affected = affected.saturating_add(n);
+    }
+    Ok(affected)
+}
+
 /// Run a single terminal→archived pass. Returns the number of rows
 /// transitioned. Weekly cadence is enough because this is purely a
 /// hygiene sweep for stale history, not a user-facing real-time state
@@ -236,7 +298,7 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
             .await
             .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
 
-        let rows: Vec<(String, String)> = sqlx::query(
+        let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT session_id, todo_id FROM session_todos \
              WHERE status IN ('completed', 'failed', 'cancelled') \
                AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -247,17 +309,7 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
         .bind(batch_size)
         .fetch_all(&mut *tx)
         .await
-        .map_err(|e| format!("completed-auto-archive select: {e}"))?
-        .into_iter()
-        .filter_map(|row| {
-            let session_id: Option<String> = row.try_get("session_id").ok();
-            let todo_id: Option<String> = row.try_get("todo_id").ok();
-            match (session_id, todo_id) {
-                (Some(session_id), Some(todo_id)) => Some((session_id, todo_id)),
-                _ => None,
-            }
-        })
-        .collect();
+        .map_err(|e| format!("completed-auto-archive select/decode: {e}"))?;
 
         if rows.is_empty() {
             break;
@@ -421,7 +473,7 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
             .await
             .map_err(|e| format!("archive-gc tx begin: {e}"))?;
 
-        let rows: Vec<(String, String)> = sqlx::query(
+        let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT session_id, todo_id FROM session_todos \
              WHERE status = 'archived' \
                AND archived_at IS NOT NULL \
@@ -433,17 +485,7 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
         .bind(batch_size)
         .fetch_all(&mut *tx)
         .await
-        .map_err(|e| format!("archive-gc select: {e}"))?
-        .into_iter()
-        .filter_map(|row| {
-            let session_id: Option<String> = row.try_get("session_id").ok();
-            let todo_id: Option<String> = row.try_get("todo_id").ok();
-            match (session_id, todo_id) {
-                (Some(session_id), Some(todo_id)) => Some((session_id, todo_id)),
-                _ => None,
-            }
-        })
-        .collect();
+        .map_err(|e| format!("archive-gc select/decode: {e}"))?;
 
         if rows.is_empty() {
             break;
@@ -483,9 +525,9 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
     Ok(total_affected)
 }
 
-/// Spawn the stale-in_progress sweeper. Tick every 5 minutes;
-/// missed ticks are coalesced (`Delay`) so a paused server doesn't
-/// cause a ticker burst on resume.
+/// Spawn the stale-in_progress sweeper. Runs once on startup and then
+/// every 5 minutes; missed ticks are coalesced (`Delay`) so a paused
+/// server doesn't cause a ticker burst on resume.
 pub(crate) fn spawn_session_todo_stale_sweeper(
     pool: SharedPool,
     lease: Arc<crate::server::sweeper_lease::SweeperLease>,
@@ -494,9 +536,6 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(STALE_SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate first tick — give the server a chance
-        // to finish startup before the first sweep.
-        interval.tick().await;
 
         let mut consecutive_failures: u32 = 0;
         loop {
@@ -543,6 +582,23 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
                                 "stale-in_progress sweep failed"
                             );
                         }
+                    }
+                }
+                match run_stale_idempotency_sweep(pool.clone()).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(
+                            target: "astra_runtime::session_todo_sweeper",
+                            rows = n,
+                            "completed {n} stale idempotency row(s) with error message"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "astra_runtime::session_todo_sweeper",
+                            error = %e,
+                            "stale-idempotency sweep failed"
+                        );
                     }
                 }
             })
@@ -1207,7 +1263,10 @@ mod tests {
         let paused_count = run_stale_in_progress_sweep(shared.clone())
             .await
             .expect("stale sweep");
-        assert_eq!(paused_count, 1);
+        assert!(
+            paused_count >= 1,
+            "global sweeper may also pause unrelated stale rows; got {paused_count}"
+        );
 
         let paused: serde_json::Value = serde_json::from_str(
             &manager
@@ -1223,9 +1282,10 @@ mod tests {
             .list(&serde_json::json!({"status_filter": "active"}))
             .await;
         assert!(
-            active.contains("No tasks found with status 'active'")
-                && !active.contains("stale running work"),
-            "paused task must not remain in active list: {active}"
+            active.contains("\"count\":1")
+                && active.contains("\"status\":\"paused\"")
+                && active.contains("stale running work"),
+            "active list should treat paused work as first-class open work: {active}"
         );
 
         cleanup().await;

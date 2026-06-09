@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -10,16 +10,78 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
+use crate::detach::DetachShellHandle;
 use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exit};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// RAII guard for detach handle lifecycle. Takes ownership on creation,
+/// automatically restores to slot on drop unless explicitly consumed.
+/// This prevents handle leaks on early-return paths (errors, validation failures).
+///
+/// Usage pattern:
+/// - Borrow handle via `.get_ref()` for operations
+/// - On success (Detached): call `.take()` to consume
+/// - On error/completed: call `.restore()` to return to slot
+/// - Guard's drop logs error if handle still present (leak detection)
+struct DetachHandleGuard<'a> {
+    slot: Option<&'a Arc<Mutex<Option<DetachShellHandle>>>>,
+    handle: Option<DetachShellHandle>,
+}
+
+impl<'a> DetachHandleGuard<'a> {
+    fn new(
+        slot: Option<&'a Arc<Mutex<Option<DetachShellHandle>>>>,
+        handle: Option<DetachShellHandle>,
+    ) -> Self {
+        Self { slot, handle }
+    }
+
+    /// Borrow the handle for use. Returns None if handle was already taken.
+    fn get_ref(&self) -> Option<&DetachShellHandle> {
+        self.handle.as_ref()
+    }
+
+    /// Take ownership of the handle. Guard's drop becomes a no-op.
+    /// Call this only on success paths where the handle is consumed (e.g., Detached).
+    fn take(&mut self) -> Option<DetachShellHandle> {
+        self.handle.take()
+    }
+
+    fn has_handle(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Restore handle to slot. Call this on error/completed paths.
+    /// Consumes self and restores the handle to the slot for reuse.
+    async fn restore(mut self) {
+        if let (Some(slot), Some(handle)) = (self.slot.as_ref(), self.handle.take()) {
+            *slot.lock().await = Some(handle);
+        }
+    }
+}
+
+impl<'a> Drop for DetachHandleGuard<'a> {
+    fn drop(&mut self) {
+        // If handle is still present, we leaked it. This should never happen
+        // because callers must either take() or restore() before drop.
+        // We can't async-lock in drop, so we just log a warning.
+        if self.handle.is_some() {
+            tracing::error!(
+                "DetachHandleGuard dropped without restore/take — handle leaked. \
+                 This is a bug: all paths must explicitly restore or take the handle."
+            );
+        }
+    }
+}
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
 /// cannot confidently identify the command family. See [`classify_bash_command`]
@@ -425,46 +487,79 @@ struct SearchIgnoreRule {
 /// regardless of interleaved path arguments, because `rm` accepts flags and
 /// paths in any order.
 fn is_rm_recursive_force(lower: &str) -> bool {
+    use std::path::Path;
+
     // Split into individual commands by shell operators.
-    let commands: Vec<&str> = lower.split([';', '|', '&', '\n', '\r']).collect();
-
-    for cmd in commands {
-        let args: Vec<&str> = cmd.split_ascii_whitespace().collect();
-
-        // Recursively check `bash -c "<script>"`, `sh -c "<script>"`, etc.
-        // This closes the simplest bypass where a user wraps `rm -rf` in a
-        // quoted -c argument that the tokenizer can't see inside.
-        if let Some(script) = extract_c_argument(&args) {
-            if is_rm_recursive_force(script) {
-                return true;
-            }
+    for segment in lower.split(&[';', '\n']) {
+        let segment = segment.trim();
+        if segment.is_empty() {
             continue;
         }
+        // Further split by pipe and background operators
+        for script in segment.split(&['|', '&']) {
+            let script = script.trim();
+            if script.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = script.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            // Recursively check `bash -c "<script>"`, `sh -c "<script>"`, etc.
+            // This closes the simplest bypass where a user wraps `rm -rf` in a
+            // quoted -c argument that the tokenizer can't see inside.
+            if let Some(inner_script) = extract_c_argument(&tokens) {
+                if is_rm_recursive_force(inner_script) {
+                    return true;
+                }
+                continue;
+            }
+            // Check the basename of token[0] — a path like /usr/bin/rm
+            // or busybox alias should still be recognized as rm.
+            let first = tokens[0];
+            let basename = Path::new(first)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(first);
+            // Multi-call binaries: busybox rm, toybox rm, etc.
+            let is_rm_cmd = if basename == "rm" {
+                true
+            } else if (basename == "busybox" || basename == "toybox") && tokens.len() >= 2 {
+                let second = Path::new(tokens[1])
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(tokens[1]);
+                second == "rm"
+            } else {
+                false
+            };
+            if !is_rm_cmd {
+                continue;
+            }
 
-        let rm_pos = match args.iter().position(|a| *a == "rm") {
-            Some(p) => p,
-            None => continue,
-        };
-        let mut has_recursive = false;
-        let mut has_force = false;
-        for &arg in &args[rm_pos + 1..] {
-            if arg == "--recursive" {
-                has_recursive = true;
-            } else if arg == "--force" {
-                has_force = true;
-            } else if arg.starts_with("--") {
-            } else if arg.starts_with('-') {
-                for c in arg.chars().skip(1) {
-                    match c {
-                        'r' | 'R' => has_recursive = true,
-                        'f' => has_force = true,
-                        _ => {}
+            // tokens[0] is the rm command (verified via basename above).
+            // Check all subsequent tokens for recursive + force flags.
+            let mut has_recursive = false;
+            let mut has_force = false;
+            for &arg in &tokens[1..] {
+                if arg == "--recursive" {
+                    has_recursive = true;
+                } else if arg == "--force" {
+                    has_force = true;
+                } else if arg.starts_with("--") {
+                } else if arg.starts_with('-') {
+                    for c in arg.chars().skip(1) {
+                        match c {
+                            'r' | 'R' => has_recursive = true,
+                            'f' => has_force = true,
+                            _ => {}
+                        }
                     }
                 }
             }
-        }
-        if has_recursive && has_force {
-            return true;
+            if has_recursive && has_force {
+                return true;
+            }
         }
     }
     false
@@ -698,29 +793,37 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     // sibling runner so Ctrl+B can transfer child + streams to the
     // BackgroundTaskRegistry. Without a slot OR with an empty slot
     // we fall through to the legacy reader (zero hot-path overhead).
+    //
+    // RAII guard pattern: take handle from slot, wrap in guard that
+    // tracks ownership. Callers must explicitly restore() on error
+    // paths or take() on success paths where the handle is consumed.
+    // Guard's drop logs a warning if the handle is still present (leak).
     let detach_slot = ctx.detach_shell_handle.as_ref().cloned();
-    let detach_handle = if let Some(slot) = detach_slot.as_ref() {
-        slot.lock().await.take()
-    } else {
-        None
-    };
+    let mut detach_handle_guard = DetachHandleGuard::new(
+        detach_slot.as_ref(),
+        if let Some(slot) = detach_slot.as_ref() {
+            slot.lock().await.take()
+        } else {
+            None
+        },
+    );
 
-    let output = if let Some(detach_handle) = detach_handle {
+    let output = if detach_handle_guard.has_handle() {
+        let handle_ref = detach_handle_guard.get_ref().unwrap();
         match run_bash_with_detach(
             &mut cmd,
             timeout,
             raw_stdout_limit,
             raw_stderr_limit,
             ctx.cancel_token.as_deref(),
-            &detach_handle,
+            handle_ref,
             command,
         )
         .await
         {
             Ok(BashRunOutcome::Completed(output)) => {
-                if let Some(slot) = detach_slot.as_ref() {
-                    *slot.lock().await = Some(detach_handle);
-                }
+                // Restore handle to slot for next bash call in this turn.
+                detach_handle_guard.restore().await;
                 output
             }
             Ok(BashRunOutcome::Detached(payload)) => {
@@ -728,6 +831,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 // through the one-shot reply channel. The host drains
                 // it in its event-loop tick and calls
                 // BackgroundTaskRegistry::adopt_detached_shell.
+                let detach_handle = detach_handle_guard.take().unwrap();
                 if let Some(sender) = detach_handle.payload_tx.lock().await.take() {
                     let send_failed = sender.send(*payload).is_err();
                     if send_failed {
@@ -749,7 +853,12 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 result.metadata = Some(metadata);
                 return result;
             }
-            Err(e) => return ToolResult::error(e),
+            Err(e) => {
+                // Restore handle on error so subsequent bash calls in this turn
+                // can still use detach. Handle is only consumed on successful Detached.
+                detach_handle_guard.restore().await;
+                return ToolResult::error(e);
+            }
         }
     } else {
         match run_readonly_command_with_partial(
@@ -4466,13 +4575,17 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn validate_bash_rm_rf_project_relative_allowed() {
-        // Project-relative rm -rf: should pass validation (permission layer handles Ask)
-        assert!(validate_execute_bash_command("rm -rf ./build").is_ok());
-        assert!(validate_execute_bash_command("rm -rf node_modules").is_ok());
-        assert!(validate_execute_bash_command("rm -rf dist/").is_ok());
-        assert!(validate_execute_bash_command("rm -rf target/debug").is_ok());
-        assert!(validate_execute_bash_command("rm -fr .cache").is_ok());
+    fn validate_bash_rm_r_project_relative_allowed_but_rm_rf_blocked() {
+        assert!(validate_execute_bash_command("rm -r ./build").is_ok());
+        assert!(validate_execute_bash_command("rm -r node_modules").is_ok());
+        assert!(validate_execute_bash_command("rm -r dist/").is_ok());
+        assert!(validate_execute_bash_command("rm -r target/debug").is_ok());
+
+        assert!(validate_execute_bash_command("rm -rf ./build").is_err());
+        assert!(validate_execute_bash_command("rm -rf node_modules").is_err());
+        assert!(validate_execute_bash_command("rm -rf dist/").is_err());
+        assert!(validate_execute_bash_command("rm -rf target/debug").is_err());
+        assert!(validate_execute_bash_command("rm -fr .cache").is_err());
     }
 
     #[test]

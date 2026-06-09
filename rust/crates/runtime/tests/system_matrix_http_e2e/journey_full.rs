@@ -839,15 +839,14 @@ pub async fn run_product_matrix_full_journey(
         "/jobs",
         Some(auth_header.as_str()),
         json!({
-            "job_type": "matrix_e2e",
-            "inputs": { "suite": "matrix" },
-            "gpu_required": false,
-            "timeout_seconds": 120
+            "title": "matrix e2e job",
+            "description": "exercise task-backed jobs endpoint",
+            "session_id": session_id
         }),
     )
     .await;
-    assert_eq!(st_job, StatusCode::OK, "submit job: {job_j}");
-    let job_id = job_j["job_id"].as_str().expect("job_id").to_string();
+    assert_eq!(st_job, StatusCode::CREATED, "submit job: {job_j}");
+    let job_id = job_j["task_id"].as_str().expect("task_id").to_string();
 
     let (st_gj, gj) = get_json(
         app,
@@ -859,19 +858,16 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_gj, StatusCode::OK, "get job: {gj}");
     assert_eq!(gj["status"].as_str(), Some("pending"));
 
-    let (st_wh, wh_j) = post_json(
+    let (st_wh, wh_j) = put_json(
         app,
-        "/jobs/webhook",
-        None,
+        &format!("/jobs/{job_id}/status"),
+        Some(auth_header.as_str()),
         json!({
-            "job_id": job_id,
-            "status": "completed",
-            "result": { "ok": true },
-            "error": null
+            "status": "completed"
         }),
     )
     .await;
-    assert_eq!(st_wh, StatusCode::OK, "job webhook: {wh_j}");
+    assert_eq!(st_wh, StatusCode::OK, "job status update: {wh_j}");
 
     let (st_gj2, gj2) = get_json(
         app,

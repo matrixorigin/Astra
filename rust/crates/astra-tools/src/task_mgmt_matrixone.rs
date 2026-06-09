@@ -65,6 +65,12 @@ struct EncodedTaskJsonFields {
     subtasks: Option<String>,
 }
 
+struct EncodedTaskDatetimes {
+    archived_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 fn encode_task_json_fields(task: &SessionTask) -> EncodedTaskJsonFields {
     EncodedTaskJsonFields {
         metadata: task
@@ -98,6 +104,18 @@ async fn insert_session_tasks(
     }
 
     for (start, end) in task_insert_batch_ranges(tasks.len()) {
+        let encoded_datetimes = tasks[start..end]
+            .iter()
+            .map(|task| {
+                let updated_at = to_mo_datetime(&task.updated_at, "updated_at", &task.id)?;
+                Ok(EncodedTaskDatetimes {
+                    archived_at: (task.status == SessionTaskStatusKind::Archived)
+                        .then(|| updated_at.clone()),
+                    created_at: to_mo_datetime(&task.created_at, "created_at", &task.id)?,
+                    updated_at,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut builder = QueryBuilder::<MySql>::new(
             "INSERT INTO session_todos (\
                 session_id, todo_id, user_id, ordinal, title, description, active_form, \
@@ -105,11 +123,12 @@ async fn insert_session_tasks(
                 created_at, updated_at) ",
         );
         builder.push_values(
-            tasks[start..end].iter().enumerate(),
-            |mut row, (offset, task)| {
+            tasks[start..end]
+                .iter()
+                .zip(encoded_datetimes.iter())
+                .enumerate(),
+            |mut row, (offset, (task, datetimes))| {
                 let encoded = encode_task_json_fields(task);
-                let archived_at = (task.status == SessionTaskStatusKind::Archived)
-                    .then(|| to_mo_datetime(&task.updated_at));
                 let status_str = task.status.to_string();
                 row.push_bind(session_id)
                     .push_bind(&task.id)
@@ -124,9 +143,9 @@ async fn insert_session_tasks(
                 push_optional_json(&mut row, encoded.blocks);
                 push_optional_json(&mut row, encoded.blocked_by);
                 push_optional_json(&mut row, encoded.subtasks);
-                row.push_bind(archived_at)
-                    .push_bind(to_mo_datetime(&task.created_at))
-                    .push_bind(to_mo_datetime(&task.updated_at));
+                row.push_bind(&datetimes.archived_at)
+                    .push_bind(&datetimes.created_at)
+                    .push_bind(&datetimes.updated_at);
             },
         );
         builder
@@ -182,21 +201,15 @@ fn peek_task_id_from_counter(row: Option<i64>, session_id: &str) -> Result<u32, 
 
 /// Convert an RFC3339 timestamp (what `TaskManager` writes) into the
 /// `YYYY-MM-DD HH:MM:SS.ffffff` form MatrixOne accepts for `DATETIME(6)`
-/// columns. Falls back to stripping the `T` + timezone offset if parsing
-/// fails, so callers can recover from legacy-format inputs without panicking.
-fn to_mo_datetime(rfc3339: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        return dt
-            .with_timezone(&chrono::Utc)
-            .format("%Y-%m-%d %H:%M:%S%.6f")
-            .to_string();
-    }
-    rfc3339
-        .replacen('T', " ", 1)
-        .split(&['+', 'Z'][..])
-        .next()
-        .unwrap_or(rfc3339)
-        .to_string()
+/// columns. Invalid timestamps are data corruption and fail closed.
+fn to_mo_datetime(rfc3339: &str, column: &'static str, task_id: &str) -> Result<String, String> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string()
+        })
+        .map_err(|e| format!("task '{task_id}' has invalid {column} timestamp '{rfc3339}': {e}"))
 }
 
 /// Pick the right [`TaskStore`] for this process: MatrixOne when a pool is
@@ -276,62 +289,88 @@ impl MatrixOneTaskStore {
 }
 
 fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> {
-    let id: String = row.try_get("todo_id")?;
-    let title: String = row.try_get("title")?;
-    let description: Option<String> = row.try_get("description").ok().flatten();
-    let active_form: Option<String> = row.try_get("active_form").ok().flatten();
-    let status_str: String = row.try_get("status")?;
-    let status = parse_persisted_status(&status_str)?;
-    let owner: Option<String> = row.try_get("owner").ok().flatten();
-    let metadata: Option<serde_json::Map<String, serde_json::Value>> =
-        parse_optional_json_text(optional_json_text(row, "metadata"), "metadata")?;
-    let blocks: Vec<String> =
-        parse_optional_json_text(optional_json_text(row, "blocks"), "blocks")?.unwrap_or_default();
-    let blocked_by: Vec<String> =
-        parse_optional_json_text(optional_json_text(row, "blocked_by"), "blocked_by")?
-            .unwrap_or_default();
-    let subtasks: Vec<SessionSubtask> =
-        parse_optional_json_text(optional_json_text(row, "subtasks"), "subtasks")?
-            .unwrap_or_default();
-    // `created_at` / `updated_at` are NOT NULL DATETIME(6) columns cast to
-    // CHAR in the SELECT. A NULL here means schema drift (column relaxed to
-    // nullable) or a bad cast — surface it instead of silently letting an
-    // empty string flow back through `to_mo_datetime` on the next save and
-    // triggering the legacy-format fallback branch.
-    let created_at_raw: String = row
-        .try_get::<Option<String>, _>("created_at")?
-        .ok_or_else(|| sqlx::Error::Decode("session_todos.created_at is NULL".into()))?;
-    let updated_at_raw: String = row
-        .try_get::<Option<String>, _>("updated_at")?
-        .ok_or_else(|| sqlx::Error::Decode("session_todos.updated_at is NULL".into()))?;
-    let created_at = from_mo_datetime(&created_at_raw, "created_at")?;
-    let updated_at = from_mo_datetime(&updated_at_raw, "updated_at")?;
+    let decoded = (|| {
+        let id: String = row.try_get("todo_id")?;
+        let title: String = row.try_get("title")?;
+        let description: Option<String> = row.try_get("description")?;
+        let active_form: Option<String> = row.try_get("active_form")?;
+        let status_str: String = row.try_get("status")?;
+        let status = parse_persisted_status(&status_str)?;
+        let owner: Option<String> = row.try_get("owner")?;
+        let metadata: Option<serde_json::Map<String, serde_json::Value>> =
+            parse_optional_json_text(optional_json_text(row, "metadata")?, "metadata")?;
+        let blocks: Vec<String> =
+            parse_optional_json_text(optional_json_text(row, "blocks")?, "blocks")?
+                .unwrap_or_default();
+        let blocked_by: Vec<String> =
+            parse_optional_json_text(optional_json_text(row, "blocked_by")?, "blocked_by")?
+                .unwrap_or_default();
+        let subtasks: Vec<SessionSubtask> =
+            parse_optional_json_text(optional_json_text(row, "subtasks")?, "subtasks")?
+                .unwrap_or_default();
+        // `created_at` / `updated_at` are NOT NULL DATETIME(6) columns cast to
+        // CHAR in the SELECT. A NULL here means schema drift (column relaxed to
+        // nullable) or a bad cast — surface it instead of silently letting an
+        // empty string flow back through `to_mo_datetime` on the next save and
+        // triggering the legacy-format fallback branch.
+        let created_at_raw: String = row
+            .try_get::<Option<String>, _>("created_at")?
+            .ok_or_else(|| sqlx::Error::Decode("session_todos.created_at is NULL".into()))?;
+        let updated_at_raw: String = row
+            .try_get::<Option<String>, _>("updated_at")?
+            .ok_or_else(|| sqlx::Error::Decode("session_todos.updated_at is NULL".into()))?;
+        let created_at = from_mo_datetime(&created_at_raw, "created_at")?;
+        let updated_at = from_mo_datetime(&updated_at_raw, "updated_at")?;
 
-    Ok(SessionTask {
-        id,
-        title,
-        description,
-        status,
-        subtasks,
-        created_at,
-        updated_at,
-        active_form,
-        owner,
-        metadata,
-        blocks,
-        blocked_by,
-        archived_at: None, // populated on load from column below
-    })
+        Ok(SessionTask {
+            id,
+            title,
+            description,
+            status,
+            subtasks,
+            created_at,
+            updated_at,
+            active_form,
+            owner,
+            metadata,
+            blocks,
+            blocked_by,
+            archived_at: None, // populated on load from column below
+        })
+    })();
+
+    if let Err(error) = &decoded {
+        let session_id = row
+            .try_get::<String, _>("session_id")
+            .unwrap_or_else(|_| "<not-selected>".to_string());
+        let todo_id = row
+            .try_get::<String, _>("todo_id")
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        tracing::error!(
+            session_id,
+            todo_id,
+            error = %error,
+            "failed to decode session_todos row"
+        );
+    }
+
+    decoded
 }
 
-fn optional_json_text(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<String> {
+fn optional_json_text(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<Option<String>, sqlx::Error> {
     if let Ok(value) = row.try_get::<Option<String>, _>(column) {
-        return value;
+        return Ok(value);
     }
-    row.try_get::<Option<Vec<u8>>, _>(column)
-        .ok()
-        .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+    let bytes = row.try_get::<Option<Vec<u8>>, _>(column)?;
+    match bytes {
+        Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|error| {
+            sqlx::Error::Decode(format!("{column} is not valid UTF-8: {error}").into())
+        }),
+        None => Ok(None),
+    }
 }
 
 fn parse_optional_json_text<T>(
@@ -754,24 +793,41 @@ impl TaskStore for MatrixOneTaskStore {
         session_id: &str,
         tasks: Vec<SessionTask>,
         next_task_id: u32,
+        expected_version: u64,
     ) -> Result<(), String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
-        if let Err(e) = sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, 0) \
-             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id)",
+        if expected_version > 0 {
+            // CAS: atomically verify the session version hasn't changed since
+            // the snapshot was captured.  Without this, a concurrent sweeper
+            // auto-pause or plan-mirror mutation could be silently overwritten.
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT version FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
+            let current_version = row.map(|(v,)| v as u64).unwrap_or(0);
+            if current_version != expected_version {
+                return Err(format!(
+                    "restore_snapshot_state: version conflict (expected={}, current={}) — \
+                     task board changed after rollback snapshot was sealed; retry with fresh state",
+                    expected_version, current_version
+                ));
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, ?) \
+             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
         )
         .bind(session_id)
         .bind(counter_bind_value(next_task_id))
+        .bind(expected_version as i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| e.to_string())
-        {
-            if let Err(rollback_err) = tx.rollback().await {
-                return Err(format!("{e}; rollback failed: {rollback_err}"));
-            }
-            return Err(e);
-        }
+        .map_err(|e| format!("restore_snapshot_state: counter upsert failed: {e}"))?;
 
         if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
             .bind(session_id)
