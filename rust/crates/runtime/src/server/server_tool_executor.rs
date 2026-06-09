@@ -3418,8 +3418,11 @@ impl ServerToolExecutor {
             }
             let needs_edges = self
                 .task_manager
-                .snapshot()
+                .load_active_tasks()
                 .await
+                .map_err(|error| {
+                    format!("load task board before approved-plan dependency sync: {error}")
+                })?
                 .into_iter()
                 .find(|task| task.id == *task_id)
                 .is_none_or(|task| blockers.iter().any(|id| !task.blocked_by.contains(id)));
@@ -3488,8 +3491,9 @@ impl ServerToolExecutor {
     ) -> Result<String, String> {
         let existing_task_id = self
             .task_manager
-            .snapshot()
+            .load_active_tasks()
             .await
+            .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
             .into_iter()
             .find(|task| {
                 Self::approved_plan_step_task_matches(
@@ -3535,8 +3539,9 @@ impl ServerToolExecutor {
         }
 
         self.task_manager
-            .snapshot()
+            .load_active_tasks()
             .await
+            .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
             .into_iter()
             .find(|task| {
                 Self::approved_plan_step_task_matches(
@@ -3562,8 +3567,9 @@ impl ServerToolExecutor {
     ) -> Result<(), String> {
         let running_task_ids: Vec<String> = self
             .task_manager
-            .snapshot()
+            .load_active_tasks()
             .await
+            .map_err(|error| format!("load task board before approved-plan handoff: {error}"))?
             .into_iter()
             .filter(|task| task.id != target_task_id && task.status.is_in_progress())
             .map(|task| task.id)
@@ -7768,6 +7774,112 @@ esac
             active.as_deref(),
             Some("plan-rollback-task-board"),
             "failed task-board mirror must keep plan mode active so writes stay guarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_fails_closed_when_task_board_reload_fails_after_snapshot() {
+        struct SnapshotThenLoadFailStore {
+            load_calls: Arc<std::sync::atomic::AtomicUsize>,
+            mutate_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl TaskStore for SnapshotThenLoadFailStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                let call = self
+                    .load_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    Ok(Vec::new())
+                } else {
+                    Err("simulated task board reload failure".to_string())
+                }
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn mutate(
+                &self,
+                _session_id: &str,
+                mutation: astra_tools::task_mgmt::TaskMutation,
+            ) -> Result<String, String> {
+                self.mutate_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = mutation(Vec::new(), 1)?;
+                Ok(result.response)
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "reload failing server plan".into(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "should not be created".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-reload-fails", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("reload-fails-session", Some("plan-reload-fails"))
+            .await
+            .unwrap();
+
+        let load_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn TaskStore> = Arc::new(SnapshotThenLoadFailStore {
+            load_calls: Arc::clone(&load_calls),
+            mutate_calls: Arc::clone(&mutate_calls),
+        });
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec = exec.with_task_store(store);
+        exec.session_id = "reload-fails-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.starts_with("Error:")
+                && result.contains("load task board before approved-plan mirror")
+                && result.contains("simulated task board reload failure"),
+            "exit_plan_mode must fail closed when task-board reload fails after snapshot: {result}"
+        );
+        assert_eq!(
+            mutate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "server approved-plan mirror must not create tasks after a failed task-board reload"
+        );
+        let active = repo
+            .active_plan_for_session("reload-fails-session")
+            .await
+            .expect("active plan lookup after failed reload");
+        assert_eq!(
+            active.as_deref(),
+            Some("plan-reload-fails"),
+            "failed task-board reload must keep plan mode active so writes stay guarded"
         );
     }
 
