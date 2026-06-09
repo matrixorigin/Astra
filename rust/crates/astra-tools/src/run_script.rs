@@ -1185,7 +1185,11 @@ pub async fn handle_run_script(
 ) -> crate::ToolResult {
     let script = match args.get("script").and_then(Value::as_str) {
         Some(s) => s,
-        None => return crate::ToolResult::error("Error: Missing 'script' parameter".into()),
+        None => {
+            return crate::ToolResult::error(
+                "Error: run_script requires a non-empty top-level `script` string, e.g. {\"script\":\"print('ok')\"}. Do not call run_script with empty arguments.".into(),
+            );
+        }
     };
 
     let timeout = resolve_timeout(args.get("timeout"), config.timeout);
@@ -2299,7 +2303,8 @@ mod tests {
         let result =
             handle_run_script(&serde_json::json!({}), &exec, RunScriptConfig::default()).await;
         assert!(result.is_error);
-        assert!(result.output.contains("Missing 'script'"));
+        assert!(result.output.contains("requires a non-empty"));
+        assert!(result.output.contains("empty arguments"));
     }
 
     // ── Integration tests (require Python) ───────────────────────────────

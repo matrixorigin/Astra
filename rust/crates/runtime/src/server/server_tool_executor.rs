@@ -4181,9 +4181,11 @@ impl ServerToolExecutor {
             .unwrap_or("(pending)")
             .trim()
             .to_string();
-        if goal.is_empty() {
-            return "Error: goal must be non-empty".to_string();
-        }
+        let goal = if goal.is_empty() {
+            "(pending)".to_string()
+        } else {
+            goal
+        };
 
         let plan_id = args
             .get("plan_id")
@@ -8303,6 +8305,30 @@ esac
         assert!(
             exec.task_manager.snapshot().await.is_empty(),
             "empty plan approval must not create task-board work"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_plan_mode_without_goal_uses_default_label_on_server() {
+        let repo = Arc::new(astra_plan::InMemoryPlanRepository::new());
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "server-empty-goal-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let result = exec.execute("enter_plan_mode", &json!({})).await;
+
+        assert!(
+            result.contains("goal=\"(pending)\""),
+            "empty enter_plan_mode args should use the same default goal label as CLI: {result}"
+        );
+        let active = repo
+            .active_plan_for_session("server-empty-goal-session")
+            .await
+            .expect("active plan lookup");
+        assert!(
+            active.is_some(),
+            "enter_plan_mode should pin an active plan"
         );
     }
 
