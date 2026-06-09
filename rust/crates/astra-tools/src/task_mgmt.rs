@@ -1266,6 +1266,28 @@ fn validate_string_chars(text: &str, field: &str, max: usize) -> Result<(), Stri
     Ok(())
 }
 
+/// **Task ID character validation**: enforce a strict allowlist to prevent
+/// path traversal (`../`), injection (`/`, `\`), and control characters.
+/// From first principles: task IDs are used as keys in storage and URLs,
+/// so they must be filesystem-safe and URL-safe. Rejecting unsafe characters
+/// at the validation layer prevents downstream exploits in plan repositories,
+/// edge task stores, and API routes.
+fn validate_task_id_chars(id: &str, field: &str) -> Result<(), String> {
+    // Reject path separators and parent-directory traversal.
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!(
+            "field '{field}' contains path traversal or separators (got: {id:?})"
+        ));
+    }
+    // Reject control characters (U+0000–U+001F, U+007F) and non-ASCII.
+    if id.chars().any(|c| c.is_control() || !c.is_ascii()) {
+        return Err(format!(
+            "field '{field}' contains control or non-ASCII characters (got: {id:?})"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_metadata_size(
     metadata: &serde_json::Map<String, Value>,
     field: &str,
@@ -1321,6 +1343,7 @@ fn parse_create_subtasks(
             return Err(format!("field 'subtasks[{index}].id' must be non-empty"));
         }
         validate_string_chars(id, &format!("subtasks[{index}].id"), MAX_SUBTASK_ID_CHARS)?;
+        validate_task_id_chars(id, &format!("subtasks[{index}].id"))?;
         if !seen_ids.insert(id.to_string()) {
             return Err(format!("duplicate subtask id '{id}'"));
         }
@@ -1395,6 +1418,10 @@ fn parse_create_subtasks(
                         dep_id,
                         &format!("subtasks[{index}].depends_on[{dep_index}]"),
                         MAX_SUBTASK_ID_CHARS,
+                    )?;
+                    validate_task_id_chars(
+                        dep_id,
+                        &format!("subtasks[{index}].depends_on[{dep_index}]"),
                     )?;
                     out.push(dep_id.to_string());
                 }
@@ -1605,21 +1632,6 @@ pub(crate) fn parse_archive_args(args: &Value) -> Result<ArchiveArgs, String> {
     })
 }
 
-/// Highest numeric suffix on any `task-<n>` id in the list, or 0 when
-/// the list is empty or all ids are non-numeric. Used as a conservative
-/// fallback when peeking the counter fails — the restored counter is
-/// at least `max + 1`, which cannot collide with a surviving id.
-fn max_task_id(tasks: &[SessionTask]) -> u32 {
-    tasks
-        .iter()
-        .filter_map(|t| {
-            t.id.strip_prefix("task-")
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .max()
-        .unwrap_or(0)
-}
-
 /// Bidirectional subtask ↔ parent status reconciliation. Called after
 /// any subtask mutation that might flip the all-completed state.
 ///
@@ -1764,15 +1776,19 @@ impl TaskManager {
         let tasks = self.store.load(&sid).await?;
         // Read the counter without consuming or mutating it so concurrent
         // allocators can't race us into duplicate ids (the old
-        // alloc-then-rewind dance clobbered concurrent increments). If
-        // the peek fails (MO pool hiccup, row lock, etc), fall back to
-        // `max(existing task id) + 1` rather than `1` — returning 1 on
-        // a peek error would make `restore_snapshot` rewind the counter
-        // and guarantee duplicate ids on the next allocation.
-        let peeked = match self.store.peek_next_task_id(&sid).await {
-            Ok(v) => v,
-            Err(_) => max_task_id(&tasks).saturating_add(1).max(1),
-        };
+        // alloc-then-rewind dance clobbered concurrent increments).
+        //
+        // **Fail-closed on peek errors.** The old fallback to
+        // `max(existing task ids) + 1` looked safe but isn't: concurrent
+        // allocators may have already consumed ids beyond the snapshot's
+        // max, and `restore_snapshot` would rewind the counter to the
+        // stale value — guaranteeing duplicate id allocation on the
+        // next `next_task_id` call. Propagating the error forces the
+        // caller to abort the mutation instead of capturing a snapshot
+        // that could corrupt the id space on rollback.
+        let peeked = self.store.peek_next_task_id(&sid).await.map_err(|e| {
+            format!("snapshot peek_next_task_id failed: {e}")
+        })?;
         Ok(TaskManagerSnapshot {
             tasks,
             next_task_id: peeked,
@@ -2098,6 +2114,9 @@ impl TaskManager {
             Ok(task_id) => task_id,
             Err(error) => return format!("Error: {error}"),
         };
+        if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
+            return format!("Error: {error}");
+        }
 
         let tasks = match self.store.load(&self.sid()).await {
             Ok(t) => t,
@@ -2139,6 +2158,9 @@ impl TaskManager {
             Ok(task_id) => task_id,
             Err(error) => return format!("Error: {error}"),
         };
+        if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
+            return format!("Error: {error}");
+        }
 
         let new_status = match normalize_update_status(args) {
             Ok(status) => status,
@@ -2735,6 +2757,9 @@ impl TaskManager {
             Ok(task_id) => task_id,
             Err(error) => return format!("Error: {error}"),
         };
+        if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
+            return format!("Error: {error}");
+        }
 
         let reason = match optional_non_empty_string_field(args, "reason") {
             Ok(Some(reason)) => reason,
@@ -5038,31 +5063,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn max_task_id_helper_handles_edges() {
-        assert_eq!(max_task_id(&[]), 0);
-        let t = SessionTask {
-            id: "task-7".into(),
-            title: "x".into(),
-            description: None,
-            status: "pending".into(),
-            subtasks: vec![],
-            created_at: "".into(),
-            updated_at: "".into(),
-            active_form: None,
-            owner: None,
-            metadata: None,
-            blocks: vec![],
-            blocked_by: vec![],
-            archived_at: None,
-        };
-        let nonnum = SessionTask {
-            id: "not-numeric".into(),
-            ..t.clone()
-        };
-        assert_eq!(max_task_id(std::slice::from_ref(&t)), 7);
-        assert_eq!(max_task_id(std::slice::from_ref(&nonnum)), 0);
-    }
+
 
     #[test]
     fn prepare_task_snapshot_for_fork_pauses_live_parent_work() {

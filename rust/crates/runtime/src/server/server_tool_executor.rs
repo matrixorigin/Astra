@@ -4193,28 +4193,49 @@ impl ServerToolExecutor {
             .map(str::to_string)
             .unwrap_or_else(|| astra_plan::PlanModeState::generate_plan_id(&goal));
 
-        // Create-or-link: if a plan with this id already exists we re-link
-        // it to this session (passing the observed version so a concurrent
-        // editor cannot be silently overwritten); otherwise we create a
-        // fresh one with no expected_version.
-        let (mut state, expected_version) = match repo.load(&plan_id).await {
-            Ok(mut s) => {
-                let v = s.version;
-                s.session_hint = Some(self.session_id.clone());
-                (s, Some(v))
-            }
-            Err(astra_plan::PlanLoadError::NotFound(_)) => {
-                let mut s =
-                    astra_plan::PlanModeState::new_with_owner(goal.clone(), self.user_id.clone());
-                s.session_hint = Some(self.session_id.clone());
-                (s, None)
-            }
-            Err(e) => return format!("Error: load plan: {e}"),
-        };
+        // Create-or-link with CAS retry: if a concurrent editor bumped the
+        // version between our load and save, reload and retry (up to 3
+        // attempts) instead of silently dropping work.
+        const MAX_CAS_RETRIES: u32 = 3;
+        let mut last_conflict: Option<String> = None;
+        for _attempt in 0..MAX_CAS_RETRIES {
+            let (mut state, expected_version) = match repo.load(&plan_id).await {
+                Ok(mut s) => {
+                    let v = s.version;
+                    s.session_hint = Some(self.session_id.clone());
+                    (s, Some(v))
+                }
+                Err(astra_plan::PlanLoadError::NotFound(_)) => {
+                    let mut s = astra_plan::PlanModeState::new_with_owner(
+                        goal.clone(),
+                        self.user_id.clone(),
+                    );
+                    s.session_hint = Some(self.session_id.clone());
+                    (s, None)
+                }
+                Err(e) => return format!("Error: load plan: {e}"),
+            };
 
-        if let Err(e) = repo.save(&plan_id, &mut state, expected_version).await {
-            return format!("Error: save plan: {e}");
+            match repo.save(&plan_id, &mut state, expected_version).await {
+                Ok(()) => {
+                    last_conflict = None;
+                    break;
+                }
+                Err(astra_plan::PlanLoadError::Conflict { expected, actual }) => {
+                    last_conflict = Some(format!(
+                        "version conflict (expected {expected}, stored {actual})"
+                    ));
+                    continue;
+                }
+                Err(e) => return format!("Error: save plan: {e}"),
+            }
         }
+        if let Some(conflict) = last_conflict {
+            return format!(
+                "Error: save plan after {MAX_CAS_RETRIES} retries: {conflict}"
+            );
+        }
+
         if let Err(e) = repo.set_active_plan(&self.session_id, Some(&plan_id)).await {
             return format!("Error: link plan to session: {e}");
         }
@@ -4265,14 +4286,35 @@ impl ServerToolExecutor {
             .and_then(Value::as_str)
             .or_else(|| args.get("plan_md").and_then(Value::as_str))
         {
-            let mut state = match repo.load(&active).await {
-                Ok(state) => state,
-                Err(e) => return format!("Error: load active plan: {e}"),
-            };
-            state.plan_md = Some(plan_md.to_string());
-            let expected = Some(state.version);
-            if let Err(e) = repo.save(&active, &mut state, expected).await {
-                return format!("Error: save submitted plan markdown: {e}");
+            // CAS retry: reload + re-save on version conflict so concurrent
+            // plan edits don't silently drop submitted markdown.
+            const MAX_CAS_RETRIES: u32 = 3;
+            let mut last_conflict: Option<String> = None;
+            for _attempt in 0..MAX_CAS_RETRIES {
+                let mut state = match repo.load(&active).await {
+                    Ok(state) => state,
+                    Err(e) => return format!("Error: load active plan: {e}"),
+                };
+                state.plan_md = Some(plan_md.to_string());
+                let expected = Some(state.version);
+                match repo.save(&active, &mut state, expected).await {
+                    Ok(()) => {
+                        last_conflict = None;
+                        break;
+                    }
+                    Err(astra_plan::PlanLoadError::Conflict { expected, actual }) => {
+                        last_conflict = Some(format!(
+                            "version conflict (expected {expected}, stored {actual})"
+                        ));
+                        continue;
+                    }
+                    Err(e) => return format!("Error: save submitted plan markdown: {e}"),
+                }
+            }
+            if let Some(conflict) = last_conflict {
+                return format!(
+                    "Error: save submitted plan markdown after {MAX_CAS_RETRIES} retries: {conflict}"
+                );
             }
         }
 

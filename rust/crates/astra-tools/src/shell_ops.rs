@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
-use astra_sandbox::{CommandRisk, analyze_command_risks, is_rm_catastrophic_rm_path};
+use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exit};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
@@ -415,6 +415,60 @@ struct SearchIgnoreRule {
 /// by the same set OR end-of-string. This catches `socat\tTCP:…`,
 /// `;socat …`, `| telnet …`, and bare `socat`, while leaving
 /// `socatenated` / `mytelnetlog` untouched.
+/// Detect `rm` with both recursive and force flags in any order/spacing.
+/// Catches: rm -rf, rm -r -f, rm -rfv, rm -R -f, rm --recursive --force, rm -r --force, etc.
+///
+/// The input is split into individual commands by shell operators (`;`, `|`,
+/// `&&`, `||`, newlines). Each command is checked independently so that flags
+/// on a later command (e.g. `echo -r -f`) are never attributed to an earlier
+/// `rm`. Within a single command, all flag-bearing arguments are scanned
+/// regardless of interleaved path arguments, because `rm` accepts flags and
+/// paths in any order.
+fn is_rm_recursive_force(lower: &str) -> bool {
+    // Split into individual commands by shell operators.
+    // We use a regex-like manual split: walk the string and cut at `;`, `|`,
+    // `&`, or `\n`/`\r`. Consecutive operators (`&&`, `||`) produce empty
+    // segments which are harmless — we skip them.
+    let commands: Vec<&str> = lower
+        .split(|c: char| c == ';' || c == '|' || c == '&' || c == '\n' || c == '\r')
+        .collect();
+
+    for cmd in commands {
+        let args: Vec<&str> = cmd.split_ascii_whitespace().collect();
+        // Find the `rm` token. It must be the first non-env-var token.
+        // We accept `rm` at any position to handle `sudo rm`, `env rm`, etc.
+        let rm_pos = match args.iter().position(|a| *a == "rm") {
+            Some(p) => p,
+            None => continue,
+        };
+        let mut has_recursive = false;
+        let mut has_force = false;
+        for &arg in &args[rm_pos + 1..] {
+            if arg == "--recursive" {
+                has_recursive = true;
+            } else if arg == "--force" {
+                has_force = true;
+            } else if arg.starts_with("--") {
+                // Other long flags (--verbose, --interactive, etc.) — skip.
+            } else if arg.starts_with('-') {
+                // Short flags: may be combined (-rf, -fr, -rfv, -rfi).
+                for c in arg.chars().skip(1) {
+                    match c {
+                        'r' | 'R' => has_recursive = true,
+                        'f' => has_force = true,
+                        _ => {} // -v, -i, -d, etc.
+                    }
+                }
+            }
+            // Non-flag arguments are paths — skip without affecting detection.
+        }
+        if has_recursive && has_force {
+            return true;
+        }
+    }
+    false
+}
+
 fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
     fn is_sep(c: char) -> bool {
         matches!(c, ' ' | '\t' | ';' | '|' | '&' | '(' | '\n' | '\r')
@@ -468,11 +522,14 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             ));
         }
     }
-    // Path-aware rm -rf: block only catastrophic targets, let permission layer handle the rest.
-    if (lower.contains("rm -rf") || lower.contains("rm -fr")) && is_rm_catastrophic_rm_path(&lower)
-    {
+    // **rm -rf hard block**: detect recursive+force deletion semantically,
+    // not just string patterns. Block: rm -rf, rm -r -f, rm --recursive --force,
+    // and indirect invocation via find/xargs. From first principles: the
+    // semantic intent is "delete recursively without confirmation", which
+    // must be blocked regardless of flag ordering or invocation method.
+    if is_rm_recursive_force(&lower) {
         return Err(
-            "Error: rm -rf targeting root/home/system path is blocked in execute_bash".into(),
+            "Error: recursive force deletion (rm -rf) requires explicit confirmation (use rm -r without -f, or confirm via permission layer)".into(),
         );
     }
     if (lower.contains("curl ") || lower.contains("wget "))

@@ -1,10 +1,11 @@
 //! Reasoning / thinking history cell — the model's internal
 //! monologue, when the provider exposes it.
 //!
-//! While streaming and after completion: render only a compact header
-//! (`Thought · Xs · N lines · N tokens`). Provider reasoning can contain
-//! internal tool transcript fragments, so raw reasoning text is never
-//! printed in the chat surface.
+//! While streaming: a fixed-height scrolling preview window so the
+//! composer stays visible. After completion: collapses to a one-line
+//! header (`Thought · Xs · N lines · N tokens`) — not a framed window or
+//! expanding pill. A reasoning cell is just another cell in the
+//! scrollback; toggle visibility lives in ChatWidget, not here.
 //!
 //! Duration is captured at `finalize()` and rendered in the
 //! header (`· 3s`). Persists as [`TurnEvent::Thinking`].
@@ -109,8 +110,17 @@ impl ReasoningCell {
     }
 }
 
+/// Max body rows shown beneath the `💭 Thinking` header while the
+/// cell is still streaming. Once the window fills up, new rows
+/// replace the oldest (fake scrolling) so the viewport stays at a
+/// fixed height — Cursor's reasoning-preview behaviour, rather
+/// than unbounded growth that pushes the composer off-screen on
+/// a 20-second think. On `finalize()` the whole body collapses
+/// away and only the header remains.
+const LIVE_PREVIEW_MAX_ROWS: usize = 4;
+
 impl HistoryCell for ReasoningCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         // Empty + still live → nothing to show yet. The widget's
         // StatusIndicator handles the "thinking but no content"
         // case; we don't invent a placeholder here.
@@ -121,10 +131,17 @@ impl HistoryCell for ReasoningCell {
         let theme = crate::tui::theme::current();
         let stat = Style::default().fg(theme.dim);
         let dim = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
-        // Raw reasoning is intentionally not rendered, even while live.
-        // Some providers include internal tool transcript fragments in
-        // reasoning deltas; surfacing that text looks like stray debug output.
-        // Keep counting it so the header still communicates activity.
+        // Body preview text: fg dim only — readable but visually subordinate.
+        let body = Style::default().fg(theme.dim);
+
+        // Done thinking → collapse to header only (`Thought ·`
+        // 22s · 45 lines · N tokens`). A 20-second reasoning blob is ~40+
+        // wrapped rows of dim prose; scrollback-dumping all of it
+        // crowds out the actual answer below. Collapse to a one-line
+        // header; users who want the detail can inspect the persisted
+        // transcript. Live cells show the most recent few rows (see
+        // `LIVE_PREVIEW_MAX_ROWS`) so progress is visible without the
+        // viewport growing unboundedly.
         let line_count = self.text.lines().count();
         let token_count = approx_tokens(self.text.chars().count() as u64);
         let line_label = if line_count == 1 {
@@ -146,7 +163,48 @@ impl HistoryCell for ReasoningCell {
             super::assistant::thought_gradient("Thought", theme),
             Span::styled(stat_text, stat),
         ]);
-        vec![header_line]
+        // Preserve live body preview (below).
+
+        let mut lines: Vec<Line<'static>> = vec![header_line];
+
+        // Live preview: render ONLY the most recent
+        // `LIVE_PREVIEW_MAX_ROWS` wrapped rows. This gives a
+        // fixed-height scrolling window — new rows slide in at the
+        // bottom, older rows fall off the top, the composer stays
+        // anchored. A `… N earlier lines` counter takes the first slot
+        // once overflow starts, so the user sees that there's
+        // thinking content above the window instead of it silently
+        // sliding away. Finalised cells render no body at all.
+        if self.live {
+            let inner_w = (width as usize).saturating_sub(2).max(20);
+            let mut body_rows: Vec<String> = Vec::new();
+            for logical in self.text.lines() {
+                for row in soft_wrap(logical, inner_w) {
+                    body_rows.push(row);
+                }
+            }
+            let total = body_rows.len();
+            let visible = if total > LIVE_PREVIEW_MAX_ROWS {
+                // Reserve row 0 for the overflow counter; show
+                // the last `LIVE_PREVIEW_MAX_ROWS - 1` actual rows
+                // so the window stays exactly at N rows even as
+                // overflow grows.
+                let tail = LIVE_PREVIEW_MAX_ROWS - 1;
+                let hidden = total - tail;
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("… {hidden} earlier lines"), dim),
+                ]));
+                total - tail
+            } else {
+                0
+            };
+            for row in body_rows.into_iter().skip(visible) {
+                lines.push(Line::from(vec![Span::raw("    "), Span::styled(row, body)]));
+            }
+        }
+
+        lines
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -295,33 +353,41 @@ mod tests {
     }
 
     #[test]
-    fn live_cell_hides_raw_reasoning_body() {
+    fn live_body_rows_are_indented_under_bullet() {
+        // Live cells render their body so the user sees progress
+        // during long thinks. Each body row is indented under the
+        // header for visual alignment. Finalised cells collapse
+        // and have no body rows at all — see `finalised_cell_hides_body`.
         let mut c = ReasoningCell::new_streaming();
-        c.push_delta("I need to inspect tools\n<tool_result>secret</tool_result>");
+        c.push_delta("first thought\nsecond thought");
         let out = render(&c, 60, 4);
-        assert!(out.contains("Thought"), "header missing: {out}");
-        assert!(
-            !out.contains("I need to inspect tools"),
-            "raw reasoning must not render live: {out}"
-        );
-        assert!(
-            !out.contains("<tool_result>"),
-            "tool transcript fragments must not render live: {out}"
-        );
+        let body_rows: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.contains("Thought") && !l.trim().is_empty())
+            .collect();
+        assert!(!body_rows.is_empty(), "live cell must render body: {out}");
+        for row in &body_rows {
+            assert!(row.starts_with("    "), "body row must indent: {row:?}");
+        }
     }
 
     #[test]
-    fn live_cell_stays_single_header_line_even_with_many_rows() {
+    fn live_body_caps_at_preview_window_showing_tail_and_counter() {
+        // Growing thinking must not push the composer off-screen.
+        // Once more than `LIVE_PREVIEW_MAX_ROWS` rows have arrived
+        // the first slot is reserved for a `⋯ +N more` counter and
+        // the remaining slots show the most recent rows (tail).
         let mut c = ReasoningCell::new_streaming();
-        let total_rows = 20;
+        let total_rows = LIVE_PREVIEW_MAX_ROWS + 5;
         let padding: Vec<String> = (1..=total_rows).map(|i| format!("row {i}")).collect();
         c.push_delta(&padding.join("\n"));
 
         let lines = c.display_lines(60);
+        // Header + counter + (LIVE_PREVIEW_MAX_ROWS - 1) body rows.
         assert_eq!(
             lines.len(),
-            1,
-            "live reasoning should render only the compact header"
+            1 + LIVE_PREVIEW_MAX_ROWS,
+            "live body must clamp to header + {LIVE_PREVIEW_MAX_ROWS} slots"
         );
 
         let rendered: String = lines
@@ -329,16 +395,26 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(rendered.contains("Thought"), "header missing: {rendered}");
+        let hidden = total_rows - (LIVE_PREVIEW_MAX_ROWS - 1);
         assert!(
-            rendered.contains("20 lines"),
-            "line count missing: {rendered}"
+            rendered.contains(&format!("… {hidden} earlier lines")),
+            "overflow counter must show hidden-row count: {rendered}"
         );
-        assert!(!rendered.contains("row 1"), "raw body leaked: {rendered}");
+        assert!(
+            !rendered.contains("row 1 "),
+            "oldest row must have scrolled off: {rendered}"
+        );
+        let last = format!("row {total_rows}");
+        assert!(
+            rendered.contains(&last),
+            "most recent row must be visible: {rendered}"
+        );
     }
 
     #[test]
-    fn live_cell_has_no_overflow_counter() {
+    fn live_body_no_counter_when_under_window() {
+        // Below the cap there's no overflow — no counter line, just
+        // header + all rows.
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("alpha\nbeta\ngamma");
         let rendered: String = c
@@ -349,21 +425,23 @@ mod tests {
             .join(" ");
         assert!(
             !rendered.contains("⋯"),
-            "no raw reasoning overflow counter should render: {rendered}"
+            "no counter when rows fit in window: {rendered}"
         );
     }
 
     #[test]
-    fn live_cell_under_window_still_hides_every_row() {
+    fn live_body_under_window_shows_every_row() {
+        // With fewer body rows than the window, everything should
+        // still be visible — the cap kicks in only after overflow.
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("alpha\nbeta\ngamma");
         let out = render(&c, 60, 5);
         assert!(
-            !out.contains("alpha"),
-            "raw reasoning row must stay hidden: {out}"
+            out.contains("alpha"),
+            "early row must show under cap: {out}"
         );
-        assert!(!out.contains("beta"), "raw reasoning row leaked: {out}");
-        assert!(!out.contains("gamma"), "raw reasoning row leaked: {out}");
+        assert!(out.contains("beta"), "middle row must show: {out}");
+        assert!(out.contains("gamma"), "latest row must show: {out}");
     }
 
     #[test]

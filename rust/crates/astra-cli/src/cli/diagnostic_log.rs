@@ -43,7 +43,21 @@ pub(crate) fn init_cli_observability(cli: &Cli) {
 
 fn try_init_file_logging(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::OpenOptions;
-    use tracing_subscriber::{EnvFilter, fmt::time::UtcTime};
+    use std::path::Path;
+    use tracing_subscriber::{fmt::time::UtcTime, EnvFilter};
+
+    // **Path sandboxing**: reject paths that escape the intended directory.
+    // Prevents writing to sensitive locations like `/etc/cron.d/` or
+    // `~/.ssh/authorized_keys` via `--log-file` argument injection.
+    let p = Path::new(path);
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("log path contains '..' (escape attempt): {path}").into());
+    }
+    if p.is_absolute() && !p.starts_with("/tmp") && !p.starts_with(std::env::temp_dir()) {
+        return Err(format!("log path must be relative or under /tmp (got: {path})").into());
+    }
 
     let file = OpenOptions::new().create(true).append(true).open(path)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file);

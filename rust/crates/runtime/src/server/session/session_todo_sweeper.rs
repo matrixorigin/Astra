@@ -338,6 +338,7 @@ async fn detach_auto_archived_dependency_edges(
     let rows = sqlx::query(
         "SELECT todo_id, blocks, blocked_by FROM session_todos \
          WHERE session_id = ? \
+           AND (blocks IS NOT NULL OR blocked_by IS NOT NULL) \
          ORDER BY ordinal ASC \
          FOR UPDATE",
     )
@@ -397,57 +398,83 @@ pub(crate) async fn run_archive_gc_once(pool: SharedPool) -> Result<u64, String>
 async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, String> {
     let days = archive_retention_days();
     let limit = limit.max(1);
-    let mut tx = pool
-        .get()
-        .begin()
-        .await
-        .map_err(|e| format!("archive-gc tx begin: {e}"))?;
 
-    let rows: Vec<(String, String)> = sqlx::query(
-        "SELECT session_id, todo_id FROM session_todos \
-         WHERE status = 'archived' \
-           AND archived_at IS NOT NULL \
-           AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY archived_at ASC \
-         LIMIT ?",
-    )
-    .bind(days)
-    .bind(limit)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("archive-gc select: {e}"))?
-    .into_iter()
-    .filter_map(|row| {
-        let session_id: Option<String> = row.try_get("session_id").ok();
-        let todo_id: Option<String> = row.try_get("todo_id").ok();
-        match (session_id, todo_id) {
-            (Some(session_id), Some(todo_id)) => Some((session_id, todo_id)),
-            _ => None,
-        }
-    })
-    .collect();
+    // Process in sub-batches of SUB_BATCH_SIZE to avoid a single large
+    // transaction that delays the entire weekly GC on transient failure.
+    // Each sub-batch commits independently so partial progress survives.
+    const SUB_BATCH_SIZE: i64 = 50;
 
-    let mut affected = 0u64;
-    for (session_id, todo_id) in &rows {
-        let result = sqlx::query(
-            "DELETE FROM session_todos \
-             WHERE session_id = ? AND todo_id = ? AND status = 'archived' \
+    let mut total_affected = 0u64;
+    let mut remaining = limit;
+
+    while remaining > 0 {
+        let batch_size = remaining.min(SUB_BATCH_SIZE);
+        let mut tx = pool
+            .get()
+            .begin()
+            .await
+            .map_err(|e| format!("archive-gc tx begin: {e}"))?;
+
+        let rows: Vec<(String, String)> = sqlx::query(
+            "SELECT session_id, todo_id FROM session_todos \
+             WHERE status = 'archived' \
                AND archived_at IS NOT NULL \
-               AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+               AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+             ORDER BY archived_at ASC \
+             LIMIT ?",
         )
-        .bind(session_id)
-        .bind(todo_id)
         .bind(days)
-        .execute(&mut *tx)
+        .bind(batch_size)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| format!("archive-gc delete: {e}"))?;
-        affected = affected.saturating_add(result.rows_affected());
+        .map_err(|e| format!("archive-gc select: {e}"))?
+        .into_iter()
+        .filter_map(|row| {
+            let session_id: Option<String> = row.try_get("session_id").ok();
+            let todo_id: Option<String> = row.try_get("todo_id").ok();
+            match (session_id, todo_id) {
+                (Some(session_id), Some(todo_id)) => Some((session_id, todo_id)),
+                _ => None,
+            }
+        })
+        .collect();
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut affected = 0u64;
+        for (session_id, todo_id) in &rows {
+            let result = sqlx::query(
+                "DELETE FROM session_todos \
+                 WHERE session_id = ? AND todo_id = ? AND status = 'archived' \
+                   AND archived_at IS NOT NULL \
+                   AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+            )
+            .bind(session_id)
+            .bind(todo_id)
+            .bind(days)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("archive-gc delete: {e}"))?;
+            affected = affected.saturating_add(result.rows_affected());
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("archive-gc commit: {e}"))?;
+
+        total_affected = total_affected.saturating_add(affected);
+        remaining -= batch_size;
+
+        // If this sub-batch returned fewer rows than requested, no more
+        // candidates exist — stop early.
+        if (rows.len() as i64) < batch_size {
+            break;
+        }
     }
 
-    tx.commit()
-        .await
-        .map_err(|e| format!("archive-gc commit: {e}"))?;
-    Ok(affected)
+    Ok(total_affected)
 }
 
 /// Spawn the stale-in_progress sweeper. Tick every 5 minutes;
@@ -467,6 +494,15 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
 
         let mut consecutive_failures: u32 = 0;
         loop {
+            // Exponential backoff: if we've failed too many times, sleep
+            // before the next tick to avoid burning CPU on deterministic
+            // panics (e.g., corrupt DB rows). Cap at 1 hour.
+            if consecutive_failures > STALE_SWEEP_ALERT_THRESHOLD {
+                let backoff_secs = (300u64
+                    << (consecutive_failures - STALE_SWEEP_ALERT_THRESHOLD).min(6))
+                .min(3600);
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            }
             interval.tick().await;
             let tick_result = AssertUnwindSafe(async {
                 match lease.check_leader().await {
