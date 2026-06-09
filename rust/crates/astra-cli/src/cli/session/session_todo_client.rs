@@ -615,8 +615,7 @@ mod wiring_e2e {
             observer.snapshot_for_render().tasks.is_empty(),
             "completed row past TTL must drop from render snapshot"
         );
-        // Truth snapshot still carries the row — counts (`/task list`,
-        // header chip) reflect the full set.
+        // Truth snapshot still carries the row — task-board counts reflect the full set.
         assert_eq!(observer.snapshot().tasks.len(), 1);
     }
 }

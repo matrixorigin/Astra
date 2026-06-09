@@ -934,7 +934,7 @@ async fn execute_repl_bridge_command(
     match slash_cmd {
         "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
-        "/task" => {
+        "/job" => {
             slash_task::handle_task_command(arg, &mut state, api, profile, token.as_deref()).await
         }
         "/memory" => {
@@ -1441,7 +1441,7 @@ pub(crate) async fn execute_cli_command(
             }
             _ => {
                 execute_repl_bridge_command(
-                    "/task",
+                    "/job",
                     &render_task_args(&args),
                     profile.as_deref(),
                     global_model.as_deref(),

@@ -285,7 +285,7 @@ pub(crate) struct SessionState {
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
     pub ingestion_user_id: Option<String>,
-    /// Local task service for /task commands.
+    /// Local/cloud job service for background job commands.
     pub task_service: Option<std::sync::Arc<dyn astra_services::TaskService>>,
     /// Cross-session tool health data for error budget persistence.
     pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,

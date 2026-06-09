@@ -126,9 +126,9 @@ pub(crate) async fn handle_task_command(
         None => {
             eprintln!(
                 "{}",
-                "  ⚠ Task service not available (local-only mode).".yellow()
+                "  ⚠ Job service not available (local-only mode).".yellow()
             );
-            eprintln!("{}", "  Use /login to enable cloud task tracking.".dim());
+            eprintln!("{}", "  Use /login to enable cloud job tracking.".dim());
             return;
         }
     };
@@ -144,13 +144,13 @@ pub(crate) async fn handle_task_command(
             Ok(tasks) if tasks.is_empty() => {
                 eprintln!(
                     "  {}",
-                    "No recent tasks. Use /task add <title> to create one.".dim()
+                    "No recent jobs. Use /job run <prompt> to start one.".dim()
                 );
             }
             Ok(tasks) => {
                 eprintln!(
                     "\n{}",
-                    "─── Recent Tasks ────────────────────────────────".bold()
+                    "─── Recent Jobs ─────────────────────────────────".bold()
                 );
                 for t in &tasks {
                     let icon = task_list_item_status_icon(t);
@@ -177,7 +177,7 @@ pub(crate) async fn handle_task_command(
                 }
                 eprintln!(
                     "  {}",
-                    "Use /task pending for the oldest-first claimable queue.".dim()
+                    "Use /job pending for the oldest-first claimable queue.".dim()
                 );
                 eprintln!();
             }
@@ -218,48 +218,6 @@ pub(crate) async fn handle_task_command(
             }
             Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
         },
-        "add" if !sub_arg.is_empty() => {
-            match svc
-                .create_task(
-                    user_id,
-                    session_id,
-                    TaskCreateRequest {
-                        title: sub_arg.to_string(),
-                        description: None,
-                        plan: None,
-                        parent_task_id: None,
-                        project_type: None,
-                        goal_pattern: None,
-                    },
-                )
-                .await
-            {
-                Ok(tid) => {
-                    let short = &tid[..8.min(tid.len())];
-                    eprintln!(
-                        "  {} Task created: {} ({})",
-                        theme::icon_ok(),
-                        sub_arg,
-                        short.dim()
-                    );
-                }
-                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-            }
-        }
-        "done" if !sub_arg.is_empty() => {
-            // Find task by prefix match on task_id or title
-            match find_task_by_query(&*svc, user_id, sub_arg).await {
-                Ok(Some(tid)) => match svc.complete_task(&tid).await {
-                    Ok(()) => eprintln!("  {} Task completed: {}", theme::icon_ok(), sub_arg),
-                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-                },
-                Ok(None) => {
-                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
-                }
-                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-            }
-        }
         "status" if !sub_arg.is_empty() => {
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.get_task(&tid).await {
@@ -267,7 +225,7 @@ pub(crate) async fn handle_task_command(
                         let read = load_task_result_read_surface(&t);
                         eprintln!(
                             "\n{}",
-                            "─── Task Detail ─────────────────────────────────".bold()
+                            "─── Job Detail ──────────────────────────────────".bold()
                         );
                         eprintln!("  {:<12} {}", "id:".dim(), t.task_id.as_str().magenta());
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
@@ -301,14 +259,14 @@ pub(crate) async fn handle_task_command(
                         eprintln!();
                     }
                     Ok(None) => {
-                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                        eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                        eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
+                        eprintln!("{}", "  Use /job list to see available jobs.".dim());
                     }
                     Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
                 },
                 Ok(None) => {
-                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                    eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /job list to see available jobs.".dim());
                 }
                 Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
@@ -380,7 +338,7 @@ pub(crate) async fn handle_task_command(
             let bg_root_agent_id = format!("task-{task_id}");
 
             eprintln!(
-                "  {} Background task started: {} ({})",
+                "  {} Background job started: {} ({})",
                 "▶".magenta(),
                 if sub_arg.len() > 50 {
                     format!("{}…", sub_arg.chars().take(50).collect::<String>())
@@ -391,7 +349,7 @@ pub(crate) async fn handle_task_command(
             );
             eprintln!(
                 "  {}",
-                "Use /task status or /task result to check progress.".dim()
+                "Use /job status or /job result to check progress.".dim()
             );
 
             // Spawn background task
@@ -507,7 +465,7 @@ pub(crate) async fn handle_task_command(
                                     "completed"
                                 };
                                 eprintln!(
-                                    "\n  {} Background task {} {}. Use /task result {} to view.",
+                                    "\n  {} Background job {} {}. Use /job result {} to view.",
                                     icon,
                                     short.magenta(),
                                     terminal,
@@ -516,7 +474,7 @@ pub(crate) async fn handle_task_command(
                             }
                             Err(error) => {
                                 eprintln!(
-                                    "\n  {} Background task {} failed: {}",
+                                    "\n  {} Background job {} failed: {}",
                                     theme::icon_err(),
                                     short.magenta(),
                                     error.red()
@@ -533,7 +491,7 @@ pub(crate) async fn handle_task_command(
                         )
                         .await;
                         eprintln!(
-                            "\n  {} Background task {} failed: {}",
+                            "\n  {} Background job {} failed: {}",
                             theme::icon_err(),
                             short.magenta(),
                             error.red()
@@ -543,7 +501,7 @@ pub(crate) async fn handle_task_command(
             });
         }
         "result" if !sub_arg.is_empty() => {
-            // Show the full result of a background task
+            // Show the full result of a background job.
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.get_task(&tid).await {
                     Ok(Some(t)) => {
@@ -551,7 +509,7 @@ pub(crate) async fn handle_task_command(
                         let short = &t.task_id[..8.min(t.task_id.len())];
                         eprintln!(
                             "\n{}",
-                            format!("─── Task Result ({short}) ─────────────────────────").bold()
+                            format!("─── Job Result ({short}) ──────────────────────────").bold()
                         );
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
                         for field in task_result_header_fields(&read) {
@@ -591,21 +549,19 @@ pub(crate) async fn handle_task_command(
                         eprintln!();
                     }
                     Ok(None) => {
-                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                        eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
                     }
                     Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
                 },
                 Ok(None) => {
-                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                    eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /job list to see available jobs.".dim());
                 }
                 Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
         }
         _ => {
-            eprintln!(
-                "  Usage: /task [list | pending | add <title> | done <id> | status <id> | run <prompt> | result <id>]"
-            );
+            eprintln!("  Usage: /job [list | pending | status <id> | run <prompt> | result <id>]");
         }
     }
 }

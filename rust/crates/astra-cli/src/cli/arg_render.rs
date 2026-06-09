@@ -74,8 +74,6 @@ pub(crate) fn render_task_args(args: &TaskArgs) -> String {
     match &args.command {
         None | Some(TaskSubcommand::List) => String::new(),
         Some(TaskSubcommand::Pending) => "pending".to_string(),
-        Some(TaskSubcommand::Add(cmd)) => format!("add {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Done(cmd)) => format!("done {}", join_words(&cmd.query)),
         Some(TaskSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
         Some(TaskSubcommand::Run(cmd)) => format!("run {}", join_words(&cmd.text)),
         Some(TaskSubcommand::Queue(cmd)) => format!("add {}", join_words(&cmd.text)),

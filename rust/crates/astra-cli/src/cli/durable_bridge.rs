@@ -6,7 +6,6 @@
 
 use crate::cli::cli_config::cli_utils::{prefix_chars, truncate_str};
 
-use astra_services::task_orchestrator::TaskOutcome;
 use astra_services::{
     ContractAmendment, ContractGenerator, DurableTaskLifecycle, LocalDurableTaskLifecycle,
     SubtaskStage, SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerifierKind,
@@ -648,37 +647,6 @@ pub(crate) fn display_delivery_report(report: &TaskDeliveryReport) {
 
     // ─── Footer ──────────────────────────────────────────────────────────────
     eprintln!("  {}", separator.as_str().dim());
-}
-
-/// Outcome and `(progress_pct, items_done, items_total)` for `/task list` after plan execution.
-/// Aligns with [`display_delivery_report`] (Delivered → [`TaskOutcome::Success`], else [`TaskOutcome::Partial`]).
-pub fn plan_run_finish_from_delivery_report(
-    report: &TaskDeliveryReport,
-) -> (TaskOutcome, u32, u32, u32) {
-    let all_subtasks_verified = report
-        .subtask_summaries
-        .iter()
-        .all(|s| s.criteria_passed == s.criteria_total);
-    let all_global_passed = report.global_verification.iter().all(|r| r.passed);
-    let fully_delivered = all_subtasks_verified && all_global_passed;
-
-    let items_total = report.subtask_summaries.len() as u32;
-    let items_done = report
-        .subtask_summaries
-        .iter()
-        .filter(|s| s.criteria_passed == s.criteria_total)
-        .count() as u32;
-    let progress_pct = items_done
-        .saturating_mul(100)
-        .checked_div(items_total)
-        .unwrap_or(if fully_delivered { 100 } else { 0 });
-
-    let outcome = if fully_delivered {
-        TaskOutcome::Success
-    } else {
-        TaskOutcome::Partial
-    };
-    (outcome, progress_pct, items_done, items_total)
 }
 
 /// Save the delivery report as JSON to the working directory.

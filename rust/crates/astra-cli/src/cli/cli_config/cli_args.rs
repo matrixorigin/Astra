@@ -503,7 +503,7 @@ pub(crate) struct TeamRestoreArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra task list\n  astra task pending\n  astra task add 修复登录重定向\n  astra task run 在当前目录补一个最小登录页\n  astra task result abc12345"
+    after_help = "Examples:\n  astra task list\n  astra task pending\n  astra task run 在当前目录补一个最小登录页\n  astra task result abc12345"
 )]
 pub(crate) struct TaskArgs {
     #[command(subcommand)]
@@ -516,10 +516,6 @@ pub(crate) enum TaskSubcommand {
     List,
     /// List claimable task queue (oldest first)
     Pending,
-    /// Create a task
-    Add(TaskTextArgs),
-    /// Mark a task as done
-    Done(TaskQueryArgs),
     /// Show task status and details
     Status(TaskQueryArgs),
     /// Run a headless task with the agent

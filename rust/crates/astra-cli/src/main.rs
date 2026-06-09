@@ -3479,7 +3479,7 @@ total_tokens_out: 500
         let tmp = tempfile::tempdir().unwrap();
         let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
 
-        // Create a task (simulates what /task run does)
+        // Create a task record (simulates what `astra task run` does).
         let tid = svc
             .create_task(
                 "test-user",
@@ -3526,7 +3526,7 @@ total_tokens_out: 500
         // Complete the task
         svc.complete_task(&tid).await.unwrap();
 
-        // Read back and verify (simulates /task result)
+        // Read back and verify (simulates `astra task result`).
         let record = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         let cp = record.checkpoint.unwrap();

@@ -909,8 +909,7 @@ mod tests {
             "completed task aged past TTL must drop from render snapshot: {:?}",
             render.tasks
         );
-        // Truth snapshot still reports the row so /task list and counts
-        // remain accurate.
+        // Truth snapshot still reports the row so task-board counts remain accurate.
         let truth = obs.snapshot();
         assert_eq!(truth.tasks.len(), 1, "snapshot() must keep aged rows");
     }
