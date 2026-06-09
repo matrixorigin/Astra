@@ -3361,6 +3361,32 @@ impl ServerToolExecutor {
                 plan_state.plan.subtasks.len()
             ));
         }
+        let snapshot = self
+            .task_manager
+            .try_snapshot_state()
+            .await
+            .map_err(|error| format!("snapshot task board before approved-plan mirror: {error}"))?;
+        match self
+            .mirror_approved_plan_to_task_board_inner(plan_id, plan_state)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Err(restore_error) = self.task_manager.restore_snapshot(&snapshot).await {
+                    return Err(format!(
+                        "{error}; additionally failed to roll back approved-plan task-board mirror: {restore_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn mirror_approved_plan_to_task_board_inner(
+        &self,
+        plan_id: &str,
+        plan_state: &astra_plan::PlanModeState,
+    ) -> Result<(), String> {
         let plan_fingerprint = Self::plan_task_board_fingerprint(&plan_state.plan);
 
         let mut step_task_ids = HashMap::new();
@@ -4507,37 +4533,25 @@ impl ServerToolExecutor {
         // /plans/{id}/execute. Rejecting keeps the plan linked for another
         // authoring pass.
         if approved {
-            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
-                return format!("Error: clear active plan: {e}");
-            }
-
             let approved_plan_state = match repo.load(&active).await {
-                Ok(state) => Some(state),
+                Ok(state) => state,
                 Err(e) => {
-                    tracing::warn!(
-                        plan_id = %active,
-                        session_id = %self.session_id,
-                        error = %e,
-                        "exit_plan_mode: failed to load approved plan for task synchronization"
-                    );
-                    None
+                    return format!("Error: load approved plan for task synchronization: {e}");
                 }
             };
 
             // Keep the user-visible task board aligned with the approved
             // plan. The task board is the single user-visible execution
             // surface for approved plan work.
-            if let Some(plan_state) = approved_plan_state.as_ref()
-                && let Err(e) = self
-                    .mirror_approved_plan_to_task_board(&active, plan_state)
-                    .await
+            if let Err(e) = self
+                .mirror_approved_plan_to_task_board(&active, &approved_plan_state)
+                .await
             {
-                tracing::warn!(
-                    plan_id = %active,
-                    session_id = %self.session_id,
-                    error = %e,
-                    "exit_plan_mode: failed to mirror approved plan into task board"
-                );
+                return format!("Error: failed to mirror approved plan into task board: {e}");
+            }
+
+            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
+                return format!("Error: clear active plan: {e}");
             }
         }
 
@@ -7680,6 +7694,80 @@ esac
                     == Some("plan-visible-task")
             }),
             "approved plan steps should all carry the plan id: {approved_plan_tasks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_rolls_back_partial_task_board_mirror_failure() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "rollback server plan".into(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "create first server step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-2".into(),
+                title: "x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-rollback-task-board", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("rollback-session", Some("plan-rollback-task-board"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "rollback-session".to_string();
+        exec.user_id = "alice".to_string();
+        let existing = exec
+            .task_manager
+            .create(&json!({
+                "title": "Existing server task",
+            }))
+            .await;
+        assert!(!existing.starts_with("Error:"), "{existing}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("Error:") && result.contains("title") && result.contains("exceeds"),
+            "exit_plan_mode should surface the original task-board mirror failure: {result}"
+        );
+
+        let tasks = exec.task_manager.snapshot().await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "failed server approved-plan mirror must roll back earlier step tasks: {tasks:?}"
+        );
+        assert_eq!(tasks[0].title, "Existing server task");
+        assert!(
+            tasks[0].metadata.is_none(),
+            "rollback must preserve unrelated user task exactly: {tasks:?}"
+        );
+        let active = repo
+            .active_plan_for_session("rollback-session")
+            .await
+            .expect("active plan lookup after failed approval");
+        assert_eq!(
+            active.as_deref(),
+            Some("plan-rollback-task-board"),
+            "failed task-board mirror must keep plan mode active so writes stay guarded"
         );
     }
 

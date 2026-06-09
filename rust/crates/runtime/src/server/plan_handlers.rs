@@ -631,6 +631,32 @@ async fn mirror_approved_plan_to_task_board(
             plan_state.plan.subtasks.len()
         ));
     }
+    let snapshot = manager
+        .try_snapshot_state()
+        .await
+        .map_err(|error| format!("snapshot task board before approved-plan mirror: {error}"))?;
+    match mirror_approved_plan_to_task_board_inner(manager, owner, session_id, plan_id, plan_state)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(restore_error) = manager.restore_snapshot(&snapshot).await {
+                return Err(format!(
+                    "{error}; additionally failed to roll back approved-plan task-board mirror: {restore_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn mirror_approved_plan_to_task_board_inner(
+    manager: &TaskManager,
+    owner: &str,
+    session_id: &str,
+    plan_id: &str,
+    plan_state: &PlanModeState,
+) -> Result<(), String> {
     let plan_fingerprint = plan_task_board_fingerprint(&plan_state.plan);
 
     let mut step_task_ids = HashMap::new();
@@ -828,23 +854,14 @@ async fn mirror_approved_plan_to_task_board_if_configured(
     session_id: &str,
     plan_id: &str,
     plan_state: &PlanModeState,
-) {
+) -> Result<(), String> {
     let Some(pool) = state.shared_pool.as_ref() else {
-        return;
+        return Ok(());
     };
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::from_shared(pool).with_user_id(user_id));
     let manager = TaskManager::new(session_id.to_string(), store);
-    if let Err(error) =
-        mirror_approved_plan_to_task_board(&manager, user_id, session_id, plan_id, plan_state).await
-    {
-        tracing::warn!(
-            plan_id = %plan_id,
-            session_id = %session_id,
-            error = %error,
-            "exit_plan_mode: failed to mirror approved plan into task board"
-        );
-    }
+    mirror_approved_plan_to_task_board(&manager, user_id, session_id, plan_id, plan_state).await
 }
 
 async fn sync_plan_task_board_subtask_status(
@@ -1353,11 +1370,6 @@ pub(super) async fn exit_plan_mode_handler(
     // plan pinned so the next authoring pass still sees the guard.
     if req.approved {
         if let Some(sid) = session_hint.as_deref() {
-            state
-                .plan_repo
-                .set_active_plan(sid, None)
-                .await
-                .map_err(map_plan_load_err)?;
             mirror_approved_plan_to_task_board_if_configured(
                 &state,
                 &user.user_id,
@@ -1365,7 +1377,18 @@ pub(super) async fn exit_plan_mode_handler(
                 &plan_id,
                 &plan_state,
             )
-            .await;
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to mirror approved plan into task board: {error}"),
+                )
+            })?;
+            state
+                .plan_repo
+                .set_active_plan(sid, None)
+                .await
+                .map_err(map_plan_load_err)?;
         }
     }
 
@@ -2323,9 +2346,55 @@ mod tests {
         .expect_err("task-board load failure should abort approved-plan mirror");
 
         assert!(
-            error.contains("load task board before approved-plan mirror")
+            error.contains("snapshot task board before approved-plan mirror")
                 && error.contains("forced task-board load failure"),
             "approved-plan mirror must not treat task-board load failure as an empty board: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_approved_plan_mirror_rolls_back_partial_step_create_failure() {
+        let manager = TaskManager::in_memory();
+        let existing = manager
+            .create(&serde_json::json!({
+                "title": "Existing cloud task",
+            }))
+            .await;
+        assert!(!existing.starts_with("Error:"), "{existing}");
+        let mut state = PlanModeState::new_with_owner("rollback cloud plan".into(), "alice".into());
+        state.plan = task_plan(vec![
+            subtask("step-1", "Create first cloud step", TaskStatus::Pending),
+            subtask(
+                "step-2",
+                &"x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1),
+                TaskStatus::Pending,
+            ),
+        ]);
+
+        let err = mirror_approved_plan_to_task_board(
+            &manager,
+            "alice",
+            "session-cloud-rollback",
+            "plan-cloud-rollback",
+            &state,
+        )
+        .await
+        .expect_err("invalid later step should abort approved-plan mirror");
+
+        assert!(
+            err.contains("title") && err.contains("exceeds"),
+            "original create validation error should be surfaced: {err}"
+        );
+        let tasks = manager.snapshot().await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "failed HTTP approved-plan mirror must roll back earlier step tasks: {tasks:?}"
+        );
+        assert_eq!(tasks[0].title, "Existing cloud task");
+        assert!(
+            tasks[0].metadata.is_none(),
+            "rollback must preserve unrelated user task exactly: {tasks:?}"
         );
     }
 
@@ -2720,6 +2789,64 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 == Some("plan-matrixone-visible")
         }));
+
+        cleanup_session_todos(&pool, &session_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
+    async fn http_approved_plan_mirror_rolls_back_partial_failure_in_matrixone() {
+        let shared = bootstrap_shared_pool().await;
+        let pool = shared.get().clone();
+        let user_id = format!("u-plan-rollback-{}", uuid::Uuid::new_v4());
+        let session_id = format!("s-plan-rollback-{}", uuid::Uuid::new_v4());
+        cleanup_session_todos(&pool, &session_id).await;
+
+        let store: Arc<dyn TaskStore> =
+            Arc::new(MatrixOneTaskStore::from_shared(&shared).with_user_id(&user_id));
+        let manager = TaskManager::new(session_id.clone(), store);
+        let existing = manager
+            .create(&serde_json::json!({
+                "title": "Existing MatrixOne task",
+            }))
+            .await;
+        assert!(existing.contains("\"success\":true"), "{existing}");
+        let mut state =
+            PlanModeState::new_with_owner("rollback MatrixOne plan".into(), user_id.clone());
+        state.plan = task_plan(vec![
+            subtask("step-1", "Create first MatrixOne step", TaskStatus::Pending),
+            subtask(
+                "step-2",
+                &"x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1),
+                TaskStatus::Pending,
+            ),
+        ]);
+
+        let err = mirror_approved_plan_to_task_board(
+            &manager,
+            &user_id,
+            &session_id,
+            "plan-http-matrixone-rollback",
+            &state,
+        )
+        .await
+        .expect_err("invalid later step should abort MatrixOne approved-plan mirror");
+
+        assert!(
+            err.contains("title") && err.contains("exceeds"),
+            "original create validation error should be surfaced: {err}"
+        );
+        let tasks = manager.snapshot().await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "failed MatrixOne approved-plan mirror must roll back earlier step tasks: {tasks:?}"
+        );
+        assert_eq!(tasks[0].title, "Existing MatrixOne task");
+        assert!(
+            tasks[0].metadata.is_none(),
+            "rollback must preserve unrelated MatrixOne task exactly: {tasks:?}"
+        );
 
         cleanup_session_todos(&pool, &session_id).await;
     }
