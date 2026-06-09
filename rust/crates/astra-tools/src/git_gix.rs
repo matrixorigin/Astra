@@ -139,22 +139,7 @@ fn estimate_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Truncate output to a byte limit, preferring line boundaries.
-fn truncate_output(mut output: String, max_bytes: usize) -> String {
-    if output.len() > max_bytes {
-        let end = output.floor_char_boundary(max_bytes);
-        let cut = output[..end]
-            .rfind('\n')
-            .filter(|&pos| pos > end / 2)
-            .map(|pos| pos + 1)
-            .unwrap_or(end);
-        output.truncate(cut);
-        output.push_str("\n[truncated]");
-    }
-    output
-}
-
-// ~4K tokens; was 30K
+use crate::truncate_output;
 
 fn percent_decode_path_token(input: &str) -> Result<String, String> {
     fn hex(b: u8) -> Option<u8> {
