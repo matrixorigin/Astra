@@ -2120,14 +2120,14 @@ impl ToolExecutor {
 
     async fn task_background_shell(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
+            return "Error: background command subsystem not active in this session (no TUI/REPL attached). \
                     Use the regular `bash` tool for foreground shell commands, or run inside the interactive REPL \
-                    (`astra`) to access background_shell."
+                    (`astra`) to access `job(action='shell')`."
                 .to_string();
         };
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c.to_string(),
-            _ => return "Error: 'command' is required for background_shell".to_string(),
+            _ => return "Error: 'command' is required for job(action='shell')".to_string(),
         };
         let description = args
             .get("description")
@@ -2166,7 +2166,7 @@ impl ToolExecutor {
 
     async fn task_list_bg(&self) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background job subsystem not active in this session (no TUI/REPL attached)."
+            return "Error: background command subsystem not active in this session (no TUI/REPL attached)."
                 .to_string();
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2180,8 +2180,8 @@ impl ToolExecutor {
 
     async fn task_output(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
-                    `job(action='output')` only works for jobs spawned via `job(action='shell')` \
+            return "Error: background command subsystem not active in this session (no TUI/REPL attached). \
+                    `job(action='output')` only works for commands spawned via `job(action='shell')` \
                     inside the interactive REPL."
                 .to_string();
         };
@@ -2282,8 +2282,8 @@ impl ToolExecutor {
 
     async fn task_kill_bg(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return "Error: background job subsystem not active in this session (no TUI/REPL attached). \
-                    Nothing to kill — background_shell is unavailable outside the interactive REPL."
+            return "Error: background command subsystem not active in this session (no TUI/REPL attached). \
+                    Nothing to kill — `job(action='kill')` only works for commands spawned inside the interactive REPL."
                 .to_string();
         };
         let job_id = match args.get("job_id").and_then(Value::as_str) {
@@ -4734,7 +4734,7 @@ mod tests {
 
     /// P0 regression: when ToolExecutor is constructed without a
     /// wired `bg_task_commands` queue (no TUI to drain), the
-    /// background_shell action MUST fail fast with a clear error
+    /// `job(action='shell')` MUST fail fast with a clear error
     /// instead of pushing to an orphan queue and hanging on rx.await.
     #[tokio::test]
     async fn task_background_shell_fails_fast_when_unwired() {
@@ -4753,6 +4753,10 @@ mod tests {
                 || result.contains("not active")
                 || result.contains("Error"),
             "should fail fast, not hang. got: {result}"
+        );
+        assert!(
+            !result.contains("background_shell"),
+            "unwired job shell errors must not mention the removed background_shell action: {result}"
         );
     }
 
