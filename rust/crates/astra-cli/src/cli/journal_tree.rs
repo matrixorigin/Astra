@@ -163,7 +163,7 @@ pub(crate) fn fold_events_into_tree(
                                 .run_id
                                 .unwrap_or_else(|| format!("delegate-{seq}")),
                             projection.agent_type,
-                            projection.task.map(|s| truncate(&s, 120)),
+                            projection.task.map(|s| truncate_label(&s, 120)),
                         )
                     }
                     JournalEventType::DelegationSubRunStarted => {
@@ -173,7 +173,7 @@ pub(crate) fn fold_events_into_tree(
                                 .run_id
                                 .unwrap_or_else(|| format!("delegate-{seq}")),
                             projection.agent_type,
-                            projection.task.map(|s| truncate(&s, 120)),
+                            projection.task.map(|s| truncate_label(&s, 120)),
                         )
                     }
                     _ => unreachable!(),
@@ -250,14 +250,7 @@ pub(crate) fn fold_events_into_tree(
     (root, events.len() as u32, skipped)
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max).collect();
-        format!("{head}…")
-    }
-}
+use crate::cli::effects::truncate_label;
 
 /// Render the tree as ASCII art into a String.
 pub fn render_text(root: &DelegationNode) -> String {

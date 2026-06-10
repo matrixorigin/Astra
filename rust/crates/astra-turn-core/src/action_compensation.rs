@@ -431,15 +431,44 @@ fn compress_context_compensation_summary() -> &'static str {
 }
 
 fn task_create_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-task snapshot; `task_stop` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-task snapshot; `task(action='stop')` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
 }
 
 fn task_update_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-update task snapshot; otherwise use `task_get` plus the `previous_status` from the tool result and rerun `task_update` manually"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-update task snapshot; otherwise use `task(action='get')` plus the `previous_status` from the tool result and rerun `task(action='update', task_id='...', new_status='<previous_status>')` manually"
 }
 
 fn task_stop_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task_update` with the `previous_status` from the tool result to reopen the task manually"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task(action='update', task_id='...', new_status='<previous_status>')` with the `previous_status` from the tool result to reopen the task manually"
+}
+
+fn task_action_profile(args: &Value) -> ActionCompensationProfile {
+    match string_arg(args, "action")
+        .unwrap_or("list")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "create" => {
+            session_state_action_profile(ActionCategory::Write, task_create_compensation_summary())
+        }
+        "update" => {
+            let category = match string_arg(args, "new_status") {
+                Some("deleted") => ActionCategory::Destructive,
+                _ => ActionCategory::Write,
+            };
+            session_state_action_profile(category, task_update_compensation_summary())
+        }
+        "stop" => session_state_action_profile(
+            ActionCategory::Destructive,
+            task_stop_compensation_summary(),
+        ),
+        "archive" => session_state_action_profile(
+            ActionCategory::Write,
+            "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-archive task snapshot",
+        ),
+        "list" | "get" | "list_user" => ActionCompensationProfile::read(true),
+        _ => ActionCompensationProfile::read(true),
+    }
 }
 
 fn session_state_action_profile(
@@ -616,18 +645,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Write,
             compress_context_compensation_summary(),
         ),
-        "task_create" => session_state_action_profile(
-            ActionCategory::Write,
-            task_create_compensation_summary(),
-        ),
-        "task_update" => session_state_action_profile(
-            ActionCategory::Write,
-            task_update_compensation_summary(),
-        ),
-        "task_stop" => session_state_action_profile(
-            ActionCategory::Destructive,
-            task_stop_compensation_summary(),
-        ),
+        "task" => task_action_profile(&normalized_args),
         "git" => match string_arg(&normalized_args, "action")
             .map(|action| action.to_ascii_lowercase())
             .as_deref()
@@ -1134,7 +1152,7 @@ mod tests {
 
     #[test]
     fn task_mutators_use_session_rollback_compensation() {
-        let create = tool_action_profile("task_create", &json!({"title": "demo"}));
+        let create = tool_action_profile("task", &json!({"action": "create", "title": "demo"}));
         assert!(create.bounded);
         assert_eq!(create.category, ActionCategory::Write);
         assert!(create.reversible);
@@ -1151,8 +1169,8 @@ mod tests {
         );
 
         let update = tool_action_profile(
-            "task_update",
-            &json!({"task_id": "task-1", "status": "done"}),
+            "task",
+            &json!({"action": "update", "task_id": "task-1", "new_status": "completed"}),
         );
         assert!(update.bounded);
         assert_eq!(update.category, ActionCategory::Write);
@@ -1168,8 +1186,15 @@ mod tests {
                 .unwrap_or_default()
                 .contains("pre-update task snapshot")
         );
+        assert!(
+            update
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("new_status='<previous_status>'")
+        );
 
-        let stop = tool_action_profile("task_stop", &json!({"task_id": "task-1"}));
+        let stop = tool_action_profile("task", &json!({"action": "stop", "task_id": "task-1"}));
         assert!(stop.bounded);
         assert_eq!(stop.category, ActionCategory::Destructive);
         assert!(stop.reversible);
@@ -1183,6 +1208,31 @@ mod tests {
                 .unwrap_or_default()
                 .contains("previous_status")
         );
+        assert!(
+            stop.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("new_status='<previous_status>'")
+        );
+    }
+
+    #[test]
+    fn task_read_actions_do_not_require_session_rollback_compensation() {
+        for args in [
+            json!({"action": "list"}),
+            json!({"action": "get", "task_id": "task-1"}),
+        ] {
+            let profile = tool_action_profile("task", &args);
+            assert_eq!(profile.category, ActionCategory::Read);
+            assert!(profile.compensation_kind.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_task_tool_names_are_not_special_compensation_surfaces() {
+        let profile = tool_action_profile("task_create", &json!({"title": "demo"}));
+        assert_eq!(profile.category, ActionCategory::Read);
+        assert!(profile.compensation_kind.is_none());
     }
 
     #[test]

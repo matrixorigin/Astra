@@ -18,6 +18,7 @@ use super::render::renderable::{FlexRenderable, Renderable, RenderableItem};
 use super::task_board_observer::TaskBoardObserver;
 use super::terminal::TerminalGuard;
 use super::{chat_widget, status_indicator, task_list};
+use crate::cli::effects::truncate_label;
 
 // ───────────────────────────────────────────────────────────────────────
 // Active-view grammar
@@ -732,21 +733,6 @@ pub(crate) fn format_short_elapsed(ms: u64) -> String {
     }
 }
 
-/// Char-aware label truncation with a single-character ellipsis.
-/// Multi-byte safe (CJK label like "审查代码" stays valid). When
-/// `max == 0` returns empty string. When the label fits, returned
-/// as-is.
-pub(crate) fn truncate_label(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{truncated}…")
-}
-
 // ───────────────────────────────────────────────────────────────────────
 // Priority resolver tests
 // ───────────────────────────────────────────────────────────────────────
@@ -878,7 +864,9 @@ mod task_board_draw_tests {
         );
         let mgr = TaskManager::new("draw-hidden", store as Arc<dyn TaskStore>);
         mgr.create(&serde_json::json!({"title": "done"})).await;
-        mgr.update(&serde_json::json!({"task_id": "task-1", "status": "completed"}))
+        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
             || obs.snapshot().tasks.len() == 1,

@@ -9,7 +9,7 @@
 
 use super::{
     ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
-    term_width,
+    term_width, truncate_label,
 };
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal};
@@ -45,7 +45,7 @@ impl PlanActivitySpinner {
             };
         }
 
-        let tag = truncate_tag(subtask_tag, 16);
+        let tag = truncate_label(subtask_tag, 16);
         let full_label = format!("[{tag}] {label}");
         let t0 = std::time::Instant::now();
         let w = term_width();
@@ -106,18 +106,4 @@ impl Drop for PlanActivitySpinner {
         }
         clear_stderr_line();
     }
-}
-
-/// Truncate a subtask tag to fit in the spinner line.
-fn truncate_tag(s: &str, max_chars: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= max_chars {
-        return t.to_string();
-    }
-    format!(
-        "{}…",
-        t.chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>()
-    )
 }

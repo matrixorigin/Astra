@@ -634,6 +634,7 @@ dependencies = [
  "astra-core",
  "astra-prompts",
  "astra-sandbox",
+ "astra-services",
  "astra-turn-types",
  "async-trait",
  "base64",

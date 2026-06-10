@@ -1707,9 +1707,41 @@ pub(crate) const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
 pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 
 /// Maximum number of times the harness pause signal triggers checkpoint
-/// injection and loop continuation before giving up and exiting with
-/// a `HarnessPaused` interruption.
+/// injection and loop continuation before forcing a text-only finalization
+/// turn.
 const MAX_HARNESS_PAUSE_RECOVERIES: u32 = 2;
+
+fn harness_pause_finalization_message(reason: &str, original_query: &str) -> String {
+    format!(
+        "Harness checkpoint: the run is still in a read-heavy stall after repeated recovery prompts.\n\n\
+         You must stop using tools and produce a concise final response now.\n\n\
+         REQUIRED final response:\n\
+         - Summarize the concrete evidence already gathered.\n\
+         - State the most likely conclusion or fix path.\n\
+         - If the task is not complete, say exactly what remains and why.\n\
+         - Do not mention internal harness implementation details unless they are necessary to explain why work stopped.\n\n\
+         Original user query: {original_query}\n\n\
+         Checkpoint reason: {reason}"
+    )
+}
+
+fn force_text_only_harness_finalization<H: AgenticLoopHost>(
+    host: &H,
+    state: &mut AgenticLoopState,
+    reason: &str,
+) {
+    // Reserve one last LLM call for the user-visible summary. Without this,
+    // the recovery turns themselves can consume the remaining budget and the
+    // user sees a BudgetExhausted interruption instead of the intended wrap-up.
+    state.remaining_turns = state.remaining_turns.max(1);
+    for name in host.valid_tool_names() {
+        state.restricted_tools.insert(name.clone());
+    }
+    state.messages.push(serde_json::json!({
+        "role": "user",
+        "content": harness_pause_finalization_message(reason, &state.message),
+    }));
+}
 
 fn apply_harness_pause_recovery_threshold(
     state: &mut AgenticLoopState,
@@ -2090,15 +2122,10 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     tracing::warn!(
                         count = harness_pause_recovery_count,
                         reason = %reason,
-                        "harness pause recovery limit exceeded at PostTurn"
+                        "harness pause recovery limit exceeded at PostTurn; forcing text-only finalization"
                     );
-                    set_harness_interruption(
-                        state,
-                        astra_turn_core::interruption::InterruptionKind::HarnessPaused,
-                        &reason,
-                    );
-                    finalize_and_render(host, state).await;
-                    return Ok(AgenticLoopOutcome::Completed);
+                    force_text_only_harness_finalization(host, state, &reason);
+                    continue;
                 }
                 tracing::info!(
                     count = harness_pause_recovery_count,
@@ -2778,6 +2805,7 @@ pub(crate) mod tests {
     fn task_board_snapshot_summarizes_active_tasks_stably() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
+                archived_at: None,
                 id: "task-2".to_string(),
                 title: "add runtime tests".to_string(),
                 description: None,
@@ -2792,6 +2820,7 @@ pub(crate) mod tests {
                 blocked_by: vec!["task-1".to_string()],
             },
             SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "wire completion guard".to_string(),
                 description: None,
@@ -2806,6 +2835,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-3".to_string(),
                 title: "already done".to_string(),
                 description: None,
@@ -2844,6 +2874,7 @@ pub(crate) mod tests {
     fn task_board_snapshot_ignores_terminal_and_archived_tasks() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "waiting".to_string(),
                 description: None,
@@ -2858,6 +2889,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-2".to_string(),
                 title: "done".to_string(),
                 description: None,
@@ -2872,6 +2904,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-3".to_string(),
                 title: "cancelled".to_string(),
                 description: None,
@@ -2886,6 +2919,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-4".to_string(),
                 title: "archived".to_string(),
                 description: None,
@@ -2908,6 +2942,62 @@ pub(crate) mod tests {
             snapshot.active_tasks,
             vec!["task-1 waiting [pending]".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_task_board_snapshot_preserves_previous_snapshot_on_load_failure() {
+        struct LoadFailsTaskStore;
+
+        #[async_trait::async_trait]
+        impl astra_tools::task_mgmt::TaskStore for LoadFailsTaskStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Err("simulated task-board load failure".to_string())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let mut state = make_state();
+        state.current_session_id = Some("session-load-fails".to_string());
+        state.hooks.task_board_monitor = Some(Arc::new(TaskManager::new(
+            "session-load-fails",
+            Arc::new(LoadFailsTaskStore),
+        )));
+        state.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "finish cloud runtime task guard".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+        let previous = state.hooks.task_board_snapshot.clone();
+
+        state.refresh_task_board_snapshot().await;
+
+        assert_eq!(state.hooks.task_board_snapshot, previous);
+        assert!(state.hooks.task_board_snapshot.has_unfinished_tasks());
     }
 
     // ── Original tests ──────────────────────────────────────────────────────
@@ -10045,7 +10135,7 @@ mod parallel_execution_tests {
         }
 
         #[tokio::test]
-        async fn harness_paused_verdict_sets_pause_interruption() {
+        async fn repeated_post_turn_harness_pause_forces_text_only_finalization() {
             let sink = InMemorySnapshotSink::arc();
             let mut state = make_state();
             state.current_session_id = Some("pause-test".into());
@@ -10063,31 +10153,39 @@ mod parallel_execution_tests {
             // PauseAtPostTurnKernel always returns Pause at PostTurn.
             // The loop recovers up to MAX_HARNESS_PAUSE_RECOVERIES times
             // by injecting checkpoint guidance. After that, it gives up
-            // and sets HarnessPaused. Provide enough turn results for
-            // the recovery attempts plus the final exit.
+            // on tool use and forces one text-only finalization turn.
             let mut host = MockHost::new(vec![
                 edge_tool_result(vec![make_edge_tool("bash", "output")], 100, 20, Some(50)),
                 edge_tool_result(vec![make_edge_tool("bash", "output")], 100, 20, Some(50)),
                 edge_tool_result(vec![make_edge_tool("bash", "output")], 100, 20, Some(50)),
+                text_result("final checkpoint summary", 100, 20, Some(50)),
             ])
             .with_valid_tools(&["bash"]);
 
             let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
             assert!(outcome.is_ok());
-            let interruption = state
-                .interruption
-                .as_ref()
-                .expect("pause verdict must set interruption");
-            assert_eq!(
-                interruption.kind,
-                astra_turn_core::interruption::InterruptionKind::HarnessPaused
+            assert!(
+                state.interruption.is_none(),
+                "post-turn pause exhaustion should ask the LLM to summarize instead of surfacing a harness interruption; interruption={:?}; final_text={:?}",
+                state.interruption,
+                state.final_text
             );
             assert!(
-                interruption
-                    .error_detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("decision checkpoint")),
-                "pause reason should be preserved for resume guidance"
+                state.final_text.contains("final checkpoint summary"),
+                "LLM finalization turn should produce the visible answer"
+            );
+            let final_request = host
+                .executed_messages
+                .last()
+                .expect("finalization request should be sent");
+            let final_prompt = final_request
+                .last()
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                final_prompt.contains("produce a concise final response now"),
+                "final request should tell the LLM to summarize before stopping: {final_prompt}"
             );
         }
 

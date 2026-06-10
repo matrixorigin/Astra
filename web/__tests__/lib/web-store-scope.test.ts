@@ -84,25 +84,27 @@ describe('web store user scoping', () => {
       maskedAccessToken: 'test-token',
       message: 'test runtime',
     });
-    globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse({
-      session_id: 'session-user-a',
-      user_id: 'user-a',
-      title: 'test',
-      metadata: {},
-      status: 'active',
-      created_at: new Date().toISOString(),
-      updated_at: null,
-    }, 201));
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          session_id: 'session-user-a',
+          user_id: 'user-a',
+          title: 'test',
+          metadata: {},
+          status: 'active',
+          created_at: new Date().toISOString(),
+          updated_at: null,
+        },
+        201,
+      ),
+    );
   });
 
   it('does not expose one user chat list to another authenticated user', async () => {
     const fetchMock = globalThis.fetch as jest.Mock;
     const uniqueMessage = `private scoped prompt ${crypto.randomUUID()}`;
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(runtimeSession('session-user-a', 'user-a', 'test'), 201))
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
-        runtimeSession('session-user-a', 'user-a', 'test'),
-      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('session-user-a', 'user-a', 'test')])))
       .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
@@ -118,18 +120,15 @@ describe('web store user scoping', () => {
       projectId: null,
     });
 
-    expect(result.chatId).toBe('session-user-a');
+    expect(result.chatId).toMatch(/^web-/);
     expect((await listChats('user-a', { q: uniqueMessage })).items).toHaveLength(1);
     expect((await listChats('user-b', { q: uniqueMessage })).items).toHaveLength(0);
   });
 
-  it('removes stale chat shells after a successful persisted session sync', async () => {
+  it('preserves pending local chat shells before their first stream creates a persisted session', async () => {
     const fetchMock = globalThis.fetch as jest.Mock;
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(runtimeSession('session-stale-after-reset', 'user-a', 'stale'), 201))
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
-        runtimeSession('session-stale-after-reset', 'user-a', 'stale'),
-      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
@@ -147,24 +146,101 @@ describe('web store user scoping', () => {
       projectId: null,
     });
 
-    expect(result.chatId).toBe('session-stale-after-reset');
+    expect(result.chatId).toMatch(/^web-/);
     expect((await listChats('user-a', { q: 'disappear remotely' })).items).toHaveLength(1);
 
-    await expect(getChatHydrated('user-a', result.chatId)).resolves.toBeNull();
-    expect((await listChats('user-a', { q: 'disappear remotely' })).items).toHaveLength(0);
+    await expect(getChatHydrated('user-a', result.chatId)).resolves.toEqual(
+      expect.objectContaining({
+        pendingTurn: expect.objectContaining({
+          content: 'this chat will disappear remotely',
+        }),
+      }),
+    );
+    expect((await listChats('user-a', { q: 'disappear remotely' })).items).toHaveLength(1);
+  });
+
+  it('syncs a persisted backend session back onto the existing local web chat id', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    const result = await createChatWithMessage('user-a', {
+      message: 'bind this local shell',
+      model: 'sonnet-4.6-adaptive',
+      options: {
+        webSearch: false,
+        thinking: true,
+        activeSkills: [],
+      },
+      projectId: null,
+    });
+    const store = getStore('user-a');
+    const localChat = store.chats.find((chat) => chat.id === result.chatId);
+    expect(localChat).toBeDefined();
+    localChat!.backendSessionId = 'runtime-session-1';
+    localChat!.pendingTurn = undefined;
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('runtime-session-1', 'user-a', 'bound')])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
+
+    const items = (await listChats('user-a', { q: 'bind this local shell' })).items;
+    expect(items).toHaveLength(1);
+    expect(items[0]?.id).toBe(result.chatId);
+    expect(store.chats.filter((chat) => chat.backendSessionId === 'runtime-session-1')).toHaveLength(1);
+  });
+
+  it('deduplicates backend-session chat records in favor of the web chat id', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    const store = getStore('user-a');
+    store.chats.push(
+      {
+        id: 'web-chat-1',
+        title: 'web copy',
+        projectId: null,
+        createdAt: '2026-06-07T00:00:00.000Z',
+        lastMessageAt: '2026-06-07T00:00:00.000Z',
+        lastMessagePreview: 'hello from web',
+        model: 'sonnet-4.6-adaptive',
+        backendSessionId: 'runtime-session-1',
+        messages: [],
+        activeRun: undefined,
+      },
+      {
+        id: 'runtime-session-1',
+        title: 'backend duplicate',
+        projectId: null,
+        createdAt: '2026-06-07T00:00:00.000Z',
+        lastMessageAt: '2026-06-07T00:00:00.000Z',
+        lastMessagePreview: 'hello from backend duplicate',
+        model: 'sonnet-4.6-adaptive',
+        backendSessionId: 'runtime-session-1',
+        messages: [],
+        activeRun: undefined,
+      },
+    );
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('runtime-session-1', 'user-a', 'web copy')])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
+
+    const items = (await listChats('user-a', { q: 'web copy' })).items;
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.id).toBe('web-chat-1');
+    expect(store.chats.map((chat) => chat.id)).not.toContain('runtime-session-1');
+    expect(store.chats.filter((chat) => chat.backendSessionId === 'runtime-session-1')).toHaveLength(1);
   });
 
   it('prefers the most interactive active run when one chat has multiple non-terminal runs', async () => {
     const fetchMock = globalThis.fetch as jest.Mock;
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
-        runtimeSession('session-multi-run', 'user-a', 'multi'),
-      ])))
-      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
-        runtimeRun('run-paused', 'session-multi-run', 'paused'),
-        runtimeRun('run-running', 'session-multi-run', 'running'),
-        runtimeRun('run-waiting', 'session-multi-run', 'waiting', 'user_input'),
-      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('session-multi-run', 'user-a', 'multi')])))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeRunList([
+            runtimeRun('run-paused', 'session-multi-run', 'paused'),
+            runtimeRun('run-running', 'session-multi-run', 'running'),
+            runtimeRun('run-waiting', 'session-multi-run', 'waiting', 'user_input'),
+          ]),
+        ),
+      )
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
 
     const detail = await getChatHydrated('user-a', 'session-multi-run');
@@ -178,13 +254,10 @@ describe('web store user scoping', () => {
   it('keeps the freshest backend run when competing active runs have the same priority', async () => {
     const fetchMock = globalThis.fetch as jest.Mock;
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
-        runtimeSession('session-running-race', 'user-a', 'race'),
-      ])))
-      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
-        runtimeRun('run-freshest', 'session-running-race', 'running'),
-        runtimeRun('run-stale', 'session-running-race', 'running'),
-      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('session-running-race', 'user-a', 'race')])))
+      .mockResolvedValueOnce(
+        jsonResponse(runtimeRunList([runtimeRun('run-freshest', 'session-running-race', 'running'), runtimeRun('run-stale', 'session-running-race', 'running')])),
+      )
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
 
     const detail = await getChatHydrated('user-a', 'session-running-race');
@@ -198,12 +271,8 @@ describe('web store user scoping', () => {
   it('preserves fresher local run state when backend polling lags behind the stream', async () => {
     const fetchMock = globalThis.fetch as jest.Mock;
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
-        runtimeSession('session-stream-lag', 'user-a', 'lag'),
-      ])))
-      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
-        runtimeRun('run-stream-lag', 'session-stream-lag', 'running'),
-      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('session-stream-lag', 'user-a', 'lag')])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([runtimeRun('run-stream-lag', 'session-stream-lag', 'running')])))
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
 
     getStore('user-a').chats.push({
@@ -234,12 +303,8 @@ describe('web store user scoping', () => {
   it('clears ghost local active runs once the backend reports the same run as terminal', async () => {
     const fetchMock = globalThis.fetch as jest.Mock;
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
-        runtimeSession('session-terminal-sync', 'user-a', 'terminal'),
-      ])))
-      .mockResolvedValueOnce(jsonResponse(runtimeRunList([
-        runtimeRun('run-terminal-sync', 'session-terminal-sync', 'completed'),
-      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession('session-terminal-sync', 'user-a', 'terminal')])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([runtimeRun('run-terminal-sync', 'session-terminal-sync', 'completed')])))
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
 
     getStore('user-a').chats.push({

@@ -6,7 +6,9 @@ use super::{
     ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
-use astra_tools::fs_ops::{check_anchor_vs_replacement_size, str_replace_fail};
+use astra_tools::fs_ops::{
+    check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
+};
 use serde_json::{Value, json};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
@@ -2715,19 +2717,6 @@ fn str_replace_ambiguous_hint(content: &str, old_str: &str, count: usize) -> Str
 
 fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-// ─── UTF-8 lossy file reading ───────────────────────────────────────────────
-
-/// Read a file to a String, falling back to lossy UTF-8 conversion for
-/// non-UTF-8 files (e.g. Latin-1, UTF-16 with BOM stripped by the OS).
-/// Returns a standard `io::Error` for I/O failures.
-fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
-    let bytes = fs::read(path)?;
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok(s),
-        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
-    }
 }
 
 /// Like `read_to_string_lossy` but reads at most `max_bytes` from the

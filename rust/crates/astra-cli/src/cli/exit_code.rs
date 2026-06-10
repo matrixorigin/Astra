@@ -13,6 +13,6 @@ pub(crate) enum ExitCode {
     PersistenceError = 4,
     /// Turn produced a partial/interrupted result without a harder failure (5)
     Partial = 5,
-    /// Task result was requested before the task had finished (6)
+    /// Job result was requested before the job had finished (6)
     Unfinished = 6,
 }

@@ -19,19 +19,20 @@ struct MarkdownStyles {
     ordered_marker: Style,
 }
 
-impl Default for MarkdownStyles {
-    fn default() -> Self {
+impl MarkdownStyles {
+    fn from_theme() -> Self {
+        let theme = super::theme::current();
         Self {
-            h1: Style::new().bold().underlined(),
-            h2: Style::new().bold(),
-            h3: Style::new().bold().italic(),
-            code: Style::new().cyan(),
+            h1: Style::new().bold().fg(theme.md_heading),
+            h2: Style::new().bold().fg(theme.md_heading),
+            h3: Style::new().bold().italic().fg(theme.md_heading),
+            code: Style::new().fg(theme.md_code),
             emphasis: Style::new().italic(),
             strong: Style::new().bold(),
             strikethrough: Style::new().crossed_out(),
-            link: Style::new().cyan().underlined(),
-            blockquote: Style::new().green(),
-            ordered_marker: Style::new().light_blue(),
+            link: Style::new().fg(theme.md_link).underlined(),
+            blockquote: Style::new().fg(theme.md_blockquote),
+            ordered_marker: Style::new().fg(theme.md_list_marker),
         }
     }
 }
@@ -56,6 +57,7 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(input, options);
     let mut writer = Writer::new(width, cwd.map(Path::to_path_buf));
+    writer.styles = MarkdownStyles::from_theme();
     writer.run(parser);
     writer.into_text()
 }
@@ -111,7 +113,7 @@ impl TableBuilder {
 impl Writer {
     fn new(width: Option<usize>, cwd: Option<PathBuf>) -> Self {
         Self {
-            styles: MarkdownStyles::default(),
+            styles: MarkdownStyles::from_theme(),
             lines: Vec::new(),
             current_spans: Vec::new(),
             style_stack: vec![Style::default()],

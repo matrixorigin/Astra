@@ -1,6 +1,6 @@
 'use client';
 
-import { Mic, SendHorizontal } from 'lucide-react';
+import { Mic, SendHorizontal, Square } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
 import { ComposerPlusMenu } from '@/components/app/composer-plus-menu';
@@ -26,6 +26,10 @@ type ComposerProps = {
   initialModel?: string;
   persistModelPreference?: boolean;
   onModelChange?: (model: string) => void;
+  showStop?: boolean;
+  stopping?: boolean;
+  stopDisabled?: boolean;
+  onStop?: () => void;
 };
 
 const SKILL_TOKEN_SELECTOR = '[data-composer-skill-token="true"]';
@@ -194,6 +198,10 @@ export function Composer({
   initialModel,
   persistModelPreference = true,
   onModelChange,
+  showStop = false,
+  stopping = false,
+  stopDisabled = false,
+  onStop,
 }: ComposerProps) {
   const [text, setText] = useState(initialValue);
   const [webSearch, setWebSearch] = useState(false);
@@ -554,6 +562,16 @@ export function Composer({
           aria-label={submitting ? 'Streaming' : 'Ready'}
         />
         <ModelSwitcher value={model} onChange={handleModelChange} thinking={thinking} onThinkingChange={setThinking} />
+        {showStop ? (
+          <IconButton
+            icon={Square}
+            label={stopping ? 'Stopping run' : 'Stop run'}
+            type="button"
+            disabled={stopDisabled}
+            onClick={onStop}
+            className="rounded-full border border-border bg-bg text-text hover:bg-surface-muted"
+          />
+        ) : null}
         <IconButton
           icon={SendHorizontal}
           label="Send message"

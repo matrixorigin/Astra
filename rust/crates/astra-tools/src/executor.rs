@@ -1757,7 +1757,8 @@ mod tests {
         let (_tmp, exec) = test_executor();
         let result = exec.execute("run_script", &serde_json::json!({})).await;
         assert!(result.is_error);
-        assert!(result.output.contains("Missing 'script'"));
+        assert!(result.output.contains("requires a non-empty"));
+        assert!(result.output.contains("empty arguments"));
     }
 
     #[tokio::test]

@@ -52,19 +52,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::service_handlers::decisions::audit_decision_handler),
         )
         .route(
-            "/jobs",
-            post(crate::service_handlers::jobs::submit_job_handler),
-        )
-        .route(
-            "/jobs/webhook",
-            post(crate::service_handlers::jobs::job_webhook_handler),
-        )
-        .route(
-            "/jobs/{job_id}",
-            get(crate::service_handlers::jobs::get_job_handler)
-                .delete(crate::service_handlers::jobs::cancel_job_handler),
-        )
-        .route(
             "/triggers",
             post(crate::service_handlers::triggers::create_trigger_handler)
                 .get(crate::service_handlers::triggers::list_triggers_handler),

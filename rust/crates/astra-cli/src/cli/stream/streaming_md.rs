@@ -315,7 +315,6 @@ pub(crate) fn find_attr_tag_open(text: &str, name: &str, from: usize) -> Option<
 /// the actual answer.  This function removes such preambles by detecting:
 /// - Lines starting with common narration patterns
 /// - Keeps content starting from markdown structure (headers, bold, lists)
-#[allow(dead_code)]
 pub(crate) fn strip_leading_narration(text: &mut String) {
     // Patterns that indicate narration (case-insensitive matching)
     const NARRATION_STARTS: &[&str] = &[
@@ -392,7 +391,6 @@ pub(crate) fn strip_leading_narration(text: &mut String) {
 /// Returns `true` when `text` contains an opened but not-yet-closed XML tag
 /// from the known set of LLM thinking tags.  Used to suppress premature
 /// rendering of text that will be stripped once the closing tag arrives.
-#[allow(dead_code)]
 pub(crate) fn has_open_xml_tag(text: &str) -> bool {
     for tag in SUPPRESSED_TAGS.iter().chain(BUFFERED_TAGS) {
         let (name, has_attrs) = match tag {

@@ -574,15 +574,8 @@ fn task_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: boo
             format!("Creating task: \"{}\"", trunc(title, 16))
         }
         "update" => {
-            // Schema canonical: `new_status` for the status change.
-            // task_mgmt runtime currently reads legacy `status` too —
-            // accept both so the preview renders whichever the model
-            // sends.
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            let status = args
-                .get("new_status")
-                .or_else(|| args.get("status"))
-                .and_then(Value::as_str);
+            let status = args.get("new_status").and_then(Value::as_str);
             let subtask = args.get("subtask_id").and_then(Value::as_str);
             match (subtask, status) {
                 (Some(sub), Some(st)) => format!(
@@ -598,14 +591,18 @@ fn task_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: boo
             }
         }
         "list" => {
-            let status = args
-                .get("status")
-                .or_else(|| args.get("status_filter"))
-                .and_then(Value::as_str);
+            let status = args.get("status_filter").and_then(Value::as_str);
             match status {
                 Some(s) => format!("Listing tasks: {}", trunc(s, 15)),
                 None => "Listing tasks".to_string(),
             }
+        }
+        "list_user" => {
+            let status = args
+                .get("user_status")
+                .and_then(Value::as_str)
+                .unwrap_or("active");
+            format!("Listing cross-session tasks: {}", trunc(status, 15))
         }
         "get" => {
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
@@ -1094,7 +1091,7 @@ mod tests {
         assert_eq!(
             p(
                 "task",
-                json!({"action": "update", "task_id": "render-pass", "status": "in_progress"})
+                json!({"action": "update", "task_id": "render-pass", "new_status": "in_progress"})
             ),
             "Updating task: render-pass -> in_progress"
         );
@@ -1103,7 +1100,7 @@ mod tests {
     #[test]
     fn task_list_with_filter() {
         assert_eq!(
-            p("task", json!({"action": "list", "status": "active"})),
+            p("task", json!({"action": "list", "status_filter": "active"})),
             "Listing tasks: active"
         );
     }
@@ -1299,6 +1296,21 @@ mod tests {
                 json!({"action": "list", "status_filter": "pending"})
             ),
             "Listing tasks: pending"
+        );
+    }
+
+    #[test]
+    fn task_list_user_uses_canonical_user_status_field() {
+        assert_eq!(
+            p("task", json!({"action": "list_user"})),
+            "Listing cross-session tasks: active"
+        );
+        assert_eq!(
+            p(
+                "task",
+                json!({"action": "list_user", "user_status": "paused"})
+            ),
+            "Listing cross-session tasks: paused"
         );
     }
 

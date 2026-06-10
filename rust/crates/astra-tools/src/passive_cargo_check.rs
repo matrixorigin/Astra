@@ -99,8 +99,8 @@ pub async fn take_passive_cargo_messages(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let combined = format!("{stdout}\n{stderr}");
     let code = output.status.code();
     let mut result = build_test::parse_build_test_output(&combined, code);

@@ -615,7 +615,8 @@ pub fn build_run_script_schema(
     };
 
     let script_param_desc = if tool_lines.is_empty() {
-        "Python code to execute. No tool bindings are available this session — \
+        "Required Python code to execute; never call run_script with empty arguments. \
+         No tool bindings are available this session — \
          use only Python stdlib. Print your final result to stdout."
             .to_string()
     } else {
@@ -627,7 +628,8 @@ pub fn build_run_script_schema(
             import_examples.join(", ")
         };
         format!(
-            "Python code to execute. Import tools with \
+            "Required Python code to execute; never call run_script with empty arguments. \
+             Import tools with \
              `from astra_tools import {example}, ...` and print your \
              final result to stdout. Tool functions are synchronous — call \
              them directly (no `await`). They return text output and raise \
@@ -637,6 +639,7 @@ pub fn build_run_script_schema(
 
     let description = format!(
         "Run a Python script that can call agent tools programmatically. \
+         Always provide the required `script` string parameter. \
          Use when you need 3+ tool calls with processing logic between them, \
          need to filter/reduce large outputs before they enter context, \
          need conditional branching, or need to loop.\n\n\
@@ -1124,8 +1127,8 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
         }
     }
 
-    let head = String::from_utf8_lossy(&head_buf).to_string();
-    let tail = String::from_utf8_lossy(&tail_ring).to_string();
+    let head = String::from_utf8_lossy(&head_buf).into_owned();
+    let tail = String::from_utf8_lossy(&tail_ring).into_owned();
 
     if total_bytes > max_bytes && !tail.is_empty() {
         let omitted = total_bytes.saturating_sub(head.len() + tail.len());
@@ -1158,7 +1161,7 @@ async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> Stri
             Err(_) => break,
         }
     }
-    let mut out = String::from_utf8_lossy(&buf).to_string();
+    let mut out = String::from_utf8_lossy(&buf).into_owned();
     if total > STDERR_CAP_BYTES {
         let omitted = total.saturating_sub(STDERR_CAP_BYTES);
         // Ensure a blank line before the notice — stderr sometimes lacks a
@@ -1182,7 +1185,11 @@ pub async fn handle_run_script(
 ) -> crate::ToolResult {
     let script = match args.get("script").and_then(Value::as_str) {
         Some(s) => s,
-        None => return crate::ToolResult::error("Error: Missing 'script' parameter".into()),
+        None => {
+            return crate::ToolResult::error(
+                "Error: run_script requires a non-empty top-level `script` string, e.g. {\"script\":\"print('ok')\"}. Do not call run_script with empty arguments.".into(),
+            );
+        }
     };
 
     let timeout = resolve_timeout(args.get("timeout"), config.timeout);
@@ -1631,6 +1638,29 @@ mod tests {
             "timeout desc missing DEFAULT={}: {}",
             DEFAULT_TIMEOUT.as_secs(),
             timeout_desc
+        );
+    }
+
+    #[test]
+    fn schema_marks_script_required_and_discourages_empty_args() {
+        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        assert_eq!(
+            schema["function"]["parameters"]["required"],
+            serde_json::json!(["script"])
+        );
+        let desc = schema["function"]["description"].as_str().unwrap();
+        let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("required `script` string parameter"),
+            "schema should make the required argument visible in the top-level description: {desc}"
+        );
+        assert!(
+            script_desc.contains("never call run_script with empty arguments"),
+            "script description should discourage empty-args calls: {script_desc}"
         );
     }
 
@@ -2273,7 +2303,8 @@ mod tests {
         let result =
             handle_run_script(&serde_json::json!({}), &exec, RunScriptConfig::default()).await;
         assert!(result.is_error);
-        assert!(result.output.contains("Missing 'script'"));
+        assert!(result.output.contains("requires a non-empty"));
+        assert!(result.output.contains("empty arguments"));
     }
 
     // ── Integration tests (require Python) ───────────────────────────────

@@ -1,11 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireRuntimeUser } from '@/lib/api/auth-guard';
-import { archiveChat, deleteChat, getChatHydrated, moveChat, updateChatModel } from '@/lib/api/web-store';
+import { archiveChat, deleteChat, getChat, getChatHydrated, moveChat, updateChatModel } from '@/lib/api/web-store';
 
-export async function GET(
-  _request: NextRequest,
-  context: { params: Promise<{ chatId: string }> },
-) {
+export async function GET(_request: NextRequest, context: { params: Promise<{ chatId: string }> }) {
   const auth = await requireRuntimeUser();
   if (auth.response) {
     return auth.response;
@@ -18,17 +15,18 @@ export async function GET(
   return NextResponse.json(detail);
 }
 
-export async function PATCH(
-  request: NextRequest,
-  context: { params: Promise<{ chatId: string }> },
-) {
+export async function PATCH(request: NextRequest, context: { params: Promise<{ chatId: string }> }) {
   const auth = await requireRuntimeUser();
   if (auth.response) {
     return auth.response;
   }
   const { chatId } = await context.params;
-  const body = (await request.json()) as { projectId?: string | null; archived?: boolean; model?: string };
-  let detail = await getChatHydrated(auth.user.user_id, chatId);
+  const body = (await request.json()) as {
+    projectId?: string | null;
+    archived?: boolean;
+    model?: string;
+  };
+  let detail = getChat(auth.user.user_id, chatId);
   if (!detail) {
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
@@ -61,16 +59,13 @@ export async function PATCH(
   return NextResponse.json(detail);
 }
 
-export async function DELETE(
-  _request: NextRequest,
-  context: { params: Promise<{ chatId: string }> },
-) {
+export async function DELETE(_request: NextRequest, context: { params: Promise<{ chatId: string }> }) {
   const auth = await requireRuntimeUser();
   if (auth.response) {
     return auth.response;
   }
   const { chatId } = await context.params;
-  const detail = await getChatHydrated(auth.user.user_id, chatId);
+  const detail = getChat(auth.user.user_id, chatId);
   if (!detail) {
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }

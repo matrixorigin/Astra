@@ -7,14 +7,12 @@ pub mod workflows;
 // HTTP handler modules (moved from crate root)
 pub mod agents;
 pub mod context;
-pub mod jobs;
 pub mod marketplace;
 pub mod replay;
 pub mod sandbox;
 
 pub use agents::*;
 pub use context::*;
-pub use jobs::*;
 pub use marketplace::*;
 pub use replay::*;
 pub use sandbox::*;

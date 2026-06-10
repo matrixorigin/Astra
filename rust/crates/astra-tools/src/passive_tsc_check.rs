@@ -122,8 +122,8 @@ pub async fn take_passive_tsc_messages(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let combined = format!("{stdout}\n{stderr}");
     let code = output.status.code();
     if matches!(code, Some(0)) {

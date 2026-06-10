@@ -243,13 +243,12 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("add", "Create task (needs title)"),
-    ("done", "Mark task done (needs id/query)"),
-    ("list", "List tasks"),
-    ("run", "Run task prompt"),
-    ("result", "Task result (needs id)"),
-    ("status", "Task status (needs id/query)"),
+const JOB_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "List background jobs"),
+    ("pending", "List claimable job queue"),
+    ("run", "Run a background job prompt"),
+    ("result", "Job result (needs id)"),
+    ("status", "Job status (needs id/query)"),
 ];
 
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -564,12 +563,12 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_subcommands(MEMORY_SUBCOMMANDS)
     .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]"),
     CommandMeta::new(
-        "/task",
-        "Tasks: list, add, done, status, run <prompt>, result <id>",
+        "/job",
+        "Background jobs: list, pending, status, run <prompt>, result <id>",
         CommandGroup::MemoryTasks,
     )
-    .with_subcommands(TASK_SUBCOMMANDS)
-    .with_arg_hint("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]")
+    .with_subcommands(JOB_SUBCOMMANDS)
+    .with_arg_hint("[list|pending|status <id>|run <prompt>|result <id>]")
     .with_tui_handler(TuiHandler::Fallback),
     // ── Observability ─────────────────────────────────────────────────────
     CommandMeta::new(
@@ -1244,6 +1243,16 @@ mod tests {
     }
 
     #[test]
+    fn task_slash_command_is_not_registered_as_background_job_surface() {
+        assert!(
+            resolve_command_meta("/task").is_none(),
+            "slash /task must remain reserved for the session task-board concept"
+        );
+        let job = resolve_command_meta("/job").expect("should resolve /job");
+        assert_eq!(job.name, "/job");
+    }
+
+    #[test]
     fn resolve_command_meta_prefix_match_also_resolves_handler() {
         // /reg prefixes to /register which is marked as Panel
         let meta = resolve_command_meta("/reg").expect("should resolve /reg → /register");
@@ -1271,7 +1280,7 @@ mod tests {
             "/diff",
             "/review",
             "/report",
-            "/task",
+            "/job",
             "/debug",
             "/lsp",
             "/telemetry",

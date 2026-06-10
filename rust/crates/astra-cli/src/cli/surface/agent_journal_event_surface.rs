@@ -31,14 +31,11 @@ pub(crate) fn project_agent_terminated(metadata: Option<&Value>) -> AgentTermina
 }
 
 fn metadata_string(metadata: Option<&Value>, key: &str) -> Option<String> {
-    metadata
-        .and_then(|m| m.get(key))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    super::metadata_string(metadata, key)
 }
 
 fn metadata_u64(metadata: Option<&Value>, key: &str) -> Option<u64> {
-    metadata.and_then(|m| m.get(key)).and_then(Value::as_u64)
+    super::metadata_u64(metadata, key)
 }
 
 #[cfg(test)]

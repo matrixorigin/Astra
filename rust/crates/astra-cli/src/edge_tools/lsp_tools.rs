@@ -667,8 +667,8 @@ impl ToolExecutor {
         let command_line = parts.join(" ");
         let runnable_kind = runnable.get("kind").cloned().unwrap_or(Value::Null);
         let output = self.run_shell_output(&command_line, 30.0)?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let mut response = json!({
             "backend": "lsp",
             "operation": operation,

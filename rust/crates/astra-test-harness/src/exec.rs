@@ -180,8 +180,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     // is dropped (outer timeout fires) `kill_on_drop` takes over.
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let mut out = parse_json_outcome(&stdout, model);
             out.stderr = stderr;
             out.exit_code = output.status.code().unwrap_or(-1);
@@ -365,8 +365,8 @@ impl CaseExecutor for ExternalCmdExecutor {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let mut out = parse_json_outcome(&stdout, model);
         out.stderr = stderr;
         out.exit_code = output.status.code().unwrap_or(-1);

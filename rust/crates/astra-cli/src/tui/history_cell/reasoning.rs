@@ -3,7 +3,7 @@
 //!
 //! While streaming: a fixed-height scrolling preview window so the
 //! composer stays visible. After completion: collapses to a one-line
-//! header (`Thought for 3s (2 lines)`) — not a framed window or
+//! header (`Thought · Xs · N lines · N tokens`) — not a framed window or
 //! expanding pill. A reasoning cell is just another cell in the
 //! scrollback; toggle visibility lives in ChatWidget, not here.
 //!
@@ -128,13 +128,14 @@ impl HistoryCell for ReasoningCell {
             return Vec::new();
         }
 
-        let dim_italic = Style::default()
-            .fg(crate::tui::theme::current().dim)
-            .add_modifier(Modifier::DIM)
-            .add_modifier(Modifier::ITALIC);
+        let theme = crate::tui::theme::current();
+        let stat = Style::default().fg(theme.dim);
+        let dim = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
+        // Body preview text: fg dim only — readable but visually subordinate.
+        let body = Style::default().fg(theme.dim);
 
-        // Done thinking → collapse to header only (`Thought for
-        // 22s (45 lines)`). A 20-second reasoning blob is ~40+
+        // Done thinking → collapse to header only (`Thought ·`
+        // 22s · 45 lines · N tokens`). A 20-second reasoning blob is ~40+
         // wrapped rows of dim prose; scrollback-dumping all of it
         // crowds out the actual answer below. Collapse to a one-line
         // header; users who want the detail can inspect the persisted
@@ -142,30 +143,27 @@ impl HistoryCell for ReasoningCell {
         // `LIVE_PREVIEW_MAX_ROWS`) so progress is visible without the
         // viewport growing unboundedly.
         let line_count = self.text.lines().count();
-        let header_line = if self.live {
-            let header_text = match self.duration_label() {
-                Some(d) => format!("Thought preview · {d}"),
-                None => "Thought preview".to_string(),
-            };
-            Line::from(vec![
-                Span::styled("• ", dim_italic),
-                Span::styled(header_text, dim_italic),
-            ])
+        let token_count = approx_tokens(self.text.chars().count() as u64);
+        let line_label = if line_count == 1 {
+            "1 line".to_string()
         } else {
-            let count_label = if line_count == 1 {
-                String::from("1 line")
-            } else {
-                format!("{line_count} lines")
-            };
-            let meta = match self.duration_label() {
-                Some(d) => format!("Thought · {d} · {count_label}"),
-                None => format!("Thought · {count_label}"),
-            };
-            Line::from(vec![
-                Span::styled("• ", dim_italic),
-                Span::styled(meta, dim_italic),
-            ])
+            format!("{line_count} lines")
         };
+        let tok_label = if token_count == 1 {
+            "1 token".to_string()
+        } else {
+            format!("{token_count} tokens")
+        };
+        let stat_text = self
+            .duration_label()
+            .map(|d| format!(" · {d} · {line_label} · {tok_label}"))
+            .unwrap_or_else(|| format!(" · {line_label} · {tok_label}"));
+        let header_line = Line::from(vec![
+            Span::styled("• ", dim),
+            super::assistant::thought_gradient("Thought", theme),
+            Span::styled(stat_text, stat),
+        ]);
+        // Preserve live body preview (below).
 
         let mut lines: Vec<Line<'static>> = vec![header_line];
 
@@ -195,17 +193,14 @@ impl HistoryCell for ReasoningCell {
                 let hidden = total - tail;
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(format!("… {hidden} earlier lines"), dim_italic),
+                    Span::styled(format!("… {hidden} earlier lines"), dim),
                 ]));
                 total - tail
             } else {
                 0
             };
             for row in body_rows.into_iter().skip(visible) {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(row, dim_italic),
-                ]));
+                lines.push(Line::from(vec![Span::raw("    "), Span::styled(row, body)]));
             }
         }
 
@@ -276,6 +271,12 @@ fn soft_wrap(input: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Approximate token count from characters: chars / 4, ceiling.
+/// Mirrors [`crate::tui::status_indicator::approx_tokens`].
+fn approx_tokens(chars: u64) -> u64 {
+    chars.div_ceil(4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,18 +320,17 @@ mod tests {
     // ── Render ───────────────────────────────────────────────────
 
     #[test]
-    fn live_header_says_thought_preview() {
+    fn live_header_shows_thought_with_time_lines_tokens() {
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("draft");
         let out = render(&c, 60, 3);
-        assert!(
-            out.contains("Thought preview"),
-            "missing Thought preview header: {out}"
-        );
+        assert!(out.contains("Thought"), "missing Thought header: {out}");
+        assert!(out.contains("1 line"), "missing line count: {out}");
+        assert!(out.contains("token"), "missing token count: {out}");
     }
 
     #[test]
-    fn finalised_header_says_thought_for() {
+    fn finalised_header_shows_thought_with_time_lines_tokens() {
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("analysis");
         c.started_at = Some(Instant::now() - Duration::from_secs(3));
@@ -338,6 +338,8 @@ mod tests {
         let out = render(&c, 60, 3);
         assert!(out.contains("Thought"), "missing header: {out}");
         assert!(out.contains("3s"), "missing duration: {out}");
+        assert!(out.contains("1 line"), "missing line count: {out}");
+        assert!(out.contains("token"), "missing token count: {out}");
     }
 
     #[test]
@@ -361,7 +363,7 @@ mod tests {
         let out = render(&c, 60, 4);
         let body_rows: Vec<&str> = out
             .lines()
-            .filter(|l| !l.contains("Thought preview") && !l.trim().is_empty())
+            .filter(|l| !l.contains("Thought") && !l.trim().is_empty())
             .collect();
         assert!(!body_rows.is_empty(), "live cell must render body: {out}");
         for row in &body_rows {
@@ -443,10 +445,10 @@ mod tests {
     }
 
     #[test]
-    fn finalised_cell_hides_body_and_shows_line_count() {
+    fn finalised_cell_hides_body_and_shows_line_and_token_count() {
         // Once thinking is done, scrollback shows only the compact
-        // header `Thought · Xs · N lines` — not the 20-40 row
-        // dim-italic wall. The count cues the user that there's
+        // header `Thought · Xs · N lines · N tokens` — not the 20-40 row
+        // dim wall. The count cues the user that there's
         // substance behind the header without dumping it on-screen.
         // (The full text stays in the JSONL transcript for later.)
         let mut c = ReasoningCell::new_streaming();
@@ -456,6 +458,7 @@ mod tests {
         let out = render(&c, 60, 4);
         assert!(out.contains("Thought"), "header missing: {out}");
         assert!(out.contains("3 lines"), "line count missing: {out}");
+        assert!(out.contains("token"), "token count missing: {out}");
         assert!(
             !out.contains("line one"),
             "body must be hidden once finalised: {out}"

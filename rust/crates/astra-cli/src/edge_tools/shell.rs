@@ -105,8 +105,10 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
 
 /// Extract the base command name from the last segment of a pipeline.
 fn last_pipeline_command(command: &str) -> &str {
-    let last = command.rsplit('|').next().unwrap_or(command);
-    last.split_whitespace().next().unwrap_or("")
+    astra_tools::exit_semantics::last_pipeline_segment(command)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
 }
 
 // ---------------------------------------------------------------------------
@@ -3335,7 +3337,7 @@ fn run_command_streaming(
             match stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let _ = tx.send(OutputChunk::Stdout(s));
                 }
                 Err(_) => break,
@@ -3349,7 +3351,7 @@ fn run_command_streaming(
             match stderr.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let _ = tx2.send(OutputChunk::Stderr(s));
                 }
                 Err(_) => break,
@@ -3457,7 +3459,6 @@ fn run_command_streaming(
 }
 
 /// Result from streaming command execution.
-#[allow(dead_code)]
 struct StreamingResult {
     output: String,
     exit_code: i32,
@@ -3541,7 +3542,7 @@ fn run_readonly_command_with_partial(
             match stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
                 }
                 Err(_) => break,
             }
@@ -4117,7 +4118,15 @@ impl ToolExecutor {
                     return if out.status.success() {
                         "(no output)".to_string()
                     } else {
-                        format!("Error: command failed (exit code {exit_code})")
+                        // Use command semantics to interpret exit code
+                        let sem = interpret_exit_code(command, exit_code);
+                        if let Some(note) = sem.note {
+                            note.to_string()
+                        } else if sem.is_error {
+                            format!("Error: command failed (exit code {exit_code})")
+                        } else {
+                            format!("(exit code {exit_code})")
+                        }
                     };
                 }
 
@@ -4134,7 +4143,10 @@ impl ToolExecutor {
                 }
 
                 if !out.status.success() {
-                    result.push_str(&format!("\n(exit code {exit_code})"));
+                    let sem = interpret_exit_code(command, exit_code);
+                    if sem.is_error {
+                        result.push_str(&format!("\n(exit code {exit_code})"));
+                    }
                 }
 
                 result
@@ -4353,7 +4365,7 @@ impl ToolExecutor {
         // Use 15s timeout for glob/find (directory traversal)
         match run_command_with_cleanup(&mut cmd, 15.0) {
             Ok(o) => {
-                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                let text = String::from_utf8_lossy(&o.stdout).into_owned();
                 if text.trim().is_empty() {
                     "No files found".to_string()
                 } else {

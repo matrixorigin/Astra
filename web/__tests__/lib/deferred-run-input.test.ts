@@ -7,13 +7,7 @@ jest.mock('@/lib/runtime-client', () => ({
   runtimeErrorDetail: jest.fn((error: unknown) => (error instanceof Error ? error.message : String(error))),
 }));
 
-import {
-  getChatHydrated,
-  getStore,
-  queueDeferredRunInput,
-  resumeActiveRun,
-  stopActiveRun,
-} from '@/lib/api/web-store';
+import { StaleDeferredRunError, getChatHydrated, getStore, queueDeferredRunInput, resumeActiveRun, stopActiveRun } from '@/lib/api/web-store';
 import { getRuntimeClient, requireRuntimeClient } from '@/lib/runtime-client';
 
 const mockGetRuntimeClient = getRuntimeClient as jest.MockedFunction<typeof getRuntimeClient>;
@@ -32,8 +26,16 @@ describe('queueDeferredRunInput', () => {
       accepted: true,
       duplicate: false,
     });
+    const getRunStatus = jest.fn().mockResolvedValue({
+      runId: 'run-1',
+      sessionId: 'chat-1',
+      status: 'running',
+      eventsCount: 1,
+      waitingFor: null,
+    });
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
+        getRunStatus,
         submitRunInput,
       },
     } as never);
@@ -52,6 +54,8 @@ describe('queueDeferredRunInput', () => {
         runId: 'run-1',
         status: 'running',
         waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
       },
     });
 
@@ -81,8 +85,16 @@ describe('queueDeferredRunInput', () => {
 
   it('does not orphan a local queued message when submitRunInput fails', async () => {
     const submitRunInput = jest.fn().mockRejectedValue(new Error('runtime unavailable'));
+    const getRunStatus = jest.fn().mockResolvedValue({
+      runId: 'run-1',
+      sessionId: 'chat-1',
+      status: 'running',
+      eventsCount: 1,
+      waitingFor: null,
+    });
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
+        getRunStatus,
         submitRunInput,
       },
     } as never);
@@ -101,15 +113,22 @@ describe('queueDeferredRunInput', () => {
         runId: 'run-1',
         status: 'running',
         waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
       },
     });
 
-    await expect(queueDeferredRunInput('user-a', 'chat-1', {
-      content: 'do not orphan this',
-      options: {
-        activeSkills: [],
-      },
-    })).rejects.toThrow('runtime unavailable');
+    await expect(
+      queueDeferredRunInput('user-a', 'chat-1', {
+        content: 'do not orphan this',
+        options: {
+          webSearch: false,
+          thinking: true,
+          model: 'sonnet-4.6-adaptive',
+          activeSkills: [],
+        },
+      }),
+    ).rejects.toThrow('runtime unavailable');
 
     expect(store.chats[0].messages).toEqual([]);
     expect(store.chats[0].lastMessagePreview).toBe('hello');
@@ -117,7 +136,55 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-1',
       status: 'running',
       waitingFor: null,
+      source: 'backend_poll',
+      observedAt: expect.any(String),
     });
+  });
+
+  it('clears stale active runs before submitting deferred input', async () => {
+    const submitRunInput = jest.fn();
+    const getRunStatus = jest.fn().mockResolvedValue({
+      runId: 'run-1',
+      sessionId: 'chat-1',
+      status: 'completed',
+      eventsCount: 10,
+      waitingFor: null,
+    });
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        getRunStatus,
+        submitRunInput,
+      },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-1',
+      title: 'Deferred test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-1',
+        status: 'running',
+        waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    await expect(
+      queueDeferredRunInput('user-a', 'chat-1', {
+        content: 'start a new turn instead',
+      }),
+    ).rejects.toBeInstanceOf(StaleDeferredRunError);
+
+    expect(submitRunInput).not.toHaveBeenCalled();
+    expect(store.chats[0].messages).toEqual([]);
+    expect(store.chats[0].activeRun).toBeUndefined();
   });
 
   it('rejects oversized deferred input before calling the runtime', async () => {
@@ -142,15 +209,22 @@ describe('queueDeferredRunInput', () => {
         runId: 'run-1',
         status: 'running',
         waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
       },
     });
 
-    await expect(queueDeferredRunInput('user-a', 'chat-1', {
-      content: 'x'.repeat(20_001),
-      options: {
-        activeSkills: [],
-      },
-    })).rejects.toThrow('Deferred input is too large.');
+    await expect(
+      queueDeferredRunInput('user-a', 'chat-1', {
+        content: 'x'.repeat(20_001),
+        options: {
+          webSearch: false,
+          thinking: true,
+          model: 'sonnet-4.6-adaptive',
+          activeSkills: [],
+        },
+      }),
+    ).rejects.toThrow('Deferred input is too large.');
 
     expect(submitRunInput).not.toHaveBeenCalled();
     expect(store.chats[0].messages).toEqual([]);
@@ -158,26 +232,30 @@ describe('queueDeferredRunInput', () => {
 
   it('hydrates a lost in-memory active run before submitting deferred input', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
-      sessions: [{
-        session_id: 'chat-1',
-        user_id: 'user-a',
-        title: 'Deferred test',
-        metadata: { source: 'web_v1' },
-        status: 'active',
-        created_at: '2026-06-07T00:00:00.000Z',
-        updated_at: '2026-06-07T00:00:00.000Z',
-      }],
+      sessions: [
+        {
+          session_id: 'chat-1',
+          user_id: 'user-a',
+          title: 'Deferred test',
+          metadata: { source: 'web_v1' },
+          status: 'active',
+          created_at: '2026-06-07T00:00:00.000Z',
+          updated_at: '2026-06-07T00:00:00.000Z',
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,
     });
     const listRuns = jest.fn().mockResolvedValue({
-      runs: [{
-        runId: 'run-recovered',
-        sessionId: 'chat-1',
-        status: 'running',
-        waitingFor: null,
-      }],
+      runs: [
+        {
+          runId: 'run-recovered',
+          sessionId: 'chat-1',
+          status: 'running',
+          waitingFor: null,
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,
@@ -186,6 +264,13 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-recovered',
       accepted: true,
       duplicate: false,
+    });
+    const getRunStatus = jest.fn().mockResolvedValue({
+      runId: 'run-recovered',
+      sessionId: 'chat-1',
+      status: 'running',
+      eventsCount: 1,
+      waitingFor: null,
     });
 
     mockGetRuntimeClient.mockResolvedValue({
@@ -196,6 +281,7 @@ describe('queueDeferredRunInput', () => {
     } as never);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
+        getRunStatus,
         submitRunInput,
       },
     } as never);
@@ -241,29 +327,33 @@ describe('queueDeferredRunInput', () => {
 
   it('hydrates active runs when opening chat detail after in-memory store loss', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
-      sessions: [{
-        session_id: 'chat-open',
-        user_id: 'user-a',
-        title: 'Open test',
-        metadata: {
-          source: 'web_v1',
-          current_model: 'sonnet-4.6-adaptive',
+      sessions: [
+        {
+          session_id: 'chat-open',
+          user_id: 'user-a',
+          title: 'Open test',
+          metadata: {
+            source: 'web_v1',
+            current_model: 'sonnet-4.6-adaptive',
+          },
+          status: 'active',
+          created_at: '2026-06-07T00:00:00.000Z',
+          updated_at: '2026-06-07T00:00:01.000Z',
         },
-        status: 'active',
-        created_at: '2026-06-07T00:00:00.000Z',
-        updated_at: '2026-06-07T00:00:01.000Z',
-      }],
+      ],
       total: 1,
       limit: 200,
       offset: 0,
     });
     const listRuns = jest.fn().mockResolvedValue({
-      runs: [{
-        runId: 'run-open',
-        sessionId: 'chat-open',
-        status: 'input-queued',
-        waitingFor: 'user_input',
-      }],
+      runs: [
+        {
+          runId: 'run-open',
+          sessionId: 'chat-open',
+          status: 'input-queued',
+          waitingFor: 'user_input',
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,
@@ -299,26 +389,30 @@ describe('queueDeferredRunInput', () => {
 
   it('hydrates a lost active run before stopping it', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
-      sessions: [{
-        session_id: 'chat-stop',
-        user_id: 'user-a',
-        title: 'Stop test',
-        metadata: { source: 'web_v1' },
-        status: 'active',
-        created_at: '2026-06-07T00:00:00.000Z',
-        updated_at: '2026-06-07T00:00:00.000Z',
-      }],
+      sessions: [
+        {
+          session_id: 'chat-stop',
+          user_id: 'user-a',
+          title: 'Stop test',
+          metadata: { source: 'web_v1' },
+          status: 'active',
+          created_at: '2026-06-07T00:00:00.000Z',
+          updated_at: '2026-06-07T00:00:00.000Z',
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,
     });
     const listRuns = jest.fn().mockResolvedValue({
-      runs: [{
-        runId: 'run-stop',
-        sessionId: 'chat-stop',
-        status: 'running',
-        waitingFor: null,
-      }],
+      runs: [
+        {
+          runId: 'run-stop',
+          sessionId: 'chat-stop',
+          status: 'running',
+          waitingFor: null,
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,
@@ -356,26 +450,30 @@ describe('queueDeferredRunInput', () => {
 
   it('hydrates a lost paused run before resuming it', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
-      sessions: [{
-        session_id: 'chat-resume',
-        user_id: 'user-a',
-        title: 'Resume test',
-        metadata: { source: 'web_v1' },
-        status: 'active',
-        created_at: '2026-06-07T00:00:00.000Z',
-        updated_at: '2026-06-07T00:00:00.000Z',
-      }],
+      sessions: [
+        {
+          session_id: 'chat-resume',
+          user_id: 'user-a',
+          title: 'Resume test',
+          metadata: { source: 'web_v1' },
+          status: 'active',
+          created_at: '2026-06-07T00:00:00.000Z',
+          updated_at: '2026-06-07T00:00:00.000Z',
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,
     });
     const listRuns = jest.fn().mockResolvedValue({
-      runs: [{
-        runId: 'run-resume',
-        sessionId: 'chat-resume',
-        status: 'paused',
-        waitingFor: null,
-      }],
+      runs: [
+        {
+          runId: 'run-resume',
+          sessionId: 'chat-resume',
+          status: 'paused',
+          waitingFor: null,
+        },
+      ],
       total: 1,
       limit: 200,
       offset: 0,

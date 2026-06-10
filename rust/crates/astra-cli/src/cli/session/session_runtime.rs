@@ -37,7 +37,7 @@ pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskSer
 /// Edge-cloud contract: the CLI never connects to MatrixOne
 /// directly. When `cloud_base` is configured (via env or the
 /// authenticated session), we return [`crate::cli::http_task_service::HttpTaskService`]
-/// which proxies trait calls through `POST /tasks:rpc`. Otherwise
+/// which proxies trait calls through `POST /jobs:rpc`. Otherwise
 /// we fall back to the local on-disk store so offline / one-shot
 /// CLI and headless tests stay functional.
 ///
@@ -64,7 +64,7 @@ pub(crate) fn resolve_cloud_base() -> Option<String> {
         .map(|s| s.trim_end_matches('/').to_string())
 }
 
-/// Task store for the Tier 1 session scratchpad (`session_todos`).
+/// Task store for the durable per-session task board (`session_todos`).
 ///
 /// When cloud is configured, returns an [`crate::cli::session::session_todo_client::HttpTaskStore`]
 /// that polls the server's `GET /sessions/{sid}/todos` endpoint and
@@ -104,7 +104,7 @@ pub(crate) async fn resolve_task_store(
         return (store, Some(notify_tx));
     }
     (
-        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
+        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation()),
         None,
     )
 }
@@ -131,12 +131,12 @@ pub(crate) fn install_task_store(
         std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
 }
 
-/// Resolve the durable cloud task runtime (TaskService + lease).
+/// Resolve the durable cloud background-job runtime (TaskService + lease).
 ///
 /// Edge-cloud contract: no direct MO connection from the CLI. Both
 /// services proxy through their REST surfaces:
-/// - TaskService → `POST /tasks:rpc`
-/// - TaskLeaseService → `/tasks/{id}/lease/*`
+/// - TaskService → `POST /jobs:rpc`
+/// - TaskLeaseService → `/jobs/{id}/lease/*`
 ///
 /// `profile` is forwarded to the access-token resolver so a logged-in
 /// CLI invocation gets bearer auth.
@@ -150,7 +150,7 @@ pub(crate) async fn resolve_cloud_task_runtime(
     String,
 > {
     let cloud_base = resolve_cloud_base().ok_or_else(|| {
-        "Cloud task runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
+        "Cloud job runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
             .to_string()
     })?;
     let token = current_access_token(profile);
@@ -769,7 +769,7 @@ fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
             Err(error) => {
                 line.push_str(&format!(
                     " [workspace metadata unreadable: {}]",
-                    truncate_status_detail(&error.to_string(), 96)
+                    truncate_label(&error.to_string(), 96)
                 ));
             }
         }
@@ -777,15 +777,7 @@ fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
     })
 }
 
-fn truncate_status_detail(detail: &str, max_chars: usize) -> String {
-    let total = detail.chars().count();
-    if total <= max_chars {
-        return detail.to_string();
-    }
-    let keep = max_chars.saturating_sub(1);
-    let truncated: String = detail.chars().take(keep).collect();
-    format!("{truncated}…")
-}
+use crate::cli::effects::truncate_label;
 
 fn workspace_matches_current_project(
     workspace: &astra_services::session_workspace::WorkspaceMetadata,

@@ -12,49 +12,31 @@ use crate::diff_utils::parse_hunk_header;
 use super::color::is_light;
 use super::render::highlight::highlight_code_to_lines;
 use super::terminal_palette::default_bg;
-
-/// Dark terminal diff colors (muted tints).
-const DARK_ADD_FG: Color = Color::Green;
-const DARK_DEL_FG: Color = Color::Red;
-const DARK_ADD_BG: Color = Color::Rgb(33, 58, 43);
-const DARK_DEL_BG: Color = Color::Rgb(74, 34, 29);
-
-/// Light terminal diff colors (GitHub-style pastels).
-const LIGHT_ADD_FG: Color = Color::Rgb(31, 35, 40);
-const LIGHT_DEL_FG: Color = Color::Rgb(31, 35, 40);
-const LIGHT_ADD_BG: Color = Color::Rgb(218, 251, 225);
-const LIGHT_DEL_BG: Color = Color::Rgb(255, 235, 233);
+use super::theme;
 
 fn is_light_bg() -> bool {
     default_bg().is_some_and(is_light)
 }
 
-/// Style for an added line.
+/// Style for an added line — reads from the current theme.
 fn add_style() -> Style {
-    if is_light_bg() {
-        Style::default().fg(LIGHT_ADD_FG).bg(LIGHT_ADD_BG)
-    } else {
-        Style::default().fg(DARK_ADD_FG).bg(DARK_ADD_BG)
-    }
+    theme::current().diff_add_style()
 }
 
-/// Style for a deleted line.
+/// Style for a deleted line — reads from the current theme.
 fn del_style() -> Style {
-    if is_light_bg() {
-        Style::default().fg(LIGHT_DEL_FG).bg(LIGHT_DEL_BG)
-    } else {
-        Style::default().fg(DARK_DEL_FG).bg(DARK_DEL_BG)
-    }
+    theme::current().diff_del_style()
 }
 
 /// Style for context/unchanged lines.
 fn ctx_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    theme::current().diff_context_style()
 }
 
 /// Style for the gutter (line numbers + sign).
 fn gutter_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    let theme = theme::current();
+    Style::default().fg(theme.dim)
 }
 
 /// Style for the diff header (file name).
@@ -80,7 +62,7 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
     for raw in diff_text.lines().take(max_lines) {
         if raw.starts_with("@@") {
             // Hunk header
-            let hunk_style = Style::default().fg(Color::Cyan);
+            let hunk_style = theme::current().diff_hunk_style();
             lines.push(Line::from(Span::styled(format!("    {raw}"), hunk_style)));
             // Try to parse line numbers from @@ -N,M +N,M @@
             if let Some(nums) = parse_hunk_header(raw) {
@@ -92,10 +74,27 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
 
         if raw.starts_with("--- ") || raw.starts_with("+++ ") {
             current_lang = diff_header_language(raw);
-            lines.push(Line::from(Span::styled(
-                format!("    {raw}"),
-                header_style(),
-            )));
+            // Style file headers with path: directory dim, filename bright.
+            let (prefix, path) = if let Some(path) = raw.strip_prefix("--- a/") {
+                ("    --- a/", path)
+            } else if let Some(path) = raw.strip_prefix("+++ b/") {
+                ("    +++ b/", path)
+            } else {
+                // No recognised prefix — render as plain bold.
+                lines.push(Line::from(Span::styled(
+                    format!("    {raw}"),
+                    header_style(),
+                )));
+                continue;
+            };
+            let mut spans = vec![Span::styled(
+                prefix.to_string(),
+                theme::current()
+                    .diff_context_style()
+                    .add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(crate::tui::path_style::style_file_path(path));
+            lines.push(Line::from(spans));
             continue;
         }
 
@@ -135,25 +134,37 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
             ));
         } else {
             // Summary lines like "3+ 0-" or other non-diff content
-            let rendered = if raw.starts_with("… +") {
-                format!("    {raw} · Ctrl+O transcript")
+            if raw.starts_with("… +") {
+                let theme = crate::tui::theme::current();
+                let dim_style = Style::default().fg(theme.dim);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {raw}"), dim_style),
+                    Span::styled(
+                        " (Ctrl+O to view transcript)".to_string(),
+                        dim_style.add_modifier(ratatui::style::Modifier::ITALIC),
+                    ),
+                ]));
             } else {
-                format!("    {raw}")
-            };
-            lines.push(Line::from(Span::styled(
-                rendered,
-                Style::default().fg(Color::DarkGray),
-            )));
+                lines.push(Line::from(Span::styled(
+                    format!("    {raw}"),
+                    Style::default().fg(theme::current().dim),
+                )));
+            }
         }
     }
 
     let total_lines = diff_text.lines().count();
     if total_lines > max_lines {
         let remaining = total_lines - max_lines;
-        lines.push(Line::from(Span::styled(
-            format!("    … +{remaining} more lines · Ctrl+O transcript"),
-            Style::default().fg(Color::DarkGray),
-        )));
+        let theme = crate::tui::theme::current();
+        let dim_style = Style::default().fg(theme.dim);
+        lines.push(Line::from(vec![
+            Span::styled(format!("    … +{remaining} more lines"), dim_style),
+            Span::styled(
+                " (Ctrl+O to view transcript)".to_string(),
+                dim_style.add_modifier(ratatui::style::Modifier::ITALIC),
+            ),
+        ]));
     }
 
     lines

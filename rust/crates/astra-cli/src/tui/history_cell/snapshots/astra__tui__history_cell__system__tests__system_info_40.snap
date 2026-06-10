@@ -2,4 +2,4 @@
 source: crates/astra-cli/src/tui/history_cell/system.rs
 expression: "render(&SystemCell::info(\"session resumed\"), 40, 1)"
 ---
-Note · session resumed
+ℹ Note · session resumed

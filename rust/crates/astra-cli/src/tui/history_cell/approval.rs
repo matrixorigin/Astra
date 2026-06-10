@@ -514,11 +514,22 @@ impl HistoryCell for ApprovalCell {
         // Optional detail (first 3 lines — bumped from 2 so a
         // multi-line bash command isn't mystery-truncated).
         if let Some(ref detail) = self.detail {
+            let theme = crate::tui::theme::current();
             for dl in detail.lines().take(3) {
-                lines.push(Line::from(vec![
-                    bar.clone(),
-                    Span::styled(dl.to_string(), body_style),
-                ]));
+                let mut spans = vec![bar.clone()];
+                if self.tool == "bash" {
+                    if let Some(cmd) = dl.strip_prefix("$ ") {
+                        spans.push(Span::styled("$ ", body_style));
+                        spans.push(Span::styled(cmd.to_string(), theme.command_style()));
+                    } else {
+                        spans.push(Span::styled(dl.to_string(), theme.command_style()));
+                    }
+                } else if dl.contains('/') && !dl.starts_with("http") {
+                    spans.extend(crate::tui::path_style::style_file_path_flat(dl, body_style));
+                } else {
+                    spans.push(Span::styled(dl.to_string(), body_style));
+                }
+                lines.push(Line::from(spans));
             }
         }
 

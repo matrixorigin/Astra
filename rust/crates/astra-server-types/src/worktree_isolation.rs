@@ -170,7 +170,7 @@ impl WorktreeManager {
             .await?;
         if !output.status.success() {
             return Err(WorktreeError::Git(
-                String::from_utf8_lossy(&output.stderr).to_string(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -297,7 +297,7 @@ impl WorktreeManager {
             .await?;
         if !output.status.success() {
             return Err(WorktreeError::Git(
-                String::from_utf8_lossy(&output.stderr).to_string(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
         Ok(())

@@ -39,6 +39,7 @@ use std::fmt::Debug;
 
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::turn_event::TurnEvent;
 
@@ -207,6 +208,29 @@ impl FreezeStamp {
     pub(crate) fn is_set(self) -> bool {
         self.0.is_some()
     }
+}
+
+/// Width-aware string truncation with Unicode display-width
+/// accounting. Shared across history-cell renderers that need to
+/// fit content into a fixed column budget.
+pub(super) fn truncate_by_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    let mut width = 0;
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw + 1 > max_width {
+            break;
+        }
+        width += cw;
+        end = i + c.len_utf8();
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

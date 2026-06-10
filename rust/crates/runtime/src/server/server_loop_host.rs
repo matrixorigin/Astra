@@ -297,6 +297,7 @@ type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 #[derive(Debug, Clone)]
 struct RequestAwareSummaryClient {
     model_name: String,
+    wire_model_name: Option<String>,
     api_key: String,
     base_url: String,
     provider: String,
@@ -325,6 +326,7 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryCli
             &self.provider,
             Some(self.max_output_tokens),
             llm_fallback_timeout(),
+            self.wire_model_name.as_deref(),
             (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
             self.request_body_overrides.as_ref(),
             self.completions_url_override.as_deref(),
@@ -753,6 +755,9 @@ pub struct ServerAgenticLoopHost {
     /// exit_plan_mode) can refresh it. `None` means no active plan; reads
     /// are cheap (one RwLock read) so `build_system_prompt` stays sync.
     plan_resume_hint: Arc<std::sync::RwLock<Option<String>>>,
+    /// Bounded task-board digest loaded before the turn starts. This is a
+    /// scan hint, not an instruction to create or update tasks every turn.
+    task_board_resume_hint: Option<String>,
 
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
@@ -851,6 +856,7 @@ pub struct ServerAgenticLoopHostBuilder {
     full_llm_capture: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
+    task_board_resume_hint: Option<String>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -895,6 +901,7 @@ impl ServerAgenticLoopHostBuilder {
             full_llm_capture: false,
             event_tx: None,
             plan_resume_hint: None,
+            task_board_resume_hint: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -946,6 +953,11 @@ impl ServerAgenticLoopHostBuilder {
     /// before the loop starts so the first and subsequent turns both see it.
     pub fn with_plan_resume_hint(mut self, hint: Option<String>) -> Self {
         self.plan_resume_hint = hint;
+        self
+    }
+
+    pub fn with_task_board_resume_hint(mut self, hint: Option<String>) -> Self {
+        self.task_board_resume_hint = hint;
         self
     }
 
@@ -1101,6 +1113,7 @@ impl ServerAgenticLoopHostBuilder {
             turn_start_lifecycle_summary: None,
             turn_start_plan_resume_hint: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
+            task_board_resume_hint: self.task_board_resume_hint,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1277,6 +1290,14 @@ impl ServerAgenticLoopHost {
                 None => "- Workspace: unavailable".to_string(),
             },
             format!("- Plan resume: {plan_line}"),
+            format!(
+                "- Task board: {}",
+                self.task_board_resume_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .unwrap_or("no open tasks")
+            ),
             format!(
                 "- Delegation: engine={} · this_turn={} · progress_stream={}",
                 if state.delegation_engine.is_some() {
@@ -2277,6 +2298,7 @@ impl ServerAgenticLoopHost {
         let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = RequestAwareSummaryClient {
             model_name: llm_cfg.model_name.clone(),
+            wire_model_name: llm_cfg.wire_model_name.clone(),
             api_key: llm_cfg.api_key.clone(),
             base_url: llm_cfg.base_url.clone(),
             provider: llm_cfg.provider.clone(),
@@ -4444,12 +4466,53 @@ mod tests {
             "plan resume digest must be visible in lifecycle summary: {text}"
         );
         assert!(
+            text.contains("Task board: no open tasks"),
+            "task-board state should be explicit even when empty: {text}"
+        );
+        assert!(
             text.contains("Session lineage: parent=parent-session-1 · forked_after_turn=7"),
             "fork lineage must be surfaced when available: {text}"
         );
         assert!(
             text.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
             "delegation state must be visible: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_includes_bounded_task_board_hint_for_web_agent() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-task-board".to_string(),
+            "s-task-board".to_string(),
+        )
+        .with_task_board_resume_hint(Some(
+            "open=2 · next=[in_progress] task-1: Ship task UX".to_string(),
+        ))
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-task-board".into());
+        state.current_run_id = Some("run-task-board".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        let outcome = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("pipeline should succeed");
+        let text = pipeline_outcome_text(&outcome);
+
+        assert!(
+            text.contains("Task board: open=2 · next=[in_progress] task-1: Ship task UX"),
+            "task-board digest must be visible in Cloud lifecycle summary: {text}"
+        );
+        assert!(
+            !text.contains("The task tools haven't been used recently."),
+            "Cloud task-board lifecycle context must stay a bounded state hint, not a noisy auto-reminder: {text}"
         );
     }
 
@@ -6194,6 +6257,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RequestAwareSummaryClient {
             model_name: "gpt-4o-mini".to_string(),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),

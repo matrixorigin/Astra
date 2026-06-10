@@ -12,7 +12,7 @@ use super::super::agentic::adaptive_tuning::{
     apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
 };
 use super::super::agentic::delegate_interception::{
-    DelegationInterceptionResult, intercept_delegations, tool_call_name,
+    DelegationInterceptionResult, intercept_delegations, tool_call_arguments_value, tool_call_name,
 };
 use super::super::agentic::headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
@@ -239,9 +239,20 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             | "deprioritize_tool"
             | "set_goal"
             | "compress_context"
-            | "task_create"
-            | "task_update"
-            | "task_stop"
+            | "task"
+    )
+}
+
+fn task_tool_call_is_session_state_mutator(tool_call: &Value) -> bool {
+    if tool_call_name(tool_call) != Some("task") {
+        return false;
+    }
+    matches!(
+        tool_call_arguments_value(tool_call)
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("list"),
+        "create" | "update" | "stop" | "archive" | "adopt"
     )
 }
 
@@ -279,11 +290,8 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
                     | "deprioritize_tool"
                     | "set_goal"
                     | "compress_context"
-                    | "task_create"
-                    | "task_update"
-                    | "task_stop"
             )
-        )
+        ) || task_tool_call_is_session_state_mutator(tool_call)
     })
 }
 
@@ -2321,9 +2329,7 @@ esac
         assert!(is_server_mutator_tool_name("deprioritize_tool"));
         assert!(is_server_mutator_tool_name("set_goal"));
         assert!(is_server_mutator_tool_name("compress_context"));
-        assert!(is_server_mutator_tool_name("task_create"));
-        assert!(is_server_mutator_tool_name("task_update"));
-        assert!(is_server_mutator_tool_name("task_stop"));
+        assert!(is_server_mutator_tool_name("task"));
 
         // Common read-only tools must NOT be classified as mutators.
         for name in [
@@ -2342,6 +2348,34 @@ esac
                 "{name} should not be a mutator"
             );
         }
+    }
+
+    #[test]
+    fn task_round_mutator_detection_uses_action_not_legacy_tool_names() {
+        assert!(server_session_state_mutator_in_round(&[json!({
+            "function": {
+                "name": "task",
+                "arguments": "{\"action\":\"create\",\"title\":\"ship\"}"
+            }
+        })]));
+        assert!(server_session_state_mutator_in_round(&[json!({
+            "function": {
+                "name": "task",
+                "arguments": "{\"action\":\"archive\",\"task_id\":\"task-1\"}"
+            }
+        })]));
+        assert!(!server_session_state_mutator_in_round(&[json!({
+            "function": {
+                "name": "task",
+                "arguments": "{\"action\":\"list\"}"
+            }
+        })]));
+        assert!(!server_session_state_mutator_in_round(&[json!({
+            "function": {
+                "name": "task_create",
+                "arguments": "{\"title\":\"old\"}"
+            }
+        })]));
     }
 
     /// The round contains a successful `write_file` alongside a failing

@@ -198,6 +198,7 @@ slash_dispatch::dispatch("/model", ctx)
 | `Enter` | Composer | Submit text / dispatch slash command |
 | `Shift+Enter` | Composer | Insert newline (multi-line input) |
 | `Ctrl+C` | Turn active | Cancel/interrupt turn |
+| `Ctrl+B` | Foreground bash running | Promote running bash command to a background shell job |
 | `Ctrl+C` | Composer non-empty | Clear draft |
 | `Ctrl+C` | Idle | Quit |
 | `Ctrl+D` | Composer empty | Quit |

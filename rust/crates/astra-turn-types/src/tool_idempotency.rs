@@ -59,6 +59,13 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
             _ => ToolIdempotency::NonIdempotent,
         },
 
+        // Consolidated `task` tool: reads are safe; mutations write
+        // session state and must not be blindly retried.
+        "task" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
+            Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        },
+
         // Pure read tools — safe to re-execute
         "read_file"
         | "file_read"
@@ -116,8 +123,6 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "find"
         | "tool_search"
         | "lsp"
-        | "task_list"
-        | "task_get"
         | "skill"
         | "discover_skills"
         | "brief"
@@ -240,6 +245,27 @@ mod tests {
             );
         }
         assert_eq!(classify("git"), ToolIdempotency::NonIdempotent);
+    }
+
+    #[test]
+    fn consolidated_task_action_aware() {
+        for action in ["list", "get", "list_user"] {
+            assert_eq!(
+                classify_tool_idempotency("task", Some(&json!({ "action": action }))),
+                ToolIdempotency::PureRead,
+                "task(action={action}) should be PureRead"
+            );
+        }
+        for action in ["create", "update", "stop", "archive", "adopt", "unknown"] {
+            assert_eq!(
+                classify_tool_idempotency("task", Some(&json!({ "action": action }))),
+                ToolIdempotency::NonIdempotent,
+                "task(action={action}) should be NonIdempotent"
+            );
+        }
+        assert_eq!(classify("task"), ToolIdempotency::NonIdempotent);
+        assert_eq!(classify("task_list"), ToolIdempotency::NonIdempotent);
+        assert_eq!(classify("task_get"), ToolIdempotency::NonIdempotent);
     }
 
     #[test]

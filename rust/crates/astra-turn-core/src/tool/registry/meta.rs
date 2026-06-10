@@ -517,6 +517,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 40,
     },
     ToolMeta {
+        name: "job",
+        description: "Local TUI background shell jobs: shell, list, output, kill.",
+        triggers: &["job", "background", "bg", "server", "long-running"],
+        pinned: false,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::Local,
+        requires: &[Capability::LocalBackgroundJobs],
+        schema_tokens: 35,
+    },
+    ToolMeta {
         name: "symbols",
         description: "Extract function/class/struct signatures from a file using tree-sitter",
         triggers: &[

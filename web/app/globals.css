@@ -1,14 +1,14 @@
-@import url('/fonts/fz-pingxian-yasong/wght.css');
-@import url('/fonts/newsreader/wght.css');
-@import url('/fonts/inconsolata/wght.css');
+@import url("/fonts/fz-pingxian-yasong/wght.css");
+@import url("/fonts/newsreader/wght.css");
+@import url("/fonts/inconsolata/wght.css");
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 /* highlight.js dark theme for code blocks */
-@import 'highlight.js/styles/github-dark-dimmed.css';
-@import 'katex/dist/katex.min.css';
+@import "highlight.js/styles/github-dark-dimmed.css";
+@import "katex/dist/katex.min.css";
 
 :root {
   color-scheme: light;
@@ -51,7 +51,11 @@ body {
   background: rgb(var(--color-bg));
   color: rgb(var(--color-text));
   font-family: var(--font-sans);
-  font-feature-settings: "kern" 1, "liga" 1, "calt" 1, "tnum" 1;
+  font-feature-settings:
+    "kern" 1,
+    "liga" 1,
+    "calt" 1,
+    "tnum" 1;
   -moz-osx-font-smoothing: grayscale;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -322,7 +326,12 @@ a {
 
 .astra-sidebar-skeleton {
   border: 1px solid rgb(var(--sidebar-line-soft) / 0.74);
-  background: linear-gradient(90deg, rgb(var(--sidebar-paper-strong) / 0.52), rgb(var(--sidebar-focus-soft) / 0.7), rgb(var(--sidebar-paper-strong) / 0.52));
+  background: linear-gradient(
+    90deg,
+    rgb(var(--sidebar-paper-strong) / 0.52),
+    rgb(var(--sidebar-focus-soft) / 0.7),
+    rgb(var(--sidebar-paper-strong) / 0.52)
+  );
 }
 
 .astra-sidebar-clear {
@@ -398,7 +407,11 @@ a,
 input,
 select,
 textarea {
-  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease, opacity 150ms ease;
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -465,7 +478,10 @@ textarea {
   font-family: var(--body-font);
   font-size: var(--body-size);
   font-weight: 400;
-  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+  font-feature-settings:
+    "kern" 1,
+    "liga" 1,
+    "calt" 1;
   font-variation-settings: "opsz" 9;
   letter-spacing: 0.03em;
   line-height: var(--body-line);
@@ -687,17 +703,21 @@ textarea {
   grid-template-columns: minmax(0, 1fr);
   gap: 0.85rem;
   min-width: 0;
-  color: rgb(var(--color-text-secondary));
+  color: rgb(var(--color-text));
   font-family: var(--font-sans);
   font-size: 17px;
   font-weight: 400;
-  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+  font-feature-settings:
+    "kern" 1,
+    "liga" 1,
+    "calt" 1;
   font-variation-settings: "opsz" 9;
   letter-spacing: 0.03em;
   line-height: 1.78;
   -webkit-text-stroke: 0;
   text-autospace: ideograph-alpha ideograph-numeric;
   text-spacing-trim: trim-start;
+  opacity: 0.92;
 }
 
 .astra-reasoning-markdown > * {
@@ -710,8 +730,8 @@ textarea {
 }
 
 .astra-reasoning-markdown strong {
-  color: rgb(var(--color-text-secondary));
-  font-weight: 560;
+  color: rgb(var(--color-text));
+  font-weight: 600;
   font-variation-settings: "opsz" 9;
 }
 
@@ -741,7 +761,7 @@ textarea {
   border-radius: 0.25rem;
   background: rgb(var(--color-surface-muted));
   padding: 0.06rem 0.25rem;
-  color: rgb(var(--color-text-secondary));
+  color: rgb(var(--color-text));
   font-family: var(--font-mono);
   font-size: 0.9em;
   letter-spacing: 0;
@@ -754,7 +774,7 @@ textarea {
   border-radius: 0.5rem;
   background: rgb(var(--color-surface-muted));
   padding: 0.75rem 0.875rem;
-  color: rgb(var(--color-text-secondary));
+  color: rgb(var(--color-text));
   font-family: var(--font-mono);
   font-size: 0.875rem;
   letter-spacing: 0;

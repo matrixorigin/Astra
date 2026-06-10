@@ -48,6 +48,16 @@ const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 
+fn ctrl_b_promoted_notification(job_id: &str) -> String {
+    format!(
+        "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use job(action='output') for the latest job, job(action='output', job_id='{job_id}') for this job, or job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
+    )
+}
+
+fn ctrl_b_cancelled_without_promotion_notification() -> String {
+    "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
     Agents,
@@ -884,7 +894,7 @@ pub(crate) async fn run_tui_session(
         chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
     }
 
-    // Resume-time summary: surface background tasks that reached
+    // Resume-time summary: surface background commands that reached
     // terminal state while the user was away. One ResumeSummary
     // rollup becomes a single banner cell at the top of scrollback
     // — it comes AFTER the replay so the banner is the last thing
@@ -960,7 +970,12 @@ pub(crate) async fn run_tui_session(
                             use bottom_pane::transcript_view::TranscriptView;
                             if bottom_pane.transcript_view_is_open() {
                                 bottom_pane.close_active_view();
-                            } else if !bottom_pane.has_active_view() {
+                            } else {
+                                // Close any other active view first so the
+                                // transcript overlay can take over.
+                                if bottom_pane.has_active_view() {
+                                    bottom_pane.close_active_view();
+                                }
                                 let size = guard.terminal.size().ok();
                                 let w = size.map(|s| s.width).unwrap_or(80);
                                 let h = size.map(|s| s.height).unwrap_or(0);
@@ -1552,7 +1567,7 @@ pub(crate) async fn run_tui_session(
                                                                 {
                                                                     "Plan run paused. Use `show`, `rewind …`, `correct …`, or `go` to continue.".to_string()
                                                                 } else if state
-                                                                    .plan_run_task_last_error
+                                                                    .plan_execution_last_error
                                                                     .is_some()
                                                                 {
                                                                     "Plan run ended with an error. Rewind or adjust it before trying `go` again.".to_string()
@@ -1785,7 +1800,8 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
-                                    let mut ctrl_b_pressed = false;
+                                    let mut ctrl_b_promoted_job_id: Option<String> = None;
+                                    let mut ctrl_b_fallback_cancelled = false;
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
                                     // we keep the listener so a Ctrl+B keypress can
@@ -1817,6 +1833,8 @@ pub(crate) async fn run_tui_session(
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
                                             state.active_turn_local_run_control.clone();
+                                        let bash_detach_slot_for_ctrl_b =
+                                            state.bash_detach_slot.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
@@ -1893,7 +1911,10 @@ pub(crate) async fn run_tui_session(
                                                             {
                                                                 let listener = bash_detach_listener.take();
                                                                 if let Some(listener) = listener {
-                                                                    listener.signal.notify_one();
+                                                                    // Fire the watch signal to request detach.
+                                                                    // If the runner already completed, send
+                                                                    // fails silently — the handler moves on.
+                                                                    let _ = listener.signal_tx.send(true);
                                                                     // Wait briefly for the runner to ship
                                                                     // the live child + streams payload.
                                                                     // 500ms is comfortably more than the
@@ -1925,9 +1946,10 @@ pub(crate) async fn run_tui_session(
                                                                             );
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::info(
-                                                                                    format!("⏎ Backgrounded as {id} — output continues; poll with agent_job(action='output')")
+                                                                                    format!("⏎ Backgrounded as {id} — output continues; poll with job(action='output')")
                                                                                 ),
                                                                             );
+                                                                            ctrl_b_promoted_job_id = Some(id);
                                                                             // The turn is over from the
                                                                             // model's perspective; cancel
                                                                             // gracefully so it sees the
@@ -1935,7 +1957,6 @@ pub(crate) async fn run_tui_session(
                                                                             // already returned by the bash
                                                                             // tool and ends cleanly.
                                                                             tui_cancel_token.cancel();
-                                                                            ctrl_b_pressed = true;
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
@@ -1943,16 +1964,20 @@ pub(crate) async fn run_tui_session(
                                                                         // or completed normally before
                                                                         // detach landed. Fall through to
                                                                         // legacy cancel-and-advise.
-                                                                        _ => {}
+                                                                        _ => {
+                                                                            if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
+                                                                                *slot = None;
+                                                                            }
+                                                                        }
                                                                     }
                                                                 }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
-                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with agent_job(action='shell') to run it in the background."
+                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with job(action='shell') to run it in the background."
                                                                     ),
                                                                 );
                                                                 tui_cancel_token.cancel();
-                                                                ctrl_b_pressed = true;
+                                                                ctrl_b_fallback_cancelled = true;
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
@@ -2474,10 +2499,18 @@ pub(crate) async fn run_tui_session(
                                         }
                                     }
 
-                                    // Ctrl+B notification: inject hint for the next turn.
-                                    if ctrl_b_pressed {
+                                    // Ctrl+B notification: tell the next turn
+                                    // which path actually happened. A true
+                                    // promotion must not suggest re-running the
+                                    // command; doing so risks duplicate side
+                                    // effects.
+                                    if let Some(job_id) = ctrl_b_promoted_job_id {
+                                        state
+                                            .pending_bg_notifications
+                                            .push(ctrl_b_promoted_notification(&job_id));
+                                    } else if ctrl_b_fallback_cancelled {
                                         state.pending_bg_notifications.push(
-                                            "<background_task_notification>\n<status>user_backgrounded</status>\n<hint>The user pressed Ctrl+B to background the current operation. If it was long-running (build, test, server), re-run it with agent_job(action='shell', command='...').</hint>\n</background_task_notification>".to_string()
+                                            ctrl_b_cancelled_without_promotion_notification(),
                                         );
                                     }
 
@@ -3178,7 +3211,7 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
-                // Drain background task commands from the tool executor.
+                // Drain background shell commands from the tool executor.
                 {
                     let cmds: Vec<_> = {
                         state.bg_task_commands.lock_recover().drain(..).collect()
@@ -3189,36 +3222,45 @@ pub(crate) async fn run_tui_session(
                                 let id = background_registry.spawn_shell(&command, &description);
                                 let _ = reply.send(id);
                             }
-                            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                                let _ = reply.send(background_registry.kill(&task_id));
+                            crate::edge_tools::BgTaskCommand::Kill { job_id, reply } => {
+                                let _ = reply.send(background_registry.kill(&job_id));
                             }
-                            crate::edge_tools::BgTaskCommand::GetOutput { task_id, tail_bytes, reply } => {
-                                let output = background_registry.get_combined_output(&task_id, tail_bytes);
+                            crate::edge_tools::BgTaskCommand::GetOutput { job_id, tail_bytes, reply } => {
+                                let output = background_registry.get_combined_output(&job_id, tail_bytes);
                                 let _ = reply.send(output);
                             }
                             crate::edge_tools::BgTaskCommand::GetOutputSince {
-                                task_id,
+                                job_id,
                                 offset,
                                 max_bytes,
                                 reply,
                             } => {
                                 let output =
-                                    background_registry.get_output_since(&task_id, offset, max_bytes);
+                                    background_registry.get_output_since(&job_id, offset, max_bytes);
                                 let _ = reply.send(output);
                             }
-                            crate::edge_tools::BgTaskCommand::IsTerminal { task_id, reply } => {
+                            crate::edge_tools::BgTaskCommand::List { reply } => {
+                                let _ = reply.send(background_registry.render_job_list_xml());
+                            }
+                            crate::edge_tools::BgTaskCommand::Latest { reply } => {
+                                let result = background_registry
+                                    .latest_job_id()
+                                    .ok_or_else(|| "no background commands".to_string());
+                                let _ = reply.send(result);
+                            }
+                            crate::edge_tools::BgTaskCommand::IsTerminal { job_id, reply } => {
                                 // Drain join_set so terminal status is current.
                                 // Use drain_join_set (not poll_completions) to
                                 // preserve pending_completions for the next tick.
                                 background_registry.drain_join_set();
-                                let result = match background_registry.get(&task_id) {
+                                let result = match background_registry.get(&job_id) {
                                     Some(h) => Ok(matches!(
                                         h.status(),
                                         crate::tui::background_tasks::BgTaskStatus::Completed
                                             | crate::tui::background_tasks::BgTaskStatus::Failed
                                             | crate::tui::background_tasks::BgTaskStatus::Killed
                                     )),
-                                    None => Err(format!("no background task with id '{task_id}'")),
+                                    None => Err(format!("no background command with id '{job_id}'")),
                                 };
                                 let _ = reply.send(result);
                             }
@@ -3226,7 +3268,7 @@ pub(crate) async fn run_tui_session(
                     }
                 }
 
-                // Poll background task completions.
+                // Poll background command completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
                     let notification = super::background_tasks::format_notification_xml(ev);
@@ -3235,16 +3277,16 @@ pub(crate) async fn run_tui_session(
                     }
                     let msg = match ev {
                         super::background_tasks::BgTaskEvent::Completed { id, summary, .. } => {
-                            Some(format!("Background task {id} completed: {summary}"))
+                            Some(format!("Background command {id} completed: {summary}"))
                         }
                         super::background_tasks::BgTaskEvent::Failed { id, error } => {
-                            Some(format!("Background task {id} failed: {error}"))
+                            Some(format!("Background command {id} failed: {error}"))
                         }
                         super::background_tasks::BgTaskEvent::Stalled { id, .. } => {
-                            Some(format!("Background task {id} may be stalled (waiting for input)"))
+                            Some(format!("Background command {id} may be stalled (waiting for input)"))
                         }
                         super::background_tasks::BgTaskEvent::Killed { id } => {
-                            Some(format!("Background task {id} killed"))
+                            Some(format!("Background command {id} killed"))
                         }
                         _ => None,
                     };
@@ -3289,7 +3331,7 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
-    // Clean up background tasks on exit.
+    // Clean up background commands on exit.
     background_registry.kill_all();
     drop(guard);
     result
@@ -3380,6 +3422,8 @@ fn handle_app_event(
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
+        | TuiAppEvent::TurnWarning(_)
+        | TuiAppEvent::TurnInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
@@ -3412,6 +3456,34 @@ mod tests {
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
             assert_eq!(decoded, target, "variant {encoded} did not round-trip");
         }
+    }
+
+    #[test]
+    fn ctrl_b_promoted_notification_guides_output_without_rerun() {
+        let notification = ctrl_b_promoted_notification("bg-shell-7");
+
+        assert!(notification.contains("<status>promoted</status>"));
+        assert!(notification.contains("<job_id>bg-shell-7</job_id>"));
+        assert!(notification.contains("job(action='output')"));
+        assert!(notification.contains("job(action='output', job_id='bg-shell-7')"));
+        assert!(notification.contains("job(action='list')"));
+        assert!(
+            !notification.contains("job(action='shell'"),
+            "true Ctrl+B promotion must not tell the model to re-run a side-effecting command: {notification}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_fallback_notification_guides_explicit_background_rerun() {
+        let notification = ctrl_b_cancelled_without_promotion_notification();
+
+        assert!(notification.contains("<status>cancelled_without_promotion</status>"));
+        assert!(notification.contains("no active bash command could be promoted"));
+        assert!(notification.contains("job(action='shell', command='...')"));
+        assert!(
+            !notification.contains("<job_id>"),
+            "fallback cancellation should not invent a background command id: {notification}"
+        );
     }
 
     #[tokio::test]

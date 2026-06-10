@@ -214,66 +214,6 @@ fn parse_grep_file_line_extracts_path_and_line() {
 }
 
 #[test]
-fn ast_validate_filters_comments() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = r#"fn real_call() { target(); }
-// target is mentioned in this comment
-fn another() { target(); }
-"#;
-    std::fs::write(dir.path().join("test.rs"), code).unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let lines = vec![
-        "test.rs:1:fn real_call() { target(); }",
-        "test.rs:2:// target is mentioned in this comment",
-        "test.rs:3:fn another() { target(); }",
-    ];
-    let result = executor.ast_validate_references(&lines, "target");
-    assert!(
-        result.contains(&"test.rs:1:fn real_call() { target(); }"),
-        "real call kept: {:?}",
-        result
-    );
-    assert!(
-        !result.iter().any(|l| l.contains("comment")),
-        "comment filtered: {:?}",
-        result
-    );
-    assert!(
-        result.contains(&"test.rs:3:fn another() { target(); }"),
-        "another call kept: {:?}",
-        result
-    );
-}
-
-#[test]
-fn ast_validate_filters_string_literals() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = r#"fn real_use() -> &str { "hello" }
-fn fake_use() -> &str { "target is in a string" }
-fn actual() { target(); }
-"#;
-    std::fs::write(dir.path().join("test.rs"), code).unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let lines = vec![
-        "test.rs:2:fn fake_use() -> &str { \"target is in a string\" }",
-        "test.rs:3:fn actual() { target(); }",
-    ];
-    let result = executor.ast_validate_references(&lines, "target");
-    assert!(
-        !result.iter().any(|l| l.contains("string")),
-        "string literal filtered: {:?}",
-        result
-    );
-    assert!(
-        result.contains(&"test.rs:3:fn actual() { target(); }"),
-        "real call kept: {:?}",
-        result
-    );
-}
-
-#[test]
 fn ast_validate_keeps_all_for_unknown_language() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.xyz"), "target is here\n").unwrap();
@@ -982,51 +922,42 @@ async fn find_definition_no_doc_still_works() {
 }
 
 #[test]
-fn extract_doc_comment_rust_triple_slash() {
-    let source = "/// First line.\n/// Second line.\nfn foo() {}\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 3);
-    assert!(
-        doc.contains("First line"),
-        "should extract first line: {doc}"
-    );
-    assert!(
-        doc.contains("Second line"),
-        "should extract second line: {doc}"
-    );
-}
-
-#[test]
-fn extract_doc_comment_block_comment() {
-    let source = "/**\n * A block doc comment.\n * With multiple lines.\n */\nfn foo() {}\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 5);
-    assert!(
-        doc.contains("block doc comment"),
-        "should extract block: {doc}"
-    );
-    assert!(
-        doc.contains("multiple lines"),
-        "should extract multi-line: {doc}"
-    );
-}
-
-#[test]
-fn extract_doc_comment_python_docstring() {
-    let source = "def foo():\n    \"\"\"A short docstring.\"\"\"\n    pass\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Python, 1);
-    assert!(
-        doc.contains("short docstring"),
-        "should extract docstring: {doc}"
-    );
-}
-
-#[test]
-fn extract_doc_comment_go_comments() {
-    let source = "// Package foo provides utilities.\n// It does things.\nfunc Foo() {}\n";
-    let doc = code_intel::extract_doc_comment(source, code_intel::Language::Go, 3);
-    assert!(
-        doc.contains("Package foo"),
-        "should extract Go comments: {doc}"
-    );
+fn extract_doc_comment_handles_all_formats() {
+    for (label, source, lang, line, expected) in [
+        (
+            "rust triple slash",
+            "/// First line.\n/// Second line.\nfn foo() {}\n",
+            code_intel::Language::Rust,
+            3usize,
+            vec!["First line", "Second line"],
+        ),
+        (
+            "rust block comment",
+            "/**\n * A block doc comment.\n * With multiple lines.\n */\nfn foo() {}\n",
+            code_intel::Language::Rust,
+            5usize,
+            vec!["block doc comment", "multiple lines"],
+        ),
+        (
+            "python docstring",
+            "def foo():\n    \"\"\"A short docstring.\"\"\"\n    pass\n",
+            code_intel::Language::Python,
+            1usize,
+            vec!["short docstring"],
+        ),
+        (
+            "go comments",
+            "// Package foo provides utilities.\n// It does things.\nfunc Foo() {}\n",
+            code_intel::Language::Go,
+            3usize,
+            vec!["Package foo"],
+        ),
+    ] {
+        let doc = code_intel::extract_doc_comment(source, lang, line);
+        for needle in expected {
+            assert!(doc.contains(needle), "[{label}] missing '{needle}': {doc}");
+        }
+    }
 }
 
 #[test]

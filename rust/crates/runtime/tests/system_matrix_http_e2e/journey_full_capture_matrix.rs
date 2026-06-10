@@ -24,7 +24,7 @@ async fn collect_full_sse_stream(
         let chunk = chunk.expect("body chunk");
         acc.extend_from_slice(&chunk);
     }
-    (status, String::from_utf8_lossy(&acc).to_string())
+    (status, String::from_utf8_lossy(&acc).into_owned())
 }
 
 fn read_journal_events(session_id: &str) -> Vec<Value> {

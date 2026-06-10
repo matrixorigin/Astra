@@ -3,6 +3,40 @@
 use serde_json::{Value, json};
 
 use super::{AGGREGATE_OUTPUT_BUDGET, ToolExecutor};
+use astra_tools::task_mgmt::SessionTask;
+
+fn task_brief_item(task: &SessionTask) -> Value {
+    json!({
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "subtasks": task.subtasks.len(),
+        "updated_at": task.updated_at,
+    })
+}
+
+fn prioritized_task_brief_items(tasks: &[SessionTask], max_items: usize) -> Vec<Value> {
+    let mut picked: Vec<&SessionTask> = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .take(max_items)
+        .collect();
+    if picked.len() < max_items {
+        picked.extend(
+            tasks
+                .iter()
+                .filter(|task| !task.status.is_open_work())
+                .take(max_items - picked.len()),
+        );
+    }
+    let mut items: Vec<Value> = picked.into_iter().map(task_brief_item).collect();
+    if tasks.len() > items.len() {
+        items.push(json!({
+            "more": tasks.len() - items.len()
+        }));
+    }
+    items
+}
 
 impl ToolExecutor {
     /// Share context with other agents via SharedContextCache.
@@ -92,7 +126,7 @@ impl ToolExecutor {
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default();
 
             let mut modified = 0usize;
@@ -133,32 +167,34 @@ impl ToolExecutor {
         }
 
         if focus == "all" || focus == "tasks" {
-            let tasks = self.task_manager.snapshot().await;
-            let mut task_summaries: Vec<Value> = tasks
-                .iter()
-                .take(max_items)
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "title": t.title,
-                        "status": t.status,
-                        "subtasks": t.subtasks.len(),
-                        "updated_at": t.updated_at,
-                    })
-                })
-                .collect();
-            if tasks.len() > max_items {
-                task_summaries.push(json!({
-                    "more": tasks.len() - max_items
-                }));
+            match self.task_manager.load_tasks().await {
+                Ok(tasks) => {
+                    let open_work_count = tasks
+                        .iter()
+                        .filter(|task| task.status.is_open_work())
+                        .count();
+                    let task_summaries = prioritized_task_brief_items(&tasks, max_items);
+                    result.insert(
+                        "tasks".to_string(),
+                        json!({
+                            "available": true,
+                            "count": tasks.len(),
+                            "open_work_count": open_work_count,
+                            "items": task_summaries,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    result.insert(
+                        "tasks".to_string(),
+                        json!({
+                            "available": false,
+                            "error": error,
+                            "message": "Task board could not be loaded; do not treat this as zero tasks.",
+                        }),
+                    );
+                }
             }
-            result.insert(
-                "tasks".to_string(),
-                json!({
-                    "count": tasks.len(),
-                    "items": task_summaries,
-                }),
-            );
         }
 
         if focus == "all" || focus == "files" {

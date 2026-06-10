@@ -263,7 +263,6 @@ async fn show_help(state: &SessionState) {
 /// In TUI mode, common read-only forms are handled natively by
 /// `tui::slash_dispatch`; advanced mutating forms still fall back here.
 /// Kept for headless / non-interactive execution paths.
-#[allow(dead_code)]
 pub(crate) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
     match parse_mcp_command(arg) {
         ParsedMcpCommand::Help => show_help(state).await,

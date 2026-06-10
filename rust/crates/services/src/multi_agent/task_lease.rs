@@ -218,7 +218,7 @@ struct ClaimedTaskLease {
 }
 
 fn task_status_is_claimable(status: &str) -> bool {
-    TaskStatus::parse_status(status).is_claimable()
+    TaskStatus::parse_status(status).is_some_and(|status| status.is_claimable())
 }
 
 const CLAIMABLE_TASK_STATUS_SQL: &str = "t.status IN ('pending', 'in_progress')";
@@ -534,8 +534,8 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             }
         }
         let has_unfinished_tasks: Option<i8> = sqlx::query_scalar(&format!(
-            "SELECT 1 FROM agent_tasks \
-             WHERE user_id = ? AND {CLAIMABLE_TASK_STATUS_SQL} \
+            "SELECT 1 FROM agent_tasks t \
+             WHERE t.user_id = ? AND {CLAIMABLE_TASK_STATUS_SQL} \
              LIMIT 1"
         ))
         .bind(user_id)
