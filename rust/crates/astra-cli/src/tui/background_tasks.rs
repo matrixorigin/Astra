@@ -476,8 +476,8 @@ impl BackgroundTaskRegistry {
     }
 
     pub fn render_background_task_list_xml(&mut self) -> String {
-        let rows = crate::tui::bg_task_proxy::background_task_rows(self);
-        crate::tui::bg_task_proxy::render_background_task_rows_xml(&rows)
+        let rows = crate::tui::bg_task_rendering::background_task_rows(self);
+        crate::tui::bg_task_rendering::render_background_task_rows_xml(&rows)
     }
 
     /// Drain the JoinSet without consuming pending_completions.
@@ -538,6 +538,14 @@ impl BackgroundTaskRegistry {
                 }
             }
         }
+    }
+
+    /// Prune terminated tasks from the registry to prevent unbounded
+    /// memory growth in long-running sessions.  Tasks that have reached a
+    /// terminal state (completed / failed / killed) are removed from the
+    /// in-memory map; their output files remain on disk.
+    pub fn prune_terminated(&mut self) {
+        self.tasks.retain(|_, h| !h.status().is_terminal());
     }
 
     /// Kill all running tasks. Returns IDs of killed tasks.
@@ -657,7 +665,10 @@ impl BackgroundTaskRegistry {
 
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
+    /// Also prunes tasks that were terminal on entry, ensuring one
+    /// full tick of display + persist before removal.
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
+        self.prune_terminated();
         self.drain_join_set();
         std::mem::take(&mut self.pending_completions)
     }

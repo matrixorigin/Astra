@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures_util::future::join_all;
+
 use astra_turn_core::orchestration::agent_result_wire::{
     render_agent_tool_error, render_unknown_agent_result, render_wait_for_agent_status,
     render_wait_timeout_outcome,
@@ -222,9 +224,10 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
         .unwrap_or(&group_id)
         .to_string();
 
-    let mut agents = Vec::with_capacity(input.slots.len());
     let slots = std::mem::take(&mut input.slots);
-    for (slot_index, slot) in slots.into_iter().enumerate() {
+
+    // Validate all slots before spawning any.
+    for (slot_index, slot) in slots.iter().enumerate() {
         if slot.description.trim().is_empty() {
             return render_agent_tool_error(
                 None,
@@ -237,26 +240,38 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
                 &format!("Invalid input: slots[{slot_index}].prompt must be non-empty"),
             );
         }
-
-        let spawn_args = fanout_slot_spawn_args(
-            &input,
-            slot,
-            &group_id,
-            &title,
-            input.target_count,
-            slot_index,
-            args.get("_tool_call_id").and_then(Value::as_str),
-        );
-        let rendered = handle_agent_spawn_action(&spawn_args, Some(ctx)).await;
-        let rendered_value = serde_json::from_str::<Value>(&rendered)
-            .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
-        agents.push(json!({
-            "slot_index": slot_index,
-            "agent_id": rendered_value.get("agent_id").cloned().unwrap_or(Value::Null),
-            "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
-            "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),
-        }));
     }
+
+    // Spawn all slots concurrently — no head-of-line blocking.
+    let futs: Vec<_> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(slot_index, slot)| {
+            let spawn_args = fanout_slot_spawn_args(
+                &input,
+                slot,
+                &group_id,
+                &title,
+                input.target_count,
+                slot_index,
+                args.get("_tool_call_id").and_then(Value::as_str),
+            );
+            Box::pin(async move {
+                let rendered = handle_agent_spawn_action(&spawn_args, Some(ctx)).await;
+                let rendered_value = serde_json::from_str::<Value>(&rendered)
+                    .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
+                json!({
+                    "slot_index": slot_index,
+                    "agent_id": rendered_value.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
+                    "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),
+                })
+            })
+        })
+        .collect();
+    let mut agents: Vec<Value> = join_all(futs).await;
+    // Restore slot-index order.
+    agents.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
 
     let group = find_fanout_group(ctx, &group_id).await;
     json!({
@@ -294,7 +309,9 @@ async fn handle_agent_fanout_get_results_action(
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
     };
 
-    let mut results = Vec::with_capacity(group.slots.len());
+    let mut results: Vec<Value> = Vec::with_capacity(group.slots.len());
+    let mut futs: Vec<_> = Vec::new();
+
     for slot in &group.slots {
         let Some(agent_id) = slot.agent_id.as_deref() else {
             results.push(json!({
@@ -304,22 +321,29 @@ async fn handle_agent_fanout_get_results_action(
             }));
             continue;
         };
-        let rendered = handle_agent_get_result_action(
-            &json!({
-                "agent_id": agent_id,
-                "_tool_call_id": args.get("_tool_call_id").and_then(Value::as_str),
-            }),
-            Some(ctx),
-        )
-        .await;
-        let value = serde_json::from_str::<Value>(&rendered)
-            .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
-        results.push(json!({
-            "slot_index": slot.slot_index,
+        let agent_id = agent_id.to_string();
+        let slot_index = slot.slot_index;
+        let get_args = json!({
             "agent_id": agent_id,
-            "result": value,
+            "_tool_call_id": args.get("_tool_call_id").and_then(Value::as_str),
+        });
+        futs.push(Box::pin(async move {
+            let rendered = handle_agent_get_result_action(&get_args, Some(ctx)).await;
+            let value = serde_json::from_str::<Value>(&rendered)
+                .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
+            json!({
+                "slot_index": slot_index,
+                "agent_id": agent_id,
+                "result": value,
+            })
         }));
     }
+
+    // Query all agent results concurrently.
+    let mut concurrent: Vec<Value> = join_all(futs).await;
+    results.append(&mut concurrent);
+    // Restore slot-index order.
+    results.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
 
     let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
     json!({

@@ -42,6 +42,7 @@ use super::terminal::TerminalGuard;
 
 use super::agent_view::*;
 use super::bg_task_proxy::*;
+use super::bg_task_rendering::*;
 use super::plan_mode::*;
 use super::{
     bottom_pane, chat_widget, history_cell, mention_menu, resume_summary, slash_dispatch,
@@ -61,18 +62,14 @@ fn ctrl_b_promoted_notification(task_id: &str) -> String {
 fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
     let description = description.trim();
     if description.is_empty() {
-        format!(
-            "Backgrounded agent {agent_id} - collect it with agent(action='get_result', agent_id='{agent_id}')"
-        )
+        format!("Backgrounded agent {agent_id}. Opened background tasks.")
     } else {
-        format!(
-            "Backgrounded agent {agent_id} ({description}) - collect it with agent(action='get_result', agent_id='{agent_id}')"
-        )
+        format!("Backgrounded agent {agent_id} ({description}). Opened background tasks.")
     }
 }
 
-fn should_show_ctrl_b_background_hint(detach_ready: bool, already_promoted_once: bool) -> bool {
-    detach_ready && !already_promoted_once
+fn should_show_ctrl_b_background_hint(detach_ready: bool) -> bool {
+    detach_ready
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -729,7 +726,6 @@ pub(crate) async fn run_tui_session(
     let mut background_task_projection_cache = background_registry.export_shell_task_projections();
     let mut background_local_agent_projection_cache = restored_local_agent_task_projections.clone();
     let mut background_registry_session_id = state.session_id.clone();
-    let mut ctrl_b_promoted_once = false;
     // User's explicit Ctrl+T choice. `None` = auto-rules apply;
     // `Some(true|false)` = honour the user's pin even when the
     // auto-hide timer fires or new tasks appear. Reset by
@@ -1604,18 +1600,15 @@ pub(crate) async fn run_tui_session(
                                     // prior turn that was never consumed (e.g. the model
                                     // didn't run bash last turn).
                                     let mut bash_detach_listener = {
-                                        let (handle, listener) = astra_tools::detach::new_detach_pair();
-                                        if let Ok(mut slot) = state.bash_detach_slot.try_lock() {
-                                            *slot = Some(handle);
-                                            chat_widget.set_bash_background_hint_enabled(
-                                                should_show_ctrl_b_background_hint(
-                                                    true,
-                                                    ctrl_b_promoted_once,
-                                                ),
-                                            );
-                                        } else {
-                                            chat_widget.set_bash_background_hint_enabled(false);
-                                        }
+                                            let (handle, listener) = astra_tools::detach::new_detach_pair();
+                                            if let Ok(mut slot) = state.bash_detach_slot.try_lock() {
+                                                *slot = Some(handle);
+                                                chat_widget.set_bash_background_hint_enabled(
+                                                    should_show_ctrl_b_background_hint(true),
+                                                );
+                                            } else {
+                                                chat_widget.set_bash_background_hint_enabled(false);
+                                            }
                                         Some(listener)
                                     };
 
@@ -1753,17 +1746,26 @@ pub(crate) async fn run_tui_session(
                                                                             );
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::info(
-                                                                                    format!("⏎ Backgrounded as {id} - output continues; poll with task_output(task_id='{id}')")
+                                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
                                                                                 ),
                                                                             );
                                                                             ctrl_b_promoted_task_id = Some(id);
-                                                                            ctrl_b_promoted_once = true;
                                                                             persist_background_task_projections_if_changed(
                                                                                 &mut background_registry,
                                                                                 background_registry_turn_session_id.as_deref(),
                                                                                 background_registry_turn_model.as_deref(),
                                                                                 &mut background_task_projection_cache,
                                                                             );
+                                                                            let selected_id = ctrl_b_promoted_task_id.as_deref();
+                                                                            let _ = reveal_background_task_view(
+                                                                                &mut background_registry,
+                                                                                agent_spawner_for_cancel.as_ref(),
+                                                                                &restored_local_agent_task_projections,
+                                                                                &mut bottom_pane,
+                                                                                &frame_requester,
+                                                                                selected_id,
+                                                                            )
+                                                                            .await;
                                                                             // The turn is over from the
                                                                             // model's perspective; cancel
                                                                             // gracefully so it sees the
@@ -1784,22 +1786,33 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                     }
                                                                 }
-                                                                if let Some(spawner) = agent_spawner_for_cancel.as_ref()
-                                                                    && let Some(agent) = spawner
-                                                                        .promote_foreground_agent_to_background(None)
-                                                                        .await
-                                                                {
-                                                                    chat_widget.commit_system(
-                                                                        history_cell::system::SystemCell::info(
-                                                                            ctrl_b_promoted_agent_message(
-                                                                                &agent.agent_id,
-                                                                                &agent.description,
-                                                                            ),
-                                                                        ),
-                                                                    );
-                                                                    frame_requester.schedule_frame();
-                                                                    continue;
-                                                                }
+                                                                    if let Some(spawner) = agent_spawner_for_cancel.as_ref() {
+                                                                        if let Some(agent) = spawner
+                                                                            .promote_foreground_agent_to_background(None)
+                                                                            .await
+                                                                        {
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::info(
+                                                                                    ctrl_b_promoted_agent_message(
+                                                                                        &agent.agent_id,
+                                                                                        &agent.description,
+                                                                                    ),
+                                                                                ),
+                                                                            );
+                                                                            let _ = reveal_background_task_view(
+                                                                                &mut background_registry,
+                                                                                agent_spawner_for_cancel.as_ref(),
+                                                                                &restored_local_agent_task_projections,
+                                                                                &mut bottom_pane,
+                                                                                &frame_requester,
+                                                                                Some(&agent.agent_id),
+                                                                            )
+                                                                            .await;
+                                                                            tui_cancel_token.cancel();
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                    }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
                                                                         "⏎ Backgrounding unavailable: no active bash or agent can be promoted right now."
@@ -3495,12 +3508,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_promoted_agent_message_guides_get_result_without_task_output() {
+    fn ctrl_b_promoted_agent_message_is_user_facing() {
         let message = ctrl_b_promoted_agent_message("reviewer@run-1", "review auth");
 
         assert!(message.contains("Backgrounded agent reviewer@run-1"));
         assert!(message.contains("review auth"));
-        assert!(message.contains("agent(action='get_result', agent_id='reviewer@run-1')"));
+        assert!(message.contains("Opened background tasks"));
+        assert!(!message.contains("agent(action="), "{message}");
         assert!(!message.contains("task_output"), "{message}");
         assert!(!message.contains("job("), "{message}");
     }
@@ -4076,11 +4090,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_background_hint_requires_detach_and_stops_after_success() {
-        assert!(should_show_ctrl_b_background_hint(true, false));
-        assert!(!should_show_ctrl_b_background_hint(false, false));
-        assert!(!should_show_ctrl_b_background_hint(true, true));
-        assert!(!should_show_ctrl_b_background_hint(false, true));
+    fn ctrl_b_background_hint_requires_detach() {
+        assert!(should_show_ctrl_b_background_hint(true));
+        assert!(!should_show_ctrl_b_background_hint(false));
     }
 
     #[tokio::test]

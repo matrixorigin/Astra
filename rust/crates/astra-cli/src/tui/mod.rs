@@ -9,6 +9,7 @@ mod app_event;
 pub(crate) mod approval;
 pub(crate) mod background_tasks;
 mod bg_task_proxy;
+mod bg_task_rendering;
 mod board_pin;
 mod bottom_pane;
 mod cancel_fanout;

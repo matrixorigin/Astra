@@ -438,6 +438,19 @@ impl BackgroundTaskView {
         view
     }
 
+    pub(crate) fn new_with_selected(
+        rows: Vec<BackgroundTaskRow>,
+        selected_id: Option<&str>,
+    ) -> Self {
+        let mut view = Self::new(rows);
+        if let Some(selected_id) = selected_id
+            && let Some(idx) = view.rows.iter().position(|row| row.id == selected_id)
+        {
+            view.selected = idx;
+        }
+        view
+    }
+
     pub(crate) fn replace_rows(&mut self, rows: Vec<BackgroundTaskRow>) {
         let selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
         let rows = sort_rows(rows);
@@ -1056,6 +1069,20 @@ mod tests {
         assert_eq!(view.rows[1].id, "fail");
         assert_eq!(view.rows[2].id, "run");
         assert_eq!(view.rows[3].id, "done");
+    }
+
+    #[test]
+    fn new_with_selected_selects_matching_row_after_sort() {
+        let view = BackgroundTaskView::new_with_selected(
+            vec![
+                row("done", "completed", "done task"),
+                row("run", "running", "running task"),
+                row("wait", "waiting_for_input", "waiting task"),
+            ],
+            Some("run"),
+        );
+
+        assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("run"));
     }
 
     #[test]
