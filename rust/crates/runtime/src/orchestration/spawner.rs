@@ -34,6 +34,10 @@ use super::agent_trace_terminal_event_type;
 
 /// Sentinel run ID for the top-level (root) agent.
 pub const ROOT_RUN_ID: &str = "root";
+/// Maximum number of fanout groups tracked concurrently. Beyond this
+/// limit, new groups are rejected with `SpawnError::FanoutGroupLimitExceeded`
+/// to prevent unbounded memory growth in long-running sessions.
+pub const MAX_FANOUT_GROUPS: usize = 64;
 pub const SPAWN_STATUS_COMPLETED: &str = "completed";
 pub const SPAWN_STATUS_INTERRUPTED: &str = "interrupted";
 pub const SPAWN_STATUS_CANCELLED: &str = "cancelled";
@@ -654,6 +658,8 @@ pub struct DynamicAgentSpawner {
     max_concurrent_agents: Option<usize>,
     /// Fanout group accounting keyed by group id. Group target_count
     /// is a user/model invariant, not a derived live-agent count.
+    /// Capped at [`MAX_FANOUT_GROUPS`] to prevent unbounded memory
+    /// growth from long-running sessions.
     fanout_groups: Arc<RwLock<HashMap<String, AgentFanoutGroupProjection>>>,
 }
 
@@ -881,6 +887,10 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
     ) -> Result<(), SpawnError> {
         let mut groups = self.fanout_groups.write().await;
+        let is_new = !groups.contains_key(&identity.group_id);
+        if is_new {
+            self.evict_terminal_fanout_group_if_full(&mut groups);
+        }
         let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
             let mut group = AgentFanoutGroupProjection::new(
                 identity.group_id.clone(),
@@ -901,7 +911,9 @@ impl DynamicAgentSpawner {
             .map_err(SpawnError::InvalidInput)?;
         group
             .record_spawn_accepted(identity.slot_index, agent_id)
-            .map_err(SpawnError::InvalidInput)
+            .map_err(SpawnError::InvalidInput)?;
+        group.touch();
+        Ok(())
     }
 
     async fn record_fanout_spawn_rejected(
@@ -914,6 +926,10 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
     ) -> Result<(), SpawnError> {
         let mut groups = self.fanout_groups.write().await;
+        let is_new = !groups.contains_key(&identity.group_id);
+        if is_new {
+            self.evict_terminal_fanout_group_if_full(&mut groups);
+        }
         let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
             let mut group = AgentFanoutGroupProjection::new(
                 identity.group_id.clone(),
@@ -934,7 +950,9 @@ impl DynamicAgentSpawner {
             .map_err(SpawnError::InvalidInput)?;
         group
             .record_spawn_rejected(identity.slot_index, reason)
-            .map_err(SpawnError::InvalidInput)
+            .map_err(SpawnError::InvalidInput)?;
+        group.touch();
+        Ok(())
     }
 
     async fn record_fanout_spawn_rejected_for_input(
@@ -968,6 +986,31 @@ impl DynamicAgentSpawner {
             return;
         };
         let _ = group.record_terminal_by_agent(&state.agent_id, status, reason);
+        group.touch();
+    }
+
+    /// Evict the least-recently-touched terminal group when the fanout-groups
+    /// map is at capacity.  Only terminal groups (Finished / Incomplete) are
+    /// candidates — evicting a live group would corrupt in-flight agent
+    /// accounting.  If no terminal candidate exists the map is allowed to
+    /// grow one extra slot so the caller's insert can proceed.
+    fn evict_terminal_fanout_group_if_full(
+        &self,
+        groups: &mut HashMap<String, AgentFanoutGroupProjection>,
+    ) {
+        if groups.len() < MAX_FANOUT_GROUPS {
+            return;
+        }
+        // Find the terminal group with the oldest last_touched.
+        let Some((evict_id, _)) = groups
+            .iter()
+            .filter(|(_, g)| g.is_terminal())
+            .min_by_key(|(_, g)| g.last_touched)
+        else {
+            return;
+        };
+        let evict_id = evict_id.clone();
+        groups.remove(&evict_id);
     }
 
     async fn mark_fanout_result_collected(&self, state: &SpawnedAgentState) {
@@ -977,6 +1020,7 @@ impl DynamicAgentSpawner {
         let mut groups = self.fanout_groups.write().await;
         if let Some(group) = groups.get_mut(&identity.group_id) {
             group.mark_result_collected(&state.agent_id);
+            group.touch();
         }
     }
 
@@ -1346,9 +1390,20 @@ impl DynamicAgentSpawner {
 
         let spawned_state_for_trace = {
             let mut active_agents = self.active_agents.write().await;
-            let state = active_agents
-                .get_mut(&agent_id)
-                .expect("agent reservation must exist after successful reservation");
+            let state = match active_agents.get_mut(&agent_id) {
+                Some(s) => s,
+                None => {
+                    // Agent was cancelled between reservation and spawn
+                    // completion. Clean up and return a race error
+                    // instead of panicking.
+                    if let Some(addr) = messaging_address.as_ref() {
+                        let _ = self.mailbox_router.unregister(addr).await;
+                    }
+                    return Err(SpawnError::Race(format!(
+                        "agent {agent_id} was cancelled before spawn completed"
+                    )));
+                }
+            };
             state.messaging_address = messaging_address.clone();
             state.worktree_path = worktree_path.clone();
             state.clone()
@@ -1604,41 +1659,84 @@ impl DynamicAgentSpawner {
     /// Cancel a single background agent by id. Returns true only when this call
     /// actually owned the cancellation and archived the agent as cancelled.
     pub async fn cancel_agent(&self, agent_id: &str, reason: &str) -> bool {
-        let Some(abort_handle) = self
-            .background_abort_handles
-            .read()
-            .await
-            .get(agent_id)
-            .cloned()
-        else {
-            return false;
+        // Single write-lock scope that *atomically* removes both the abort
+        // handle and the agent state.  This prevents a TOCTOU race where the
+        // monitor finalises the agent between handle removal and state
+        // finalization — which would leave the cancel_agent caller thinking
+        // it "won" while the monitor already cleaned up (and possibly recorded
+        // a different terminal status for fanout slots).
+        let (abort_handle, mut state) = {
+            let mut handles = self.background_abort_handles.write().await;
+            let Some(handle) = handles.remove(agent_id) else {
+                return false;
+            };
+            if handle.is_finished() {
+                return false;
+            }
+            // Atomically seize the active state.  If we hold the abort handle
+            // but not the state, the monitor may finalize independently and
+            // leave fanout slots in a non-terminal state (or worse, in a
+            // terminal state that disagrees with user intent).
+            let mut active = self.active_agents.write().await;
+            let Some(state) = active.remove(agent_id) else {
+                return false;
+            };
+            (handle, state)
         };
-        if abort_handle.is_finished() {
-            return false;
-        }
-
-        let Some(abort_handle) = self.background_abort_handles.write().await.remove(agent_id)
-        else {
-            return false;
-        };
-        if abort_handle.is_finished() {
-            return false;
-        }
 
         abort_handle.abort();
         // `cancel_agent` is the user-driven cancel surface (Ctrl+G x,
         // /agent cancel, etc.). Propagate the user-driven flag so the
         // wire output tells the LLM not to respawn.
-        self.finalize_background_agent(
-            agent_id,
-            AgentStatus::cancelled_by_user(reason),
-            "cancelled",
-            Some(reason),
-            None,
-            Some(reason),
-            None,
-        )
-        .await
+        self.finalize_cancelled_agent(&mut state, agent_id, reason)
+            .await
+    }
+
+    /// Finalize an agent that was atomically seized by [`cancel_agent`].
+    /// Performs all the same cleanup as [`finalize_background_agent`] but
+    /// operates on a pre-extracted [`SpawnedAgentState`] — the caller already
+    /// owns the state and the abort handle is already removed from the book.
+    async fn finalize_cancelled_agent(
+        &self,
+        state: &mut SpawnedAgentState,
+        agent_id: &str,
+        reason: &str,
+    ) -> bool {
+        self.remove_background_agent_id(agent_id);
+
+        let status = AgentStatus::cancelled_by_user(reason);
+        state.status = status;
+        let messaging_address = state.messaging_address.take();
+
+        self.record_fanout_terminal_state(state).await;
+        self.emit_agent_terminal_trace(state, "cancelled", Some(reason), Some(reason), None)
+            .await;
+        self.persist_agent_terminated_state(state, "cancelled", Some(reason))
+            .await;
+        if let Some(event_type) =
+            agent_status_to_progress_event(&state.status, &state.metrics, state.started_at)
+        {
+            let timestamp_epoch_ms = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.progress_broadcaster.emit(AgentProgressEvent {
+                agent_id: agent_id.to_string(),
+                event_type,
+                timestamp_epoch_ms,
+            });
+        }
+        if let Some(addr) = messaging_address
+            && let Err(err) = self.mailbox_router.unregister(&addr).await
+        {
+            eprintln!(
+                "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
+                agent_id, err
+            );
+        }
+        self.archive_state(state.clone()).await;
+        self.notify_completion(agent_id).await;
+        true
     }
 
     async fn finalize_background_agent(
@@ -2143,6 +2241,13 @@ pub enum SpawnError {
     /// only visible via `last_prefix_resolve`.
     #[error("Required prefix inheritance failed: {reason}")]
     PrefixInheritanceRequired { reason: String },
+
+    /// Agent was cancelled or removed between reservation and spawn
+    /// completion. This is a transient race, not a user error — the
+    /// caller should treat it as a soft failure (same as a cancelled
+    /// spawn) rather than propagating a hard error.
+    #[error("Spawn race: {0}")]
+    Race(String),
 
     /// Concurrency cap reached. The LLM (or human caller) should wait
     /// for an outstanding agent to finish, cancel one explicitly, or

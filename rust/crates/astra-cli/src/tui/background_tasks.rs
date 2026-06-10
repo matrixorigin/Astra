@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use astra_pipeline::output_stream::OutputStream;
@@ -202,6 +202,10 @@ impl BackgroundTaskHandle {
 const MAX_OUTPUT_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 #[cfg(test)]
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+/// Maximum number of concurrently running background tasks. Spawns
+/// beyond this limit are soft-rejected (return an empty id) to prevent
+/// unbounded resource consumption.  The LLM can retry or re-plan.
+const MAX_CONCURRENT_TASKS: usize = 32;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const PROMPT_PATTERNS: &[&str] = &[
@@ -237,6 +241,9 @@ impl BackgroundTaskRegistry {
 
     /// Spawn a shell command in the background. Returns the task ID.
     pub fn spawn_shell(&mut self, command: &str, description: &str) -> String {
+        if self.running_count() >= MAX_CONCURRENT_TASKS {
+            return String::new();
+        }
         let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
         let cancel = CancellationToken::new();
         let stdout_path = self.output_dir.join(format!("{id}.stdout"));
@@ -314,6 +321,9 @@ impl BackgroundTaskRegistry {
         partial_stdout: String,
         partial_stderr: String,
     ) -> String {
+        if self.running_count() >= MAX_CONCURRENT_TASKS {
+            return String::new();
+        }
         let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
         let cancel = CancellationToken::new();
         let stdout_path = self.output_dir.join(format!("{id}.stdout"));
@@ -362,6 +372,7 @@ impl BackgroundTaskRegistry {
         });
 
         let task_id = id.clone();
+        let command_label = command_label.to_string();
         self.join_set.spawn(async move {
             run_adopted_shell(
                 child,
@@ -371,6 +382,7 @@ impl BackgroundTaskRegistry {
                 &stderr_path,
                 cancel,
                 &task_id,
+                &command_label,
             )
             .await
         });
@@ -935,7 +947,13 @@ async fn run_shell_task(
             match exit {
                 Ok(exit_status) => {
                     let code = exit_status.code();
-                    let success = exit_status.success();
+                    let success = exit_status.success()
+                        || code
+                            .map(|code| {
+                                !astra_tools::exit_semantics::classify_exit(cmd, code)
+                                    .is_tool_error()
+                            })
+                            .unwrap_or(false);
                     let summary = make_summary(stdout_path, code);
                     if success {
                         TaskCompletion {
@@ -1050,6 +1068,7 @@ async fn run_adopted_shell(
     stderr_path: &std::path::Path,
     cancel: CancellationToken,
     task_id: &str,
+    command_label: &str,
 ) -> TaskCompletion {
     let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.to_path_buf()));
     let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.to_path_buf()));
@@ -1062,7 +1081,13 @@ async fn run_adopted_shell(
             match exit {
                 Ok(exit_status) => {
                     let code = exit_status.code();
-                    let success = exit_status.success();
+                    let success = exit_status.success()
+                        || code
+                            .map(|code| {
+                                !astra_tools::exit_semantics::classify_exit(command_label, code)
+                                    .is_tool_error()
+                            })
+                            .unwrap_or(false);
                     let summary = make_summary(stdout_path, code);
                     if success {
                         TaskCompletion {
@@ -1655,6 +1680,27 @@ mod tests {
             .expect("completion event");
 
         assert_eq!(title, "cargo test -p astra-cli");
+    }
+
+    #[tokio::test]
+    async fn grep_no_match_background_shell_completes_without_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("grep needle /dev/null", "grep needle /dev/null");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let events = reg.poll_completions();
+        let completion = events
+            .iter()
+            .find_map(|event| match event {
+                BgTaskEvent::Completed { id: eid, .. } if eid == &id => Some("completed"),
+                BgTaskEvent::Failed { id: eid, error, .. } if eid == &id => Some(error.as_str()),
+                _ => None,
+            })
+            .expect("background grep should emit a terminal event");
+
+        assert_eq!(completion, "completed");
+        assert_eq!(reg.get(&id).unwrap().projected_status(), "completed");
     }
 
     #[tokio::test]

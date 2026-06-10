@@ -6,6 +6,7 @@
 //! cancellations, and budget cancellations do not inflate or blur the group.
 
 use serde::Serialize;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentFanoutSlotIdentity {
@@ -51,6 +52,9 @@ pub struct AgentFanoutGroupProjection {
     pub created_by_tool_use_id: Option<String>,
     pub slots: Vec<AgentFanoutSlot>,
     pub status: AgentFanoutStatus,
+    /// Monotonic timestamp of last mutation or access.  Used for
+    /// LRU eviction when the fanout-groups map exceeds its cap.
+    pub last_touched: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +127,24 @@ impl AgentFanoutGroupProjection {
             created_by_tool_use_id: None,
             slots,
             status: AgentFanoutStatus::Planned,
+            last_touched: SystemTime::now(),
         }
+    }
+
+    /// Bump the `last_touched` timestamp.  Call on every access path
+    /// that reads or mutates the group so LRU eviction has a consistent
+    /// ordering signal.
+    pub fn touch(&mut self) {
+        self.last_touched = SystemTime::now();
+    }
+
+    /// True when the group has no active slots (all started slots have
+    /// reached a terminal status).  Used to identify safe eviction candidates.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
+        )
     }
 
     pub fn set_slot_request(
@@ -205,6 +226,12 @@ impl AgentFanoutGroupProjection {
         else {
             return Err(format!("fanout agent {agent_id} is not assigned to a slot"));
         };
+        if slot.status.is_terminal() {
+            return Err(format!(
+                "fanout agent {agent_id} already recorded terminal status {:?}",
+                slot.status
+            ));
+        }
         slot.status = status;
         slot.terminal_reason = reason;
         self.recompute_status();

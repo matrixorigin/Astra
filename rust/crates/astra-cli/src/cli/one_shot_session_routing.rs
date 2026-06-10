@@ -1,18 +1,21 @@
 use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
-use crate::cli::session::session_continuation::load_session_messages_for_continuation;
+use crate::cli::session::session_continuation::{
+    load_session_messages_for_continuation, sanitize_continuation_messages,
+};
 use crate::cli::session::session_restore_client::{
     list_cloud_resumable_sessions, restore_session_snapshot_with_client,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct OneShotSessionResumeMetadata {
     pub(crate) model: Option<String>,
     pub(crate) permission_mode: Option<String>,
+    pub(crate) continuation_messages: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct OneShotSessionRouting {
     pub(crate) server_session_id: Option<String>,
     pub(crate) history_source_session_id: Option<String>,
@@ -21,6 +24,9 @@ pub(crate) struct OneShotSessionRouting {
 
 impl OneShotSessionRouting {
     pub(crate) fn continuation_messages(&self) -> Option<Vec<serde_json::Value>> {
+        if !self.resume_metadata.continuation_messages.is_empty() {
+            return Some(self.resume_metadata.continuation_messages.clone());
+        }
         self.history_source_session_id
             .as_deref()
             .and_then(load_session_messages_for_continuation)
@@ -83,10 +89,15 @@ async fn load_one_shot_resume_metadata(
     };
 
     match restore_session_snapshot_with_client(profile, api, session_id).await {
-        Ok(Some(restored)) => OneShotSessionResumeMetadata {
-            model: restored.model,
-            permission_mode: restored.permission_mode,
-        },
+        Ok(Some(restored)) => {
+            let continuation_messages =
+                sanitize_continuation_messages(restored.conversation_messages);
+            OneShotSessionResumeMetadata {
+                model: restored.model,
+                permission_mode: restored.permission_mode,
+                continuation_messages,
+            }
+        }
         Ok(None) => OneShotSessionResumeMetadata::default(),
         Err(error) => {
             tracing::warn!(
@@ -247,6 +258,19 @@ mod tests {
                 "session_id": session_id,
                 "turn_count": 1
             })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_cloud_resume(
+        server: &MockServer,
+        session_id: &str,
+        restored: astra_services::session_restore::RestoredSession,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(restored))
             .mount(server)
             .await;
     }
@@ -416,6 +440,60 @@ mod tests {
         );
         assert_eq!(routing.restored_model(), Some("gpt-5"));
         assert_eq!(routing.restored_permission_mode(), Some("plan"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_uses_cloud_resume_messages_without_local_checkpoint()
+    {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_existing_session(&server, &session_id).await;
+        mock_cloud_resume(
+            &server,
+            &session_id,
+            astra_services::session_restore::RestoredSession {
+                session_id: session_id.clone(),
+                model: Some("gpt-5-cloud".to_string()),
+                permission_mode: Some("accept_edits".to_string()),
+                conversation_messages: vec![
+                    serde_json::json!({"role": "user", "content": "cloud question"}),
+                    serde_json::json!({"role": "assistant", "content": "cloud answer"}),
+                ],
+                restored_from_cloud: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let routing =
+            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id.clone()), true)
+                .await
+                .expect("explicit cloud resume should restore messages");
+
+        assert_eq!(routing.restored_model(), Some("gpt-5-cloud"));
+        assert_eq!(routing.restored_permission_mode(), Some("accept_edits"));
+        let continuation = routing
+            .continuation_messages()
+            .expect("cloud resume messages should feed one-shot continuation");
+        assert_eq!(continuation.len(), 2);
+        assert_eq!(continuation[0]["content"], "cloud question");
+        assert_eq!(continuation[1]["content"], "cloud answer");
     }
 
     #[serial_test::serial]
