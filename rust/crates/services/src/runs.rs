@@ -15,6 +15,8 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::normalization::{non_empty_optional_string, normalize_optional_string};
+
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 
@@ -713,6 +715,22 @@ fn run_requires_session_exclusive_start(record: &DurableRunRecord) -> bool {
         && record.agent_id.is_none()
 }
 
+fn normalize_run_record_optional_fields(record: &mut DurableRunRecord) {
+    normalize_optional_string(&mut record.parent_run_id);
+    normalize_optional_string(&mut record.root_run_id);
+    normalize_optional_string(&mut record.ancestor_path);
+    normalize_optional_string(&mut record.delegation_id);
+    normalize_optional_string(&mut record.agent_id);
+    normalize_optional_string(&mut record.retry_of);
+    normalize_optional_string(&mut record.retry_scope);
+    normalize_optional_string(&mut record.waiting_for);
+    normalize_optional_string(&mut record.owner_pod_id);
+    normalize_optional_string(&mut record.checkpoint_version);
+    normalize_optional_string(&mut record.checkpoint_json);
+    normalize_optional_string(&mut record.error_code);
+    normalize_optional_string(&mut record.error_message);
+}
+
 fn checkpoint_metadata(
     run_id: &str,
     checkpoint_json: &str,
@@ -848,7 +866,8 @@ fn build_run_display_projection(
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
-    async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+    async fn insert_run(&self, mut record: DurableRunRecord) -> Result<(), String> {
+        normalize_run_record_optional_fields(&mut record);
         let mut runs = self.runs.write().await;
         let run_id = record.run_id.clone();
         if run_requires_session_exclusive_start(&record)
@@ -1739,18 +1758,15 @@ impl DatabaseRunStateStore {
             .allocate_event_indices_batch(run_id, events.len() as i64)
             .await?;
 
-        // Build bulk INSERT. MatrixOne / MySQL supports multi-row VALUES.
-        // Column list is defined once; the number of `?` placeholders per row
-        // (12) is derived from BatchEventRow's field count (created_at uses NOW(6)).
-        const EVENT_INSERT_COLUMNS: &str =
-            "(id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
-              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)";
-        let mut query = String::from("INSERT IGNORE INTO agent_run_events ");
-        query.push_str(EVENT_INSERT_COLUMNS);
-        query.push_str(" VALUES ");
-
-        // Number of bind placeholders must match column count (13 cols, 1 is NOW(6)).
-        const BIND_COUNT: usize = 12;
+        // MatrixOne 3.0.4 can panic in its dedup/multi-update path for large
+        // multi-row INSERT IGNORE statements. Keep idempotent insert semantics,
+        // but execute one row per statement so event durability cannot depend on
+        // that optimizer path.
+        const EVENT_INSERT_SQL: &str =
+            "INSERT IGNORE INTO agent_run_events \
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
+              idempotency_key, event_hash, producer_pod_id, payload_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))";
 
         #[derive(Debug)]
         struct BatchEventRow {
@@ -1793,19 +1809,6 @@ impl DatabaseRunStateStore {
         let mut rows: Vec<BatchEventRow> = Vec::with_capacity(events.len());
 
         for (i, event) in events.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
-            }
-            // Build one row's placeholders: BIND_COUNT `?`s + `NOW(6)` for created_at.
-            query.push('(');
-            for j in 0..BIND_COUNT {
-                if j > 0 {
-                    query.push_str(", ");
-                }
-                query.push('?');
-            }
-            query.push_str(", NOW(6))");
-
             let payload_json = serde_json::to_string(event).map_err(|source| {
                 DatabaseRunStateStoreError::Json {
                     operation: "serialize_run_event_batch",
@@ -1836,36 +1839,36 @@ impl DatabaseRunStateStore {
             });
         }
 
-        let mut exec = sqlx::query(&query);
         for row in &rows {
-            exec = row.bind_all(exec);
-        }
-        match exec.execute(self.pool.get()).await {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(db_err)) => {
-                // MySQL error 1062 / SQLSTATE 23000 = duplicate key.
-                // INSERT IGNORE should prevent this, but if a UNIQUE constraint
-                // fires anyway (e.g. on a non-idempotency-key column), propagate.
-                if db_err.code() == Some(std::borrow::Cow::Borrowed("23000"))
-                    && db_err.message().contains("idempotency_key")
-                {
-                    tracing::warn!(
-                        target: "astra_services::runs",
-                        run_id = %run_id,
-                        "Idempotency key conflict in batch insert, skipping"
-                    );
-                } else {
-                    return Err(db_error(
-                        "insert_run_events_batch",
-                        run_id,
-                        sqlx::Error::Database(db_err),
-                    ));
+            let exec = row.bind_all(sqlx::query(EVENT_INSERT_SQL));
+            match exec.execute(self.pool.get()).await {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(db_err)) => {
+                    // MySQL error 1062 / SQLSTATE 23000 = duplicate key.
+                    // INSERT IGNORE should prevent this, but if a UNIQUE constraint
+                    // fires anyway (e.g. on a non-idempotency-key column), propagate.
+                    if db_err.code() == Some(std::borrow::Cow::Borrowed("23000"))
+                        && db_err.message().contains("idempotency_key")
+                    {
+                        tracing::warn!(
+                            target: "astra_services::runs",
+                            run_id = %run_id,
+                            event_idx = row.event_idx,
+                            "Idempotency key conflict in row insert, skipping"
+                        );
+                    } else {
+                        return Err(db_error(
+                            "insert_run_events_batch",
+                            run_id,
+                            sqlx::Error::Database(db_err),
+                        ));
+                    }
+                }
+                Err(source) => {
+                    return Err(db_error("insert_run_events_batch", run_id, source));
                 }
             }
-            Err(source) => {
-                return Err(db_error("insert_run_events_batch", run_id, source));
-            }
-        };
+        }
 
         // Update last_event_idx to the highest allocated index.
         // Use events.len() (allocated range), not actually_inserted, because
@@ -1891,6 +1894,7 @@ impl DatabaseRunStateStore {
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
     async fn insert_run(&self, mut record: DurableRunRecord) -> Result<(), String> {
+        normalize_run_record_optional_fields(&mut record);
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
             && let Some(parent) = self
@@ -1932,98 +1936,53 @@ impl RunStateStore for DatabaseRunStateStore {
             record.last_event_idx = -1;
         }
 
-        let insert_result = if run_requires_session_exclusive_start(&record) {
-            sqlx::query(
-                "INSERT INTO agent_runs
-                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)
-                 FROM DUAL
-                 WHERE NOT EXISTS (
-                     SELECT 1
-                     FROM agent_runs
-                     WHERE user_id = ?
-                       AND session_id = ?
-                       AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
-                     LIMIT 1
-                 )",
-            )
-            .bind(&record.run_id)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.parent_run_id)
-            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-            .bind(record.depth as i64)
-            .bind(&record.delegation_id)
-            .bind(&record.agent_id)
-            .bind(&record.retry_of)
-            .bind(&retry_scope)
-            .bind(&record.status)
-            .bind(&record.waiting_for)
-            .bind(&self.owner_pod_id)
-            .bind(lease_expires_at.naive_utc())
-            .bind(record.run_generation as i64)
-            .bind(record.last_event_idx)
-            .bind(&record.checkpoint_version)
-            .bind(&record.checkpoint_json)
-            .bind(&record.error_code)
-            .bind(&record.error_message)
-            .bind(record.retry_count as i64)
-            .bind(record.total_prompt_tokens as i64)
-            .bind(record.total_completion_tokens as i64)
-            .bind(record.total_tool_calls as i64)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
-        } else {
-            sqlx::query(
-                "INSERT INTO agent_runs
-                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
-                 ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
-            )
-            .bind(&record.run_id)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.parent_run_id)
-            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-            .bind(record.depth as i64)
-            .bind(&record.delegation_id)
-            .bind(&record.agent_id)
-            .bind(&record.retry_of)
-            .bind(&retry_scope)
-            .bind(&record.status)
-            .bind(&record.waiting_for)
-            .bind(&self.owner_pod_id)
-            .bind(lease_expires_at.naive_utc())
-            .bind(record.run_generation as i64)
-            .bind(record.last_event_idx)
-            .bind(&record.checkpoint_version)
-            .bind(&record.checkpoint_json)
-            .bind(&record.error_code)
-            .bind(&record.error_message)
-            .bind(record.retry_count as i64)
-            .bind(record.total_prompt_tokens as i64)
-            .bind(record.total_completion_tokens as i64)
-            .bind(record.total_tool_calls as i64)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
-        };
-        if insert_result.rows_affected() == 0 {
+        if run_requires_session_exclusive_start(&record)
+            && self
+                .find_blocking_session_run(&record.user_id, &record.session_id)
+                .await?
+                .is_some()
+        {
             return Err("session already has an active run".to_string());
         }
+
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+              delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+              checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+              total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
+        )
+        .bind(&record.run_id)
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.parent_run_id)
+        .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+        .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+        .bind(record.depth as i64)
+        .bind(&record.delegation_id)
+        .bind(&record.agent_id)
+        .bind(&record.retry_of)
+        .bind(&retry_scope)
+        .bind(&record.status)
+        .bind(&record.waiting_for)
+        .bind(&self.owner_pod_id)
+        .bind(lease_expires_at.naive_utc())
+        .bind(record.run_generation as i64)
+        .bind(record.last_event_idx)
+        .bind(&record.checkpoint_version)
+        .bind(&record.checkpoint_json)
+        .bind(&record.error_code)
+        .bind(&record.error_message)
+        .bind(record.retry_count as i64)
+        .bind(record.total_prompt_tokens as i64)
+        .bind(record.total_completion_tokens as i64)
+        .bind(record.total_tool_calls as i64)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?;
 
         if !events.is_empty() {
             self.append_events_batch(&record.run_id, &events)
@@ -2538,24 +2497,24 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
     Ok(DurableRunRecord {
         user_id: row.try_get("user_id").unwrap_or_default(),
         session_id: row.try_get("session_id").unwrap_or_default(),
-        parent_run_id: row.try_get("parent_run_id").ok(),
-        root_run_id: row.try_get("root_run_id").ok(),
-        ancestor_path: row.try_get("ancestor_path").ok(),
+        parent_run_id: non_empty_optional_string(row.try_get("parent_run_id").ok()),
+        root_run_id: non_empty_optional_string(row.try_get("root_run_id").ok()),
+        ancestor_path: non_empty_optional_string(row.try_get("ancestor_path").ok()),
         depth: row.try_get::<i64, _>("depth").unwrap_or(0).max(0) as u32,
-        delegation_id: row.try_get("delegation_id").ok(),
-        agent_id: row.try_get("agent_id").ok(),
-        retry_of: row.try_get("retry_of").ok(),
-        retry_scope: row.try_get("retry_scope").ok(),
+        delegation_id: non_empty_optional_string(row.try_get("delegation_id").ok()),
+        agent_id: non_empty_optional_string(row.try_get("agent_id").ok()),
+        retry_of: non_empty_optional_string(row.try_get("retry_of").ok()),
+        retry_scope: non_empty_optional_string(row.try_get("retry_scope").ok()),
         status: row.try_get("status").unwrap_or_default(),
-        waiting_for: row.try_get("waiting_for").ok(),
-        owner_pod_id: row.try_get("owner_pod_id").ok(),
+        waiting_for: non_empty_optional_string(row.try_get("waiting_for").ok()),
+        owner_pod_id: non_empty_optional_string(row.try_get("owner_pod_id").ok()),
         owner_lease_expires_at: datetime_string(&row, "owner_lease_expires_at"),
         run_generation: row.try_get::<i64, _>("run_generation").unwrap_or(0).max(0) as u64,
         last_event_idx: row.try_get::<i64, _>("last_event_idx").unwrap_or(-1),
-        checkpoint_version: row.try_get("checkpoint_version").ok(),
-        checkpoint_json: row.try_get("checkpoint_json").ok(),
-        error_code: row.try_get("error_code").ok(),
-        error_message: row.try_get("error_message").ok(),
+        checkpoint_version: non_empty_optional_string(row.try_get("checkpoint_version").ok()),
+        checkpoint_json: non_empty_optional_string(row.try_get("checkpoint_json").ok()),
+        error_code: non_empty_optional_string(row.try_get("error_code").ok()),
+        error_message: non_empty_optional_string(row.try_get("error_message").ok()),
         retry_count: row.try_get::<i64, _>("retry_count").unwrap_or(0).max(0) as u32,
         total_prompt_tokens: row
             .try_get::<i64, _>("total_prompt_tokens")
@@ -3057,6 +3016,27 @@ mod tests {
         let mut team_parent = durable_run_record("team-parent");
         team_parent.agent_id = Some("orchestrator".into());
         assert!(!run_requires_session_exclusive_start(&team_parent));
+    }
+
+    #[tokio::test]
+    async fn run_store_normalizes_blank_optional_identifiers() {
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("root");
+        root.parent_run_id = Some(" ".into());
+        root.delegation_id = Some(String::new());
+        root.agent_id = Some("\t".into());
+
+        store.insert_run(root).await.expect("insert root run");
+
+        let stored = store
+            .load_run("root")
+            .await
+            .expect("load run")
+            .expect("stored run");
+        assert_eq!(stored.parent_run_id, None);
+        assert_eq!(stored.delegation_id, None);
+        assert_eq!(stored.agent_id, None);
+        assert!(run_requires_session_exclusive_start(&stored));
     }
 
     #[test]

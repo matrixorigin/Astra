@@ -10,6 +10,7 @@ use crate::context_manifest::{
     BudgetV1_8k, ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
     artifact_id_from_raw_ref,
 };
+use crate::normalization::non_empty_optional_string;
 
 pub const PROTECTED_COMPACTION_CATEGORIES: &[&str] = &[
     "plan_state",
@@ -1354,14 +1355,14 @@ impl DatabaseStateProjectionStore {
             run_id: row.try_get("run_id").unwrap_or_default(),
             user_id: row.try_get("user_id").unwrap_or_default(),
             session_id: row.try_get("session_id").unwrap_or_default(),
-            parent_run_id: row.try_get("parent_run_id").ok(),
-            root_run_id: row.try_get("root_run_id").ok(),
-            ancestor_path: row.try_get("ancestor_path").ok(),
+            parent_run_id: non_empty_optional_string(row.try_get("parent_run_id").ok()),
+            root_run_id: non_empty_optional_string(row.try_get("root_run_id").ok()),
+            ancestor_path: non_empty_optional_string(row.try_get("ancestor_path").ok()),
             depth: row.try_get::<i64, _>("depth").unwrap_or(0).max(0) as u32,
-            delegation_id: row.try_get("delegation_id").ok(),
-            agent_id: row.try_get("agent_id").ok(),
-            retry_of: row.try_get("retry_of").ok(),
-            retry_scope: row.try_get("retry_scope").ok(),
+            delegation_id: non_empty_optional_string(row.try_get("delegation_id").ok()),
+            agent_id: non_empty_optional_string(row.try_get("agent_id").ok()),
+            retry_of: non_empty_optional_string(row.try_get("retry_of").ok()),
+            retry_scope: non_empty_optional_string(row.try_get("retry_scope").ok()),
         }))
     }
 }

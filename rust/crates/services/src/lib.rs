@@ -28,6 +28,7 @@ pub mod marketplace_stats;
 pub mod mcp_registry;
 pub mod models;
 pub mod multi_agent;
+pub(crate) mod normalization;
 pub mod pagination;
 pub mod personal_skills;
 pub mod prompt_delta;

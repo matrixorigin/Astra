@@ -1252,7 +1252,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     );
 
     {
-        let turn_num = (state.max_turns - state.remaining_turns) as u32;
+        let turn_num = state.max_turns.saturating_sub(state.remaining_turns) as u32;
         for edge_result in &turn_result.edge_tool_round {
             record_recent_read_file_path(
                 &mut state.recent_file_reads,
