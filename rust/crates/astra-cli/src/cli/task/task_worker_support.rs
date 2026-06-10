@@ -154,8 +154,8 @@ impl WorkerClaimIdleReason {
 
     pub(crate) fn human_message(self) -> &'static str {
         match self {
-            Self::NoClaimableTasks => "No claimable cloud tasks.",
-            Self::AllClaimableTasksLeased => "All claimable cloud tasks are currently leased.",
+            Self::NoClaimableTasks => "No claimable cloud jobs.",
+            Self::AllClaimableTasksLeased => "All claimable cloud jobs are currently leased.",
         }
     }
 }
@@ -198,7 +198,7 @@ pub(crate) async fn claim_task_for_worker(
     })
 }
 
-/// Loads the claimed task and releases the lease if the task vanished mid-claim.
+/// Loads the claimed job and releases the lease if the task vanished mid-claim.
 pub(crate) async fn get_claimed_task_or_release(
     task_svc: &dyn astra_services::TaskService,
     lease_svc: &dyn astra_services::TaskLeaseService,
@@ -217,7 +217,7 @@ pub(crate) async fn get_claimed_task_or_release(
                 "get_task returned None",
             )
             .await?;
-            Err(format!("claimed task disappeared: {claimed_task_id}"))
+            Err(format!("claimed job disappeared: {claimed_task_id}"))
         }
         Err(e) => {
             release_claimed_task_after_lookup_failure(
@@ -243,17 +243,17 @@ async fn release_claimed_task_after_lookup_failure(
     match lease_svc.release_lease(user_id, task_id, agent_id).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!(
-            "claimed task lookup failed ({lookup_failure}) and lease was already expired or stolen: {task_id}"
+            "claimed job lookup failed ({lookup_failure}) and lease was already expired or stolen: {task_id}"
         )),
         Err(e) => {
             tracing::warn!(
                 task_id = %task_id,
                 error = %e,
                 lookup_failure,
-                "release_lease failed after claimed task lookup failure"
+                "release_lease failed after claimed job lookup failure"
             );
             Err(format!(
-                "claimed task lookup failed ({lookup_failure}) and lease release failed for {task_id}: {e}"
+                "claimed job lookup failed ({lookup_failure}) and lease release failed for {task_id}: {e}"
             ))
         }
     }
@@ -602,7 +602,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err, "claimed task disappeared: missing-task");
+        assert_eq!(err, "claimed job disappeared: missing-task");
         assert_eq!(
             lease_svc.released(),
             vec![(
@@ -632,7 +632,7 @@ mod tests {
 
         assert_eq!(
             err,
-            "claimed task lookup failed (get_task returned None) and lease release failed for missing-task: db unavailable"
+            "claimed job lookup failed (get_task returned None) and lease release failed for missing-task: db unavailable"
         );
         assert_eq!(
             lease_svc.released(),
@@ -654,7 +654,7 @@ mod tests {
                 "task-user",
                 "session-1",
                 TaskCreateRequest {
-                    title: "claimed task".to_string(),
+                    title: "claimed job".to_string(),
                     ..Default::default()
                 },
             )

@@ -1098,7 +1098,6 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
 /// Retention: fallback handler for `/info` / `/whoami` — called from slash_router.rs.
 /// In TUI mode this is shadowed by the native info panel.
 /// Kept for headless / non-interactive execution paths.
-#[allow(dead_code)]
 pub(crate) async fn handle_info_command(
     cmd: &str,
     arg: &str,

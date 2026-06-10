@@ -8,6 +8,7 @@ description = "Extracted tool execution library for astra-engine. Shared by CLI 
 astra-core.workspace = true
 astra-prompts.workspace = true
 astra-sandbox = { path = "../astra-sandbox" }
+astra-services.workspace = true
 astra-turn-types = { path = "../astra-turn-types" }
 async-trait.workspace = true
 chrono.workspace = true

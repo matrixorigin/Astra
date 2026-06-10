@@ -654,38 +654,7 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 _ => None,
             }
         }
-        "task_create" => obj
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(|title| truncate_str(title, 60)),
-        "task_list" => obj
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(|status| truncate_str(status, 30)),
-        "task_get" | "task_stop" => obj
-            .get("task_id")
-            .and_then(|v| v.as_str())
-            .map(|task_id| truncate_str(task_id, 50)),
-        "task_update" => {
-            let task_id = obj.get("task_id").and_then(|v| v.as_str());
-            let status = obj.get("status").and_then(|v| v.as_str());
-            let subtask_id = obj.get("subtask_id").and_then(|v| v.as_str());
-            match (task_id, subtask_id, status) {
-                (Some(task_id), Some(subtask_id), Some(status)) => Some(format!(
-                    "{}:{} -> {}",
-                    truncate_str(task_id, 24),
-                    truncate_str(subtask_id, 16),
-                    truncate_str(status, 16)
-                )),
-                (Some(task_id), None, Some(status)) => Some(format!(
-                    "{} -> {}",
-                    truncate_str(task_id, 36),
-                    truncate_str(status, 16)
-                )),
-                (Some(task_id), _, None) => Some(truncate_str(task_id, 50)),
-                _ => None,
-            }
-        }
+        "task" => task_tool_detail(obj),
         "get_agent_info" => obj
             .get("dimension")
             .and_then(|v| v.as_str())
@@ -767,6 +736,44 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
             match (scope, turn_index) {
                 (Some("turn"), Some(turn_index)) => Some(format!("turn {turn_index}")),
                 (Some(scope), _) => Some(scope.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn task_tool_detail(obj: &Map<String, Value>) -> Option<String> {
+    match obj.get("action").and_then(|v| v.as_str()).unwrap_or("list") {
+        "create" => obj
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|title| truncate_str(title, 60)),
+        "list" => obj
+            .get("status_filter")
+            .and_then(|v| v.as_str())
+            .map(|status| truncate_str(status, 30)),
+        "get" | "stop" | "archive" | "adopt" => obj
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|task_id| truncate_str(task_id, 50)),
+        "update" => {
+            let task_id = obj.get("task_id").and_then(|v| v.as_str());
+            let status = obj.get("new_status").and_then(|v| v.as_str());
+            let subtask_id = obj.get("subtask_id").and_then(|v| v.as_str());
+            match (task_id, subtask_id, status) {
+                (Some(task_id), Some(subtask_id), Some(status)) => Some(format!(
+                    "{}:{} -> {}",
+                    truncate_str(task_id, 24),
+                    truncate_str(subtask_id, 16),
+                    truncate_str(status, 16)
+                )),
+                (Some(task_id), None, Some(status)) => Some(format!(
+                    "{} -> {}",
+                    truncate_str(task_id, 36),
+                    truncate_str(status, 16)
+                )),
+                (Some(task_id), _, None) => Some(truncate_str(task_id, 50)),
                 _ => None,
             }
         }
@@ -1151,15 +1158,18 @@ mod tests {
 
     #[test]
     fn tool_call_detail_task_create_shows_title() {
-        let detail = tool_call_detail("task_create", &json!({"title": "Fix renderer drift"}));
+        let detail = tool_call_detail(
+            "task",
+            &json!({"action": "create", "title": "Fix renderer drift"}),
+        );
         assert_eq!(detail.as_deref(), Some("Fix renderer drift"));
     }
 
     #[test]
     fn tool_call_detail_task_update_shows_status() {
         let detail = tool_call_detail(
-            "task_update",
-            &json!({"task_id": "render-pass", "status": "in_progress"}),
+            "task",
+            &json!({"action": "update", "task_id": "render-pass", "new_status": "in_progress"}),
         );
         assert_eq!(detail.as_deref(), Some("render-pass -> in_progress"));
     }

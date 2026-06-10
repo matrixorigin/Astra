@@ -64,9 +64,20 @@ pub(crate) async fn execute_stream_turn(
 }
 
 async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamState {
-    let append_system_prompt = {
-        let tasks = state.task_manager.snapshot().await;
-        crate::cli::execution_state_summary::format_for_session_state(state, &tasks)
+    let append_system_prompt = match state.task_manager.load_tasks().await {
+        Ok(tasks) => crate::cli::execution_state_summary::format_for_session_state(state, &tasks),
+        Err(error) => {
+            let warning = format!(
+                "### Turn-start session execution state\n\
+                 task board: unavailable · {}\n\
+                 Do not assume there are no open tasks. If task tracking is relevant, retry task(action='list') before creating duplicate work.",
+                preview_for_turn_prompt(&error, 220)
+            );
+            match crate::cli::execution_state_summary::format_for_session_state(state, &[]) {
+                Some(existing) => Some(format!("{existing}\n\n{warning}")),
+                None => Some(warning),
+            }
+        }
     };
 
     PreparedTurnStreamState {
@@ -80,6 +91,16 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
         observability_session: state.observability_session.clone(),
         append_system_prompt,
     }
+}
+
+fn preview_for_turn_prompt(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -265,6 +286,8 @@ mod tests {
     use super::{PreparedTurnStreamState, build_turn_stream_params, prepare_turn_stream_state};
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
+    use astra_tools::task_mgmt::{SessionTask, TaskStore};
+    use async_trait::async_trait;
     use std::sync::Arc;
 
     /// Source-level guard: cancellation paths in `await_stream_with_interrupts`
@@ -308,6 +331,54 @@ mod tests {
             .as_deref()
             .expect("task board prompt");
         assert!(prompt.contains("Validate stream projection"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_stream_state_warns_when_task_board_load_fails() {
+        struct FailingTaskStore;
+
+        #[async_trait]
+        impl TaskStore for FailingTaskStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Err("simulated task-board outage".to_string())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let state = SessionState {
+            task_manager: Arc::new(crate::edge_tools::TaskManager::new(
+                "sess-stream-fail",
+                Arc::new(FailingTaskStore),
+            )),
+            ..SessionState::default()
+        };
+
+        let prepared = prepare_turn_stream_state(&state).await;
+        let prompt = prepared
+            .append_system_prompt
+            .as_deref()
+            .expect("degraded task-board prompt");
+        assert!(
+            prompt.contains("task board: unavailable")
+                && prompt.contains("simulated task-board outage")
+                && prompt.contains("Do not assume there are no open tasks"),
+            "task-board load failure should be explicit in the turn-start prompt: {prompt}"
+        );
     }
 
     #[test]

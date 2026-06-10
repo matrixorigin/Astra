@@ -254,11 +254,7 @@ pub(crate) async fn rewind_plan(
 }
 
 pub(crate) fn abandon_plan_execution(state: &mut SessionState) -> bool {
-    let had_plan = has_executing_plan(state)
-        || state.plan_run_task_id.is_some()
-        || state.plan_run_task_last_error.is_some()
-        || state.plan_run_task_last_outcome.is_some()
-        || state.plan_run_task_last_progress.is_some();
+    let had_plan = has_executing_plan(state);
     if !had_plan {
         return false;
     }
@@ -273,6 +269,7 @@ pub(crate) fn abandon_plan_execution(state: &mut SessionState) -> bool {
     state.plan_execution_corrections.clear();
     state.durable_task_state = None;
     state.last_delivery_report = None;
+    state.plan_execution_last_error = None;
     true
 }
 
@@ -445,10 +442,7 @@ fn apply_rewound_plan(
 fn reset_plan_runtime_metadata(state: &mut SessionState) {
     let _ = crate::cli::plan::plan_runtime::shutdown_plan_executor(state);
     state.current_plan_subtask_id = None;
-    state.plan_run_task_id = None;
-    state.plan_run_task_last_progress = None;
-    state.plan_run_task_last_outcome = None;
-    state.plan_run_task_last_error = None;
+    state.plan_execution_last_error = None;
     state.pending_approval = None;
     state.plan_in_token_stream = false;
     state.plan_md_renderer = None;
@@ -688,11 +682,7 @@ mod tests {
         state.executing_plan = Some(sample_plan());
         state.executing_plan_goal = Some("Ship auth".into());
         state.current_plan_subtask_id = Some("s2".into());
-        state.plan_run_task_id = Some("task-1".into());
-        state.plan_run_task_last_progress = Some((33, 1, 3));
-        state.plan_run_task_last_outcome =
-            Some(astra_services::task_orchestrator::TaskOutcome::Partial);
-        state.plan_run_task_last_error = Some("boom".into());
+        state.plan_execution_last_error = Some("boom".into());
         state.plan_execution_corrections = vec!["retry with tests".into()];
 
         let api = astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap();
@@ -704,10 +694,7 @@ mod tests {
         assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
         assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
         assert!(state.current_plan_subtask_id.is_none());
-        assert!(state.plan_run_task_id.is_none());
-        assert!(state.plan_run_task_last_progress.is_none());
-        assert!(state.plan_run_task_last_outcome.is_none());
-        assert!(state.plan_run_task_last_error.is_none());
+        assert!(state.plan_execution_last_error.is_none());
         assert_eq!(state.plan_execution_corrections, vec!["retry with tests"]);
     }
 
@@ -719,9 +706,7 @@ mod tests {
         state.executing_plan_id = Some("plan-7".into());
         state.plan_execution_rounds = 2;
         state.plan_execution_corrections = vec!["retry with tests".into()];
-        state.plan_run_task_id = Some("task-1".into());
-        state.plan_run_task_last_outcome =
-            Some(astra_services::task_orchestrator::TaskOutcome::Partial);
+        state.plan_execution_last_error = Some("boom".into());
 
         assert!(abandon_plan_execution(&mut state));
         assert!(state.executing_plan.is_none());
@@ -729,7 +714,6 @@ mod tests {
         assert!(state.executing_plan_id.is_none());
         assert_eq!(state.plan_execution_rounds, 0);
         assert!(state.plan_execution_corrections.is_empty());
-        assert!(state.plan_run_task_id.is_none());
-        assert!(state.plan_run_task_last_outcome.is_none());
+        assert!(state.plan_execution_last_error.is_none());
     }
 }

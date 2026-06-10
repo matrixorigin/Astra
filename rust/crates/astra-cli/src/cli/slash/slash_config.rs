@@ -56,7 +56,6 @@ pub(crate) fn set_deep_analyze_arg(arg: Option<String>) {
 /// Consume the stashed `/session analyze deep` argument. Returns
 /// `None` when the caller didn't supply a session id (the
 /// line-mode analyzer should then default to the current session).
-#[allow(dead_code)]
 pub(crate) fn take_deep_analyze_arg() -> Option<String> {
     DEEP_ANALYZE_ARG
         .get()

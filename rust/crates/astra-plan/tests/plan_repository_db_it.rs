@@ -434,6 +434,63 @@ async fn step_runs_are_append_only_and_list_in_recency_order() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn step_run_unknown_status_fails_closed_on_get_and_list() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-corrupt-{}", Uuid::new_v4().simple());
+    let sess = format!("sit-corrupt-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-corrupt-{}", Uuid::new_v4().simple());
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-corrupt-").await;
+    ensure_session(&pool, &sess, &user).await;
+
+    let mut state = make_state_with_subtasks(&user, "corrupt status", &["s1"]);
+    repo.save(&plan_id, &mut state, None).await.unwrap();
+    let run_id = repo
+        .record_step_run(NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: "s1",
+            attempt: 1,
+            status: TaskStatus::InProgress,
+            session_id: &sess,
+            request_id: "req-corrupt",
+        })
+        .await
+        .expect("record step run");
+
+    sqlx::query("UPDATE plan_step_runs SET status = 'unknown_status' WHERE run_id = ?")
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .expect("corrupt step-run status");
+
+    let get_err = repo
+        .get_step_run(&plan_id, &run_id)
+        .await
+        .expect_err("get_step_run must reject unknown persisted statuses");
+    assert!(
+        matches!(get_err, PlanLoadError::Corrupt(_)),
+        "unexpected get_step_run error: {get_err}"
+    );
+    assert!(
+        get_err.to_string().contains("unknown step_run status"),
+        "unexpected get_step_run error text: {get_err}"
+    );
+
+    let list_err = repo
+        .list_step_runs(&plan_id, Some("s1"), 10)
+        .await
+        .expect_err("list_step_runs must reject unknown persisted statuses");
+    assert!(
+        matches!(list_err, PlanLoadError::Corrupt(_)),
+        "unexpected list_step_runs error: {list_err}"
+    );
+
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-corrupt-").await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn finalize_step_run_rejects_cross_plan_run_id() {
     // Security regression: finalize_step_run used to filter only on run_id.
     // A caller holding a run_id from plan B could finalize it even while

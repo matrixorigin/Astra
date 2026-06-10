@@ -1812,7 +1812,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 32 * 1024];
             let n = socket.read(&mut buf).await.unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
             assert_request(&request);
             let response = format!(
                 "HTTP/1.1 {status_code} {reason_phrase}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",

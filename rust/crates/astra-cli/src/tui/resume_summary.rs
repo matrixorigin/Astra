@@ -59,9 +59,9 @@ impl ResumeSummary {
         }
         let breakdown = parts.join(", ");
         let noun = if total == 1 {
-            "background job"
+            "background command"
         } else {
-            "background jobs"
+            "background commands"
         };
         format!("While you were away: {total} {noun} finished ({breakdown}).")
     }
@@ -248,7 +248,7 @@ mod tests {
         };
         let out = s.render();
         assert!(
-            out.contains("1 background job") && !out.contains("1 background jobs"),
+            out.contains("1 background command") && !out.contains("1 background commands"),
             "singular copy required: {out}"
         );
         assert!(out.starts_with("While you were away:"));
@@ -265,7 +265,7 @@ mod tests {
         };
         let out = s.render();
         assert!(
-            out.contains("5 background jobs"),
+            out.contains("5 background commands"),
             "plural copy missing: {out}"
         );
         assert!(

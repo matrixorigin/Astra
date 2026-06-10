@@ -40,6 +40,16 @@ impl BgTaskStatus {
     fn is_terminal(self) -> bool {
         !matches!(self, Self::Running | Self::Stalled)
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Killed => "killed",
+            Self::Stalled => "stalled",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +76,7 @@ pub(crate) enum BgTaskEvent {
     },
 }
 
-/// Result collected when a background task's future completes.
+/// Result collected when a background command's future completes.
 struct TaskCompletion {
     id: String,
     status: BgTaskStatus,
@@ -303,7 +313,7 @@ impl BackgroundTaskRegistry {
         id
     }
 
-    /// Kill a background task by ID.
+    /// Kill a background command by ID.
     pub fn kill(&mut self, id: &str) -> Result<(), String> {
         // Drain any completed futures into pending_completions so we
         // have accurate status. Use the internal drain helper that
@@ -313,9 +323,9 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background command with id '{id}'"))?;
         if handle.status().is_terminal() {
-            return Err(format!("task '{id}' already terminated"));
+            return Err(format!("background command '{id}' already terminated"));
         }
         // Only signal cancellation. The runner observes this via
         // `cancel.cancelled()`, kills the child, and emits its own
@@ -326,8 +336,45 @@ impl BackgroundTaskRegistry {
         Ok(())
     }
 
+    pub fn latest_job_id(&mut self) -> Option<String> {
+        self.drain_join_set();
+        self.tasks
+            .values()
+            .max_by_key(|handle| handle.started_at)
+            .map(|handle| handle.id.clone())
+    }
+
+    pub fn render_job_list_xml(&mut self) -> String {
+        self.drain_join_set();
+        let mut jobs: Vec<_> = self.tasks.values().collect();
+        jobs.sort_by_key(|handle| handle.started_at);
+        if jobs.is_empty() {
+            return "<background_jobs count=\"0\" />".to_string();
+        }
+
+        let mut out = format!("<background_jobs count=\"{}\">", jobs.len());
+        for handle in jobs {
+            out.push_str(&format!(
+                "\n<job id=\"{}\" status=\"{}\" elapsed_ms=\"{}\">{}</job>",
+                xml_escape(&handle.id),
+                handle.status().as_str(),
+                handle.started_at.elapsed().as_millis(),
+                xml_escape(&handle.description),
+            ));
+        }
+        out.push_str("\n</background_jobs>");
+        out
+    }
+
     /// Drain the JoinSet without consuming pending_completions.
-    /// Updates handle status and pushes events to the queue.
+    /// Collect all completed `JoinSet` futures and push terminal events
+    /// into `pending_completions`. Must be called before any method that
+    /// reads task state (`kill`, `latest_job_id`, `render_job_list_xml`,
+    /// `poll_completions`, etc.) to ensure handles reflect the latest
+    /// runner-reported status.
+    ///
+    /// Idempotent: safe to call multiple times per tick; only new
+    /// completions are collected.
     pub fn drain_join_set(&mut self) {
         while let Some(result) = self.join_set.try_join_next() {
             match result {
@@ -353,7 +400,7 @@ impl BackgroundTaskRegistry {
                     self.pending_completions.push(event);
                 }
                 Err(e) => {
-                    tracing::warn!("background task join error: {e}");
+                    tracing::warn!("background command join error: {e}");
                 }
             }
         }
@@ -361,6 +408,7 @@ impl BackgroundTaskRegistry {
 
     /// Kill all running tasks. Returns IDs of killed tasks.
     pub fn kill_all(&mut self) -> Vec<String> {
+        self.drain_join_set();
         let ids: Vec<String> = self
             .tasks
             .iter()
@@ -378,7 +426,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background command with id '{id}'"))?;
         read_tail_str(&handle.stdout_path, tail_bytes)
     }
 
@@ -393,7 +441,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background command with id '{id}'"))?;
         read_from_str(&handle.stdout_path, offset, max_bytes)
     }
 
@@ -402,7 +450,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+            .ok_or_else(|| format!("no background command with id '{id}'"))?;
         read_tail_str(&handle.stderr_path, tail_bytes)
     }
 
@@ -436,6 +484,7 @@ impl BackgroundTaskRegistry {
 
     /// Check all running shell tasks for stalls (no output growth for STALL_THRESHOLD).
     pub fn stall_check(&mut self) {
+        self.drain_join_set();
         let mut stall_events = Vec::new();
         for handle in self.tasks.values_mut() {
             if handle.status().is_terminal() {
@@ -457,7 +506,7 @@ impl BackgroundTaskRegistry {
                     stall_events.push(BgTaskEvent::Failed {
                         id: handle.id.clone(),
                         error: format!(
-                            "background task output exceeded {} bytes; task was terminated",
+                            "background command output exceeded {} bytes; command was terminated",
                             MAX_OUTPUT_BYTES
                         ),
                     });
@@ -584,7 +633,7 @@ async fn run_shell_task(
     #[cfg(unix)]
     {
         // Put shell and its descendants in a fresh process group so cancel can
-        // kill the whole background job, not just the intermediate `sh`.
+        // kill the whole background command, not just the intermediate `sh`.
         unsafe {
             command.pre_exec(|| {
                 let rc = nix::libc::setpgid(0, 0);
@@ -841,7 +890,7 @@ fn read_tail_str(path: &Path, max_bytes: usize) -> Result<(String, u64), String>
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(max_bytes.min(len as usize));
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buf).to_string();
+    let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, len))
 }
 
@@ -856,7 +905,7 @@ fn read_from_str(path: &Path, offset: u64, max_bytes: usize) -> Result<(String, 
         .map(|m| m.len())
         .unwrap_or(end_offset);
     Ok((
-        String::from_utf8_lossy(&buf).to_string(),
+        String::from_utf8_lossy(&buf).into_owned(),
         end_offset,
         total_bytes,
     ))
@@ -900,32 +949,32 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
             summary,
         } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>completed</status>\n\
                  <exit_code>{}</exit_code>\n\
                  <summary>{}</summary>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
                 exit_code.unwrap_or(0),
                 xml_escape(summary),
             )
         }
         BgTaskEvent::Failed { id, error } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>failed</status>\n\
                  <error>{}</error>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
                 xml_escape(error),
             )
         }
         BgTaskEvent::Killed { id } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>killed</status>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
             )
         }
         BgTaskEvent::Stalled {
@@ -933,12 +982,12 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
             last_output_tail,
         } => {
             format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
+                "<background_job_notification>\n\
+                 <job_id>{id}</job_id>\n\
                  <status>stalled</status>\n\
                  <hint>Process may be waiting for interactive input. Consider killing and re-running with non-interactive flags.</hint>\n\
                  <last_output>{}</last_output>\n\
-                 </background_task_notification>",
+                 </background_job_notification>",
                 xml_escape(last_output_tail),
             )
         }
@@ -1130,6 +1179,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_job_id_returns_most_recent_background_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let first = reg.spawn_shell("sleep 1", "first");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = reg.spawn_shell("sleep 1", "second");
+
+        assert_eq!(reg.latest_job_id().as_deref(), Some(second.as_str()));
+        assert_ne!(first, second);
+        let _ = reg.kill(&first);
+        let _ = reg.kill(&second);
+    }
+
+    #[tokio::test]
+    async fn render_job_list_xml_reports_ids_status_and_escaped_descriptions() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("sleep 1", "build <all> & test");
+
+        let xml = reg.render_job_list_xml();
+        assert!(xml.contains("<background_jobs count=\"1\">"), "{xml}");
+        assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
+        assert!(xml.contains("status=\"running\""), "{xml}");
+        assert!(xml.contains("build &lt;all&gt; &amp; test"), "{xml}");
+        let _ = reg.kill(&id);
+    }
+
+    #[tokio::test]
     async fn combined_output_preserves_stdout_when_stderr_missing() {
         let tmp = TempDir::new().unwrap();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
@@ -1225,7 +1302,10 @@ mod tests {
         if let Some(h) = reg.tasks.get(&id) {
             h.set_status(BgTaskStatus::Completed);
         }
-        assert!(reg.kill(&id).is_err());
+        let err = reg
+            .kill(&id)
+            .expect_err("terminal command should reject kill");
+        assert_eq!(err, format!("background command '{id}' already terminated"));
     }
 
     // ── TDD: output truncation ──────────────────────────────────
@@ -1236,7 +1316,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("yes 'aaaaaaaaaa'", "large output");
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
-            let handle = reg.tasks.get(&id).expect("background task handle");
+            let handle = reg.tasks.get(&id).expect("background command handle");
             let stdout_size = std::fs::metadata(&handle.stdout_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -1246,7 +1326,7 @@ mod tests {
             stdout_size.saturating_add(stderr_size) > MAX_OUTPUT_BYTES
         })
         .await
-        .expect("background task should exceed output cap");
+        .expect("background command should exceed output cap");
         reg.stall_check();
 
         let events = reg.poll_completions();
@@ -1323,7 +1403,10 @@ mod tests {
             Ok(stat) => !stat.contains(") Z "),
             Err(_) => nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok(),
         };
-        assert!(!alive, "descendant pid {pid} survived background task kill");
+        assert!(
+            !alive,
+            "descendant pid {pid} survived background command kill"
+        );
     }
 
     // ── TDD: progress events ────────────────────────────────────

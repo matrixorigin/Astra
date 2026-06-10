@@ -139,6 +139,10 @@ pub(crate) enum WireEvent {
     /// Turn ended with an error. Error text gets humanised by
     /// `SystemCell::error` before storage.
     TurnError(String),
+    /// Turn-level warning. Rendered as `SystemCell::warning` in scrollback.
+    TurnWarning(String),
+    /// Turn-level informational message. Rendered as `SystemCell::info` in scrollback.
+    TurnInfo(String),
     ExplainReport(Vec<serde_json::Value>),
     VerdictReport(Vec<crate::VerdictEvent>),
     /// Structured compaction event — renders as a system info cell
@@ -664,7 +668,7 @@ impl ChatWidget {
         // the in-flight set so a follow-up Ctrl+C is a no-op (count=0,
         // no banner). Pre-fix the same ids stayed visible to the next
         // press; the task service rejected re-cancels and the user
-        // saw "Cancelled 1 background task." printed once per press
+        // saw "Cancelled 1 background command." printed once per press
         // until they all settled. Cancelling badges (the cancelling
         // map above) keep the strip showing "Cancelling…" until the
         // worker's terminal event prunes the rest.
@@ -674,7 +678,7 @@ impl ChatWidget {
     }
 
     /// Commit a single-line banner into scrollback confirming how
-    /// many background tasks were cancelled by the latest Ctrl+C.
+    /// many background commands were cancelled by the latest Ctrl+C.
     /// No-op when `count == 0` so a normal Ctrl+C (no live tasks)
     /// doesn't clutter the transcript. Called by the event loop
     /// right after `cancel_fanout::fanout`.
@@ -682,13 +686,13 @@ impl ChatWidget {
         if count == 0 {
             return;
         }
-        let noun = if count == 1 { "job" } else { "jobs" };
+        let noun = if count == 1 { "command" } else { "commands" };
         let msg = format!("Stopped {count} background {noun}.");
         self.commit_cell(Box::new(SystemCell::warning(msg)));
     }
 
     /// Commit a resume-time summary banner telling the user what
-    /// background tasks finished while they were gone. Called once
+    /// background commands finished while they were gone. Called once
     /// after replay_session_into_widget finishes, with the message
     /// pre-rendered by `resume_summary::ResumeSummary::render`.
     /// Info-styled because it's neutral history, not an alert.
@@ -888,6 +892,8 @@ impl ChatWidget {
             }
             WireEvent::TurnComplete(stats) => self.on_turn_complete(*stats),
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
+            WireEvent::TurnWarning(msg) => self.on_turn_warning(msg),
+            WireEvent::TurnInfo(msg) => self.on_turn_info(msg),
             WireEvent::ExplainReport(items) => self.on_explain_report(items),
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
             WireEvent::Compaction(event) => {
@@ -1617,6 +1623,14 @@ impl ChatWidget {
     fn on_turn_error(&mut self, msg: String) {
         self.commit_active();
         self.commit_cell(Box::new(SystemCell::error(msg)));
+    }
+
+    fn on_turn_warning(&mut self, msg: String) {
+        self.commit_cell(Box::new(SystemCell::warning(msg)));
+    }
+
+    fn on_turn_info(&mut self, msg: String) {
+        self.commit_cell(Box::new(SystemCell::info(msg)));
     }
 
     fn on_explain_report(&mut self, items: Vec<serde_json::Value>) {
@@ -2475,7 +2489,7 @@ mod tests {
 
     /// CRITICAL: a single Ctrl+C must take ALL live ids out of the
     /// in-flight set so a follow-up press doesn't re-target the same
-    /// tasks. Pre-fix users saw "Cancelled 1 background task." print
+    /// tasks. Pre-fix users saw "Cancelled 1 background command." print
     /// six times for one Ctrl+C burst — every press kept finding the
     /// same ids and the durable task service rejected the
     /// already-cancelled ones, so only one new acked-success per
@@ -2516,7 +2530,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .expect("cancel banner must be a SystemCell");
         assert!(
-            sys.message().contains("Stopped 2 background jobs"),
+            sys.message().contains("Stopped 2 background commands"),
             "banner must name the plural count: {}",
             sys.message()
         );
@@ -2531,7 +2545,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .unwrap();
         assert!(
-            sys.message().contains("Stopped 1 background job."),
+            sys.message().contains("Stopped 1 background command."),
             "singular copy required: {}",
             sys.message()
         );
@@ -2541,7 +2555,7 @@ mod tests {
     fn resume_summary_commits_info_cell_with_message() {
         let mut w = fresh();
         w.commit_resume_summary(
-            "While you were away: 3 background jobs finished (2 ok, 1 failed).".into(),
+            "While you were away: 3 background commands finished (2 ok, 1 failed).".into(),
         );
         assert_eq!(w.history.len(), 1);
         let sys = w.history[0]
@@ -2549,7 +2563,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .expect("resume summary must be a SystemCell");
         assert!(sys.message().contains("While you were away"));
-        assert!(sys.message().contains("3 background jobs"));
+        assert!(sys.message().contains("3 background commands"));
     }
 
     #[test]

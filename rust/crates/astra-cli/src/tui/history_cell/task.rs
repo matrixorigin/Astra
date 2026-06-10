@@ -23,6 +23,7 @@
 use std::any::Any;
 use std::time::Instant;
 
+use super::truncate_by_width;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -298,13 +299,33 @@ impl HistoryCell for TaskCell {
                             + if meta.is_some() { 3 } else { 0 },
                     ),
                 );
+                let theme = crate::tui::theme::current();
                 let mut spans = vec![
                     Span::styled(connector.to_string(), dim),
                     Span::styled(name, name_style),
                 ];
                 if !desc.is_empty() {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::raw(desc));
+                    // Apply semantic styling based on tool type.
+                    if child.name == "bash" {
+                        if let Some(cmd) = desc.strip_prefix("$ ") {
+                            spans.push(Span::styled("$ ", dim));
+                            spans.push(Span::styled(cmd.to_string(), theme.command_style()));
+                        } else {
+                            spans.push(Span::styled(desc.to_string(), theme.command_style()));
+                        }
+                    } else if matches!(
+                        child.name.as_str(),
+                        "read" | "read_file" | "write_file" | "grep" | "glob" | "list_dir"
+                    ) && desc.contains('/')
+                    {
+                        spans.extend(crate::tui::path_style::style_file_path_flat(
+                            &desc,
+                            Style::default(),
+                        ));
+                    } else {
+                        spans.push(Span::raw(desc.to_string()));
+                    }
                 }
                 if let Some(meta) = meta {
                     spans.push(Span::styled(format!(" · {meta}"), dim));
@@ -413,26 +434,6 @@ fn trimmed_desc(desc: &str, max_w: usize) -> String {
         return String::from("(no description)");
     }
     truncate_by_width(desc, max_w)
-}
-
-fn truncate_by_width(s: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    let mut width = 0;
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw + 1 > max_width {
-            break;
-        }
-        width += cw;
-        end = i + c.len_utf8();
-    }
-    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

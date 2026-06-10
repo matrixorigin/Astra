@@ -1084,7 +1084,7 @@ pub(crate) struct BackgroundPlanContext {
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// Threaded from `SessionState.bg_task_commands` so plan subtasks
-    /// can also use `agent_job(action='shell')`. `None` for
+    /// can also use `job(action='shell')`. `None` for
     /// non-TUI plan executions (headless test paths).
     pub bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
     /// Detach slot for bash Ctrl+B promotion in plan subtasks.

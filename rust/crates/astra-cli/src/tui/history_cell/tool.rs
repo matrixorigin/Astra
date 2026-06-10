@@ -7,7 +7,7 @@
 //!   until the final `complete()` call.
 //! - **Success** — green bullet, `Ran <name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
-//! - **Failed** — red bullet, `Ran <name> · Xms · failed`, otherwise identical
+//! - **Failed** — red bullet, `Ran <name> · Xms`, otherwise identical
 //!   to Success.
 //!
 //! Diff-looking output summaries (lines starting with `+` or `-`)
@@ -24,16 +24,16 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::time::Instant;
 
-use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
-
 use super::HistoryCell;
+use super::truncate_by_width;
 use crate::cli::cli_config::cli_formatting::extract_cli_diff_block;
 use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
 use crate::tui::wrapping::{RtOptions, word_wrap_lines};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// Live status. `Running` is intentionally separate from the
 /// persisted `TurnEvent::Tool.status` enum — a still-running tool
@@ -117,8 +117,9 @@ impl ToolCell {
         if !description.is_empty() {
             self.description = description;
         }
-        self.output_summary = output_summary;
-        self.output = output;
+        self.output_summary = non_empty_tool_text(output_summary);
+        self.output = non_empty_tool_text(output);
+        self.ensure_failure_details();
         self.frozen_at.stamp_now();
     }
 
@@ -154,14 +155,14 @@ impl ToolCell {
         let started_at = Instant::now()
             .checked_sub(std::time::Duration::from_millis(duration_ms))
             .unwrap_or_else(Instant::now);
-        Some(Self {
+        let mut cell = Self {
             name,
             description,
             status,
             started_at,
             duration_ms: Some(duration_ms),
-            output_summary,
-            output,
+            output_summary: non_empty_tool_text(output_summary),
+            output: non_empty_tool_text(output),
             ts,
             progress_lines: 0,
             progress_bytes: 0,
@@ -169,7 +170,27 @@ impl ToolCell {
             // `FreezeStamp::revived` for the launch-independent
             // phase rationale.
             frozen_at: super::FreezeStamp::revived(),
-        })
+        };
+        cell.ensure_failure_details();
+        Some(cell)
+    }
+
+    fn ensure_failure_details(&mut self) {
+        if self.status != ToolStatus::Failed {
+            return;
+        }
+        if self
+            .output_summary
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+            || self
+                .output
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            return;
+        }
+        self.output_summary = Some(failure_detail_fallback(&self.name, &self.description));
     }
 
     fn bullet(&self) -> Span<'static> {
@@ -199,27 +220,8 @@ impl ToolCell {
         }
     }
 
-    fn title_text(&self) -> &'static str {
-        match self.status {
-            ToolStatus::Running => "running",
-            ToolStatus::Success => "done",
-            ToolStatus::Failed => "failed",
-        }
-    }
-
     fn display_name(&self) -> String {
-        match self.name.as_str() {
-            "bash" => "Bash".into(),
-            "read" | "read_file" => "Read".into(),
-            "write_file" => "Write file".into(),
-            "str_replace" => "Replace text".into(),
-            "grep" | "glob" => "Search".into(),
-            "list_dir" => "List directory".into(),
-            "task" => "Task".into(),
-            "memory" => "Memory".into(),
-            "tool_search" => "Tool search".into(),
-            _ => humanize_tool_name(&self.name),
-        }
+        friendly_tool_display_name(&self.name)
     }
 
     fn preview_text(&self) -> Option<&str> {
@@ -233,10 +235,6 @@ impl ToolCell {
             (None, Some(output)) => Some(output),
             (None, None) => None,
         }
-    }
-
-    fn has_transcript(&self) -> bool {
-        self.output.is_some() || self.output_summary.is_some()
     }
 
     fn edited_diff_preview(&self) -> Option<EditedDiffPreview<'_>> {
@@ -398,15 +396,25 @@ impl HistoryCell for ToolCell {
         } else {
             self.edited_diff_preview()
         };
+        let preview_text = self.preview_text().filter(|text| !text.trim().is_empty());
         let header = if let Some(edited) = edited_diff.as_ref() {
             let mut spans = vec![
                 self.bullet(),
                 Span::styled("Edited ", Style::default().bold()),
             ];
-            spans.push(Span::styled(
-                truncate_by_width(&edited.label, w.saturating_sub(24).max(12)),
-                Style::default(),
-            ));
+            // Use path styling for file paths — directory dim, filename bright.
+            if edited.label.contains('/') || edited.label.contains('\\') {
+                let truncated = truncate_by_width(&edited.label, w.saturating_sub(24).max(12));
+                spans.extend(crate::tui::path_style::style_file_path_flat(
+                    &truncated,
+                    Style::default(),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    truncate_by_width(&edited.label, w.saturating_sub(24).max(12)),
+                    Style::default(),
+                ));
+            }
             if edited.additions > 0 || edited.deletions > 0 {
                 spans.push(Span::styled(" · ", meta_style));
                 spans.push(Span::styled(
@@ -426,28 +434,21 @@ impl HistoryCell for ToolCell {
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
-            let mut spans = vec![
+            let spans = vec![
                 self.bullet(),
                 Span::styled(format!("Ran {label}"), Style::default().bold()),
                 Span::styled(" · ", meta_style),
                 Span::styled(self.elapsed_str(), meta_style),
             ];
-            if self.status == ToolStatus::Failed {
-                spans.push(Span::styled(" · ", meta_style));
-                spans.push(Span::styled(
-                    self.title_text(),
-                    Style::default().fg(Color::Red),
-                ));
-            }
             Line::from(spans)
         };
 
         let mut lines = vec![header];
 
-        let has_error_label = self.status == ToolStatus::Failed
-            && (self.has_transcript() || self.preview_text().is_none());
-        let has_preview_block = edited_diff.is_some() || self.preview_text().is_some();
-        let description_has_children = has_error_label || has_preview_block;
+        let missing_failure_details =
+            self.status == ToolStatus::Failed && edited_diff.is_none() && preview_text.is_none();
+        let has_preview_block = edited_diff.is_some() || preview_text.is_some();
+        let description_has_children = missing_failure_details || has_preview_block;
 
         // Spinner + progress bar for long-running tools.
         if self.status == ToolStatus::Running {
@@ -461,7 +462,7 @@ impl HistoryCell for ToolCell {
         if edited_diff.is_none() && !self.description.is_empty() {
             let description = sanitize_terminal_text(&self.description);
             let theme = crate::tui::theme::current();
-            let command_style = Style::default().fg(theme.selected_fg);
+            let command_style = theme.command_style();
             let desc_prefix = if description_has_children {
                 "  ├ "
             } else {
@@ -477,7 +478,13 @@ impl HistoryCell for ToolCell {
                 if self.name == "bash" {
                     if let Some(cmd) = dl.strip_prefix("$ ") {
                         spans.push(Span::styled("$ ".to_string(), dim));
-                        spans.push(Span::styled(cmd.to_string(), command_style));
+                        // Split command name (bold + colour) from arguments (dim).
+                        if let Some((first, rest)) = cmd.split_once(' ') {
+                            spans.push(Span::styled(first.to_string(), command_style.bold()));
+                            spans.push(Span::styled(format!(" {rest}"), command_style));
+                        } else {
+                            spans.push(Span::styled(cmd.to_string(), command_style.bold()));
+                        }
                     } else {
                         spans.push(Span::styled(dl.to_string(), command_style));
                     }
@@ -494,16 +501,13 @@ impl HistoryCell for ToolCell {
 
         // Output summary — diff renderer for +/- content,
         // plain truncated preview otherwise.
-        if self.status == ToolStatus::Failed && self.has_transcript() {
+        if missing_failure_details {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", dim),
-                Span::styled("Details in transcript", Style::default().fg(Color::Red)),
-                Span::styled(" · Ctrl+O transcript", dim),
-            ]));
-        } else if self.status == ToolStatus::Failed && self.preview_text().is_none() {
-            lines.push(Line::from(vec![
-                Span::styled("  └ ", dim),
-                Span::styled("No details returned", Style::default().fg(Color::Red)),
+                Span::styled(
+                    failure_detail_fallback(&self.name, &self.description),
+                    Style::default().fg(Color::Red),
+                ),
             ]));
         }
 
@@ -518,7 +522,7 @@ impl HistoryCell for ToolCell {
                         .map(|line| pad_line_background(line, width)),
                 );
             }
-        } else if let Some(summary) = self.preview_text() {
+        } else if let Some(summary) = preview_text {
             let summary = sanitize_terminal_text(summary);
             let has_diff = looks_like_unified_diff_preview(&summary);
             if has_diff {
@@ -543,11 +547,28 @@ impl HistoryCell for ToolCell {
                     } else {
                         "  ├ ".to_string()
                     };
+                    // Style git diff --stat lines: dim path, bright filename.
+                    // Also detect bare file paths in plain output lines.
+                    let styled_content: Vec<Span<'static>> =
+                        if let Some(file_part) = ol.trim().split_once('|') {
+                            let path = file_part.0.trim();
+                            let stats = file_part.1; // includes leading "| "
+                            let mut spans = Vec::new();
+                            spans.extend(crate::tui::path_style::style_file_path(path));
+                            spans.push(Span::styled(format!(" |{stats}"), dim));
+                            spans
+                        } else {
+                            let trimmed = ol.trim();
+                            if looks_like_file_path(trimmed) {
+                                crate::tui::path_style::style_file_path(trimmed)
+                            } else {
+                                vec![Span::raw((*ol).to_string())]
+                            }
+                        };
+                    let mut line_spans = vec![Span::styled(gutter.clone(), dim)];
+                    line_spans.extend(styled_content);
                     lines.extend(wrap_prefixed_line(
-                        Line::from(vec![
-                            Span::styled(gutter.clone(), dim),
-                            Span::raw((*ol).to_string()),
-                        ]),
+                        Line::from(line_spans),
                         width,
                         Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
                     ));
@@ -556,7 +577,10 @@ impl HistoryCell for ToolCell {
                     let remaining = summary.lines().count() - 5;
                     lines.push(Line::from(vec![
                         Span::styled("  └ ".to_string(), dim),
-                        Span::styled(format!("… +{remaining} lines · Ctrl+O transcript"), dim),
+                        Span::styled(
+                            format!("… +{remaining} lines (Ctrl+O to view transcript)"),
+                            dim,
+                        ),
                     ]));
                 }
             }
@@ -588,6 +612,9 @@ impl HistoryCell for ToolCell {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
             }
         }
+        self.output_summary = non_empty_tool_text(self.output_summary.take());
+        self.output = non_empty_tool_text(self.output.take());
+        self.ensure_failure_details();
         self.frozen_at.stamp_now();
     }
 
@@ -696,23 +723,6 @@ fn pad_line_background(mut line: Line<'static>, width: u16) -> Line<'static> {
     line
 }
 
-fn truncate_by_width(s: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    let mut width = 0;
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw + 1 > max_width {
-            break;
-        }
-        width += cw;
-        end = i + c.len_utf8();
-    }
-    format!("{}…", &s[..end])
-}
-
 fn is_placeholder_capture_summary(summary: &str) -> bool {
     let normalized = summary.trim().to_ascii_lowercase();
     normalized.ends_with("lines captured")
@@ -779,6 +789,58 @@ pub(super) fn humanize_tool_name(name: &str) -> String {
     } else {
         out
     }
+}
+
+fn non_empty_tool_text(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    })
+}
+
+fn failure_detail_fallback(name: &str, description: &str) -> String {
+    let label = friendly_tool_display_name(name);
+    let description = description.trim();
+    if description.is_empty() {
+        format!("{label} failed before returning output")
+    } else {
+        format!("{label} failed before returning output: {description}")
+    }
+}
+
+fn friendly_tool_display_name(name: &str) -> String {
+    match name {
+        "bash" => "Bash".into(),
+        "read" | "read_file" => "Read".into(),
+        "write_file" => "Write file".into(),
+        "str_replace" => "Replace text".into(),
+        "grep" | "glob" => "Search".into(),
+        "list_dir" => "List directory".into(),
+        "task" => "Task".into(),
+        "memory" => "Memory".into(),
+        "tool_search" => "Tool search".into(),
+        _ => humanize_tool_name(name),
+    }
+}
+
+/// Quick heuristic: does `s` look like a file path that should be
+/// rendered with dimmed directory / bright filename styling?
+fn looks_like_file_path(s: &str) -> bool {
+    // Must contain a path separator and a dot (likely an extension).
+    if !s.contains('/') && !s.contains('\\') {
+        return false;
+    }
+    // Reject URLs and flag-like strings.
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("--") {
+        return false;
+    }
+    // Must have a dot after the last separator (an extension).
+    let last_sep = s.rfind('/').or_else(|| s.rfind('\\')).unwrap_or(0);
+    let after_sep = &s[last_sep..];
+    after_sep.contains('.')
 }
 
 struct EditedDiffPreview<'a> {
@@ -850,6 +912,10 @@ mod tests {
         t.finalize();
         assert_eq!(t.status, ToolStatus::Failed);
         assert!(t.duration_ms.is_some(), "duration snapshotted on finalize");
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Bash failed before returning output: slow op")
+        );
         assert!(!t.is_live());
     }
 
@@ -899,10 +965,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_header_is_red_and_says_failed() {
+    fn failed_header_uses_red_bullet_without_status_word() {
         let t = err_tool("bash", "false", 10);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Ran Bash · 10ms · failed"));
+        assert!(out.contains("• Ran Bash · 10ms"));
+        assert!(!out.contains("· failed"), "{out}");
     }
 
     #[test]
@@ -913,7 +980,7 @@ mod tests {
         assert_eq!(desc.spans[1].content.as_ref(), "$ ");
         assert_eq!(
             desc.spans[2].style.fg,
-            Some(crate::tui::theme::current().selected_fg)
+            Some(crate::tui::theme::current().command)
         );
     }
 
@@ -922,16 +989,49 @@ mod tests {
         let mut t = err_tool("bash", "cat missing.txt", 10);
         t.output = Some("cat: missing.txt: No such file or directory".into());
         let out = render(&t, 80, 5);
-        assert!(out.contains("Details in transcript"), "{out}");
+        assert!(!out.contains("Details in transcript"), "{out}");
         assert!(out.contains("No such file or directory"), "{out}");
-        assert!(out.contains("Ctrl+O transcript"), "{out}");
+        assert!(!out.contains("Ctrl+O transcript"), "{out}");
     }
 
     #[test]
     fn failed_tool_without_any_details_says_so_explicitly() {
         let t = err_tool("read", "Reading: missing.txt", 10);
         let out = render(&t, 80, 4);
-        assert!(out.contains("No details returned"), "{out}");
+        assert!(
+            out.contains("Read failed before returning output: Reading: missing.txt"),
+            "{out}"
+        );
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn complete_failed_tool_synthesizes_missing_details() {
+        let mut t = ToolCell::new_running("bash", "$ make check 2>&1");
+        t.complete("failed", 1200, String::new(), None, None);
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Bash failed before returning output: $ make check 2>&1")
+        );
+        let out = render(&t, 100, 4);
+        assert!(out.contains("Bash failed before returning output"), "{out}");
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn complete_failed_tool_treats_blank_output_as_missing_details() {
+        let mut t = ToolCell::new_running("read_file", "Reading: src/main.rs");
+        t.complete(
+            "error",
+            19,
+            String::new(),
+            Some(" \n ".into()),
+            Some("\t".into()),
+        );
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Read failed before returning output: Reading: src/main.rs")
+        );
     }
 
     #[test]
@@ -955,7 +1055,7 @@ mod tests {
         assert!(out.contains("file-5"));
         assert!(!out.contains("file-6"), "row 6 should have been trimmed");
         assert!(out.contains("… +3 lines"));
-        assert!(out.contains("Ctrl+O transcript"));
+        assert!(out.contains("(Ctrl+O to view transcript)"));
     }
 
     #[test]
@@ -1014,7 +1114,7 @@ mod tests {
         assert!(out.contains("   1 + print(\"new1\")"), "{out}");
         assert!(out.contains("   5 + print(\"new5\")"), "{out}");
         assert!(out.contains("… +1 more changed lines"), "{out}");
-        assert!(out.contains("Ctrl+O transcript"), "{out}");
+        assert!(out.contains("(Ctrl+O to view transcript)"), "{out}");
     }
 
     #[test]
@@ -1050,7 +1150,7 @@ mod tests {
         assert!(out.contains("line 1"), "{out}");
         assert!(out.contains("line 5"), "{out}");
         assert!(!out.contains("286 lines captured"), "{out}");
-        assert!(out.contains("Ctrl+O transcript"), "{out}");
+        assert!(out.contains("(Ctrl+O to view transcript)"), "{out}");
     }
 
     #[test]

@@ -95,7 +95,7 @@ impl DigestCollector for AstraCliDigestCollector {
             .await
             .map_err(|_| format!("digest timeout after {}s", timeout.as_secs()))?
             .map_err(|e| format!("digest wait: {e}"))?;
-        let stdout_body = String::from_utf8_lossy(&output.stdout).to_string();
+        let stdout_body = String::from_utf8_lossy(&output.stdout).into_owned();
 
         let trimmed = stdout_body.trim();
         if trimmed.is_empty() {

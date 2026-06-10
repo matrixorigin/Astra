@@ -1,4 +1,4 @@
-//! MatrixOne-backed [`TaskStore`] for the session scratchpad.
+//! MatrixOne-backed [`TaskStore`] for the durable session task board.
 //!
 //! Authoritative store for the Tier 1 task board, per Plan
 //! `docs/plans/task-system-design.md` §2.1. Each edge and cloud loop host
@@ -23,15 +23,14 @@
 
 use astra_core::sqlx::{self, MySql, MySqlConnection, Pool, QueryBuilder, Row};
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde::de::DeserializeOwned;
 
 use std::sync::Arc;
 
 use crate::task_mgmt::{
-    InMemoryTaskStore, SESSION_TASK_STATUS_ARCHIVED, SESSION_TASK_STATUS_CANCELLED,
-    SESSION_TASK_STATUS_COMPLETED, SESSION_TASK_STATUS_FAILED, SESSION_TASK_STATUS_IN_PROGRESS,
+    InMemoryTaskStore, SESSION_TASK_STATUS_IN_PROGRESS, SESSION_TASK_STATUS_PAUSED,
     SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
-    TaskStore, prefix_summary,
+    TaskStore,
 };
 
 /// Soft cap on the number of rows a single `session_todos` full-replace
@@ -66,6 +65,12 @@ struct EncodedTaskJsonFields {
     subtasks: Option<String>,
 }
 
+struct EncodedTaskDatetimes {
+    archived_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 fn encode_task_json_fields(task: &SessionTask) -> EncodedTaskJsonFields {
     EncodedTaskJsonFields {
         metadata: task
@@ -81,6 +86,13 @@ fn encode_task_json_fields(task: &SessionTask) -> EncodedTaskJsonFields {
     }
 }
 
+fn push_optional_json<'args>(
+    row: &mut sqlx::query_builder::Separated<'_, 'args, MySql, &'static str>,
+    value: Option<String>,
+) {
+    row.push_bind(value);
+}
+
 async fn insert_session_tasks(
     executor: &mut MySqlConnection,
     session_id: &str,
@@ -92,6 +104,18 @@ async fn insert_session_tasks(
     }
 
     for (start, end) in task_insert_batch_ranges(tasks.len()) {
+        let encoded_datetimes = tasks[start..end]
+            .iter()
+            .map(|task| {
+                let updated_at = to_mo_datetime(&task.updated_at, "updated_at", &task.id)?;
+                Ok(EncodedTaskDatetimes {
+                    archived_at: (task.status == SessionTaskStatusKind::Archived)
+                        .then(|| updated_at.clone()),
+                    created_at: to_mo_datetime(&task.created_at, "created_at", &task.id)?,
+                    updated_at,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut builder = QueryBuilder::<MySql>::new(
             "INSERT INTO session_todos (\
                 session_id, todo_id, user_id, ordinal, title, description, active_form, \
@@ -99,11 +123,12 @@ async fn insert_session_tasks(
                 created_at, updated_at) ",
         );
         builder.push_values(
-            tasks[start..end].iter().enumerate(),
-            |mut row, (offset, task)| {
+            tasks[start..end]
+                .iter()
+                .zip(encoded_datetimes.iter())
+                .enumerate(),
+            |mut row, (offset, (task, datetimes))| {
                 let encoded = encode_task_json_fields(task);
-                let archived_at = (task.status == SessionTaskStatusKind::Archived)
-                    .then(|| to_mo_datetime(&task.updated_at));
                 let status_str = task.status.to_string();
                 row.push_bind(session_id)
                     .push_bind(&task.id)
@@ -113,14 +138,14 @@ async fn insert_session_tasks(
                     .push_bind(&task.description)
                     .push_bind(&task.active_form)
                     .push_bind(status_str)
-                    .push_bind(&task.owner)
-                    .push_bind(encoded.metadata)
-                    .push_bind(encoded.blocks)
-                    .push_bind(encoded.blocked_by)
-                    .push_bind(encoded.subtasks)
-                    .push_bind(archived_at)
-                    .push_bind(to_mo_datetime(&task.created_at))
-                    .push_bind(to_mo_datetime(&task.updated_at));
+                    .push_bind(&task.owner);
+                push_optional_json(&mut row, encoded.metadata);
+                push_optional_json(&mut row, encoded.blocks);
+                push_optional_json(&mut row, encoded.blocked_by);
+                push_optional_json(&mut row, encoded.subtasks);
+                row.push_bind(&datetimes.archived_at)
+                    .push_bind(&datetimes.created_at)
+                    .push_bind(&datetimes.updated_at);
             },
         );
         builder
@@ -162,23 +187,29 @@ fn locked_counter_advance(raw: i64, session_id: &str) -> Result<(u32, u64), Stri
     Ok((current, next_stored))
 }
 
+fn peek_task_id_from_counter(row: Option<i64>, session_id: &str) -> Result<u32, String> {
+    let Some(raw) = row else {
+        return Ok(1);
+    };
+    if raw <= 0 {
+        return Err(format!(
+            "session_todo_counters.next_id out of range for {session_id}: {raw}"
+        ));
+    }
+    allocated_task_id_from_counter(raw as u64, session_id)
+}
+
 /// Convert an RFC3339 timestamp (what `TaskManager` writes) into the
 /// `YYYY-MM-DD HH:MM:SS.ffffff` form MatrixOne accepts for `DATETIME(6)`
-/// columns. Falls back to stripping the `T` + timezone offset if parsing
-/// fails, so callers can recover from legacy-format inputs without panicking.
-fn to_mo_datetime(rfc3339: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        return dt
-            .with_timezone(&chrono::Utc)
-            .format("%Y-%m-%d %H:%M:%S%.6f")
-            .to_string();
-    }
-    rfc3339
-        .replacen('T', " ", 1)
-        .split(&['+', 'Z'][..])
-        .next()
-        .unwrap_or(rfc3339)
-        .to_string()
+/// columns. Invalid timestamps are data corruption and fail closed.
+fn to_mo_datetime(rfc3339: &str, column: &'static str, task_id: &str) -> Result<String, String> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string()
+        })
+        .map_err(|e| format!("task '{task_id}' has invalid {column} timestamp '{rfc3339}': {e}"))
 }
 
 /// Pick the right [`TaskStore`] for this process: MatrixOne when a pool is
@@ -187,10 +218,11 @@ fn to_mo_datetime(rfc3339: &str) -> String {
 /// sessions; each `TaskManager` scopes reads/writes by `session_id`.
 pub fn select_task_store(
     pool: Option<astra_core::sqlx::Pool<astra_core::sqlx::MySql>>,
-) -> Arc<dyn TaskStore> {
+    user_id: impl Into<String>,
+) -> Result<Arc<dyn TaskStore>, String> {
     match pool {
-        Some(pool) => Arc::new(MatrixOneTaskStore::new(pool)),
-        None => Arc::new(InMemoryTaskStore::new()),
+        Some(pool) => Ok(Arc::new(MatrixOneTaskStore::new_for_user(pool, user_id)?)),
+        None => Ok(Arc::new(InMemoryTaskStore::new())),
     }
 }
 
@@ -201,30 +233,37 @@ pub struct MatrixOneTaskStore {
     /// User who owns rows written through this store. Threaded into
     /// every INSERT so cross-session user-scoped queries
     /// (`idx_session_todos_user_status_updated`) can find them
-    /// without a join. Empty string means the store is
-    /// "anonymous" — only test paths should construct that shape.
+    /// without a join. Production construction must bind a real user_id.
     user_id: String,
 }
 
 impl MatrixOneTaskStore {
-    pub fn new(pool: Pool<MySql>) -> Self {
-        Self {
+    pub fn new_for_user(pool: Pool<MySql>, user_id: impl Into<String>) -> Result<Self, String> {
+        let user_id = user_id.into();
+        if user_id.trim().is_empty() {
+            return Err(
+                "MatrixOne task store requires a non-empty user_id for durable task access"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
             pool,
             changed_tx: tokio::sync::broadcast::channel(16).0,
-            user_id: String::new(),
-        }
+            user_id,
+        })
     }
 
-    pub fn from_shared(shared: &astra_core::SharedPool) -> Self {
-        Self::new(shared.get().clone())
+    pub fn from_shared_for_user(
+        shared: &astra_core::SharedPool,
+        user_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::new_for_user(shared.get().clone(), user_id)
     }
 
-    /// Bind the user that owns subsequent writes. Must be set before
-    /// any `save()` / `mutate()` so the user_id column has a real
-    /// owner for cross-session queries.
-    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
-        self.user_id = user_id.into();
-        self
+    #[cfg(test)]
+    pub fn new_for_test(pool: Pool<MySql>, user_id: impl Into<String>) -> Self {
+        Self::new_for_user(pool, user_id)
+            .expect("test MatrixOneTaskStore user_id must be non-empty")
     }
 
     async fn load_rows(&self, session_id: &str) -> Result<Vec<SessionTask>, sqlx::Error> {
@@ -250,62 +289,134 @@ impl MatrixOneTaskStore {
 }
 
 fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> {
-    let id: String = row.try_get("todo_id")?;
-    let title: String = row.try_get("title")?;
-    let description: Option<String> = row.try_get("description").ok().flatten();
-    let active_form: Option<String> = row.try_get("active_form").ok().flatten();
-    let status_str: String = row.try_get("status")?;
-    let status = SessionTaskStatusKind::from_status_str(&status_str);
-    let owner: Option<String> = row.try_get("owner").ok().flatten();
-    let metadata: Option<serde_json::Map<String, serde_json::Value>> = row
-        .try_get::<Option<String>, _>("metadata")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    let blocks: Vec<String> = row
-        .try_get::<Option<String>, _>("blocks")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let blocked_by: Vec<String> = row
-        .try_get::<Option<String>, _>("blocked_by")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let subtasks: Vec<SessionSubtask> = row
-        .try_get::<Option<String>, _>("subtasks")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    // `created_at` / `updated_at` are NOT NULL DATETIME(6) columns cast to
-    // CHAR in the SELECT. A NULL here means schema drift (column relaxed to
-    // nullable) or a bad cast — surface it instead of silently letting an
-    // empty string flow back through `to_mo_datetime` on the next save and
-    // triggering the legacy-format fallback branch.
-    let created_at: String = row
-        .try_get::<Option<String>, _>("created_at")?
-        .ok_or_else(|| sqlx::Error::Decode("session_todos.created_at is NULL".into()))?;
-    let updated_at: String = row
-        .try_get::<Option<String>, _>("updated_at")?
-        .ok_or_else(|| sqlx::Error::Decode("session_todos.updated_at is NULL".into()))?;
+    let decoded = (|| {
+        let id: String = row.try_get("todo_id")?;
+        let title: String = row.try_get("title")?;
+        let description: Option<String> = row.try_get("description")?;
+        let active_form: Option<String> = row.try_get("active_form")?;
+        let status_str: String = row.try_get("status")?;
+        let status = parse_persisted_status(&status_str)?;
+        let owner: Option<String> = row.try_get("owner")?;
+        let metadata: Option<serde_json::Map<String, serde_json::Value>> =
+            parse_optional_json_text(optional_json_text(row, "metadata")?, "metadata")?;
+        let blocks: Vec<String> =
+            parse_optional_json_text(optional_json_text(row, "blocks")?, "blocks")?
+                .unwrap_or_default();
+        let blocked_by: Vec<String> =
+            parse_optional_json_text(optional_json_text(row, "blocked_by")?, "blocked_by")?
+                .unwrap_or_default();
+        let subtasks: Vec<SessionSubtask> =
+            parse_optional_json_text(optional_json_text(row, "subtasks")?, "subtasks")?
+                .unwrap_or_default();
+        // `created_at` / `updated_at` are NOT NULL DATETIME(6) columns cast to
+        // CHAR in the SELECT. A NULL here means schema drift (column relaxed to
+        // nullable) or a bad cast — surface it instead of silently letting an
+        // empty string flow back through `to_mo_datetime` on the next save and
+        // triggering the legacy-format fallback branch.
+        let created_at_raw: String = row
+            .try_get::<Option<String>, _>("created_at")?
+            .ok_or_else(|| sqlx::Error::Decode("session_todos.created_at is NULL".into()))?;
+        let updated_at_raw: String = row
+            .try_get::<Option<String>, _>("updated_at")?
+            .ok_or_else(|| sqlx::Error::Decode("session_todos.updated_at is NULL".into()))?;
+        let created_at = from_mo_datetime(&created_at_raw, "created_at")?;
+        let updated_at = from_mo_datetime(&updated_at_raw, "updated_at")?;
 
-    Ok(SessionTask {
-        id,
-        title,
-        description,
-        status,
-        subtasks,
-        created_at,
-        updated_at,
-        active_form,
-        owner,
-        metadata,
-        blocks,
-        blocked_by,
+        Ok(SessionTask {
+            id,
+            title,
+            description,
+            status,
+            subtasks,
+            created_at,
+            updated_at,
+            active_form,
+            owner,
+            metadata,
+            blocks,
+            blocked_by,
+            archived_at: None, // populated on load from column below
+        })
+    })();
+
+    if let Err(error) = &decoded {
+        let session_id = row
+            .try_get::<String, _>("session_id")
+            .unwrap_or_else(|_| "<not-selected>".to_string());
+        let todo_id = row
+            .try_get::<String, _>("todo_id")
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        tracing::error!(
+            session_id,
+            todo_id,
+            error = %error,
+            "failed to decode session_todos row"
+        );
+    }
+
+    decoded
+}
+
+fn optional_json_text(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<Option<String>, sqlx::Error> {
+    if let Ok(value) = row.try_get::<Option<String>, _>(column) {
+        return Ok(value);
+    }
+    let bytes = row.try_get::<Option<Vec<u8>>, _>(column)?;
+    match bytes {
+        Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|error| {
+            sqlx::Error::Decode(format!("{column} is not valid UTF-8: {error}").into())
+        }),
+        None => Ok(None),
+    }
+}
+
+fn parse_optional_json_text<T>(
+    value: Option<String>,
+    column: &'static str,
+) -> Result<Option<T>, sqlx::Error>
+where
+    T: DeserializeOwned,
+{
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    serde_json::from_str(&raw).map(Some).map_err(|e| {
+        sqlx::Error::Decode(format!("session_todos.{column} contains invalid JSON: {e}").into())
     })
+}
+
+fn from_mo_datetime(value: &str, column: &'static str) -> Result<String, sqlx::Error> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.with_timezone(&chrono::Utc).to_rfc3339());
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc))
+        .map(|dt| dt.to_rfc3339())
+        .map_err(|e| {
+            sqlx::Error::Decode(
+                format!("session_todos.{column} contains invalid DATETIME '{value}': {e}").into(),
+            )
+        })
+}
+
+fn parse_persisted_status(status: &str) -> Result<SessionTaskStatusKind, sqlx::Error> {
+    match status {
+        "in_progress" => Ok(SessionTaskStatusKind::InProgress),
+        "pending" => Ok(SessionTaskStatusKind::Pending),
+        "paused" => Ok(SessionTaskStatusKind::Paused),
+        "completed" => Ok(SessionTaskStatusKind::Completed),
+        "failed" => Ok(SessionTaskStatusKind::Failed),
+        "cancelled" => Ok(SessionTaskStatusKind::Cancelled),
+        "archived" => Ok(SessionTaskStatusKind::Archived),
+        "deleted" => Ok(SessionTaskStatusKind::Deleted),
+        "migrated" => Ok(SessionTaskStatusKind::Migrated),
+        other => Err(sqlx::Error::Decode(
+            format!("session_todos.status contains invalid status '{other}'").into(),
+        )),
+    }
 }
 
 #[async_trait]
@@ -314,9 +425,15 @@ impl TaskStore for MatrixOneTaskStore {
         self.load_rows(session_id).await.map_err(|e| e.to_string())
     }
 
-    /// U-8: SQL-pushdown path for active-only queries.
+    /// U-8: SQL-pushdown path for open-work `active` queries.
     /// Uses `idx_session_todos_session_status_updated` so only matching
     /// rows are returned instead of shipping the whole table to Rust.
+    ///
+    /// **Security fix**: removed fail-open `OR status NOT IN (...)` clause.
+    /// From first principles: load_active must return ONLY known active
+    /// statuses (pending, in_progress, paused). Treating unknown/corrupted
+    /// status values as active violates the fail-closed principle and could
+    /// expose inactive tasks to orchestration logic.
     async fn load_active(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
         let rows = sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
@@ -324,12 +441,14 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
-             WHERE session_id = ? AND status IN (?, ?) \
+             WHERE session_id = ? \
+               AND status IN (?, ?, ?) \
              ORDER BY ordinal ASC",
         )
         .bind(session_id)
         .bind(SESSION_TASK_STATUS_PENDING.to_string())
         .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
+        .bind(SESSION_TASK_STATUS_PAUSED.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -341,210 +460,26 @@ impl TaskStore for MatrixOneTaskStore {
         Ok(tasks)
     }
 
-    async fn archive(&self, session_id: &str, args: &Value) -> Result<String, String> {
-        if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-            let status_row: Option<(String,)> = if self.user_id.is_empty() {
-                sqlx::query_as(
-                    "SELECT status FROM session_todos \
-                     WHERE session_id = ? AND todo_id = ? LIMIT 1",
-                )
-                .bind(session_id)
-                .bind(task_id)
-                .fetch_optional(&self.pool)
-                .await
-            } else {
-                sqlx::query_as(
-                    "SELECT status FROM session_todos \
-                     WHERE user_id = ? AND session_id = ? AND todo_id = ? LIMIT 1",
-                )
-                .bind(&self.user_id)
-                .bind(session_id)
-                .bind(task_id)
-                .fetch_optional(&self.pool)
-                .await
-            }
-            .map_err(|e| e.to_string())?;
-
-            let Some((status,)) = status_row else {
-                return Ok(prefix_summary(
-                    format!("Refused: task #{task_id} not found in session {session_id}"),
-                    json!({
-                        "success": false,
-                        "task_id": task_id,
-                        "session_id": session_id,
-                        "message": format!(
-                            "Task '{}' was not found in session '{}'",
-                            task_id, session_id
-                        ),
-                    })
-                    .to_string(),
-                ));
-            };
-            let status_kind = SessionTaskStatusKind::from_status_str(&status);
-            if status_kind == SessionTaskStatusKind::Archived {
-                return Ok(prefix_summary(
-                    format!("Refused: task #{task_id} is already archived"),
-                    json!({
-                        "success": false,
-                        "task_id": task_id,
-                        "session_id": session_id,
-                        "previous_status": status,
-                        "message": format!("Task '{}' is already archived", task_id),
-                    })
-                    .to_string(),
-                ));
-            }
-            if !status_kind.can_be_archived() {
-                return Ok(prefix_summary(
-                    format!(
-                        "Refused: task #{task_id} is '{status}' — only completed, failed, or cancelled tasks can be archived"
-                    ),
-                    json!({
-                        "success": false,
-                        "task_id": task_id,
-                        "session_id": session_id,
-                        "previous_status": status,
-                        "message": format!(
-                            "Task '{}' must be completed, failed, or cancelled before it can be archived",
-                            task_id
-                        ),
-                    })
-                    .to_string(),
-                ));
-            }
-
-            let result = if self.user_id.is_empty() {
-                sqlx::query(
-                    "UPDATE session_todos \
-                     SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
-                     WHERE session_id = ? AND todo_id = ? \
-                       AND status IN (?, ?, ?)",
-                )
-                .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-                .bind(session_id)
-                .bind(task_id)
-                .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-                .bind(SESSION_TASK_STATUS_FAILED.to_string())
-                .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
-                .execute(&self.pool)
-                .await
-            } else {
-                sqlx::query(
-                    "UPDATE session_todos \
-                     SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
-                     WHERE user_id = ? AND session_id = ? AND todo_id = ? \
-                       AND status IN (?, ?, ?)",
-                )
-                .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-                .bind(&self.user_id)
-                .bind(session_id)
-                .bind(task_id)
-                .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-                .bind(SESSION_TASK_STATUS_FAILED.to_string())
-                .bind(SESSION_TASK_STATUS_CANCELLED.to_string())
-                .execute(&self.pool)
-                .await
-            }
-            .map_err(|e| e.to_string())?;
-
-            if result.rows_affected() == 0 {
-                return Ok(prefix_summary(
-                    format!(
-                        "Refused: task #{task_id} changed before it could be archived; reload and try again"
-                    ),
-                    json!({
-                        "success": false,
-                        "task_id": task_id,
-                        "session_id": session_id,
-                        "message": format!(
-                            "Task '{}' changed before archive could be applied; reload and try again",
-                            task_id
-                        ),
-                    })
-                    .to_string(),
-                ));
-            }
-
-            return Ok(prefix_summary(
-                format!("Archived task #{task_id} (was {status})"),
-                json!({
-                    "success": true,
-                    "task_id": task_id,
-                    "session_id": session_id,
-                    "previous_status": status,
-                    "status": SESSION_TASK_STATUS_ARCHIVED,
-                    "message": format!("Task '{}' archived", task_id),
-                })
-                .to_string(),
-            ));
-        }
-
-        let days_raw = args
-            .get("older_than_days")
-            .and_then(Value::as_u64)
-            .unwrap_or(30);
-        let days = i64::try_from(days_raw)
-            .map_err(|_| format!("older_than_days is too large: {days_raw}"))?;
-        let result = if self.user_id.is_empty() {
-            sqlx::query(
-                "UPDATE session_todos \
-                 SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE session_id = ? AND status = ? \
-                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
-            )
-            .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-            .bind(session_id)
-            .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-            .bind(days)
-            .execute(&self.pool)
-            .await
-        } else {
-            sqlx::query(
-                "UPDATE session_todos \
-                 SET status = ?, archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE user_id = ? AND status = ? \
-                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
-            )
-            .bind(SESSION_TASK_STATUS_ARCHIVED.to_string())
-            .bind(&self.user_id)
-            .bind(SESSION_TASK_STATUS_COMPLETED.to_string())
-            .bind(days)
-            .execute(&self.pool)
-            .await
-        }
-        .map_err(|e| e.to_string())?;
-
-        let scope = if self.user_id.is_empty() {
-            format!("session {session_id}")
-        } else {
-            format!("user {}", self.user_id)
-        };
-        Ok(prefix_summary(
-            format!(
-                "Archived {} completed task(s) older than {days} days for {scope}",
-                result.rows_affected()
-            ),
-            json!({
-                "success": true,
-                "archived": result.rows_affected(),
-                "older_than_days": days,
-                "scope": scope,
-                "message": format!(
-                    "Archived {} completed task(s) older than {} days for {}",
-                    result.rows_affected(),
-                    days,
-                    scope
-                ),
-            })
-            .to_string(),
-        ))
-    }
-
     async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
         // Full replace semantics: the caller computed the next state; we
         // atomically make the table match it. Transaction ensures readers
         // on the other node never see a partial update.
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+
+        if let Err(e) = sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
+             ON DUPLICATE KEY UPDATE next_id = next_id",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
 
         if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
             .bind(session_id)
@@ -575,6 +510,20 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
+        if let Err(e) = sqlx::query(
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(())
@@ -584,7 +533,7 @@ impl TaskStore for MatrixOneTaskStore {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         if let Err(e) = sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 1) \
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
              ON DUPLICATE KEY UPDATE next_id = next_id",
         )
         .bind(session_id)
@@ -714,6 +663,20 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
+        if let Err(e) = sqlx::query(
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(result.response)
@@ -766,7 +729,7 @@ impl TaskStore for MatrixOneTaskStore {
             None => {
                 // First allocation: seed counter to 2 (reserves id 1).
                 if let Err(e) = sqlx::query(
-                    "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 2)",
+                    "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 2, 1)",
                 )
                 .bind(session_id)
                 .execute(&mut *tx)
@@ -793,7 +756,7 @@ impl TaskStore for MatrixOneTaskStore {
                 // Persist the bump (may store the exhausted sentinel;
                 // `allocated_task_id_from_counter` rejects it on next read).
                 if let Err(e) =
-                    sqlx::query("UPDATE session_todo_counters SET next_id = ? WHERE session_id = ?")
+                    sqlx::query("UPDATE session_todo_counters SET next_id = ?, version = version + 1 WHERE session_id = ?")
                         .bind(next_stored as i64)
                         .bind(session_id)
                         .execute(&mut *tx)
@@ -814,8 +777,8 @@ impl TaskStore for MatrixOneTaskStore {
 
     async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
         sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, ?) \
-             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id)",
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, 1) \
+             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
         )
         .bind(session_id)
         .bind(counter_bind_value(next))
@@ -825,30 +788,128 @@ impl TaskStore for MatrixOneTaskStore {
         Ok(())
     }
 
+    async fn restore_snapshot_state(
+        &self,
+        session_id: &str,
+        tasks: Vec<SessionTask>,
+        next_task_id: u32,
+        expected_version: u64,
+    ) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+
+        if expected_version > 0 {
+            // CAS: atomically verify the session version hasn't changed since
+            // the snapshot was captured.  Without this, a concurrent sweeper
+            // auto-pause or plan-mirror mutation could be silently overwritten.
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT version FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
+            let current_version = row.map(|(v,)| v as u64).unwrap_or(0);
+            if current_version != expected_version {
+                return Err(format!(
+                    "restore_snapshot_state: version conflict (expected={}, current={}) — \
+                     task board changed after rollback snapshot was sealed; retry with fresh state",
+                    expected_version, current_version
+                ));
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, ?) \
+             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
+        )
+        .bind(session_id)
+        .bind(counter_bind_value(next_task_id))
+        .bind(expected_version as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("restore_snapshot_state: counter upsert failed: {e}"))?;
+
+        if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
+        debug_assert!(
+            tasks.len() < TASK_SOFT_CAP,
+            "session_todos full-replace exceeded soft cap ({} rows); revisit incremental upserts",
+            tasks.len()
+        );
+
+        if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &tasks).await {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
+        if let Err(e) = sqlx::query(
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())
+        {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        let _ = self.changed_tx.send(session_id.to_string());
+        Ok(())
+    }
+
     async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
         // Pure read — no side effect, so concurrent allocators can't
         // race the snapshot. Missing row → 1 (matches next_task_id's
-        // "first allocation" semantics). A `next_id` of 0 is treated
-        // the same as "no row" for the same reason.
+        // "first allocation" semantics). If a row exists but contains
+        // 0/negative, fail loudly so try_snapshot_state falls back to
+        // max(existing task id) + 1 instead of capturing a corrupt
+        // counter and later restoring it.
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT next_id FROM session_todo_counters WHERE session_id = ?")
                 .bind(session_id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| e.to_string())?;
-        let raw = row.map(|(v,)| v).unwrap_or(0);
-        if raw == 0 {
-            return Ok(1);
+        peek_task_id_from_counter(row.map(|(v,)| v), session_id)
+    }
+
+    async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT version FROM session_todo_counters WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        match row {
+            Some((version,)) if version >= 0 => u64::try_from(version)
+                .map_err(|_| format!("session_todo_counters.version overflow for {session_id}")),
+            Some((version,)) => Err(format!(
+                "session_todo_counters.version out of range for {session_id}: {version}"
+            )),
+            None => Ok(0),
         }
-        if raw < 0 {
-            return Err(format!(
-                "session_todo_counters.next_id out of range for {session_id}"
-            ));
-        }
-        allocated_task_id_from_counter(raw as u64, session_id)
     }
 
     async fn load_all_sessions(&self) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+        if self.user_id.trim().is_empty() {
+            return Err("load_all_sessions requires a user-scoped MatrixOneTaskStore".to_string());
+        }
         // One SQL round-trip across the whole table — the multi-
         // session board is a low-frequency power-user surface so
         // we favour simplicity over a per-session fan-out. Order
@@ -860,8 +921,10 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
+             WHERE user_id = ? \
              ORDER BY session_id ASC, ordinal ASC",
         )
+        .bind(&self.user_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -877,6 +940,51 @@ impl TaskStore for MatrixOneTaskStore {
                 _ => {
                     out.push((sid, vec![task]));
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn load_open_sessions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+        if self.user_id.trim().is_empty() {
+            return Err("load_open_sessions requires a user-scoped MatrixOneTaskStore".to_string());
+        }
+        let limit = i64::try_from(limit.min(200)).unwrap_or(200).max(0);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT session_id, todo_id, title, description, active_form, status, owner, \
+                    metadata, blocks, blocked_by, subtasks, \
+                    CAST(created_at AS CHAR) AS created_at, \
+                    CAST(updated_at AS CHAR) AS updated_at \
+             FROM session_todos \
+             WHERE user_id = ? \
+               AND status IN (?, ?, ?) \
+             ORDER BY updated_at DESC, session_id ASC, ordinal ASC \
+             LIMIT ?",
+        )
+        .bind(&self.user_id)
+        .bind(SESSION_TASK_STATUS_PENDING.to_string())
+        .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
+        .bind(SESSION_TASK_STATUS_PAUSED.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut out: Vec<(String, Vec<SessionTask>)> = Vec::new();
+        for row in rows {
+            let sid: String = row.try_get("session_id").map_err(|e| e.to_string())?;
+            let task = row_to_task(&row).map_err(|e| e.to_string())?;
+            if let Some((_, tasks)) = out.iter_mut().find(|(cur_sid, _)| cur_sid == &sid) {
+                tasks.push(task);
+            } else {
+                out.push((sid, vec![task]));
             }
         }
         Ok(out)
@@ -932,6 +1040,33 @@ mod tests {
     }
 
     #[test]
+    fn peek_counter_decode_distinguishes_missing_from_corrupt_zero() {
+        assert_eq!(
+            peek_task_id_from_counter(None, "sess-new").expect("missing counter starts at one"),
+            1
+        );
+        assert_eq!(
+            peek_task_id_from_counter(Some(7), "sess-existing")
+                .expect("positive counter is the next task id"),
+            7
+        );
+
+        let zero = peek_task_id_from_counter(Some(0), "sess-corrupt")
+            .expect_err("persisted zero counter must not look like a missing row");
+        assert!(
+            zero.contains("out of range") && zero.contains("0"),
+            "unexpected error: {zero}"
+        );
+
+        let negative = peek_task_id_from_counter(Some(-1), "sess-corrupt")
+            .expect_err("negative counter is corrupt");
+        assert!(
+            negative.contains("out of range") && negative.contains("-1"),
+            "unexpected error: {negative}"
+        );
+    }
+
+    #[test]
     fn encode_task_json_fields_omits_empty_optional_columns() {
         let task = SessionTask {
             id: "task-1".into(),
@@ -946,6 +1081,7 @@ mod tests {
             metadata: None,
             blocks: vec![],
             blocked_by: vec![],
+            archived_at: None,
         };
 
         let encoded = encode_task_json_fields(&task);
@@ -980,6 +1116,7 @@ mod tests {
             )])),
             blocks: vec!["task-3".into()],
             blocked_by: vec!["task-0".into()],
+            archived_at: None,
         };
 
         let encoded = encode_task_json_fields(&task);
@@ -991,6 +1128,58 @@ mod tests {
             Some(
                 r#"[{"id":"sub-1","title":"subtask","description":null,"status":"pending","depends_on":["sub-0"]}]"#
             )
+        );
+    }
+
+    #[test]
+    fn parse_optional_json_text_fails_closed_on_corrupt_task_columns() {
+        let absent: Option<Vec<String>> =
+            parse_optional_json_text(None, "blocks").expect("null column is empty");
+        assert!(absent.is_none());
+
+        let blocks: Option<Vec<String>> =
+            parse_optional_json_text(Some(r#"["task-2"]"#.into()), "blocks")
+                .expect("valid JSON array parses");
+        assert_eq!(blocks, Some(vec!["task-2".to_string()]));
+
+        let corrupt =
+            parse_optional_json_text::<Vec<String>>(Some("not-json".into()), "blocked_by")
+                .expect_err("invalid dependency JSON must not be treated as empty");
+        let corrupt = corrupt.to_string();
+        assert!(
+            corrupt.contains("session_todos.blocked_by") && corrupt.contains("invalid JSON"),
+            "unexpected error: {corrupt}"
+        );
+
+        let wrong_shape =
+            parse_optional_json_text::<Vec<String>>(Some(r#"{"task":"task-2"}"#.into()), "blocks")
+                .expect_err("wrong dependency shape must not be treated as empty");
+        let wrong_shape = wrong_shape.to_string();
+        assert!(
+            wrong_shape.contains("session_todos.blocks") && wrong_shape.contains("invalid JSON"),
+            "unexpected error: {wrong_shape}"
+        );
+    }
+
+    #[test]
+    fn from_mo_datetime_normalizes_matrixone_datetimes_to_rfc3339() {
+        assert_eq!(
+            from_mo_datetime("2026-05-29 22:57:42.599249", "updated_at")
+                .expect("MatrixOne DATETIME(6) parses"),
+            "2026-05-29T22:57:42.599249+00:00"
+        );
+        assert_eq!(
+            from_mo_datetime("2026-05-29T22:57:42Z", "created_at")
+                .expect("RFC3339 values remain accepted"),
+            "2026-05-29T22:57:42+00:00"
+        );
+
+        let err = from_mo_datetime("not-a-time", "updated_at")
+            .expect_err("bad datetime must not round-trip silently")
+            .to_string();
+        assert!(
+            err.contains("session_todos.updated_at") && err.contains("invalid DATETIME"),
+            "unexpected error: {err}"
         );
     }
 

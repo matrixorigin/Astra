@@ -14,8 +14,8 @@ fn git_command(workspace_root: &Path, git_args: &[&str]) -> ToolResult {
 
     match output {
         Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             if out.status.success() {
                 ToolResult::text(stdout)
             } else {

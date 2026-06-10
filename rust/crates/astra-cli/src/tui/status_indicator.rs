@@ -195,7 +195,7 @@ fn render_for(
     let label_style = Style::default()
         .fg(intensity_color)
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(theme.dim);
 
     let state_label: String = match state {
         IndicatorState::Thinking { .. } => "Thinking".into(),

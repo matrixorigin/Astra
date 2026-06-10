@@ -392,7 +392,7 @@ pub async fn collect_sse_body_text(
         let bytes = body::to_bytes(response.into_body(), 4 * 1024 * 1024)
             .await
             .unwrap_or_default();
-        return (status, String::from_utf8_lossy(&bytes).to_string());
+        return (status, String::from_utf8_lossy(&bytes).into_owned());
     }
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
@@ -424,7 +424,7 @@ pub async fn collect_sse_body_text(
             &preview[..preview.len().min(500)]
         );
     }
-    (status, String::from_utf8_lossy(&acc).to_string())
+    (status, String::from_utf8_lossy(&acc).into_owned())
 }
 
 /// Parse SSE `data: {...}` blocks; return the first JSON object whose `type` matches.

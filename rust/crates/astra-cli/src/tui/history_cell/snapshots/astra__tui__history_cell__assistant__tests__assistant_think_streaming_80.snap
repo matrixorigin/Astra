@@ -1,8 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
-assertion_line: 1023
 expression: "render(&c, 80, 4)"
 ---
-• Thought preview
+• Thought · 2 lines · 21 tokens
     First, let me think about the structure.
     Actually, the user wants a concise answer.

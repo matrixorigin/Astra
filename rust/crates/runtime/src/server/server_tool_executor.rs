@@ -13,7 +13,7 @@
 //! `server_tool_executor` field. When present, the headless round
 //! calls it directly instead of waiting for edge POST callbacks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -31,7 +31,8 @@ use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::exit_semantics::{classify_command_result, classify_exit};
 use astra_tools::task_mgmt::{
-    InMemoryTaskStore, SessionTask, TaskManager, TaskManagerSnapshot, TaskStore,
+    InMemoryTaskStore, MAX_CREATE_SUBTASKS, SessionTask, TaskManager, TaskManagerSnapshot,
+    TaskStore,
 };
 use astra_tools::{
     AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt, AskUserQuestionAnswer,
@@ -46,6 +47,8 @@ use crate::tool_sandbox::{
     execute_isolated, filter_environment, wrap_command_with_limits,
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
+
+use astra_tools::plan_task_mirror;
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
@@ -592,7 +595,18 @@ fn json_usize_arg(args: &Value, key: &str, default: usize, min: usize, max: usiz
     let value = args
         .get(key)
         .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
+        .and_then(|value| {
+            usize::try_from(value)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        key,
+                        value,
+                        error = %e,
+                        "json_usize_arg: type overflow, falling back to default={default}"
+                    );
+                })
+                .ok()
+        })
         .unwrap_or(default);
     value.clamp(min, max)
 }
@@ -707,10 +721,16 @@ fn render_session_history_rows(
 /// Code's `prepareContextForPlanMode` behaviour: the model must call
 /// ExitPlanMode before writing anything.
 ///
-/// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search,
-/// task_*, memory_retrieve, …) stay available so the agent can continue
-/// exploring while authoring a plan.
-fn is_plan_mode_blocked_tool(tool: &str) -> bool {
+/// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search)
+/// and session-scoped authoring tools (`task`, memory_retrieve, …) stay
+/// available so the agent can continue exploring while authoring a plan.
+fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
+    if tool == "job" {
+        return !matches!(
+            args.get("action").and_then(Value::as_str),
+            Some("list" | "output")
+        );
+    }
     matches!(
         tool,
         "bash"
@@ -913,14 +933,6 @@ pub struct ServerToolExecutor {
     /// `None` leaves plan-mode unconditionally off (back-compat for tests /
     /// constructor call sites that haven't been updated).
     plan_repo: Option<Arc<dyn astra_plan::PlanRepository>>,
-    /// Sink for seeding `session_plan_todos` after a plan is approved.
-    /// `None` skips the seed step (e.g. tests or runtime init that
-    /// hasn't wired the cloud DB yet); when present, `tool_exit_plan_mode`
-    /// inserts one row per subtask after `set_active_plan(None)`. The
-    /// trait indirection lets tests capture seeds in-memory without a
-    /// real MatrixOne. Production wiring goes through
-    /// [`astra_services::DatabasePlanTodoSink`].
-    plan_todo_sink: Option<Arc<dyn astra_services::PlanTodoSink>>,
     /// Cache for `plan_mode_authoring_active()` so a typical session with
     /// 20-50 tool calls doesn't incur 40-100 DB round-trips. Invalidated
     /// explicitly on `enter_plan_mode` / `exit_plan_mode`. Holds the latest
@@ -991,7 +1003,7 @@ impl ServerToolExecutor {
             Duration::from_secs(15),
         );
 
-        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new().with_validation());
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();
@@ -1028,7 +1040,6 @@ impl ServerToolExecutor {
             workspace_artifact_store: None,
             context_manifest_pool: None,
             plan_repo: None,
-            plan_todo_sink: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -1114,13 +1125,6 @@ impl ServerToolExecutor {
     /// can check `active_plan_id` and flip plan phase.
     pub fn set_plan_repository(&mut self, repo: Arc<dyn astra_plan::PlanRepository>) {
         self.plan_repo = Some(repo);
-    }
-
-    /// Inject the `session_plan_todos` sink so `exit_plan_mode(approved=true)`
-    /// can seed one row per subtask. `None` skips the seed step (back-compat
-    /// for test executors and non-DB runtime paths).
-    pub fn set_plan_todo_sink(&mut self, sink: Arc<dyn astra_services::PlanTodoSink>) {
-        self.plan_todo_sink = Some(sink);
     }
 
     /// Inject the host's plan-resume hint handle so tool-driven plan-mode
@@ -1213,43 +1217,18 @@ impl ServerToolExecutor {
                 "Error: publish_artifact requires a non-empty path".to_string(),
             );
         };
-        let path = match self.resolve_publish_artifact_path(raw_path) {
-            Ok(path) => path,
-            Err(error) => return astra_tools::ToolResult::error(error),
+        let (path, bytes) = match self.resolve_publish_artifact_path(raw_path) {
+            Ok(v) => v,
+            Err(e) => return astra_tools::ToolResult::error(e),
         };
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: failed to inspect artifact file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
-        if !metadata.is_file() {
-            return astra_tools::ToolResult::error(format!(
-                "Error: publish_artifact path is not a regular file: {}",
-                path.display()
-            ));
-        }
-        if metadata.len() > MAX_PUBLISH_ARTIFACT_BYTES {
+        if bytes.len() as u64 > MAX_PUBLISH_ARTIFACT_BYTES {
             return astra_tools::ToolResult::error(format!(
                 "Error: publish_artifact currently supports files up to {} MiB; {} is {} bytes",
                 MAX_PUBLISH_ARTIFACT_BYTES / 1024 / 1024,
                 path.display(),
-                metadata.len()
+                bytes.len()
             ));
         }
-
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: failed to read artifact file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
 
         let content_type = match string_arg(args, "content_type") {
             Some(value) => match validate_content_type(value) {
@@ -1434,9 +1413,13 @@ impl ServerToolExecutor {
                 source: "transcript".to_string(),
                 role,
                 content,
-                run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
+                run_id: row.try_get::<Option<String>, _>("run_id")
+                    .inspect_err(|e| tracing::warn!(column="run_id", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
+                    .ok()
+                    .flatten(),
                 created_at: row
                     .try_get::<Option<String>, _>("created_at")
+                    .inspect_err(|e| tracing::warn!(column="created_at", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
                     .ok()
                     .flatten(),
             });
@@ -1504,9 +1487,13 @@ impl ServerToolExecutor {
                 source: "history_chunk".to_string(),
                 role: chunk_type,
                 content,
-                run_id: row.try_get::<Option<String>, _>("source_id").ok().flatten(),
+                run_id: row.try_get::<Option<String>, _>("source_id")
+                    .inspect_err(|e| tracing::warn!(column="source_id", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
+                    .ok()
+                    .flatten(),
                 created_at: row
                     .try_get::<Option<String>, _>("created_at")
+                    .inspect_err(|e| tracing::warn!(column="created_at", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
                     .ok()
                     .flatten(),
             });
@@ -1896,7 +1883,7 @@ impl ServerToolExecutor {
         // names ExitPlanMode as the escape hatch. Read-only tools (explore,
         // status, tasks, memory) still pass through so the agent can keep
         // investigating while authoring.
-        if is_plan_mode_blocked_tool(name) && self.plan_mode_authoring_active().await {
+        if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             return astra_tools::ToolResult::error(format!(
                 "Tool '{name}' is blocked while plan mode is active. \
                  The agent must call `exit_plan_mode` with an approved plan \
@@ -2037,21 +2024,58 @@ impl ServerToolExecutor {
             "rollback_session_state" => {
                 tool_result_from_output(self.rollback_session_state(args).await)
             }
-            "task_create" => tool_result_from_output(self.task_create(args).await),
-            "task_list" => tool_result_from_output(self.task_list(args).await),
-            "task_get" => tool_result_from_output(self.task_get(args).await),
-            "task_update" => tool_result_from_output(self.task_update(args).await),
-            "task_stop" => tool_result_from_output(self.task_stop(args).await),
             "task" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+                let action_value = args.get("action");
+                let action = match action_value {
+                    Some(Value::String(action)) => action.as_str(),
+                    Some(_) => {
+                        return tool_result_from_output(
+                            "Error: field 'action' must be a string".to_string(),
+                        );
+                    }
+                    None => {
+                        return tool_result_from_output(
+                            "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive.".to_string(),
+                        );
+                    }
+                };
                 match action {
-                    "create" => tool_result_from_output(self.task_create(args).await),
-                    "list" => tool_result_from_output(self.task_list(args).await),
-                    "get" => tool_result_from_output(self.task_get(args).await),
-                    "update" => tool_result_from_output(self.task_update(args).await),
-                    "stop" => tool_result_from_output(self.task_stop(args).await),
+                    "create" => match Self::validate_task_tool_args_for_action("create", args) {
+                        Ok(()) => tool_result_from_output(self.task_action_create(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "list" => match Self::validate_task_tool_args_for_action("list", args) {
+                        Ok(()) => tool_result_from_output(self.task_list(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "get" => match Self::validate_task_tool_args_for_action("get", args) {
+                        Ok(()) => tool_result_from_output(self.task_get(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "update" => match Self::validate_task_tool_args_for_action("update", args) {
+                        Ok(()) => tool_result_from_output(self.task_action_update(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
+                        Ok(()) => tool_result_from_output(self.task_action_stop(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "list_user" => {
+                        match Self::validate_task_tool_args_for_action("list_user", args) {
+                            Ok(()) => tool_result_from_output(self.task_list_user(args).await),
+                            Err(error) => tool_result_from_output(format!("Error: {error}")),
+                        }
+                    }
+                    "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
+                        Ok(()) => tool_result_from_output(self.task_adopt(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
+                    "archive" => match Self::validate_task_tool_args_for_action("archive", args) {
+                        Ok(()) => tool_result_from_output(self.task_archive(args).await),
+                        Err(error) => tool_result_from_output(format!("Error: {error}")),
+                    },
                     other => tool_result_from_output(format!(
-                        "Unknown task action: '{other}'. Use: create, list, get, update, stop"
+                        "Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive."
                     )),
                 }
             }
@@ -2217,7 +2241,7 @@ impl ServerToolExecutor {
                     "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, compress_context, \
-                     rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
+                     rollback_session_state, task, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
@@ -2475,17 +2499,85 @@ impl ServerToolExecutor {
         &self.workspace_root
     }
 
-    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
+    fn with_file_journal_mut<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut FileEditJournal) -> T,
+    ) -> T {
         match self.file_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
+            Ok(mut journal) => f(&mut journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "file_journal mutex poisoned; recovering inner journal"
+                );
+                let mut journal = poisoned.into_inner();
+                f(&mut journal)
+            }
         }
     }
 
+    fn with_file_journal<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&FileEditJournal) -> T,
+    ) -> T {
+        match self.file_journal.lock() {
+            Ok(journal) => f(&journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "file_journal mutex poisoned; recovering inner journal"
+                );
+                let journal = poisoned.into_inner();
+                f(&journal)
+            }
+        }
+    }
+
+    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
+        self.with_file_journal("file_journal_checkpoint", |journal| journal.checkpoint())
+    }
+
     pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
+        self.with_database_snapshot_journal("database_snapshot_journal_checkpoint", |journal| {
+            journal.checkpoint()
+        })
+    }
+
+    fn with_database_snapshot_journal_mut<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut DatabaseSnapshotRollbackJournal) -> T,
+    ) -> T {
         match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
+            Ok(mut journal) => f(&mut journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "database_snapshot_journal mutex poisoned; recovering inner journal"
+                );
+                let mut journal = poisoned.into_inner();
+                f(&mut journal)
+            }
+        }
+    }
+
+    fn with_database_snapshot_journal<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&DatabaseSnapshotRollbackJournal) -> T,
+    ) -> T {
+        match self.database_snapshot_journal.lock() {
+            Ok(journal) => f(&journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "database_snapshot_journal mutex poisoned; recovering inner journal"
+                );
+                let journal = poisoned.into_inner();
+                f(&journal)
+            }
         }
     }
 
@@ -2495,29 +2587,22 @@ impl ServerToolExecutor {
         database: Option<String>,
     ) {
         let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
-        match self.database_snapshot_journal.lock() {
-            Ok(mut journal) => journal.record(snapshot_id, database, turn_index),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .record(snapshot_id, database, turn_index),
-        }
+        self.with_database_snapshot_journal_mut("record_database_snapshot_rollback", |journal| {
+            journal.record(snapshot_id, database, turn_index)
+        });
     }
 
     fn database_snapshot_entries(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.list(),
-            Err(poisoned) => poisoned.into_inner().list(),
-        }
+        self.with_database_snapshot_journal("database_snapshot_entries", |journal| journal.list())
     }
 
     fn database_snapshot_entry_for_snapshot(
         &self,
         snapshot_id: &str,
     ) -> Option<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.entry_for_snapshot(snapshot_id),
-            Err(poisoned) => poisoned.into_inner().entry_for_snapshot(snapshot_id),
-        }
+        self.with_database_snapshot_journal("database_snapshot_entry_for_snapshot", |journal| {
+            journal.entry_for_snapshot(snapshot_id)
+        })
     }
 
     fn database_snapshot_restore_plan_for_turn_since(
@@ -2525,23 +2610,16 @@ impl ServerToolExecutor {
         turn_index: u32,
         checkpoint: u64,
     ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
+        self.with_database_snapshot_journal(
+            "database_snapshot_restore_plan_for_turn_since",
+            |journal| journal.restore_plan_for_turn_since(turn_index, checkpoint),
+        )
     }
 
     fn remove_database_snapshot_rollback(&self, snapshot_id: &str) {
-        match self.database_snapshot_journal.lock() {
-            Ok(mut journal) => {
-                journal.remove_snapshot(snapshot_id);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove_snapshot(snapshot_id);
-            }
-        }
+        self.with_database_snapshot_journal_mut("remove_database_snapshot_rollback", |journal| {
+            journal.remove_snapshot(snapshot_id)
+        });
     }
 
     fn rollback_database_snapshot_entry_json(entry: &DatabaseSnapshotRollbackEntry) -> Value {
@@ -2762,10 +2840,10 @@ impl ServerToolExecutor {
                 let plan = if checkpoint > 0 {
                     self.database_snapshot_restore_plan_for_turn_since(turn_index, checkpoint)
                 } else {
-                    match self.database_snapshot_journal.lock() {
-                        Ok(journal) => journal.restore_plan_for_turn(turn_index),
-                        Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
-                    }
+                    self.with_database_snapshot_journal(
+                        "database_snapshot_restore_plan_for_turn",
+                        |journal| journal.restore_plan_for_turn(turn_index),
+                    )
                 };
                 let mut restored = Vec::new();
                 let mut failed = Vec::new();
@@ -2825,18 +2903,52 @@ impl ServerToolExecutor {
     }
 
     pub(crate) fn session_state_journal_checkpoint(&self) -> u64 {
+        self.with_session_state_journal("session_state_journal_checkpoint", |journal| {
+            journal.checkpoint()
+        })
+    }
+
+    fn with_session_state_journal_mut<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut SessionStateRollbackJournal) -> T,
+    ) -> T {
         match self.session_state_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
+            Ok(mut journal) => f(&mut journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "session_state_journal mutex poisoned; recovering inner journal"
+                );
+                let mut journal = poisoned.into_inner();
+                f(&mut journal)
+            }
+        }
+    }
+
+    fn with_session_state_journal<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&SessionStateRollbackJournal) -> T,
+    ) -> T {
+        match self.session_state_journal.lock() {
+            Ok(journal) => f(&journal),
+            Err(poisoned) => {
+                tracing::warn!(
+                    operation,
+                    "session_state_journal mutex poisoned; recovering inner journal"
+                );
+                let journal = poisoned.into_inner();
+                f(&journal)
+            }
         }
     }
 
     fn record_session_state_rollback(&self, label: String, action: SessionStateRollbackAction) {
         let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
-        match self.session_state_journal.lock() {
-            Ok(mut journal) => journal.record(turn_index, label, action),
-            Err(poisoned) => poisoned.into_inner().record(turn_index, label, action),
-        }
+        self.with_session_state_journal_mut("record_session_state_rollback", |journal| {
+            journal.record(turn_index, label, action)
+        });
     }
 
     fn record_tool_preferences_rollback(
@@ -2890,20 +3002,16 @@ impl ServerToolExecutor {
     }
 
     fn session_state_entries(&self) -> Vec<SessionStateRollbackEntry> {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.list(),
-            Err(poisoned) => poisoned.into_inner().list(),
-        }
+        self.with_session_state_journal("session_state_entries", |journal| journal.list())
     }
 
     fn session_state_restore_plan_for_turn(
         &self,
         turn_index: u32,
     ) -> Vec<SessionStateRollbackEntry> {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn(turn_index),
-            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
-        }
+        self.with_session_state_journal("session_state_restore_plan_for_turn", |journal| {
+            journal.restore_plan_for_turn(turn_index)
+        })
     }
 
     fn session_state_restore_plan_for_turn_since(
@@ -2911,23 +3019,15 @@ impl ServerToolExecutor {
         turn_index: u32,
         checkpoint: u64,
     ) -> Vec<SessionStateRollbackEntry> {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
+        self.with_session_state_journal("session_state_restore_plan_for_turn_since", |journal| {
+            journal.restore_plan_for_turn_since(turn_index, checkpoint)
+        })
     }
 
     fn remove_session_state_rollback(&self, sequence: u64) {
-        match self.session_state_journal.lock() {
-            Ok(mut journal) => {
-                journal.remove_sequence(sequence);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove_sequence(sequence);
-            }
-        }
+        self.with_session_state_journal_mut("remove_session_state_rollback", |journal| {
+            journal.remove_sequence(sequence)
+        });
     }
 
     fn restore_observability_snapshot(
@@ -2948,9 +3048,25 @@ impl ServerToolExecutor {
         let timestamp_ms = entry
             .timestamp
             .duration_since(SystemTime::UNIX_EPOCH)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "rollback timestamp predates UNIX_EPOCH, using 0"
+                );
+            })
             .ok()
             .map(|duration| duration.as_millis())
-            .and_then(|millis| u64::try_from(millis).ok());
+            .and_then(|millis| {
+                u64::try_from(millis)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            millis,
+                            error = %e,
+                            "rollback timestamp u64 overflow, using 0"
+                        );
+                    })
+                    .ok()
+            });
         let mut value = serde_json::Map::from_iter([
             ("label".to_string(), Value::String(entry.label.clone())),
             (
@@ -3062,7 +3178,7 @@ impl ServerToolExecutor {
         }
     }
 
-    /// Decide whether a `task_*` tool's output represents a successful
+    /// Decide whether a `task(action=...)` tool output represents a successful
     /// mutation worth snapshotting for rollback.
     ///
     /// Conservative policy (C-SRV-1 fix): the **default is "yes"**, with
@@ -3072,9 +3188,18 @@ impl ServerToolExecutor {
     ///
     /// Pre-fix this returned `false` when the body had no `{`, which
     /// silently dropped the rollback snapshot for every successful
-    /// task_create / task_update / task_stop whose response was a plain
+    /// `task(action=create|update|stop)` response that was a plain
     /// human-readable summary (e.g. just `"Created task #5: foo"`).
     /// That made `rollback_session_state` a no-op on the most common path.
+    fn find_json_body_start(output: &str) -> Option<usize> {
+        // task_mgmt prefixes responses with a one-line summary followed by a JSON body.
+        // The JSON body starts on its own line, so look for `{` at the start of a line.
+        if output.starts_with('{') {
+            return Some(0);
+        }
+        output.find("\n{").map(|pos| pos + 1)
+    }
+
     fn task_output_success(output: &str) -> bool {
         if output.starts_with("Error:") {
             return false;
@@ -3084,7 +3209,7 @@ impl ServerToolExecutor {
         // If we *can* find a JSON body, honor its explicit `success: false`;
         // otherwise treat as a success (conservative — better to snapshot
         // a no-op than to lose a real snapshot).
-        if let Some(pos) = output.find('{') {
+        if let Some(pos) = Self::find_json_body_start(output) {
             if let Ok(value) = serde_json::from_str::<Value>(&output[pos..]) {
                 if let Some(false) = value.get("success").and_then(Value::as_bool) {
                     return false;
@@ -3095,14 +3220,110 @@ impl ServerToolExecutor {
         true
     }
 
-    async fn task_create(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state().await;
+    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
+        let allowed: &[&str] = match action {
+            "create" => &[
+                "action",
+                "title",
+                "description",
+                "subtasks",
+                "active_form",
+                "owner",
+                "metadata",
+            ],
+            "list" => &["action", "status_filter"],
+            "get" => &["action", "task_id"],
+            "update" => &[
+                "action",
+                "task_id",
+                "new_status",
+                "title",
+                "description",
+                "subtask_id",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+                "remove_blocks",
+                "remove_blocked_by",
+                "error_message",
+            ],
+            "stop" => &["action", "task_id", "reason"],
+            "list_user" => &["action", "user_status"],
+            "adopt" => &["action", "source_session_id", "task_id"],
+            "archive" => &["action", "task_id", "older_than_days"],
+            _ => return Ok(()),
+        };
+        let Some(obj) = args.as_object() else {
+            return Err(format!("task.{action} arguments must be an object"));
+        };
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "unknown field '{key}' for task.{action} (valid: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
+        let Some(raw) = args.get("user_status") else {
+            return Ok("active");
+        };
+        let Some(status) = raw.as_str() else {
+            return Err("Error: field 'user_status' must be a string".to_string());
+        };
+        if astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.contains(&status) {
+            Ok(status)
+        } else {
+            Err(format!(
+                "Error: invalid user_status '{}' (valid: {})",
+                status,
+                astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.join("|")
+            ))
+        }
+    }
+
+    fn task_user_status_matches(
+        status_filter: &str,
+        status: astra_tools::task_mgmt::SessionTaskStatusKind,
+    ) -> bool {
+        match status_filter {
+            // Cross-session active means open work the user may need to
+            // resume or adopt. Keep this aligned with single-session
+            // task.list(status_filter="active"): pending + in_progress +
+            // paused.
+            "active" => status.blocks_duplicate_create(),
+            "all" => true,
+            status_filter => {
+                status == astra_tools::task_mgmt::SessionTaskStatusKind::from(status_filter)
+            }
+        }
+    }
+
+    async fn task_action_create(&self, args: &Value) -> String {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
         let output = self.task_manager.create(args).await;
         if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task_create:{}",
+                    "task:create:{}",
                     args.get("title").and_then(Value::as_str).unwrap_or("task")
                 ),
             );
@@ -3118,207 +3339,166 @@ impl ServerToolExecutor {
         self.task_manager.get(args).await
     }
 
-    async fn task_update(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state().await;
-        let output = self.task_manager.update(args).await;
-        if Self::task_output_success(&output) {
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task_update:{}",
-                    args.get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-        }
-        output
-    }
-
-    async fn task_stop(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state().await;
-        let output = self.task_manager.stop(args).await;
-        if Self::task_output_success(&output) {
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task_stop:{}",
-                    args.get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-        }
-        output
-    }
-
-    async fn mirror_approved_plan_to_task_board(
-        &self,
-        plan_id: &str,
-        plan_state: &astra_plan::PlanModeState,
-    ) -> Result<(), String> {
-        if plan_state.plan.subtasks.is_empty() {
-            return Ok(());
-        }
-        let plan_fingerprint = Self::plan_task_board_fingerprint(&plan_state.plan);
-
-        let existing_task_id = self
-            .task_manager
-            .snapshot()
-            .await
-            .into_iter()
-            .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
-            .map(|task| task.id);
-
-        let task_id = if let Some(task_id) = existing_task_id {
-            task_id
-        } else {
-            let subtasks: Vec<Value> = plan_state
-                .plan
-                .subtasks
-                .iter()
-                .map(|subtask| {
-                    json!({
-                        "id": subtask.id,
-                        "title": subtask.title,
-                        "description": subtask.description,
-                        "depends_on": subtask.depends_on,
-                    })
-                })
-                .collect();
-            let create_output = self
-                .task_manager
-                .create(&json!({
-                    "title": plan_state.goal,
-                    "description": format!(
-                        "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
-                        plan_state.plan.subtasks.len()
-                    ),
-                    "active_form": "Executing approved plan",
-                    "owner": self.user_id,
-                    "metadata": {
-                        "source": "approved_plan",
-                        "plan_id": plan_id,
-                        "plan_fingerprint": plan_fingerprint,
-                        "session_id": self.session_id,
-                        "step_count": plan_state.plan.subtasks.len(),
-                    },
-                    "subtasks": subtasks,
-                }))
-                .await;
-            if create_output.starts_with("Error:") {
-                return Err(create_output);
-            }
-
-            let created_task_id = self
-                .task_manager
-                .snapshot()
-                .await
-                .into_iter()
-                .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
-                .map(|task| task.id);
-            if let Some(task_id) = created_task_id {
-                task_id
-            } else if create_output.contains("already has this title")
-                || create_output.contains("duplicate_of")
-            {
-                let suffix: String = plan_id.chars().take(16).collect();
-                let disambiguated_title = if suffix.is_empty() {
-                    format!("{} (new plan)", plan_state.goal)
-                } else {
-                    format!("{} ({suffix})", plan_state.goal)
-                };
-                let retry_output = self
-                    .task_manager
-                    .create(&json!({
-                        "title": disambiguated_title,
-                        "description": format!(
-                            "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
-                            plan_state.plan.subtasks.len()
-                        ),
-                        "active_form": "Executing approved plan",
-                        "owner": self.user_id,
-                        "metadata": {
-                            "source": "approved_plan",
-                            "plan_id": plan_id,
-                            "plan_fingerprint": plan_fingerprint,
-                            "session_id": self.session_id,
-                            "step_count": plan_state.plan.subtasks.len(),
-                        },
-                        "subtasks": subtasks,
-                    }))
-                    .await;
-                if retry_output.starts_with("Error:") {
-                    return Err(retry_output);
-                }
-                self.task_manager
-                    .snapshot()
-                    .await
-                    .into_iter()
-                    .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
-                    .map(|task| task.id)
-                    .ok_or_else(|| {
-                        format!(
-                            "approved plan {plan_id} was not visible in task board after duplicate-title retry"
-                        )
-                    })?
-            } else {
-                return Err(format!(
-                    "approved plan {plan_id} was not visible in task board after task.create"
-                ));
+    async fn task_action_update(&self, args: &Value) -> String {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
+        let output = self.task_manager.update(args).await;
+        if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task:update:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
+                ),
+            );
+        }
+        output
+    }
 
-        let update_output = self
-            .task_manager
-            .update(&json!({
-                "task_id": task_id,
-                "new_status": "in_progress",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": plan_id,
-                    "plan_fingerprint": plan_fingerprint,
-                    "session_id": self.session_id,
-                    "step_count": plan_state.plan.subtasks.len(),
+    async fn task_action_stop(&self, args: &Value) -> String {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
+        let output = self.task_manager.stop(args).await;
+        if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task:stop:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
+                ),
+            );
+        }
+        output
+    }
+
+    async fn task_list_user(&self, args: &Value) -> String {
+        let status_filter = match Self::normalize_task_user_status(args) {
+            Ok(status) => status,
+            Err(err) => return err,
+        };
+        let sessions = match self.task_manager.store().load_all_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let mut rows = Vec::new();
+        for (session_id, tasks) in sessions {
+            for task in tasks {
+                let include = Self::task_user_status_matches(status_filter, task.status);
+                if include {
+                    rows.push(json!({
+                        "session_id": session_id,
+                        "todo_id": task.id,
+                        "title": task.title,
+                        "status": task.status.to_string(),
+                        "updated_at": task.updated_at,
+                    }));
                 }
-            }))
-            .await;
-        if update_output.starts_with("Error:") {
-            return Err(update_output);
+            }
         }
-        Ok(())
+        rows.sort_by(|a, b| {
+            let a_updated = a.get("updated_at").and_then(Value::as_str).unwrap_or("");
+            let b_updated = b.get("updated_at").and_then(Value::as_str).unwrap_or("");
+            b_updated.cmp(a_updated)
+        });
+        rows.truncate(200);
+        let total = rows.len();
+        format!(
+            "Cross-session todos: {total} item(s)\n{}",
+            json!({
+                "tasks": rows,
+                "total": total,
+            })
+        )
     }
 
+    async fn task_adopt(&self, _args: &Value) -> String {
+        "Error: task(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
+            .to_string()
+    }
+
+    async fn task_archive(&self, args: &Value) -> String {
+        let mut snapshot = match self.task_manager.try_snapshot_state().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return format!("Error: failed to capture task rollback snapshot: {error}");
+            }
+        };
+        let output = self.task_manager.archive(args).await;
+        if Self::task_output_success(&output) {
+            if let Err(error) = self
+                .task_manager
+                .seal_snapshot_for_restore(&mut snapshot)
+                .await
+            {
+                return format!("Error: failed to seal task rollback snapshot: {error}");
+            }
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task:archive:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("bulk")
+                ),
+            );
+        }
+        output
+    }
+
+    #[allow(dead_code)]
     fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
-        let mut parts = Vec::new();
-        for subtask in &plan.subtasks {
-            parts.push(format!("{}:{}", subtask.id, subtask.title));
-        }
-        parts.join("|")
+        plan_task_mirror::plan_task_board_fingerprint(plan)
     }
 
+    #[allow(dead_code)]
     fn approved_plan_task_matches(
         task: &SessionTask,
         plan_id: &str,
         plan_fingerprint: &str,
     ) -> bool {
-        let metadata = task.metadata.as_ref();
-        let source = metadata
-            .and_then(|metadata| metadata.get("source"))
-            .and_then(Value::as_str);
-        let task_plan_id = metadata
-            .and_then(|metadata| metadata.get("plan_id"))
-            .and_then(Value::as_str);
-        let task_fingerprint = metadata
-            .and_then(|metadata| metadata.get("plan_fingerprint"))
-            .and_then(Value::as_str);
+        plan_task_mirror::approved_plan_task_matches(task, plan_id, plan_fingerprint)
+    }
 
-        source == Some("approved_plan")
-            && task_fingerprint == Some(plan_fingerprint)
-            && match task_plan_id {
-                Some(existing_plan_id) => existing_plan_id == plan_id,
-                None => true,
-            }
+    #[allow(dead_code)]
+    fn approved_plan_step_task_matches(
+        task: &SessionTask,
+        plan_id: &str,
+        plan_fingerprint: &str,
+        plan_subtask_id: &str,
+    ) -> bool {
+        plan_task_mirror::approved_plan_step_task_matches(
+            task,
+            plan_id,
+            plan_fingerprint,
+            plan_subtask_id,
+        )
     }
 
     fn server_get_agent_info(&self, args: &Value) -> String {
@@ -3412,8 +3592,15 @@ impl ServerToolExecutor {
             .to_string();
         }
 
-        let parse_u32 =
-            |value: &Value| value.as_u64().and_then(|number| u32::try_from(number).ok());
+        let parse_u32 = |value: &Value| {
+            value.as_u64().and_then(|number| {
+                u32::try_from(number)
+                    .inspect_err(|e| {
+                        tracing::warn!("config_drift: u64→u32 overflow converting {number}: {e}");
+                    })
+                    .ok()
+            })
+        };
         let parse_f64 = |value: &Value| value.as_f64();
         let ceiling = constraints.config_drift_ceiling;
         let session_snapshot = session.rollback_snapshot();
@@ -3819,11 +4006,13 @@ impl ServerToolExecutor {
             .unwrap_or("summary");
         let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
 
-        let snapshot = self
-            .introspect_snapshot
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let snapshot = self.introspect_snapshot.read().unwrap_or_else(|poison| {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "introspect_snapshot lock poisoned (writer panicked), recovering with inner data"
+            );
+            poison.into_inner()
+        }).clone();
 
         match snapshot {
             Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
@@ -4112,9 +4301,11 @@ impl ServerToolExecutor {
             .unwrap_or("(pending)")
             .trim()
             .to_string();
-        if goal.is_empty() {
-            return "Error: goal must be non-empty".to_string();
-        }
+        let goal = if goal.is_empty() {
+            "(pending)".to_string()
+        } else {
+            goal
+        };
 
         let plan_id = args
             .get("plan_id")
@@ -4122,49 +4313,49 @@ impl ServerToolExecutor {
             .map(str::to_string)
             .unwrap_or_else(|| astra_plan::PlanModeState::generate_plan_id(&goal));
 
-        // Create-or-link: if a plan with this id already exists we re-link
-        // it to this session (passing the observed version so a concurrent
-        // editor cannot be silently overwritten); otherwise we create a
-        // fresh one with no expected_version.
-        let (mut state, expected_version) = match repo.load(&plan_id).await {
-            Ok(mut s) => {
-                let v = s.version;
-                s.session_hint = Some(self.session_id.clone());
-                (s, Some(v))
-            }
-            Err(astra_plan::PlanLoadError::NotFound(_)) => {
-                let mut s =
-                    astra_plan::PlanModeState::new_with_owner(goal.clone(), self.user_id.clone());
-                s.session_hint = Some(self.session_id.clone());
-                (s, None)
-            }
-            Err(e) => return format!("Error: load plan: {e}"),
-        };
+        // Create-or-link with CAS retry: if a concurrent editor bumped the
+        // version between our load and save, reload and retry (up to 3
+        // attempts) instead of silently dropping work.
+        const MAX_CAS_RETRIES: u32 = 3;
+        let mut last_conflict: Option<String> = None;
+        for _attempt in 0..MAX_CAS_RETRIES {
+            let (mut state, expected_version) = match repo.load(&plan_id).await {
+                Ok(mut s) => {
+                    let v = s.version;
+                    s.session_hint = Some(self.session_id.clone());
+                    (s, Some(v))
+                }
+                Err(astra_plan::PlanLoadError::NotFound(_)) => {
+                    let mut s = astra_plan::PlanModeState::new_with_owner(
+                        goal.clone(),
+                        self.user_id.clone(),
+                    );
+                    s.session_hint = Some(self.session_id.clone());
+                    (s, None)
+                }
+                Err(e) => return format!("Error: load plan: {e}"),
+            };
 
-        if let Err(e) = repo.save(&plan_id, &mut state, expected_version).await {
-            return format!("Error: save plan: {e}");
+            match repo.save(&plan_id, &mut state, expected_version).await {
+                Ok(()) => {
+                    last_conflict = None;
+                    break;
+                }
+                Err(astra_plan::PlanLoadError::Conflict { expected, actual }) => {
+                    last_conflict = Some(format!(
+                        "version conflict (expected {expected}, stored {actual})"
+                    ));
+                    continue;
+                }
+                Err(e) => return format!("Error: save plan: {e}"),
+            }
         }
+        if let Some(conflict) = last_conflict {
+            return format!("Error: save plan after {MAX_CAS_RETRIES} retries: {conflict}");
+        }
+
         if let Err(e) = repo.set_active_plan(&self.session_id, Some(&plan_id)).await {
             return format!("Error: link plan to session: {e}");
-        }
-
-        // U-6: when the user re-enters plan mode with a fresh plan, mark
-        // any prior plan's seeded `session_plan_todos` rows in this session
-        // as `superseded` so the next `task.list` doesn't show them next
-        // to the new plan's items. Best-effort — failure logs but doesn't
-        // abort the enter (the new plan_id is still pinned, and a stale
-        // active row in the prior plan only causes UI noise, not
-        // correctness loss).
-        if let Some(sink) = self.plan_todo_sink.clone()
-            && let Err(e) = sink.supersede_other_plans(&self.session_id, &plan_id).await
-        {
-            tracing::warn!(
-                session_id = %self.session_id,
-                new_plan_id = %plan_id,
-                error = %e,
-                "enter_plan_mode: failed to supersede prior plans' seeded todos; \
-                 list may show stale items"
-            );
         }
 
         // Invalidate so the next write tool and the next system-prompt build
@@ -4193,19 +4384,12 @@ impl ServerToolExecutor {
         )
     }
 
-    /// `exit_plan_mode` tool — flip the current session out of authoring so
-    /// write tools unlock. Does NOT start execution; the caller still needs
-    /// `POST /plans/{id}/execute` (or the next turn can proceed with writes
-    /// directly — approved plans are advisory, not a hard requirement for
-    /// subsequent bash/file ops).
+    /// `exit_plan_mode` tool — submit the authored plan for trusted user
+    /// approval. Model-supplied tool arguments must not unlock writes.
     async fn tool_exit_plan_mode(&self, args: &Value) -> String {
         let Some(repo) = self.plan_repo.clone() else {
             return "Error: plan repository not configured on this executor".to_string();
         };
-        let approved = args
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
 
         let active = match repo.active_plan_for_session(&self.session_id).await {
             Ok(Some(id)) => id,
@@ -4215,116 +4399,58 @@ impl ServerToolExecutor {
             Err(e) => return format!("Error: lookup active plan: {e}"),
         };
 
-        // We unlock writes by clearing `active_plan_id`. The `plans` row
-        // stays around so the approved plan can drive execution via
-        // /plans/{id}/execute. Rejecting keeps the plan linked for another
-        // authoring pass.
-        if approved {
-            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
-                return format!("Error: clear active plan: {e}");
-            }
-
-            let approved_plan_state = match repo.load(&active).await {
-                Ok(state) => Some(state),
-                Err(e) => {
-                    tracing::warn!(
-                        plan_id = %active,
-                        session_id = %self.session_id,
-                        error = %e,
-                        "exit_plan_mode: failed to load approved plan for task synchronization"
-                    );
-                    None
-                }
-            };
-
-            // Seed `session_plan_todos` so the next turn has executable
-            // items without the model manually re-creating each subtask.
-            // The sink is optional: when `None`, the seed step is a no-op
-            // (test executors, runtime paths with no cloud DB wired).
-            //
-            // Failures here are non-fatal: the plan is approved either
-            // way, and the model can still re-create todos via the
-            // `task` tool. We log via the journal but don't roll back
-            // the unlock.
-            if let (Some(sink), Some(plan_state)) =
-                (self.plan_todo_sink.clone(), approved_plan_state.as_ref())
-            {
-                let seeds: Vec<astra_services::PlanTodoSeed> = plan_state
-                    .plan
-                    .subtasks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, subtask)| astra_services::PlanTodoSeed {
-                        todo_id: format!("{active}:{}", subtask.id),
-                        user_id: self.user_id.clone(),
-                        session_id: self.session_id.clone(),
-                        plan_id: active.clone(),
-                        title: subtask.title.clone(),
-                        priority: i as i32,
-                        depth: 0,
-                    })
-                    .collect();
-                if !seeds.is_empty()
-                    && let Err(e) = sink.seed(seeds).await
-                {
-                    tracing::warn!(
-                        plan_id = %active,
-                        session_id = %self.session_id,
-                        error = %e,
-                        "exit_plan_mode: failed to seed session_plan_todos; \
-                         model can re-create via `task` tool"
-                    );
+        if let Some(plan_md) = args
+            .get("plan")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("plan_md").and_then(Value::as_str))
+        {
+            // CAS retry: reload + re-save on version conflict so concurrent
+            // plan edits don't silently drop submitted markdown.
+            const MAX_CAS_RETRIES: u32 = 3;
+            let mut last_conflict: Option<String> = None;
+            for _attempt in 0..MAX_CAS_RETRIES {
+                let mut state = match repo.load(&active).await {
+                    Ok(state) => state,
+                    Err(e) => return format!("Error: load active plan: {e}"),
+                };
+                state.plan_md = Some(plan_md.to_string());
+                let expected = Some(state.version);
+                match repo.save(&active, &mut state, expected).await {
+                    Ok(()) => {
+                        last_conflict = None;
+                        break;
+                    }
+                    Err(astra_plan::PlanLoadError::Conflict { expected, actual }) => {
+                        last_conflict = Some(format!(
+                            "version conflict (expected {expected}, stored {actual})"
+                        ));
+                        continue;
+                    }
+                    Err(e) => return format!("Error: save submitted plan markdown: {e}"),
                 }
             }
-
-            // Keep the user-visible task board aligned with the approved
-            // plan. `session_plan_todos` remains the execution queue; this
-            // task tree is the surface the user and model can inspect.
-            if let Some(plan_state) = approved_plan_state.as_ref()
-                && let Err(e) = self
-                    .mirror_approved_plan_to_task_board(&active, plan_state)
-                    .await
-            {
-                tracing::warn!(
-                    plan_id = %active,
-                    session_id = %self.session_id,
-                    error = %e,
-                    "exit_plan_mode: failed to mirror approved plan into task board"
+            if let Some(conflict) = last_conflict {
+                return format!(
+                    "Error: save submitted plan markdown after {MAX_CAS_RETRIES} retries: {conflict}"
                 );
             }
         }
 
-        // Always invalidate on exit — even a rejection mutates nothing but
-        // clients often immediately retry in-plan editing afterward, and
-        // a stale cache is cheap to avoid.
         self.invalidate_plan_mode_cache().await;
 
         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&self.session_id) {
             let _ = writer.append(
                 &astra_services::session_journal::JournalEvent::plan_lifecycle(
                     Some(&self.session_id),
-                    if approved {
-                        "plan_approved"
-                    } else {
-                        "plan_rejected"
-                    },
+                    "plan_submitted_for_approval",
                     Some(serde_json::json!({ "plan_id": active })),
                 ),
             );
         }
 
-        if approved {
-            format!(
-                "Exited plan mode. plan_id={} is approved; write tools unlocked. \
-                 Use `/plans/{}/execute` to start step-by-step execution.",
-                active, active
-            )
-        } else {
-            format!(
-                "Plan {} left open for another authoring pass. Write tools remain blocked.",
-                active
-            )
-        }
+        format!(
+            "Plan {active} submitted for trusted user approval. Write tools remain blocked until the UI/control plane records the user's approval."
+        )
     }
 
     // File operations (sandboxed to workspace_root)
@@ -4334,13 +4460,8 @@ impl ServerToolExecutor {
         astra_tools::fs_ops::resolve_path(&self.workspace_root, relative)
     }
 
-    fn resolve_publish_artifact_path(&self, raw_path: &str) -> Result<PathBuf, String> {
-        let requested = Path::new(raw_path);
-        let candidate = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            self.workspace_root.join(requested)
-        };
+    fn resolve_publish_artifact_path(&self, raw_path: &str) -> Result<(PathBuf, Vec<u8>), String> {
+        let candidate = self.workspace_root.join(raw_path);
         let canonical = candidate.canonicalize().map_err(|error| {
             format!(
                 "Error: publish_artifact path does not resolve to an existing file: {} ({error})",
@@ -4349,29 +4470,42 @@ impl ServerToolExecutor {
         })?;
 
         // `publish_artifact` is intentionally narrower than arbitrary file
-        // reads. It can only publish files produced inside the session
-        // workspace or the process temp directory, which are the same roots the
-        // server-side executor allows generated artifacts to land in.
-        let mut allowed_roots = Vec::new();
-        for root in [&self.workspace_root, Path::new("/tmp")] {
+        // access: only files under the session workspace or /tmp are allowed.
+        let mut allowed = false;
+        for root in [&self.workspace_root] {
             if let Ok(canonical_root) = root.canonicalize() {
-                allowed_roots.push(canonical_root);
-            } else {
-                allowed_roots.push(root.to_path_buf());
+                if canonical.starts_with(&canonical_root) {
+                    allowed = true;
+                    break;
+                }
             }
         }
-        if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
-            allowed_roots.push(temp_root);
+        if !allowed {
+            if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
+                if canonical.starts_with(&temp_root) {
+                    allowed = true;
+                }
+            }
         }
-
-        if allowed_roots.iter().any(|root| canonical.starts_with(root)) {
-            Ok(canonical)
-        } else {
-            Err(format!(
+        if !allowed {
+            return Err(format!(
                 "Error: publish_artifact can only publish files under the session workspace or /tmp: {}",
                 canonical.display()
-            ))
+            ));
         }
+
+        // **TOCTOU defense**: open and read the canonical file immediately
+        // while we still hold the resolved path.  Without this, a symlink
+        // swap between canonicalize and tokio::fs::read could redirect the
+        // read to an arbitrary file.
+        let bytes = std::fs::read(&canonical).map_err(|error| {
+            format!(
+                "Error: publish_artifact failed to read resolved file: {} ({error})",
+                canonical.display()
+            )
+        })?;
+
+        Ok((canonical, bytes))
     }
 
     fn server_write_file(&self, args: &Value) -> String {
@@ -4381,16 +4515,16 @@ impl ServerToolExecutor {
         };
 
         // Record journal entry before writing
-        if let Ok(mut journal) = self.file_journal.lock() {
-            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        self.with_file_journal_mut("server_write_file:record_before", |journal| {
             journal.record_before(prepared.path(), "server-write", turn_idx);
-        }
+        });
 
         let result = prepared.apply();
-        if !result.is_error
-            && let Ok(mut journal) = self.file_journal.lock()
-        {
-            journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
+        if !result.is_error {
+            self.with_file_journal_mut("server_write_file:record_after", |journal| {
+                journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
+            });
         }
         result.output
     }
@@ -4410,16 +4544,16 @@ impl ServerToolExecutor {
         let new_content_bytes = prepared.new_content_bytes().to_vec();
 
         // Record journal entry
-        if let Ok(mut journal) = self.file_journal.lock() {
-            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+        self.with_file_journal_mut("server_str_replace:record_before", |journal| {
             journal.record_before_patch(&path, "server-str-replace", turn_idx);
-        }
+        });
 
         let result = prepared.apply();
-        if !result.is_error
-            && let Ok(mut journal) = self.file_journal.lock()
-        {
-            journal.record_after(&path, "server-str-replace", &new_content_bytes);
+        if !result.is_error {
+            self.with_file_journal_mut("server_str_replace:record_after", |journal| {
+                journal.record_after(&path, "server-str-replace", &new_content_bytes);
+            });
         }
         result.output
     }
@@ -4434,10 +4568,11 @@ impl ServerToolExecutor {
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            && let Ok(mut journal) = self.file_journal.lock()
         {
             let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
+            self.with_file_journal_mut("server_multi_edit:record_before", |journal| {
+                journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
+            });
         }
 
         let result = prepared.apply();
@@ -4446,13 +4581,14 @@ impl ServerToolExecutor {
                 .get("dry_run")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-            && let Ok(mut journal) = self.file_journal.lock()
         {
-            journal.record_after(
-                prepared.path(),
-                "server-multi-edit",
-                prepared.new_content_bytes(),
-            );
+            self.with_file_journal_mut("server_multi_edit:record_after", |journal| {
+                journal.record_after(
+                    prepared.path(),
+                    "server-multi-edit",
+                    prepared.new_content_bytes(),
+                );
+            });
         }
         result.output
     }
@@ -4466,15 +4602,15 @@ impl ServerToolExecutor {
         let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
 
         let result = prepared.apply();
-        if !result.is_error
-            && let Ok(mut journal) = self.file_journal.lock()
-        {
-            journal.record_delete(
-                &path,
-                "server-delete",
-                turn_idx,
-                prepared.into_before_content(),
-            );
+        if !result.is_error {
+            self.with_file_journal_mut("server_delete_file:record_delete", |journal| {
+                journal.record_delete(
+                    &path,
+                    "server-delete",
+                    turn_idx,
+                    prepared.into_before_content(),
+                );
+            });
         }
         result.output
     }
@@ -4543,10 +4679,8 @@ impl ServerToolExecutor {
 
         match scope {
             "list" => {
-                let summary = match self.file_journal.lock() {
-                    Ok(journal) => journal.summary(),
-                    Err(poisoned) => poisoned.into_inner().summary(),
-                };
+                let summary =
+                    self.with_file_journal("rollback_file_edits:list", |journal| journal.summary());
                 let entries: Vec<Value> = summary
                     .into_iter()
                     .map(|(path, turn_index, edit_type)| {
@@ -4581,12 +4715,9 @@ impl ServerToolExecutor {
                     Err(error) => return error,
                 };
                 let rollback_candidates = self.rollback_path_candidates(raw_path, &path);
-                let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => undo_file_with_candidates(&journal, &rollback_candidates),
-                    Err(poisoned) => {
-                        undo_file_with_candidates(&poisoned.into_inner(), &rollback_candidates)
-                    }
-                };
+                let undo_result = self.with_file_journal("rollback_file_edits:file", |journal| {
+                    undo_file_with_candidates(journal, &rollback_candidates)
+                });
                 match undo_result {
                     Ok(Some((rolled_back_path, edit_type))) => json!({
                         "success": true,
@@ -5075,6 +5206,335 @@ esac
         (exec, dir)
     }
 
+    #[tokio::test]
+    async fn consolidated_task_tool_routes_archive_on_server_executor() {
+        let (exec, _dir) = test_executor();
+
+        let created = exec
+            .execute(
+                "task",
+                &json!({"action": "create", "title": "server archive"}),
+            )
+            .await;
+        assert!(
+            created.contains("\"success\":true"),
+            "create precondition failed: {created}"
+        );
+        let started = exec
+            .execute(
+                "task",
+                &json!({"action": "update", "task_id": "task-1", "new_status": "in_progress"}),
+            )
+            .await;
+        assert!(
+            started.contains("\"status\":\"in_progress\""),
+            "start precondition failed: {started}"
+        );
+        let completed = exec
+            .execute(
+                "task",
+                &json!({"action": "update", "task_id": "task-1", "new_status": "completed"}),
+            )
+            .await;
+        assert!(
+            completed.contains("\"status\":\"completed\""),
+            "complete precondition failed: {completed}"
+        );
+
+        let archived = exec
+            .execute("task", &json!({"action": "archive", "task_id": "task-1"}))
+            .await;
+        assert!(
+            !archived.contains("Unknown task action"),
+            "archive must be routed by the consolidated task tool: {archived}"
+        );
+        assert!(
+            archived.contains("\"status\":\"archived\""),
+            "archive should move the task to archived: {archived}"
+        );
+
+        let list = exec
+            .execute(
+                "task",
+                &json!({"action": "list", "status_filter": "archived"}),
+            )
+            .await;
+        assert!(
+            list.contains("\"count\":1") && list.contains("server archive"),
+            "archived task should be queryable through the same server executor: {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_task_tool_names_are_not_executable_on_server_executor() {
+        let (exec, _dir) = test_executor();
+
+        let legacy = exec
+            .execute("task_create", &json!({"title": "old surface"}))
+            .await;
+        assert!(
+            legacy.contains("not available") || legacy.contains("Unknown tool"),
+            "legacy task_create must not remain an executable task surface: {legacy}"
+        );
+
+        let unified = exec
+            .execute("task", &json!({"action": "create", "title": "new surface"}))
+            .await;
+        assert!(
+            unified.contains("\"success\":true") && unified.contains("task-1"),
+            "unified task(action=create) should remain the executable surface: {unified}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_rejects_bad_action_shape_on_server_executor() {
+        let (exec, _dir) = test_executor();
+
+        let missing = exec.execute("task", &json!({})).await;
+        assert!(
+            missing.starts_with("Error:")
+                && missing.contains("missing required parameter")
+                && missing.contains("action")
+                && !missing.contains("\"count\""),
+            "server task tool must not default missing action to list: {missing}"
+        );
+
+        let wrong_type = exec.execute("task", &json!({"action": true})).await;
+        assert!(
+            wrong_type.starts_with("Error:")
+                && wrong_type.contains("field 'action'")
+                && wrong_type.contains("string"),
+            "server task tool should reject non-string action: {wrong_type}"
+        );
+
+        let unknown = exec.execute("task", &json!({"action": "complete"})).await;
+        assert!(
+            unknown.starts_with("Error:")
+                && unknown.contains("unknown `task` action")
+                && unknown.contains("update"),
+            "server task tool should mark unknown actions as tool errors: {unknown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_rejects_unknown_server_only_action_fields() {
+        let (exec, _dir) = test_executor();
+
+        let list_user_typo = exec
+            .execute(
+                "task",
+                &json!({"action": "list_user", "user_status": "active", "limit": 10}),
+            )
+            .await;
+        assert!(
+            list_user_typo.starts_with("Error:")
+                && list_user_typo.contains("unknown field")
+                && list_user_typo.contains("limit"),
+            "server list_user should reject unknown fields before returning a filtered list: {list_user_typo}"
+        );
+
+        let update_status_field = exec
+            .execute(
+                "task",
+                &json!({"action": "update", "task_id": "task-1", "status": "paused"}),
+            )
+            .await;
+        assert!(
+            update_status_field.starts_with("Error:")
+                && update_status_field.contains("unknown field")
+                && update_status_field.contains("status")
+                && !update_status_field.contains("new_status, status"),
+            "server task.update must not recognize the old status argument: {update_status_field}"
+        );
+
+        let list_status_field = exec
+            .execute("task", &json!({"action": "list", "status": "active"}))
+            .await;
+        assert!(
+            list_status_field.starts_with("Error:")
+                && list_status_field.contains("unknown field")
+                && list_status_field.contains("status")
+                && !list_status_field.contains("status_filter, status"),
+            "server task.list must not recognize the old status argument: {list_status_field}"
+        );
+
+        let adopt_typo = exec
+            .execute(
+                "task",
+                &json!({
+                    "action": "adopt",
+                    "source_session_id": "source",
+                    "task_id": "task-1",
+                    "copy_edges": true
+                }),
+            )
+            .await;
+        assert!(
+            adopt_typo.starts_with("Error:")
+                && adopt_typo.contains("unknown field")
+                && adopt_typo.contains("copy_edges")
+                && !adopt_typo.contains("todos:execute"),
+            "server adopt should reject typo fields before endpoint routing guidance: {adopt_typo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_routes_list_user_on_server_executor() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let manager_a = TaskManager::new("list-user-a", store.clone());
+        let manager_b = TaskManager::new("list-user-b", store.clone());
+        let manager_c = TaskManager::new("list-user-c", store.clone());
+        manager_a
+            .create(&json!({"title": "active cross-session task"}))
+            .await;
+        manager_b
+            .create(&json!({"title": "completed cross-session task"}))
+            .await;
+        manager_b
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        manager_b
+            .update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        manager_c
+            .create(&json!({"title": "paused cross-session task"}))
+            .await;
+        manager_c
+            .update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_task_store(store);
+
+        let active = exec.execute("task", &json!({"action": "list_user"})).await;
+        assert!(
+            active.contains("\"total\":2")
+                && active.contains("active cross-session task")
+                && active.contains("paused cross-session task"),
+            "list_user should include open tasks across known sessions, including paused: {active}"
+        );
+        assert!(
+            !active.contains("completed cross-session task"),
+            "default list_user view should not include completed tasks: {active}"
+        );
+
+        let completed = exec
+            .execute(
+                "task",
+                &json!({"action": "list_user", "user_status": "completed"}),
+            )
+            .await;
+        assert!(
+            completed.contains("\"total\":1") && completed.contains("completed cross-session task"),
+            "completed list_user view should be status-filtered: {completed}"
+        );
+
+        let typo = exec
+            .execute(
+                "task",
+                &json!({"action": "list_user", "user_status": "cancelledd"}),
+            )
+            .await;
+        assert!(
+            typo.contains("invalid user_status") && typo.contains("cancelled"),
+            "invalid list_user status must not silently return an empty list: {typo}"
+        );
+
+        let wrong_type = exec
+            .execute("task", &json!({"action": "list_user", "user_status": true}))
+            .await;
+        assert!(
+            wrong_type.contains("user_status") && wrong_type.contains("string"),
+            "wrong-type user_status should be actionable: {wrong_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_task_mutation_refuses_when_rollback_snapshot_load_fails() {
+        struct LoadFailMutateWouldSucceedStore {
+            mutate_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl TaskStore for LoadFailMutateWouldSucceedStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Err("simulated task board load failure".to_string())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn mutate(
+                &self,
+                _session_id: &str,
+                mutation: astra_tools::task_mgmt::TaskMutation,
+            ) -> Result<String, String> {
+                self.mutate_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = mutation(Vec::new(), 1)?;
+                Ok(result.response)
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let mutate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn TaskStore> = Arc::new(LoadFailMutateWouldSucceedStore {
+            mutate_calls: Arc::clone(&mutate_calls),
+        });
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_task_store(store);
+
+        let out = exec
+            .execute(
+                "task",
+                &json!({"action": "create", "title": "must not mutate"}),
+            )
+            .await;
+
+        assert!(
+            out.starts_with("Error:")
+                && out.contains("rollback snapshot")
+                && out.contains("simulated task board load failure"),
+            "server task mutation should fail closed when rollback snapshot cannot be captured: {out}"
+        );
+        assert_eq!(
+            mutate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "server task mutation must not run after rollback snapshot capture fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_task_tool_adopt_returns_actionable_server_executor_error() {
+        let (exec, _dir) = test_executor();
+        let out = exec
+            .execute(
+                "task",
+                &json!({
+                    "action": "adopt",
+                    "source_session_id": "source",
+                    "task_id": "task-1"
+                }),
+            )
+            .await;
+        assert!(
+            out.starts_with("Error:") && out.contains("todos:execute"),
+            "adopt must be a known action with an actionable transactional endpoint error: {out}"
+        );
+    }
+
     struct PanicEdgeDispatch;
 
     #[async_trait]
@@ -5086,7 +5546,7 @@ esac
             _request_id: &str,
             _payload_json: &str,
         ) -> Result<i64, String> {
-            panic!("MCP tools must not be routed through edge dispatch");
+            Err("MCP tools must not be routed through edge dispatch".to_string())
         }
 
         async fn poll_pending(
@@ -5094,11 +5554,11 @@ esac
             _user_id: &str,
             _edge_agent_id: &str,
         ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
-            panic!("MCP tools must not poll edge dispatch");
+            Err("MCP tools must not poll edge dispatch".to_string())
         }
 
         async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-            panic!("MCP tools must not mark edge dispatch");
+            Err("MCP tools must not mark edge dispatch".to_string())
         }
 
         async fn deliver_result(
@@ -5107,7 +5567,7 @@ esac
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
-            panic!("MCP tools must not deliver edge dispatch results");
+            Err("MCP tools must not deliver edge dispatch results".to_string())
         }
 
         async fn wait_result(
@@ -5115,11 +5575,11 @@ esac
             _request_id: &str,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
-            panic!("MCP tools must not wait for edge dispatch results");
+            Err("MCP tools must not wait for edge dispatch results".to_string())
         }
 
         async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
-            panic!("MCP tools must not clean edge dispatch");
+            Err("MCP tools must not clean edge dispatch".to_string())
         }
     }
 
@@ -5136,7 +5596,7 @@ esac
             _worktree_path: Option<&str>,
             _capabilities: Option<serde_json::Value>,
         ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
-            panic!("MCP tools must not update edge registry");
+            Err("MCP tools must not update edge registry".to_string())
         }
 
         async fn heartbeat(
@@ -5145,18 +5605,18 @@ esac
             _edge_agent_id: &str,
             _edge_id_header: &str,
         ) -> Result<(), String> {
-            panic!("MCP tools must not heartbeat edge registry");
+            Err("MCP tools must not heartbeat edge registry".to_string())
         }
 
         async fn list_by_user(
             &self,
             _user_id: &str,
         ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
-            panic!("MCP tools must not list edge registry");
+            Err("MCP tools must not list edge registry".to_string())
         }
 
         async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
-            panic!("MCP tools must not unregister edge registry");
+            Err("MCP tools must not unregister edge registry".to_string())
         }
     }
 
@@ -6707,6 +7167,22 @@ esac
         ) -> Result<u64, astra_plan::PlanLoadError> {
             self.inner.abort_open_step_runs(plan_id, subtask_ids).await
         }
+        async fn save_existing_and_abort_open_step_runs(
+            &self,
+            plan_id: &str,
+            state: &mut astra_plan::PlanModeState,
+            expected_version: u64,
+            subtask_ids: &[String],
+        ) -> Result<u64, astra_plan::PlanLoadError> {
+            self.inner
+                .save_existing_and_abort_open_step_runs(
+                    plan_id,
+                    state,
+                    expected_version,
+                    subtask_ids,
+                )
+                .await
+        }
     }
 
     #[tokio::test]
@@ -6749,6 +7225,26 @@ esac
             load_after_first,
             "load() count must not budge on cache hits either"
         );
+    }
+
+    #[test]
+    fn plan_mode_job_guard_blocks_shell_and_kill_but_allows_reads() {
+        assert!(is_plan_mode_blocked_tool(
+            "job",
+            &json!({"action": "shell", "command": "npm run dev"})
+        ));
+        assert!(is_plan_mode_blocked_tool(
+            "job",
+            &json!({"action": "kill", "job_id": "bg-shell-1"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "job",
+            &json!({"action": "output", "job_id": "bg-shell-1"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "job",
+            &json!({"action": "list"})
+        ));
     }
 
     #[tokio::test]
@@ -6942,6 +7438,28 @@ esac
         ) -> Result<u64, astra_plan::PlanLoadError> {
             Ok(0)
         }
+        async fn save_existing_and_abort_open_step_runs(
+            &self,
+            plan_id: &str,
+            state: &mut astra_plan::PlanModeState,
+            expected_version: u64,
+            _subtask_ids: &[String],
+        ) -> Result<u64, astra_plan::PlanLoadError> {
+            let mut guard = self.plan_state.write().await;
+            let actual = match &*guard {
+                Some((stored_plan_id, stored)) if stored_plan_id == plan_id => stored.version,
+                _ => return Err(astra_plan::PlanLoadError::conflict(expected_version, 0)),
+            };
+            if actual != expected_version {
+                return Err(astra_plan::PlanLoadError::conflict(
+                    expected_version,
+                    actual,
+                ));
+            }
+            state.version = actual + 1;
+            *guard = Some((plan_id.to_string(), state.clone()));
+            Ok(0)
+        }
     }
 
     /// Core plan-mode write guard contract: bash is blocked while a plan is
@@ -6991,117 +7509,29 @@ esac
             "write_file must be blocked during authoring, got: {result}"
         );
 
-        // ── Phase 2: exit_plan_mode(approved=true) unblocks ──────────────
-        // Phase 2 split (2026-05): plan-mode actions promoted from
-        // `session` sub-actions to top-level `enter_plan_mode` /
-        // `exit_plan_mode` tools (claudecode parity). The legacy
-        // session.exit_plan path now returns an Error: redirect, so
-        // this test calls the new top-level surface directly.
+        // ── Phase 2: model-supplied approval must not unblock ────────────
+        // The model may submit a plan, but it cannot approve its own plan.
+        // Write unlock is owned by the trusted UI/control plane.
         let exit_result = exec
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            exit_result.contains("unlocked"),
-            "exit_plan_mode must confirm write tools are unlocked, got: {exit_result}"
+            exit_result.contains("submitted for trusted user approval"),
+            "exit_plan_mode must submit, not self-approve, got: {exit_result}"
         );
 
-        // bash now succeeds (or at least isn't blocked by the guard).
+        // bash remains blocked until a trusted approval clears active_plan_id.
         let result = exec
             .execute("bash", &json!({"command": "echo hello"}))
             .await;
         assert!(
-            !result.contains("blocked while plan mode is active"),
-            "bash must NOT be blocked after exit_plan_mode, got: {result}"
+            result.contains("blocked while plan mode is active"),
+            "bash must remain blocked after model-supplied exit_plan_mode, got: {result}"
         );
     }
 
-    /// Phase 2.4: when the model approves a plan via `exit_plan_mode`,
-    /// the server must seed `session_plan_todos` with one row per
-    /// subtask so the next turn can execute step-by-step without the
-    /// model manually re-creating each item via `task.create`. This
-    /// test drives the seed-shape contract: each subtask becomes one
-    /// todo with the right title, depth, plan_id, session_id, user_id.
-    /// The actual SQL goes through a `PlanTodoSink` trait so we can
-    /// observe the seed without standing up a real MatrixOne.
     #[tokio::test]
-    async fn exit_plan_mode_approved_seeds_session_plan_todos() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-
-        // Plan with 3 subtasks — typical "split into steps" output.
-        let mut state =
-            astra_plan::PlanModeState::new_with_owner("ship feature X".into(), "alice".into());
-        for (i, title) in ["wire schema", "implement handler", "write tests"]
-            .iter()
-            .enumerate()
-        {
-            state
-                .plan
-                .subtasks
-                .push(astra_services::task_orchestrator::SubtaskPlan {
-                    id: format!("s{}", i + 1),
-                    title: (*title).into(),
-                    status: astra_services::task_orchestrator::TaskStatus::Pending,
-                    ..Default::default()
-                });
-        }
-        repo.save("plan-seed-test", &mut state, None).await.unwrap();
-        repo.set_active_plan("seed-session", Some("plan-seed-test"))
-            .await
-            .unwrap();
-
-        // In-memory sink captures what the seed step would have written.
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
-        // The executor under test was constructed via `test_executor`,
-        // which uses a default session_id. Override so the seeded
-        // session matches the active plan's pin.
-        exec.session_id = "seed-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
-        );
-
-        let captured = sink.captured();
-        assert_eq!(
-            captured.len(),
-            3,
-            "must seed exactly one todo per subtask. Got {} todos: {captured:?}",
-            captured.len()
-        );
-
-        // Verify shape — order, titles, ownership.
-        for (i, expected_title) in ["wire schema", "implement handler", "write tests"]
-            .iter()
-            .enumerate()
-        {
-            assert_eq!(
-                captured[i].title, *expected_title,
-                "subtask order must be preserved so `depends_on` chains stay valid"
-            );
-            assert_eq!(
-                captured[i].plan_id, "plan-seed-test",
-                "every seeded todo must reference the source plan"
-            );
-            assert_eq!(
-                captured[i].session_id, "seed-session",
-                "every seeded todo must be scoped to the active session"
-            );
-            assert_eq!(
-                captured[i].user_id, "alice",
-                "every seeded todo must inherit the plan owner so isolation holds"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_approved_mirrors_plan_into_user_visible_task_tree() {
+    async fn exit_plan_mode_approved_mirrors_plan_into_user_visible_step_tasks() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -7141,42 +7571,204 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
-        let tasks = exec.task_manager.snapshot().await;
-        let plan_task = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .expect("approved plan must be mirrored into the user-visible task board");
-        assert_eq!(plan_task.title, "ship user-visible plan");
-        assert_eq!(
-            plan_task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert_eq!(plan_task.subtasks.len(), 3);
-        assert_eq!(plan_task.subtasks[0].id, "step-1");
-        assert_eq!(plan_task.subtasks[0].title, "design state model");
+        let tasks = exec.task_manager.snapshot().await.unwrap();
         assert!(
-            plan_task.subtasks.iter().all(|subtask| {
-                subtask.status == astra_tools::task_mgmt::SessionTaskStatusKind::Pending
-            }),
-            "newly approved plan steps should start pending: {plan_task:?}"
+            tasks.is_empty(),
+            "model-submitted exit_plan_mode must not mirror approved-plan tasks locally: {tasks:?}"
+        );
+        let active = repo
+            .active_plan_for_session("visible-session")
+            .await
+            .expect("active plan lookup after submission");
+        assert!(
+            active.as_deref() == Some("plan-visible-task"),
+            "trusted approval is still pending, so the session must remain in plan mode: {active:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_rolls_back_partial_task_board_mirror_failure() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "rollback server plan".into(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "create first server step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-2".into(),
+                title: "x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-rollback-task-board", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("rollback-session", Some("plan-rollback-task-board"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "rollback-session".to_string();
+        exec.user_id = "alice".to_string();
+        let existing = exec
+            .task_manager
+            .create(&json!({
+                "title": "Existing server task",
+            }))
+            .await;
+        assert!(!existing.starts_with("Error:"), "{existing}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode should submit for trusted approval instead of mirroring immediately: {result}"
+        );
+
+        let tasks = exec.task_manager.snapshot().await.unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "model-submitted exit_plan_mode must leave the task board untouched while approval is pending: {tasks:?}"
+        );
+        assert!(
+            tasks.iter().any(|t| t.title == "Existing server task"),
+            "existing server task must remain untouched: {tasks:?}"
+        );
+        let active = repo
+            .active_plan_for_session("rollback-session")
+            .await
+            .expect("active plan lookup after submission");
+        assert_eq!(
+            active.as_deref(),
+            Some("plan-rollback-task-board"),
+            "trusted approval is still pending, so the session must stay in plan mode: {active:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_fails_closed_when_task_board_reload_fails_after_snapshot() {
+        struct SnapshotThenLoadFailStore {
+            load_calls: Arc<std::sync::atomic::AtomicUsize>,
+            mutate_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl TaskStore for SnapshotThenLoadFailStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                let call = self
+                    .load_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    Ok(Vec::new())
+                } else {
+                    Err("simulated task board reload failure".to_string())
+                }
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn mutate(
+                &self,
+                _session_id: &str,
+                mutation: astra_tools::task_mgmt::TaskMutation,
+            ) -> Result<String, String> {
+                self.mutate_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = mutation(Vec::new(), 1)?;
+                Ok(result.response)
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "reload failing server plan".into(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "should not be created".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-reload-fails", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("reload-fails-session", Some("plan-reload-fails"))
+            .await
+            .unwrap();
+
+        let load_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn TaskStore> = Arc::new(SnapshotThenLoadFailStore {
+            load_calls: Arc::clone(&load_calls),
+            mutate_calls: Arc::clone(&mutate_calls),
+        });
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec = exec.with_task_store(store);
+        exec.session_id = "reload-fails-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode must submit for trusted approval instead of touching the task board: {result}"
         );
         assert_eq!(
-            plan_task
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("plan-visible-task")
+            mutate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "model-submitted exit_plan_mode must not mutate the task board before trusted approval"
+        );
+        assert_eq!(
+            load_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "model-submitted exit_plan_mode must not even read the task board before trusted approval"
+        );
+        let active = repo
+            .active_plan_for_session("reload-fails-session")
+            .await
+            .expect("active plan lookup after submission");
+        assert_eq!(
+            active.as_deref(),
+            Some("plan-reload-fails"),
+            "trusted approval is still pending, so the session must stay in plan mode: {active:?}"
         );
     }
 
@@ -7214,7 +7806,7 @@ esac
                 "title": "ship user-visible plan",
                 "owner": "subagent-1",
                 "metadata": {
-                    "source": "agent_job",
+                    "source": "background_job",
                     "agent_id": "subagent-1"
                 }
             }))
@@ -7225,41 +7817,34 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
-        let tasks = exec.task_manager.snapshot().await;
+        let tasks = exec.task_manager.snapshot().await.unwrap();
         assert!(
             tasks.iter().any(|task| {
                 task.metadata
                     .as_ref()
                     .and_then(|metadata| metadata.get("source"))
                     .and_then(serde_json::Value::as_str)
-                    == Some("agent_job")
+                    == Some("background_job")
             }),
             "pre-existing async/subagent task must remain visible"
         );
         assert!(
-            tasks.iter().any(|task| {
+            tasks.iter().all(|task| {
                 task.metadata
                     .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("plan-title-collision")
+                    .and_then(|metadata| metadata.get("plan_id"))
+                    .is_none()
             }),
-            "approved plan must still create its own task tree despite title collision: {tasks:?}"
+            "model-submitted exit_plan_mode must not create or claim approved-plan tasks before trusted approval: {tasks:?}"
         );
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_reuses_cli_style_plan_tree_with_matching_fingerprint() {
+    async fn exit_plan_mode_approved_does_not_reuse_legacy_cli_style_plan_tree() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -7306,14 +7891,15 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -7326,20 +7912,201 @@ esac
         assert_eq!(
             approved_plan_tasks.len(),
             1,
-            "server path should reuse CLI-style mirrored tree instead of duplicating it: {approved_plan_tasks:?}"
+            "model-submitted exit_plan_mode must not create a new approved-plan step task before trusted approval: {approved_plan_tasks:?}"
         );
-        assert_eq!(
-            approved_plan_tasks[0]
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_fingerprint"))
-                .and_then(serde_json::Value::as_str),
-            Some(fingerprint.as_str())
+        assert!(
+            approved_plan_tasks
+                .iter()
+                .all(|task| task.subtasks.len() == 1),
+            "legacy tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
         );
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_stale_server_tree_when_fingerprint_changes() {
+    async fn exit_plan_mode_approved_does_not_reopen_completed_plan_history() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("repeat server plan".into(), "alice".into());
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "repeatable server step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-repeat-server", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "repeat-server-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let existing = exec
+            .task_manager
+            .create(&json!({
+                "title": "repeatable server step",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-repeat-server",
+                    "plan_goal": "repeat server plan",
+                    "plan_subtask_id": "step-1",
+                    "plan_fingerprint": ServerToolExecutor::plan_task_board_fingerprint(&state.plan)
+                }
+            }))
+            .await;
+        assert!(existing.contains("created"), "{existing}");
+        let started = exec
+            .task_manager
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
+        let completed = exec
+            .task_manager
+            .update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("submitted for trusted user approval"),
+            "first submission must stay pending for trusted approval; got: {result}"
+        );
+
+        repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
+            .await
+            .unwrap();
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("submitted for trusted user approval"),
+            "repeat submission must stay pending for trusted approval; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            1,
+            "model-submitted exit_plan_mode must not reopen completed approved-plan history before trusted approval: {approved_plan_tasks:?}"
+        );
+        assert!(
+            approved_plan_tasks
+                .iter()
+                .any(|task| task.status.is_completed()),
+            "completed history should remain completed: {approved_plan_tasks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_reuse_cli_style_tree_for_different_goal() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("new visible goal".into(), "alice".into());
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "shared step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-new-visible-goal", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("different-goal-session", Some("plan-new-visible-goal"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "different-goal-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let old_cli_style = exec
+            .task_manager
+            .create(&json!({
+                "title": "old visible goal",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_goal": "old visible goal",
+                    "plan_fingerprint": fingerprint
+                },
+                "subtasks": [
+                    { "id": "step-1", "title": "shared step" }
+                ]
+            }))
+            .await;
+        assert!(old_cli_style.contains("created"), "{old_cli_style}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            1,
+            "model-submitted exit_plan_mode must not create new approved-plan step tasks before trusted approval: {approved_plan_tasks:?}"
+        );
+        let old_task = approved_plan_tasks
+            .iter()
+            .find(|task| task.title == "old visible goal")
+            .expect("old CLI-style task remains distinct");
+        assert!(
+            old_task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_id"))
+                .is_none(),
+            "old different-goal task must not be claimed by the new plan: {old_task:?}"
+        );
+        assert_eq!(old_task.subtasks.len(), 1, "{old_task:?}");
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_reuse_stale_server_history_when_fingerprint_changes()
+    {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -7360,7 +8127,7 @@ esac
             .unwrap();
 
         state.plan.subtasks[0].title = "new task board sync".into();
-        let fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let _fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
         repo.save("plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
@@ -7393,14 +8160,15 @@ esac
             .execute("exit_plan_mode", &json!({"approved": true}))
             .await;
         assert!(
-            result.contains("unlocked"),
-            "exit_plan_mode approved must announce unlock; got: {result}"
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
         );
 
         let approved_plan_tasks: Vec<_> = exec
             .task_manager
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter(|task| {
                 task.metadata
@@ -7412,28 +8180,8 @@ esac
             .collect();
         assert_eq!(
             approved_plan_tasks.len(),
-            2,
-            "a changed plan fingerprint must create a fresh mirrored tree instead of reusing stale steps: {approved_plan_tasks:?}"
-        );
-        assert!(
-            approved_plan_tasks.iter().any(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("plan-same-id-new-steps")
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("plan_fingerprint"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(fresh_fingerprint.as_str())
-                    && task
-                        .subtasks
-                        .iter()
-                        .any(|subtask| subtask.title == "new task board sync")
-            }),
-            "fresh mirrored tree missing after plan edit: {approved_plan_tasks:?}"
+            1,
+            "model-submitted exit_plan_mode must not create fresh approved-plan tasks before trusted approval: {approved_plan_tasks:?}"
         );
         assert!(
             approved_plan_tasks.iter().any(|task| {
@@ -7447,15 +8195,127 @@ esac
                         .iter()
                         .any(|subtask| subtask.title == "old task board sync")
             }),
-            "stale tree should remain distinct rather than being silently mutated: {approved_plan_tasks:?}"
+            "stale tree-shaped history should remain distinct rather than being silently mutated: {approved_plan_tasks:?}"
         );
     }
 
-    /// Rejected plans must NOT seed todos — the plan is still being
-    /// authored. Idempotency: re-exiting an already-rejected plan
-    /// also must not write.
     #[tokio::test]
-    async fn exit_plan_mode_rejected_does_not_seed_todos() {
+    async fn exit_plan_mode_approved_does_not_reuse_stale_server_history_when_dependencies_change()
+    {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "ship dependency-aware plan".into(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "build core".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-2".into(),
+                title: "verify core".into(),
+                depends_on: vec!["step-1".into()],
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        let stale_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        repo.save("plan-same-id-new-deps", &mut state, None)
+            .await
+            .unwrap();
+
+        state.plan.subtasks[1].depends_on.clear();
+        let fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        assert_ne!(
+            stale_fingerprint, fresh_fingerprint,
+            "dependency changes must affect task-board fingerprint"
+        );
+        repo.save("plan-same-id-new-deps", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("same-deps-session", Some("plan-same-id-new-deps"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "same-deps-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let stale_tree = exec
+            .task_manager
+            .create(&json!({
+                "title": "ship dependency-aware plan",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-same-id-new-deps",
+                    "plan_fingerprint": stale_fingerprint,
+                },
+                "subtasks": [
+                    { "id": "step-1", "title": "build core" },
+                    { "id": "step-2", "title": "verify core", "depends_on": ["step-1"] }
+                ]
+            }))
+            .await;
+        assert!(stale_tree.contains("created"), "{stale_tree}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("submitted for trusted user approval"),
+            "exit_plan_mode approved must submit for trusted approval; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            1,
+            "model-submitted exit_plan_mode must not create fresh step tasks before trusted approval: {approved_plan_tasks:?}"
+        );
+        let verify = approved_plan_tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_fingerprint"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(stale_fingerprint.as_str())
+            })
+            .expect("stale legacy task remains");
+        assert!(
+            verify
+                .subtasks
+                .iter()
+                .any(|subtask| subtask.depends_on.iter().any(|dep| dep == "step-1")),
+            "stale dependency-bearing history should remain untouched while approval is pending: {verify:?}"
+        );
+    }
+
+    /// Rejected plans must NOT create user-visible task-board work:
+    /// the plan is still being authored.
+    #[tokio::test]
+    async fn exit_plan_mode_rejected_does_not_create_task_board_work() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state =
             astra_plan::PlanModeState::new_with_owner("still drafting".into(), "alice".into());
@@ -7475,10 +8335,8 @@ esac
             .await
             .unwrap();
 
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
         exec.session_id = "reject-session".to_string();
         exec.user_id = "alice".to_string();
 
@@ -7487,19 +8345,15 @@ esac
             .await;
 
         assert!(
-            sink.captured().is_empty(),
-            "rejected plan must not seed todos — the plan is still authoring. \
-             Got: {:?}",
-            sink.captured()
+            exec.task_manager.snapshot().await.unwrap().is_empty(),
+            "rejected plan must not create task-board work while still authoring"
         );
     }
 
-    /// Empty-plan defense: if the model approves a plan with no
-    /// subtasks, the seed step is a no-op. Without this defense, a
-    /// 0-row INSERT would still hit the DB and waste a round-trip;
-    /// worse, it could mask a "plan not generated" bug.
+    /// Empty-plan defense: approving a plan with no subtasks should
+    /// unlock writes without creating an empty task-board shell.
     #[tokio::test]
-    async fn exit_plan_mode_with_empty_plan_seeds_nothing() {
+    async fn exit_plan_mode_with_empty_plan_creates_no_task_board_work() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state =
             astra_plan::PlanModeState::new_with_owner("empty plan".into(), "alice".into());
@@ -7510,10 +8364,8 @@ esac
             .await
             .unwrap();
 
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
         exec.session_id = "empty-session".to_string();
         exec.user_id = "alice".to_string();
 
@@ -7522,128 +8374,32 @@ esac
             .await;
 
         assert!(
-            sink.captured().is_empty(),
-            "empty plan approval must not seed anything"
+            exec.task_manager.snapshot().await.unwrap().is_empty(),
+            "empty plan approval must not create task-board work"
         );
     }
 
-    /// Test sink that captures seed + supersede calls instead of
-    /// hitting the DB. The supersede capture lets U-6 tests verify
-    /// the call shape (session_id, keep_plan_id) without standing
-    /// up MatrixOne.
-    #[derive(Debug, Default)]
-    struct InMemoryPlanTodoSink {
-        captured: tokio::sync::Mutex<Vec<astra_services::PlanTodoSeed>>,
-        supersede_calls: tokio::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    impl InMemoryPlanTodoSink {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        fn captured(&self) -> Vec<astra_services::PlanTodoSeed> {
-            self.captured.try_lock().expect("sink contention").clone()
-        }
-
-        fn supersede_log(&self) -> Vec<(String, String)> {
-            self.supersede_calls
-                .try_lock()
-                .expect("sink contention")
-                .clone()
-        }
-    }
-
-    #[async_trait]
-    impl astra_services::PlanTodoSink for InMemoryPlanTodoSink {
-        async fn seed(&self, todos: Vec<astra_services::PlanTodoSeed>) -> Result<(), String> {
-            self.captured.lock().await.extend(todos);
-            Ok(())
-        }
-
-        async fn supersede_other_plans(
-            &self,
-            session_id: &str,
-            keep_plan_id: &str,
-        ) -> Result<u64, String> {
-            self.supersede_calls
-                .lock()
-                .await
-                .push((session_id.to_string(), keep_plan_id.to_string()));
-            // Tests don't simulate prior rows; return 0 affected.
-            Ok(0)
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct FailingPlanTodoSink {
-        fail_seed: bool,
-        fail_supersede: bool,
-    }
-
-    #[async_trait]
-    impl astra_services::PlanTodoSink for FailingPlanTodoSink {
-        async fn seed(&self, _todos: Vec<astra_services::PlanTodoSeed>) -> Result<(), String> {
-            if self.fail_seed {
-                Err("synthetic seed failure".to_string())
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn supersede_other_plans(
-            &self,
-            _session_id: &str,
-            _keep_plan_id: &str,
-        ) -> Result<u64, String> {
-            if self.fail_supersede {
-                Err("synthetic supersede failure".to_string())
-            } else {
-                Ok(0)
-            }
-        }
-    }
-
-    /// U-6 (unhappy path): when the user re-enters plan mode with a
-    /// new plan, the prior plan's seeded `session_plan_todos` rows
-    /// must be marked `superseded` so `task.list` doesn't show
-    /// stale items mixed with the new plan's seeds. We can't observe
-    /// the SQL effect from a unit test (no MO), but we CAN observe
-    /// the sink call shape — pre-fix the sink was never called from
-    /// `tool_enter_plan_mode` at all.
     #[tokio::test]
-    async fn enter_plan_mode_supersedes_prior_plans_seeded_todos() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let sink = Arc::new(InMemoryPlanTodoSink::new());
-
+    async fn enter_plan_mode_without_goal_uses_default_label_on_server() {
+        let repo = Arc::new(astra_plan::InMemoryPlanRepository::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink.clone() as Arc<dyn astra_services::PlanTodoSink>);
-        exec.session_id = "supersede-session".to_string();
+        exec.session_id = "server-empty-goal-session".to_string();
         exec.user_id = "alice".to_string();
 
-        let result = exec
-            .execute("enter_plan_mode", &json!({"goal": "ship feature X"}))
-            .await;
-        assert!(
-            !result.starts_with("Error"),
-            "enter_plan_mode must succeed; got: {result}"
-        );
+        let result = exec.execute("enter_plan_mode", &json!({})).await;
 
-        // The supersede call must have fired with the just-created
-        // plan_id — that pin ensures the prior plan's rows (if any)
-        // get superseded but the current plan's seeds will not.
-        let log = sink.supersede_log();
-        assert_eq!(
-            log.len(),
-            1,
-            "enter_plan_mode must call supersede_other_plans exactly once; got {log:?}"
-        );
-        let (sid, keep_id) = &log[0];
-        assert_eq!(sid, "supersede-session");
         assert!(
-            !keep_id.is_empty(),
-            "keep_plan_id must be the new plan's id, not empty"
+            result.contains("goal=\"(pending)\""),
+            "empty enter_plan_mode args should use the same default goal label as CLI: {result}"
+        );
+        let active = repo
+            .active_plan_for_session("server-empty-goal-session")
+            .await
+            .expect("active plan lookup");
+        assert!(
+            active.is_some(),
+            "enter_plan_mode should pin an active plan"
         );
     }
 
@@ -7734,77 +8490,6 @@ esac
         );
     }
 
-    #[tokio::test]
-    async fn exit_plan_mode_seed_failure_is_non_fatal_and_unlocks_writes() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state =
-            astra_plan::PlanModeState::new_with_owner("seed failure plan".into(), "alice".into());
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "s1".into(),
-                title: "step 1".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        repo.save("plan-seed-fail-test", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan("seed-fail-session", Some("plan-seed-fail-test"))
-            .await
-            .unwrap();
-
-        let sink = Arc::new(FailingPlanTodoSink {
-            fail_seed: true,
-            fail_supersede: false,
-        });
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink as Arc<dyn astra_services::PlanTodoSink>);
-        exec.session_id = "seed-fail-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let exit = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            exit.contains("unlocked"),
-            "seed failure must not roll back approval, got: {exit}"
-        );
-
-        let bash = exec
-            .execute("bash", &json!({"command": "echo hello"}))
-            .await;
-        assert!(
-            !bash.contains("blocked while plan mode is active"),
-            "writes should still unlock even when seeding fails, got: {bash}"
-        );
-    }
-
-    #[tokio::test]
-    async fn enter_plan_mode_supersede_failure_is_non_fatal() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let sink = Arc::new(FailingPlanTodoSink {
-            fail_seed: false,
-            fail_supersede: true,
-        });
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
-        exec.set_plan_todo_sink(sink as Arc<dyn astra_services::PlanTodoSink>);
-        exec.session_id = "supersede-fail-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let result = exec
-            .execute("enter_plan_mode", &json!({"goal": "ship feature Y"}))
-            .await;
-        assert!(
-            result.contains("Entered plan mode"),
-            "supersede failure must not abort plan entry, got: {result}"
-        );
-    }
-
     // ── C-SRV-1 regression: task_output_success policy ────────────────
     //
     // Pre-fix returned `false` when the output had no `{`, silently
@@ -7865,6 +8550,8 @@ esac
             TaskManagerSnapshot {
                 tasks: vec![],
                 next_task_id: 1,
+                version: 0,
+                restore_version: None,
             },
             "seed",
         );
@@ -7898,6 +8585,8 @@ esac
             TaskManagerSnapshot {
                 tasks: vec![],
                 next_task_id: 1,
+                version: 0,
+                restore_version: None,
             },
             "task-seed",
         );

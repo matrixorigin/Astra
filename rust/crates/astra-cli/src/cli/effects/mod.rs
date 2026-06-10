@@ -131,6 +131,23 @@ pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char,
 /// Standard icon for running operations (tool calls, system states).
 pub const ICON_RUNNING: &str = "○";
 
+/// Truncate a label string, adding ellipsis if it exceeds max_chars.
+pub(crate) fn truncate_label(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let t = s.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    format!(
+        "{}…",
+        t.chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+    )
+}
+
 /// Which kind of spinner is shown in the single "thinking" stderr slot.
 pub enum ThinkingSpinnerKind {
     /// Classic prefix+braille spinner (e.g., "  Thinking ⣾").

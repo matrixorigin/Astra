@@ -68,64 +68,6 @@ pub(crate) fn resolve_theme_by_name(name: &str) -> Option<Theme> {
     None
 }
 
-#[allow(dead_code)]
-pub(crate) fn set_theme_override(
-    name: Option<String>,
-    astra_home: Option<PathBuf>,
-) -> Option<String> {
-    let _ = ASTRA_HOME.set(astra_home);
-    let resolved = name.as_ref().and_then(|n| resolve_theme_by_name(n));
-    let accepted = if resolved.is_some() { name } else { None };
-    let _ = THEME_OVERRIDE.set(accepted.clone());
-    accepted
-}
-
-#[allow(dead_code)]
-pub(crate) fn set_syntax_theme(theme: Theme) {
-    if let Ok(mut t) = current_theme().write() {
-        *t = theme;
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn current_syntax_theme() -> Theme {
-    current_theme()
-        .read()
-        .map(|t| t.clone())
-        .unwrap_or_default()
-}
-
-#[allow(dead_code)]
-pub(crate) fn configured_theme_name() -> Option<String> {
-    THEME_OVERRIDE.get().and_then(|o| o.clone())
-}
-
-#[allow(dead_code)]
-pub(crate) fn list_available_themes(astra_home: Option<&PathBuf>) -> Vec<String> {
-    let mut names: Vec<String> = EmbeddedLazyThemeSet::theme_names()
-        .iter()
-        .map(|t| t.as_name().to_string())
-        .collect();
-    if let Some(home) = astra_home {
-        let themes_dir = home.join("themes");
-        if themes_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "tmTheme") {
-                        if let Some(stem) = path.file_stem() {
-                            names.push(stem.to_string_lossy().into_owned());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
 fn exceeds_highlight_limits(total_bytes: usize, total_lines: usize) -> bool {
     total_bytes > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES
 }
@@ -226,9 +168,4 @@ pub(crate) fn highlight_code_to_lines(code: &str, lang: &str) -> Vec<Line<'stati
             }
         })
         .collect()
-}
-
-#[allow(dead_code)]
-pub(crate) fn highlight_bash_to_lines(script: &str) -> Vec<Line<'static>> {
-    highlight_code_to_lines(script, "bash")
 }

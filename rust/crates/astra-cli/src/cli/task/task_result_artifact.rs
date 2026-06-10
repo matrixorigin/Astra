@@ -45,7 +45,7 @@ pub(crate) fn task_output_path(task_id: &str) -> Result<PathBuf, String> {
 
 pub(crate) fn write_task_output(task_id: &str, text: &str) -> Result<PathBuf, String> {
     let dir = task_output_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create task output dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create job output dir: {e}"))?;
     let path = dir.join(format!("{task_id}.output"));
     #[cfg(unix)]
     {
@@ -57,10 +57,10 @@ pub(crate) fn write_task_output(task_id: &str, text: &str) -> Result<PathBuf, St
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|e| format!("open task output: {e}"))?;
+            .map_err(|e| format!("open job output: {e}"))?;
         use std::io::Write as _;
         file.write_all(text.as_bytes())
-            .map_err(|e| format!("write task output: {e}"))?;
+            .map_err(|e| format!("write job output: {e}"))?;
     }
     #[cfg(not(unix))]
     {
@@ -69,10 +69,10 @@ pub(crate) fn write_task_output(task_id: &str, text: &str) -> Result<PathBuf, St
             .truncate(true)
             .write(true)
             .open(&path)
-            .map_err(|e| format!("open task output: {e}"))?;
+            .map_err(|e| format!("open job output: {e}"))?;
         use std::io::Write as _;
         file.write_all(text.as_bytes())
-            .map_err(|e| format!("write task output: {e}"))?;
+            .map_err(|e| format!("write job output: {e}"))?;
     }
     Ok(path)
 }
@@ -126,7 +126,7 @@ pub(crate) fn load_task_result_artifact(
         })),
         Ok(_) => Ok(None),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("read task output: {error}")),
+        Err(error) => Err(format!("read job output: {error}")),
     }
 }
 
@@ -240,7 +240,7 @@ mod tests {
             std::fs::create_dir_all(&path).unwrap();
 
             let err = load_task_result_artifact(&base_task()).unwrap_err();
-            assert!(err.contains("read task output"));
+            assert!(err.contains("read job output"));
         });
     }
 

@@ -19,8 +19,6 @@ pub(crate) struct PartialTurnData {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub tool_calls_count: u32,
-    #[allow(dead_code)]
-    pub tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,

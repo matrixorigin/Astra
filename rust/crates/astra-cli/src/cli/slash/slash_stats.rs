@@ -7,7 +7,6 @@ use crossterm::style::Stylize;
 /// Retention: fallback handler for `/stats` — called from slash_router.rs.
 /// In TUI mode this is shadowed by the native stats views.
 /// Kept for headless / non-interactive execution paths.
-#[allow(dead_code)]
 pub(crate) async fn handle_stats_command(arg: &str, state: &SessionState) {
     use astra_services::session_analytics;
 

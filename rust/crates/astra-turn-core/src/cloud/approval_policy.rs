@@ -660,22 +660,22 @@ mod tests {
     }
 
     #[test]
-    fn task_background_shell_is_execute_gated_with_args() {
+    fn job_shell_is_execute_gated_with_args() {
         let args = serde_json::json!({
-            "action": "background_shell",
+            "action": "shell",
             "command": "npm run dev"
         });
         assert_eq!(
-            cloud_gated_tool_kind_with_args("task", Some(&args)),
+            cloud_gated_tool_kind_with_args("job", Some(&args)),
             Some(CloudGatedToolKind::Execute)
         );
 
         let read_only = serde_json::json!({
-            "action": "background_shell",
+            "action": "shell",
             "command": "git status"
         });
         assert_eq!(
-            cloud_gated_tool_kind_with_args("task", Some(&read_only)),
+            cloud_gated_tool_kind_with_args("job", Some(&read_only)),
             None
         );
     }

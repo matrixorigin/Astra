@@ -2453,10 +2453,10 @@ pub async fn ensure_core_schema(
             active_form VARCHAR(512) NULL,
             status VARCHAR(16) NOT NULL,
             owner VARCHAR(128) NULL,
-            metadata JSON NULL,
-            blocks JSON NULL,
-            blocked_by JSON NULL,
-            subtasks JSON NULL,
+            metadata LONGTEXT NULL,
+            blocks LONGTEXT NULL,
+            blocked_by LONGTEXT NULL,
+            subtasks LONGTEXT NULL,
             archived_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL,
             updated_at DATETIME(6) NOT NULL,
@@ -3258,6 +3258,45 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
             "DROP TABLE IF EXISTS eval_llm_feedback",
             "DROP TABLE IF EXISTS user_preference_history",
         ],
+    )
+    .await?;
+
+    run_migration_batch(
+        pool,
+        16,
+        "store session_todos structured fields as LONGTEXT for MatrixOne parameter writes",
+        &[
+            "ALTER TABLE session_todos MODIFY COLUMN metadata LONGTEXT NULL",
+            "ALTER TABLE session_todos MODIFY COLUMN blocks LONGTEXT NULL",
+            "ALTER TABLE session_todos MODIFY COLUMN blocked_by LONGTEXT NULL",
+            "ALTER TABLE session_todos MODIFY COLUMN subtasks LONGTEXT NULL",
+        ],
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        17,
+        "add session_todo_counters.version for task-board CAS rollback",
+        "ALTER TABLE session_todo_counters ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        18,
+        "create session_todo_idempotency ledger",
+        "CREATE TABLE session_todo_idempotency (
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            action VARCHAR(32) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            args_json LONGTEXT NOT NULL,
+            output LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL,
+            updated_at DATETIME(6) NOT NULL,
+            PRIMARY KEY (session_id, user_id, action, idempotency_key)
+        )",
     )
     .await?;
 

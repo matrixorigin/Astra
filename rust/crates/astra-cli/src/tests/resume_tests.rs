@@ -1,12 +1,9 @@
-use super::{chat_stream_tests::sse_text_response, spawn_mock};
-use crate::cli::cli_config::cli_utils::prefix_chars;
+use super::chat_stream_tests::sse_text_response;
+use super::*;
 use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
 use crate::cli::session::session_runtime;
-use crate::cli::slash::slash_task;
 use crate::cli::turn::turn_entry::{TurnContext, handle_chat_input};
-use crate::tests::isolate_credentials;
-use astra_services::session_journal;
-use axum::{Router, response::IntoResponse, routing::post};
+use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn env_lock() -> &'static Mutex<()> {
@@ -49,110 +46,31 @@ impl Drop for EnvVarGuard {
     }
 }
 
-// ── slash_task::find_task_by_query ────────────────────────────────────────────────────
+// ── slash_task::find_task_by_query ─────────────────────────────────────────
 
 use astra_services::TaskService as _;
 
-const REAL_SESSION_1D21375_FIXTURE: &str =
-    include_str!("../../../services/fixtures/real_session_1d21375_min.jsonl");
-
 #[tokio::test]
-async fn find_task_by_id_prefix() {
+async fn find_task_by_query_scenarios() {
+    use crate::cli::cli_config::cli_utils::prefix_chars;
+
     let tmp = tempfile::TempDir::new().unwrap();
     let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-    let tid = svc
+
+    // Create first task for ID/prefix/title tests
+    let tid_a = svc
         .create_task(
             "u1",
             "s1",
             astra_services::TaskCreateRequest {
-                title: "Build auth".into(),
+                title: "Refactor authentication module".into(),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
 
-    // Full ID match
-    let found = slash_task::find_task_by_query(&svc, "u1", &tid)
-        .await
-        .unwrap();
-    assert_eq!(found, Some(tid.clone()));
-
-    // Prefix match (first 8 Unicode scalars)
-    let prefix = prefix_chars(&tid, 8);
-    let found = slash_task::find_task_by_query(&svc, "u1", &prefix)
-        .await
-        .unwrap();
-    assert_eq!(found, Some(tid));
-}
-
-#[tokio::test]
-async fn find_task_by_title_substring() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-    svc.create_task(
-        "u1",
-        "s1",
-        astra_services::TaskCreateRequest {
-            title: "Refactor authentication module".into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    // Case-insensitive title match
-    let found = slash_task::find_task_by_query(&svc, "u1", "authentication")
-        .await
-        .unwrap();
-    assert!(found.is_some());
-
-    let found = slash_task::find_task_by_query(&svc, "u1", "AUTH")
-        .await
-        .unwrap();
-    assert!(found.is_some());
-}
-
-#[tokio::test]
-async fn find_task_by_title_substring_fails_on_ambiguity() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-    for title in [
-        "Refactor authentication module",
-        "Refactor authentication tests",
-    ] {
-        svc.create_task(
-            "u1",
-            "s1",
-            astra_services::TaskCreateRequest {
-                title: title.into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    let err = slash_task::find_task_by_query(&svc, "u1", "authentication")
-        .await
-        .unwrap_err();
-    assert!(err.contains("task query 'authentication' is ambiguous"));
-}
-
-#[tokio::test]
-async fn find_task_not_found() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-    let found = slash_task::find_task_by_query(&svc, "u1", "nonexistent")
-        .await
-        .unwrap();
-    assert!(found.is_none());
-}
-
-#[tokio::test]
-async fn find_task_wrong_user() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+    // Create other user's task for isolation test
     svc.create_task(
         "user-a",
         "s1",
@@ -164,14 +82,60 @@ async fn find_task_wrong_user() {
     .await
     .unwrap();
 
-    // Different user can't find it
+    // ID prefix match
+    let found = slash_task::find_task_by_query(&svc, "u1", &tid_a)
+        .await
+        .unwrap();
+    assert_eq!(found, Some(tid_a.clone()));
+
+    let prefix = prefix_chars(&tid_a, 8);
+    let found = slash_task::find_task_by_query(&svc, "u1", &prefix)
+        .await
+        .unwrap();
+    assert_eq!(found, Some(tid_a));
+
+    // Title substring + case-insensitive (only 1 match so far)
+    let found = slash_task::find_task_by_query(&svc, "u1", "authentication")
+        .await
+        .unwrap();
+    assert!(found.is_some());
+
+    let found = slash_task::find_task_by_query(&svc, "u1", "AUTH")
+        .await
+        .unwrap();
+    assert!(found.is_some());
+
+    // Now add a second "authentication" task → ambiguity
+    svc.create_task(
+        "u1",
+        "s1",
+        astra_services::TaskCreateRequest {
+            title: "Refactor authentication tests".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = slash_task::find_task_by_query(&svc, "u1", "authentication")
+        .await
+        .unwrap_err();
+    assert!(err.contains("task query 'authentication' is ambiguous"));
+
+    // Not found
+    let found = slash_task::find_task_by_query(&svc, "u1", "nonexistent")
+        .await
+        .unwrap();
+    assert!(found.is_none());
+
+    // Wrong user isolation
     let found = slash_task::find_task_by_query(&svc, "user-b", "Private")
         .await
         .unwrap();
     assert!(found.is_none());
 }
 
-// ── Resume user verification ─────────────────────────────────────────────
+// ── Resume user verification ────────────────────────────────────────────────
 
 #[serial_test::serial]
 #[tokio::test]
@@ -180,10 +144,8 @@ async fn resume_local_restore_rejects_unowned_session() {
     use astra_services::session_restore::SessionRestoreService;
     use session_journal::JournalWriter;
 
-    // Create a session with both journal AND workspace (what restore_session needs)
     let sid = format!("test-unowned-{}", uuid::Uuid::new_v4());
 
-    // 1. Create journal
     let writer = JournalWriter::new(&sid).unwrap();
     writer
         .append(&session_journal::JournalEvent::session_start(
@@ -206,39 +168,27 @@ async fn resume_local_restore_rejects_unowned_session() {
         .unwrap();
     drop(writer);
 
-    // 2. Create workspace.yaml (required for local restore)
     let ws_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".astra")
         .join("sessions")
         .join(&sid);
     std::fs::create_dir_all(&ws_dir).unwrap();
-    let ws_content = r#"session_id: test-unowned
-cwd: /tmp
-model: gpt-4o
-created_at: "2024-01-01T00:00:00Z"
-updated_at: "2024-01-01T00:00:00Z"
-status: active
-turn_count: 1
-total_tokens_in: 5
-total_tokens_out: 3
-"#;
+    let ws_content = format!(
+        "session_id: {sid}\ncwd: /tmp\nmodel: gpt-4o\ncreated_at: \"2024-01-01T00:00:00Z\"\n\
+         updated_at: \"2024-01-01T00:00:00Z\"\nstatus: active\nturn_count: 1\n\
+         total_tokens_in: 5\ntotal_tokens_out: 3\n"
+    );
     std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
 
-    // Now restore_session should find it
     let svc = astra_services::session_restore::HybridRestoreService::local_only();
     let result = svc.restore_session(&sid).await.unwrap();
     assert!(
         result.is_some(),
         "local restore should find session with workspace.yaml"
     );
-
-    // Verify it's marked as local (not cloud)
     let restored = result.unwrap();
     assert!(!restored.restored_from_cloud, "should be local restore");
-
-    // Note: The user ownership check in handle_resume_command only verifies
-    // that the journal exists, not that the user owns it. This is a known limitation.
 }
 
 #[serial_test::serial]
@@ -303,14 +253,8 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     ws.turn_count = 1;
     ws.total_tokens_in = 5;
     ws.total_tokens_out = 3;
-    ws.pinned_skills = vec![
-        "session-lifecycle".to_string(),
-        "goal-driven-evolution".to_string(),
-    ];
-    ws.discovered_skills = vec![
-        "episodic-memory".to_string(),
-        "knowledge-graph-reasoning".to_string(),
-    ];
+    ws.pinned_skills = vec!["session-lifecycle".into(), "goal-driven-evolution".into()];
+    ws.discovered_skills = vec!["episodic-memory".into(), "knowledge-graph-reasoning".into()];
     astra_services::session_workspace::write_workspace(&ws).unwrap();
 
     let mut creds = CredentialsFile::default();
@@ -334,7 +278,70 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     assert_eq!(state.turn, 0);
 }
 
-#[serial_test::serial]
+// ── Crash recovery helpers ──────────────────────────────────────────────────
+
+const REAL_SESSION_1D21375_FIXTURE: &str =
+    include_str!("../../../services/fixtures/real_session_1d21375_min.jsonl");
+
+/// Build a Router that creates a new session on POST /sessions,
+/// and rejects chat requests for `old_sid` (404) while serving fresh ones.
+fn build_crash_recovery_router(
+    recovered_session_id: &str,
+    mock_state: &std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    old_sid: &str,
+    response_body: &str,
+) -> axum::Router {
+    let recovered_sid = recovered_session_id.to_string();
+    let s = mock_state.clone();
+    let sid = old_sid.to_string();
+    let body = response_body.to_string();
+
+    axum::Router::new()
+        .route(
+            "/sessions",
+            axum::routing::post({
+                let rsid = recovered_sid.clone();
+                move || {
+                    let rsid = rsid.clone();
+                    async move { axum::Json(serde_json::json!({ "session_id": rsid })) }
+                }
+            }),
+        )
+        .route(
+            "/chat/turn",
+            axum::routing::post({
+                let s = s.clone();
+                let sid = sid.clone();
+                let body = body.clone();
+                let recovered_sid = recovered_sid.clone();
+                move |axum::Json(b): axum::Json<serde_json::Value>| {
+                    let s = s.clone();
+                    let sid = sid.clone();
+                    let body = body.clone();
+                    let recovered_sid = recovered_sid.clone();
+                    async move {
+                        s.lock().await.push(b.clone());
+                        if b.get("session_id").and_then(serde_json::Value::as_str) == Some(&sid) {
+                            (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({ "error": "session not found" })),
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                [("content-type", "text/event-stream")],
+                                sse_text_response(&body, &recovered_sid),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        )
+}
+
+// ── Crash recovery ─────────────────────────────────────────────────────────
+
 #[tokio::test(flavor = "current_thread")]
 async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore() {
     let _creds = isolate_credentials();
@@ -445,8 +452,7 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     .unwrap();
 
     // Session-memory file setup removed: `build_session_memory_resume_guidance`
-    // now retrieves the last L1 from Memoria, not from disk. This test
-    // asserts the resume replay path but not the memory-content injection.
+    // now retrieves the last L1 from Memoria, not from disk.
     let _ = astra_runtime::claude_code_session_memory_path(&current_cwd_str, &sid);
 
     let mut creds = CredentialsFile::default();
@@ -467,60 +473,14 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
-    #[derive(Clone)]
-    struct MockState {
-        requests: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
-    }
-
-    let mock_state = MockState {
-        requests: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
-    };
+    let mock_state = MockRequestVec::new();
     let recovered_session_id = "fresh-resume-session".to_string();
-    let app =
-        Router::new()
-            .route(
-                "/sessions",
-                post({
-                    let recovered_session_id = recovered_session_id.clone();
-                    move || {
-                        let recovered_session_id = recovered_session_id.clone();
-                        async move {
-                            axum::Json(serde_json::json!({ "session_id": recovered_session_id }))
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/chat/turn",
-                post({
-                    let mock_state = mock_state.clone();
-                    let sid = sid.clone();
-                    let recovered_session_id = recovered_session_id.clone();
-                    move |axum::Json(body): axum::Json<serde_json::Value>| {
-                        let mock_state = mock_state.clone();
-                        let sid = sid.clone();
-                        let recovered_session_id = recovered_session_id.clone();
-                        async move {
-                            mock_state.requests.lock().await.push(body.clone());
-                            if body.get("session_id").and_then(serde_json::Value::as_str)
-                                == Some(sid.as_str())
-                            {
-                                (
-                                    axum::http::StatusCode::NOT_FOUND,
-                                    axum::Json(serde_json::json!({ "error": "session not found" })),
-                                )
-                                    .into_response()
-                            } else {
-                                (
-                                    [("content-type", "text/event-stream")],
-                                    sse_text_response("Recovered!", &recovered_session_id),
-                                )
-                                    .into_response()
-                            }
-                        }
-                    }
-                }),
-            );
+    let app = build_crash_recovery_router(
+        &recovered_session_id,
+        &mock_state.requests,
+        &sid,
+        "Recovered!",
+    );
 
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -538,21 +498,13 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     .unwrap();
 
     let requests = mock_state.requests.lock().await.clone();
+    assert!(!requests.is_empty(), "expected a fresh chat request");
+    let sid_str = sid.as_str();
     assert!(
-        !requests.is_empty(),
-        "expected a fresh chat request, got {} requests",
-        requests.len()
-    );
-    assert!(
-        requests.iter().all(
-            |req| req.get("session_id").and_then(serde_json::Value::as_str) != Some(sid.as_str())
-        ),
+        requests
+            .iter()
+            .all(|req| req.get("session_id").and_then(serde_json::Value::as_str) != Some(sid_str)),
         "ordinary chat input must not silently restore pending session {sid}: {requests:?}"
-    );
-    let fresh = requests.last().unwrap();
-    assert_ne!(
-        fresh.get("session_id").and_then(serde_json::Value::as_str),
-        Some(sid.as_str())
     );
     assert_eq!(state.pending_recovery, None);
     assert_eq!(
@@ -613,60 +565,14 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
     );
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
-    #[derive(Clone)]
-    struct MockState {
-        requests: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
-    }
-
-    let mock_state = MockState {
-        requests: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
-    };
+    let mock_state = MockRequestVec::new();
     let recovered_session_id = "repair-recovery-session".to_string();
-    let app =
-        Router::new()
-            .route(
-                "/sessions",
-                post({
-                    let recovered_session_id = recovered_session_id.clone();
-                    move || {
-                        let recovered_session_id = recovered_session_id.clone();
-                        async move {
-                            axum::Json(serde_json::json!({ "session_id": recovered_session_id }))
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/chat/turn",
-                post({
-                    let mock_state = mock_state.clone();
-                    let sid = sid.clone();
-                    let recovered_session_id = recovered_session_id.clone();
-                    move |axum::Json(body): axum::Json<serde_json::Value>| {
-                        let mock_state = mock_state.clone();
-                        let sid = sid.clone();
-                        let recovered_session_id = recovered_session_id.clone();
-                        async move {
-                            mock_state.requests.lock().await.push(body.clone());
-                            if body.get("session_id").and_then(serde_json::Value::as_str)
-                                == Some(sid.as_str())
-                            {
-                                (
-                                    axum::http::StatusCode::NOT_FOUND,
-                                    axum::Json(serde_json::json!({ "error": "session not found" })),
-                                )
-                                    .into_response()
-                            } else {
-                                (
-                                    [("content-type", "text/event-stream")],
-                                    sse_text_response("Patched.", &recovered_session_id),
-                                )
-                                    .into_response()
-                            }
-                        }
-                    }
-                }),
-            );
+    let app = build_crash_recovery_router(
+        &recovered_session_id,
+        &mock_state.requests,
+        &sid,
+        "Patched.",
+    );
 
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -684,14 +590,12 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
     .unwrap();
 
     let requests = mock_state.requests.lock().await.clone();
+    assert!(!requests.is_empty(), "expected a fresh chat request");
+    let sid_str = sid.as_str();
     assert!(
-        !requests.is_empty(),
-        "expected a fresh chat request, got no requests"
-    );
-    assert!(
-        requests.iter().all(
-            |req| req.get("session_id").and_then(serde_json::Value::as_str) != Some(sid.as_str())
-        ),
+        requests
+            .iter()
+            .all(|req| req.get("session_id").and_then(serde_json::Value::as_str) != Some(sid_str)),
         "repair follow-up must not silently restore pending session {sid}: {requests:?}"
     );
     assert_eq!(state.pending_recovery, None);
@@ -701,80 +605,68 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
     );
 }
 
-// ── Edge cases ───────────────────────────────────────────────────────────
+/// Ad-hoc mock request collector for crash recovery tests.
+#[derive(Clone)]
+struct MockRequestVec {
+    requests: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl MockRequestVec {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+// ── Edge cases ──────────────────────────────────────────────────────────────
 
 #[serial_test::serial]
 #[tokio::test]
-async fn resume_handles_malformed_workspace_yaml() {
+async fn resume_handles_workspace_edge_cases() {
     let _creds = isolate_credentials();
     use astra_services::session_restore::SessionRestoreService;
 
-    let sid = format!("test-malformed-{}", uuid::Uuid::new_v4());
+    for (label, workspace_yaml) in [
+        ("malformed", Some("invalid: yaml: content: [")),
+        ("missing", None),
+    ] {
+        let sid = format!("test-ws-edge-{}-{}", label, uuid::Uuid::new_v4());
 
-    // Create journal
-    let writer = session_journal::JournalWriter::new(&sid).unwrap();
-    writer
-        .append(&session_journal::JournalEvent::session_start(
-            Some(&sid),
-            Some("gpt-4o"),
-        ))
-        .unwrap();
-    drop(writer);
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-4o"),
+            ))
+            .unwrap();
+        drop(writer);
 
-    // Create malformed workspace.yaml
-    let ws_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
-        .join(&sid);
-    std::fs::create_dir_all(&ws_dir).unwrap();
-    std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
+        if let Some(yaml_content) = workspace_yaml {
+            let ws_dir = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".astra")
+                .join("sessions")
+                .join(&sid);
+            std::fs::create_dir_all(&ws_dir).unwrap();
+            std::fs::write(ws_dir.join("workspace.yaml"), yaml_content).unwrap();
+        }
 
-    // Malformed workspace now falls back to journal-only local restore.
-    let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let result = svc
-        .restore_session(&sid)
-        .await
-        .unwrap()
-        .expect("malformed workspace should still restore from journal");
-    assert_eq!(result.session_id, sid);
-    assert_eq!(result.turn_count, 0);
-    assert_eq!(result.model.as_deref(), Some("gpt-4o"));
-    assert_eq!(result.last_status, "local");
-    assert!(!result.restored_from_cloud);
+        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let result = svc
+            .restore_session(&sid)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{label}: journal-only session should restore"));
+        assert_eq!(result.session_id, sid);
+        assert_eq!(result.turn_count, 0);
+        assert_eq!(result.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(result.last_status, "local");
+        assert!(!result.restored_from_cloud);
+    }
 }
 
-#[serial_test::serial]
-#[tokio::test]
-async fn resume_handles_missing_workspace() {
-    let _creds = isolate_credentials();
-    use astra_services::session_restore::SessionRestoreService;
-
-    // Only journal, no workspace → local journal-only restore should still work.
-    let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
-    let writer = session_journal::JournalWriter::new(&sid).unwrap();
-    writer
-        .append(&session_journal::JournalEvent::session_start(
-            Some(&sid),
-            Some("gpt-4o"),
-        ))
-        .unwrap();
-    drop(writer);
-
-    let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let result = svc
-        .restore_session(&sid)
-        .await
-        .unwrap()
-        .expect("journal-only session should restore");
-    assert_eq!(result.session_id, sid);
-    assert_eq!(result.turn_count, 0);
-    assert_eq!(result.model.as_deref(), Some("gpt-4o"));
-    assert_eq!(result.last_status, "local");
-    assert!(!result.restored_from_cloud);
-}
-
-// ── Checkpoint listing ───────────────────────────────────────────────────
+// ── Checkpoint listing ──────────────────────────────────────────────────────
 
 #[serial_test::serial]
 #[tokio::test]
@@ -785,7 +677,6 @@ async fn resume_lists_checkpoints_for_session() {
 
     let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 
-    // Create journal
     let writer = session_journal::JournalWriter::new(&sid).unwrap();
     writer
         .append(&session_journal::JournalEvent::session_start(
@@ -795,7 +686,6 @@ async fn resume_lists_checkpoints_for_session() {
         .unwrap();
     drop(writer);
 
-    // Create workspace
     let ws_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".astra")
@@ -817,7 +707,6 @@ total_tokens_out: 500
     )
     .unwrap();
 
-    // List checkpoints should return empty (no checkpoints created yet)
     let svc = astra_services::session_restore::HybridRestoreService::local_only();
     let ckpts = svc.list_checkpoints(&sid).await.unwrap();
     assert!(ckpts.is_empty(), "no checkpoints created yet");

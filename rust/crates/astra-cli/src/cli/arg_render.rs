@@ -6,8 +6,8 @@
 
 use crate::cli::cli_config::cli_args::{
     AgentArgs, AgentSubcommand, BugArgs, BugSubcommand, DebugArgs, DiffArgs, DiffSubcommand,
-    GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, MessagingArgs, MessagingSubcommand,
-    PermissionsArgs, PermissionsSubcommand, ReviewArgs, ReviewSubcommand, TaskArgs, TaskSubcommand,
+    GrepArgs, GrepSubcommand, JobArgs, JobSubcommand, MemoryArgs, MemorySubcommand, MessagingArgs,
+    MessagingSubcommand, PermissionsArgs, PermissionsSubcommand, ReviewArgs, ReviewSubcommand,
     TeamArgs, TeamSubcommand,
 };
 
@@ -69,18 +69,16 @@ pub(crate) fn render_team_args(args: &TeamArgs) -> String {
     }
 }
 
-/// Render [`TaskArgs`] back into a stable textual argument list.
-pub(crate) fn render_task_args(args: &TaskArgs) -> String {
+/// Render [`JobArgs`] back into a stable textual argument list.
+pub(crate) fn render_job_args(args: &JobArgs) -> String {
     match &args.command {
-        None | Some(TaskSubcommand::List) => String::new(),
-        Some(TaskSubcommand::Pending) => "pending".to_string(),
-        Some(TaskSubcommand::Add(cmd)) => format!("add {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Done(cmd)) => format!("done {}", join_words(&cmd.query)),
-        Some(TaskSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
-        Some(TaskSubcommand::Run(cmd)) => format!("run {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Queue(cmd)) => format!("add {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Worker(_)) => "worker".to_string(),
-        Some(TaskSubcommand::Result(cmd)) => format!("result {}", join_words(&cmd.query)),
+        None | Some(JobSubcommand::List) => String::new(),
+        Some(JobSubcommand::Pending) => "pending".to_string(),
+        Some(JobSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
+        Some(JobSubcommand::Run(cmd)) => format!("run {}", join_words(&cmd.text)),
+        Some(JobSubcommand::Queue(cmd)) => format!("queue {}", join_words(&cmd.text)),
+        Some(JobSubcommand::Worker(_)) => "worker".to_string(),
+        Some(JobSubcommand::Result(cmd)) => format!("result {}", join_words(&cmd.query)),
     }
 }
 
@@ -229,9 +227,9 @@ pub(crate) fn render_bug_args(args: &BugArgs) -> String {
 
 #[cfg(test)]
 mod arg_render_tests {
-    use super::{render_permissions_args, render_task_args};
+    use super::{render_job_args, render_permissions_args};
     use crate::cli::cli_config::cli_args::{
-        PermissionsArgs, PermissionsSubcommand, PermissionsTraceArgs, TaskArgs, TaskSubcommand,
+        JobArgs, JobSubcommand, PermissionsArgs, PermissionsSubcommand, PermissionsTraceArgs,
     };
 
     #[test]
@@ -274,10 +272,10 @@ mod arg_render_tests {
     }
 
     #[test]
-    fn task_pending_renders_explicit_queue_view() {
-        let args = TaskArgs {
-            command: Some(TaskSubcommand::Pending),
+    fn job_pending_renders_explicit_queue_view() {
+        let args = JobArgs {
+            command: Some(JobSubcommand::Pending),
         };
-        assert_eq!(render_task_args(&args), "pending");
+        assert_eq!(render_job_args(&args), "pending");
     }
 }

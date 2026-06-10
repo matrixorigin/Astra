@@ -96,6 +96,12 @@ export type ChatDetail = {
     archivedAt?: string | null;
     model?: string | null;
   };
+  session?: {
+    chatId: string;
+    backendSessionId?: string | null;
+    persisted: boolean;
+    messageCount: number;
+  };
   messages: ChatMessage[];
   project?: { id: string; name: string };
   activeRun?: {

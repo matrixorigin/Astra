@@ -1762,8 +1762,7 @@ impl DatabaseRunStateStore {
         // multi-row INSERT IGNORE statements. Keep idempotent insert semantics,
         // but execute one row per statement so event durability cannot depend on
         // that optimizer path.
-        const EVENT_INSERT_SQL: &str =
-            "INSERT IGNORE INTO agent_run_events \
+        const EVENT_INSERT_SQL: &str = "INSERT IGNORE INTO agent_run_events \
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
               idempotency_key, event_hash, producer_pod_id, payload_json, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))";

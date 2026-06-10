@@ -312,7 +312,7 @@ impl BottomPaneView for InFlightAgentsView {
                     },
                 ),
                 Span::styled(
-                    format!("{}. {}", row_idx + 1, truncate(&row.name, 38)),
+                    format!("{}. {}", row_idx + 1, truncate_label(&row.name, 38)),
                     if selected {
                         Style::default()
                             .fg(status_color)
@@ -396,16 +396,7 @@ impl BottomPaneView for InFlightAgentsView {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max == 0 {
-        String::new()
-    } else {
-        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{truncated}…")
-    }
-}
+use crate::cli::effects::truncate_label;
 
 fn step_label(child_count: usize) -> String {
     if child_count == 0 {
@@ -703,7 +694,7 @@ mod tests {
     fn truncate_handles_cjk() {
         // Should not panic on multi-byte boundaries.
         let s = "日本語のとても長いタスク説明".repeat(3);
-        let result = truncate(&s, 10);
+        let result = truncate_label(&s, 10);
         assert!(result.chars().count() <= 10);
     }
 

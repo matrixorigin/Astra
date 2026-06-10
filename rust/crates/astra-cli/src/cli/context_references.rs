@@ -609,7 +609,7 @@ fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String, String> {
         return Err(format!("git command failed: {}", stderr.trim()));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if stdout.trim().is_empty() {
         return Err("no output (clean working tree?)".to_string());
     }

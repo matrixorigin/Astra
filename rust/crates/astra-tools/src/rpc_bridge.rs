@@ -590,7 +590,7 @@ mod tests {
 
         let mut resp = Vec::new();
         let _ = reader.read_to_end(&mut resp).await;
-        (String::from_utf8_lossy(&resp).to_string(), outcome)
+        (String::from_utf8_lossy(&resp).into_owned(), outcome)
     }
 
     // ── Core RPC behavior ────────────────────────────────────────────────

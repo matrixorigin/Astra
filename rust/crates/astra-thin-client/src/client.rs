@@ -792,14 +792,14 @@ impl ThinClient {
             .send()
             .await?)
     }
-    // ── Tasks (§5.5 state CRUD — `router_builder`) ───────────────────────────
+    // ── Jobs (§5.5 state CRUD — `router_builder`) ───────────────────────────
 
-    pub async fn get_tasks_query_text(
+    pub async fn get_agent_jobs_query_text(
         &self,
         token: &str,
         query: &[(&str, String)],
     ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::TASKS)?;
+        let url = self.url(paths::AGENT_JOBS)?;
         let resp = self
             .http
             .get(url)
@@ -1443,15 +1443,15 @@ impl ThinClient {
         let resp = req.send().await?;
         Self::json_or_error(resp).await
     }
-    /// `POST /tasks/{task_id}/lease/claim`
-    pub async fn post_task_lease_claim(
+    /// `POST /agent-jobs/{task_id}/lease/claim`
+    pub async fn post_agent_job_lease_claim(
         &self,
         bearer_override: Option<&str>,
         edge_transport_id: Option<&str>,
         task_id: &str,
         body: &TaskLeaseMutationRequest,
     ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::task_lease_claim(task_id))?;
+        let url = self.url(&paths::agent_job_lease_claim(task_id))?;
         let mut req = self
             .http
             .post(url)
@@ -2115,20 +2115,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiremock_tasks_list() {
+    async fn wiremock_agent_jobs_list() {
         let srv = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/tasks"))
+            .and(path("/agent-jobs"))
             .and(header("authorization", "Bearer t"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tasks": []})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"jobs": []})))
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let body = client.get_tasks_query_text("t", &[]).await.unwrap();
-        assert!(body.contains("tasks"), "{body}");
+        let body = client.get_agent_jobs_query_text("t", &[]).await.unwrap();
+        assert!(body.contains("jobs"), "{body}");
     }
 
     #[tokio::test]
@@ -2190,10 +2188,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiremock_task_lease_claim_sends_edge_header() {
+    async fn wiremock_agent_job_lease_claim_sends_edge_header() {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/tasks/t1/lease/claim"))
+            .and(path("/agent-jobs/t1/lease/claim"))
             .and(header("authorization", "Bearer t"))
             .and(header("x-astra-edge-id", "edge-xyz"))
             .respond_with(
@@ -2208,7 +2206,7 @@ mod tests {
             ttl_sec: Some(120),
         };
         let v = client
-            .post_task_lease_claim(Some("t"), Some("edge-xyz"), "t1", &body)
+            .post_agent_job_lease_claim(Some("t"), Some("edge-xyz"), "t1", &body)
             .await
             .unwrap();
         assert_eq!(v["status"], "granted");

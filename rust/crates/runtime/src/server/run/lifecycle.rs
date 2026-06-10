@@ -41,6 +41,8 @@ use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
 };
 use astra_services::{EdgeContext, LlmTokenServiceConfig};
+use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskStore};
+use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
@@ -1104,6 +1106,38 @@ fn restore_session_state_compact(
     }
 }
 
+fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<String> {
+    let open: Vec<&SessionTask> = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+
+    let next = open
+        .iter()
+        .copied()
+        .find(|task| task.status.is_in_progress())
+        .or_else(|| open.iter().copied().find(|task| task.status.is_pending()))
+        .or_else(|| open.first().copied())?;
+    let title = next.title.chars().take(120).collect::<String>();
+    let more = open.len().saturating_sub(1);
+    let more_suffix = if more > 0 {
+        format!(" · +{more} more open")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "open={} · next=[{}] {}: {}{}",
+        open.len(),
+        next.status,
+        next.id,
+        title,
+        more_suffix
+    ))
+}
+
 fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
     let mut messages = state.messages.clone();
     let final_text = state.final_text.trim();
@@ -1537,6 +1571,15 @@ fn build_llm_round_trace_events(
     model_name: Option<&str>,
     rounds: &[crate::turn::agentic_loop::host::RecentRoundSummary],
 ) -> Vec<TraceEvent> {
+    // Hoist repeated per-round allocations. session_id/user_id in new() are
+    // overwritten by with_turn_context, so pass empty strings to skip 2 clones.
+    let run_id_owned = run_id.to_string();
+    let agent_str = agent_id.unwrap_or("root-agent").to_string();
+    let parent_run_str = parent_run_id.map(|s| s.to_string());
+    let parent_agent_str = parent_agent_id.map(|s| s.to_string());
+    let root_event_id = trace.root_event_id.clone();
+    let model_default = model_name.map(|s| s.to_string());
+
     rounds
         .iter()
         .enumerate()
@@ -1545,20 +1588,20 @@ fn build_llm_round_trace_events(
             let round_key = round_index.to_string();
             let mut event = TraceEvent::new(
                 trace_event_id("round_done", &[run_id, &round_key, &trace.turn_id]),
-                trace.session_id.clone(),
-                trace.user_id.clone(),
+                "",
+                "",
                 "llm_round_completed",
                 "llm_round",
             )
             .with_turn_context(trace);
-            event.run_id = Some(run_id.to_string());
-            event.parent_run_id = parent_run_id.map(ToString::to_string);
-            event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
-            event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+            event.run_id = Some(run_id_owned.clone());
+            event.parent_run_id = parent_run_str.clone();
+            event.agent_id = Some(agent_str.clone());
+            event.parent_agent_id = parent_agent_str.clone();
             event.round_index = Some(round_index);
             event.llm_model_used = (!round.model.is_empty())
                 .then(|| round.model.clone())
-                .or_else(|| model_name.map(ToString::to_string));
+                .or_else(|| model_default.clone());
             event.meta_duration_ms = i32::try_from(round.duration_ms).ok();
             event.token_usage = Some(json!({
                 "prompt": round.prompt_tokens,
@@ -1570,7 +1613,7 @@ fn build_llm_round_trace_events(
                     + round.cache_read_tokens
                     + round.cache_creation_tokens,
             }));
-            event.parent_event_id = Some(trace.root_event_id.clone());
+            event.parent_event_id = Some(root_event_id.clone());
             event.metadata = json!({
                 "finish_reason": round.finish_reason,
                 "tool_calls_returned": round.tool_calls_returned,
@@ -1604,6 +1647,15 @@ fn build_tool_trace_events(
     parent_agent_id: Option<&str>,
     records: &[astra_services::session_journal::ToolCallRecord],
 ) -> Vec<TraceEvent> {
+    // Hoist repeated per-record allocations. session_id/user_id in new() are
+    // overwritten by with_turn_context, so pass empty strings to skip 4 clones
+    // per record (2 events x 2 fields).
+    let run_id_owned = run_id.to_string();
+    let agent_str = agent_id.unwrap_or("root-agent").to_string();
+    let parent_run_str = parent_run_id.map(|s| s.to_string());
+    let parent_agent_str = parent_agent_id.map(|s| s.to_string());
+    let root_event_id = trace.root_event_id.clone();
+
     let mut events = Vec::with_capacity(records.len().saturating_mul(2));
     for (index, record) in records.iter().enumerate() {
         if record.is_synthetic_placeholder() {
@@ -1621,23 +1673,26 @@ fn build_tool_trace_events(
         let child_run_id = child_run_id_from_tool_result(result_json.as_ref());
         let round_index = record.round.map(i64::from);
         let started_at = chrono::Utc::now();
+        // Clone call_id once, share for both events.
+        let call_id_clone = call_id.clone();
+        let tool_name = record.name.clone();
 
         let mut started = TraceEvent::new(
             trace_event_id("tool_start", &[run_id, &call_id]),
-            trace.session_id.clone(),
-            trace.user_id.clone(),
+            "",
+            "",
             "tool_call_started",
             "tool_call",
         )
         .with_turn_context(trace);
-        started.run_id = Some(run_id.to_string());
-        started.parent_run_id = parent_run_id.map(ToString::to_string);
-        started.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
-        started.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        started.run_id = Some(run_id_owned.clone());
+        started.parent_run_id = parent_run_str.clone();
+        started.agent_id = Some(agent_str.clone());
+        started.parent_agent_id = parent_agent_str.clone();
         started.round_index = round_index;
-        started.tool_call_id = Some(call_id.clone());
-        started.meta_tool_name = Some(record.name.clone());
-        started.parent_event_id = Some(trace.root_event_id.clone());
+        started.tool_call_id = Some(call_id_clone);
+        started.meta_tool_name = Some(tool_name.clone());
+        started.parent_event_id = Some(root_event_id.clone());
         started.created_at = started_at;
         started.metadata = json!({
             "args_preview": record.args_preview,
@@ -1654,21 +1709,21 @@ fn build_tool_trace_events(
         };
         let mut completed = TraceEvent::new(
             trace_event_id(terminal_type, &[run_id, &call_id]),
-            trace.session_id.clone(),
-            trace.user_id.clone(),
+            "",
+            "",
             terminal_type,
             "tool_call",
         )
         .with_turn_context(trace);
-        completed.run_id = Some(run_id.to_string());
-        completed.parent_run_id = parent_run_id.map(ToString::to_string);
-        completed.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
-        completed.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        completed.run_id = Some(run_id_owned.clone());
+        completed.parent_run_id = parent_run_str.clone();
+        completed.agent_id = Some(agent_str.clone());
+        completed.parent_agent_id = parent_agent_str.clone();
         completed.round_index = round_index;
         completed.tool_call_id = Some(call_id);
-        completed.meta_tool_name = Some(record.name.clone());
+        completed.meta_tool_name = Some(tool_name);
         completed.meta_duration_ms = i32::try_from(record.ms).ok();
-        completed.parent_event_id = Some(trace.root_event_id.clone());
+        completed.parent_event_id = Some(root_event_id.clone());
         completed.metadata = json!({
             "ok": record.ok,
             "action": action,
@@ -3377,6 +3432,7 @@ impl AgenticRunLifecycleService {
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
         plan_resume_hint: Option<String>,
+        task_board_resume_hint: Option<String>,
     ) -> server_loop_host::ServerAgenticLoopHost {
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
@@ -3395,7 +3451,8 @@ impl AgenticRunLifecycleService {
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(request.interaction_mode)
         .with_interactive_client(request.interactive_client)
-        .with_plan_resume_hint(plan_resume_hint);
+        .with_plan_resume_hint(plan_resume_hint)
+        .with_task_board_resume_hint(task_board_resume_hint);
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -3427,6 +3484,45 @@ impl AgenticRunLifecycleService {
             builder = builder.with_test_llm_rounds(rounds);
         }
         builder.build()
+    }
+
+    async fn task_board_resume_hint_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        let Some(shared) = &self.shared_pool else {
+            return None;
+        };
+        let store: Arc<dyn TaskStore> =
+            match MatrixOneTaskStore::from_shared_for_user(shared, user_id) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        user_id = %user_id,
+                        error = %error,
+                        "failed to construct user-scoped task store for resume hint"
+                    );
+                    return None;
+                }
+            };
+        let manager = TaskManager::new(session_id.to_string(), store);
+        match manager.load_active_tasks().await {
+            Ok(tasks) => format_task_board_resume_hint(&tasks),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    user_id = %user_id,
+                    error = %error,
+                    "failed to load task board resume hint for Cloud turn"
+                );
+                Some(format!(
+                    "Task board state could not be loaded for this turn: {error}. \
+                     Do not assume the task board is empty; avoid creating duplicate tasks and surface the load failure to the user."
+                ))
+            }
+        }
     }
 
     /// Build the initial [`AgenticLoopState`] from a chat request.
@@ -4027,6 +4123,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let task_board_resume_hint = self
+            .task_board_resume_hint_for_session(&user_id, &session_id)
+            .await;
         let mut host = self.build_host(
             &user_id,
             &session_id,
@@ -4034,6 +4133,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile,
             plan_resume_hint,
+            task_board_resume_hint,
         );
         if let Some(ref bundle) = mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone());
@@ -4107,7 +4207,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
-            );
+                user_id.clone(),
+            )
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
             let mut executor = server_tool_executor::ServerToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
@@ -4145,15 +4247,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-                // Production sink: exit_plan_mode(approved=true) seeds
-                // `session_plan_todos` so the next turn has executable
-                // items without the model manually re-creating each
-                // subtask via `task.create`.
-                executor.set_plan_todo_sink(std::sync::Arc::new(
-                    astra_services::DatabasePlanTodoSink::new(
-                        astra_services::DatabaseStateProjectionStore::new(shared.clone()),
-                    ),
                 ));
             }
             // Share the host's plan-resume hint slot so tool-triggered
@@ -4616,6 +4709,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let task_board_resume_hint = self
+            .task_board_resume_hint_for_session(&user_id, &session_id)
+            .await;
         let mut host = self.build_host(
             &user_id,
             &session_id,
@@ -4623,6 +4719,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile,
             plan_resume_hint,
+            task_board_resume_hint,
         );
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
@@ -4683,7 +4780,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
-            );
+                user_id.clone(),
+            )
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
             let mut executor = server_tool_executor::ServerToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
@@ -4720,15 +4819,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-                // Production sink: exit_plan_mode(approved=true) seeds
-                // `session_plan_todos` so the next turn has executable
-                // items without the model manually re-creating each
-                // subtask via `task.create`.
-                executor.set_plan_todo_sink(std::sync::Arc::new(
-                    astra_services::DatabasePlanTodoSink::new(
-                        astra_services::DatabaseStateProjectionStore::new(shared.clone()),
-                    ),
                 ));
             }
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
@@ -6228,7 +6318,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
-            );
+                config.user_id.clone(),
+            )?;
             let mut executor = server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 config.user_id.clone(),
@@ -6260,15 +6351,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(shared) = self.shared_pool.as_ref() {
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-                // Production sink: exit_plan_mode(approved=true) seeds
-                // `session_plan_todos` so the next turn has executable
-                // items without the model manually re-creating each
-                // subtask via `task.create`.
-                executor.set_plan_todo_sink(std::sync::Arc::new(
-                    astra_services::DatabasePlanTodoSink::new(
-                        astra_services::DatabaseStateProjectionStore::new(shared.clone()),
-                    ),
                 ));
             }
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
@@ -6438,7 +6520,65 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
+    fn test_session_task(
+        id: &str,
+        title: &str,
+        status: astra_tools::task_mgmt::SessionTaskStatusKind,
+    ) -> SessionTask {
+        SessionTask {
+            archived_at: None,
+            id: id.to_string(),
+            title: title.to_string(),
+            description: None,
+            status,
+            subtasks: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: vec![],
+            blocked_by: vec![],
+        }
+    }
+
     // ── extract_prev_assistant_text + implicit feedback wiring ──
+
+    #[test]
+    fn task_board_resume_hint_is_bounded_and_prefers_running_work() {
+        use astra_tools::task_mgmt::SessionTaskStatusKind;
+
+        let tasks = vec![
+            test_session_task("task-1", "pending setup", SessionTaskStatusKind::Pending),
+            test_session_task(
+                "task-2",
+                "active implementation",
+                SessionTaskStatusKind::InProgress,
+            ),
+            test_session_task("task-3", "already done", SessionTaskStatusKind::Completed),
+            test_session_task("task-4", "waiting review", SessionTaskStatusKind::Paused),
+        ];
+
+        let hint = format_task_board_resume_hint(&tasks).expect("open task hint");
+
+        assert_eq!(
+            hint,
+            "open=3 · next=[in_progress] task-2: active implementation · +2 more open"
+        );
+    }
+
+    #[test]
+    fn task_board_resume_hint_is_absent_without_open_work() {
+        use astra_tools::task_mgmt::SessionTaskStatusKind;
+
+        let tasks = vec![test_session_task(
+            "task-1",
+            "already done",
+            SessionTaskStatusKind::Completed,
+        )];
+
+        assert!(format_task_board_resume_hint(&tasks).is_none());
+    }
 
     #[test]
     fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {

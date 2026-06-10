@@ -97,7 +97,12 @@ pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::exit_cod
                 | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
             ) => false,
             None => !r.ok,
-            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError) => true,
+            Some(
+                astra_tools::exit_semantics::ExitSemantics::TimedOut
+                | astra_tools::exit_semantics::ExitSemantics::Cancelled
+                | astra_tools::exit_semantics::ExitSemantics::Signaled
+                | astra_tools::exit_semantics::ExitSemantics::ExecutionError,
+            ) => true,
         }
     };
 
@@ -217,6 +222,48 @@ mod tests {
         assert_eq!(stream_result_exit_code(&result), ExitCode::PersistenceError);
         result.session_persistence_error = None;
         assert_eq!(stream_result_exit_code(&result), ExitCode::Partial);
+    }
+
+    #[test]
+    fn stream_result_exit_code_treats_terminal_exit_semantics_as_tool_failure() {
+        for semantics in ["timed_out", "cancelled", "signaled", "execution_error"] {
+            let result = StreamResult {
+                tool_call_records: vec![astra_services::session_journal::ToolCallRecord {
+                    name: "bash".into(),
+                    ok: false,
+                    exit_semantics: Some(semantics.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            assert_eq!(
+                stream_result_exit_code(&result),
+                ExitCode::ToolFailure,
+                "{semantics}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_result_exit_code_treats_domain_negative_exit_semantics_as_success() {
+        for semantics in ["success", "informational_failure", "domain_negative"] {
+            let result = StreamResult {
+                tool_call_records: vec![astra_services::session_journal::ToolCallRecord {
+                    name: "bash".into(),
+                    ok: false,
+                    exit_semantics: Some(semantics.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            assert_eq!(
+                stream_result_exit_code(&result),
+                ExitCode::Success,
+                "{semantics}"
+            );
+        }
     }
 
     #[test]

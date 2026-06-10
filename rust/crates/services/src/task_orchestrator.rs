@@ -54,15 +54,15 @@ impl TaskStatus {
         }
     }
 
-    pub fn parse_status(s: &str) -> Self {
+    pub fn parse_status(s: &str) -> Option<Self> {
         match s {
-            "pending" => Self::Pending,
-            "in_progress" => Self::InProgress,
-            "paused" => Self::Paused,
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            "cancelled" => Self::Cancelled,
-            _ => Self::Pending,
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "paused" => Some(Self::Paused),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
         }
     }
 
@@ -439,7 +439,7 @@ pub trait TaskService: Send + Sync {
 
     /// Mark a non-plan task as completed with an explicit outcome.
     ///
-    /// Used by one-shot and background task runs where the task has no
+    /// Used by one-shot and background job runs where the task has no
     /// subtask progress but may still finish partially.
     async fn complete_task_with_outcome(
         &self,
@@ -450,7 +450,7 @@ pub trait TaskService: Send + Sync {
     /// Mark a plan-run task finished with explicit progress and learning outcome.
     ///
     /// Sets `status = completed`, `completed_at`, and `outcome` (e.g. `success` vs `partial`).
-    /// Used when the background plan executor finishes so `/task list` matches delivery state.
+    /// Used when the background plan executor finishes so job status matches delivery state.
     async fn complete_plan_run(
         &self,
         task_id: &str,
@@ -511,6 +511,8 @@ pub struct MatrixOneTaskService {
 
 const MAX_TASK_LIST_ROWS: usize = 200;
 const MAX_TASK_QUERY_MATCH_ROWS: usize = 8;
+const AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD: &str =
+    "AND status IN ('pending', 'in_progress', 'paused')";
 
 fn task_query_match_rank(task_id: &str, title: &str, query: &str) -> Option<u8> {
     if task_id == query {
@@ -610,6 +612,8 @@ impl MatrixOneTaskService {
             .and_then(|j| serde_json::from_str(j).ok());
 
         let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
+        let status = TaskStatus::parse_status(&status_str)
+            .ok_or_else(|| format!("unknown persisted task status: {status_str}"))?;
 
         // Learning fields (may not exist in older schemas)
         let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
@@ -622,7 +626,7 @@ impl MatrixOneTaskService {
             parent_task_id: row.try_get("parent_task_id").ok().flatten(),
             title: row.try_get("title").map_err(|e| e.to_string())?,
             description: row.try_get("description").ok().flatten(),
-            status: TaskStatus::parse_status(&status_str),
+            status,
             progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
             items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
             items_total: row.try_get::<i32, _>("items_total").unwrap_or(0) as u32,
@@ -662,7 +666,8 @@ impl MatrixOneTaskService {
             None => Err(format!("task not found: {task_id}")),
             Some(r) => {
                 let cur: String = r.try_get("status").unwrap_or_default();
-                let cur_status = TaskStatus::parse_status(&cur);
+                let cur_status = TaskStatus::parse_status(&cur)
+                    .ok_or_else(|| format!("task {task_id} has unknown persisted status: {cur}"))?;
                 if cur_status.is_terminal() {
                     Err(format!(
                         "invalid task status transition: {} → {} (terminal states are immutable)",
@@ -686,6 +691,8 @@ impl MatrixOneTaskService {
         use sqlx::Row;
 
         let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
+        let status = TaskStatus::parse_status(&status_str)
+            .ok_or_else(|| format!("unknown persisted task status: {status_str}"))?;
         let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
         let outcome = outcome_str.as_deref().and_then(TaskOutcome::parse);
         let claimability_str: Option<String> = row.try_get("claimability").ok().flatten();
@@ -693,7 +700,7 @@ impl MatrixOneTaskService {
             task_id: row.try_get("task_id").map_err(|e| e.to_string())?,
             title: row.try_get("title").map_err(|e| e.to_string())?,
             session_id: row.try_get("session_id").ok().flatten(),
-            status: TaskStatus::parse_status(&status_str),
+            status,
             progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
             items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
             items_total: row.try_get::<i32, _>("items_total").unwrap_or(0) as u32,
@@ -912,15 +919,13 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
-        // Atomic transition guard: the WHERE clause rejects updates from terminal states,
-        // eliminating the TOCTOU race of a separate SELECT + UPDATE.
-        let terminal_guard = "AND status NOT IN ('completed', 'failed', 'cancelled')";
-
+        // Atomic transition guard: the WHERE clause rejects terminal and unknown
+        // persisted states, eliminating the TOCTOU race of a separate SELECT + UPDATE.
         let result = if status.is_terminal() {
             sqlx::query(&format!(
                 "UPDATE agent_tasks \
                  SET status = ?, updated_at = NOW(), completed_at = NOW() \
-                 WHERE task_id = ? {terminal_guard}",
+                 WHERE task_id = ? {AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD}",
             ))
             .bind(status.as_str())
             .bind(task_id)
@@ -931,7 +936,7 @@ impl TaskService for MatrixOneTaskService {
             sqlx::query(&format!(
                 "UPDATE agent_tasks \
                  SET status = ?, updated_at = NOW(), completed_at = NULL \
-                 WHERE task_id = ? {terminal_guard}",
+                 WHERE task_id = ? {AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD}",
             ))
             .bind(status.as_str())
             .bind(task_id)
@@ -949,7 +954,9 @@ impl TaskService for MatrixOneTaskService {
                 .map_err(|e| format!("update_status check: {e}"))?;
             if let Some(row) = current_row {
                 let current_str: String = row.try_get("status").unwrap_or_default();
-                let current = TaskStatus::parse_status(&current_str);
+                let current = TaskStatus::parse_status(&current_str).ok_or_else(|| {
+                    format!("task {task_id} has unknown persisted status: {current_str}")
+                })?;
                 if current.is_terminal() && status != current {
                     return Err(format!(
                         "invalid task status transition: {} → {} (terminal states are immutable)",
@@ -957,6 +964,8 @@ impl TaskService for MatrixOneTaskService {
                         status.as_str()
                     ));
                 }
+            } else {
+                return Err(format!("task not found: {task_id}"));
             }
         }
         if status.is_terminal() {
@@ -979,7 +988,7 @@ impl TaskService for MatrixOneTaskService {
     ) -> Result<(), String> {
         let result = sqlx::query(
             "UPDATE agent_tasks SET progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
-             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
+             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
         )
         .bind(progress_pct as i32)
         .bind(items_done as i32)
@@ -1005,7 +1014,7 @@ impl TaskService for MatrixOneTaskService {
             serde_json::to_string(checkpoint).map_err(|e| format!("serialize ckpt: {e}"))?;
         let result = sqlx::query(
             "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = NOW() \
-             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
+             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
         )
         .bind(&ckpt_json)
         .bind(task_id)
@@ -1028,7 +1037,7 @@ impl TaskService for MatrixOneTaskService {
 
         let result = sqlx::query(
             "UPDATE agent_tasks SET plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
-             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
+             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
         )
         .bind(&plan_json)
         .bind(progress as i32)
@@ -1048,7 +1057,7 @@ impl TaskService for MatrixOneTaskService {
         let result = sqlx::query(
             "UPDATE agent_tasks SET status = 'failed', outcome = 'failed', error_message = ?, \
              updated_at = NOW(), completed_at = NOW() \
-             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
+             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
         )
         .bind(error)
         .bind(task_id)
@@ -1084,7 +1093,7 @@ impl TaskService for MatrixOneTaskService {
             "UPDATE agent_tasks SET status = 'completed', progress_pct = 100, \
              outcome = ?, error_message = NULL, \
              updated_at = NOW(), completed_at = NOW() \
-             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
+             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
         )
         .bind(outcome.as_str())
         .bind(task_id)
@@ -1117,7 +1126,7 @@ impl TaskService for MatrixOneTaskService {
             "UPDATE agent_tasks SET status = 'completed', progress_pct = ?, items_done = ?, \
              items_total = ?, outcome = ?, error_message = NULL, \
              updated_at = NOW(), completed_at = NOW() \
-             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
+             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
         )
         .bind(progress_pct as i32)
         .bind(items_done as i32)
@@ -2205,7 +2214,7 @@ mod tests {
             TaskStatus::Failed,
             TaskStatus::Cancelled,
         ] {
-            assert_eq!(TaskStatus::parse_status(status.as_str()), status);
+            assert_eq!(TaskStatus::parse_status(status.as_str()), Some(status));
         }
     }
 
@@ -2244,8 +2253,8 @@ mod tests {
     }
 
     #[test]
-    fn task_status_unknown_defaults_to_pending() {
-        assert_eq!(TaskStatus::parse_status("unknown"), TaskStatus::Pending);
+    fn task_status_unknown_rejects_instead_of_defaulting_to_pending() {
+        assert_eq!(TaskStatus::parse_status("unknown"), None);
     }
 
     // ── TaskPlan ──
@@ -3512,14 +3521,14 @@ mod tests {
 
     #[test]
     fn task_status_parse_empty_string() {
-        assert_eq!(TaskStatus::parse_status(""), TaskStatus::Pending);
+        assert_eq!(TaskStatus::parse_status(""), None);
     }
 
     #[test]
     fn task_status_parse_case_sensitive() {
         // "In_Progress" should not match (case-sensitive)
-        assert_eq!(TaskStatus::parse_status("In_Progress"), TaskStatus::Pending);
-        assert_eq!(TaskStatus::parse_status("COMPLETED"), TaskStatus::Pending);
+        assert_eq!(TaskStatus::parse_status("In_Progress"), None);
+        assert_eq!(TaskStatus::parse_status("COMPLETED"), None);
     }
 
     #[test]
@@ -3755,30 +3764,28 @@ mod tests {
     }
 
     /// P2-B: update_status must validate state transitions.
-    /// Terminal states (Completed, Failed, Cancelled) must be immutable.
+    /// Only known non-terminal states are mutable; unknown persisted states fail closed.
     #[test]
     fn update_status_validates_transitions() {
         let source = include_str!("task_orchestrator.rs");
-        let impl_start = source
-            .find("impl TaskOrchestrator for MatrixOneTaskOrchestrator")
-            .expect("impl must exist");
-        let impl_source = &source[impl_start..];
-        let fn_start = impl_source
-            .find("async fn update_status")
-            .expect("update_status must exist");
-        let fn_end = impl_source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(impl_source.len());
-        let fn_body = &impl_source[fn_start..fn_end];
-        // Must use atomic WHERE guard to prevent terminal state overwrites
+        let fn_body = matrixone_task_service_method_source(source, "update_status");
+        // Must use atomic allow-list guard to prevent terminal or unknown state overwrites.
         assert!(
-            fn_body.contains("NOT IN"),
-            "update_status must use atomic WHERE guard against terminal states"
+            fn_body.contains("status IN ('pending', 'in_progress', 'paused')")
+                || fn_body.contains("AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD"),
+            "update_status must use an atomic known-non-terminal guard"
         );
         assert!(
             fn_body.contains("invalid task status transition"),
             "update_status must reject invalid transitions with descriptive error"
+        );
+        assert!(
+            fn_body.contains("unknown persisted status"),
+            "update_status must fail closed on unknown persisted statuses"
+        );
+        assert!(
+            fn_body.contains("task not found"),
+            "update_status must reject missing task ids"
         );
     }
 
@@ -3798,14 +3805,34 @@ mod tests {
     }
 
     #[test]
-    fn matrixone_checkpoint_and_plan_updates_use_terminal_guards() {
+    fn matrixone_task_service_mutations_use_known_non_terminal_guards() {
         let source = include_str!("task_orchestrator.rs");
-        for method in ["save_checkpoint", "update_plan"] {
+        for method in [
+            "update_status",
+            "update_progress",
+            "save_checkpoint",
+            "update_plan",
+            "fail_task",
+            "complete_task_with_outcome",
+            "complete_plan_run",
+        ] {
             let fn_body = matrixone_task_service_method_source(source, method);
             assert!(
-                fn_body.contains("status NOT IN ('completed', 'failed', 'cancelled')"),
-                "{method} must use atomic terminal-state guard"
+                fn_body.contains("status IN ('pending', 'in_progress', 'paused')")
+                    || fn_body.contains("AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD"),
+                "{method} must use an atomic known-non-terminal guard"
             );
+        }
+
+        for method in [
+            "update_progress",
+            "save_checkpoint",
+            "update_plan",
+            "fail_task",
+            "complete_task_with_outcome",
+            "complete_plan_run",
+        ] {
+            let fn_body = matrixone_task_service_method_source(source, method);
             assert!(
                 fn_body.contains("report_terminal_guard_violation"),
                 "{method} must surface terminal-state guard violations"

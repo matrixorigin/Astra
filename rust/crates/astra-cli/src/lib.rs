@@ -26,7 +26,6 @@
 )]
 
 // ═══════════════════════════ Top-level utility modules ═══════════════════
-pub mod delta_log;
 pub mod diff_utils;
 pub mod edge_tools;
 pub mod explain_dag;
@@ -68,5 +67,6 @@ pub(crate) mod tests {
     pub(crate) use super::test_utils::isolated_sessions_dir;
     pub(crate) use super::test_utils::stub_stream_result;
     pub(crate) use super::test_utils::stub_stream_result_with_records;
+    pub(crate) use super::test_utils::test_temp_dir;
     pub(crate) use super::test_utils::wait_until;
 }

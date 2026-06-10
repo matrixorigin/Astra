@@ -44,6 +44,7 @@ pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
 pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
     let _ = env; // reserved for future env-gated tools
     let mut schemas = all_tool_schemas_core();
+    enforce_task_schema_unknown_field_contract(&mut schemas);
     // run_script is Unix-only (UDS RPC transport). Always exposed on Unix —
     // no env gate, this is the production tool.
     #[cfg(unix)]
@@ -66,6 +67,33 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
         }
     }));
     schemas
+}
+
+fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
+    if let Some(task) = schemas.iter_mut().find(|schema| {
+        schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some("task")
+    }) && let Some(parameters) = task
+        .get_mut("function")
+        .and_then(|function| function.get_mut("parameters"))
+        .and_then(Value::as_object_mut)
+    {
+        parameters.insert("additionalProperties".to_string(), Value::Bool(false));
+        if let Some(subtasks) = parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("subtasks"))
+            .and_then(Value::as_object_mut)
+        {
+            subtasks.insert(
+                "maxItems".to_string(),
+                Value::from(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
+            );
+        }
+    }
 }
 
 /// Default `run_script` schema exposed when the caller has not yet wired
@@ -101,6 +129,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Publish a file that was already generated in the current session workspace or /tmp so the web UI can preview and download it. Use this after creating images, PDFs, CSVs, Markdown, HTML, or other files with bash/write_file/run_script. Do not use this to generate content directly; first create the file, then publish its path.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
@@ -122,6 +151,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Execute a shell command in the project root. PREFER dedicated tools: git for VCS, glob for file search, grep for content search, read_file for file reading, write_file/str_replace for edits. Use bash only for bespoke scripting, chain pipelines, builds/tests/installs, or actions with no dedicated tool. Shell commands bypass safety validations (no path-traversal or shell-meta guards) — prefer dedicated tools whenever they cover the operation. Identical commands are cached per session; use `force: true` to bypass the cache.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
                         "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Use a larger value for long builds/tests, e.g. cargo build or full test suites."},
@@ -138,6 +168,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Read file contents. Use start_line/end_line for large files. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based)"},
@@ -664,11 +695,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.
 
-         ## agent vs agent_job vs task
+         ## agent vs shell work vs task
          - `agent(spawn)` + `agent(get_result)`: synchronous or background sub-agents you plan to collect results from. Supports fan-out coalescing.
-         - `agent_job(action='agent', ...)`: fire-and-forget long-running sub-agents that survive session restarts. Simpler API, no get_result needed (use output/kill).
-         - `agent_job(action='shell', ...)`: background shell processes (builds, test suites, servers).
-         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; agent_job runs it.",
+         - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
+         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -746,7 +776,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "notify",
-                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
+                "description": "Send a notification to the user. Use for proactive updates (background job done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -812,153 +842,127 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "task",
                 "description": "Durable task list. Use this tool proactively for multi-step work.\n\
         \n\
-        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; use `agent_job` for background work.\n\
+        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; not for shell commands or agents.\n\
         \n\
         ## When to Use\n\
         - 3 or more distinct outcomes, files, or phases.\n\
-        - Approved plans or delegated/background work.\n\
-        - Scope expands mid-flight.\n\
+        - Approved plans or delegated work with deliverables.\n\
+        - Scope expands.\n\
         \n\
-        1. Create one task per concrete outcome or phase — NOT one umbrella task for the whole request.\n\
+        1. Create one task per outcome or phase — NOT one umbrella task for the whole request.\n\
         2. For broad work, split into 3-7 leaf tasks sized to one artifact or validation step.\n\
-        3. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
+        3. Mark first actionable task `in_progress` BEFORE beginning work.\n\
         4. Keep exactly ONE task as `in_progress` at a time.\n\
         5. Finish tasks immediately: `completed` on success, `failed` + `error_message` on failure, use `archive` when old history should leave the board.\n\
         \n\
         ## When NOT to Use\n\
         - Single edit / single command / answer.\n\
         - Pure information request.\n\
-        - Trivial work.\n\
+        - Trivial.\n\
         \n\
-        ## Field Conventions\n\
-        - `title`: specific outcome.\n\
-        - `active_form`: spinner text while in_progress.\n\
-        - `description`: definition of done.\n\
-        - `subtasks`: optional nested steps; use `depends_on` for order.\n\
-        - `metadata`: free-form state; on update, `{key: null}` deletes that key.\n\
+        Field notes: `title` is the concrete outcome, `description` is done criteria, `active_form` is spinner text, `metadata` null deletes a key.\n\
         \n\
-        <example>\n\
-        User: Build an employee reimbursement system.\n\
-        Assistant: Create tasks like `scaffold backend`, `expense API`, `frontend flows`, `verify startup`; do NOT create one umbrella task `build reimbursement system`. Mark the first task `in_progress` BEFORE beginning work.\n\
-        </example>",
+        <example>User: Build reimbursements. Assistant: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation to perform"},
                         "source_session_id": {"type": "string", "description": "(adopt) Source session id."},
-                        "older_than_days": {"type": "integer", "description": "(archive bulk) Archive completed tasks older than N days. Default 30."},
-                        "user_status": {"type": "string", "enum": ["active","completed","failed","archived","all"], "description": "(list_user) Cross-session filter. Default active."},
+                        "older_than_days": {"type": "integer", "description": "(archive bulk; omit task_id) Archive completed tasks older than N days. Default 30."},
+                        "user_status": {"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Cross-session filter. Default active = open work: pending + in_progress + paused."},
                         "title": {"type": "string", "description": "(create/update) Imperative title."},
                         "description": {"type": "string", "description": "(create/update) Definition of done."},
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in the current session."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status. `deleted` permanently removes the task."},
-                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) Legacy alias for new_status."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","archived","all","active"], "description": "(list) Result filter. `active` = pending + in_progress."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Status. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list) `active` = pending + in_progress + paused."},
                         "subtask_id": {"type": "string", "description": "(update) Specific subtask id."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Task owner."},
                         "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs; null deletes a key on update."},
-                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids blocked by this task."},
-                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids that must finish before this task starts."},
-                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from blocks."},
-                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from blocked_by."},
+                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids this task blocks; edge is symmetric. Blocked tasks wait for completed blockers."},
+                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids blocking this task. It cannot start until every blocker is completed or removed."},
+                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove symmetric blocks edges."},
+                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove symmetric blocked_by edges."},
                         "subtasks": {
                             "type": "array",
                             "description": "(create) Optional subtasks.",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": false,
                                 "properties": {
                                     "id": {"type": "string"},
                                     "title": {"type": "string"},
                                     "description": {"type": "string"},
-                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Sibling ids completed before this subtask starts or completes."},
+                                    "owner": {"type": "string"}
                                 },
                                 "required": ["id", "title"]
                             }
                         },
                         "reason": {"type": "string", "description": "(stop) Why the task is being stopped."},
-                        "error_message": {"type": "string", "description": "(update) Failure reason."}
+                        "error_message": {"type": "string", "description": "(update) Failure reason to include when setting new_status='failed'."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "create": ["title"],
                         "update": ["task_id"],
                         "get": ["task_id"],
-                        "stop": ["task_id"]
+                        "stop": ["task_id"],
+                        "adopt": ["source_session_id", "task_id"]
                     }
                 }
             }
         }),
-        // ── agent_job ───────────────────────────────────────────────
-        // Background execution surface. Owns shell processes and
-        // durable sub-agent runs that the model wants to fire-and-
-        // poll. Split out of `task` in 2026-05 so the model has one
+        // ── job ─────────────────────────────────────────────────────
+        // Background shell execution surface. Split out of `task` in
+        // 2026-05 so the model has one
         // tool for the session checklist and a different tool for
         // long-running work — see `task_schema_does_not_advertise_
-        // background_actions`. Inspiration: codex `spawn_agents_on_csv`
-        // + `report_agent_job_result`; claudecode `Bash(run_in_background)`
-        // + `Agent(run_in_background)`.
+        // background_actions`. Inspiration: claudecode
+        // `Bash(run_in_background)`.
         json!({
             "type": "function",
             "function": {
-                "name": "agent_job",
-                "description": "Run shell commands or spawn durable sub-agents in the background while continuing to chat. Use this when work is long-running, can run independently, or you need to do other things in parallel.\n\
+                "name": "job",
+                "description": "Run local shell commands in the background while continuing to chat. Use this when shell work is long-running, can run independently, or you need to do other things in parallel.\n\
         \n\
-        Actions: shell, agent, output, kill.\n\
+        Actions: shell, list, output, kill.\n\
         \n\
         ## When to Use This Tool\n\
         - **Long-running shell** (builds, test suites, servers, scripts > ~10s): use `shell` instead of blocking `bash` — keeps the conversation responsive.\n\
-        - **Durable sub-agent fan-out**: use `agent` to spawn an agent that should survive until it produces a result. The job ID returned is durable across CLI restart.\n\
-        - **Need output later**: pair `shell` / `agent` with a follow-up `output` call. With `block: true` (default), `output` waits up to `timeout_ms` for completion. Use `offset` to resume from the last byte you already consumed.\n\
-        - **Cancel a stuck job**: `kill` terminates immediately.\n\
+        - **Need shell output later**: call `output` with no `job_id` to read the most recent shell job, or pass `job_id` for a specific job. With `block: true` (default), `output` waits up to `timeout_ms` for completion. Use `offset` to resume from the last byte you already consumed.\n\
+        - **Need to inspect running shell work**: use `list` to see job IDs, status, age, and descriptions.\n\
+        - **Cancel a stuck shell command**: `kill` terminates immediately.\n\
         \n\
         ## When NOT to Use This Tool\n\
         - Quick commands (< 5s): use `bash` directly — the round-trip overhead isn't worth it.\n\
-        - Synchronous sub-agent that you need the answer from before continuing: use `agent(action='spawn', ...)` + `agent(action='get_result', agent_id=...)` — that path is integrated with the parallel-spawn coalescing window.\n\
-        - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `agent_job` is for processes, not progress markers.\n\
+        - Sub-agents: use `agent(action='spawn', ..., run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the exact returned `agent_id`. Agent results are not readable through `job(action='output')`.\n\
+        - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `job` is for shell processes, not progress markers.\n\
         \n\
         ## Notifications\n\
-        You will receive `<background_task_notification>` XML when background jobs complete, fail, or stall (no output for ~45s + interactive-prompt pattern). When you see one, decide whether to read its output, acknowledge it, or `kill` and retry with non-interactive flags.\n\
+        You will receive `<background_job_notification>` XML when background shell jobs complete, fail, or stall (no output for ~45s + interactive-prompt pattern). When you see one, decide whether to read its output, acknowledge it, or `kill` and retry with non-interactive flags.\n\
         \n\
         ## Examples\n\
         \n\
         <example>\n\
         User: kick off the full test suite, I'll keep working.\n\
-        Assistant: *Calls agent_job(action='shell', command='cargo test --workspace')* — returns task_id `bg-shell-3`. *Continues with other work; later calls agent_job(action='output', task_id='bg-shell-3') to read the results.*\n\
-        </example>\n\
-        \n\
-        <example>\n\
-        User: have an explorer agent map every TODO across the codebase while we keep coding.\n\
-        Assistant: *Calls agent_job(action='agent', prompt='Find every TODO/FIXME...', agent_type='explore')* — fires it in the background.\n\
+        Assistant: *Calls job(action='shell', command='cargo test --workspace')* — returns job_id `bg-shell-3`. *Continues with other work; later calls job(action='output') to read the latest shell result.*\n\
         </example>",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["shell", "agent", "output", "kill"],
+                            "enum": ["shell", "list", "output", "kill"],
                             "description": "Operation to perform"
                         },
                         "command": {
                             "type": "string",
                             "description": "(shell) Shell command to run in the background"
                         },
-                        "prompt": {
+                        "job_id": {
                             "type": "string",
-                            "description": "(agent) Instruction for the background sub-agent"
-                        },
-                        "agent_type": {
-                            "type": "string",
-                            "enum": ["explore", "code-review", "task", "general-purpose"],
-                            "description": "(agent) Agent type. Default general-purpose."
-                        },
-                        "model": {
-                            "type": "string",
-                            "description": "(agent) Model override for the background agent"
-                        },
-                        "task_id": {
-                            "type": "string",
-                            "description": "(output/kill) The background job ID returned by shell/agent"
+                            "description": "(output/kill) The background shell job ID returned by `job(action='shell')`. Optional for output: defaults to the most recent shell job."
                         },
                         "block": {
                             "type": "boolean",
@@ -982,9 +986,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "shell": ["command"],
-                        "agent": ["prompt"],
-                        "output": ["task_id"],
-                        "kill": ["task_id"]
+                        "kill": ["job_id"]
                     }
                 }
             }
@@ -1017,7 +1019,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         2. Explore with read tools and identify existing patterns to follow.\n\
         3. Produce executable leaf steps: each step should map to one concrete artifact, API surface, or validation target.\n\
         4. Avoid umbrella steps like \"build the whole system\" when code, API, UI, and verification are separate outcomes.\n\
-        5. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval. Approval unlocks edits and seeds executable plan items.\n\
+        5. Call `exit_plan_mode(plan='<markdown>')` to submit the plan for user approval. Approval is produced by the UI/control plane, not by model-supplied tool arguments.\n\
         \n\
         ## When NOT to Use This Tool\n\
         Do not enter plan mode when normal execution is clearer:\n\
@@ -1042,14 +1044,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
         // ── exit_plan_mode ──────────────────────────────────────────
         // Companion to enter_plan_mode. Surfaces the proposed plan to
         // the user for approval, lifts the write-tool guard on
-        // success, and (server-side) seeds the approved plan items
-        // into `session_plan_todos` so the next turn can execute
-        // step-by-step.
+        // success, and mirrors the approved plan into the session task
+        // board so the next turn can execute step-by-step.
         json!({
             "type": "function",
             "function": {
                 "name": "exit_plan_mode",
-                "description": "Present the plan for user approval and exit plan mode. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects. On approval, write tools unlock and the items seed `session_plan_todos`. On rejection (`approved=false`), the plan stays open for another authoring pass.\n\
+                "description": "Submit the plan for user approval. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects in the trusted UI. The model cannot approve its own plan; approval unlocks writes only after the UI/control plane returns the user's decision. After trusted approval, the approved work appears in the session task board.\n\
         \n\
         ## Plan structure (what makes a good plan)\n\
         - Numbered list of concrete, executable leaf steps — each step maps to ONE artifact, API surface, or validation target.\n\
@@ -1067,11 +1068,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "plan": {
                             "type": "string",
                             "description": "The plan markdown to present for approval. Numbered list of steps; nested bullets ok. The user reads this verbatim."
-                        },
-                        "approved": {
-                            "type": "boolean",
-                            "default": true,
-                            "description": "True to commit the plan and unlock writes. False to keep planning."
                         }
                     },
                     "required": ["plan"]
@@ -1227,22 +1223,26 @@ mod tests {
     }
 
     #[test]
-    fn agent_job_schema_uses_consolidated_agent_actions() {
+    fn job_schema_keeps_sub_agents_on_agent_tool_lifecycle() {
         let schemas = all_tool_schemas_with_env(|_| None);
-        let agent_job = find_schema(&schemas, "agent_job").expect("agent_job schema must exist");
-        let desc = agent_job
+        let job = find_schema(&schemas, "job").expect("job schema must exist");
+        assert!(
+            find_schema(&schemas, "agent_job").is_none(),
+            "agent_job must not remain in the model-facing schema; use job for background shell work"
+        );
+        let desc = job
             .get("function")
             .and_then(|f| f.get("description"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            desc.contains("agent(action='spawn', ...)")
+            desc.contains("agent(action='spawn', ..., run_in_background=true)")
                 && desc.contains("agent(action='get_result', agent_id=...)"),
-            "agent_job description must teach the consolidated agent(action=...) syntax"
+            "job description must point sub-agents back to the agent lifecycle"
         );
         assert!(
-            !desc.contains("agent.spawn") && !desc.contains("agent.get_result"),
-            "agent_job description must not mention the legacy dotted agent syntax"
+            !desc.contains("job(action='agent'") && !desc.contains("agent_job"),
+            "job description must not advertise the removed agent_job lifecycle"
         );
     }
 
@@ -1334,13 +1334,29 @@ mod tests {
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task["function"]["description"].as_str().unwrap();
         let properties = &task["function"]["parameters"]["properties"];
+        assert_eq!(
+            task["function"]["parameters"]["additionalProperties"], false,
+            "task schema should reject unknown top-level fields"
+        );
 
-        for field in ["active_form", "add_blocks", "add_blocked_by"] {
+        for field in [
+            "active_form",
+            "add_blocks",
+            "add_blocked_by",
+            "error_message",
+        ] {
             assert!(
                 properties.get(field).is_some(),
                 "task schema must expose {field} to the model"
             );
         }
+        let error_message_desc = properties["error_message"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            error_message_desc.contains("new_status='failed'"),
+            "error_message should be explicitly tied to failed task updates: {error_message_desc}"
+        );
         assert!(
             properties["active_form"]["description"]
                 .as_str()
@@ -1360,6 +1376,120 @@ mod tests {
                 .and_then(|_| properties["status_filter"]["enum"].as_array())
                 .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("archived"))),
             "task schema should let the model query archived tasks explicitly"
+        );
+        assert!(
+            properties["status_filter"]
+                .as_object()
+                .and_then(|_| properties["status_filter"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
+            "task schema should let the model query cancelled tasks explicitly"
+        );
+        assert!(
+            properties["status_filter"]
+                .as_object()
+                .and_then(|_| properties["status_filter"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
+            "task schema should let the model query auto-paused tasks explicitly"
+        );
+        let status_filter_desc = properties["status_filter"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            status_filter_desc.contains("active")
+                && status_filter_desc.contains("pending + in_progress + paused"),
+            "task schema should explain task.list active includes paused open work: {status_filter_desc}"
+        );
+        assert!(
+            properties.get("status").is_none(),
+            "task schema must not expose the old status field; use new_status/status_filter"
+        );
+        assert!(
+            properties["new_status"]
+                .as_object()
+                .and_then(|_| properties["new_status"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
+            "task schema should let the model intentionally pause/resume stale work"
+        );
+        let new_status_desc = properties["new_status"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            new_status_desc.contains("Only one parent task may be in_progress"),
+            "new_status should teach the single in_progress task invariant: {new_status_desc}"
+        );
+        let add_blocked_by_desc = properties["add_blocked_by"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            add_blocked_by_desc.contains("completed or removed"),
+            "blocked_by should explain blockers must resolve before start: {add_blocked_by_desc}"
+        );
+        let add_blocks_desc = properties["add_blocks"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            add_blocks_desc.contains("edge is symmetric"),
+            "blocks should explain task dependency edges are symmetric: {add_blocks_desc}"
+        );
+        let depends_on_desc =
+            properties["subtasks"]["items"]["properties"]["depends_on"]["description"]
+                .as_str()
+                .unwrap_or_default();
+        assert!(
+            depends_on_desc.contains("before this subtask starts or completes"),
+            "subtask depends_on should explain execution order constraints: {depends_on_desc}"
+        );
+        let subtask_item = &properties["subtasks"]["items"];
+        assert_eq!(
+            properties["subtasks"]["maxItems"].as_u64(),
+            Some(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
+            "task schema should expose the same subtask fan-out limit as TaskManager"
+        );
+        assert_eq!(
+            subtask_item["additionalProperties"], false,
+            "subtask schema should reject unknown fields"
+        );
+        assert!(
+            subtask_item["properties"].get("owner").is_some(),
+            "subtask schema should expose the supported owner field"
+        );
+        assert!(
+            properties["user_status"]
+                .as_object()
+                .and_then(|_| properties["user_status"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
+            "task schema should let the model query cancelled cross-session tasks explicitly"
+        );
+        assert!(
+            properties["user_status"]
+                .as_object()
+                .and_then(|_| properties["user_status"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
+            "task schema should let the model query paused cross-session tasks explicitly"
+        );
+        let user_status_desc = properties["user_status"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            user_status_desc.contains("Default active")
+                && user_status_desc.contains("pending + in_progress + paused"),
+            "task schema should explain list_user active includes paused open work: {user_status_desc}"
+        );
+        let per_action_required = task["function"]["parameters"]["x-astra-per-action-required"]
+            .as_object()
+            .expect("task schema must expose per-action required fields");
+        let adopt_required = per_action_required
+            .get("adopt")
+            .and_then(|value| value.as_array())
+            .expect("adopt should list required fields");
+        assert!(
+            adopt_required
+                .iter()
+                .any(|value| value.as_str() == Some("source_session_id"))
+                && adopt_required
+                    .iter()
+                    .any(|value| value.as_str() == Some("task_id")),
+            "adopt requires both source_session_id and task_id: {adopt_required:?}"
         );
     }
 
@@ -1390,6 +1520,34 @@ mod tests {
                 "plan schema must not encode phrase-list triggers: {desc}"
             );
         }
+    }
+
+    #[test]
+    fn exit_plan_mode_schema_points_to_task_board_not_legacy_plan_todos() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let exit =
+            find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
+        let desc = exit["function"]["description"].as_str().unwrap();
+        let properties = exit["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("exit_plan_mode properties must be an object");
+
+        assert!(
+            desc.contains("session task board"),
+            "approved plans should surface through the user-visible task board: {desc}"
+        );
+        assert!(
+            desc.contains("model cannot approve its own plan"),
+            "schema must make user approval ownership explicit: {desc}"
+        );
+        assert!(
+            !properties.contains_key("approved"),
+            "model-facing exit_plan_mode schema must not expose an approval parameter"
+        );
+        assert!(
+            !desc.contains("session_plan_todos"),
+            "schema must not expose the old internal plan todo queue: {desc}"
+        );
     }
 
     #[test]

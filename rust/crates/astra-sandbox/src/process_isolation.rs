@@ -635,8 +635,8 @@ pub async fn execute_isolated(
         cleanup_cgroup(cg);
     }
 
-    let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let mut stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+    let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     if timed_out || stdout_capped {
         trim_incomplete_trailing_line(&mut stdout);
     }

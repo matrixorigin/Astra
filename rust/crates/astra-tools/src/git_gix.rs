@@ -139,22 +139,7 @@ fn estimate_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Truncate output to a byte limit, preferring line boundaries.
-fn truncate_output(mut output: String, max_bytes: usize) -> String {
-    if output.len() > max_bytes {
-        let end = output.floor_char_boundary(max_bytes);
-        let cut = output[..end]
-            .rfind('\n')
-            .filter(|&pos| pos > end / 2)
-            .map(|pos| pos + 1)
-            .unwrap_or(end);
-        output.truncate(cut);
-        output.push_str("\n[truncated]");
-    }
-    output
-}
-
-// ~4K tokens; was 30K
+use crate::truncate_output;
 
 fn percent_decode_path_token(input: &str) -> Result<String, String> {
     fn hex(b: u8) -> Option<u8> {
@@ -714,7 +699,7 @@ pub fn git_log(project_root: &Path, args: &Value) -> String {
                         let summary = raw
                             .lines()
                             .next()
-                            .map(|l| String::from_utf8_lossy(l).to_string())
+                            .map(|l| String::from_utf8_lossy(l).into_owned())
                             .unwrap_or_default();
                         out.push_str(&format!("{short} {summary}\n"));
                     }
@@ -819,13 +804,13 @@ pub fn git_show(
     // Header
     out.push_str(&format!("commit {}\n", commit.id));
     if let Ok(author) = commit.author() {
-        let name = String::from_utf8_lossy(author.name).to_string();
-        let email = String::from_utf8_lossy(author.email).to_string();
+        let name = String::from_utf8_lossy(author.name).into_owned();
+        let email = String::from_utf8_lossy(author.email).into_owned();
         let date = format_author_date(&author);
         out.push_str(&format!("Author: {name} <{email}>\nDate:   {date}\n"));
     }
 
-    let message = String::from_utf8_lossy(commit.message_raw_sloppy()).to_string();
+    let message = String::from_utf8_lossy(commit.message_raw_sloppy()).into_owned();
     out.push_str(&format!("\n    {}\n", message.trim()));
 
     // Merge commits: gix first-parent diff produces useless tree-level output,
@@ -1106,7 +1091,7 @@ pub fn git_blame(project_root: &Path, args: &Value) -> String {
             .and_then(|obj| obj.try_into_commit().ok())
             .and_then(|c: gix::Commit<'_>| {
                 c.author().ok().map(|a| {
-                    let name = String::from_utf8_lossy(a.name).to_string();
+                    let name = String::from_utf8_lossy(a.name).into_owned();
                     let date = format_author_date(&a);
                     (name, date)
                 })
@@ -1362,7 +1347,7 @@ fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<
     if !out.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if stdout.trim().is_empty() {
         return Some("No changes".to_string());
     }
@@ -1749,7 +1734,7 @@ pub fn git_file_history(project_root: &Path, args: &Value) -> String {
         let author = commit
             .author()
             .ok()
-            .map(|a| String::from_utf8_lossy(a.name).to_string())
+            .map(|a| String::from_utf8_lossy(a.name).into_owned())
             .unwrap_or_else(|| "?".to_string());
         let date = commit
             .author()
@@ -1760,7 +1745,7 @@ pub fn git_file_history(project_root: &Path, args: &Value) -> String {
             let raw = commit.message_raw_sloppy();
             raw.lines()
                 .next()
-                .map(|l| String::from_utf8_lossy(l).to_string())
+                .map(|l| String::from_utf8_lossy(l).into_owned())
                 .unwrap_or_default()
         };
 
@@ -1905,7 +1890,7 @@ pub fn git_log_search(project_root: &Path, args: &Value) -> String {
         let author = commit
             .author()
             .ok()
-            .map(|a| String::from_utf8_lossy(a.name).to_string())
+            .map(|a| String::from_utf8_lossy(a.name).into_owned())
             .unwrap_or_else(|| "?".to_string());
         let date = commit
             .author()
@@ -1916,7 +1901,7 @@ pub fn git_log_search(project_root: &Path, args: &Value) -> String {
             let raw = commit.message_raw_sloppy();
             raw.lines()
                 .next()
-                .map(|l| String::from_utf8_lossy(l).to_string())
+                .map(|l| String::from_utf8_lossy(l).into_owned())
                 .unwrap_or_default()
         };
         let tokens = estimate_tokens(&message);
@@ -2039,7 +2024,7 @@ pub fn git_contributors(project_root: &Path, args: &Value) -> String {
         let author_name = commit
             .author()
             .ok()
-            .map(|a| String::from_utf8_lossy(a.name).to_string())
+            .map(|a| String::from_utf8_lossy(a.name).into_owned())
             .unwrap_or_else(|| "?".to_string());
 
         // Path filter: check if commit touches the target path
@@ -2115,7 +2100,7 @@ pub fn git_contributors(project_root: &Path, args: &Value) -> String {
                 let raw = commit.message_raw_sloppy();
                 raw.lines()
                     .next()
-                    .map(|l| String::from_utf8_lossy(l).to_string())
+                    .map(|l| String::from_utf8_lossy(l).into_owned())
                     .unwrap_or_default()
             };
             recent_lines.push(format!("{short} {msg}"));

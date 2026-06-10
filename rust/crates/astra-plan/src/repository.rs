@@ -230,6 +230,18 @@ pub trait PlanRepository: Send + Sync {
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError>;
+
+    /// Persist an existing plan and cancel open step-runs for the supplied
+    /// subtasks as one repository mutation. Cloud implementations must commit
+    /// both changes in the same database transaction; in-memory/test
+    /// implementations must protect both changes under the same write lock.
+    async fn save_existing_and_abort_open_step_runs(
+        &self,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        subtask_ids: &[String],
+    ) -> Result<u64, PlanLoadError>;
 }
 
 /// Filter for [`PlanRepository::list_for_user`].
@@ -276,6 +288,11 @@ fn infer_phase_for_persist(state: &PlanModeState) -> &'static str {
 
 fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
+}
+
+fn parse_persisted_step_run_status(status: &str) -> Result<TaskStatus, PlanLoadError> {
+    TaskStatus::parse_status(status)
+        .ok_or_else(|| PlanLoadError::Corrupt(format!("unknown step_run status: {status}")))
 }
 
 fn validate_plan_id(plan_id: &str) -> Result<(), PlanLoadError> {
@@ -777,7 +794,9 @@ impl PlanRepository for CloudPlanRepository {
             plan_id: r.try_get("plan_id").map_err(map_sqlx)?,
             subtask_id: r.try_get("subtask_id").map_err(map_sqlx)?,
             attempt: r.try_get("attempt").map_err(map_sqlx)?,
-            status: TaskStatus::parse_status(&r.try_get::<String, _>("status").map_err(map_sqlx)?),
+            status: parse_persisted_step_run_status(
+                &r.try_get::<String, _>("status").map_err(map_sqlx)?,
+            )?,
             session_id: r.try_get("session_id").map_err(map_sqlx)?,
             started_at: r.try_get("started_at").map_err(map_sqlx)?,
             finished_at: r.try_get("finished_at").map_err(map_sqlx)?,
@@ -835,9 +854,9 @@ impl PlanRepository for CloudPlanRepository {
                 plan_id: r.try_get("plan_id").map_err(map_sqlx)?,
                 subtask_id: r.try_get("subtask_id").map_err(map_sqlx)?,
                 attempt: r.try_get("attempt").map_err(map_sqlx)?,
-                status: TaskStatus::parse_status(
+                status: parse_persisted_step_run_status(
                     &r.try_get::<String, _>("status").map_err(map_sqlx)?,
-                ),
+                )?,
                 session_id: r.try_get("session_id").map_err(map_sqlx)?,
                 started_at: r.try_get("started_at").map_err(map_sqlx)?,
                 finished_at: r.try_get("finished_at").map_err(map_sqlx)?,
@@ -879,6 +898,84 @@ impl PlanRepository for CloudPlanRepository {
         }
         let result = q.execute(&self.pool).await.map_err(map_sqlx)?;
         Ok(result.rows_affected())
+    }
+
+    async fn save_existing_and_abort_open_step_runs(
+        &self,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        subtask_ids: &[String],
+    ) -> Result<u64, PlanLoadError> {
+        validate_plan_id(plan_id)?;
+        let phase = infer_phase_for_persist(state);
+        let progress = state.plan.progress_pct() as i32;
+        let goal = state.goal.clone();
+        let next_version = expected_version
+            .checked_add(1)
+            .ok_or_else(|| PlanLoadError::Internal("plan version overflow".into()))?;
+        let mut persisted_state = state.clone();
+        persisted_state.version = next_version;
+        let plan_json = serde_json::to_string(&persisted_state)
+            .map_err(|e| PlanLoadError::Internal(e.to_string()))?;
+        let subtask_count = persisted_state.plan.subtasks.len() as i32;
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let update = sqlx::query(
+            "UPDATE plans \
+             SET goal = ?, phase = ?, version = ?, plan_json = ?, plan_md = ?, \
+                 progress_pct = ?, subtask_count = ?, updated_at = NOW(6) \
+             WHERE plan_id = ? AND version = ?",
+        )
+        .bind(&goal)
+        .bind(phase)
+        .bind(next_version as i64)
+        .bind(&plan_json)
+        .bind(persisted_state.plan_md.as_deref())
+        .bind(progress)
+        .bind(subtask_count)
+        .bind(plan_id)
+        .bind(expected_version as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        if update.rows_affected() == 0 {
+            let latest: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM plans WHERE plan_id = ?")
+                    .bind(plan_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+            tx.rollback().await.map_err(map_sqlx)?;
+            let actual = latest.map(|(v,)| v as u64).unwrap_or(0);
+            return Err(PlanLoadError::conflict(expected_version, actual));
+        }
+
+        let aborted = if subtask_ids.is_empty() {
+            0
+        } else {
+            let placeholders = std::iter::repeat_n("?", subtask_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE plan_step_runs \
+                 SET status = ?, finished_at = NOW(6) \
+                 WHERE plan_id = ? AND finished_at IS NULL \
+                   AND subtask_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql)
+                .bind(TaskStatus::Cancelled.as_str())
+                .bind(plan_id);
+            for sid in subtask_ids {
+                q = q.bind(sid);
+            }
+            q.execute(&mut *tx).await.map_err(map_sqlx)?.rows_affected()
+        };
+
+        tx.commit().await.map_err(map_sqlx)?;
+        state.version = next_version;
+        Ok(aborted)
     }
 }
 
@@ -1125,6 +1222,9 @@ impl PlanRepository for InMemoryPlanRepository {
         if run.plan_id != plan_id {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
         }
+        if run.finished_at.is_some() {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
         run.status = status;
         run.finished_at = Some(Utc::now());
         run.error = error.map(str::to_string);
@@ -1192,6 +1292,42 @@ impl PlanRepository for InMemoryPlanRepository {
         }
         Ok(aborted)
     }
+
+    async fn save_existing_and_abort_open_step_runs(
+        &self,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        subtask_ids: &[String],
+    ) -> Result<u64, PlanLoadError> {
+        validate_plan_id(plan_id)?;
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let Some(actual) = guard.plans.get(plan_id).map(|s| s.version) else {
+            return Err(PlanLoadError::conflict(expected_version, 0));
+        };
+        if actual != expected_version {
+            return Err(PlanLoadError::conflict(expected_version, actual));
+        }
+
+        let now = Utc::now();
+        let mut aborted = 0;
+        for run in guard.step_runs.values_mut() {
+            if run.plan_id == plan_id
+                && run.finished_at.is_none()
+                && subtask_ids
+                    .iter()
+                    .any(|subtask_id| subtask_id == &run.subtask_id)
+            {
+                run.status = TaskStatus::Cancelled;
+                run.finished_at = Some(now);
+                aborted += 1;
+            }
+        }
+
+        state.version = actual + 1;
+        guard.plans.insert(plan_id.to_string(), state.clone());
+        Ok(aborted)
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1226,6 +1362,19 @@ mod tests {
         for id in ["abc", "plan-123", "my_plan_v2", "ABC-xyz_01"] {
             assert!(validate_plan_id(id).is_ok(), "should accept {id}");
         }
+    }
+
+    #[test]
+    fn persisted_step_run_status_rejects_unknown_values() {
+        assert_eq!(
+            parse_persisted_step_run_status("in_progress").unwrap(),
+            TaskStatus::InProgress
+        );
+        let err = parse_persisted_step_run_status("unknown_status").unwrap_err();
+        assert!(
+            matches!(err, PlanLoadError::Corrupt(_)),
+            "unknown persisted step-run status must fail closed: {err}"
+        );
     }
 
     #[tokio::test]

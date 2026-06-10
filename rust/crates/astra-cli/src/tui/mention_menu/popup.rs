@@ -17,6 +17,7 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use super::provider::FileKind;
 use super::{FileEntry, MentionMenu};
+use crate::tui::truncate_ellipsis;
 
 pub(crate) const MAX_VISIBLE_ROWS: u16 = 10;
 
@@ -123,20 +124,6 @@ fn pad_right(s: &str, width: usize) -> String {
         }
         out
     }
-}
-
-fn truncate_ellipsis(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    if width == 1 {
-        return "…".to_string();
-    }
-    let out: String = s.chars().take(width - 1).collect();
-    format!("{out}…")
 }
 
 /// Produce the text to splice into the composer for a selected entry.

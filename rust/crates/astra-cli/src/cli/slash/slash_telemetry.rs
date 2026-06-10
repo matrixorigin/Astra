@@ -13,7 +13,6 @@ use crossterm::style::Stylize;
 /// Retention: fallback handler for `/telemetry` — called from slash_router.rs.
 /// In TUI mode this stays on the text fallback path.
 /// Kept for headless / non-interactive execution paths.
-#[allow(dead_code)]
 pub(crate) fn handle_telemetry_command(arg: &str, state: &SessionState) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),

@@ -540,8 +540,8 @@ fn pending_chip_is_yellow_without_extra_bold() {
 // ── Phase 3b.2: background task chip ────────────────────────────────
 //
 // When the BackgroundTaskRegistry has any non-terminal tasks, the
-// status line shows a compact `N jobs` (and `· M waiting` if any) chip
-// so the user can see at a glance how many fire-and-poll jobs are in
+// status line shows a compact `N background commands` (and `· M waiting` if any) chip
+// so the user can see at a glance how many fire-and-poll shell commands are in
 // flight without opening a separate view. Hidden when all bg tasks
 // are terminal (or none exist) so the chip doesn't waste space.
 
@@ -550,7 +550,7 @@ fn no_bg_tasks_renders_no_chip() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        !plain.contains("jobs"),
+        !plain.contains("background commands"),
         "no bg tasks must render no chip; got {plain:?}"
     );
 }
@@ -563,7 +563,7 @@ fn bg_running_only_renders_count() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("2 background jobs"),
+        plain.contains("2 background commands"),
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
@@ -580,7 +580,7 @@ fn bg_running_and_stalled_appends_stalled_segment() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("3 background jobs"),
+        plain.contains("3 background commands"),
         "must show running count; got {plain:?}"
     );
     assert!(
@@ -592,7 +592,7 @@ fn bg_running_and_stalled_appends_stalled_segment() {
 #[test]
 fn bg_zero_running_zero_stalled_hides_chip() {
     // (0, 0) — registry exists but no live tasks. Hide the chip
-    // rather than render `0 jobs` noise.
+    // rather than render `0 background commands` noise.
     let c = StatusContext {
         bg_task_counts: Some((0, 0)),
         ..ctx()

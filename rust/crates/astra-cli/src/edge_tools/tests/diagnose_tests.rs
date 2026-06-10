@@ -1,5 +1,8 @@
 use super::ToolExecutor;
+use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskStore};
+use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 
 // ─── diagnose tests ───────────────────────────────────────────────────────────
 
@@ -80,9 +83,11 @@ async fn diagnose_tasks_with_items() {
     let exe = ToolExecutor::new(dir.path());
 
     // Create some tasks
-    exe.task_create(&json!({"title": "Task 1"})).await;
-    exe.task_create(&json!({"title": "Task 2"})).await;
-    exe.task_update(&json!({"task_id": "task-1", "status": "completed"}))
+    exe.task_action_create(&json!({"title": "Task 1"})).await;
+    exe.task_action_create(&json!({"title": "Task 2"})).await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+        .await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 
     let result = exe.diagnose(&json!({"category": "tasks"})).await;
@@ -91,18 +96,23 @@ async fn diagnose_tasks_with_items() {
     assert_eq!(parsed["tasks"]["total"], 2);
     assert_eq!(parsed["tasks"]["completed"], 1);
     assert_eq!(parsed["tasks"]["pending"], 1);
+    assert_eq!(parsed["tasks"]["paused"], 0);
+    assert_eq!(parsed["tasks"]["open_work"], 1);
 }
 
 #[tokio::test]
-async fn diagnose_tasks_counts_cancelled_as_unsuccessful() {
+async fn diagnose_tasks_counts_paused_as_open_work_and_cancelled_as_unsuccessful() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
 
-    exe.task_create(&json!({"title": "Task 1"})).await;
-    exe.task_create(&json!({"title": "Task 2"})).await;
-    exe.task_update(&json!({"task_id": "task-1", "status": "in_progress"}))
+    exe.task_action_create(&json!({"title": "Task 1"})).await;
+    exe.task_action_create(&json!({"title": "Task 2"})).await;
+    exe.task_action_create(&json!({"title": "Task 3"})).await;
+    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
         .await;
-    exe.task_stop(&json!({"task_id": "task-1", "reason": "user cancelled"}))
+    exe.task_action_stop(&json!({"task_id": "task-1", "reason": "user cancelled"}))
+        .await;
+    exe.task_action_update(&json!({"task_id": "task-3", "new_status": "paused"}))
         .await;
 
     let result = exe.diagnose(&json!({"category": "tasks"})).await;
@@ -111,6 +121,54 @@ async fn diagnose_tasks_counts_cancelled_as_unsuccessful() {
     assert_eq!(parsed["tasks"]["failed_or_cancelled"], 1);
     assert_eq!(parsed["tasks"]["completed"], 0);
     assert_eq!(parsed["tasks"]["pending"], 1);
+    assert_eq!(parsed["tasks"]["paused"], 1);
+    assert_eq!(parsed["tasks"]["open_work"], 2);
+}
+
+#[tokio::test]
+async fn diagnose_tasks_surfaces_task_board_load_failure() {
+    struct FailingTaskStore;
+
+    #[async_trait]
+    impl TaskStore for FailingTaskStore {
+        async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+            Err("simulated task diagnostics outage".to_string())
+        }
+
+        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+
+        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path()).with_shared_task_manager(Arc::new(TaskManager::new(
+        "diag-fail",
+        Arc::new(FailingTaskStore),
+    )));
+
+    let result = exe.diagnose(&json!({"category": "tasks"})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["tasks"]["available"], false, "{parsed}");
+    assert!(
+        parsed["tasks"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("simulated task diagnostics outage"),
+        "diagnose(tasks) must surface task-board load failure: {parsed}"
+    );
+    assert!(
+        parsed["tasks"].get("total").is_none(),
+        "diagnose(tasks) must not report total=0 when the task board is unreadable: {parsed}"
+    );
 }
 
 #[tokio::test]

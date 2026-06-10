@@ -3,11 +3,7 @@ import { ChatView } from '@/components/app/chat-view';
 import { getCurrentUser } from '@/lib/auth/actions';
 import { getChatHydrated } from '@/lib/api/web-store';
 
-export default async function ChatPage({
-  params,
-}: {
-  params: Promise<{ chatId: string }>;
-}) {
+export default async function ChatPage({ params }: { params: Promise<{ chatId: string }> }) {
   const user = await getCurrentUser();
   if (!user) {
     notFound();

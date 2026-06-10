@@ -131,11 +131,44 @@ pub(crate) fn isolate_credentials() -> CredentialsGuard {
 
 // ── Session Journal Isolation ──────────────────────────────────────────
 
+/// Create a temp dir on a real-disk filesystem (not tmpfs), avoiding
+/// ENOSPC due to small /tmp on memory-backed mounts.  Respects
+/// `TMPDIR`; otherwise uses `target/test-tmp` under the workspace.
+pub(crate) fn test_temp_dir() -> tempfile::TempDir {
+    use std::sync::OnceLock;
+
+    static BASE: OnceLock<PathBuf> = OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        // 1. explicit override
+        if let Ok(d) = std::env::var("TMPDIR") {
+            let p = PathBuf::from(d);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        // 2. LOCATE workspace root from crate directory
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for ancestor in manifest.ancestors().skip(1) {
+            if ancestor.join("Cargo.lock").exists() || ancestor.join("Cargo.toml").exists() {
+                return ancestor.join("target").join("test-tmp");
+            }
+        }
+        // 3. last resort
+        std::env::temp_dir()
+    });
+
+    std::fs::create_dir_all(base).expect("create test-tmp base dir");
+    tempfile::Builder::new()
+        .prefix("astra-test-")
+        .tempdir_in(base)
+        .expect("create test temp dir")
+}
+
 pub(crate) fn isolated_sessions_dir() -> (
     tempfile::TempDir,
     astra_services::session_journal::JournalDirGuard,
 ) {
-    let tmp = tempfile::tempdir().expect("create temp sessions dir");
+    let tmp = test_temp_dir();
     let sessions = tmp.path().join("sessions");
     std::fs::create_dir_all(&sessions).expect("create isolated sessions root");
     let guard = astra_services::session_journal::JournalDirGuard::new(&sessions);

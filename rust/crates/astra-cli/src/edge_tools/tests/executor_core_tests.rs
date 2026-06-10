@@ -150,22 +150,14 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
     );
 }
 
-/// REGRESSION: after the Phase 1 split, `task.background_shell` and
-/// the other 3 background actions live on the new `agent_job` tool.
-/// Calling them on `task` is a sign the model is on a stale schema or
-/// hallucinating a path that no longer exists. The executor must
-/// surface this as an Error: with a redirect — same shape as the
-/// `agent.delegate` rejection — so the model self-corrects on the
-/// next turn instead of silently failing.
+/// `task` is only the durable checklist surface. Background process
+/// actions belong to `job`; if they arrive on `task`, treat them
+/// as ordinary unknown task actions rather than preserving per-action
+/// migration branches.
 #[tokio::test]
-async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
+async fn task_background_actions_are_plain_unknown_task_actions() {
     let executor = test_executor();
-    for (action, redirect_action) in &[
-        ("background_shell", "shell"),
-        ("background_agent", "agent"),
-        ("output", "output"),
-        ("kill", "kill"),
-    ] {
+    for action in ["background_shell", "background_agent", "output", "kill"] {
         let result = executor
             .execute(
                 "task",
@@ -183,16 +175,10 @@ async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
              a red banner — got: {result}"
         );
         assert!(
-            result.contains("agent_job"),
-            "task.{action} error must name `agent_job` as the new home — \
-             without that, the model has no path to recovery. Got: {result}"
+            result.contains("unknown `task` action") && result.contains(action),
+            "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
-        assert!(
-            result.contains(&format!("agent_job(action='{redirect_action}')"))
-                || result.contains(redirect_action),
-            "task.{action} error must point at the specific replacement \
-             action `agent_job(action='{redirect_action}')`. Got: {result}"
-        );
+        assert!(!result.contains("agent_job(action='"), "{result}");
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
             "task.{action} rejection must classify as an error so cloud \
@@ -235,68 +221,77 @@ async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
 }
 
 #[tokio::test]
-async fn exit_plan_mode_accepts_plan_alias_and_explicit_approved_skips_overlay() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(header("authorization", "Bearer token"))
-        .and(query_param("session_id", "sess-1"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [
-                { "plan_id": "plan-2", "goal": "Ship auth", "status": "planning" }
-            ]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/plans/plan-2/exit-plan-mode"))
-        .and(header("authorization", "Bearer token"))
-        .and(body_json(json!({
-            "approved": true,
-            "plan_md": "1. Ship auth"
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plan_id": "plan-2",
-            "phase": "refining"
-        })))
-        .mount(&server)
-        .await;
+async fn exit_plan_mode_ignores_model_supplied_approval_without_overlay() {
+    // LLM/tool arguments are not a trusted approval source. Even if the
+    // model passes `approved: true`, exit_plan_mode must require the
+    // interactive plan-review overlay before unlocking writes.
+    for (label, use_cloud, status, plan_id) in [
+        ("cloud planning", true, "planning", "plan-cloud-plan"),
+        ("cloud refining", true, "refining", "plan-cloud-ref"),
+        ("offline", false, "planning", ""),
+    ] {
+        let session_id = format!("sess-{label}");
 
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
+        if use_cloud {
+            let server = MockServer::start().await;
+            mock_authoring_plan_present(&server, &session_id, plan_id, status).await;
 
-    // Explicit `approved: true` is the headless / harness escape hatch:
-    // it bypasses the interactive Approve / Keep-planning overlay and
-    // commits the plan directly. Interactive callers leave `approved`
-    // out so the TUI can surface the 4-option dialog.
-    let result = executor
-        .execute(
-            "exit_plan_mode",
-            &json!({"plan": "1. Ship auth", "approved": true}),
-        )
-        .await;
+            let temp = tempfile::tempdir().unwrap();
+            let executor = ToolExecutor::new(temp.path().to_path_buf())
+                .with_active_session_id(&session_id)
+                .with_cloud(server.uri(), "token");
 
-    assert!(
-        result.starts_with("Exited plan mode."),
-        "exit_plan_mode should accept schema-native `plan` and approve when `approved=true` is explicit. Got: {result}"
-    );
-    assert!(
-        result.contains("plan-2"),
-        "result should mention the resolved plan id. Got: {result}"
-    );
-    assert!(
-        result.contains("auto"),
-        "explicit approval should default the next turn back to auto mode. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Auto),
-        "headless explicit approval must still stage a non-plan permission mode"
-    );
+            let result = executor
+                .execute(
+                    "exit_plan_mode",
+                    &json!({"plan": "1. Ship auth", "approved": true}),
+                )
+                .await;
+
+            assert!(
+                result.contains("trusted interactive plan-review overlay"),
+                "[{label}] model-supplied approval must not bypass UI review. Got: {result}"
+            );
+            assert_eq!(
+                executor.take_pending_permission_mode_change(),
+                None,
+                "[{label}] no trusted approval means no permission-mode change"
+            );
+        } else {
+            let temp = tempfile::tempdir().unwrap();
+            let executor =
+                ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id(&session_id);
+
+            let enter_result = executor
+                .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
+                .await;
+            assert!(
+                !enter_result.starts_with("Error:"),
+                "[{label}] offline enter should succeed. Got: {enter_result}"
+            );
+            assert_eq!(
+                executor.take_pending_permission_mode_change(),
+                Some(crate::cli::permission_manager::PermissionMode::Plan),
+                "[{label}] enter must stage Plan"
+            );
+
+            let exit_result = executor
+                .execute(
+                    "exit_plan_mode",
+                    &json!({"approved": true, "plan": "1. Ship auth"}),
+                )
+                .await;
+            assert!(
+                exit_result.contains("trusted interactive plan-review overlay"),
+                "[{label}] model-supplied approval must not bypass local UI review. Got: {exit_result}"
+            );
+            assert_eq!(
+                executor.take_pending_permission_mode_change(),
+                None,
+                "[{label}] no trusted approval means local plan mode stays active"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -346,168 +341,207 @@ async fn plan_mode_write_guard_cache_is_invalidated_when_session_changes() {
     );
 }
 
+// ── Overlay-driven exit_plan_mode paths ───────────────────────────
+// All three overlay outcomes share the same arrange → act shape:
+// exit_plan_mode without `approved` routes through plan_review_request_tx.
+
 #[tokio::test]
-async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
-    // End-to-end of the Approve / Keep-planning dialog: model calls
-    // exit_plan_mode without `approved`; the executor surfaces the
-    // 4-option dialog through `plan_review_request_tx`; the test
-    // auto-answers with PermissionMode::Auto so the executor commits
-    // the plan and stages Auto in the pending-mode slot.
+async fn exit_plan_mode_overlay_paths() {
     use crate::cli::chat_stream::PlanReviewDecision;
     use crate::cli::permission_manager::PermissionMode;
 
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-1"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-7", "goal": "Ship auth", "status": "planning" }]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/plans/plan-7/exit-plan-mode"))
-        .and(body_json(json!({
-            "approved": true,
-            "plan_md": "1. Ship auth"
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plan_id": "plan-7",
-            "phase": "refining"
-        })))
-        .mount(&server)
-        .await;
+    #[derive(Debug)]
+    struct Case {
+        label: &'static str,
+        install_overlay: bool,
+        decision: Option<PlanReviewDecision>,
+        expect_starts_with: &'static str,
+        expect_contains: &'static [&'static str],
+        expect_not_contains: &'static [&'static str],
+        expect_pending_mode: Option<PermissionMode>,
+        expect_tool_boost: Option<&'static [&'static str]>,
+    }
 
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
+    let cases = [
+        Case {
+            label: "approve-auto",
+            install_overlay: true,
+            decision: Some(PlanReviewDecision::Approve {
+                mode: PermissionMode::Auto,
+            }),
+            expect_starts_with: "Exited plan mode.",
+            expect_contains: &["auto"],
+            expect_not_contains: &["Error"],
+            expect_pending_mode: Some(PermissionMode::Auto),
+            expect_tool_boost: Some(&["bash", "read_file", "write_file", "str_replace"]),
+        },
+        Case {
+            label: "keep-planning",
+            install_overlay: true,
+            decision: Some(PlanReviewDecision::KeepPlanning),
+            expect_starts_with: "",
+            expect_contains: &["left open", "feedback"],
+            expect_not_contains: &["Error"],
+            expect_pending_mode: None,
+            expect_tool_boost: None,
+        },
+        Case {
+            label: "no-overlay",
+            install_overlay: false,
+            decision: None,
+            expect_starts_with: "Error:",
+            expect_contains: &["trusted interactive plan-review overlay"],
+            expect_not_contains: &[],
+            expect_pending_mode: None,
+            expect_tool_boost: None,
+        },
+    ];
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
-    executor.set_plan_review_request_tx(Some(tx));
+    for case in &cases {
+        let plan_id = format!("plan-{}-{}", case.label, Utc::now().timestamp_millis());
+        let plan_text = if case.label == "keep-planning" {
+            "1. Draft"
+        } else {
+            "1. Ship auth"
+        };
 
-    let overlay_task = tokio::spawn(async move {
-        let request = rx.recv().await.expect("overlay request");
-        let _ = request.response_tx.send(PlanReviewDecision::Approve {
-            mode: PermissionMode::Auto,
-        });
-    });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plans"))
+            .and(query_param("session_id", "sess-1"))
+            .and(query_param("active_session_only", "true"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "plans": [{ "plan_id": &plan_id, "goal": "Ship auth", "status": "planning" }]
+            })))
+            .mount(&server)
+            .await;
 
-    let result = executor
-        .execute("exit_plan_mode", &json!({"plan": "1. Ship auth"}))
-        .await;
-    overlay_task.await.unwrap();
+        // Only approve / keep-planning paths hit the POST endpoint
+        if case.install_overlay {
+            let mock_approved = matches!(case.decision, Some(PlanReviewDecision::Approve { .. }));
+            Mock::given(method("POST"))
+                .and(path(format!("/plans/{plan_id}/exit-plan-mode")))
+                .and(body_json(json!({
+                    "approved": mock_approved,
+                    "plan_md": plan_text
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "plan_id": &plan_id,
+                    "phase": "refining"
+                })))
+                .mount(&server)
+                .await;
+        }
 
-    assert!(
-        result.starts_with("Exited plan mode."),
-        "approve path should commit the plan. Got: {result}"
-    );
-    assert!(
-        result.contains("auto"),
-        "tool result should advertise the next-turn mode so the model knows the runtime is now permissive. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Auto),
-        "host must see Auto staged in the pending slot to apply on the next turn"
-    );
-    assert_eq!(
-        executor.take_pending_round_tool_boost(),
-        Some(vec![
-            "bash".to_string(),
-            "read_file".to_string(),
-            "write_file".to_string(),
-            "str_replace".to_string(),
-        ]),
-        "approved exit must stage a one-shot core-tool boost for the next round"
-    );
+        let temp = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(temp.path().to_path_buf())
+            .with_active_session_id("sess-1")
+            .with_cloud(server.uri(), "token");
+
+        let mut overlay_task = None;
+        if let Some(decision) = &case.decision {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
+                crate::cli::chat_stream::PlanReviewRequest,
+            >();
+            executor.set_plan_review_request_tx(Some(tx));
+            let dec = decision.clone();
+            overlay_task = Some(tokio::spawn(async move {
+                let request = rx.recv().await.expect("overlay request");
+                let _ = request.response_tx.send(dec);
+            }));
+        }
+
+        let result = executor
+            .execute("exit_plan_mode", &json!({"plan": plan_text}))
+            .await;
+
+        if let Some(task) = overlay_task {
+            task.await.unwrap();
+        }
+
+        if !case.expect_starts_with.is_empty() {
+            assert!(
+                result.starts_with(case.expect_starts_with),
+                "[{}] expected start '{}'. Got: {result}",
+                case.label,
+                case.expect_starts_with
+            );
+        }
+        for expect in case.expect_contains {
+            assert!(
+                result.contains(expect),
+                "[{}] expected to contain '{}'. Got: {result}",
+                case.label,
+                expect
+            );
+        }
+        for expect_not in case.expect_not_contains {
+            assert!(
+                !result.contains(expect_not),
+                "[{}] expected NOT to contain '{}'. Got: {result}",
+                case.label,
+                expect_not
+            );
+        }
+        assert_eq!(
+            executor.take_pending_permission_mode_change(),
+            case.expect_pending_mode,
+            "[{}] pending permission mode mismatch",
+            case.label
+        );
+        let expected_boost: Option<Vec<String>> = case
+            .expect_tool_boost
+            .map(|v| v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            executor.take_pending_round_tool_boost(),
+            expected_boost,
+            "[{}] tool boost mismatch",
+            case.label
+        );
+    }
 }
 
-// ── Plan-mode systemic invariants (Step 4) ────────────────────────────
-//
-// These tests pin the invariants from the cross-deployment audit. They
-// were written first and stay red until each piece of the refactor
-// lands. See `project_plan_mode_schema_truth` memory for the audit
-// table mapping I1..I9 to deployment shapes.
+// ── Plan-mode entry invariants ──────────────────────────────────────
+// enter_plan_mode must stage PermissionMode::Plan regardless of cloud availability.
 
 #[tokio::test]
-async fn enter_plan_mode_falls_back_to_local_when_cloud_unavailable() {
-    // Invariant I1 + I2: pressing Shift+Tab → Plan must succeed
-    // even with no cloud reachable. Today `enter_plan_mode_remote`
-    // hard-requires `cloud_token`; offline / unauthenticated CLI
-    // sessions silently lose plan mode. After the refactor an
-    // unconfigured cloud must route to the same overlay-less local
-    // entry: stage `PermissionMode::Plan` in the pending slot, no
-    // network calls, no `Error:` prefix.
-    //
-    // RED until Step 4-3 lands.
-    let temp = tempfile::tempdir().unwrap();
-    let executor =
-        ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-offline");
-    // Deliberately no `with_cloud(...)` — simulates Shift+Tab in a
-    // detached CLI run.
+async fn enter_plan_mode_stages_permission_mode_plan() {
+    for (label, use_cloud) in [("offline", false), ("cloud", true)] {
+        let temp = tempfile::tempdir().unwrap();
 
-    let result = executor
-        .execute("enter_plan_mode", &json!({"goal": "Investigate auth"}))
-        .await;
+        let executor = if use_cloud {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/plans"))
+                .and(header("authorization", "Bearer token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "plan_id": "plan-cloud-1",
+                    "phase": "planning"
+                })))
+                .mount(&server)
+                .await;
+            ToolExecutor::new(temp.path().to_path_buf())
+                .with_active_session_id("sess-cloud")
+                .with_cloud(server.uri(), "token")
+        } else {
+            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-offline")
+        };
 
-    assert!(
-        !result.starts_with("Error:"),
-        "enter_plan_mode must not error out without a cloud token; \
-         it should fall back to a local plan-mode pivot. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan),
-        "entering plan mode must stage Plan on the pending slot \
-         so the host applies it on the next turn"
-    );
-}
+        let result = executor
+            .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
+            .await;
 
-#[tokio::test]
-async fn enter_plan_mode_stages_perm_mode_change_to_plan_even_on_cloud_path() {
-    // Invariant I6: a single source of truth for "am I in plan mode".
-    // Today the cloud path (`enter_plan_mode_remote` with a real
-    // server) flips the cloud `plans` row but leaves `perm_manager`
-    // untouched — so `perm_manager.mode()` and the cloud row
-    // disagree. The host then has no signal to update the schema
-    // for the next turn. This test pins the contract that whichever
-    // path runs, the perm-mode change always lands in the slot.
-    //
-    // RED until Step 4-3 wires the slot from the cloud branch too.
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/plans"))
-        .and(header("authorization", "Bearer token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plan_id": "plan-cloud-1",
-            "phase": "planning"
-        })))
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-cloud")
-        .with_cloud(server.uri(), "token");
-
-    let result = executor
-        .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
-        .await;
-
-    assert!(
-        !result.starts_with("Error:"),
-        "cloud path must succeed when the server returns a plan_id. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan),
-        "cloud path must stage Plan on the pending slot too — single \
-         source of truth invariant"
-    );
+        assert!(
+            !result.starts_with("Error:"),
+            "[{label}] enter_plan_mode must not error. Got: {result}"
+        );
+        assert_eq!(
+            executor.take_pending_permission_mode_change(),
+            Some(crate::cli::permission_manager::PermissionMode::Plan),
+            "[{label}] must stage Plan on the pending permission-mode slot"
+        );
+    }
 }
 
 #[tokio::test]
@@ -642,271 +676,6 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     );
 }
 
-#[tokio::test]
-async fn exit_plan_mode_explicit_approved_defaults_to_auto_offline() {
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-explicit-offline");
-
-    let enter_result = executor
-        .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
-        .await;
-    assert!(
-        !enter_result.starts_with("Error:"),
-        "offline enter should succeed. Got: {enter_result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan),
-        "enter must stage Plan before the simulated host applies it"
-    );
-
-    let exit_result = executor
-        .execute(
-            "exit_plan_mode",
-            &json!({"approved": true, "plan": "1. Review auth flow"}),
-        )
-        .await;
-    assert!(
-        exit_result.starts_with("Exited plan mode"),
-        "explicit offline approval should succeed. Got: {exit_result}"
-    );
-    assert!(
-        exit_result.contains("auto"),
-        "explicit approval should advertise the default Auto mode. Got: {exit_result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Auto),
-        "explicit approval without overlay must still leave plan mode on the next turn"
-    );
-}
-
-#[tokio::test]
-async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
-    // User chooses "Keep planning"; the plan must stay in `planning`
-    // phase (server call body `approved: false`), no permission-mode
-    // change should be staged, and the message must tell the model
-    // to address feedback before re-calling.
-    use crate::cli::chat_stream::PlanReviewDecision;
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-1"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-8", "goal": "Ship auth", "status": "planning" }]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/plans/plan-8/exit-plan-mode"))
-        .and(body_json(json!({
-            "approved": false,
-            "plan_md": "1. Draft"
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plan_id": "plan-8",
-            "phase": "planning"
-        })))
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
-
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
-    executor.set_plan_review_request_tx(Some(tx));
-
-    let overlay_task = tokio::spawn(async move {
-        let request = rx.recv().await.expect("overlay request");
-        let _ = request.response_tx.send(PlanReviewDecision::KeepPlanning);
-    });
-
-    let result = executor
-        .execute("exit_plan_mode", &json!({"plan": "1. Draft"}))
-        .await;
-    overlay_task.await.unwrap();
-
-    assert!(
-        result.contains("left open"),
-        "keep-planning path should signal the plan stays open. Got: {result}"
-    );
-    assert!(
-        result.contains("feedback"),
-        "result should tell the model to address feedback before re-calling. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        None,
-        "no mode change should be staged when the user keeps planning"
-    );
-    assert_eq!(
-        executor.take_pending_round_tool_boost(),
-        None,
-        "keep-planning must not leave a deferred execution-tool boost behind"
-    );
-}
-
-#[test]
-fn switching_sessions_clears_deferred_plan_exit_state() {
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-a");
-    executor.debug_stage_pending_permission_mode_change_for_test(
-        crate::cli::permission_manager::PermissionMode::AcceptEdits,
-    );
-    executor.debug_stage_pending_round_tool_boost_for_test(&[
-        "bash",
-        "read_file",
-        "write_file",
-        "str_replace",
-    ]);
-
-    executor.set_active_session_id("sess-b");
-
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        None,
-        "deferred permission-mode changes must not bleed into another session"
-    );
-    assert_eq!(
-        executor.take_pending_round_tool_boost(),
-        None,
-        "deferred tool boosts must not bleed into another session"
-    );
-}
-
-#[tokio::test]
-async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
-    // Regression for session d9b5119f: user pressed Shift+Tab to
-    // enter plan mode (so `perm_manager.mode() == Plan`, but no
-    // cloud `plans` row was created). The model authored a plan and
-    // called `exit_plan_mode(plan="…")`. The previous implementation
-    // hard-required a `phase=planning` cloud record and bailed with
-    // "no active planning plan found for the current session" — the
-    // agent was stuck in plan mode forever.
-    //
-    // After the dual-path refactor the same call must complete via
-    // the local-only path: probe the cloud, find nothing, fall
-    // through to the overlay + `pending_permission_mode_change` slot
-    // exactly like the cloud path does, and never hit any
-    // `/plans/*/exit-plan-mode` endpoint.
-    use crate::cli::chat_stream::PlanReviewDecision;
-    use crate::cli::permission_manager::PermissionMode;
-
-    let server = MockServer::start().await;
-    // Probe returns an empty plans array — that's the trigger for
-    // the local fallback. We deliberately do NOT mount any
-    // `POST /plans/*/exit-plan-mode` mock; if the implementation
-    // were to call it the test would fail with an unexpected request.
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-shift-tab"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-shift-tab")
-        .with_cloud(server.uri(), "token");
-
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
-    executor.set_plan_review_request_tx(Some(tx));
-
-    let overlay_task = tokio::spawn(async move {
-        let request = rx.recv().await.expect("overlay request");
-        let _ = request.response_tx.send(PlanReviewDecision::Approve {
-            mode: PermissionMode::AcceptEdits,
-        });
-    });
-
-    let result = executor
-        .execute(
-            "exit_plan_mode",
-            &json!({"plan": "1. Read auth flow\n2. Add tests"}),
-        )
-        .await;
-    overlay_task.await.unwrap();
-
-    assert!(
-        result.starts_with("Exited plan mode"),
-        "Shift+Tab path must complete the exit even without a cloud plan record. Got: {result}"
-    );
-    assert!(
-        !result.contains("no active planning plan"),
-        "must not surface the cloud-lookup error any more. Got: {result}"
-    );
-    assert!(
-        result.contains("edit"),
-        "tool result should advertise the chosen mode. Got: {result}"
-    );
-    assert!(
-        result.contains("1. Read auth flow"),
-        "local path should echo the plan markdown so the next turn has it in context. Got: {result}"
-    );
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::AcceptEdits),
-        "host must see AcceptEdits staged in the pending slot for the next turn"
-    );
-}
-
-#[tokio::test]
-async fn exit_plan_mode_without_overlay_or_approved_returns_actionable_error() {
-    // Without an `ask_user_request_tx` installed (headless / sub-run
-    // context) and without an explicit `approved` field, the model
-    // would otherwise hang forever waiting for a TUI dialog that will
-    // never arrive. We instead return a clear error so the model can
-    // re-call with `approved=true|false`. Pinning the message text
-    // because both halves matter:
-    //   - "requires an interactive TUI overlay" tells the human reader
-    //     why the call failed in this environment;
-    //   - "Re-call with `approved=true` or `approved=false`" gives the
-    //     model a concrete recovery action so it doesn't spin.
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-1"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-3", "goal": "Ship auth", "status": "planning" }]
-        })))
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
-
-    let result = executor
-        .execute("exit_plan_mode", &json!({"plan": "1. Ship auth"}))
-        .await;
-
-    assert!(
-        result.starts_with("Error:"),
-        "expected an error result without overlay channel. Got: {result}"
-    );
-    assert!(
-        result.contains("interactive TUI overlay"),
-        "error should explain the missing overlay sink. Got: {result}"
-    );
-    assert!(
-        result.contains("approved"),
-        "error should suggest `approved=true|false` as a fallback. Got: {result}"
-    );
-}
-
 // ── Plan-mode write guard (CLI parity with server-side guard) ──────────
 //
 // Session b4cef5bb (2026-05-16, Haiku 4.5) showed the model writing 14
@@ -954,92 +723,36 @@ async fn mock_no_authoring_plan(server: &MockServer, session_id: &str) {
         .await;
 }
 
-#[tokio::test]
-async fn write_file_is_blocked_while_plan_mode_is_authoring() {
+async fn setup_blocked_executor(
+    plan_status: &str,
+) -> (MockServer, ToolExecutor, tempfile::TempDir) {
     let server = MockServer::start().await;
-    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
-
+    mock_authoring_plan_present(&server, "sess-1", "plan-9", plan_status).await;
     let temp = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf())
         .with_active_session_id("sess-1")
         .with_cloud(server.uri(), "token");
-    let target = temp.path().join("ledger.txt");
-
-    let result = executor
-        .execute(
-            "write_file",
-            &json!({"path": target.to_string_lossy(), "content": "x"}),
-        )
-        .await;
-
-    assert!(
-        result.contains("blocked while plan mode is active"),
-        "write_file must be blocked while a plan is being authored (parity with server). Got: {result}"
-    );
-    assert!(
-        result.contains("exit_plan_mode"),
-        "the error must point the model at exit_plan_mode as the escape hatch. Got: {result}"
-    );
-    assert!(
-        !target.exists(),
-        "the guard must short-circuit BEFORE any file is created on disk"
-    );
+    (server, executor, temp)
 }
 
-#[tokio::test]
-async fn refining_plan_still_blocks_writes_during_authoring() {
-    let server = MockServer::start().await;
-    mock_authoring_plan_present(&server, "sess-refining", "plan-r", "refining").await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let canary = temp.path().join("canary.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-refining")
-        .with_cloud(server.uri(), "token");
-
-    let result = executor
-        .execute(
-            "bash",
-            &json!({"command": format!("touch {}", canary.display())}),
-        )
-        .await;
-
-    assert!(
-        result.contains("blocked while plan mode is active"),
-        "refining plans remain authoring-active until approval. Got: {result}"
-    );
-    assert!(
-        !canary.exists(),
-        "authoring guard must stop the shell before side effects leak"
-    );
-}
-
-#[tokio::test]
-async fn bash_is_blocked_while_plan_mode_is_authoring() {
-    let server = MockServer::start().await;
-    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let canary = temp.path().join("canary.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
-
-    let result = executor
-        .execute(
-            "bash",
-            &json!({"command": format!("touch {}", canary.display())}),
-        )
-        .await;
-
-    assert!(
-        result.contains("blocked while plan mode is active"),
-        "bash must be blocked while a plan is being authored. Got: {result}"
-    );
-    assert!(
-        !canary.exists(),
-        "the bash guard must run before the shell, so no side effects leak"
-    );
+#[test]
+fn plan_mode_job_guard_blocks_shell_and_kill_but_allows_reads() {
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "shell", "command": "npm run dev"})
+    ));
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "kill", "job_id": "bg-shell-1"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "output", "job_id": "bg-shell-1"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "list"})
+    ));
 }
 
 #[tokio::test]
@@ -1066,46 +779,6 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
     assert!(
         result.contains("hello"),
         "read_file must return the file contents. Got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn exit_plan_mode_finds_active_refining_cloud_plan() {
-    let server = MockServer::start().await;
-    mock_authoring_plan_present(&server, "sess-refining", "plan-r", "refining").await;
-    Mock::given(method("POST"))
-        .and(path("/plans/plan-r/exit-plan-mode"))
-        .and(header("authorization", "Bearer token"))
-        .and(body_json(json!({
-            "approved": true,
-            "plan_md": "1. Ship auth"
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plan_id": "plan-r",
-            "phase": "refining"
-        })))
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-refining")
-        .with_cloud(server.uri(), "token");
-
-    let result = executor
-        .execute(
-            "exit_plan_mode",
-            &json!({"approved": true, "plan": "1. Ship auth"}),
-        )
-        .await;
-
-    assert!(
-        result.starts_with("Exited plan mode."),
-        "refining active plans must exit through the cloud path. Got: {result}"
-    );
-    assert!(
-        result.contains("plan-r"),
-        "result should mention the resolved plan id. Got: {result}"
     );
 }
 
@@ -1142,13 +815,26 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         "precondition: writes must be blocked before exit. Got: {blocked}"
     );
 
-    // Approve exit.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
+    let overlay_task = tokio::spawn(async move {
+        let request = rx.recv().await.expect("overlay request");
+        let _ = request
+            .response_tx
+            .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
+                mode: crate::cli::permission_manager::PermissionMode::Auto,
+            });
+    });
+
+    // Approve exit through the trusted overlay.
     let exit = executor
-        .execute("exit_plan_mode", &json!({"approved": true}))
+        .execute("exit_plan_mode", &json!({"plan": "1. Ship"}))
         .await;
+    overlay_task.await.unwrap();
     assert!(
         exit.starts_with("Exited plan mode."),
-        "exit_plan_mode(approved=true) must succeed. Got: {exit}"
+        "trusted overlay approval must succeed. Got: {exit}"
     );
 
     // After approval, writes go through.
@@ -1160,77 +846,66 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         .await;
     assert!(
         !unblocked.contains("blocked while plan mode is active"),
-        "after exit_plan_mode(approved=true), writes must be unblocked. Got: {unblocked}"
+        "after trusted exit_plan_mode approval, writes must be unblocked. Got: {unblocked}"
     );
 }
 
 #[tokio::test]
-async fn write_guard_is_inactive_when_no_planning_plan_exists() {
-    let server = MockServer::start().await;
-    mock_no_authoring_plan(&server, "sess-1").await;
+async fn write_guard_is_inactive_when_no_authoring_plan() {
+    // Guard must be inactive (fail open) when there's no authoring plan,
+    // regardless of whether cloud is configured or unavailable.
+    for (label, with_cloud, mock_plan) in [
+        ("no plan on cloud", true, true),
+        ("no cloud binding", false, false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("note.txt");
 
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("note.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
+        let executor = if with_cloud {
+            let server = MockServer::start().await;
+            if mock_plan {
+                mock_no_authoring_plan(&server, "sess-1").await;
+            }
+            ToolExecutor::new(temp.path().to_path_buf())
+                .with_active_session_id("sess-1")
+                .with_cloud(server.uri(), "token")
+        } else {
+            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1")
+        };
 
-    let result = executor
-        .execute(
-            "write_file",
-            &json!({"path": target.to_string_lossy(), "content": "x"}),
-        )
-        .await;
+        let result = executor
+            .execute(
+                "write_file",
+                &json!({"path": target.to_string_lossy(), "content": "x"}),
+            )
+            .await;
 
-    assert!(
-        !result.contains("blocked while plan mode is active"),
-        "with no planning plan present, the guard must be inactive. Got: {result}"
-    );
+        assert!(
+            !result.contains("blocked while plan mode is active"),
+            "[{label}] guard must be inactive. Got: {result}"
+        );
+    }
 }
 
-#[tokio::test]
-async fn write_guard_is_inactive_without_cloud_binding() {
-    // No cloud binding ⇒ guard cannot consult the plan store; it must
-    // fail open so offline / unauthenticated CLI runs still work.
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("note.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
-
-    let result = executor
-        .execute(
-            "write_file",
-            &json!({"path": target.to_string_lossy(), "content": "x"}),
-        )
-        .await;
-
-    assert!(
-        !result.contains("blocked while plan mode is active"),
-        "without cloud binding, the guard must fail open. Got: {result}"
-    );
-}
-
-/// `agent_job` is the new entry point. It must dispatch the four
-/// background actions to the same handlers that previously sat on
-/// `task` — verified here with the cheapest possible smoke: an
+/// `job` is the entry point. It must dispatch the background
+/// shell actions to the same handlers that previously sat on `task` —
+/// verified here with the cheapest possible smoke: an
 /// unwired CLI executor returns a known fail-fast string for each
 /// action (the BackgroundTaskRegistry is wired only inside the TUI
 /// REPL — see `task_background_shell_fails_fast_when_unwired`).
 #[tokio::test]
-async fn agent_job_actions_dispatch_through_executor() {
+async fn job_actions_dispatch_through_executor() {
     let executor = test_executor();
     // shell — needs `command`; without the registry wired we expect
     // the unwired-fast-fail path, not the missing-arg path.
     let result = executor
-        .execute(
-            "agent_job",
-            &json!({"action": "shell", "command": "echo hi"}),
-        )
+        .execute("job", &json!({"action": "shell", "command": "echo hi"}))
         .await;
     assert!(
         result.contains("background_shell")
             || result.contains("interactive REPL")
             || result.contains("not available"),
-        "agent_job.shell should reach the same fail-fast path that \
+        "job.shell should reach the same fail-fast path that \
          task.background_shell used to hit (registry only wired inside \
          the TUI). Got: {result}"
     );
@@ -1238,18 +913,46 @@ async fn agent_job_actions_dispatch_through_executor() {
     // output — must reach the same handler that returns the unwired
     // message; both kill and output share the registry dependency.
     let result = executor
-        .execute(
-            "agent_job",
-            &json!({"action": "kill", "task_id": "bg-shell-1"}),
-        )
+        .execute("job", &json!({"action": "kill", "job_id": "bg-shell-1"}))
         .await;
     assert!(
         result.contains("background")
             || result.contains("interactive REPL")
             || result.contains("Nothing to kill"),
-        "agent_job.kill should reach the registry-unwired fail-fast path. \
+        "job.kill should reach the registry-unwired fail-fast path. \
          Got: {result}"
     );
+}
+
+#[tokio::test]
+async fn job_agent_action_is_rejected_with_agent_tool_guidance() {
+    let executor = test_executor();
+    let result = executor
+        .execute("job", &json!({"action": "agent", "prompt": "audit TODOs"}))
+        .await;
+
+    assert!(result.contains("not a supported user journey"), "{result}");
+    assert!(result.contains("agent(action='spawn'"), "{result}");
+    assert!(result.contains("agent(action='get_result'"), "{result}");
+    assert!(
+        !result.contains("background_agent requires"),
+        "job.agent must not route into the old background_agent shim. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_agent_job_tool_is_rejected_with_job_guidance() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "agent_job",
+            &json!({"action": "shell", "command": "echo hi"}),
+        )
+        .await;
+
+    assert!(result.contains("removed from the user journey"), "{result}");
+    assert!(result.contains("job(action='shell'"), "{result}");
+    assert!(result.contains("agent(action='spawn'"), "{result}");
 }
 
 /// The `agent` tool's action enum must NOT advertise "delegate" to

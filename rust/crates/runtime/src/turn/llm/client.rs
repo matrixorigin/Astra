@@ -2773,6 +2773,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                             provider,
                             max_output_tokens,
                             fb_timeout,
+                            wire_model_name,
                             header_overrides,
                             request_body_overrides,
                             completions_url_override,
@@ -2852,6 +2853,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                         provider,
                         max_output_tokens,
                         fb_timeout,
+                        wire_model_name,
                         header_overrides,
                         request_body_overrides,
                         completions_url_override,
@@ -3652,6 +3654,7 @@ impl Drop for CancelOnClientDisconnect {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // only used in #[cfg(test)]
 pub(crate) async fn call_llm_nonstream_fallback(
     client: &reqwest::Client,
     messages: &[Value],
@@ -3677,6 +3680,7 @@ pub(crate) async fn call_llm_nonstream_fallback(
         None,
         None,
         None,
+        None,
         &ThinkingConfig::Off,
     )
     .await
@@ -3693,6 +3697,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     provider: &str,
     max_output_tokens: Option<usize>,
     timeout: std::time::Duration,
+    wire_model_name: Option<&str>,
     header_overrides: Option<&HashMap<String, String>>,
     request_body_overrides: Option<&Map<String, Value>>,
     completions_url_override: Option<&str>,
@@ -3700,13 +3705,14 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let started = Instant::now();
+    let upstream_name = wire_model_name.unwrap_or(model_name);
 
     let messages = consolidate_system_messages(messages);
 
     let body = build_provider_request_body_with_overrides(
         &messages,
         tools,
-        model_name,
+        upstream_name,
         provider,
         max_output_tokens,
         None,
@@ -3719,7 +3725,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         base_url,
         completions_url_override,
         provider,
-        model_name,
+        upstream_name,
         false,
     );
     let mut req = client.post(&url).header("content-type", "application/json");
@@ -5146,6 +5152,14 @@ mod tests {
         fallback_hits: Arc<AtomicU32>,
     }
 
+    #[derive(Clone, Default)]
+    struct StreamFallbackModelCapture {
+        stream_model: Arc<Mutex<Option<String>>>,
+        fallback_model: Arc<Mutex<Option<String>>>,
+        stream_hits: Arc<AtomicU32>,
+        fallback_hits: Arc<AtomicU32>,
+    }
+
     async fn spawn_local_http_server(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -5341,6 +5355,40 @@ mod tests {
             Response::builder()
                 .status(500)
                 .body(Body::from("fallback exploded"))
+                .unwrap()
+        }
+    }
+
+    async fn mock_stream_idle_after_partial_captures_fallback_model(
+        State(state): State<StreamFallbackModelCapture>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if is_stream {
+            state.stream_hits.fetch_add(1, Ordering::SeqCst);
+            *state.stream_model.lock().expect("stream model lock") = model;
+            let partial = json!({"choices":[{"delta":{"content":"partial"}}]});
+            let body_stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+                format!("data: {partial}\n\n"),
+            ))])
+            .chain(stream::pending::<Result<Bytes, std::io::Error>>());
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(body_stream))
+                .unwrap()
+        } else {
+            state.fallback_hits.fetch_add(1, Ordering::SeqCst);
+            *state.fallback_model.lock().expect("fallback model lock") = model;
+            Response::builder()
+                .status(200)
+                .body(Body::from(
+                    r#"{"choices":[{"message":{"content":"from-fallback"}}]}"#,
+                ))
                 .unwrap()
         }
     }
@@ -6855,6 +6903,58 @@ mod tests {
         assert_eq!(res.full_text, "from-transport-fallback");
         assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_fallback_uses_wire_model_name() {
+        let _guard = set_test_stream_timeouts(10, Some(10));
+        let state = StreamFallbackModelCapture::default();
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(mock_stream_idle_after_partial_captures_fallback_model),
+            )
+            .with_state(state.clone());
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "deepseek-v4-pro-official",
+            Some("deepseek-v4-pro"),
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect("fallback succeeds");
+
+        assert_eq!(res.full_text, "from-fallback");
+        assert_eq!(res.model_used, "deepseek-v4-pro-official");
+        assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .stream_model
+                .lock()
+                .expect("stream model lock")
+                .as_deref(),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            state
+                .fallback_model
+                .lock()
+                .expect("fallback model lock")
+                .as_deref(),
+            Some("deepseek-v4-pro"),
+            "non-stream fallback must use the upstream wire model, not the local alias"
+        );
     }
 
     #[tokio::test]

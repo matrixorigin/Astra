@@ -463,6 +463,7 @@ mod tests {
     pub(crate) use super::test_utils::isolated_sessions_dir;
     pub(crate) use super::test_utils::stub_stream_result;
     pub(crate) use super::test_utils::stub_stream_result_with_records;
+    pub(crate) use super::test_utils::test_temp_dir;
     pub(crate) use super::test_utils::wait_until;
 
     use super::{
@@ -476,9 +477,9 @@ mod tests {
     use cli::auth_flow::{do_login, do_register};
     use cli::cli_config::cli_args::{
         AgentSubcommand, AuditCmd, AuditShowArgs, AuditToolsArgs, BugSubcommand, Command,
-        ConfigCmd, DiffSubcommand, McpCmd, MemorySubcommand, MessagingArgs, MessagingSubcommand,
-        PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd, SessionShowArgs,
-        TaskSubcommand, TeamSubcommand,
+        ConfigCmd, DiffSubcommand, JobSubcommand, McpCmd, MemorySubcommand, MessagingArgs,
+        MessagingSubcommand, PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd,
+        SessionShowArgs, TeamSubcommand,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, prefix_chars, save_credentials,
@@ -2896,14 +2897,14 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn cli_task_command_parses_structured_run_subcommand() {
-        let cli = Cli::try_parse_from(["astra", "task", "run", "fix", "login", "page"]).unwrap();
+    fn cli_job_command_parses_structured_run_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "job", "run", "fix", "login", "page"]).unwrap();
         match cli.command {
-            Some(Command::Task(args)) => match args.command {
-                Some(TaskSubcommand::Run(run)) => {
+            Some(Command::Job(args)) => match args.command {
+                Some(JobSubcommand::Run(run)) => {
                     assert_eq!(run.text, vec!["fix", "login", "page"]);
                 }
-                other => panic!("unexpected task subcommand: {other:?}"),
+                other => panic!("unexpected job subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3478,7 +3479,7 @@ total_tokens_out: 500
         let tmp = tempfile::tempdir().unwrap();
         let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
 
-        // Create a task (simulates what /task run does)
+        // Create a task record (simulates what `astra job run` does).
         let tid = svc
             .create_task(
                 "test-user",
@@ -3525,7 +3526,7 @@ total_tokens_out: 500
         // Complete the task
         svc.complete_task(&tid).await.unwrap();
 
-        // Read back and verify (simulates /task result)
+        // Read back and verify (simulates `astra job result`).
         let record = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         let cp = record.checkpoint.unwrap();

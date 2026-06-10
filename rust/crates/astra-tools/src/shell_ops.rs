@@ -1,8 +1,8 @@
 //! Shell operations: bash execution, grep, glob.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
-use std::sync::OnceLock;
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -10,16 +10,78 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
-use astra_sandbox::{CommandRisk, analyze_command_risks, is_rm_catastrophic_rm_path};
+use astra_sandbox::{CommandRisk, analyze_command_risks};
 
+use crate::detach::DetachShellHandle;
 use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exit};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// RAII guard for detach handle lifecycle. Takes ownership on creation,
+/// automatically restores to slot on drop unless explicitly consumed.
+/// This prevents handle leaks on early-return paths (errors, validation failures).
+///
+/// Usage pattern:
+/// - Borrow handle via `.get_ref()` for operations
+/// - On success (Detached): call `.take()` to consume
+/// - On error/completed: call `.restore()` to return to slot
+/// - Guard's drop logs error if handle still present (leak detection)
+struct DetachHandleGuard<'a> {
+    slot: Option<&'a Arc<Mutex<Option<DetachShellHandle>>>>,
+    handle: Option<DetachShellHandle>,
+}
+
+impl<'a> DetachHandleGuard<'a> {
+    fn new(
+        slot: Option<&'a Arc<Mutex<Option<DetachShellHandle>>>>,
+        handle: Option<DetachShellHandle>,
+    ) -> Self {
+        Self { slot, handle }
+    }
+
+    /// Borrow the handle for use. Returns None if handle was already taken.
+    fn get_ref(&self) -> Option<&DetachShellHandle> {
+        self.handle.as_ref()
+    }
+
+    /// Take ownership of the handle. Guard's drop becomes a no-op.
+    /// Call this only on success paths where the handle is consumed (e.g., Detached).
+    fn take(&mut self) -> Option<DetachShellHandle> {
+        self.handle.take()
+    }
+
+    fn has_handle(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Restore handle to slot. Call this on error/completed paths.
+    /// Consumes self and restores the handle to the slot for reuse.
+    async fn restore(mut self) {
+        if let (Some(slot), Some(handle)) = (self.slot.as_ref(), self.handle.take()) {
+            *slot.lock().await = Some(handle);
+        }
+    }
+}
+
+impl<'a> Drop for DetachHandleGuard<'a> {
+    fn drop(&mut self) {
+        // If handle is still present, we leaked it. This should never happen
+        // because callers must either take() or restore() before drop.
+        // We can't async-lock in drop, so we just log a warning.
+        if self.handle.is_some() {
+            tracing::error!(
+                "DetachHandleGuard dropped without restore/take — handle leaked. \
+                 This is a bug: all paths must explicitly restore or take the handle."
+            );
+        }
+    }
+}
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
 /// cannot confidently identify the command family. See [`classify_bash_command`]
@@ -340,7 +402,7 @@ enum SearchSortMode {
     Path,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StreamKind {
     Stdout,
     Stderr,
@@ -415,6 +477,132 @@ struct SearchIgnoreRule {
 /// by the same set OR end-of-string. This catches `socat\tTCP:…`,
 /// `;socat …`, `| telnet …`, and bare `socat`, while leaving
 /// `socatenated` / `mytelnetlog` untouched.
+/// Detect `rm` with both recursive and force flags in any order/spacing.
+/// Catches: rm -rf, rm -r -f, rm -rfv, rm -R -f, rm --recursive --force, rm -r --force, etc.
+///
+/// The input is split into individual commands by shell operators (`;`, `|`,
+/// `&&`, `||`, newlines). Each command is checked independently so that flags
+/// on a later command (e.g. `echo -r -f`) are never attributed to an earlier
+/// `rm`. Within a single command, all flag-bearing arguments are scanned
+/// regardless of interleaved path arguments, because `rm` accepts flags and
+/// paths in any order.
+fn is_rm_recursive_force(lower: &str) -> bool {
+    use std::path::Path;
+
+    // Split into individual commands by shell operators.
+    for segment in lower.split(&[';', '\n']) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        // Further split by pipe and background operators
+        for script in segment.split(&['|', '&']) {
+            let script = script.trim();
+            if script.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = script.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            // Recursively check `bash -c "<script>"`, `sh -c "<script>"`, etc.
+            // This closes the simplest bypass where a user wraps `rm -rf` in a
+            // quoted -c argument that the tokenizer can't see inside.
+            if let Some(inner_script) = extract_c_argument(&tokens) {
+                if is_rm_recursive_force(inner_script) {
+                    return true;
+                }
+                continue;
+            }
+            // Check the basename of token[0] — a path like /usr/bin/rm
+            // or busybox alias should still be recognized as rm.
+            let first = tokens[0];
+            let basename = Path::new(first)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(first);
+            // Multi-call binaries: busybox rm, toybox rm, etc.
+            let is_rm_cmd = if basename == "rm" {
+                true
+            } else if (basename == "busybox" || basename == "toybox") && tokens.len() >= 2 {
+                let second = Path::new(tokens[1])
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(tokens[1]);
+                second == "rm"
+            } else {
+                false
+            };
+            if !is_rm_cmd {
+                continue;
+            }
+
+            // tokens[0] is the rm command (verified via basename above).
+            // Check all subsequent tokens for recursive + force flags.
+            let mut has_recursive = false;
+            let mut has_force = false;
+            for &arg in &tokens[1..] {
+                if arg == "--recursive" {
+                    has_recursive = true;
+                } else if arg == "--force" {
+                    has_force = true;
+                } else if arg.starts_with("--") {
+                } else if arg.starts_with('-') {
+                    for c in arg.chars().skip(1) {
+                        match c {
+                            'r' | 'R' => has_recursive = true,
+                            'f' => has_force = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if has_recursive && has_force {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// When args looks like `["bash", "-c", "\"rm -rf /\""]` (or `sh`, `zsh`),
+/// extract the script argument with outer quotes stripped and return it
+/// for recursive scanning. Returns `None` if the command is not a
+/// `*-c <script>` invocation.
+fn extract_c_argument<'a>(args: &[&'a str]) -> Option<&'a str> {
+    // Match `bash -c <script>`, `sh -c <script>`, `zsh -c <script>`.
+    if args.len() < 3 {
+        return None;
+    }
+    if !matches!(
+        args[0],
+        "bash"
+            | "sh"
+            | "zsh"
+            | "/bin/bash"
+            | "/bin/sh"
+            | "/bin/zsh"
+            | "/usr/bin/bash"
+            | "/usr/bin/sh"
+            | "/usr/bin/zsh"
+    ) {
+        return None;
+    }
+    if args[1] != "-c" {
+        return None;
+    }
+    let script = args[2];
+    // Strip one layer of matching outer quotes (single or double).
+    let stripped = if (script.starts_with('"') && script.ends_with('"'))
+        || (script.starts_with('\'') && script.ends_with('\''))
+    {
+        &script[1..script.len().saturating_sub(1)]
+    } else {
+        script
+    };
+    Some(stripped)
+}
+
 fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
     fn is_sep(c: char) -> bool {
         matches!(c, ' ' | '\t' | ';' | '|' | '&' | '(' | '\n' | '\r')
@@ -468,11 +656,14 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             ));
         }
     }
-    // Path-aware rm -rf: block only catastrophic targets, let permission layer handle the rest.
-    if (lower.contains("rm -rf") || lower.contains("rm -fr")) && is_rm_catastrophic_rm_path(&lower)
-    {
+    // **rm -rf hard block**: detect recursive+force deletion semantically,
+    // not just string patterns. Block: rm -rf, rm -r -f, rm --recursive --force,
+    // and indirect invocation via find/xargs. From first principles: the
+    // semantic intent is "delete recursively without confirmation", which
+    // must be blocked regardless of flag ordering or invocation method.
+    if is_rm_recursive_force(&lower) {
         return Err(
-            "Error: rm -rf targeting root/home/system path is blocked in execute_bash".into(),
+            "Error: recursive force deletion (rm -rf) requires explicit confirmation (use rm -r without -f, or confirm via permission layer)".into(),
         );
     }
     if (lower.contains("curl ") || lower.contains("wget "))
@@ -602,43 +793,63 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     // sibling runner so Ctrl+B can transfer child + streams to the
     // BackgroundTaskRegistry. Without a slot OR with an empty slot
     // we fall through to the legacy reader (zero hot-path overhead).
-    let detach_handle = if let Some(slot) = ctx.detach_shell_handle.as_ref() {
-        slot.lock().await.take()
-    } else {
-        None
-    };
+    //
+    // RAII guard pattern: take handle from slot, wrap in guard that
+    // tracks ownership. Callers must explicitly restore() on error
+    // paths or take() on success paths where the handle is consumed.
+    // Guard's drop logs a warning if the handle is still present (leak).
+    let detach_slot = ctx.detach_shell_handle.as_ref().cloned();
+    let mut detach_handle_guard = DetachHandleGuard::new(
+        detach_slot.as_ref(),
+        if let Some(slot) = detach_slot.as_ref() {
+            slot.lock().await.take()
+        } else {
+            None
+        },
+    );
 
-    let output = if let Some(detach_handle) = detach_handle {
+    let output = if detach_handle_guard.has_handle() {
+        let handle_ref = detach_handle_guard.get_ref().unwrap();
         match run_bash_with_detach(
             &mut cmd,
             timeout,
             raw_stdout_limit,
             raw_stderr_limit,
             ctx.cancel_token.as_deref(),
-            &detach_handle,
+            handle_ref,
             command,
         )
         .await
         {
-            Ok(BashRunOutcome::Completed(output)) => output,
+            Ok(BashRunOutcome::Completed(output)) => {
+                // Restore handle to slot for next bash call in this turn.
+                detach_handle_guard.restore().await;
+                output
+            }
             Ok(BashRunOutcome::Detached(payload)) => {
                 // Hand the live child + streams back to the host
                 // through the one-shot reply channel. The host drains
                 // it in its event-loop tick and calls
                 // BackgroundTaskRegistry::adopt_detached_shell.
-                if let Some(sender) = detach_handle.payload_tx.lock().await.take() {
-                    let send_failed = sender.send(*payload).is_err();
-                    if send_failed {
-                        return ToolResult::error(
-                            "Error: bash detach: TUI listener dropped before payload arrived"
-                                .to_string(),
-                        );
-                    }
+                let detach_handle = detach_handle_guard.take().unwrap();
+                let Some(sender) = detach_handle.payload_tx.lock().await.take() else {
+                    terminate_detached_payload(payload).await;
+                    return ToolResult::error(
+                        "Error: bash detach failed: host payload channel was not available"
+                            .to_string(),
+                    );
+                };
+                if let Err(payload) = sender.send(*payload) {
+                    terminate_detached_payload(Box::new(payload)).await;
+                    return ToolResult::error(
+                        "Error: bash detach failed: host listener dropped before payload arrived"
+                            .to_string(),
+                    );
                 }
                 let mut result = ToolResult::text(
                     "<bash_detached>The bash command was promoted to a background task. \
                      The host will resume reading its output via the BackgroundTaskRegistry; \
-                     poll progress with `agent_job(action='output', task_id=<bg-shell-N>)`.\
+                     poll progress with `job(action='output')` or `job(action='output', job_id=<bg-shell-N>)`.\
                      </bash_detached>"
                         .to_string(),
                 );
@@ -647,7 +858,12 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 result.metadata = Some(metadata);
                 return result;
             }
-            Err(e) => return ToolResult::error(e),
+            Err(e) => {
+                // Restore handle on error so subsequent bash calls in this turn
+                // can still use detach. Handle is only consumed on successful Detached.
+                detach_handle_guard.restore().await;
+                return ToolResult::error(e);
+            }
         }
     } else {
         match run_readonly_command_with_partial(
@@ -713,7 +929,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         } else {
             result = format!("Error: bash timed out after {timeout_secs}s with no captured output");
         }
-        return ToolResult::error(truncate_output(result, output_limit));
+        return ToolResult::error(truncate_output(result, output_limit))
+            .with_exit_semantics(ExitSemantics::TimedOut);
     }
 
     if output.cancelled {
@@ -722,7 +939,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         } else {
             result = "Error: bash cancelled before any output was captured".into();
         }
-        return ToolResult::error(truncate_output(result, output_limit));
+        return ToolResult::error(truncate_output(result, output_limit))
+            .with_exit_semantics(ExitSemantics::Cancelled);
     }
 
     let exit_semantics = classify_exit(command, output.exit_code);
@@ -1909,7 +2127,7 @@ async fn load_gitignored_search_paths(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = exit_code_from_status(&output.status);
     if exit_code == 0 {
         return Ok(stdout.lines().map(strip_current_dir_prefix).collect());
     }
@@ -2697,6 +2915,24 @@ async fn sigkill_process_group(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    -1
+}
+
+async fn terminate_detached_payload(mut payload: Box<crate::detach::DetachedShellPayload>) {
+    sigkill_process_group(&mut payload.child).await;
+}
+
 async fn run_readonly_command_with_partial(
     cmd: &mut Command,
     timeout: Duration,
@@ -2726,7 +2962,7 @@ async fn run_readonly_command_with_partial(
         .take()
         .ok_or_else(|| format!("Error: failed to capture {command_kind} stderr"))?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(StreamKind, String)>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(StreamKind, String)>(256);
     let stdout_task = tokio::spawn(read_stream(stdout, StreamKind::Stdout, tx.clone()));
     let stderr_task = tokio::spawn(read_stream(stderr, StreamKind::Stderr, tx));
 
@@ -2752,7 +2988,7 @@ async fn run_readonly_command_with_partial(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                exit_code = Some(status.code().unwrap_or(-1));
+                exit_code = Some(exit_code_from_status(&status));
                 break;
             }
             Ok(None) => {
@@ -2858,12 +3094,10 @@ pub(crate) async fn run_bash_with_detach(
         .take()
         .ok_or_else(|| "Error: failed to capture bash command stderr".to_string())?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(StreamKind, String)>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(StreamKind, String)>(256);
     // Two private notify halves so the outer detach signal fans out
-    // to both reader tasks without losing notifications. Cloning the
-    // shared Notify directly works because notify_one wakes one
-    // waiter; we want both to stop, so we trip both manually after
-    // observing the shared signal.
+    // to both reader tasks without losing notifications. We trip
+    // both manually after observing the shared oneshot signal.
     let stdout_detach = Arc::new(tokio::sync::Notify::new());
     let stderr_detach = Arc::new(tokio::sync::Notify::new());
     let stdout_task = tokio::spawn(read_stream_until_detach(
@@ -2878,6 +3112,11 @@ pub(crate) async fn run_bash_with_detach(
         tx,
         stderr_detach.clone(),
     ));
+
+    // Take the watch receiver for detach. If absent, treat as no detach
+    // plumbing (legacy path). The watch receiver is borrowed in select!
+    // so we don't need ownership gymnastics.
+    let mut signal_rx = detach.signal_rx.lock().await.take();
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut stdout_text = String::new();
@@ -2902,7 +3141,7 @@ pub(crate) async fn run_bash_with_detach(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                exit_code = Some(status.code().unwrap_or(-1));
+                exit_code = Some(exit_code_from_status(&status));
                 break;
             }
             Ok(None) => {
@@ -2912,33 +3151,55 @@ pub(crate) async fn run_bash_with_detach(
                     break;
                 }
                 // Race: detach signal vs cancel vs idle tick.
-                let detach_signal = detach.signal.clone();
-                if let Some(token) = cancel_token {
+                // Watch receiver's `changed()` borrows `&mut self` so it
+                // plays nicely with select! without ownership transfer.
+                if let Some(ref mut rx) = signal_rx {
+                    if let Some(token) = cancel_token {
+                        tokio::select! {
+                            _ = token.cancelled() => {
+                                cancelled = true;
+                                sigkill_process_group(&mut child).await;
+                                break;
+                            }
+                            res = rx.changed() => {
+                                if res.is_ok() {
+                                    detached = true;
+                                    stdout_detach.notify_one();
+                                    stderr_detach.notify_one();
+                                    break;
+                                }
+                                // Sender dropped → no detach possible.
+                                signal_rx = None;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        }
+                    } else {
+                        tokio::select! {
+                            res = rx.changed() => {
+                                if res.is_ok() {
+                                    detached = true;
+                                    stdout_detach.notify_one();
+                                    stderr_detach.notify_one();
+                                    break;
+                                }
+                                signal_rx = None;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        }
+                    }
+                } else if let Some(token) = cancel_token {
+                    // No detach signal available, but cancel is wired.
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
                             sigkill_process_group(&mut child).await;
                             break;
                         }
-                        _ = detach_signal.notified() => {
-                            detached = true;
-                            // Trip both reader notifies so they yield streams.
-                            stdout_detach.notify_one();
-                            stderr_detach.notify_one();
-                            break;
-                        }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                     }
                 } else {
-                    tokio::select! {
-                        _ = detach_signal.notified() => {
-                            detached = true;
-                            stdout_detach.notify_one();
-                            stderr_detach.notify_one();
-                            break;
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                    }
+                    // Neither detach nor cancel: plain tick.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
             Err(e) => {
@@ -2990,17 +3251,13 @@ pub(crate) async fn run_bash_with_detach(
             });
             return Ok(BashRunOutcome::Detached(payload));
         }
-        // Streams already drained — fall back to Completed shape.
-        let _ = child.wait().await;
-        return Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
-            stdout: stdout_text,
-            stderr: stderr_text,
-            exit_code: -1,
-            timed_out: false,
-            cancelled: false,
-            stdout_capped,
-            stderr_capped,
-        }));
+        // Detach is an ownership transfer. If either stream is already gone,
+        // the host cannot safely adopt the live process, so terminate it
+        // instead of leaving an orphan or blocking the foreground tool.
+        sigkill_process_group(&mut child).await;
+        return Err(
+            "Error: bash detach failed: child stream closed before handoff completed".to_string(),
+        );
     }
 
     // Normal completion path: drain remaining bytes and assemble
@@ -3036,7 +3293,7 @@ pub(crate) async fn run_bash_with_detach(
 async fn read_stream<R>(
     mut stream: R,
     kind: StreamKind,
-    tx: tokio::sync::mpsc::UnboundedSender<(StreamKind, String)>,
+    tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -3046,7 +3303,14 @@ async fn read_stream<R>(
             Ok(0) => break,
             Ok(read) => {
                 let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                let _ = tx.send((kind, text));
+                if tx.send((kind, text)).await.is_err() {
+                    tracing::warn!(
+                        stream_kind = ?kind,
+                        "command output channel closed; {} bytes of output lost",
+                        read
+                    );
+                    break;
+                }
             }
             Err(_) => break,
         }
@@ -3070,7 +3334,7 @@ async fn read_stream<R>(
 async fn read_stream_until_detach<R>(
     mut stream: R,
     kind: StreamKind,
-    tx: tokio::sync::mpsc::UnboundedSender<(StreamKind, String)>,
+    tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
     detach: std::sync::Arc<tokio::sync::Notify>,
 ) -> Option<R>
 where
@@ -3087,7 +3351,14 @@ where
                 Ok(0) => return None,
                 Ok(read) => {
                     let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                    let _ = tx.send((kind, text));
+                    if tx.send((kind, text)).await.is_err() {
+                        tracing::warn!(
+                            stream_kind = ?kind,
+                            "detach command output channel closed; {} bytes lost",
+                            read
+                        );
+                        return None;
+                    }
                 }
                 Err(_) => return None,
             },
@@ -3099,7 +3370,7 @@ where
 }
 
 fn drain_command_chunks(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(StreamKind, String)>,
+    rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
     stdout_text: &mut String,
     stderr_text: &mut String,
     max_stdout_bytes: usize,
@@ -4321,13 +4592,17 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn validate_bash_rm_rf_project_relative_allowed() {
-        // Project-relative rm -rf: should pass validation (permission layer handles Ask)
-        assert!(validate_execute_bash_command("rm -rf ./build").is_ok());
-        assert!(validate_execute_bash_command("rm -rf node_modules").is_ok());
-        assert!(validate_execute_bash_command("rm -rf dist/").is_ok());
-        assert!(validate_execute_bash_command("rm -rf target/debug").is_ok());
-        assert!(validate_execute_bash_command("rm -fr .cache").is_ok());
+    fn validate_bash_rm_r_project_relative_allowed_but_rm_rf_blocked() {
+        assert!(validate_execute_bash_command("rm -r ./build").is_ok());
+        assert!(validate_execute_bash_command("rm -r node_modules").is_ok());
+        assert!(validate_execute_bash_command("rm -r dist/").is_ok());
+        assert!(validate_execute_bash_command("rm -r target/debug").is_ok());
+
+        assert!(validate_execute_bash_command("rm -rf ./build").is_err());
+        assert!(validate_execute_bash_command("rm -rf node_modules").is_err());
+        assert!(validate_execute_bash_command("rm -rf dist/").is_err());
+        assert!(validate_execute_bash_command("rm -rf target/debug").is_err());
+        assert!(validate_execute_bash_command("rm -fr .cache").is_err());
     }
 
     #[test]
@@ -4437,6 +4712,75 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_grep_no_match_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "grep needle haystack.txt"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "grep no-match is informational, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_diff_difference_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "diff a.txt b.txt"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "diff differences are domain-negative, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_false_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "false"})).await;
+
+        assert!(
+            !result.is_error,
+            "false is a domain-negative shell predicate, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
+        );
+    }
+
+    #[tokio::test]
     async fn bash_masked_missing_command_is_env_failure() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -4488,6 +4832,10 @@ printf 'probe.txt:1:needle\n'
             "got: {}",
             result.output
         );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::TimedOut)
+        );
         assert!(!result.output.contains("done"), "got: {}", result.output);
     }
 
@@ -4532,6 +4880,27 @@ printf 'probe.txt:1:needle\n'
             result.output.contains("bash cancelled"),
             "got: {}",
             result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn exit_status_signal_is_not_encoded_as_minus_one() {
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .await
+            .expect("spawn signal test");
+
+        assert_eq!(exit_code_from_status(&status), 143);
+        assert_eq!(
+            classify_exit("bash -c 'kill -TERM $$'", exit_code_from_status(&status)),
+            crate::exit_semantics::ExitSemantics::Signaled
         );
     }
 
@@ -4931,7 +5300,7 @@ printf 'probe.txt:1:needle\n'
         // armed. 200ms is comfortably more than the 25ms tick
         // without entering the post-sleep `after` window.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        listener.signal.notify_one();
+        listener.signal_tx.send(true).expect("detach signal send");
 
         let payload = listener
             .payload_rx
@@ -4969,6 +5338,147 @@ printf 'probe.txt:1:needle\n'
         // The child is still alive in the payload; clean up so the
         // test doesn't leak a sleeping shell.
         drop(payload);
+    }
+
+    #[tokio::test]
+    async fn bash_detach_without_payload_channel_kills_child_and_errors() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (handle, listener) = crate::detach::new_detach_pair();
+        *handle.payload_tx.lock().await = None;
+        let slot = Arc::new(Mutex::new(Some(handle)));
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+            .await
+            .expect("detach failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("host payload channel was not available"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_detach_when_listener_dropped_kills_child_and_errors() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        let crate::detach::DetachShellListener {
+            signal_tx,
+            payload_rx,
+        } = listener;
+        drop(payload_rx);
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        signal_tx.send(true).expect("detach signal send");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+            .await
+            .expect("detach failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("host listener dropped before payload arrived"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_detach_after_stream_eof_kills_child_and_errors() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "exec 1>&-; sleep 30"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+            .await
+            .expect("detach failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("child stream closed before handoff completed"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_detach_slot_is_reusable_after_normal_completion() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, _listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot.clone());
+
+        let first = execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})).await;
+        assert!(first.output.contains("first"), "{}", first.output);
+        assert!(
+            slot.lock().await.is_some(),
+            "normal bash completion must return the detach handle so later bash calls in the same turn can still be backgrounded"
+        );
+
+        let second =
+            execute_bash(&ctx, &serde_json::json!({"command": "printf 'second\\n'"})).await;
+        assert!(second.output.contains("second"), "{}", second.output);
+        assert!(
+            slot.lock().await.is_some(),
+            "second normal bash completion must also return the detach handle"
+        );
     }
 
     /// Sanity: when no detach handle is wired, the bash tool falls

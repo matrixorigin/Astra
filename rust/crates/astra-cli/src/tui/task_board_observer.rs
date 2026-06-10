@@ -47,6 +47,9 @@ const FAST_POLL: Duration = Duration::from_millis(50);
 /// How long the board stays painted after the last incomplete task
 /// closes out before `hidden` flips.
 const HIDE_DELAY: Duration = Duration::from_secs(5);
+/// Cross-session board cap. This view is periodically refreshed while open,
+/// so it must stay bounded even for users with years of completed task rows.
+const CROSS_SESSION_OPEN_LIMIT: usize = 200;
 
 /// Observable snapshot of the task board. Cheap to clone (moves the
 /// owned vec; callers get a full copy).
@@ -78,7 +81,7 @@ pub(crate) enum ViewMode {
 
 impl TaskBoardSnapshot {
     pub fn has_incomplete(&self) -> bool {
-        self.tasks.iter().any(|t| t.status.is_active())
+        self.tasks.iter().any(|t| t.status.is_open_work())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -327,7 +330,7 @@ impl TaskBoardObserver {
             .snapshot
             .tasks
             .iter()
-            .filter(|t| t.status.is_active())
+            .filter(|t| t.status.is_open_work())
             .count();
         (open, total, st.snapshot.hidden)
     }
@@ -411,8 +414,11 @@ impl TaskBoardObserver {
         }
         st.session_id = sid;
         st.snapshot = TaskBoardSnapshot::default();
+        st.multi_snapshot = MultiSessionSnapshot::default();
         st.hide_at = None;
         st.manual_review_visible = false;
+        st.event_ring.clear();
+        st.completed_at.clear();
         self.inner.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -517,7 +523,23 @@ impl TaskBoardObserver {
             Due::All => {
                 let inner = self.inner.clone();
                 tokio::spawn(async move {
-                    let per_session = inner.store.load_all_sessions().await.unwrap_or_default();
+                    let per_session = match inner
+                        .store
+                        .load_open_sessions(CROSS_SESSION_OPEN_LIMIT)
+                        .await
+                    {
+                        Ok(per_session) => per_session,
+                        Err(error) => {
+                            tracing::warn!(
+                                error,
+                                "task board multi-session refresh failed; preserving last snapshot"
+                            );
+                            let (mut st, _) = lock_state(&inner, "multi_fetch_failed");
+                            st.fetch_in_flight = false;
+                            st.last_fetch = Instant::now();
+                            return;
+                        }
+                    };
                     let (mut st, _) = lock_state(&inner, "multi_fetch_complete");
                     st.fetch_in_flight = false;
                     st.last_fetch = Instant::now();
@@ -537,7 +559,20 @@ impl TaskBoardObserver {
             Due::Single(sid) => {
                 let inner = self.inner.clone();
                 tokio::spawn(async move {
-                    let tasks = inner.store.load(&sid).await.unwrap_or_default();
+                    let tasks = match inner.store.load(&sid).await {
+                        Ok(tasks) => tasks,
+                        Err(error) => {
+                            tracing::warn!(
+                                %sid,
+                                error,
+                                "task board refresh failed; preserving last snapshot"
+                            );
+                            let (mut st, _) = lock_state(&inner, "fetch_failed");
+                            st.fetch_in_flight = false;
+                            st.last_fetch = Instant::now();
+                            return;
+                        }
+                    };
                     let (mut st, _) = lock_state(&inner, "fetch_complete");
                     st.fetch_in_flight = false;
                     st.last_fetch = Instant::now();
@@ -650,8 +685,10 @@ fn same_board(a: &[SessionTask], b: &[SessionTask]) -> bool {
 mod tests {
     use super::*;
     use crate::lock_recovery::LockRecovery;
-    use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager};
+    use astra_tools::task_mgmt::{InMemoryTaskStore, SessionTaskStatusKind, TaskManager};
+    use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn mgr(store: Arc<InMemoryTaskStore>, sid: &str) -> TaskManager {
         let store_dyn: Arc<dyn TaskStore> = store;
@@ -664,6 +701,33 @@ mod tests {
             pump();
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn paused_tasks_count_as_incomplete_for_board_visibility() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-paused");
+        let m = mgr(store, "sess-paused");
+
+        m.create(&json!({"title": "paused-work"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+
+        wait_until(
+            || obs.snapshot().has_incomplete(),
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        let snapshot = obs.snapshot();
+        assert!(
+            snapshot.has_incomplete(),
+            "paused open work must keep the board visible"
+        );
+        assert!(!snapshot.hidden, "paused board should not be auto-hidden");
+        assert_eq!(obs.counts().0, 1, "paused task counts as open");
     }
 
     /// REGRESSION (Phase 4 / problem 1): the in-turn `do_draw` path
@@ -716,6 +780,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_single_session_refresh_preserves_last_known_snapshot() {
+        struct FailsAfterFirstLoadStore {
+            loads: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl TaskStore for FailsAfterFirstLoadStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                if self.loads.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    Ok(vec![SessionTask {
+                        archived_at: None,
+                        id: "task-1".to_string(),
+                        title: "visible work".to_string(),
+                        description: None,
+                        status: SessionTaskStatusKind::Pending,
+                        subtasks: Vec::new(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                        active_form: None,
+                        owner: None,
+                        metadata: None,
+                        blocks: Vec::new(),
+                        blocked_by: Vec::new(),
+                    }])
+                } else {
+                    Err("simulated MatrixOne read failure".to_string())
+                }
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let store: Arc<dyn TaskStore> = Arc::new(FailsAfterFirstLoadStore {
+            loads: AtomicUsize::new(0),
+        });
+        let obs = TaskBoardObserver::new(store, "sess-load-fail");
+
+        wait_until(
+            || obs.snapshot().tasks.len() == 1,
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+        assert_eq!(obs.snapshot().tasks[0].title, "visible work");
+
+        {
+            let mut st = obs.inner.state.lock_recover();
+            st.last_fetch = Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
+        }
+        obs.inner.dirty.store(true, Ordering::Relaxed);
+        obs.maybe_refresh();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let snapshot = obs.snapshot();
+        assert_eq!(
+            snapshot.tasks.len(),
+            1,
+            "failed refresh must preserve the last known task board instead of rendering empty"
+        );
+        assert_eq!(snapshot.tasks[0].title, "visible work");
+    }
+
     /// REGRESSION: completed tasks used to linger on the board until
     /// the user opened a new session. With per-task TTL, a task that
     /// has been `completed` for longer than `COMPLETED_TASK_TTL` drops
@@ -729,7 +872,9 @@ mod tests {
         let m = mgr(store, "sess-ttl");
 
         m.create(&json!({"title": "shipping work"})).await;
-        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
             || {
@@ -767,8 +912,7 @@ mod tests {
             "completed task aged past TTL must drop from render snapshot: {:?}",
             render.tasks
         );
-        // Truth snapshot still reports the row so /task list and counts
-        // remain accurate.
+        // Truth snapshot still reports the row so task-board counts remain accurate.
         let truth = obs.snapshot();
         assert_eq!(truth.tasks.len(), 1, "snapshot() must keep aged rows");
     }
@@ -805,6 +949,52 @@ mod tests {
         );
         let st = obs.inner.state.lock_recover();
         assert_eq!(st.session_id, "sess-mid-turn");
+    }
+
+    #[tokio::test]
+    async fn bound_observer_ignores_other_session_broadcasts() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-a");
+
+        let a = mgr(store.clone(), "sess-a");
+        a.create(&json!({"title": "work in a"})).await;
+        wait_until(
+            || {
+                obs.snapshot()
+                    .tasks
+                    .first()
+                    .map(|task| task.title == "work in a")
+                    .unwrap_or(false)
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        {
+            let mut st = obs.inner.state.lock_recover();
+            st.last_fetch = Instant::now();
+        }
+        obs.inner.dirty.store(false, Ordering::Relaxed);
+
+        let b = mgr(store, "sess-b");
+        b.create(&json!({"title": "work in b"})).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        obs.maybe_refresh();
+
+        let snapshot = obs.snapshot();
+        assert_eq!(snapshot.tasks.len(), 1, "{snapshot:?}");
+        assert_eq!(snapshot.tasks[0].title, "work in a");
+        let st = obs.inner.state.lock_recover();
+        assert_eq!(
+            st.session_id, "sess-a",
+            "observer bound to a real session must not adopt later broadcasts from another session"
+        );
+        assert!(
+            !obs.inner.dirty.load(Ordering::Relaxed),
+            "foreign-session broadcasts must not mark the single-session board dirty"
+        );
     }
 
     #[tokio::test]
@@ -865,6 +1055,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebind_clears_completed_ttl_for_same_task_ids_in_new_session() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-a");
+
+        let a = mgr(store.clone(), "sess-a");
+        a.create(&json!({"title": "done in old session"})).await;
+        a.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        a.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        wait_until(
+            || {
+                obs.snapshot()
+                    .tasks
+                    .iter()
+                    .any(|task| task.status.is_completed())
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+        obs.testing_force_completed_at_past("task-1", COMPLETED_TASK_TTL + Duration::from_secs(1));
+        assert!(
+            obs.snapshot_for_render().tasks.is_empty(),
+            "old session's completed task should be aged out before rebind"
+        );
+
+        obs.rebind_session("sess-b");
+        let b = mgr(store, "sess-b");
+        b.create(&json!({"title": "done in new session"})).await;
+        b.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        b.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+
+        wait_until(
+            || {
+                obs.snapshot()
+                    .tasks
+                    .first()
+                    .map(|task| task.title == "done in new session")
+                    .unwrap_or(false)
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        let render = obs.snapshot_for_render();
+        assert!(
+            render
+                .tasks
+                .iter()
+                .any(|task| task.title == "done in new session"),
+            "new session task-1 must get a fresh completed TTL after rebind: {render:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn all_completed_arms_hide_timer() {
         let store = Arc::new(InMemoryTaskStore::new());
         let store_dyn: Arc<dyn TaskStore> = store.clone();
@@ -872,7 +1122,9 @@ mod tests {
         let m = mgr(store, "sess-hide");
 
         m.create(&json!({"title": "done-me"})).await;
-        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
 
         // Pump until the snapshot reflects the completion.
@@ -910,7 +1162,9 @@ mod tests {
         let m = mgr(store, "sess-review");
 
         m.create(&json!({"title": "done-me"})).await;
-        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
             || {
@@ -950,7 +1204,9 @@ mod tests {
         let m = mgr(store, "sess-pinned-review");
 
         m.create(&json!({"title": "done-me"})).await;
-        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
             || {
@@ -1003,7 +1259,9 @@ mod tests {
         let m = mgr(store, "sess-grace-review");
 
         m.create(&json!({"title": "done-me"})).await;
-        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
             .await;
         wait_until(
             || {
@@ -1046,7 +1304,7 @@ mod tests {
         let m = mgr(store, "sess-active");
 
         m.create(&json!({"title": "running-work"})).await;
-        m.update(&json!({"task_id": "task-1", "status": "in_progress"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
         wait_until(
             || {
@@ -1229,6 +1487,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_all_sessions_refresh_preserves_last_known_snapshot() {
+        struct MultiFailsAfterFirstLoadStore {
+            loads: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl TaskStore for MultiFailsAfterFirstLoadStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Ok(Vec::new())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn load_open_sessions(
+                &self,
+                _limit: usize,
+            ) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+                if self.loads.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    Ok(vec![(
+                        "sess-a".to_string(),
+                        vec![SessionTask {
+                            archived_at: None,
+                            id: "task-1".to_string(),
+                            title: "visible cross-session work".to_string(),
+                            description: None,
+                            status: SessionTaskStatusKind::Pending,
+                            subtasks: Vec::new(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            updated_at: chrono::Utc::now().to_rfc3339(),
+                            active_form: None,
+                            owner: None,
+                            metadata: None,
+                            blocks: Vec::new(),
+                            blocked_by: Vec::new(),
+                        }],
+                    )])
+                } else {
+                    Err("simulated cross-session read failure".to_string())
+                }
+            }
+        }
+
+        let store: Arc<dyn TaskStore> = Arc::new(MultiFailsAfterFirstLoadStore {
+            loads: AtomicUsize::new(0),
+        });
+        let obs = TaskBoardObserver::new(store, "sess-a");
+        obs.toggle_view_mode();
+
+        wait_until(
+            || obs.multi_snapshot().per_session.len() == 1,
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+        assert_eq!(
+            obs.multi_snapshot().per_session[0].1[0].title,
+            "visible cross-session work"
+        );
+
+        {
+            let mut st = obs.inner.state.lock_recover();
+            st.last_fetch = Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
+        }
+        obs.inner.dirty.store(true, Ordering::Relaxed);
+        obs.maybe_refresh();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let multi = obs.multi_snapshot();
+        assert_eq!(
+            multi.per_session.len(),
+            1,
+            "failed all-sessions refresh must preserve the last known cross-session board"
+        );
+        assert_eq!(
+            multi.per_session[0].1[0].title,
+            "visible cross-session work"
+        );
+    }
+
+    #[tokio::test]
     async fn toggle_back_to_single_preserves_session_snapshot() {
         // Flipping into AllSessions and back out must not drop the
         // single-session cached view — the user expects instant
@@ -1319,7 +1673,7 @@ mod tests {
         );
 
         // Now flip the status — next refresh should surface it as fresh.
-        m.update(&json!({"task_id": "task-1", "status": "in_progress"}))
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
         wait_until(
             || !obs.fresh_event_task_ids().is_empty(),

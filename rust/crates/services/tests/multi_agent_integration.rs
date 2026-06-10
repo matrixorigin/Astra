@@ -13,7 +13,9 @@ use astra_services::multi_agent::{
     NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService,
     push_tasks_pack_held_mysql,
 };
-use astra_services::task_orchestrator::{TaskRecord, TaskStatus};
+use astra_services::task_orchestrator::{
+    MatrixOneTaskService, TaskRecord, TaskService, TaskStatus,
+};
 use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::Barrier;
@@ -44,6 +46,100 @@ async fn cleanup_edge(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, edge_agent_
         .bind(edge_agent_id)
         .execute(pool)
         .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn agent_task_unknown_status_fails_closed_across_service_and_worker_views() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'unknown_status')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("unknown-status-it")
+    .execute(&pool)
+    .await
+    .expect("insert task with unknown status");
+
+    let svc = MatrixOneTaskService::new(pool.clone());
+    let get_err = svc
+        .get_task(&task_id)
+        .await
+        .expect_err("get_task must reject unknown persisted status");
+    assert!(
+        get_err.contains("unknown persisted task status: unknown_status"),
+        "unexpected get_task error: {get_err}"
+    );
+
+    let list_err = svc
+        .list_recent_tasks(&user, None)
+        .await
+        .expect_err("unfiltered list must fail closed on unknown persisted status");
+    assert!(
+        list_err.contains("unknown persisted task status: unknown_status"),
+        "unexpected list_recent_tasks error: {list_err}"
+    );
+
+    let pending = svc
+        .list_recent_tasks(&user, Some(TaskStatus::Pending))
+        .await
+        .expect("status-filtered pending list should not include unknown rows");
+    assert!(
+        pending.is_empty(),
+        "unknown status must not be projected as pending: {pending:?}"
+    );
+
+    let update_err = svc
+        .update_status(&task_id, TaskStatus::Pending)
+        .await
+        .expect_err("update_status must not coerce unknown status rows back to pending");
+    assert!(
+        update_err.contains("unknown persisted status: unknown_status"),
+        "unexpected update_status error: {update_err}"
+    );
+
+    let search_err = svc
+        .search_tasks(&user, "unknown-status-it", 8)
+        .await
+        .expect_err("search must fail closed when the best match has an unknown status");
+    assert!(
+        search_err.contains("unknown persisted task status: unknown_status"),
+        "unexpected search_tasks error: {search_err}"
+    );
+
+    let claimable = svc
+        .list_claimable_tasks_for_worker(&user, 8)
+        .await
+        .expect("worker list should ignore unknown statuses");
+    assert!(
+        claimable.is_empty(),
+        "unknown status must not be claimable: {claimable:?}"
+    );
+
+    let lease =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
+    let explicit_claim = lease
+        .try_claim_lease(&user, &task_id, "agent-alpha", "edge-a", 120)
+        .await
+        .expect_err("explicit worker claim must reject unknown statuses");
+    assert!(
+        explicit_claim.contains("task is not claimable from status 'unknown_status'"),
+        "unexpected claim error: {explicit_claim}"
+    );
+
+    let next = lease
+        .claim_next_claimable_lease(&user, "agent-alpha", "edge-a", 120)
+        .await
+        .expect("claim-next should not treat unknown statuses as unfinished claimable work");
+    assert_eq!(next, NextClaimableLeaseClaimResult::NoClaimableTasks);
+
+    cleanup_task(&pool, &task_id).await;
 }
 
 #[tokio::test]

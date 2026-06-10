@@ -2349,8 +2349,8 @@ impl ToolExecutor {
 
         let (stdout, stderr, exit_code) = match output {
             Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
                 let code = out.status.code();
                 (stdout, stderr, code)
             }
