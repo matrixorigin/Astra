@@ -65,6 +65,7 @@ export type AgentSurfaceItem = {
 
 export type WorkSurfaceState = {
   sessionId: string | null;
+  runId: string | null;
   tasks: SessionTask[];
   tools: ToolSurfaceItem[];
   agents: AgentSurfaceItem[];
@@ -76,6 +77,7 @@ export type WorkSurfaceState = {
 
 export type WorkSurfaceResponse = {
   sessionId: string | null;
+  runId?: string | null;
   tasks: SessionTask[];
   events?: Record<string, unknown>[];
   generatedAt?: string;
@@ -83,9 +85,11 @@ export type WorkSurfaceResponse = {
 
 export function createEmptyWorkSurface(
   sessionId: string | null = null,
+  runId: string | null = null,
 ): WorkSurfaceState {
   return {
     sessionId,
+    runId,
     tasks: [],
     tools: [],
     agents: [],
@@ -99,12 +103,36 @@ export function createEmptyWorkSurface(
 export function beginWorkSurfaceLoad(
   state: WorkSurfaceState,
   sessionId: string | null,
+  runId: string | null = state.runId,
 ): WorkSurfaceState {
   return {
     ...state,
     sessionId,
+    runId,
     loading: true,
     error: null,
+  };
+}
+
+export function resetWorkSurfaceForRun(
+  state: WorkSurfaceState,
+  params: { sessionId?: string | null; runId: string | null },
+): WorkSurfaceState {
+  if (
+    state.runId === params.runId &&
+    (params.sessionId === undefined || state.sessionId === params.sessionId)
+  ) {
+    return state;
+  }
+  return {
+    ...state,
+    sessionId:
+      params.sessionId === undefined ? state.sessionId : params.sessionId,
+    runId: params.runId,
+    tools: [],
+    agents: [],
+    error: null,
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -127,7 +155,10 @@ export function hydrateWorkSurface(
   let next: WorkSurfaceState = {
     ...current,
     sessionId: response.sessionId,
+    runId: response.runId ?? null,
     tasks: response.tasks,
+    tools: [],
+    agents: [],
     loading: false,
     hydrated: true,
     error: null,

@@ -11,6 +11,13 @@ type RuntimeTodosResponse = {
   tasks?: Array<Record<string, unknown>>;
 };
 
+type RuntimeRunProjectionResponse = {
+  session_id?: string;
+  recent_events?: Array<Record<string, unknown>>;
+};
+
+const WORK_SURFACE_RECENT_EVENT_LIMIT = 400;
+
 export async function GET(
   _request: Request,
   context: { params: Promise<{ chatId: string }> },
@@ -27,10 +34,12 @@ export async function GET(
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
 
-  const sessionId = chat.session?.backendSessionId ?? chatId;
-  if (!sessionId) {
+  const sessionId = chat.session?.backendSessionId ?? null;
+  const runId = chat.activeRun?.runId ?? null;
+  if (!sessionId && !runId) {
     return NextResponse.json({
       sessionId: null,
+      runId,
       tasks: [],
       events: [],
       generatedAt: new Date().toISOString(),
@@ -42,19 +51,32 @@ export async function GET(
       auth: "required",
       operation: "load web work surface",
     });
-    const todos = await runtime.get<RuntimeTodosResponse>(
-      `/sessions/${encodeURIComponent(sessionId)}/todos`,
-      {
-        auth: "required",
-        operation: "load session todos for web work surface",
-      },
-    );
-    const events = chat.activeRun?.runId
-      ? await runtime.sdk.getRunEvents(chat.activeRun.runId, 0).catch(() => [])
-      : [];
+    const projection = runId
+      ? await runtime.get<RuntimeRunProjectionResponse>(
+          `/chat/runs/${encodeURIComponent(
+            runId,
+          )}/projection?recent_limit=${WORK_SURFACE_RECENT_EVENT_LIMIT}`,
+          {
+            auth: "required",
+            operation: "load active run projection for web work surface",
+          },
+        )
+      : null;
+    const resolvedSessionId = sessionId ?? projection?.session_id ?? null;
+    const todos = resolvedSessionId
+      ? await runtime.get<RuntimeTodosResponse>(
+          `/sessions/${encodeURIComponent(resolvedSessionId)}/todos`,
+          {
+            auth: "required",
+            operation: "load session todos for web work surface",
+          },
+        )
+      : { tasks: [] };
+    const events = projection?.recent_events ?? [];
 
     return NextResponse.json({
-      sessionId,
+      sessionId: resolvedSessionId,
+      runId,
       tasks: Array.isArray(todos.tasks) ? todos.tasks : [],
       events,
       generatedAt: new Date().toISOString(),

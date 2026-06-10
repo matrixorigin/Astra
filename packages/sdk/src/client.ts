@@ -22,6 +22,7 @@ import type {
   RunInputRequestBody,
   RunInputResponse,
   RunListResponse,
+  RunProjectionResponse,
   RunStatus,
   RuntimeChatResponse,
   RuntimeArtifactListParams,
@@ -81,6 +82,7 @@ import {
   chatRunInputPath,
   chatRunPath,
   chatRunPausePath,
+  chatRunProjectionPath,
   chatRunResumePath,
   chatRunStreamPath,
   chatSessionDecisionTracePath,
@@ -641,6 +643,20 @@ export class AstraClient {
 
     const text = await res.text();
     return parseSseDataEvents(text);
+  }
+
+  /**
+   * Fetch the bounded durable projection for a run without attaching to its
+   * live SSE stream.
+   */
+  async getRunProjection(
+    runId: string,
+    opts?: { recentLimit?: number },
+  ): Promise<RunProjectionResponse> {
+    const q = buildQueryString({
+      ...(opts?.recentLimit !== undefined ? { recent_limit: opts.recentLimit } : {}),
+    });
+    return this.fetch<RunProjectionResponse>(`${chatRunProjectionPath(runId)}${q}`);
   }
 
   /** `GET /runs` — list durable runs for the current user. */

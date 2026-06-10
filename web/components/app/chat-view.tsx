@@ -57,12 +57,19 @@ import {
   createEmptyWorkSurface,
   failWorkSurfaceLoad,
   hydrateWorkSurface,
+  resetWorkSurfaceForRun,
   type WorkSurfaceResponse as WorkSurfaceProjection,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
+const ATTACHABLE_RUN_STATUSES = new Set([
+  "running",
+  "input-queued",
+  "waiting",
+  "cancelling",
+]);
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
@@ -85,6 +92,31 @@ function hasCompletedAssistantAfterUser(
     }
   }
   return false;
+}
+
+function findStreamingAssistantMessageId(messages: ChatMessage[]) {
+  return [...messages].reverse().find(
+    (message) =>
+      message.role === "assistant" &&
+      (message.status === "streaming" ||
+        message.reasoningStatus === "streaming"),
+  )?.id;
+}
+
+function createStreamingAssistantMessage(id: string): ChatMessage {
+  return {
+    id,
+    role: "assistant",
+    content: "",
+    createdAt: new Date().toISOString(),
+    status: "streaming",
+    reasoning: "",
+    reasoningStatus: "streaming",
+  };
+}
+
+function canAttachRunStream(status: string | undefined | null) {
+  return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
 }
 
 function createAssistantPatchController(params: {
@@ -149,7 +181,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [resumingRun, setResumingRun] = useState(false);
   const [stoppingRun, setStoppingRun] = useState(false);
   const [workSurface, setWorkSurface] = useState(() =>
-    createEmptyWorkSurface(initial.session?.backendSessionId ?? null),
+    createEmptyWorkSurface(
+      initial.session?.backendSessionId ?? null,
+      initial.activeRun?.runId ?? null,
+    ),
   );
   const [workSurfaceTab, setWorkSurfaceTab] =
     useState<WorkSurfaceTab>("tasks");
@@ -158,6 +193,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const attachedRunRef = useRef<string | null>(null);
+  const autoAttachAttemptedRunRef = useRef<string | null>(null);
   const reconcileTimerRef = useRef<number | undefined>(undefined);
   const reconcileIntervalRef = useRef<number | undefined>(undefined);
   const stopReconcileRef = useRef<() => void>(() => {
@@ -236,6 +273,172 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     [],
   );
 
+  const resetWorkSurfaceRun = useCallback(
+    (runId: string | null, sessionId?: string | null) => {
+      setWorkSurface((current) =>
+        resetWorkSurfaceForRun(current, {
+          sessionId:
+            sessionId === undefined
+              ? (detail.session?.backendSessionId ?? current.sessionId)
+              : sessionId,
+          runId,
+        }),
+      );
+    },
+    [detail.session?.backendSessionId],
+  );
+
+  const ensureStreamingAssistantMessage = useCallback(() => {
+    const existingAssistantMessageId = findStreamingAssistantMessageId(
+      detail.messages,
+    );
+    if (existingAssistantMessageId) {
+      return existingAssistantMessageId;
+    }
+
+    const assistantMessageId = crypto.randomUUID();
+    setDetail((current) =>
+      findStreamingAssistantMessageId(current.messages)
+        ? current
+        : {
+            ...current,
+            messages: [
+              ...current.messages,
+              createStreamingAssistantMessage(assistantMessageId),
+            ],
+          },
+    );
+    return assistantMessageId;
+  }, [detail.messages]);
+
+  const attachExistingRunStream = useCallback(
+    (runId: string, assistantMessageId: string, failureMessage: string) => {
+      if (attachedRunRef.current === runId) {
+        return;
+      }
+
+      attachedRunRef.current = runId;
+      resetWorkSurfaceRun(runId);
+      const assistantPatcher = createAssistantPatchController({
+        setDetail,
+        getAssistantId: () => assistantMessageId,
+      });
+      const clearActiveRun = () => {
+        setDetail((current) =>
+          current.activeRun?.runId === runId
+            ? {
+                ...current,
+                activeRun: undefined,
+              }
+            : current,
+        );
+      };
+
+      void streamExistingChatRun(detail.chat.id, runId, {
+        signal: nextStreamAbortSignal(),
+        onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+        onRunUpdated: (run) => {
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId: run.runId,
+              status: run.status,
+              waitingFor: run.waitingFor ?? null,
+            },
+          }));
+        },
+        onRunFinished: () => {
+          setStoppingRun(false);
+          clearActiveRun();
+        },
+        onReasoning: (reasoning) => {
+          assistantPatcher.patchBatched({
+            reasoning,
+            reasoningStatus: "streaming",
+            status: "streaming",
+          });
+        },
+        onReasoningDone: (reasoning) => {
+          assistantPatcher.patchBatched({
+            reasoning,
+            reasoningStatus: "complete",
+            status: "streaming",
+          });
+        },
+        onText: (content) => {
+          assistantPatcher.patchBatched({ content, status: "streaming" });
+        },
+        onArtifacts: (artifacts) => {
+          assistantPatcher.patchBatched({ artifacts });
+        },
+        onDone: (content) => {
+          assistantPatcher.flushNow();
+          clearActiveRun();
+          assistantPatcher.patchNow({
+            content:
+              content ||
+              "Astra completed the run without returning visible text.",
+            reasoningStatus: "complete",
+            status: "complete",
+          });
+        },
+        onCancelled: (content) => {
+          assistantPatcher.flushNow();
+          clearActiveRun();
+          assistantPatcher.patchNow({
+            content: content || "Stopped.",
+            reasoningStatus: "complete",
+            status: "complete",
+          });
+        },
+        onPaused: (content) => {
+          assistantPatcher.flushNow();
+          assistantPatcher.patchNow({
+            content,
+            status: "streaming",
+          });
+        },
+      })
+        .catch((streamError: unknown) => {
+          if (isAbortError(streamError)) {
+            return;
+          }
+          if (isAuthRequiredError(streamError)) {
+            router.push(
+              `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
+            );
+            return;
+          }
+          if (isNotFoundError(streamError)) {
+            router.replace(chatListHref);
+            return;
+          }
+          assistantPatcher.patchNow({
+            content:
+              streamError instanceof Error
+                ? `${failureMessage} (${streamError.message})`
+                : failureMessage,
+            reasoningStatus: "complete",
+            status: "failed",
+          });
+        })
+        .finally(() => {
+          if (attachedRunRef.current === runId) {
+            attachedRunRef.current = null;
+          }
+          assistantPatcher.cancel();
+        });
+    },
+    [
+      applyWorkSurfaceStreamEvent,
+      chatListHref,
+      detail.chat.id,
+      nextStreamAbortSignal,
+      resetWorkSurfaceRun,
+      router,
+    ],
+  );
+
   const openWorkSurfaceTab = useCallback((tab: WorkSurfaceTab) => {
     setWorkSurfaceTab(tab);
     setWorkSurfaceOpenSignal((signal) => signal + 1);
@@ -245,7 +448,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     async (options?: { silent?: boolean }) => {
       const sessionId = detail.session?.backendSessionId ?? null;
       if (!options?.silent) {
-        setWorkSurface((current) => beginWorkSurfaceLoad(current, sessionId));
+        setWorkSurface((current) =>
+          beginWorkSurfaceLoad(current, sessionId, current.runId),
+        );
       }
       try {
         const response = await getChatWorkSurface(detail.chat.id);
@@ -312,6 +517,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         getAssistantId: () => currentAssistantId,
       });
       let recoveredFromHydration = false;
+      let streamRunId: string | null = null;
       const canReconcilePersistedTranscript = Boolean(pendingMessageId);
       const stopReconcile = () => {
         reconcileTimerRef.current = undefined;
@@ -420,6 +626,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               });
             },
             onRunStarted: (runId) => {
+              streamRunId = runId;
+              attachedRunRef.current = runId;
+              resetWorkSurfaceRun(runId);
               setStartingRun(false);
               setDetail((current) => ({
                 ...current,
@@ -432,8 +641,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             },
             onSessionBound: ({ sessionId }) => {
               setWorkSurface((current) => ({
-                ...current,
-                sessionId,
+                ...resetWorkSurfaceForRun(current, {
+                  sessionId,
+                  runId: current.runId,
+                }),
                 error: null,
               }));
               setDetail((current) => ({
@@ -459,10 +670,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             onRunFinished: () => {
               setStoppingRun(false);
               setStartingRun(false);
-              setDetail((current) => ({
-                ...current,
-                activeRun: undefined,
-              }));
+              setDetail((current) =>
+                streamRunId && current.activeRun?.runId === streamRunId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
             },
             onReasoning: (reasoning) => {
               assistantPatcher.patchBatched({
@@ -487,10 +702,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             onDone: (content) => {
               assistantPatcher.flushNow();
               setStartingRun(false);
-              setDetail((current) => ({
-                ...current,
-                activeRun: undefined,
-              }));
+              setDetail((current) =>
+                streamRunId && current.activeRun?.runId === streamRunId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
               assistantPatcher.patchNow({
                 content:
                   content ||
@@ -503,10 +722,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               assistantPatcher.flushNow();
               setStoppingRun(false);
               setStartingRun(false);
-              setDetail((current) => ({
-                ...current,
-                activeRun: undefined,
-              }));
+              setDetail((current) =>
+                streamRunId && current.activeRun?.runId === streamRunId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
               assistantPatcher.patchNow({
                 content: content || "Stopped.",
                 reasoningStatus: "complete",
@@ -553,6 +776,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           status: "failed",
         });
       } finally {
+        if (streamRunId && attachedRunRef.current === streamRunId) {
+          attachedRunRef.current = null;
+        }
         assistantPatcher.cancel();
         stopReconcile();
         setStartingRun(false);
@@ -565,6 +791,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       detail.chat.id,
       nextStreamAbortSignal,
       router,
+      resetWorkSurfaceRun,
     ],
   );
 
@@ -585,6 +812,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           options,
         });
         const assistantMessageId = crypto.randomUUID();
+        const runId = result.activeRun.runId;
+        attachedRunRef.current = runId;
+        resetWorkSurfaceRun(runId);
         setDetail((current) => ({
           ...current,
           activeRun: result.activeRun,
@@ -609,7 +839,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           setDetail,
           getAssistantId: () => assistantMessageId,
         });
-        void streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+        void streamExistingChatRun(detail.chat.id, runId, {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
           onRunUpdated: (run) => {
@@ -624,10 +854,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onRunFinished: () => {
             setStoppingRun(false);
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
           },
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
@@ -651,10 +885,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onDone: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content:
                 content ||
@@ -665,10 +903,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onCancelled: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content: content || "Stopped.",
               reasoningStatus: "complete",
@@ -706,6 +948,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             });
           })
           .finally(() => {
+            if (attachedRunRef.current === runId) {
+              attachedRunRef.current = null;
+            }
             assistantPatcher.cancel();
           });
       } catch (error) {
@@ -748,6 +993,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       detail.chat.id,
       nextStreamAbortSignal,
       router,
+      resetWorkSurfaceRun,
       startStream,
     ],
   );
@@ -835,6 +1081,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       if (!result.activeRun?.runId) {
         throw new Error("Resume response did not include an active run.");
       }
+      const runId = result.activeRun.runId;
+      attachedRunRef.current = runId;
+      resetWorkSurfaceRun(runId);
       setDetail((current) => ({
         ...current,
         activeRun: result.activeRun,
@@ -860,7 +1109,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         getAssistantId: () => assistantMessageId,
       });
       try {
-        await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+        await streamExistingChatRun(detail.chat.id, runId, {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
           onRunUpdated: (run) => {
@@ -875,10 +1124,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onRunFinished: () => {
             setStoppingRun(false);
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
           },
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
@@ -902,10 +1155,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onDone: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content:
                 content ||
@@ -916,10 +1173,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onCancelled: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content: content || "Stopped.",
               reasoningStatus: "complete",
@@ -962,6 +1223,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           "warning",
         );
       } finally {
+        if (attachedRunRef.current === runId) {
+          attachedRunRef.current = null;
+        }
         assistantPatcher.cancel();
       }
     } catch (error) {
@@ -997,6 +1261,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     detail.chat.id,
     detail.messages,
     nextStreamAbortSignal,
+    resetWorkSurfaceRun,
     router,
   ]);
 
@@ -1011,6 +1276,37 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   useEffect(() => {
     void hydrateWorkSurfaceForChat();
   }, [hydrateWorkSurfaceForChat]);
+
+  useEffect(() => {
+    const activeRun = detail.activeRun;
+    if (!activeRun?.runId) {
+      autoAttachAttemptedRunRef.current = null;
+      return;
+    }
+    if (
+      isArchived ||
+      detail.pendingTurn ||
+      !canAttachRunStream(activeRun.status) ||
+      attachedRunRef.current === activeRun.runId ||
+      autoAttachAttemptedRunRef.current === activeRun.runId
+    ) {
+      return;
+    }
+
+    autoAttachAttemptedRunRef.current = activeRun.runId;
+    const assistantMessageId = ensureStreamingAssistantMessage();
+    attachExistingRunStream(
+      activeRun.runId,
+      assistantMessageId,
+      "The run is active, but the web UI could not reconnect to its stream.",
+    );
+  }, [
+    attachExistingRunStream,
+    detail.activeRun,
+    detail.pendingTurn,
+    ensureStreamingAssistantMessage,
+    isArchived,
+  ]);
 
   useEffect(() => {
     if (shouldAutoScrollChat({ pinnedToBottom: pinnedRef.current })) {
@@ -1326,48 +1622,42 @@ function RunActivityBar({
   onOpenTasks: () => void;
   onOpenTools: () => void;
 }) {
-  const hasActivityCounts = agents > 0 || tools > 0 || tasks > 0;
   return (
     <div className="mb-3 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
       <span className="inline-flex items-center gap-2 font-medium text-text">
         <Loader2 className="size-3.5 animate-spin text-accent" />
         {label}
       </span>
-      {hasActivityCounts ? (
-        <>
-          <span className="h-4 w-px bg-border" />
-          <RunActivityMetric
-            icon={Bot}
-            label="Agents"
-            value={agents}
-            onClick={onOpenAgents}
-          />
-          <RunActivityMetric
-            icon={ClipboardList}
-            label="Tasks"
-            value={tasks}
-            onClick={onOpenTasks}
-          />
-          <RunActivityMetric
-            icon={Terminal}
-            label="Tools"
-            value={tools}
-            onClick={onOpenTools}
-          />
-        </>
-      ) : (
-        <span className="inline-flex items-center gap-1 pl-0.5" aria-hidden="true">
-          <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
-          <span
-            className="size-1.5 animate-bounce rounded-full bg-text-muted"
-            style={{ animationDelay: "120ms" }}
-          />
-          <span
-            className="size-1.5 animate-bounce rounded-full bg-text-muted"
-            style={{ animationDelay: "240ms" }}
-          />
-        </span>
-      )}
+      <span className="inline-flex items-center gap-1 pl-0.5" aria-hidden="true">
+        <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
+        <span
+          className="size-1.5 animate-bounce rounded-full bg-text-muted"
+          style={{ animationDelay: "120ms" }}
+        />
+        <span
+          className="size-1.5 animate-bounce rounded-full bg-text-muted"
+          style={{ animationDelay: "240ms" }}
+        />
+      </span>
+      <span className="h-4 w-px bg-border" />
+      <RunActivityMetric
+        icon={Bot}
+        label="Agents"
+        value={agents}
+        onClick={onOpenAgents}
+      />
+      <RunActivityMetric
+        icon={ClipboardList}
+        label="Tasks"
+        value={tasks}
+        onClick={onOpenTasks}
+      />
+      <RunActivityMetric
+        icon={Terminal}
+        label="Tools"
+        value={tools}
+        onClick={onOpenTools}
+      />
     </div>
   );
 }

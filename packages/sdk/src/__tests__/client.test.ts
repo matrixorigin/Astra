@@ -319,6 +319,36 @@ describe('AstraClient — Runs', () => {
     expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain('last_index=5');
   });
 
+  test('getRunProjection uses bounded projection endpoint', async () => {
+    globalThis.fetch = mockFetch(200, {
+      run_id: 'r1',
+      session_id: 's1',
+      status: 'running',
+      run_event_high_watermark: 7,
+      projection_event_idx: 6,
+      projection_updated_at: '2026-06-10T00:00:00.000Z',
+      projection_hash: 'hash',
+      total_prompt_tokens: 1,
+      total_completion_tokens: 2,
+      total_tool_calls: 3,
+      observability: {
+        has_durable_projection: true,
+        observability_available: true,
+        projection_lag_events: 1,
+        prompt_request_count: 0,
+      },
+      recent_events: [{ type: 'tool_call_start', call_id: 'call-1', tool: 'bash' }],
+    });
+
+    const projection = await createClient().getRunProjection('r1', {
+      recentLimit: 25,
+    });
+    expect(projection.recent_events).toHaveLength(1);
+    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    expect(url).toContain('/chat/runs/r1/projection');
+    expect(url).toContain('recent_limit=25');
+  });
+
   test('listRuns normalizes snake_case runs', async () => {
     globalThis.fetch = mockFetch(200, {
       runs: [

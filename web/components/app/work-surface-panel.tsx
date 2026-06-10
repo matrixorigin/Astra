@@ -372,7 +372,7 @@ function AgentBoard({
   onSelectAgent: (agentId: string) => void;
 }) {
   if (!agents.length) {
-    return <EmptySurface loading={loading} label="No subagents active" />;
+    return <EmptySurface loading={loading} label="No subagent activity yet" />;
   }
   const sorted = [...agents].sort((left, right) => right.updatedAt - left.updatedAt);
   return (
@@ -594,7 +594,7 @@ function AgentLiveEvents({
       <div className="mb-2 flex items-center justify-between gap-3">
         <div className="inline-flex min-w-0 items-center gap-1.5 text-[11px] font-semibold text-text">
           <Activity className="size-3.5 text-accent" />
-          <span>Live output</span>
+          <span>Live activity</span>
         </div>
         {active ? <MiniLiveDots className="shrink-0" /> : null}
       </div>
@@ -607,7 +607,7 @@ function AgentLiveEvents({
       ) : (
         <div className="flex items-center gap-2 rounded-[6px] bg-bg/70 px-2 py-2 text-xs text-text-muted">
           {active ? <MiniLiveDots /> : null}
-          <span>Waiting for first subagent event</span>
+          <span>Waiting for subagent activity</span>
         </div>
       )}
     </div>

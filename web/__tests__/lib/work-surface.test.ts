@@ -58,6 +58,7 @@ describe("work surface reducer", () => {
   it("hydrates from tasks and current run events", () => {
     const state = hydrateWorkSurface(createEmptyWorkSurface(), {
       sessionId: "session-1",
+      runId: "run-1",
       tasks: [task],
       events: [
         {
@@ -80,6 +81,7 @@ describe("work surface reducer", () => {
     });
 
     expect(state.tasks).toEqual([task]);
+    expect(state.runId).toBe("run-1");
     expect(state.agents).toHaveLength(1);
     expect(state.agents[0]).toMatchObject({
       agentId: "agent-1",
@@ -94,6 +96,37 @@ describe("work surface reducer", () => {
       "Spawned",
       "Completed",
     ]);
+  });
+
+  it("treats hydration as the authoritative tool and agent projection for the run", () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface("session-1", "run-old"), {
+      type: "tool_call_start",
+      call_id: "call-old",
+      tool: "bash",
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: "agent_spawned",
+      agent_id: "agent-old",
+      run_id: "run-old",
+      agent_type: "reviewer",
+    });
+
+    const hydrated = hydrateWorkSurface(state, {
+      sessionId: "session-1",
+      runId: "run-new",
+      tasks: [task],
+      events: [
+        {
+          type: "tool_call_start",
+          call_id: "call-new",
+          tool: "rg",
+        },
+      ],
+    });
+
+    expect(hydrated.runId).toBe("run-new");
+    expect(hydrated.tools.map((item) => item.callId)).toEqual(["call-new"]);
+    expect(hydrated.agents).toEqual([]);
   });
 
   it("updates subagents from live current-protocol progress events", () => {

@@ -118,6 +118,7 @@ export type ChatDetail = {
 
 export type WorkSurfaceResponse = {
   sessionId: string | null;
+  runId: string | null;
   tasks: Array<Record<string, unknown>>;
   events: Array<Record<string, unknown>>;
   generatedAt: string;

@@ -535,6 +535,43 @@ export type RunStatus = {
   waitingFor?: string | null;
 };
 
+export type RunProjectionResponse = {
+  run_id: string;
+  session_id: string;
+  status: string;
+  waiting_for?: string | null;
+  error_message?: string | null;
+  run_event_high_watermark: number;
+  projection_event_idx: number;
+  projection_updated_at: string;
+  projection_hash: string;
+  latest_event_type?: string | null;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tool_calls: number;
+  latest_checkpoint?: {
+    checkpoint_id: string;
+    checkpoint_kind: string;
+    checkpoint_version: string;
+    node_seq: number;
+    created_at: string;
+  } | null;
+  observability: {
+    has_durable_projection: boolean;
+    observability_available: boolean;
+    projection_lag_events: number;
+    prompt_request_count: number;
+    latest_prompt_request?: {
+      request_id: string;
+      request_hash: string;
+      message_count: number;
+      tool_count: number;
+      delta_counts: unknown;
+    } | null;
+  };
+  recent_events: Array<StreamEvent | Record<string, unknown>>;
+};
+
 export type RunInputRequestBody = {
   idempotencyKey: string;
   input?: unknown;

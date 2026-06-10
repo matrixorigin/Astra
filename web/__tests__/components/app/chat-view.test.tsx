@@ -212,6 +212,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     mockGetChatWorkSurface.mockReset();
     mockGetChatWorkSurface.mockResolvedValue({
       sessionId: "chat-123",
+      runId: "run-123",
       tasks: [],
       events: [],
       generatedAt: "2026-06-07T00:00:00.000Z",
@@ -669,9 +670,15 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
 
-    resolveStop({ activeRun: undefined });
+    resolveStop({
+      activeRun: {
+        runId: "run-123",
+        status: "cancelling",
+        waitingFor: null,
+      },
+    });
     await waitFor(() => {
-      expect(screen.queryByText("Stopping current run")).not.toBeInTheDocument();
+      expect(screen.getByText("Stopping")).toBeInTheDocument();
     });
   });
 

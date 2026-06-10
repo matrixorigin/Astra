@@ -441,7 +441,11 @@ describe('queueDeferredRunInput', () => {
     const result = await stopActiveRun('user-a', 'chat-stop');
 
     expect(cancelRun).toHaveBeenCalledWith('run-stop');
-    expect(result?.activeRun).toBeUndefined();
+    expect(result?.activeRun).toEqual({
+      runId: 'run-stop',
+      status: 'cancelling',
+      waitingFor: null,
+    });
   });
 
   it('hydrates a lost paused run before resuming it', async () => {

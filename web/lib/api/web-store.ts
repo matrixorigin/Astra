@@ -863,10 +863,17 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
 
   const runId = chat.activeRun.runId;
   await client.sdk.cancelRun(runId);
-  chat.activeRun = undefined;
+  chat.activeRun = makeActiveRunRecord(
+    {
+      runId,
+      status: "cancelling",
+      waitingFor: null,
+    },
+    "local_mutation",
+  );
 
   return {
-    activeRun: undefined,
+    activeRun: publicActiveRun(chat.activeRun),
   };
 }
 
