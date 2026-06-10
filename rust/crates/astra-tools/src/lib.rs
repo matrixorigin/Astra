@@ -124,13 +124,11 @@ impl ToolResult {
 
     /// Convert a legacy `String` output into a `ToolResult`.
     ///
-    /// Heuristic: strings starting with `"Error"` are treated as errors.
+    /// A string payload has no reliable error semantics. Callers that know the
+    /// result is an error must use [`ToolResult::error`] instead of relying on
+    /// output text.
     pub fn from_string(output: String) -> Self {
-        if output.starts_with("Error") {
-            Self::error(output)
-        } else {
-            Self::text(output)
-        }
+        Self::text(output)
     }
 }
 
@@ -720,6 +718,13 @@ mod tests {
         let r = ToolResult::error("boom".into());
         assert_eq!(r.output, "boom");
         assert!(r.is_error);
+    }
+
+    #[test]
+    fn tool_result_from_string_does_not_infer_error_from_text() {
+        let r = ToolResult::from_string("Error count: 0".into());
+        assert_eq!(r.output, "Error count: 0");
+        assert!(!r.is_error);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Shell operations: bash execution, grep, glob.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -832,14 +832,19 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 // it in its event-loop tick and calls
                 // BackgroundTaskRegistry::adopt_detached_shell.
                 let detach_handle = detach_handle_guard.take().unwrap();
-                if let Some(sender) = detach_handle.payload_tx.lock().await.take() {
-                    let send_failed = sender.send(*payload).is_err();
-                    if send_failed {
-                        return ToolResult::error(
-                            "Error: bash detach: TUI listener dropped before payload arrived"
-                                .to_string(),
-                        );
-                    }
+                let Some(sender) = detach_handle.payload_tx.lock().await.take() else {
+                    terminate_detached_payload(payload).await;
+                    return ToolResult::error(
+                        "Error: bash detach failed: host payload channel was not available"
+                            .to_string(),
+                    );
+                };
+                if let Err(payload) = sender.send(*payload) {
+                    terminate_detached_payload(Box::new(payload)).await;
+                    return ToolResult::error(
+                        "Error: bash detach failed: host listener dropped before payload arrived"
+                            .to_string(),
+                    );
                 }
                 let mut result = ToolResult::text(
                     "<bash_detached>The bash command was promoted to a background task. \
@@ -924,7 +929,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         } else {
             result = format!("Error: bash timed out after {timeout_secs}s with no captured output");
         }
-        return ToolResult::error(truncate_output(result, output_limit));
+        return ToolResult::error(truncate_output(result, output_limit))
+            .with_exit_semantics(ExitSemantics::TimedOut);
     }
 
     if output.cancelled {
@@ -933,7 +939,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         } else {
             result = "Error: bash cancelled before any output was captured".into();
         }
-        return ToolResult::error(truncate_output(result, output_limit));
+        return ToolResult::error(truncate_output(result, output_limit))
+            .with_exit_semantics(ExitSemantics::Cancelled);
     }
 
     let exit_semantics = classify_exit(command, output.exit_code);
@@ -2120,7 +2127,7 @@ async fn load_gitignored_search_paths(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = exit_code_from_status(&output.status);
     if exit_code == 0 {
         return Ok(stdout.lines().map(strip_current_dir_prefix).collect());
     }
@@ -2908,6 +2915,24 @@ async fn sigkill_process_group(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    -1
+}
+
+async fn terminate_detached_payload(mut payload: Box<crate::detach::DetachedShellPayload>) {
+    sigkill_process_group(&mut payload.child).await;
+}
+
 async fn run_readonly_command_with_partial(
     cmd: &mut Command,
     timeout: Duration,
@@ -2963,7 +2988,7 @@ async fn run_readonly_command_with_partial(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                exit_code = Some(status.code().unwrap_or(-1));
+                exit_code = Some(exit_code_from_status(&status));
                 break;
             }
             Ok(None) => {
@@ -3116,7 +3141,7 @@ pub(crate) async fn run_bash_with_detach(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                exit_code = Some(status.code().unwrap_or(-1));
+                exit_code = Some(exit_code_from_status(&status));
                 break;
             }
             Ok(None) => {
@@ -3226,21 +3251,13 @@ pub(crate) async fn run_bash_with_detach(
             });
             return Ok(BashRunOutcome::Detached(payload));
         }
-        // Streams already drained — fall back to Completed shape.
-        let exit_code = child
-            .wait()
-            .await
-            .map(|s| s.code().unwrap_or(-1))
-            .unwrap_or(-1);
-        return Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
-            stdout: stdout_text,
-            stderr: stderr_text,
-            exit_code,
-            timed_out: false,
-            cancelled: false,
-            stdout_capped,
-            stderr_capped,
-        }));
+        // Detach is an ownership transfer. If either stream is already gone,
+        // the host cannot safely adopt the live process, so terminate it
+        // instead of leaving an orphan or blocking the foreground tool.
+        sigkill_process_group(&mut child).await;
+        return Err(
+            "Error: bash detach failed: child stream closed before handoff completed".to_string(),
+        );
     }
 
     // Normal completion path: drain remaining bytes and assemble
@@ -4695,6 +4712,75 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_grep_no_match_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "grep needle haystack.txt"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "grep no-match is informational, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_diff_difference_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "diff a.txt b.txt"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "diff differences are domain-negative, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_false_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "false"})).await;
+
+        assert!(
+            !result.is_error,
+            "false is a domain-negative shell predicate, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
+        );
+    }
+
+    #[tokio::test]
     async fn bash_masked_missing_command_is_env_failure() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -4746,6 +4832,10 @@ printf 'probe.txt:1:needle\n'
             "got: {}",
             result.output
         );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::TimedOut)
+        );
         assert!(!result.output.contains("done"), "got: {}", result.output);
     }
 
@@ -4790,6 +4880,27 @@ printf 'probe.txt:1:needle\n'
             result.output.contains("bash cancelled"),
             "got: {}",
             result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn exit_status_signal_is_not_encoded_as_minus_one() {
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .await
+            .expect("spawn signal test");
+
+        assert_eq!(exit_code_from_status(&status), 143);
+        assert_eq!(
+            classify_exit("bash -c 'kill -TERM $$'", exit_code_from_status(&status)),
+            crate::exit_semantics::ExitSemantics::Signaled
         );
     }
 
@@ -5227,6 +5338,124 @@ printf 'probe.txt:1:needle\n'
         // The child is still alive in the payload; clean up so the
         // test doesn't leak a sleeping shell.
         drop(payload);
+    }
+
+    #[tokio::test]
+    async fn bash_detach_without_payload_channel_kills_child_and_errors() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (handle, listener) = crate::detach::new_detach_pair();
+        *handle.payload_tx.lock().await = None;
+        let slot = Arc::new(Mutex::new(Some(handle)));
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+            .await
+            .expect("detach failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("host payload channel was not available"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_detach_when_listener_dropped_kills_child_and_errors() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        let crate::detach::DetachShellListener {
+            signal_tx,
+            payload_rx,
+        } = listener;
+        drop(payload_rx);
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        signal_tx.send(true).expect("detach signal send");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+            .await
+            .expect("detach failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("host listener dropped before payload arrived"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_detach_after_stream_eof_kills_child_and_errors() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "exec 1>&-; sleep 30"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+            .await
+            .expect("detach failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("child stream closed before handoff completed"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]

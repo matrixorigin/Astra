@@ -18,6 +18,13 @@ pub enum ExitSemantics {
     /// Command completed normally and found a negative/different
     /// domain state (e.g. `diff` found differences, `test` false).
     DomainNegative,
+    /// Command was terminated because the tool timeout elapsed.
+    TimedOut,
+    /// Command was terminated because the user/run cancellation token fired.
+    Cancelled,
+    /// Command was terminated by a signal. POSIX shells conventionally surface
+    /// this as exit status `128 + signal`.
+    Signaled,
     /// Command failed to execute, crashed, was denied, or returned a
     /// tool-specific real error.
     ExecutionError,
@@ -26,7 +33,10 @@ pub enum ExitSemantics {
 impl ExitSemantics {
     #[must_use]
     pub fn is_tool_error(self) -> bool {
-        matches!(self, Self::ExecutionError)
+        matches!(
+            self,
+            Self::TimedOut | Self::Cancelled | Self::Signaled | Self::ExecutionError
+        )
     }
 }
 
@@ -65,6 +75,9 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     if exit_code == 0 {
         return ExitSemantics::Success;
     }
+    if (128..256).contains(&exit_code) {
+        return ExitSemantics::Signaled;
+    }
     if matches!(exit_code, 126 | 127) || !(0..128).contains(&exit_code) {
         return ExitSemantics::ExecutionError;
     }
@@ -73,6 +86,7 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     match (family.as_deref(), exit_code) {
         (Some("grep" | "rg" | "ripgrep" | "ag"), 1) => ExitSemantics::InformationalFailure,
         (Some("diff" | "cmp"), 1) => ExitSemantics::DomainNegative,
+        (Some("false"), 1) => ExitSemantics::DomainNegative,
         (Some("test" | "["), 1) => ExitSemantics::DomainNegative,
         (Some("pytest" | "nose2" | "tox" | "unittest" | "jest" | "vitest" | "mocha"), 1) => {
             ExitSemantics::DomainNegative
@@ -116,6 +130,9 @@ pub fn classify_command_result(
                 } else {
                     CommandResultClass::DomainNegative
                 }
+            }
+            ExitSemantics::TimedOut | ExitSemantics::Cancelled | ExitSemantics::Signaled => {
+                CommandResultClass::ExecutionError
             }
             ExitSemantics::ExecutionError => {
                 if is_build_test_or_lint_command(command)
@@ -327,12 +344,13 @@ mod tests {
     }
 
     #[test]
-    fn diff_and_test_false_are_domain_negative() {
+    fn diff_test_false_and_false_are_domain_negative() {
         for command in [
             "diff a b",
             "git diff --quiet",
             "test -f missing",
             "[ -f missing ]",
+            "false",
             "cargo test",
             "go test ./...",
             "npm test",
@@ -347,10 +365,19 @@ mod tests {
     }
 
     #[test]
-    fn command_not_found_and_signal_are_execution_errors() {
-        for code in [2, 126, 127, 130, -1] {
+    fn command_not_found_is_execution_error() {
+        for code in [2, 126, 127, -1] {
             let semantics = classify_exit("grep bad[", code);
             assert_eq!(semantics, ExitSemantics::ExecutionError, "{code}");
+            assert!(semantics.is_tool_error(), "{code}");
+        }
+    }
+
+    #[test]
+    fn signal_encoded_exit_is_signaled() {
+        for code in [129, 130, 137, 143] {
+            let semantics = classify_exit("sleep 999", code);
+            assert_eq!(semantics, ExitSemantics::Signaled, "{code}");
             assert!(semantics.is_tool_error(), "{code}");
         }
     }
