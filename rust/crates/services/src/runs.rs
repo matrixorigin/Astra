@@ -2690,6 +2690,9 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "explain",
     "error",
     "ping",
+    "tool_call",
+    "tool_call_start",
+    "tool_call_end",
     // Plan / delegation surface (public admin features).
     "plan_created",
     "plan_step_start",
@@ -2702,6 +2705,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "agent_failed",
     "agent_cancelled",
     "agent_interrupted",
+    "task_board_snapshot",
 ];
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -3457,6 +3461,14 @@ mod tests {
         let event = json!({"type": "text_delta", "content": "hello", "index": 3});
         let out = transform_run_event_for_client(event.clone());
         assert_eq!(out, event);
+    }
+
+    #[test]
+    fn already_shaped_work_surface_tool_events_pass_through() {
+        let start = json!({"type": "tool_call", "tool_call": {"id": "c1"}});
+        let end = json!({"type": "tool_call_end", "call_id": "c1", "result": "ok"});
+        assert_eq!(transform_run_event_for_client(start.clone()), start);
+        assert_eq!(transform_run_event_for_client(end.clone()), end);
     }
 
     #[test]

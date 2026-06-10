@@ -1,4 +1,8 @@
-import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
+import {
+  mergeTextDelta,
+  splitThinkingTags,
+  stripDsmlToolCallBlocks,
+} from "@/lib/api/stream-text";
 
 describe("mergeTextDelta", () => {
   it("ignores empty, duplicate, and replayed suffix deltas", () => {
@@ -39,5 +43,27 @@ describe("splitThinkingTags", () => {
       hasThinking: true,
       reasoningOpen: true,
     });
+  });
+
+  it("keeps DSML tool-call envelopes out of visible assistant text", () => {
+    const dsml =
+      "<\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls> " +
+      "<\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke name=\"agent\">" +
+      "<\uFF5C\uFF5CDSML\uFF5C\uFF5Cparameter name=\"action\">get_result" +
+      "</\uFF5C\uFF5CDSML\uFF5C\uFF5Cparameter>" +
+      "</\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke> " +
+      "</\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls>";
+
+    expect(splitThinkingTags(`Done.\n\n${dsml}`).visibleText).toBe("Done.");
+  });
+});
+
+describe("stripDsmlToolCallBlocks", () => {
+  it("hides incomplete DSML tool-call blocks while streaming", () => {
+    const partial =
+      "Waiting.\n\n<\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls>" +
+      "<\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke name=\"agent\">";
+
+    expect(stripDsmlToolCallBlocks(partial)).toBe("Waiting.");
   });
 });

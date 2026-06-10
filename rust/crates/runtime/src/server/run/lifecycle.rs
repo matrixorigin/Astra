@@ -20,7 +20,7 @@ use axum::http::StatusCode;
 use futures_util::FutureExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc, oneshot};
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
@@ -2441,7 +2441,23 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
 }
 
 fn live_delta_event_for_persistence(event: &Value) -> bool {
-    durable_event_type(event) == Some("text_delta")
+    matches!(
+        durable_event_type(event),
+        Some(
+            "text_delta"
+                | "agent_delegated"
+                | "agent_spawned"
+                | "agent_progress"
+                | "agent_completed"
+                | "agent_failed"
+                | "agent_cancelled"
+                | "agent_interrupted"
+                | "task_board_snapshot"
+                | "tool_call"
+                | "tool_call_start"
+                | "tool_call_end"
+        )
+    )
 }
 
 /// Per-run state held in the lifecycle service.
@@ -2719,6 +2735,47 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .and_then(|engine| engine.progress_broadcaster().cloned())
             .unwrap_or_else(|| Arc::clone(&self.server_agent_progress_broadcaster))
+    }
+
+    fn spawn_agent_progress_stream_bridge(
+        &self,
+        root_run_id: String,
+        event_tx: mpsc::Sender<Value>,
+    ) -> oneshot::Sender<()> {
+        let mut progress_rx = self.dynamic_agent_progress_broadcaster().subscribe();
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut filter = server_loop_host::RunScopedAgentProgressFilter::new(root_run_id);
+            'bridge: loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    received = progress_rx.recv() => {
+                        match received {
+                            Ok(evt) => {
+                                for evt in filter.accept(evt) {
+                                    let Some(event) = server_loop_host::progress_event_to_sse(&evt) else {
+                                        continue;
+                                    };
+                                    if event_tx.send(event).await.is_err() {
+                                        break 'bridge;
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::work_surface",
+                                    dropped,
+                                    "agent progress live stream lagged"
+                                );
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+        stop_tx
     }
 
     async fn server_agent_spawner_for_session(&self, session_id: &str) -> ServerAgentSpawnerEntry {
@@ -3428,6 +3485,7 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         session_id: &str,
+        run_id: &str,
         request: &ChatRequestData,
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
@@ -3459,7 +3517,9 @@ impl AgenticRunLifecycleService {
         }
         // Wire one shared agent-progress broadcaster for delegation and
         // dynamic `agent.spawn` trees so Web SSE observes a single lineage.
-        builder = builder.with_progress_broadcaster(self.dynamic_agent_progress_broadcaster());
+        builder = builder
+            .with_progress_broadcaster(self.dynamic_agent_progress_broadcaster())
+            .with_progress_root_run_id(run_id.to_string());
         if let Some(ref de) = self.delegation_engine {
             // G2: share the delegation engine's fork-prefix store with
             // the parent loop host so `on_turn_completed` captures land
@@ -4129,6 +4189,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let mut host = self.build_host(
             &user_id,
             &session_id,
+            &run_id,
             &request,
             edge_tools,
             edge_profile,
@@ -4641,7 +4702,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let _ = live_tx_for_fanout.send(event.clone());
                 let _ = client_event_tx.send(event).await;
             }
-            // Flush accumulated text_deltas in a single batch at turn end.
+            // Flush accumulated live events in a single batch at turn end.
             if !pending_deltas.is_empty() {
                 astra_core::log_persist!(
                     fanout_run_engine
@@ -4653,6 +4714,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
             }
         });
+        let progress_bridge_stop =
+            self.spawn_agent_progress_stream_bridge(run_id.clone(), event_tx.clone());
 
         let (mut run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
@@ -4715,6 +4778,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let mut host = self.build_host(
             &user_id,
             &session_id,
+            &run_id,
             &request,
             edge_tools,
             edge_profile,
@@ -4827,6 +4891,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(writer) = self.auxiliary_event_writer.clone() {
                 executor.set_auxiliary_event_writer(writer);
             }
+            executor.set_work_surface_event_tx(event_tx.clone());
             self.wire_server_dynamic_agent_tools(
                 &mut executor,
                 &user_id,
@@ -5045,6 +5110,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await;
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
+            let _ = progress_bridge_stop.send(());
             drop(event_tx);
 
             // Post-loop memory cleanup — identical to `create_run`. Runs
@@ -5900,6 +5966,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             llm_token_service: context.llm_token_service.clone(),
             request_constraints,
             recursion_depth: config.recursion_depth,
+            max_turns: Some(config.max_turns),
             pause_flag: context.pause_flag.clone(),
             checkpoint_gate: None,
             mailbox: config.mailbox,
@@ -6050,6 +6117,23 @@ impl ServerSubRunExecutor {
     }
 }
 
+fn resolve_subrun_agentic_turn_budget(
+    task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+    explicit_max_turns: Option<u32>,
+) -> astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+    astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+        task_profile,
+        astra_core::RuntimeLimits::global().max_turns,
+        explicit_max_turns.map(|max_turns| {
+            let max_turns = max_turns as usize;
+            astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
+                initial_turns: Some(max_turns),
+                hard_turn_limit: Some(max_turns),
+            }
+        }),
+    )
+}
+
 #[async_trait]
 impl SubRunExecutor for ServerSubRunExecutor {
     async fn execute(
@@ -6126,6 +6210,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         });
 
         let task_profile = infer_task_execution_profile(&full_task);
+        let agentic_turn_budget =
+            resolve_subrun_agentic_turn_budget(task_profile, config.max_turns);
+        let max_turns = agentic_turn_budget.initial_turns;
         let project_root_buf = project_root_from_delegation_context(&config.context);
         let hook_sets = project_root_buf
             .as_ref()
@@ -6164,7 +6251,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_user_id: Some(config.user_id.clone()),
             context_manifest_model_name: config.agent_profile.model_override.clone(),
-            recursion_depth: 0,
+            recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -6174,14 +6261,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_tool_calls: 0,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
-            max_turns: 10,
-            remaining_turns: 10,
+            max_turns,
+            remaining_turns: max_turns,
             turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
-            agentic_turn_budget:
-                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default()
-                    .agentic_turn_budget,
+            agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -6508,6 +6593,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 mod tests {
     use super::*;
     use crate::DatabaseTurnHookDbWriter;
+    use crate::orchestration::{AgentProgressEvent, ProgressEventType};
     use astra_services::runs::{
         DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
         InMemoryRunStateStore, RunStateStore,
@@ -6540,6 +6626,123 @@ mod tests {
             blocks: vec![],
             blocked_by: vec![],
         }
+    }
+
+    fn test_agent_progress_event(
+        agent_id: &str,
+        timestamp_epoch_ms: u64,
+        event_type: ProgressEventType,
+    ) -> AgentProgressEvent {
+        AgentProgressEvent {
+            agent_id: agent_id.to_string(),
+            event_type,
+            timestamp_epoch_ms,
+        }
+    }
+
+    fn test_agent_spawned(
+        agent_id: &str,
+        run_id: &str,
+        parent_run_id: &str,
+        timestamp_epoch_ms: u64,
+    ) -> AgentProgressEvent {
+        test_agent_progress_event(
+            agent_id,
+            timestamp_epoch_ms,
+            ProgressEventType::AgentSpawned {
+                run_id: run_id.to_string(),
+                parent_run_id: parent_run_id.to_string(),
+                agent_type: "reviewer".to_string(),
+                description: "review code".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn run_scoped_agent_progress_filter_replays_early_events_after_spawn() {
+        let mut filter =
+            server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
+
+        let accepted = filter.accept(test_agent_progress_event(
+            "agent-a",
+            1,
+            ProgressEventType::Started {
+                description: "review code".to_string(),
+            },
+        ));
+        assert!(accepted.is_empty());
+
+        let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 2));
+        assert_eq!(accepted.len(), 2);
+        assert!(matches!(
+            accepted[0].event_type,
+            ProgressEventType::Started { .. }
+        ));
+        assert!(matches!(
+            accepted[1].event_type,
+            ProgressEventType::AgentSpawned { .. }
+        ));
+
+        let accepted = filter.accept(test_agent_progress_event(
+            "agent-a",
+            3,
+            ProgressEventType::ToolExecuting {
+                tool_name: "rg".to_string(),
+                turn: 1,
+            },
+        ));
+        assert_eq!(accepted.len(), 1);
+    }
+
+    #[test]
+    fn run_scoped_agent_progress_filter_blocks_foreign_root_events() {
+        let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-a".to_string());
+
+        assert!(
+            filter
+                .accept(test_agent_progress_event(
+                    "agent-b",
+                    1,
+                    ProgressEventType::Started {
+                        description: "other run".to_string(),
+                    },
+                ))
+                .is_empty()
+        );
+        assert!(
+            filter
+                .accept(test_agent_spawned("agent-b", "child-b", "root-b", 2))
+                .is_empty()
+        );
+        assert!(
+            !filter.agent_ids.contains("agent-b"),
+            "foreign agent must not be admitted"
+        );
+        assert!(
+            !filter.pending_by_agent.contains_key("agent-b"),
+            "foreign spawn should clear cached early events"
+        );
+    }
+
+    #[test]
+    fn run_scoped_agent_progress_filter_allows_nested_child_runs() {
+        let mut filter =
+            server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
+
+        assert_eq!(
+            filter
+                .accept(test_agent_spawned("agent-a", "child-a", "root-run", 1))
+                .len(),
+            1
+        );
+        assert_eq!(
+            filter
+                .accept(test_agent_spawned("agent-b", "grandchild-b", "child-a", 2))
+                .len(),
+            1
+        );
+        assert!(filter.agent_ids.contains("agent-b"));
+        assert!(filter.run_ids.contains("grandchild-b"));
     }
 
     // ── extract_prev_assistant_text + implicit feedback wiring ──
@@ -6860,6 +7063,18 @@ mod tests {
         };
 
         assert!(err.contains("parent run lineage"), "{err}");
+    }
+
+    #[test]
+    fn subrun_turn_budget_uses_explicit_spawn_max_turns() {
+        let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+            "explore the codebase and implement the fix",
+        );
+        let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
+
+        assert_eq!(budget.initial_turns, 3);
+        assert_eq!(budget.hard_turn_limit, 3);
+        assert_eq!(budget.max_extensions, 0);
     }
 
     #[test]

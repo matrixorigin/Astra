@@ -7,6 +7,7 @@ import { WebApiError } from "@/lib/api/errors";
 import type { ChatDetail, ComposerOptions } from "@/lib/api/types";
 import {
   getChat,
+  getChatWorkSurface,
   queueChatRunInput,
   resumeChatRun,
   stopChatRun,
@@ -47,9 +48,15 @@ jest.mock("next/link", () => ({
   ),
 }));
 
-jest.mock("lucide-react", () => ({
-  MoreVertical: () => null,
-}));
+jest.mock("lucide-react", () => {
+  const Icon = () => null;
+  return new Proxy(
+    { __esModule: true },
+    {
+      get: (_target, prop) => (prop === "__esModule" ? true : Icon),
+    },
+  );
+});
 
 jest.mock("@/components/app/chat-actions-menu", () => ({
   ChatActionsMenu: () => null,
@@ -127,6 +134,7 @@ jest.mock("@/components/app/composer", () => ({
 
 jest.mock("@/lib/api/chats", () => ({
   getChat: jest.fn(),
+  getChatWorkSurface: jest.fn(),
   queueChatRunInput: jest.fn(),
   resumeChatRun: jest.fn(),
   stopChatRun: jest.fn(),
@@ -136,6 +144,9 @@ jest.mock("@/lib/api/chats", () => ({
 }));
 
 const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
+const mockGetChatWorkSurface = getChatWorkSurface as jest.MockedFunction<
+  typeof getChatWorkSurface
+>;
 const mockQueueChatRunInput = queueChatRunInput as jest.MockedFunction<
   typeof queueChatRunInput
 >;
@@ -198,6 +209,13 @@ describe("ChatView deferred-input unhappy paths", () => {
     replaceMock.mockReset();
     refreshMock.mockReset();
     mockGetChat.mockReset();
+    mockGetChatWorkSurface.mockReset();
+    mockGetChatWorkSurface.mockResolvedValue({
+      sessionId: "chat-123",
+      tasks: [],
+      events: [],
+      generatedAt: "2026-06-07T00:00:00.000Z",
+    });
     mockQueueChatRunInput.mockReset();
     mockResumeChatRun.mockReset();
     mockStopChatRun.mockReset();
@@ -527,7 +545,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
     });
-    expect(screen.getByText("Stopping current run")).toBeInTheDocument();
+    expect(screen.getByText("Stopping")).toBeInTheDocument();
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
@@ -651,15 +669,9 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
 
-    resolveStop({
-      activeRun: {
-        runId: "run-123",
-        status: "cancelling",
-        waitingFor: null,
-      },
-    });
+    resolveStop({ activeRun: undefined });
     await waitFor(() => {
-      expect(screen.getByText("Stopping current run")).toBeInTheDocument();
+      expect(screen.queryByText("Stopping current run")).not.toBeInTheDocument();
     });
   });
 
@@ -708,11 +720,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(
-      screen.getByText(
-        "Run status is initializing-provider. Stop it or refresh before sending new input.",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Run initializing-provider")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
     ).toBeDisabled();

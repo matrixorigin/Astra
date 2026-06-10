@@ -11,6 +11,7 @@ import type {
   SendMessageRequest,
   SendMessageResponse,
   ActiveRunMutationResponse,
+  WorkSurfaceResponse,
 } from "@/lib/api/types";
 
 export function listChats(params: {
@@ -32,6 +33,12 @@ export function createChat(payload: CreateChatRequest) {
 
 export function getChat(chatId: string) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`);
+}
+
+export function getChatWorkSurface(chatId: string) {
+  return requestJson<WorkSurfaceResponse>(
+    `/api/chats/${encodeURIComponent(chatId)}/work-surface`,
+  );
 }
 
 export function archiveChat(chatId: string, archived: boolean) {
@@ -123,6 +130,7 @@ export type ChatStreamHandlers = {
     status: string;
     error?: string | null;
   }) => void;
+  onWorkSurfaceEvent?: (event: Record<string, unknown>) => void;
   onCancelled?: (text: string) => void;
   onPaused?: (text: string) => void;
   onDone?: (text: string) => void;
@@ -186,6 +194,23 @@ function applyStreamEvent(
   handlers: ChatStreamHandlers,
 ) {
   const type = typeof event.type === "string" ? event.type : "";
+
+  if (
+    type === "task_board_snapshot" ||
+    type === "tool_call" ||
+    type === "tool_call_start" ||
+    type === "tool_call_end" ||
+    type === "agent_delegated" ||
+    type === "agent_spawned" ||
+    type === "agent_progress" ||
+    type === "agent_completed" ||
+    type === "agent_failed" ||
+    type === "agent_cancelled" ||
+    type === "agent_interrupted"
+  ) {
+    handlers.onWorkSurfaceEvent?.(event);
+    return;
+  }
 
   if (
     type === "local_messages" &&

@@ -52,6 +52,78 @@ use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
 
+use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+
+const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
+const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
+
+#[derive(Debug)]
+pub(crate) struct RunScopedAgentProgressFilter {
+    pub(crate) run_ids: HashSet<String>,
+    pub(crate) agent_ids: HashSet<String>,
+    pub(crate) pending_by_agent: HashMap<String, Vec<AgentProgressEvent>>,
+}
+
+impl RunScopedAgentProgressFilter {
+    pub(crate) fn new(root_run_id: String) -> Self {
+        let mut run_ids = HashSet::new();
+        run_ids.insert(root_run_id);
+        Self {
+            run_ids,
+            agent_ids: HashSet::new(),
+            pending_by_agent: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn accept(&mut self, event: AgentProgressEvent) -> Vec<AgentProgressEvent> {
+        if self.agent_ids.contains(&event.agent_id) {
+            return vec![event];
+        }
+
+        if let ProgressEventType::AgentSpawned {
+            run_id,
+            parent_run_id,
+            ..
+        } = &event.event_type
+        {
+            if self.run_ids.contains(parent_run_id) || self.run_ids.contains(run_id) {
+                self.run_ids.insert(run_id.clone());
+                self.agent_ids.insert(event.agent_id.clone());
+                let mut accepted = self
+                    .pending_by_agent
+                    .remove(&event.agent_id)
+                    .unwrap_or_default();
+                accepted.push(event);
+                return accepted;
+            }
+
+            self.pending_by_agent.remove(&event.agent_id);
+            return Vec::new();
+        }
+
+        self.remember_pending(event);
+        Vec::new()
+    }
+
+    fn remember_pending(&mut self, event: AgentProgressEvent) {
+        if !self.pending_by_agent.contains_key(&event.agent_id)
+            && self.pending_by_agent.len() >= MAX_PENDING_PROGRESS_AGENTS
+            && let Some(key) = self.pending_by_agent.keys().next().cloned()
+        {
+            self.pending_by_agent.remove(&key);
+        }
+
+        let pending = self
+            .pending_by_agent
+            .entry(event.agent_id.clone())
+            .or_default();
+        if pending.len() >= MAX_PENDING_PROGRESS_PER_AGENT {
+            pending.remove(0);
+        }
+        pending.push(event);
+    }
+}
+
 fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     match CLIENT.get_or_init(|| {
@@ -784,6 +856,7 @@ pub struct ServerAgenticLoopHost {
     // ── Agent progress ──
     /// Optional receiver for agent progress events (multi-agent tree updates).
     progress_rx: Option<tokio::sync::broadcast::Receiver<crate::orchestration::AgentProgressEvent>>,
+    progress_filter: Option<RunScopedAgentProgressFilter>,
     /// Latches the first lifecycle summary built for this host/user turn.
     /// Keeps prompt and introspection lifecycle context byte-consistent across
     /// multi-round tool loops.
@@ -851,6 +924,7 @@ pub struct ServerAgenticLoopHostBuilder {
     user_id: String,
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
+    progress_root_run_id: Option<String>,
     interactive_client: bool,
     interaction_mode: Option<RequestedTurnInteractionMode>,
     full_llm_capture: bool,
@@ -896,6 +970,7 @@ impl ServerAgenticLoopHostBuilder {
             user_id,
             session_id,
             progress_broadcaster: None,
+            progress_root_run_id: None,
             interactive_client: false,
             interaction_mode: None,
             full_llm_capture: false,
@@ -1005,6 +1080,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_progress_root_run_id(mut self, run_id: String) -> Self {
+        self.progress_root_run_id = Some(run_id);
+        self
+    }
+
     pub fn with_interactive_client(mut self, interactive_client: bool) -> Self {
         self.interactive_client = interactive_client;
         self
@@ -1079,6 +1159,9 @@ impl ServerAgenticLoopHostBuilder {
             .collect();
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
+        let progress_filter = self
+            .progress_root_run_id
+            .map(RunScopedAgentProgressFilter::new);
 
         ServerAgenticLoopHost {
             matrixone: self.matrixone,
@@ -1110,6 +1193,7 @@ impl ServerAgenticLoopHostBuilder {
             client_cancel_flag: None,
             client_cancel_token: None,
             progress_rx,
+            progress_filter,
             turn_start_lifecycle_summary: None,
             turn_start_plan_resume_hint: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
@@ -1405,8 +1489,15 @@ impl ServerAgenticLoopHost {
             loop {
                 match rx.try_recv() {
                     Ok(evt) => {
-                        if let Some(sse_val) = progress_event_to_sse(&evt) {
-                            progress_events.push(sse_val);
+                        let accepted = if let Some(filter) = self.progress_filter.as_mut() {
+                            filter.accept(evt)
+                        } else {
+                            vec![evt]
+                        };
+                        for evt in accepted {
+                            if let Some(sse_val) = progress_event_to_sse(&evt) {
+                                progress_events.push(sse_val);
+                            }
                         }
                     }
                     Err(TryRecvError::Lagged(n)) => {
@@ -1431,6 +1522,12 @@ impl ServerAgenticLoopHost {
     /// When the channel closes (client disconnect), `cancel_flag` and
     /// `cancel_token` are triggered to stop the agentic loop.
     pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+        // In live streaming mode, run_lifecycle owns the dedicated progress
+        // bridge. Keeping the host subscription active would replay the same
+        // agent progress events at turn-boundary drains, duplicating cards and
+        // persisted work-surface deltas.
+        self.progress_rx = None;
+        self.progress_filter = None;
         self.event_tx = Some(tx);
     }
 
@@ -3522,7 +3619,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
 /// Convert an `AgentProgressEvent` into an SSE-compatible JSON value.
 /// Returns `None` for event types that don't need to be sent to web clients.
-fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Option<Value> {
+pub(crate) fn progress_event_to_sse(
+    evt: &crate::orchestration::AgentProgressEvent,
+) -> Option<Value> {
     use crate::orchestration::ProgressEventType;
     let agent_id = &evt.agent_id;
     let ts = evt.timestamp_epoch_ms;
@@ -3534,24 +3633,20 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
             agent_type,
             description,
         } => Some(json!({
-            "event_type": "agent_spawned",
-            "data": {
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "parent_run_id": parent_run_id,
-                "agent_type": agent_type,
-                "description": description,
-                "timestamp": ts,
-            }
+            "type": "agent_spawned",
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "parent_run_id": parent_run_id,
+            "agent_type": agent_type,
+            "description": description,
+            "timestamp": ts,
         })),
         ProgressEventType::Started { description } => Some(json!({
-            "event_type": "agent_progress",
-            "data": {
-                "agent_id": agent_id,
-                "status": "started",
-                "description": description,
-                "timestamp": ts,
-            }
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "started",
+            "description": description,
+            "timestamp": ts,
         })),
         ProgressEventType::Completed {
             result_summary,
@@ -3559,16 +3654,14 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
             total_tokens,
             duration_ms,
         } => Some(json!({
-            "event_type": "agent_completed",
-            "data": {
-                "agent_id": agent_id,
-                "status": "completed",
-                "result_summary": result_summary,
-                "total_tool_calls": total_tool_calls,
-                "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
-                "duration_ms": duration_ms,
-                "timestamp": ts,
-            }
+            "type": "agent_completed",
+            "agent_id": agent_id,
+            "status": "completed",
+            "result_summary": result_summary,
+            "total_tool_calls": total_tool_calls,
+            "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
+            "duration_ms": duration_ms,
+            "timestamp": ts,
         })),
         ProgressEventType::Interrupted {
             reason,
@@ -3577,45 +3670,37 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
             total_tokens,
             duration_ms,
         } => Some(json!({
-            "event_type": "agent_interrupted",
-            "data": {
-                "agent_id": agent_id,
-                "status": "interrupted",
-                "reason": reason,
-                "partial_summary": partial_summary,
-                "total_tool_calls": total_tool_calls,
-                "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
-                "duration_ms": duration_ms,
-                "timestamp": ts,
-            }
+            "type": "agent_interrupted",
+            "agent_id": agent_id,
+            "status": "interrupted",
+            "reason": reason,
+            "partial_summary": partial_summary,
+            "total_tool_calls": total_tool_calls,
+            "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
+            "duration_ms": duration_ms,
+            "timestamp": ts,
         })),
         ProgressEventType::Failed { error } => Some(json!({
-            "event_type": "agent_failed",
-            "data": {
-                "agent_id": agent_id,
-                "status": "failed",
-                "error": error,
-                "timestamp": ts,
-            }
+            "type": "agent_failed",
+            "agent_id": agent_id,
+            "status": "failed",
+            "error": error,
+            "timestamp": ts,
         })),
         ProgressEventType::Cancelled { reason } => Some(json!({
-            "event_type": "agent_cancelled",
-            "data": {
-                "agent_id": agent_id,
-                "status": "cancelled",
-                "reason": reason,
-                "timestamp": ts,
-            }
+            "type": "agent_cancelled",
+            "agent_id": agent_id,
+            "status": "cancelled",
+            "reason": reason,
+            "timestamp": ts,
         })),
         ProgressEventType::ToolExecuting { tool_name, turn } => Some(json!({
-            "event_type": "agent_progress",
-            "data": {
-                "agent_id": agent_id,
-                "status": "tool_executing",
-                "tool_name": tool_name,
-                "turn": turn,
-                "timestamp": ts,
-            }
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "tool_executing",
+            "tool_name": tool_name,
+            "turn": turn,
+            "timestamp": ts,
         })),
         ProgressEventType::MetricsUpdate {
             turn,
@@ -3624,17 +3709,15 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
             total_completion_tokens,
             total_tool_calls,
         } => Some(json!({
-            "event_type": "agent_progress",
-            "data": {
-                "agent_id": agent_id,
-                "status": "metrics_update",
-                "turn": turn,
-                "max_turns": max_turns,
-                "total_prompt_tokens": total_prompt_tokens,
-                "total_completion_tokens": total_completion_tokens,
-                "total_tool_calls": total_tool_calls,
-                "timestamp": ts,
-            }
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "metrics_update",
+            "turn": turn,
+            "max_turns": max_turns,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
+            "total_tool_calls": total_tool_calls,
+            "timestamp": ts,
         })),
         // Other event types (Idle, Busy, LlmCallStarted, LlmCallCompleted,
         // TurnCompleted, PermissionDenied) are too granular for web SSE
@@ -6428,6 +6511,30 @@ mod tests {
     // ── progress_event_to_sse tests ──
 
     #[test]
+    fn set_event_tx_disables_host_progress_subscription() {
+        use crate::orchestration::ProgressBroadcaster;
+
+        let broadcaster = Arc::new(ProgressBroadcaster::default());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_progress_broadcaster(broadcaster)
+        .with_progress_root_run_id("run-root".to_string())
+        .build();
+        assert!(host.progress_rx.is_some());
+        assert!(host.progress_filter.is_some());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        host.set_event_tx(tx);
+
+        assert!(host.progress_rx.is_none());
+        assert!(host.progress_filter.is_none());
+    }
+
+    #[test]
     fn progress_event_agent_spawned_to_sse() {
         use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 
@@ -6442,10 +6549,10 @@ mod tests {
             timestamp_epoch_ms: 1000,
         };
         let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
-        assert_eq!(sse["event_type"], "agent_spawned");
-        assert_eq!(sse["data"]["agent_id"], "agent-1");
-        assert_eq!(sse["data"]["run_id"], "run-123");
-        assert_eq!(sse["data"]["agent_type"], "explore");
+        assert_eq!(sse["type"], "agent_spawned");
+        assert_eq!(sse["agent_id"], "agent-1");
+        assert_eq!(sse["run_id"], "run-123");
+        assert_eq!(sse["agent_type"], "explore");
     }
 
     #[test]
@@ -6463,9 +6570,9 @@ mod tests {
             timestamp_epoch_ms: 2000,
         };
         let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
-        assert_eq!(sse["event_type"], "agent_completed");
-        assert_eq!(sse["data"]["status"], "completed");
-        assert_eq!(sse["data"]["total_tool_calls"], 5);
+        assert_eq!(sse["type"], "agent_completed");
+        assert_eq!(sse["status"], "completed");
+        assert_eq!(sse["total_tool_calls"], 5);
     }
 
     #[test]
@@ -6484,9 +6591,9 @@ mod tests {
             timestamp_epoch_ms: 2000,
         };
         let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
-        assert_eq!(sse["event_type"], "agent_interrupted");
-        assert_eq!(sse["data"]["status"], "interrupted");
-        assert_eq!(sse["data"]["reason"], "budget_exhausted");
+        assert_eq!(sse["type"], "agent_interrupted");
+        assert_eq!(sse["status"], "interrupted");
+        assert_eq!(sse["reason"], "budget_exhausted");
     }
 
     #[test]
@@ -6511,10 +6618,10 @@ mod tests {
         let failed_sse = super::progress_event_to_sse(&failed).expect("failed SSE");
         let cancelled_sse = super::progress_event_to_sse(&cancelled).expect("cancelled SSE");
 
-        assert_eq!(failed_sse["event_type"], "agent_failed");
-        assert_eq!(failed_sse["data"]["status"], "failed");
-        assert_eq!(cancelled_sse["event_type"], "agent_cancelled");
-        assert_eq!(cancelled_sse["data"]["status"], "cancelled");
+        assert_eq!(failed_sse["type"], "agent_failed");
+        assert_eq!(failed_sse["status"], "failed");
+        assert_eq!(cancelled_sse["type"], "agent_cancelled");
+        assert_eq!(cancelled_sse["status"], "cancelled");
     }
 
     #[test]

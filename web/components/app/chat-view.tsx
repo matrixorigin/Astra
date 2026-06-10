@@ -1,6 +1,13 @@
 "use client";
 
-import { MoreVertical } from "lucide-react";
+import {
+  Bot,
+  ClipboardList,
+  Loader2,
+  MoreVertical,
+  Terminal,
+  type LucideIcon,
+} from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -16,11 +23,16 @@ import { ChatDotNavigator } from "@/components/app/chat-dot-navigator";
 import { Composer } from "@/components/app/composer";
 import { MessageBubble } from "@/components/app/message-bubble";
 import { MoveChatModal } from "@/components/app/move-chat-modal";
+import {
+  WorkSurfacePanel,
+  type WorkSurfaceTab,
+} from "@/components/app/work-surface-panel";
 import { IconButton } from "@/components/ui/icon-button";
 import { useChatLifecycleActions } from "@/hooks/use-chat-lifecycle-actions";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
 import {
   getChat,
+  getChatWorkSurface,
   queueChatRunInput,
   resumeChatRun,
   stopChatRun,
@@ -39,6 +51,14 @@ import {
   isChatScrolledToBottom,
   shouldAutoScrollChat,
 } from "@/lib/chat-scroll-state";
+import {
+  applyWorkSurfaceEvent,
+  beginWorkSurfaceLoad,
+  createEmptyWorkSurface,
+  failWorkSurfaceLoad,
+  hydrateWorkSurface,
+  type WorkSurfaceResponse as WorkSurfaceProjection,
+} from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
@@ -128,6 +148,12 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [queueingDeferredInput, setQueueingDeferredInput] = useState(false);
   const [resumingRun, setResumingRun] = useState(false);
   const [stoppingRun, setStoppingRun] = useState(false);
+  const [workSurface, setWorkSurface] = useState(() =>
+    createEmptyWorkSurface(initial.session?.backendSessionId ?? null),
+  );
+  const [workSurfaceTab, setWorkSurfaceTab] =
+    useState<WorkSurfaceTab>("tasks");
+  const [workSurfaceOpenSignal, setWorkSurfaceOpenSignal] = useState(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
@@ -173,10 +199,28 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   });
   const showRunStatusPanel = Boolean(
     detail.activeRun?.runId &&
-    (canResumeRun ||
-      activeRunBlocksNewInput ||
-      activeRunStatus === "cancelling"),
+    canResumeRun,
   );
+  const runningAgentCount = workSurface.agents.filter((agent) =>
+    ["running", "started", "tool_executing", "metrics_update"].includes(
+      agent.status,
+    ),
+  ).length;
+  const runningToolCount = workSurface.tools.filter(
+    (tool) => tool.status === "running",
+  ).length;
+  const workingTaskCount = workSurface.tasks.filter(
+    (task) => task.status === "in_progress",
+  ).length;
+  const showRunActivityBar = Boolean(
+    !isArchived && !canResumeRun && (startingRun || detail.activeRun?.runId),
+  );
+  const runActivityLabel =
+    stoppingRun || activeRunStatus === "cancelling"
+      ? "Stopping"
+      : startingRun
+        ? "Starting run"
+        : activeRunLabel;
 
   const nextStreamAbortSignal = useCallback(() => {
     streamAbortRef.current?.abort();
@@ -184,6 +228,46 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     streamAbortRef.current = controller;
     return controller.signal;
   }, []);
+
+  const applyWorkSurfaceStreamEvent = useCallback(
+    (event: Record<string, unknown>) => {
+      setWorkSurface((current) => applyWorkSurfaceEvent(current, event));
+    },
+    [],
+  );
+
+  const openWorkSurfaceTab = useCallback((tab: WorkSurfaceTab) => {
+    setWorkSurfaceTab(tab);
+    setWorkSurfaceOpenSignal((signal) => signal + 1);
+  }, []);
+
+  const hydrateWorkSurfaceForChat = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const sessionId = detail.session?.backendSessionId ?? null;
+      if (!options?.silent) {
+        setWorkSurface((current) => beginWorkSurfaceLoad(current, sessionId));
+      }
+      try {
+        const response = await getChatWorkSurface(detail.chat.id);
+        setWorkSurface((current) =>
+          hydrateWorkSurface(
+            current,
+            response as unknown as WorkSurfaceProjection,
+          ),
+        );
+      } catch (error) {
+        setWorkSurface((current) =>
+          failWorkSurfaceLoad(
+            current,
+            error instanceof Error
+              ? error.message
+              : "Failed to load work surface.",
+          ),
+        );
+      }
+    },
+    [detail.chat.id, detail.session?.backendSessionId],
+  );
 
   const startStream = useCallback(
     async ({
@@ -285,6 +369,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           {
             signal: nextStreamAbortSignal(),
+            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
             onLocalMessages: ({
               userMessage: localUserMessage,
               assistantMessage: localAssistantMessage,
@@ -346,6 +431,11 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               }));
             },
             onSessionBound: ({ sessionId }) => {
+              setWorkSurface((current) => ({
+                ...current,
+                sessionId,
+                error: null,
+              }));
               setDetail((current) => ({
                 ...current,
                 session: {
@@ -469,6 +559,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       }
     },
     [
+      applyWorkSurfaceStreamEvent,
       chatListHref,
       detail.chat.archivedAt,
       detail.chat.id,
@@ -520,6 +611,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         });
         void streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
           signal: nextStreamAbortSignal(),
+          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
@@ -650,6 +742,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     },
     [
       addToast,
+      applyWorkSurfaceStreamEvent,
       chatListHref,
       detail.chat.archivedAt,
       detail.chat.id,
@@ -668,6 +761,16 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     }
     runControlMutationRef.current = true;
     setStoppingRun(true);
+    setDetail((current) => ({
+      ...current,
+      activeRun: current.activeRun?.runId
+        ? {
+            runId: current.activeRun.runId,
+            status: "cancelling",
+            waitingFor: null,
+          }
+        : current.activeRun,
+    }));
     try {
       const result = await stopChatRun(detail.chat.id);
       setDetail((current) => ({
@@ -684,6 +787,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       if (isNotFoundError(error)) {
         router.replace(chatListHref);
         return;
+      }
+      const refreshed = await getChat(detail.chat.id).catch(() => null);
+      if (refreshed) {
+        setDetail(refreshed);
       }
       addToast(
         error instanceof Error
@@ -725,6 +832,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     setResumingRun(true);
     try {
       const result = await resumeChatRun(detail.chat.id);
+      if (!result.activeRun?.runId) {
+        throw new Error("Resume response did not include an active run.");
+      }
       setDetail((current) => ({
         ...current,
         activeRun: result.activeRun,
@@ -752,6 +862,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       try {
         await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
           signal: nextStreamAbortSignal(),
+          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
@@ -879,6 +990,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     }
   }, [
     addToast,
+    applyWorkSurfaceStreamEvent,
     canResumeRun,
     chatListHref,
     detail.activeRun?.runId,
@@ -895,6 +1007,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     },
     [],
   );
+
+  useEffect(() => {
+    void hydrateWorkSurfaceForChat();
+  }, [hydrateWorkSurfaceForChat]);
 
   useEffect(() => {
     if (shouldAutoScrollChat({ pinnedToBottom: pinnedRef.current })) {
@@ -993,179 +1109,290 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
 
   return (
-    <div className="astra-chat-view relative flex h-full min-h-0 flex-col overflow-hidden bg-bg">
-      <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
-        <Link
-          href={
-            detail.chat.projectId
-              ? `/projects/${detail.chat.projectId}`
-              : "/chats"
-          }
-          className="inline-flex items-center gap-1 text-[13px] text-text-muted transition-colors hover:text-text"
-        >
-          ← {detail.project?.name ?? "Chats"}
-        </Link>
-        <div className="min-w-0">
-          <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">
-            {detail.chat.title ?? "Untitled"}
-          </h1>
-          <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
-            <span className="size-1.5 rounded-full bg-success" />
-            <span>
-              {activeRunLabel} · {detail.chat.model ?? "Default model"}
+    <div className="astra-chat-view relative flex h-full min-h-0 overflow-hidden bg-bg">
+      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
+        <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
+          <Link
+            href={
+              detail.chat.projectId
+                ? `/projects/${detail.chat.projectId}`
+                : "/chats"
+            }
+            className="inline-flex items-center gap-1 text-[13px] text-text-muted transition-colors hover:text-text"
+          >
+            ← {detail.project?.name ?? "Chats"}
+          </Link>
+          <div className="min-w-0">
+            <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">
+              {detail.chat.title ?? "Untitled"}
+            </h1>
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
+              <span className="size-1.5 rounded-full bg-success" />
+              <span>
+                {detail.chat.model ?? "Default model"}
+              </span>
+            </div>
+          </div>
+          <div className="min-w-0 flex-1" />
+          {detail.chat.archivedAt ? (
+            <span className="rounded-full bg-surface-muted px-2 py-1 text-xs font-medium text-text-muted">
+              Archived
             </span>
+          ) : null}
+          <ChatActionsMenu
+            chatId={detail.chat.id}
+            archived={isArchived}
+            active
+            afterMutationHref={chatListHref}
+            onMove={() => setMoveOpen(true)}
+            onChatUpdated={setDetail}
+            trigger={
+              <IconButton
+                icon={MoreVertical}
+                label="Chat menu"
+                className="size-8"
+              />
+            }
+          />
+        </header>
+
+        <div
+          ref={scrollRef}
+          data-testid="chat-scroll-container"
+          onScroll={(event) => {
+            const target = event.currentTarget;
+            pinnedRef.current = isChatScrolledToBottom(target);
+          }}
+          className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
+        >
+          <div className="mx-auto w-full max-w-[860px] px-7 pb-44 pt-10">
+            {detail.messages.map((message, index) => (
+              <div key={message.id} data-chat-message-index={index}>
+                <MessageBubble message={message} />
+              </div>
+            ))}
           </div>
         </div>
-        <div className="min-w-0 flex-1" />
-        {detail.chat.archivedAt ? (
-          <span className="rounded-full bg-surface-muted px-2 py-1 text-xs font-medium text-text-muted">
-            Archived
-          </span>
-        ) : null}
-        <ChatActionsMenu
-          chatId={detail.chat.id}
-          archived={isArchived}
-          active
-          afterMutationHref={chatListHref}
-          onMove={() => setMoveOpen(true)}
-          onChatUpdated={setDetail}
-          trigger={
-            <IconButton
-              icon={MoreVertical}
-              label="Chat menu"
-              className="size-8"
-            />
-          }
+        <ChatDotNavigator
+          messages={detail.messages}
+          scrollContainerRef={scrollRef}
         />
-      </header>
 
-      <div
-        ref={scrollRef}
-        data-testid="chat-scroll-container"
-        onScroll={(event) => {
-          const target = event.currentTarget;
-          pinnedRef.current = isChatScrolledToBottom(target);
-        }}
-        className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
-      >
-        <div className="mx-auto w-full px-7 pb-44 pt-10 md:w-[70%]">
-          {detail.messages.map((message, index) => (
-            <div key={message.id} data-chat-message-index={index}>
-              <MessageBubble message={message} />
-            </div>
-          ))}
-        </div>
-      </div>
-      <ChatDotNavigator
-        messages={detail.messages}
-        scrollContainerRef={scrollRef}
-      />
-
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
-        <div className="pointer-events-auto mx-auto w-full md:w-[70%]">
-          {isArchived ? (
-            <div className="rounded-[20px] border border-border bg-surface px-5 py-4 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
-              <div className="flex items-center justify-between gap-4">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-text">
-                    This chat is archived.
-                  </p>
-                  <p className="mt-1 text-sm text-text-muted">
-                    Archived chats are read-only. Unarchive it to continue.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  disabled={lifecycle.busyChatId === detail.chat.id}
-                  onClick={() => {
-                    void lifecycle.unarchive(detail.chat.id);
-                  }}
-                  className="shrink-0 rounded-control bg-text px-3 py-2 text-sm font-medium text-white hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Unarchive
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <Composer
-                disabled={composerDisabled}
-                placeholder={composerPlaceholder}
-                initialModel={
-                  detail.pendingTurn?.options.model ??
-                  detail.chat.model ??
-                  undefined
-                }
-                persistModelPreference={false}
-                onModelChange={handleModelChange}
-                showStop={Boolean(canStopRun && canQueueDeferredInput)}
-                stopping={stoppingRun}
-                stopDisabled={runControlBusy}
-                onStop={() => {
-                  void stopActiveRun();
-                }}
-                projectContext={
-                  detail.chat.projectId
-                    ? { projectId: detail.chat.projectId }
-                    : undefined
-                }
-                onSubmit={async ({ text, options }) => {
-                  if (canQueueDeferredInput) {
-                    await queueDeferredInput({ text, options });
-                    return;
-                  }
-                  void startStream({ text, options, appendUser: true });
-                }}
-              />
-              {showRunStatusPanel ? (
-                <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
-                  <p>
-                    {activeRunStatus === "paused"
-                      ? "This run is paused. Resume to continue or Stop to cancel it."
-                      : activeRunBlocksNewInput
-                        ? `Run status is ${activeRunStatus}. Stop it or refresh before sending new input.`
-                        : "Stopping current run"}
-                  </p>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {canResumeRun ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void resumeActiveRun();
-                        }}
-                        disabled={runControlBusy}
-                        className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {resumingRun ? "Resuming..." : "Resume"}
-                      </button>
-                    ) : null}
-                    {canStopRun ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void stopActiveRun();
-                        }}
-                        disabled={runControlBusy}
-                        className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {stoppingRun ? "Stopping..." : "Stop"}
-                      </button>
-                    ) : null}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
+          <div className="pointer-events-auto mx-auto w-full max-w-[860px]">
+            {isArchived ? (
+              <div className="rounded-[20px] border border-border bg-surface px-5 py-4 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-text">
+                      This chat is archived.
+                    </p>
+                    <p className="mt-1 text-sm text-text-muted">
+                      Archived chats are read-only. Unarchive it to continue.
+                    </p>
                   </div>
+                  <button
+                    type="button"
+                    disabled={lifecycle.busyChatId === detail.chat.id}
+                    onClick={() => {
+                      void lifecycle.unarchive(detail.chat.id);
+                    }}
+                    className="shrink-0 rounded-control bg-text px-3 py-2 text-sm font-medium text-white hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Unarchive
+                  </button>
                 </div>
-              ) : null}
-            </>
-          )}
+              </div>
+            ) : (
+              <>
+                {showRunActivityBar ? (
+                  <RunActivityBar
+                    label={runActivityLabel}
+                    agents={runningAgentCount}
+                    tools={runningToolCount}
+                    tasks={workingTaskCount}
+                    onOpenAgents={() => openWorkSurfaceTab("agents")}
+                    onOpenTasks={() => openWorkSurfaceTab("tasks")}
+                    onOpenTools={() => openWorkSurfaceTab("tools")}
+                  />
+                ) : null}
+                <Composer
+                  disabled={composerDisabled}
+                  placeholder={composerPlaceholder}
+                  initialModel={
+                    detail.pendingTurn?.options.model ??
+                    detail.chat.model ??
+                    undefined
+                  }
+                  persistModelPreference={false}
+                  onModelChange={handleModelChange}
+                  showStop={Boolean(canStopRun && canQueueDeferredInput)}
+                  stopping={stoppingRun}
+                  stopDisabled={runControlBusy}
+                  onStop={() => {
+                    void stopActiveRun();
+                  }}
+                  projectContext={
+                    detail.chat.projectId
+                      ? { projectId: detail.chat.projectId }
+                      : undefined
+                  }
+                  onSubmit={async ({ text, options }) => {
+                    if (canQueueDeferredInput) {
+                      await queueDeferredInput({ text, options });
+                      return;
+                    }
+                    void startStream({ text, options, appendUser: true });
+                  }}
+                />
+                {showRunStatusPanel ? (
+                  <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
+                    <p>
+                      {activeRunStatus === "paused"
+                        ? "This run is paused. Resume to continue or Stop to cancel it."
+                        : activeRunBlocksNewInput
+                          ? `Run status is ${activeRunStatus}. Stop it or refresh before sending new input.`
+                          : "Stopping current run"}
+                    </p>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {canResumeRun ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void resumeActiveRun();
+                          }}
+                          disabled={runControlBusy}
+                          className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {resumingRun ? "Resuming..." : "Resume"}
+                        </button>
+                      ) : null}
+                      {canStopRun ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void stopActiveRun();
+                          }}
+                          disabled={runControlBusy}
+                          className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {stoppingRun ? "Stopping..." : "Stop"}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            )}
+          </div>
         </div>
-      </div>
 
-      <MoveChatModal
-        open={moveOpen}
-        chatId={detail.chat.id}
-        currentProjectId={detail.chat.projectId}
-        onOpenChange={setMoveOpen}
-        onMoved={refresh}
+        <MoveChatModal
+          open={moveOpen}
+          chatId={detail.chat.id}
+          currentProjectId={detail.chat.projectId}
+          onOpenChange={setMoveOpen}
+          onMoved={refresh}
+        />
+      </div>
+      <WorkSurfacePanel
+        state={workSurface}
+        activeRun={detail.activeRun}
+        tab={workSurfaceTab}
+        onTabChange={setWorkSurfaceTab}
+        openSignal={workSurfaceOpenSignal}
+        onRefresh={() => {
+          void hydrateWorkSurfaceForChat();
+        }}
       />
     </div>
+  );
+}
+
+function RunActivityBar({
+  label,
+  agents,
+  tools,
+  tasks,
+  onOpenAgents,
+  onOpenTasks,
+  onOpenTools,
+}: {
+  label: string;
+  agents: number;
+  tools: number;
+  tasks: number;
+  onOpenAgents: () => void;
+  onOpenTasks: () => void;
+  onOpenTools: () => void;
+}) {
+  const hasActivityCounts = agents > 0 || tools > 0 || tasks > 0;
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
+      <span className="inline-flex items-center gap-2 font-medium text-text">
+        <Loader2 className="size-3.5 animate-spin text-accent" />
+        {label}
+      </span>
+      {hasActivityCounts ? (
+        <>
+          <span className="h-4 w-px bg-border" />
+          <RunActivityMetric
+            icon={Bot}
+            label="Agents"
+            value={agents}
+            onClick={onOpenAgents}
+          />
+          <RunActivityMetric
+            icon={ClipboardList}
+            label="Tasks"
+            value={tasks}
+            onClick={onOpenTasks}
+          />
+          <RunActivityMetric
+            icon={Terminal}
+            label="Tools"
+            value={tools}
+            onClick={onOpenTools}
+          />
+        </>
+      ) : (
+        <span className="inline-flex items-center gap-1 pl-0.5" aria-hidden="true">
+          <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
+          <span
+            className="size-1.5 animate-bounce rounded-full bg-text-muted"
+            style={{ animationDelay: "120ms" }}
+          />
+          <span
+            className="size-1.5 animate-bounce rounded-full bg-text-muted"
+            style={{ animationDelay: "240ms" }}
+          />
+        </span>
+      )}
+    </div>
+  );
+}
+
+function RunActivityMetric({
+  icon: Icon,
+  label,
+  value,
+  onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  value: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center gap-1 rounded-full bg-bg px-2 py-1 font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30"
+      onClick={onClick}
+      aria-label={`Open ${label.toLowerCase()} work surface`}
+      title={`Open ${label}`}
+    >
+      <Icon className="size-3.5 text-text-muted" />
+      {value}
+    </button>
   );
 }

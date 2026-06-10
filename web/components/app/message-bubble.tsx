@@ -190,7 +190,7 @@ export const MessageBubble = memo(function MessageBubble({
   if (isUser) {
     return (
       <article className="flex justify-end py-4">
-        <div className="astra-chat-user-message max-w-[80%] rounded-[22px] rounded-br-md bg-surface-muted px-[18px] py-3 text-[15px] font-normal leading-[1.55] tracking-[0.06em] text-text [-webkit-text-stroke:0.03px_currentColor]">
+        <div className="astra-chat-user-message max-w-[78%] rounded-[20px] rounded-br-md bg-surface-muted px-4 py-2.5 text-[15px] font-normal leading-6 text-text">
           <SkillMentionText
             content={content}
             skills={message.activeSkills}
@@ -212,14 +212,7 @@ export const MessageBubble = memo(function MessageBubble({
         <ReasoningPanel reasoning={reasoning} streaming={reasoningStreaming} />
       ) : null}
       {isStreamingEmpty ? (
-        <div
-          className="flex h-7 items-center gap-1 text-text-muted"
-          aria-label="Astra is responding"
-        >
-          <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
-          <span className="size-1.5 animate-bounce rounded-full bg-text-muted [animation-delay:120ms]" />
-          <span className="size-1.5 animate-bounce rounded-full bg-text-muted [animation-delay:240ms]" />
-        </div>
+        <AssistantTypingIndicator />
       ) : (
         <MarkdownContent content={content} />
       )}
@@ -255,6 +248,27 @@ export const MessageBubble = memo(function MessageBubble({
     </article>
   );
 });
+
+function AssistantTypingIndicator() {
+  return (
+    <div
+      className="mb-2 inline-flex items-center gap-1.5 rounded-[18px] rounded-bl-md bg-surface-muted px-4 py-3"
+      aria-label="Astra is responding"
+      role="status"
+      aria-live="polite"
+    >
+      <span className="size-2 animate-bounce rounded-full bg-text-muted" />
+      <span
+        className="size-2 animate-bounce rounded-full bg-text-muted"
+        style={{ animationDelay: "120ms" }}
+      />
+      <span
+        className="size-2 animate-bounce rounded-full bg-text-muted"
+        style={{ animationDelay: "240ms" }}
+      />
+    </div>
+  );
+}
 
 function ArtifactList({ artifacts }: { artifacts: ChatArtifactRef[] }) {
   const visibleArtifacts = artifacts.filter(isChatVisibleArtifact);

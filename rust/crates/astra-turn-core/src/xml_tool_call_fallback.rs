@@ -26,6 +26,8 @@ use uuid::Uuid;
 /// content is plain prose surrounding the tags, it's probably a normal
 /// response that happens to mention the format.
 const MAX_NON_XML_RATIO: f64 = 0.20;
+const DSML_FULLWIDTH_PREFIX: &str = "\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
+const DSML_ASCII_PREFIX: &str = "||DSML||";
 
 /// Try to extract tool calls from XML `<invoke>` blocks in `text`.
 ///
@@ -39,6 +41,8 @@ const MAX_NON_XML_RATIO: f64 = 0.20;
 /// { "id": "...", "type": "function", "function": { "name": "...", "arguments": "{...}" } }
 /// ```
 pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
+    let normalized = normalize_dsml_tool_call_markup(text);
+    let text = normalized.as_str();
     if !text.contains("<invoke") {
         return None;
     }
@@ -79,6 +83,9 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
 /// Strip successfully-parsed `<invoke>` blocks from text, returning the
 /// remaining content (trimmed).  Unparseable fragments are kept.
 pub fn strip_parsed_invocations(text: &str) -> String {
+    if let Some(stripped) = strip_parsed_dsml_tool_call_blocks(text) {
+        return stripped;
+    }
     if !text.contains("<invoke") {
         return text.to_string();
     }
@@ -107,6 +114,46 @@ pub fn strip_parsed_invocations(text: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+fn normalize_dsml_tool_call_markup(text: &str) -> String {
+    let mut normalized = text.to_string();
+    for prefix in [DSML_FULLWIDTH_PREFIX, DSML_ASCII_PREFIX] {
+        for tag in ["tool_calls", "invoke", "parameter"] {
+            normalized = normalized.replace(&format!("<{prefix}{tag}"), &format!("<{tag}"));
+            normalized = normalized.replace(&format!("</{prefix}{tag}"), &format!("</{tag}"));
+        }
+    }
+    normalized
+}
+
+fn strip_parsed_dsml_tool_call_blocks(text: &str) -> Option<String> {
+    let mut result = text.to_string();
+    let mut changed = false;
+
+    for prefix in [DSML_FULLWIDTH_PREFIX, DSML_ASCII_PREFIX] {
+        let open = format!("<{prefix}tool_calls>");
+        let close = format!("</{prefix}tool_calls>");
+        let mut search_from = 0;
+
+        while let Some(start) = result[search_from..].find(&open) {
+            let abs_start = search_from + start;
+            let Some(close_start) = result[abs_start..].find(&close) else {
+                search_from = abs_start + open.len();
+                continue;
+            };
+            let block_end = abs_start + close_start + close.len();
+            let block = &result[abs_start..block_end];
+            if parse_xml_tool_calls(block).is_some() {
+                result.replace_range(abs_start..block_end, "");
+                changed = true;
+            } else {
+                search_from = block_end;
+            }
+        }
+    }
+
+    changed.then(|| result.trim().to_string())
 }
 
 // ─── <tool_call> Fallback ────────────────────────────────────────────────────
@@ -419,6 +466,43 @@ mod tests {
         assert_eq!(args["path"], "src/main.rs");
         assert!(calls[0]["id"].as_str().unwrap().starts_with("xmlfb_"));
         assert_eq!(calls[0]["type"], "function");
+    }
+
+    #[test]
+    fn parse_dsml_wrapped_invoke_with_params() {
+        let dsml = concat!(
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"agent\">",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"action\" string=\"true\">get_result",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"agent_id\" string=\"true\">reviewer@run",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke>",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>",
+        );
+
+        let calls = parse_xml_tool_calls(dsml).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "agent");
+        let args: serde_json::Map<String, Value> =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["action"], "get_result");
+        assert_eq!(args["agent_id"], "reviewer@run");
+    }
+
+    #[test]
+    fn strip_dsml_wrapped_invoke_preserves_prose() {
+        let dsml = concat!(
+            "Web review complete.\n\n",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"agent\">",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"action\">get_result",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke>",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>",
+        );
+
+        assert_eq!(strip_parsed_invocations(dsml), "Web review complete.");
     }
 
     #[test]

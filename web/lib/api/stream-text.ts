@@ -10,6 +10,16 @@ const THINKING_TAGS = [
   ["<think>", "</think>"],
 ] as const;
 
+const DSML_PREFIX = "[|\\uFF5C]{2}DSML[|\\uFF5C]{2}";
+const DSML_TOOL_CALL_OPEN_RE = new RegExp(
+  `<\\s*${DSML_PREFIX}tool_calls\\s*>`,
+  "i",
+);
+const DSML_TOOL_CALL_CLOSE_RE = new RegExp(
+  `<\\s*\\/\\s*${DSML_PREFIX}tool_calls\\s*>`,
+  "i",
+);
+
 export function mergeTextDelta(current: string, delta: string) {
   if (!delta || current === delta || current.endsWith(delta)) {
     return current;
@@ -18,6 +28,32 @@ export function mergeTextDelta(current: string, delta: string) {
     return delta;
   }
   return `${current}${delta}`;
+}
+
+export function stripDsmlToolCallBlocks(text: string) {
+  let cursor = 0;
+  let visible = "";
+
+  for (;;) {
+    const tail = text.slice(cursor);
+    const open = DSML_TOOL_CALL_OPEN_RE.exec(tail);
+    if (!open || open.index === undefined) {
+      visible += tail;
+      break;
+    }
+
+    const openStart = cursor + open.index;
+    visible += text.slice(cursor, openStart);
+    const bodyStart = openStart + open[0].length;
+    const close = DSML_TOOL_CALL_CLOSE_RE.exec(text.slice(bodyStart));
+    if (!close || close.index === undefined) {
+      cursor = text.length;
+      break;
+    }
+    cursor = bodyStart + close.index + close[0].length;
+  }
+
+  return visible.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function splitThinkingTags(text: string): ThinkingSplit {
@@ -77,8 +113,8 @@ export function splitThinkingTags(text: string): ThinkingSplit {
   }
 
   return {
-    visibleText: visibleText.replace(/\n{3,}/g, "\n\n").trim(),
-    reasoning: reasoning.replace(/\n{3,}/g, "\n\n").trim(),
+    visibleText: stripDsmlToolCallBlocks(visibleText),
+    reasoning: stripDsmlToolCallBlocks(reasoning),
     hasThinking,
     reasoningOpen,
   };

@@ -12,6 +12,7 @@ export type StreamEventType =
   | 'text_done'
   | 'reasoning_delta'
   | 'reasoning_done'
+  | 'tool_call'
   | 'tool_call_start'
   | 'tool_call_end'
   | 'usage'
@@ -27,6 +28,10 @@ export type StreamEventType =
   | 'agent_spawned'
   | 'agent_progress'
   | 'agent_completed'
+  | 'agent_failed'
+  | 'agent_cancelled'
+  | 'agent_interrupted'
+  | 'task_board_snapshot'
   | 'tool_approval_request'
   | 'ping'
   | 'device_revoked'
@@ -93,6 +98,24 @@ export type ToolCallStartEvent = {
   tool: string;
   call_id: string;
   arguments?: string;
+};
+
+export type ToolCallEvent = {
+  type: 'tool_call';
+  tool_call: {
+    id?: string;
+    call_id?: string;
+    name?: string;
+    tool?: string;
+    arguments?: unknown;
+    args?: unknown;
+    function?: {
+      name?: string;
+      arguments?: unknown;
+      id?: string;
+      call_id?: string;
+    };
+  };
 };
 
 export type ToolCallEndEvent = {
@@ -212,6 +235,66 @@ export type AgentCompletedEvent = {
   timestamp?: number;
 };
 
+export type AgentFailedEvent = {
+  type: 'agent_failed';
+  agent_id: string;
+  status?: 'failed';
+  error?: string;
+  timestamp?: number;
+};
+
+export type AgentCancelledEvent = {
+  type: 'agent_cancelled';
+  agent_id: string;
+  status?: 'cancelled';
+  reason?: string;
+  timestamp?: number;
+};
+
+export type AgentInterruptedEvent = {
+  type: 'agent_interrupted';
+  agent_id: string;
+  status?: 'interrupted';
+  reason?: string;
+  partial_summary?: string;
+  total_tool_calls?: number;
+  total_tokens?: { prompt: number; completion: number };
+  duration_ms?: number;
+  timestamp?: number;
+};
+
+export type SessionSubtask = {
+  id: string;
+  title: string;
+  description?: string | null;
+  status: string;
+  owner?: string | null;
+  depends_on?: string[];
+};
+
+export type SessionTask = {
+  id: string;
+  title: string;
+  description?: string | null;
+  active_form?: string | null;
+  status: string;
+  owner?: string | null;
+  metadata?: Record<string, unknown> | null;
+  blocks?: string[];
+  blocked_by?: string[];
+  subtasks?: SessionSubtask[];
+  created_at: string;
+  updated_at: string;
+  archived_at?: string | null;
+};
+
+export type TaskBoardSnapshotEvent = {
+  type: 'task_board_snapshot';
+  session_id: string;
+  reason?: string;
+  tasks: SessionTask[];
+};
+
 export type ToolApprovalRequestEvent = {
   type: 'tool_approval_request';
   request_id: string;
@@ -264,6 +347,7 @@ export type StreamEvent = (
   | TextDoneEvent
   | ThinkingDeltaEvent
   | ThinkingDoneEvent
+  | ToolCallEvent
   | ToolCallStartEvent
   | ToolCallEndEvent
   | UsageEvent
@@ -279,6 +363,10 @@ export type StreamEvent = (
   | AgentSpawnedEvent
   | AgentProgressEvent
   | AgentCompletedEvent
+  | AgentFailedEvent
+  | AgentCancelledEvent
+  | AgentInterruptedEvent
+  | TaskBoardSnapshotEvent
   | ToolApprovalRequestEvent
   | PingEvent
   | DeviceLeaseEndedEvent

@@ -180,6 +180,8 @@ pub struct SubRunConfig {
     pub request_constraints: RequestConstraints,
     /// Current nested agent/sub-run depth for the child loop.
     pub recursion_depth: u8,
+    /// Optional explicit turn budget for the child loop.
+    pub max_turns: Option<u32>,
     /// Cooperative pause flag — checked between turns by the sub-run loop.
     /// When set to `true`, the sub-run should yield with status "paused".
     pub pause_flag: Option<Arc<AtomicBool>>,
@@ -217,6 +219,7 @@ impl std::fmt::Debug for SubRunConfig {
             .field("llm_token_service", &self.llm_token_service.is_some())
             .field("request_constraints", &self.request_constraints)
             .field("recursion_depth", &self.recursion_depth)
+            .field("max_turns", &self.max_turns)
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
             .field("mailbox", &self.mailbox.is_some())
@@ -2240,6 +2243,7 @@ impl DelegationEngine {
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
+                max_turns: None,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
@@ -2524,6 +2528,7 @@ impl DelegationEngine {
                                 llm_token_service: llm_token_service.cloned(),
                                 request_constraints: request_constraints.clone(),
                                 recursion_depth: child_recursion_depth,
+                                max_turns: None,
                                 pause_flag: None,
                                 checkpoint_gate: None,
                                 mailbox: None,
@@ -2701,6 +2706,7 @@ impl DelegationEngine {
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
+                max_turns: None,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
@@ -2810,6 +2816,7 @@ impl DelegationEngine {
                         llm_token_service: llm_token_service.cloned(),
                         request_constraints: request_constraints.clone(),
                         recursion_depth: child_recursion_depth,
+                        max_turns: None,
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
@@ -2995,6 +3002,7 @@ impl DelegationEngine {
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
+                max_turns: None,
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
@@ -3098,6 +3106,7 @@ impl DelegationEngine {
                         llm_token_service: llm_token_service.cloned(),
                         request_constraints: request_constraints.clone(),
                         recursion_depth: child_recursion_depth,
+                        max_turns: None,
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
@@ -3204,6 +3213,7 @@ impl DelegationEngine {
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
+                max_turns: None,
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
@@ -3439,6 +3449,7 @@ impl DelegationEngine {
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
+                max_turns: None,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
@@ -4902,6 +4913,7 @@ mod tests {
             llm_token_service: None,
             request_constraints: Default::default(),
             recursion_depth: 1,
+            max_turns: None,
             pause_flag: None,
             checkpoint_gate: None,
             mailbox: None,

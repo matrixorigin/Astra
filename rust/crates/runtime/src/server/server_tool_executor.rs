@@ -953,6 +953,8 @@ pub struct ServerToolExecutor {
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Shared dynamic-agent tool context for `agent.spawn/get_result`.
     agent_tool_context: Option<AgentToolContext>,
+    /// Optional live event channel used by the web-agent work surface.
+    work_surface_event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     server_tool_names: HashSet<String>,
 }
@@ -1045,6 +1047,7 @@ impl ServerToolExecutor {
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             mcp_manager: None,
             agent_tool_context: None,
+            work_surface_event_tx: None,
             capabilities,
             server_tool_names,
         }
@@ -1178,6 +1181,11 @@ impl ServerToolExecutor {
     /// Attach the shared dynamic-agent tool context.
     pub fn set_agent_tool_context(&mut self, ctx: AgentToolContext) {
         self.agent_tool_context = Some(ctx);
+    }
+
+    /// Attach the live web-agent work-surface event channel.
+    pub fn set_work_surface_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+        self.work_surface_event_tx = Some(tx);
     }
 
     async fn server_run_script(&self, args: &Value) -> astra_tools::ToolResult {
@@ -2287,6 +2295,7 @@ impl ServerToolExecutor {
             cb.tool_completed(&call_id, &result.output, !result.is_error)
                 .await;
         }
+        self.emit_tool_call_end(args, &result);
 
         result
     }
@@ -3327,6 +3336,7 @@ impl ServerToolExecutor {
                     args.get("title").and_then(Value::as_str).unwrap_or("task")
                 ),
             );
+            self.emit_task_board_snapshot("task_create").await;
         }
         output
     }
@@ -3364,6 +3374,7 @@ impl ServerToolExecutor {
                         .unwrap_or("task")
                 ),
             );
+            self.emit_task_board_snapshot("task_update").await;
         }
         output
     }
@@ -3393,6 +3404,7 @@ impl ServerToolExecutor {
                         .unwrap_or("task")
                 ),
             );
+            self.emit_task_board_snapshot("task_stop").await;
         }
         output
     }
@@ -3468,8 +3480,64 @@ impl ServerToolExecutor {
                         .unwrap_or("bulk")
                 ),
             );
+            self.emit_task_board_snapshot("task_archive").await;
         }
         output
+    }
+
+    async fn emit_task_board_snapshot(&self, reason: &str) {
+        let Some(tx) = &self.work_surface_event_tx else {
+            return;
+        };
+        let tasks = match self.task_manager.store().load(&self.session_id).await {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::work_surface",
+                    session_id = %self.session_id,
+                    error = %error,
+                    "failed to load task board snapshot after task mutation"
+                );
+                return;
+            }
+        };
+        let event = json!({
+            "type": "task_board_snapshot",
+            "session_id": self.session_id.clone(),
+            "reason": reason,
+            "tasks": tasks,
+        });
+        if let Err(error) = tx.try_send(event) {
+            tracing::debug!(
+                target: "astra_runtime::work_surface",
+                session_id = %self.session_id,
+                error = %error,
+                "work-surface event channel unavailable"
+            );
+        }
+    }
+
+    fn emit_tool_call_end(&self, args: &Value, result: &astra_tools::ToolResult) {
+        let Some(tx) = &self.work_surface_event_tx else {
+            return;
+        };
+        let Some(call_id) = args.get("_tool_call_id").and_then(Value::as_str) else {
+            return;
+        };
+        let event = json!({
+            "type": "tool_call_end",
+            "call_id": call_id,
+            "result": result.output.clone(),
+            "success": !result.is_error,
+        });
+        if let Err(error) = tx.try_send(event) {
+            tracing::debug!(
+                target: "astra_runtime::work_surface",
+                session_id = %self.session_id,
+                error = %error,
+                "work-surface tool completion event channel unavailable"
+            );
+        }
     }
 
     #[allow(dead_code)]
