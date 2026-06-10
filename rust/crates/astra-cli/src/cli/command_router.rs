@@ -319,6 +319,43 @@ fn finalize_one_shot_stream_result(
     compute_exit_code(sr)
 }
 
+fn effective_one_shot_model<'a>(
+    explicit_model: Option<&'a str>,
+    restored_model: Option<&'a str>,
+    fallback_model: Option<&'a str>,
+) -> Option<&'a str> {
+    explicit_model
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| restored_model.filter(|model| !model.trim().is_empty()))
+        .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
+}
+
+fn effective_one_shot_permission_mode(
+    explicit_mode: Option<&str>,
+    explicit_auto: bool,
+    restored_mode: Option<&str>,
+    fallback_auto: bool,
+) -> Result<PermissionMode, String> {
+    if let Some(mode) = explicit_mode.filter(|mode| !mode.trim().is_empty()) {
+        return mode
+            .parse::<PermissionMode>()
+            .map_err(|error| format!("invalid permission mode '{mode}': {error}"));
+    }
+    if explicit_auto {
+        return Ok(PermissionMode::Auto);
+    }
+    if let Some(mode) = restored_mode.filter(|mode| !mode.trim().is_empty()) {
+        return mode.parse::<PermissionMode>().map_err(|error| {
+            format!("invalid restored session permission mode '{mode}': {error}")
+        });
+    }
+    Ok(if fallback_auto {
+        PermissionMode::Auto
+    } else {
+        PermissionMode::Prompt
+    })
+}
+
 fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option<String> {
     if let Some(error) = sr.session_persistence_error.as_deref() {
         Some(format!("Session persistence degraded: {error}"))
@@ -402,6 +439,15 @@ async fn execute_headless_task_body(
     use astra_services::TaskStatus;
     let (_creds, profile_name, _, token) = get_profile_and_token(profile)?;
     let session_id = session_routing.server_session_id.clone();
+    let effective_model =
+        effective_one_shot_model(None, session_routing.restored_model(), global_model)
+            .map(str::to_owned);
+    let effective_permission_mode = effective_one_shot_permission_mode(
+        None,
+        false,
+        session_routing.restored_permission_mode(),
+        true,
+    )?;
     let mut continuation_messages = session_routing.continuation_messages();
 
     emit_task_event(
@@ -429,7 +475,11 @@ async fn execute_headless_task_body(
     let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
     let skill_search = astra_core::SkillSearchSettings::default();
     let project_root = std::env::current_dir().unwrap_or_default();
-    let mut pm = PermissionManager::with_project(true, &project_root);
+    let mut pm = PermissionManager::with_load_policy(
+        effective_permission_mode,
+        &project_root,
+        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+    );
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let root_agent_id = format!("task-{}", task_id.as_str());
     let spawner = super::agent_runtime::build_one_shot_spawner(
@@ -439,7 +489,7 @@ async fn execute_headless_task_body(
         pm.mode(),
         skill_search.clone(),
         session_id.clone(),
-        global_model.map(str::to_owned),
+        effective_model.clone(),
     )
     .await;
     let spawner_handle_for_drain = spawner.clone();
@@ -470,7 +520,7 @@ async fn execute_headless_task_body(
         api,
         auth_profile: profile,
         message: &prompt,
-        model: global_model,
+        model: effective_model.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: terminal::size().is_ok() && !options.quiet && !options.json,
@@ -540,7 +590,7 @@ async fn execute_headless_task_body(
 
     persist_one_shot_session_state(
         Some(&profile_name),
-        global_model,
+        effective_model.as_deref(),
         &prompt,
         &mut sr,
         turn_start,
@@ -1147,14 +1197,16 @@ pub(crate) async fn execute_cli_command(
     match command {
         // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
+            let mut interactive_context = cli_context.clone();
+            let resume_session_id = interactive_context.session_id.take();
             run_interactive_chat(
                 api,
                 profile.as_deref(),
                 global_model.as_deref(),
-                None,
+                resume_session_id.as_deref(),
                 no_instructions,
                 max_budget,
-                cli_context,
+                &interactive_context,
             )
             .await?;
             Ok(ExitCode::Success)
@@ -1196,15 +1248,22 @@ pub(crate) async fn execute_cli_command(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
+            let effective_model = effective_one_shot_model(
+                None,
+                session_routing.restored_model(),
+                global_model.as_deref(),
+            )
+            .map(str::to_owned);
+            let effective_permission_mode = effective_one_shot_permission_mode(
+                None,
+                auto_approve,
+                session_routing.restored_permission_mode(),
+                false,
+            )?;
             let mut continuation_messages = session_routing.continuation_messages();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
-            let mode = if auto_approve {
-                PermissionMode::Auto
-            } else {
-                PermissionMode::Prompt
-            };
             let mut pm = PermissionManager::with_load_policy(
-                mode,
+                effective_permission_mode,
                 &std::env::current_dir().unwrap_or_default(),
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
@@ -1214,7 +1273,7 @@ pub(crate) async fn execute_cli_command(
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
-                model: global_model.as_deref(),
+                model: effective_model.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
@@ -1223,10 +1282,6 @@ pub(crate) async fn execute_cli_command(
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
-                // Non-Chat (Message-style) path — legacy single-shot
-                // invocation without dynamic sub-agent support. Keep
-                // pre-fix behavior; extend later if this path needs
-                // spawning too.
                 agent_spawner: None,
                 root_agent_id: None,
                 task_manager: None,
@@ -1291,7 +1346,7 @@ pub(crate) async fn execute_cli_command(
             };
             let exit_code = finalize_one_shot_stream_result(
                 profile.as_deref(),
-                global_model.as_deref(),
+                effective_model.as_deref(),
                 &message,
                 &mut sr,
                 turn_start,
@@ -1650,14 +1705,18 @@ pub(crate) async fn execute_cli_command(
             } else {
                 // No message → start interactive TUI with optional pre-set session/model
                 let model = args.model.as_deref().or(global_model.as_deref());
-                let interactive_context = cli_context
+                let mut interactive_context = cli_context
                     .clone()
                     .with_permission_mode(args.permission_mode.clone());
+                let resume_session_id = args
+                    .session_id
+                    .clone()
+                    .or_else(|| interactive_context.session_id.take());
                 run_interactive_chat(
                     api,
                     profile.as_deref(),
                     model,
-                    None,
+                    resume_session_id.as_deref(),
                     no_instructions,
                     max_budget,
                     &interactive_context,
@@ -1679,33 +1738,28 @@ pub(crate) async fn execute_cli_command(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
+            let effective_model = effective_one_shot_model(
+                args.model.as_deref(),
+                session_routing.restored_model(),
+                global_model.as_deref(),
+            )
+            .map(str::to_owned);
+            let effective_permission_mode = effective_one_shot_permission_mode(
+                args.permission_mode.as_deref(),
+                args.auto_approve || auto_approve,
+                session_routing.restored_permission_mode(),
+                false,
+            )?;
             let mut continuation_messages = session_routing.continuation_messages();
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
-                if let Some(ref mode_str) = args.permission_mode {
-                    let mode: PermissionMode = mode_str.parse().unwrap_or_else(|e| {
-                        eprintln!("{}", format!("  ⚠  {e}, defaulting to prompt").yellow());
-                        PermissionMode::Prompt
-                    });
-                    PermissionManager::with_load_policy(
-                        mode,
-                        &project_root,
-                        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-                    )
-                } else {
-                    let mode = if args.auto_approve || auto_approve {
-                        PermissionMode::Auto
-                    } else {
-                        PermissionMode::Prompt
-                    };
-                    PermissionManager::with_load_policy(
-                        mode,
-                        &project_root,
-                        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-                    )
-                }
+                PermissionManager::with_load_policy(
+                    effective_permission_mode,
+                    &project_root,
+                    &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                )
             };
             let explain_mode = args.explain.unwrap_or(ExplainMode::Off);
 
@@ -1722,15 +1776,8 @@ pub(crate) async fn execute_cli_command(
                 crate::cli::stream::stream_render::RenderPolicy::Stream
             };
 
-            // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
-            // can service `agent(action='spawn', ...)`, matching the REPL
-            // path. Without this, one-shot LLM invocations that try
-            // to spawn hit "Agent spawning not available in
-            // this context." — discovered during real-world MiniMax
-            // verification. Mirrors the REPL's
-            // `initialize_multi_agent_runtime` wiring via the
-            // extracted `build_one_shot_spawner` helper so the
-            // fork-prefix pipeline is identically configured.
+            // One-shot chat uses the same local agent spawner wiring as the
+            // REPL so agent(action='spawn', ...) has the same behavior.
             let root_agent_id = format!("root-{}", uuid::Uuid::new_v4());
             let one_shot_spawner = super::agent_runtime::build_one_shot_spawner(
                 api,
@@ -1739,10 +1786,7 @@ pub(crate) async fn execute_cli_command(
                 pm.mode(),
                 skill_search.clone(),
                 session_id.clone(),
-                args.model
-                    .as_deref()
-                    .or(global_model.as_deref())
-                    .map(str::to_owned),
+                effective_model.clone(),
             )
             .await;
 
@@ -1781,7 +1825,7 @@ pub(crate) async fn execute_cli_command(
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
-                model: args.model.as_deref().or(global_model.as_deref()),
+                model: effective_model.as_deref(),
                 provider: None,
                 explain: explain_mode,
                 render_md,
@@ -1828,7 +1872,7 @@ pub(crate) async fn execute_cli_command(
 
             let exit_code = finalize_one_shot_stream_result(
                 profile.as_deref(),
-                args.model.as_deref().or(global_model.as_deref()),
+                effective_model.as_deref(),
                 &message,
                 &mut sr,
                 turn_start,
@@ -2476,24 +2520,25 @@ pub(crate) async fn run_print_mode(
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
     let session_id = session_routing.server_session_id.clone();
+    let effective_model =
+        effective_one_shot_model(None, session_routing.restored_model(), model).map(str::to_owned);
+    let effective_permission_mode = effective_one_shot_permission_mode(
+        None,
+        false,
+        session_routing.restored_permission_mode(),
+        true,
+    )?;
     let mut continuation_messages = session_routing.continuation_messages();
     let _pipeline = create_pipeline_modules(api, profile);
-    // Issue #326 P0 / R1 Major 2: print mode (headless `astra -p`) is
-    // non-interactive — there is no TUI to ask for approvals. We force
-    // `auto_approve = true` (= PermissionMode::Auto) here. The
-    // bypass-immune deny rules (sensitive paths, git-destructive,
-    // execute hard-deny, sandbox circuit breaker) still fire in Auto
-    // mode; this only avoids popping a non-existent prompt. If a tool genuinely requires
-    // NeedApproval (e.g. compensation prompts after a denial), the
-    // gate fans out to silent-fail-closed in stream_render.rs (line
-    // ~1983), surfacing the deny reason to the LLM instead of hanging.
+    // Print mode is non-interactive. Restored session mode wins when present;
+    // otherwise Auto is the headless fallback.
     // Issue #326 P5b: print mode is headless — strip project
     // allow rules so a hostile project file can't quietly enable
     // capabilities the user didn't ask for. Project deny rules
     // still apply (a project can tighten, never loosen, the
     // headless policy).
     let mut pm = PermissionManager::with_load_policy(
-        crate::cli::permission_manager::PermissionMode::Auto,
+        effective_permission_mode,
         &std::env::current_dir().unwrap_or_default(),
         &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
     );
@@ -2525,7 +2570,7 @@ pub(crate) async fn run_print_mode(
         api,
         auth_profile: profile,
         message: &message,
-        model,
+        model: effective_model.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: false,
@@ -2571,7 +2616,13 @@ pub(crate) async fn run_print_mode(
         Err(e) => return Err(e.error),
     };
 
-    let exit_code = finalize_one_shot_stream_result(profile, model, &message, &mut sr, turn_start);
+    let exit_code = finalize_one_shot_stream_result(
+        profile,
+        effective_model.as_deref(),
+        &message,
+        &mut sr,
+        turn_start,
+    );
 
     match output_format {
         "json" | "stream-json" => {
@@ -3284,6 +3335,49 @@ mod final_json_output_tests {
         assert_eq!(
             output["persistence_error"],
             "failed to append one-shot journal events"
+        );
+    }
+}
+
+#[cfg(test)]
+mod one_shot_effective_settings_tests {
+    use super::{effective_one_shot_model, effective_one_shot_permission_mode};
+    use crate::cli::permission_manager::PermissionMode;
+
+    #[test]
+    fn effective_one_shot_model_prefers_explicit_then_restored_then_fallback() {
+        assert_eq!(
+            effective_one_shot_model(Some("chat-explicit"), Some("restored"), Some("fallback")),
+            Some("chat-explicit")
+        );
+        assert_eq!(
+            effective_one_shot_model(None, Some("restored"), Some("fallback")),
+            Some("restored")
+        );
+        assert_eq!(
+            effective_one_shot_model(None, None, Some("fallback")),
+            Some("fallback")
+        );
+    }
+
+    #[test]
+    fn effective_one_shot_permission_mode_prefers_explicit_then_auto_then_restored() {
+        assert_eq!(
+            effective_one_shot_permission_mode(Some("plan"), true, Some("accept_edits"), false)
+                .unwrap(),
+            PermissionMode::Plan
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(None, true, Some("plan"), false).unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(None, false, Some("accept_edits"), false).unwrap(),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(None, false, None, true).unwrap(),
+            PermissionMode::Auto
         );
     }
 }

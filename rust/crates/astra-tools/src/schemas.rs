@@ -978,7 +978,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and an output preview when available. Requires the exact task_id so the model and UI refer to the same background task.",
+                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and the requested output chunk when available. Requires the exact task_id so the model and UI refer to the same background task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,

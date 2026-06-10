@@ -639,6 +639,26 @@ impl BackgroundTaskRegistry {
         read_from_str(&handle.stdout_path, offset, max_bytes)
     }
 
+    /// Read the model-facing combined stdout/stderr projection starting at
+    /// `offset`. Offsets are over the rendered projection, not raw stdout.
+    pub fn get_combined_output_since(
+        &self,
+        id: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(String, u64, u64, u64), String> {
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+        let stdout_missing = !handle.stdout_path.exists();
+        let stderr_has_output = file_len(&handle.stderr_path) > 0;
+        if handle.status().is_terminal() && stdout_missing && !stderr_has_output {
+            return Err(missing_output_artifact_error(&handle.stdout_path));
+        }
+        read_combined_from_str(&handle.stdout_path, &handle.stderr_path, offset, max_bytes)
+    }
+
     /// Read stderr from a task.
     pub fn get_stderr(&self, id: &str, tail_bytes: usize) -> Result<(String, u64), String> {
         let handle = self
@@ -1193,6 +1213,152 @@ fn read_from_str(
     ))
 }
 
+enum CombinedOutputSegment<'a> {
+    File(&'a Path, u64),
+    Static(&'static [u8]),
+}
+
+impl CombinedOutputSegment<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::File(_, len) => *len,
+            Self::Static(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn combined_output_segments<'a>(
+    stdout_path: &'a Path,
+    stderr_path: &'a Path,
+) -> Vec<CombinedOutputSegment<'a>> {
+    let stdout_len = file_len(stdout_path);
+    let stderr_len = file_len(stderr_path);
+    let mut segments = Vec::new();
+    if stdout_len > 0 {
+        segments.push(CombinedOutputSegment::File(stdout_path, stdout_len));
+    }
+    if stderr_len > 0 {
+        if stdout_len > 0 {
+            segments.push(CombinedOutputSegment::Static(b"\n<stderr>\n"));
+        } else {
+            segments.push(CombinedOutputSegment::Static(b"<stderr>\n"));
+        }
+        segments.push(CombinedOutputSegment::File(stderr_path, stderr_len));
+        segments.push(CombinedOutputSegment::Static(b"\n</stderr>"));
+    }
+    segments
+}
+
+fn count_combined_output_lines(stdout_path: &Path, stderr_path: &Path) -> u64 {
+    let segments = combined_output_segments(stdout_path, stderr_path);
+    count_combined_segments_lines(&segments).unwrap_or(0)
+}
+
+fn count_combined_segments_lines(segments: &[CombinedOutputSegment<'_>]) -> Result<u64, String> {
+    use std::io::Read;
+
+    let mut lines = 0_u64;
+    let mut saw_any = false;
+    let mut last_byte = None;
+    let mut buf = [0_u8; 8192];
+    for segment in segments {
+        match segment {
+            CombinedOutputSegment::Static(bytes) => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                saw_any = true;
+                lines = lines.saturating_add(bytes.iter().filter(|&&b| b == b'\n').count() as u64);
+                last_byte = bytes.last().copied();
+            }
+            CombinedOutputSegment::File(path, _) => {
+                let mut file = std::fs::File::open(path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                loop {
+                    let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    saw_any = true;
+                    lines = lines
+                        .saturating_add(buf[..n].iter().filter(|&&b| b == b'\n').count() as u64);
+                    last_byte = Some(buf[n - 1]);
+                }
+            }
+        }
+    }
+    if saw_any && last_byte != Some(b'\n') {
+        lines = lines.saturating_add(1);
+    }
+    Ok(lines)
+}
+
+fn read_combined_from_str(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<(String, u64, u64, u64), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let segments = combined_output_segments(stdout_path, stderr_path);
+    let total_bytes = segments.iter().map(CombinedOutputSegment::len).sum::<u64>();
+    if offset > total_bytes {
+        return Err(format!(
+            "offset {offset} beyond end of output ({total_bytes} bytes)"
+        ));
+    }
+
+    let mut remaining = max_bytes;
+    let mut cursor = 0_u64;
+    let mut out = Vec::new();
+    for segment in segments {
+        if remaining == 0 {
+            break;
+        }
+        let segment_len = segment.len();
+        let segment_end = cursor.saturating_add(segment_len);
+        if offset >= segment_end {
+            cursor = segment_end;
+            continue;
+        }
+
+        let segment_offset = offset.saturating_sub(cursor);
+        let available = segment_len.saturating_sub(segment_offset);
+        let take = available.min(remaining as u64) as usize;
+        match segment {
+            CombinedOutputSegment::Static(bytes) => {
+                let start = segment_offset as usize;
+                out.extend_from_slice(&bytes[start..start + take]);
+            }
+            CombinedOutputSegment::File(path, _) => {
+                let mut file = std::fs::File::open(path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                file.seek(SeekFrom::Start(segment_offset))
+                    .map_err(|e| e.to_string())?;
+                let mut buf = vec![0_u8; take];
+                file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+                out.extend_from_slice(&buf);
+            }
+        }
+        remaining = remaining.saturating_sub(take);
+        cursor = segment_end;
+    }
+
+    let end_offset = offset.saturating_add(out.len() as u64);
+    let total_lines = count_combined_output_lines(stdout_path, stderr_path);
+    Ok((
+        String::from_utf8_lossy(&out).into_owned(),
+        end_offset,
+        total_bytes,
+        total_lines,
+    ))
+}
+
 fn count_file_lines(path: &Path) -> Result<u64, String> {
     use std::io::Read;
     let mut file =
@@ -1509,6 +1675,76 @@ mod tests {
         assert!(tail.contains("err1"), "{tail}");
         assert_eq!(total_bytes, 15);
         assert_eq!(total_lines, 3);
+    }
+
+    #[tokio::test]
+    async fn get_combined_output_since_reads_stderr_only_projection() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr only");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+
+        let expected = "<stderr>\nstderr-line\n\n</stderr>";
+        let (chunk, end, total, total_lines) = reg
+            .get_combined_output_since(&id, 0, 4096)
+            .expect("combined chunk");
+        assert_eq!(chunk, expected);
+        assert_eq!(end, expected.as_bytes().len() as u64);
+        assert_eq!(total, expected.as_bytes().len() as u64);
+        assert_eq!(total_lines, expected.lines().count() as u64);
+    }
+
+    #[tokio::test]
+    async fn get_combined_output_since_uses_offsets_over_rendered_projection() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell(
+            "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2",
+            "mixed output",
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+
+        let expected = "stdout-line\n\n<stderr>\nstderr-line\n\n</stderr>";
+        let (first, first_end, total, total_lines) = reg
+            .get_combined_output_since(&id, 0, "stdout-line\n".len())
+            .expect("first combined chunk");
+        assert_eq!(first, "stdout-line\n");
+        assert_eq!(first_end, "stdout-line\n".len() as u64);
+        assert_eq!(total, expected.as_bytes().len() as u64);
+        assert_eq!(total_lines, expected.lines().count() as u64);
+
+        let (second, second_end, second_total, second_total_lines) = reg
+            .get_combined_output_since(&id, first_end, 4096)
+            .expect("second combined chunk");
+        assert_eq!(second, "\n<stderr>\nstderr-line\n\n</stderr>");
+        assert_eq!(second_end, expected.as_bytes().len() as u64);
+        assert_eq!(second_total, expected.as_bytes().len() as u64);
+        assert_eq!(second_total_lines, expected.lines().count() as u64);
+    }
+
+    #[tokio::test]
+    async fn get_combined_output_since_reports_missing_stdout_when_stderr_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'short'", "missing stdout");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+        let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
+        std::fs::remove_file(&stdout_path).unwrap();
+
+        let error = reg
+            .get_combined_output_since(&id, 0, 1024)
+            .expect_err("missing stdout with empty stderr should fail");
+        assert!(error.contains("output artifact missing"), "{error}");
+        assert!(
+            error.contains(&stdout_path.display().to_string()),
+            "{error}"
+        );
     }
 
     #[tokio::test]

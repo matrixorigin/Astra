@@ -574,16 +574,12 @@ fn format_background_task_output(
         return format!("{header}\n{state} · {metadata}");
     }
 
-    let line_count = snapshot.output.lines().count();
-    let preview = snapshot.output.lines().last().unwrap_or("").trim();
-    let mut text = format!(
-        "{header}\n{line_count} new {} · {metadata} · {status_label}",
+    let chunk = snapshot.output.trim_end();
+    let line_count = chunk.lines().count();
+    format!(
+        "{header}\n{line_count} new {} · {metadata} · {status_label}\nOutput chunk:\n{chunk}",
         if line_count == 1 { "line" } else { "lines" }
-    );
-    if !preview.is_empty() {
-        text.push_str(&format!("\n└ {preview}"));
-    }
-    text
+    )
 }
 
 fn format_background_task_output_timeout(task_id: &str, timeout_ms: u64) -> String {
@@ -5124,6 +5120,10 @@ mod tests {
         );
         assert!(output.contains("2 new lines"), "{output}");
         assert!(output.contains("2 total lines"), "{output}");
+        assert!(output.contains("Output chunk:"), "{output}");
+        assert!(output.contains("hello"), "{output}");
+        assert!(output.contains("world"), "{output}");
+        assert!(!output.contains("\n└ world"), "{output}");
     }
 
     #[test]

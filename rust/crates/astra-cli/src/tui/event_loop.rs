@@ -477,6 +477,114 @@ fn background_task_fanout_membership_from_projection(
     }
 }
 
+fn background_task_rejected_fanout_slot_id(group_id: &str, slot_index: usize) -> String {
+    format!("fanout:{group_id}:slot:{slot_index}:spawn_rejected")
+}
+
+fn background_task_rejected_fanout_slot_label(
+    slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlot,
+) -> String {
+    let requested = slot.requested_description.trim();
+    if !requested.is_empty() {
+        return requested.to_string();
+    }
+    let role = slot.role.trim();
+    if !role.is_empty() {
+        return role.to_string();
+    }
+    let ordinal = slot.slot_index.saturating_add(1);
+    format!("fanout slot {ordinal}")
+}
+
+fn background_task_row_for_rejected_fanout_slot(
+    group: &astra_turn_core::orchestration_fanout_group::AgentFanoutGroupProjection,
+    slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlot,
+) -> Option<bottom_pane::background_task_view::BackgroundTaskRow> {
+    use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotStatus;
+    use bottom_pane::background_task_view::{
+        BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow, LiveControlState,
+    };
+
+    if slot.status != AgentFanoutSlotStatus::SpawnRejected || slot.agent_id.is_some() {
+        return None;
+    }
+    let label = background_task_rejected_fanout_slot_label(slot);
+    let reason = slot
+        .terminal_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or("spawn rejected")
+        .to_string();
+    let title = slot
+        .requested_description
+        .trim()
+        .is_empty()
+        .then(|| label.clone())
+        .unwrap_or_else(|| slot.requested_description.trim().to_string());
+    let total_bytes = reason.as_bytes().len() as u64;
+    let total_lines = reason.lines().count() as u64;
+    Some(
+        BackgroundTaskRow::new(
+            background_task_rejected_fanout_slot_id(&group.group_id, slot.slot_index),
+            BackgroundTaskKind::LocalAgent,
+            "failed",
+            0,
+            title,
+            Some(format!(
+                "fanout_spawn_rejected: {}#{}",
+                group.group_id, slot.slot_index
+            )),
+            Some(reason.clone()),
+            Some(total_bytes),
+        )
+        .with_output_stats(None, Some(total_lines))
+        .with_terminal(None, Some(reason))
+        .with_live_control(LiveControlState::UnsupportedInMode)
+        .with_fanout(BackgroundTaskFanoutMembership {
+            group_id: group.group_id.clone(),
+            group_title: if group.title.trim().is_empty() {
+                group.group_id.clone()
+            } else {
+                group.title.clone()
+            },
+            target_count: group.target_count,
+            slot_index: slot.slot_index,
+            slot_label: label,
+        }),
+    )
+}
+
+fn background_task_output_snapshot_for_rejected_fanout_slot(
+    group: &astra_turn_core::orchestration_fanout_group::AgentFanoutGroupProjection,
+    slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlot,
+    offset: u64,
+    max_bytes: usize,
+) -> Option<crate::edge_tools::BgTaskOutputSnapshot> {
+    let row = background_task_row_for_rejected_fanout_slot(group, slot)?;
+    let full_output = row.output_tail.clone().unwrap_or_default();
+    let total_bytes = full_output.as_bytes().len() as u64;
+    let start = offset.min(total_bytes) as usize;
+    let end = start.saturating_add(max_bytes).min(full_output.len());
+    let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
+    Some(crate::edge_tools::BgTaskOutputSnapshot {
+        kind: "local agent".to_string(),
+        title: Some(row.title),
+        output,
+        end_offset: end as u64,
+        total_bytes,
+        total_lines: full_output.lines().count() as u64,
+        status: "failed".to_string(),
+        terminal: true,
+        output_ref: row.output_ref.unwrap_or_else(|| {
+            format!(
+                "fanout_spawn_rejected: {}#{}",
+                group.group_id, slot.slot_index
+            )
+        }),
+    })
+}
+
 fn background_task_row_for_local_agent_with_fanout_title(
     agent: &astra_turn_core::orchestration_types::SpawnedAgentInfo,
     fanout_title: Option<&str>,
@@ -890,11 +998,10 @@ async fn background_task_rows_with_agents(
     let mut rows = background_task_rows(background_registry);
     let mut live_agent_ids = std::collections::HashSet::new();
     if let Some(spawner) = agent_spawner {
-        let fanout_titles = spawner
-            .list_fanout_groups()
-            .await
-            .into_iter()
-            .map(|group| (group.group_id, group.title))
+        let fanout_groups = spawner.list_fanout_groups().await;
+        let fanout_titles = fanout_groups
+            .iter()
+            .map(|group| (group.group_id.clone(), group.title.clone()))
             .collect::<BTreeMap<_, _>>();
         for agent in spawner.get_agent_history(None).await {
             let fanout_title = agent
@@ -907,6 +1014,14 @@ async fn background_task_rows_with_agents(
                 live_agent_ids.insert(row.id.clone());
                 rows.push(row);
             }
+        }
+        for group in &fanout_groups {
+            rows.extend(
+                group
+                    .slots
+                    .iter()
+                    .filter_map(|slot| background_task_row_for_rejected_fanout_slot(group, slot)),
+            );
         }
     }
     rows.extend(
@@ -1290,7 +1405,7 @@ fn background_task_output_snapshot(
         handle.stderr_path.display()
     );
     let (output, end_offset, total_bytes, total_lines) =
-        background_registry.get_output_since(task_id, offset, max_bytes)?;
+        background_registry.get_combined_output_since(task_id, offset, max_bytes)?;
 
     Ok(crate::edge_tools::BgTaskOutputSnapshot {
         kind: "shell".to_string(),
@@ -1393,6 +1508,19 @@ async fn background_task_output_snapshot_with_agents(
                         &info, offset, max_bytes,
                     ));
                 }
+                for group in spawner.list_fanout_groups().await {
+                    for slot in &group.slots {
+                        if background_task_rejected_fanout_slot_id(&group.group_id, slot.slot_index)
+                            == task_id
+                            && let Some(snapshot) =
+                                background_task_output_snapshot_for_rejected_fanout_slot(
+                                    &group, slot, offset, max_bytes,
+                                )
+                        {
+                            return Ok(snapshot);
+                        }
+                    }
+                }
             }
             if let Some(projection) = restored_local_agents
                 .iter()
@@ -1431,16 +1559,11 @@ fn format_background_task_output_system_message(
     }
 
     let line_count = tail.lines().count();
-    let preview = tail.lines().next_back().unwrap_or("").trim();
-    let mut message = format!(
-        "Read shell output {task_id} · {label}\n{line_count} new {} · offset {offset} -> {total_bytes} · total {total_bytes} bytes · {total_lines} total lines · {}",
+    format!(
+        "Read shell output {task_id} · {label}\n{line_count} new {} · offset {offset} -> {total_bytes} · total {total_bytes} bytes · {total_lines} total lines · {}\nOutput chunk:\n{tail}",
         if line_count == 1 { "line" } else { "lines" },
         background_task_status_label(status)
-    );
-    if !preview.is_empty() {
-        message.push_str(&format!("\n└ {preview}"));
-    }
-    message
+    )
 }
 
 fn background_task_empty_output_state(status: &str) -> &'static str {
@@ -5076,6 +5199,69 @@ mod tests {
     }
 
     #[test]
+    fn background_task_row_projects_rejected_fanout_slot_without_agent_history() {
+        let mut group =
+            astra_turn_core::orchestration_fanout_group::AgentFanoutGroupProjection::new(
+                "review-1",
+                "review fanout",
+                3,
+            );
+        group
+            .set_slot_request(1, "api reviewer", "review API surface")
+            .unwrap();
+        group
+            .record_spawn_rejected(1, "concurrency cap reached")
+            .unwrap();
+
+        let row = background_task_row_for_rejected_fanout_slot(&group, &group.slots[1])
+            .expect("rejected fanout slot should project to a task row");
+
+        assert_eq!(row.id, "fanout:review-1:slot:1:spawn_rejected");
+        assert_eq!(
+            row.status,
+            bottom_pane::background_task_view::BackgroundTaskStatus::Failed
+        );
+        assert_eq!(row.title, "review API surface");
+        assert_eq!(row.output_tail.as_deref(), Some("concurrency cap reached"));
+        assert_eq!(
+            row.terminal_reason.as_deref(),
+            Some("concurrency cap reached")
+        );
+        assert_eq!(
+            row.live_control,
+            bottom_pane::background_task_view::LiveControlState::UnsupportedInMode
+        );
+
+        let fanout = row.fanout.as_ref().expect("fanout metadata");
+        assert_eq!(fanout.group_id, "review-1");
+        assert_eq!(fanout.group_title, "review fanout");
+        assert_eq!(fanout.target_count, 3);
+        assert_eq!(fanout.slot_index, 1);
+        assert_eq!(fanout.slot_label, "review API surface");
+
+        let summaries = status_line::BackgroundTaskFanoutSummary::from_rows(&[row.clone()]);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].failed, 1);
+
+        let xml = render_background_task_rows_xml(&[row.clone()]);
+        assert!(
+            xml.contains("id=\"fanout:review-1:slot:1:spawn_rejected\""),
+            "{xml}"
+        );
+        assert!(xml.contains("status=\"failed\""), "{xml}");
+        assert!(xml.contains("preview=\"concurrency cap reached\""), "{xml}");
+
+        let snapshot =
+            background_task_output_snapshot_for_rejected_fanout_slot(&group, &group.slots[1], 0, 9)
+                .expect("snapshot");
+        assert_eq!(snapshot.kind, "local agent");
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.terminal);
+        assert_eq!(snapshot.output, "concurren");
+        assert_eq!(snapshot.total_bytes, "concurrency cap reached".len() as u64);
+    }
+
+    #[test]
     fn background_task_output_snapshot_projects_local_agent_state() {
         let agent = agent_info(
             "agent-1",
@@ -5695,6 +5881,26 @@ mod tests {
         assert_eq!(snapshot.status, "completed");
         assert!(snapshot.terminal, "{snapshot:?}");
         assert!(snapshot.output.contains("done"), "{snapshot:?}");
+        assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
+        assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
+    }
+
+    #[tokio::test]
+    async fn background_task_output_snapshot_includes_stderr_only_shell_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-output-stderr"),
+        );
+        let id = registry.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr output");
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let snapshot =
+            background_task_output_snapshot(&mut registry, &id, 0, 1024).expect("snapshot");
+
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.terminal, "{snapshot:?}");
+        assert!(snapshot.output.contains("<stderr>"), "{snapshot:?}");
+        assert!(snapshot.output.contains("stderr-line"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
     }
@@ -6710,8 +6916,9 @@ mod tests {
         assert!(message.contains("total 13244 bytes"), "{message}");
         assert!(message.contains("312 total lines"), "{message}");
         assert!(message.contains("still running"), "{message}");
+        assert!(message.contains("Output chunk:"), "{message}");
         assert!(
-            message.contains("└ Listening on http://localhost:5173/"),
+            message.contains("Listening on http://localhost:5173/"),
             "{message}"
         );
         assert!(

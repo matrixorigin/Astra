@@ -2,12 +2,21 @@ use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::load_session_messages_for_continuation;
-use crate::cli::session::session_restore_client::list_cloud_resumable_sessions;
+use crate::cli::session::session_restore_client::{
+    list_cloud_resumable_sessions, restore_session_snapshot_with_client,
+};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OneShotSessionResumeMetadata {
+    pub(crate) model: Option<String>,
+    pub(crate) permission_mode: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OneShotSessionRouting {
     pub(crate) server_session_id: Option<String>,
     pub(crate) history_source_session_id: Option<String>,
+    pub(crate) resume_metadata: OneShotSessionResumeMetadata,
 }
 
 impl OneShotSessionRouting {
@@ -19,6 +28,14 @@ impl OneShotSessionRouting {
 
     pub(crate) fn task_scope_session_id(&self) -> Option<&str> {
         self.server_session_id.as_deref()
+    }
+
+    pub(crate) fn restored_model(&self) -> Option<&str> {
+        self.resume_metadata.model.as_deref()
+    }
+
+    pub(crate) fn restored_permission_mode(&self) -> Option<&str> {
+        self.resume_metadata.permission_mode.as_deref()
     }
 }
 
@@ -45,13 +62,55 @@ pub(crate) fn select_one_shot_session_routing(
         return OneShotSessionRouting {
             server_session_id: Some(session_id.clone()),
             history_source_session_id: Some(session_id),
+            resume_metadata: OneShotSessionResumeMetadata::default(),
         };
     }
 
     OneShotSessionRouting {
         history_source_session_id: remote_session_id.clone().or(local_session_id),
         server_session_id: remote_session_id,
+        resume_metadata: OneShotSessionResumeMetadata::default(),
     }
+}
+
+async fn load_one_shot_resume_metadata(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    session_id: Option<&str>,
+) -> OneShotSessionResumeMetadata {
+    let Some(session_id) = session_id else {
+        return OneShotSessionResumeMetadata::default();
+    };
+
+    match restore_session_snapshot_with_client(profile, api, session_id).await {
+        Ok(Some(restored)) => OneShotSessionResumeMetadata {
+            model: restored.model,
+            permission_mode: restored.permission_mode,
+        },
+        Ok(None) => OneShotSessionResumeMetadata::default(),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to restore one-shot session metadata; continuing without metadata"
+            );
+            OneShotSessionResumeMetadata::default()
+        }
+    }
+}
+
+async fn attach_one_shot_resume_metadata(
+    mut routing: OneShotSessionRouting,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> OneShotSessionRouting {
+    let metadata_session_id = routing
+        .history_source_session_id
+        .as_deref()
+        .or(routing.server_session_id.as_deref());
+    routing.resume_metadata =
+        load_one_shot_resume_metadata(api, profile, metadata_session_id).await;
+    routing
 }
 
 pub(crate) async fn resolve_one_shot_session_routing(
@@ -65,25 +124,24 @@ pub(crate) async fn resolve_one_shot_session_routing(
     }
 
     if let Some(session_id) = current_session_id {
-        return Ok(
-            match preflight_remote_resume_session(api, profile, &session_id).await {
-                SessionResumePreflight::Missing => {
-                    return Err(explicit_resume_preflight_error(
-                        &session_id,
-                        SessionResumePreflight::Missing,
-                    ));
-                }
-                SessionResumePreflight::NoAuth => {
-                    return Err(explicit_resume_preflight_error(
-                        &session_id,
-                        SessionResumePreflight::NoAuth,
-                    ));
-                }
-                SessionResumePreflight::Valid | SessionResumePreflight::Unknown => {
-                    select_one_shot_session_routing(Some(session_id), None, None)
-                }
-            },
-        );
+        let routing = match preflight_remote_resume_session(api, profile, &session_id).await {
+            SessionResumePreflight::Missing => {
+                return Err(explicit_resume_preflight_error(
+                    &session_id,
+                    SessionResumePreflight::Missing,
+                ));
+            }
+            SessionResumePreflight::NoAuth => {
+                return Err(explicit_resume_preflight_error(
+                    &session_id,
+                    SessionResumePreflight::NoAuth,
+                ));
+            }
+            SessionResumePreflight::Valid | SessionResumePreflight::Unknown => {
+                select_one_shot_session_routing(Some(session_id), None, None)
+            }
+        };
+        return Ok(attach_one_shot_resume_metadata(routing, api, profile).await);
     }
 
     let local_session_id = local_resumable_last_session_id(profile);
@@ -101,11 +159,8 @@ pub(crate) async fn resolve_one_shot_session_routing(
             None
         }
     };
-    Ok(select_one_shot_session_routing(
-        None,
-        remote_session_id,
-        local_session_id,
-    ))
+    let routing = select_one_shot_session_routing(None, remote_session_id, local_session_id);
+    Ok(attach_one_shot_resume_metadata(routing, api, profile).await)
 }
 
 #[cfg(test)]
@@ -123,8 +178,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn write_local_resumable_session_with_checkpoint(session_id: &str) {
-        let workspace =
+        let mut workspace =
             astra_services::session_workspace::WorkspaceMetadata::new(session_id, "gpt-5");
+        workspace.permission_mode = Some("plan".to_string());
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
         let heavy = HeavyCheckpoint {
@@ -179,6 +235,18 @@ mod tests {
             .and(path(format!("/sessions/{session_id}")))
             .and(header_exists("authorization"))
             .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_existing_session(server: &MockServer, session_id: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "turn_count": 1
+            })))
             .mount(server)
             .await;
     }
@@ -273,6 +341,8 @@ mod tests {
             Some(session_id.as_str())
         );
         assert_eq!(routing.task_scope_session_id(), None);
+        assert_eq!(routing.restored_model(), Some("gpt-5"));
+        assert_eq!(routing.restored_permission_mode(), Some("plan"));
 
         let continuation = routing
             .continuation_messages()
@@ -310,6 +380,42 @@ mod tests {
         assert_eq!(routing.history_source_session_id, None);
         assert_eq!(routing.task_scope_session_id(), None);
         assert!(routing.continuation_messages().is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_restores_explicit_local_model_and_mode() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        write_local_resumable_session_with_checkpoint(&session_id);
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_existing_session(&server, &session_id).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let routing =
+            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id.clone()), true)
+                .await
+                .expect("explicit local resume should restore metadata");
+
+        assert_eq!(
+            routing.server_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(routing.restored_model(), Some("gpt-5"));
+        assert_eq!(routing.restored_permission_mode(), Some("plan"));
     }
 
     #[serial_test::serial]
