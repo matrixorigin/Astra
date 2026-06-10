@@ -452,10 +452,22 @@ impl BackgroundTaskView {
     }
 
     pub(crate) fn replace_rows(&mut self, rows: Vec<BackgroundTaskRow>) {
-        let selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+        self.replace_rows_with_selected(rows, None);
+    }
+
+    pub(crate) fn replace_rows_with_selected(
+        &mut self,
+        rows: Vec<BackgroundTaskRow>,
+        selected_id: Option<&str>,
+    ) {
+        let current_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
         let rows = sort_rows(rows);
-        self.selected = selected_id
+        let selected_idx = selected_id.and_then(|id| rows.iter().position(|row| row.id == id));
+        let fallback_idx = current_selected_id
             .and_then(|id| rows.iter().position(|row| row.id == id))
+            .or_else(|| rows.first().map(|_| 0));
+        self.selected = selected_idx
+            .or(fallback_idx)
             .unwrap_or(0)
             .min(rows.len().saturating_sub(1));
         self.rows = rows;
@@ -829,6 +841,15 @@ impl BottomPaneView for BackgroundTaskView {
 
     fn refresh_background_task_rows(&mut self, rows: Vec<BackgroundTaskRow>) -> bool {
         self.replace_rows(rows);
+        true
+    }
+
+    fn refresh_background_task_rows_selecting(
+        &mut self,
+        rows: Vec<BackgroundTaskRow>,
+        selected_id: Option<&str>,
+    ) -> bool {
+        self.replace_rows_with_selected(rows, selected_id);
         true
     }
 
@@ -1360,6 +1381,25 @@ mod tests {
             view.selected_row().map(|row| row.id.as_str()),
             Some("second")
         );
+    }
+
+    #[test]
+    fn refresh_can_select_explicit_id_after_sort() {
+        let mut view = BackgroundTaskView::new(vec![
+            row("first", "running", "first command"),
+            row("second", "running", "second command"),
+        ]);
+
+        view.replace_rows_with_selected(
+            vec![
+                row("first", "running", "first command"),
+                row("new", "waiting_for_input", "new command"),
+                row("second", "running", "second command"),
+            ],
+            Some("new"),
+        );
+
+        assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("new"));
     }
 
     #[test]

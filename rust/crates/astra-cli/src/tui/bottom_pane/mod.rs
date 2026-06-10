@@ -237,6 +237,15 @@ impl BottomPane {
             .is_some_and(|view| view.refresh_background_task_rows(rows))
     }
 
+    pub fn refresh_background_task_rows_selecting(
+        &mut self,
+        rows: Vec<background_task_view::BackgroundTaskRow>,
+        selected_id: Option<&str>,
+    ) -> bool {
+        self.active_view_mut()
+            .is_some_and(|view| view.refresh_background_task_rows_selecting(rows, selected_id))
+    }
+
     pub fn accepts_background_task_rows(&self) -> bool {
         self.view_stack
             .last()

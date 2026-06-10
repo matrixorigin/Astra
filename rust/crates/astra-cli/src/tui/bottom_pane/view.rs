@@ -74,6 +74,14 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
+    fn refresh_background_task_rows_selecting(
+        &mut self,
+        rows: Vec<crate::tui::bottom_pane::background_task_view::BackgroundTaskRow>,
+        _selected_id: Option<&str>,
+    ) -> bool {
+        self.refresh_background_task_rows(rows)
+    }
+
     fn accepts_background_task_rows(&self) -> bool {
         false
     }

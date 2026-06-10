@@ -463,7 +463,7 @@ pub(crate) async fn reveal_background_task_view(
     }
     use super::bottom_pane::background_task_view::BackgroundTaskView;
     if bottom_pane.accepts_background_task_rows() {
-        bottom_pane.refresh_background_task_rows(rows);
+        bottom_pane.refresh_background_task_rows_selecting(rows, selected_id);
     } else {
         bottom_pane.push_view(Box::new(BackgroundTaskView::new_with_selected(
             rows,
