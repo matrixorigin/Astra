@@ -139,7 +139,7 @@ pub enum DecisionSource {
 }
 
 /// Where a rule originally came from. UI uses this for the
-/// "Saved to .kiro/permissions.json" line in the approval card.
+/// "Saved to .astra/permissions.json" line in the approval card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleOrigin {
     Project,
@@ -252,7 +252,7 @@ pub enum RiskTag {
     /// know what it does.
     MCPUnknownCapability,
     /// Workspace not in the trust ledger; persistent rules from
-    /// `.kiro/permissions.json` are downgraded to allow-only-once.
+    /// `.astra/permissions.json` are downgraded to allow-only-once.
     WorkspaceUntrusted,
     /// `sandbox_expand:*` request — the agent is asking us to widen
     /// the sandbox, not run a tool.

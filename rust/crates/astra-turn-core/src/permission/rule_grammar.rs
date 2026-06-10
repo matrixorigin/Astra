@@ -1,5 +1,5 @@
 //! Issue #326 P1.5b / R2 Major 2: versioned rule grammar for
-//! `.kiro/permissions.json` and `~/.astra/permissions.json`.
+//! `.astra/permissions.json` and `~/.astra/permissions.json`.
 //!
 //! ## Why version the grammar
 //!

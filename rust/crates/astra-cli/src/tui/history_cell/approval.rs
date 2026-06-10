@@ -119,7 +119,7 @@ pub(crate) struct ApprovalCell {
     ///
     ///   None        -> not yet attempted (or no Always pressed)
     ///   Some("…")   -> save outcome, e.g.
-    ///                  "Saved to .kiro/permissions.json" or
+    ///                  "Saved to .astra/permissions.json" or
     ///                  "Failed to save rule: <reason>"
     pub save_outcome: Option<String>,
     pub selection_hint: Option<String>,
@@ -776,10 +776,10 @@ mod tests {
             "execute".into(),
             true,
         )
-        .with_save_outcome("Saved to .kiro/permissions.json");
+        .with_save_outcome("Saved to .astra/permissions.json");
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Saved to .kiro/permissions.json"),
+            rendered.contains("Saved to .astra/permissions.json"),
             "save outcome should render verbatim, got:\n{rendered}"
         );
     }

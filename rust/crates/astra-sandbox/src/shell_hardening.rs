@@ -28,7 +28,7 @@ pub const DANGEROUS_FILE_PATHS: &[&str] = &[
     ".idea/",
     // Agent configs
     ".claude/",
-    ".kiro/",
+    ".astra/",
     // SSH keys
     ".ssh/",
     // Ripgrep config (can alter search behavior)

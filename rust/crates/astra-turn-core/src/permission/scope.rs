@@ -9,7 +9,7 @@
 //!   this LLM round only
 //! - `RestOfSession`  — auto-approve until the session ends
 //!   (per-fingerprint, NOT a global mode flip)
-//! - `Project`        — write to .kiro/permissions.json
+//! - `Project`        — write to .astra/permissions.json
 //! - `User`           — write to ~/.astra/permissions.json
 //!
 //! Plan v3 §P3 also says destructive risk tags
@@ -35,7 +35,7 @@ pub enum AllowScope {
     RestOfTurn,
     /// Until session ends; per-fingerprint, not a global Auto flip.
     RestOfSession,
-    /// Persist to .kiro/permissions.json (project-shared).
+    /// Persist to .astra/permissions.json (project-shared).
     Project,
     /// Persist to ~/.astra/permissions.json (per-user).
     User,

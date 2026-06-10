@@ -15,7 +15,7 @@
 //! question. R2 Major 4 specifically calls this out as a gap:
 //! exporting the audit log shouldn't say "Yes, it was approved"
 //! without saying "by user X, choosing Always-Project-User-Trusted,
-//! saved to .kiro/permissions.json successfully".
+//! saved to .astra/permissions.json successfully".
 //!
 //! The three events:
 //!
@@ -29,7 +29,7 @@
 //!    which scope (if AlwaysAllow).
 //!
 //! 3. [`RulePersistedEvent`] — fires when a rule is written to
-//!    `.kiro/permissions.json` or `~/.astra/permissions.json`.
+//!    `.astra/permissions.json` or `~/.astra/permissions.json`.
 //!    Payload includes the file, the new rule, and whether the
 //!    save succeeded.
 //!
@@ -76,7 +76,7 @@ pub enum AllowScope {
     /// Auto-approve identical fingerprints until the session ends.
     /// Per-fingerprint, NOT a global mode change.
     RestOfSession,
-    /// Persist a rule to `.kiro/permissions.json` (project file).
+    /// Persist a rule to `.astra/permissions.json` (project file).
     Project,
     /// Persist a rule to `~/.astra/permissions.json` (user file).
     User,

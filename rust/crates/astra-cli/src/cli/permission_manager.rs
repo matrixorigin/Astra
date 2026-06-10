@@ -43,7 +43,7 @@ pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     if lower.contains("sensitive path") {
         Some(
             "Write to a workspace-local path instead (e.g. under the current project tree), \
-             or set allow_sensitive_path_writes=true in .kiro/permissions.json to opt in.",
+             or set allow_sensitive_path_writes=true in .astra/permissions.json to opt in.",
         )
     } else if lower.contains("git safety") || lower.contains("force push") {
         Some(
@@ -93,7 +93,7 @@ fn cloud_always_feedback_message(
     if sensitive_path {
         return format!(
             "  ✓ {remember_preview}: allowed for this session only. \
-To auto-allow sensitive paths across sessions, set allow_sensitive_path_writes=true in .kiro/permissions.json."
+To auto-allow sensitive paths across sessions, set allow_sensitive_path_writes=true in .astra/permissions.json."
         );
     }
     if let Some(err) = persist_error {
@@ -864,7 +864,7 @@ fn now_rfc3339() -> String {
 }
 
 impl PermissionSettings {
-    /// Load from the project-level settings file (`.kiro/permissions.json`).
+    /// Load from the project-level settings file (`.astra/permissions.json`).
     ///
     /// Backwards-compatible facade: returns the parsed settings, falling
     /// back to `default()` on any error and emitting a `tracing::warn`.
@@ -882,7 +882,7 @@ impl PermissionSettings {
     /// settings (always defaulted on error so the agent stays usable)
     /// and a structured error for the UI to surface.
     pub fn try_load(project_root: &Path) -> PermissionSettingsLoadOutcome {
-        let path = project_root.join(".kiro").join("permissions.json");
+        let path = project_root.join(".astra").join("permissions.json");
         Self::try_load_inner(&path)
     }
 
@@ -989,7 +989,7 @@ impl PermissionSettings {
     /// Writes atomically via temp file + rename. Use `modify` (preferred) when
     /// correctness across concurrent processes matters.
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
-        let dir = project_root.join(".kiro");
+        let dir = project_root.join(".astra");
         let path = dir.join("permissions.json");
         self.save_to_file(&dir, &path)
     }
@@ -1027,7 +1027,7 @@ impl PermissionSettings {
     ///
     /// `modify` closes that gap by:
     ///
-    /// 1. Acquiring an exclusive flock on `.kiro/permissions.lock`
+    /// 1. Acquiring an exclusive flock on `.astra/permissions.lock`
     ///    (blocks until any other process releases).
     /// 2. Re-reading the JSON file from disk so the closure sees
     ///    the freshest baseline.
@@ -1106,14 +1106,14 @@ impl PermissionSettings {
     where
         F: FnOnce(&mut Self) -> Result<(), E>,
     {
-        let dir = project_root.join(".kiro");
+        let dir = project_root.join(".astra");
         let path = dir.join("permissions.json");
         let lock_path = dir.join("permissions.lock");
         Self::modify_file(
             &dir,
             &path,
             &lock_path,
-            "create .kiro/",
+            "create .astra/",
             mutate,
             |settings| settings.save(project_root),
         )
@@ -1524,7 +1524,7 @@ impl PermissionManager {
     }
 
     /// Create with settings loaded from a project directory.
-    /// Loads `.kiro/permissions.json` if it exists, applying persistent allow/deny rules.
+    /// Loads `.astra/permissions.json` if it exists, applying persistent allow/deny rules.
     pub(crate) fn with_project(auto_approve: bool, project_root: &Path) -> Self {
         let mode = if auto_approve {
             PermissionMode::Auto
@@ -2529,7 +2529,7 @@ impl PermissionManager {
                 //   1. In-session override, keyed on the approval
                 //      fingerprint — the same process won't re-prompt.
                 //   2. Persistent allow rule, written to
-                //      `.kiro/permissions.json` — survives restart.
+                //      `.astra/permissions.json` — survives restart.
                 // Before this branch was fixed, only (1) fired for the
                 // cloud path while the local path did both. Symptom:
                 // next `astra` invocation re-prompts the same tool.
@@ -2816,7 +2816,7 @@ impl PermissionManager {
             return;
         };
 
-        let target_path = root.join(".kiro/permissions.json");
+        let target_path = root.join(".astra/permissions.json");
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -4413,7 +4413,7 @@ mod tests {
     #[test]
     fn try_load_returns_corrupt_for_invalid_json() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let path = kiro.join("permissions.json");
         std::fs::write(&path, "{ this is not json").unwrap();
@@ -4438,7 +4438,7 @@ mod tests {
     #[test]
     fn try_load_returns_invalid_rule_for_unknown_v2_key() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -4457,7 +4457,7 @@ mod tests {
     #[test]
     fn permission_manager_with_corrupt_project_records_load_error() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(kiro.join("permissions.json"), "not valid json").unwrap();
 
@@ -4478,7 +4478,7 @@ mod tests {
         // or may not be capturing). The new signal is on
         // `PermissionManager::load_errors()`, not on `load()`.
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(kiro.join("permissions.json"), "garbage").unwrap();
 
@@ -4541,7 +4541,7 @@ mod tests {
         // trying to fix by hand. modify surfaces the error so the
         // caller (TUI banner / headless exit-1) can deal with it.
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(kiro.join("permissions.json"), "{ not json").unwrap();
 
@@ -4589,7 +4589,7 @@ mod tests {
     #[test]
     fn load_policy_headless_safe_drops_project_allow_keeps_deny() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -4619,7 +4619,7 @@ mod tests {
     #[test]
     fn load_policy_interactive_untrusted_drops_allow_keeps_deny() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -4647,7 +4647,7 @@ mod tests {
     #[test]
     fn load_policy_interactive_trusted_loads_everything() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -4672,7 +4672,7 @@ mod tests {
     #[test]
     fn load_policy_corrupt_file_still_surfaces_through_headless_safe() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(kiro.join("permissions.json"), "{ bad").unwrap();
 
@@ -4690,7 +4690,7 @@ mod tests {
     #[test]
     fn workspace_trust_unknown_drops_allow_keeps_deny() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -4754,7 +4754,7 @@ mod tests {
     #[test]
     fn workspace_trust_matching_hash_loads_project_allow() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -4784,7 +4784,7 @@ mod tests {
     #[test]
     fn workspace_trust_hash_mismatch_drops_project_allow() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let permissions_path = kiro.join("permissions.json");
         std::fs::write(&permissions_path, r#"{"allow":["Bash(ls:*)"]}"#).unwrap();
@@ -6207,7 +6207,7 @@ mod tests {
     fn rules_summary_shows_mode_and_rules() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let kiro = root.join(".kiro");
+        let kiro = root.join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
@@ -7646,8 +7646,8 @@ mod tests {
         );
 
         // And persisted to disk — `PermissionSettings::save` writes to
-        // `<project>/.kiro/permissions.json` (see impl).
-        let settings_path = dir.path().join(".kiro").join("permissions.json");
+        // `<project>/.astra/permissions.json` (see impl).
+        let settings_path = dir.path().join(".astra").join("permissions.json");
         assert!(
             settings_path.exists(),
             "permissions.json must be written to disk at {}",
@@ -7730,7 +7730,7 @@ mod tests {
             );
         }
 
-        let settings_path = dir.path().join(".kiro").join("permissions.json");
+        let settings_path = dir.path().join(".astra").join("permissions.json");
         if settings_path.exists() {
             let on_disk = std::fs::read_to_string(&settings_path).unwrap();
             let saved: PermissionSettings = serde_json::from_str(&on_disk).unwrap();

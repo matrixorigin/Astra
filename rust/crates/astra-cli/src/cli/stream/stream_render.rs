@@ -380,7 +380,7 @@ fn persist_scoped_allow_rule(
     }
     if let Some(err) = pm.take_last_save_error() {
         let target_label = match target {
-            astra_turn_core::permission::audit::PersistTarget::Project => ".kiro/permissions.json",
+            astra_turn_core::permission::audit::PersistTarget::Project => ".astra/permissions.json",
             astra_turn_core::permission::audit::PersistTarget::User => "~/.astra/permissions.json",
         };
         astra_core::agent_warn!(

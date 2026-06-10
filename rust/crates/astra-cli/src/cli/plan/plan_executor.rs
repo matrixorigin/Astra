@@ -1190,7 +1190,7 @@ async fn plan_executor_task(
         emit_event(&update_tx, event);
     }
     // Issue #326 P5b: plan_executor is a headless sub-run; project
-    // allow rules from .kiro/permissions.json must NOT escalate the
+    // allow rules from .astra/permissions.json must NOT escalate the
     // sub-run's capabilities, but project deny rules are kept so the
     // user's restrictions still bind. apply_load_policy(HeadlessSafe)
     // strips allow_*/allow_sensitive_path_writes while preserving deny.

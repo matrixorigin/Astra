@@ -3,7 +3,7 @@
 //!
 //! ## Why
 //!
-//! `.kiro/permissions.json` is a project-level file that ends up
+//! `.astra/permissions.json` is a project-level file that ends up
 //! committed to git. If a user clones a hostile repo (or just an
 //! unfamiliar one) and starts astra, the project file can grant
 //! the agent capabilities the user didn't intend — the
@@ -44,7 +44,7 @@
 //! }
 //! ```
 //!
-//! `rules_hash` is the SHA-256 of `.kiro/permissions.json` at the
+//! `rules_hash` is the SHA-256 of `.astra/permissions.json` at the
 //! moment trust was granted. If the project file later changes
 //! (team adds rules), the next session sees a hash mismatch and
 //! can prompt the user "N rules changed — re-review?".
@@ -152,7 +152,7 @@ pub struct WorkspaceTrustEntry {
     /// `None` for `Ask`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_at: Option<String>,
-    /// SHA-256 of `.kiro/permissions.json` at the moment the trust
+    /// SHA-256 of `.astra/permissions.json` at the moment the trust
     /// decision was made. `None` when there was no project file
     /// yet (a brand-new workspace) or when the trust state is
     /// `Ask`.
@@ -490,15 +490,15 @@ fn canonicalize_key(workspace: &Path) -> String {
         .unwrap_or_else(|_| workspace.to_string_lossy().into_owned())
 }
 
-/// SHA-256 of `<workspace>/.kiro/permissions.json`, if it exists.
+/// SHA-256 of `<workspace>/.astra/permissions.json`, if it exists.
 pub fn project_permissions_hash(workspace: &Path) -> Result<Option<String>, WorkspaceTrustError> {
-    let path = workspace.join(".kiro").join("permissions.json");
+    let path = workspace.join(".astra").join("permissions.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(WorkspaceTrustError::Io {
-                stage: "read .kiro/permissions.json",
+                stage: "read .astra/permissions.json",
                 source: e,
             });
         }
@@ -514,8 +514,8 @@ pub fn project_permissions_hash(workspace: &Path) -> Result<Option<String>, Work
 #[cfg(test)]
 mod tests {
     use super::{
-        TrustState, WorkspaceTrustError, WorkspaceTrustLedger, WorkspaceTrustReason,
-        evaluate_workspace_trust_from_path, project_permissions_hash,
+        evaluate_workspace_trust_from_path, project_permissions_hash, TrustState,
+        WorkspaceTrustError, WorkspaceTrustLedger, WorkspaceTrustReason,
     };
     use std::path::Path;
 
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn project_permissions_hash_returns_sha256_when_file_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(kiro.join("permissions.json"), b"{}").unwrap();
         let hash = project_permissions_hash(dir.path()).unwrap().unwrap();
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn project_permissions_hash_changes_when_rules_change() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let path = kiro.join("permissions.json");
         std::fs::write(&path, br#"{"allow":["Bash(ls:*)"]}"#).unwrap();
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn evaluate_workspace_trust_requires_matching_rules_hash() {
         let dir = tempfile::tempdir().unwrap();
-        let kiro = dir.path().join(".kiro");
+        let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let path = kiro.join("permissions.json");
         std::fs::write(&path, br#"{"allow":["Bash(ls:*)"]}"#).unwrap();
