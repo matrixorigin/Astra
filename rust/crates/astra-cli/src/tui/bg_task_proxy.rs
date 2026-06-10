@@ -464,18 +464,63 @@ pub(crate) fn format_background_task_output_system_message(
     total_lines: u64,
     output: &str,
 ) -> String {
+    format_background_task_output_system_message_for_kind(
+        "shell",
+        BackgroundTaskOutputSystemMessage {
+            task_id,
+            title,
+            status,
+            offset,
+            total_bytes,
+            total_lines,
+            output,
+        },
+    )
+}
+
+pub(crate) struct BackgroundTaskOutputSystemMessage<'a> {
+    pub task_id: &'a str,
+    pub title: &'a str,
+    pub status: &'a str,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub total_lines: u64,
+    pub output: &'a str,
+}
+
+pub(crate) fn format_background_task_output_system_message_for_kind(
+    kind: &str,
+    message: BackgroundTaskOutputSystemMessage<'_>,
+) -> String {
+    let BackgroundTaskOutputSystemMessage {
+        task_id,
+        title,
+        status,
+        offset,
+        total_bytes,
+        total_lines,
+        output,
+    } = message;
     let label = background_shell_notification_label(task_id, title);
+    let read_label = match kind.trim() {
+        "" | "shell" => "Read shell output".to_string(),
+        "local agent" => "Read local agent output".to_string(),
+        "cloud session" => "Read cloud session output".to_string(),
+        "main session" => "Read main session output".to_string(),
+        "monitor" => "Read monitor output".to_string(),
+        other => format!("Read {other} output"),
+    };
     let tail = output.trim_end();
     if tail.is_empty() {
         return format!(
-            "Read shell output {task_id} · {label}\n{} · offset {offset} -> {total_bytes} · total {total_bytes} bytes · {total_lines} total lines",
+            "{read_label} {task_id} · {label}\n{} · offset {offset} -> {total_bytes} · total {total_bytes} bytes · {total_lines} total lines",
             background_task_empty_output_state(status)
         );
     }
 
     let line_count = tail.lines().count();
     format!(
-        "Read shell output {task_id} · {label}\n{line_count} new {} · offset {offset} -> {total_bytes} · total {total_bytes} bytes · {total_lines} total lines · {}\nOutput chunk:\n{tail}",
+        "{read_label} {task_id} · {label}\n{line_count} new {} · offset {offset} -> {total_bytes} · total {total_bytes} bytes · {total_lines} total lines · {}\nOutput chunk:\n{tail}",
         if line_count == 1 { "line" } else { "lines" },
         background_task_status_label(status)
     )

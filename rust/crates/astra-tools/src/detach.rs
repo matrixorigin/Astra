@@ -20,6 +20,7 @@
 //! boundary without lifetime gymnastics.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -53,6 +54,23 @@ pub struct DetachShellHandle {
     /// One-shot reply channel for the runner to transfer the live
     /// child + streams back to the TUI.
     pub payload_tx: Arc<Mutex<Option<oneshot::Sender<DetachedShellPayload>>>>,
+    /// True only while a bash invocation is actively running with
+    /// this handle. The TUI uses this to avoid treating an idle
+    /// preloaded handle as a foreground bash task.
+    active: Arc<AtomicBool>,
+    /// Set once the TUI has consumed or abandoned the listener side.
+    /// A retired handle must not be restored to the reusable slot.
+    retired: Arc<AtomicBool>,
+}
+
+impl DetachShellHandle {
+    pub fn mark_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
 }
 
 /// TUI-side end of the detach plumbing. Writes `true` to `signal_tx`
@@ -62,6 +80,19 @@ pub struct DetachShellListener {
     pub signal_tx: watch::Sender<bool>,
     /// Receive the detached child + streams from the runner.
     pub payload_rx: oneshot::Receiver<DetachedShellPayload>,
+    active: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
+}
+
+impl DetachShellListener {
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 /// Renewable slot the TUI installs on `ToolContext`. The bash runner
@@ -88,13 +119,19 @@ pub fn new_slot_with_handle() -> (DetachShellSlot, DetachShellListener) {
 pub fn new_detach_pair() -> (DetachShellHandle, DetachShellListener) {
     let (payload_tx, payload_rx) = oneshot::channel::<DetachedShellPayload>();
     let (signal_tx, signal_rx) = watch::channel(false);
+    let active = Arc::new(AtomicBool::new(false));
+    let retired = Arc::new(AtomicBool::new(false));
     let handle = DetachShellHandle {
         signal_rx: Arc::new(Mutex::new(Some(signal_rx))),
         payload_tx: Arc::new(Mutex::new(Some(payload_tx))),
+        active: active.clone(),
+        retired: retired.clone(),
     };
     let listener = DetachShellListener {
         signal_tx,
         payload_rx,
+        active,
+        retired,
     };
     (handle, listener)
 }
@@ -119,6 +156,21 @@ mod tests {
             result.is_err(),
             "with no detach the receiver must observe a closed channel"
         );
+    }
+
+    #[test]
+    fn listener_reports_active_window_and_retirement() {
+        let (handle, listener) = new_detach_pair();
+
+        assert!(!listener.is_active());
+        assert!(!handle.is_retired());
+
+        handle.mark_active(true);
+        assert!(listener.is_active());
+
+        listener.retire();
+        assert!(!listener.is_active());
+        assert!(handle.is_retired());
     }
 
     /// Round-trip: when the runner side takes the sender and

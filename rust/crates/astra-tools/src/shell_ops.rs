@@ -64,7 +64,10 @@ impl<'a> DetachHandleGuard<'a> {
     /// Consumes self and restores the handle to the slot for reuse.
     async fn restore(mut self) {
         if let (Some(slot), Some(handle)) = (self.slot.as_ref(), self.handle.take()) {
-            *slot.lock().await = Some(handle);
+            handle.mark_active(false);
+            if !handle.is_retired() {
+                *slot.lock().await = Some(handle);
+            }
         }
     }
 }
@@ -820,6 +823,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
 
     let output = if detach_handle_guard.has_handle() {
         let handle_ref = detach_handle_guard.get_ref().unwrap();
+        handle_ref.mark_active(true);
         match run_bash_with_detach(
             &mut cmd,
             timeout,
@@ -843,6 +847,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 // BackgroundTaskRegistry::adopt_detached_shell.
                 let detach_handle = detach_handle_guard.take().unwrap();
                 let Some(sender) = detach_handle.payload_tx.lock().await.take() else {
+                    detach_handle.mark_active(false);
                     terminate_detached_payload(payload).await;
                     return ToolResult::error(
                         "Error: bash detach failed: host payload channel was not available"
@@ -850,6 +855,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                     );
                 };
                 if let Err(payload) = sender.send(*payload) {
+                    detach_handle.mark_active(false);
                     terminate_detached_payload(Box::new(payload)).await;
                     return ToolResult::error(
                         "Error: bash detach failed: host listener dropped before payload arrived"
@@ -5396,11 +5402,8 @@ printf 'probe.txt:1:needle\n'
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
         let (slot, listener) = crate::detach::new_slot_with_handle();
-        let crate::detach::DetachShellListener {
-            signal_tx,
-            payload_rx,
-        } = listener;
-        drop(payload_rx);
+        let signal_tx = listener.signal_tx.clone();
+        drop(listener.payload_rx);
         ctx.detach_shell_handle = Some(slot);
 
         let bash_fut = tokio::spawn({
@@ -5512,6 +5515,23 @@ printf 'probe.txt:1:needle\n'
 
         let second = second.await.expect("second bash task");
         assert!(second.output.contains("bash_detached"), "{}", second.output);
+    }
+
+    #[tokio::test]
+    async fn retired_detach_slot_is_not_restored_after_normal_completion() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot.clone());
+
+        listener.retire();
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "printf 'done\\n'"})).await;
+        assert!(result.output.contains("done"), "{}", result.output);
+        assert!(
+            slot.lock().await.is_none(),
+            "retired detach handles must not be restored with a consumed or abandoned listener"
+        );
     }
 
     /// Sanity: when no detach handle is wired, the bash tool falls

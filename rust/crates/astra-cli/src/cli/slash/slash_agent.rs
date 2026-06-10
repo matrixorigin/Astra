@@ -1943,6 +1943,19 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    struct PendingWatchExecutor;
+
+    #[async_trait::async_trait]
+    impl astra_runtime::orchestration::SpawnAgentExecutor for PendingWatchExecutor {
+        async fn execute(
+            &self,
+            _config: astra_runtime::orchestration::SpawnRunConfig,
+        ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+            std::future::pending::<Result<astra_runtime::orchestration::SpawnRunResult, String>>()
+                .await
+        }
+    }
+
     fn make_agent(agent_id: &str, run_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
         SpawnedAgentInfo {
             agent_id: agent_id.to_string(),
@@ -2525,7 +2538,9 @@ mod tests {
         let transport = Arc::new(InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
-        let spawner = Arc::new(DynamicAgentSpawner::new(router));
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(router).with_executor(Arc::new(PendingWatchExecutor)),
+        );
         let mut rx = Some(spawner.subscribe_progress());
         let last_snapshot = build_watch_snapshot(&[], &[]);
         let context = SpawnContext {
@@ -2544,6 +2559,7 @@ mod tests {
             description: "watch test agent".to_string(),
             prompt: "do nothing".to_string(),
             agent_type: "task".to_string(),
+            run_in_background: true,
             ..Default::default()
         };
 
@@ -2568,6 +2584,10 @@ mod tests {
 
         assert!(snapshot.contains("Spawned agents (1)"));
         assert!(snapshot.contains(agent_id.split('@').next().unwrap_or("watch")));
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_millis(1))
+            .await;
     }
 
     #[tokio::test]

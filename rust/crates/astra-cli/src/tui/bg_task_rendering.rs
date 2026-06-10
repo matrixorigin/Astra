@@ -5,10 +5,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use super::bg_task_proxy::{
-    background_task_output_snapshot, background_task_output_snapshot_for_local_agent,
+    BackgroundTaskOutputSystemMessage, background_task_output_snapshot,
+    background_task_output_snapshot_for_local_agent,
     background_task_output_snapshot_for_local_agent_projection,
     background_task_rejected_fanout_slot_id, background_task_rejected_fanout_slot_label,
     format_background_task_output_read_error, format_background_task_output_system_message,
+    format_background_task_output_system_message_for_kind,
     format_background_task_stop_error_system_message, is_background_task_terminal_race_error,
 };
 use super::bottom_pane::BottomPane;
@@ -590,9 +592,11 @@ pub(crate) async fn stop_background_task_with_agents(
     }
 }
 
-pub(crate) fn try_dispatch_background_task_output_sentinel(
+pub(crate) async fn try_dispatch_background_task_output_sentinel(
     sentinel: &str,
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     chat_widget: &mut super::chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
@@ -602,32 +606,71 @@ pub(crate) fn try_dispatch_background_task_output_sentinel(
         return false;
     };
     let task_id = task_id.to_string();
-    let (title, status) = background_registry
-        .get(&task_id)
-        .map(|handle| (handle.description.clone(), handle.projected_status()))
-        .unwrap_or_else(|| (task_id.clone(), "unknown"));
-    match background_registry.get_combined_output_stats(&task_id, 8192) {
-        Ok((output, total_bytes, total_lines)) => {
-            let offset = total_bytes.saturating_sub(output.len() as u64);
-            chat_widget.commit_system(super::history_cell::system::SystemCell::info(
-                format_background_task_output_system_message(
-                    &task_id,
-                    &title,
-                    status,
-                    offset,
-                    total_bytes,
-                    total_lines,
-                    &output,
-                ),
-            ));
+
+    if let Some(handle) = background_registry.get(&task_id) {
+        let title = handle.description.clone();
+        let status = handle.projected_status();
+        match background_registry.get_combined_output_stats(&task_id, 8192) {
+            Ok((output, total_bytes, total_lines)) => {
+                let offset = total_bytes.saturating_sub(output.len() as u64);
+                chat_widget.commit_system(super::history_cell::system::SystemCell::info(
+                    format_background_task_output_system_message(
+                        &task_id,
+                        &title,
+                        status,
+                        offset,
+                        total_bytes,
+                        total_lines,
+                        &output,
+                    ),
+                ));
+            }
+            Err(error) => {
+                chat_widget.commit_system(super::history_cell::system::SystemCell::error(
+                    format_background_task_output_read_error(&task_id, &error),
+                ));
+            }
         }
-        Err(error) => {
-            chat_widget.commit_system(super::history_cell::system::SystemCell::error(
-                format_background_task_output_read_error(&task_id, &error),
-            ));
+    } else {
+        match background_task_output_snapshot_with_agents(
+            background_registry,
+            agent_spawner.as_ref(),
+            restored_local_agents,
+            &task_id,
+            0,
+            8192,
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                chat_widget.commit_system(super::history_cell::system::SystemCell::info(
+                    format_background_task_output_system_message_for_kind(
+                        &snapshot.kind,
+                        BackgroundTaskOutputSystemMessage {
+                            task_id: &task_id,
+                            title: snapshot.title.as_deref().unwrap_or(&task_id),
+                            status: &snapshot.status,
+                            offset: 0,
+                            total_bytes: snapshot.total_bytes,
+                            total_lines: snapshot.total_lines,
+                            output: &snapshot.output,
+                        },
+                    ),
+                ));
+            }
+            Err(error) => {
+                chat_widget.commit_system(super::history_cell::system::SystemCell::error(
+                    format_background_task_output_read_error(&task_id, &error),
+                ));
+            }
         }
     }
-    let rows = background_task_rows(background_registry);
+    let rows = background_task_rows_with_agents(
+        background_registry,
+        agent_spawner.as_ref(),
+        restored_local_agents,
+    )
+    .await;
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();

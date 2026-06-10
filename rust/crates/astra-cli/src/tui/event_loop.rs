@@ -1712,128 +1712,143 @@ pub(crate) async fn run_tui_session(
                                                             {
                                                                 let listener = bash_detach_listener.take();
                                                                 if let Some(listener) = listener {
-                                                                    if !background_registry.can_spawn_shell_task() {
-                                                                        bash_detach_listener = Some(listener);
-                                                                        chat_widget.commit_system(
-                                                                            history_cell::system::SystemCell::error(
-                                                                                "⏎ Backgrounding unavailable: background shell task limit reached."
-                                                                            ),
-                                                                        );
-                                                                        frame_requester.schedule_frame();
-                                                                        continue;
-                                                                    }
-                                                                    // Fire the watch signal to request detach.
-                                                                    // If the runner already completed, send
-                                                                    // fails silently — the handler moves on.
-                                                                    let _ = listener.signal_tx.send(true);
-                                                                    // Wait briefly for the runner to ship
-                                                                    // the live child + streams payload.
-                                                                    // 500ms is comfortably more than the
-                                                                    // bash runner's 25ms idle-poll tick;
-                                                                    // longer waits indicate bash wasn't
-                                                                    // actually running when the user hit
-                                                                    // Ctrl+B.
-                                                                    let payload = tokio::time::timeout(
-                                                                        std::time::Duration::from_millis(500),
-                                                                        listener.payload_rx,
-                                                                    )
-                                                                    .await;
-                                                                    match payload {
-                                                                        Ok(Ok(p)) => {
-                                                                            // Drop the bash runner straight
-                                                                            // into the registry. The
-                                                                            // adopt_detached_shell API
-                                                                            // takes the live child + streams
-                                                                            // and emits Started/Completed
-                                                                            // events like a normal bg task.
-                                                                            let id = match background_registry.adopt_detached_shell(
-                                                                                p.child,
-                                                                                p.stdout,
-                                                                                p.stderr,
-                                                                                &p.command,
-                                                                                p.partial_stdout,
-                                                                                p.partial_stderr,
-                                                                            ) {
-                                                                                Ok(id) => id,
-                                                                                Err(error) => {
-                                                                                    chat_widget.commit_system(
-                                                                                        history_cell::system::SystemCell::error(
-                                                                                            format!("⏎ Backgrounding failed: {error}")
-                                                                                        ),
-                                                                                    );
-                                                                                    frame_requester.schedule_frame();
-                                                                                    continue;
-                                                                                }
-                                                                            };
+                                                                    if listener.is_active() {
+                                                                        if !background_registry.can_spawn_shell_task() {
+                                                                            bash_detach_listener = Some(listener);
                                                                             chat_widget.commit_system(
-                                                                                history_cell::system::SystemCell::info(
-                                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
+                                                                                history_cell::system::SystemCell::error(
+                                                                                    "⏎ Backgrounding unavailable: background shell task limit reached."
                                                                                 ),
                                                                             );
-                                                                            ctrl_b_promoted_task_id = Some(id);
-                                                                            persist_background_task_projections_if_changed(
-                                                                                &mut background_registry,
-                                                                                background_registry_turn_session_id.as_deref(),
-                                                                                background_registry_turn_model.as_deref(),
-                                                                                &mut background_task_projection_cache,
-                                                                            );
-                                                                            let selected_id = ctrl_b_promoted_task_id.as_deref();
-                                                                            let _ = reveal_background_task_view(
-                                                                                &mut background_registry,
-                                                                                agent_spawner_for_cancel.as_ref(),
-                                                                                &restored_local_agent_task_projections,
-                                                                                &mut bottom_pane,
-                                                                                &frame_requester,
-                                                                                selected_id,
-                                                                            )
-                                                                            .await;
-                                                                            // The turn is over from the
-                                                                            // model's perspective; cancel
-                                                                            // gracefully so it sees the
-                                                                            // <bash_detached> marker
-                                                                            // already returned by the bash
-                                                                            // tool and ends cleanly.
-                                                                            tui_cancel_token.cancel();
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        // No payload — bash wasn't running,
-                                                                        // or completed normally before
-                                                                        // detach landed.
-                                                                        _ => {
+                                                                        // Fire the watch signal to request detach.
+                                                                        // Once signalled, this listener is single-use:
+                                                                        // the payload receiver is consumed below, so the
+                                                                        // runner must not restore the paired handle for a
+                                                                        // later bash invocation if handoff loses a race.
+                                                                        if listener.signal_tx.send(true).is_err() {
+                                                                            listener.retire();
                                                                             if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
                                                                                 *slot = None;
                                                                             }
+                                                                        } else {
+                                                                            listener.retire();
+                                                                        // Wait briefly for the runner to ship
+                                                                        // the live child + streams payload.
+                                                                        // 500ms is comfortably more than the
+                                                                        // bash runner's 25ms idle-poll tick;
+                                                                        // longer waits indicate bash wasn't
+                                                                        // actually running when the user hit
+                                                                        // Ctrl+B.
+                                                                        let payload = tokio::time::timeout(
+                                                                            std::time::Duration::from_millis(500),
+                                                                            listener.payload_rx,
+                                                                        )
+                                                                        .await;
+                                                                        match payload {
+                                                                            Ok(Ok(p)) => {
+                                                                                // Drop the bash runner straight
+                                                                                // into the registry. The
+                                                                                // adopt_detached_shell API
+                                                                                // takes the live child + streams
+                                                                                // and emits Started/Completed
+                                                                                // events like a normal bg task.
+                                                                                let id = match background_registry.adopt_detached_shell(
+                                                                                    p.child,
+                                                                                    p.stdout,
+                                                                                    p.stderr,
+                                                                                    &p.command,
+                                                                                    p.partial_stdout,
+                                                                                    p.partial_stderr,
+                                                                                ) {
+                                                                                    Ok(id) => id,
+                                                                                    Err(error) => {
+                                                                                        chat_widget.commit_system(
+                                                                                            history_cell::system::SystemCell::error(
+                                                                                                format!("⏎ Backgrounding failed: {error}")
+                                                                                            ),
+                                                                                        );
+                                                                                        frame_requester.schedule_frame();
+                                                                                        continue;
+                                                                                    }
+                                                                                };
+                                                                                chat_widget.commit_system(
+                                                                                    history_cell::system::SystemCell::info(
+                                                                                        format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
+                                                                                    ),
+                                                                                );
+                                                                                ctrl_b_promoted_task_id = Some(id);
+                                                                                persist_background_task_projections_if_changed(
+                                                                                    &mut background_registry,
+                                                                                    background_registry_turn_session_id.as_deref(),
+                                                                                    background_registry_turn_model.as_deref(),
+                                                                                    &mut background_task_projection_cache,
+                                                                                );
+                                                                                let selected_id = ctrl_b_promoted_task_id.as_deref();
+                                                                                let _ = reveal_background_task_view(
+                                                                                    &mut background_registry,
+                                                                                    agent_spawner_for_cancel.as_ref(),
+                                                                                    &restored_local_agent_task_projections,
+                                                                                    &mut bottom_pane,
+                                                                                    &frame_requester,
+                                                                                    selected_id,
+                                                                                )
+                                                                                .await;
+                                                                                // The turn is over from the
+                                                                                // model's perspective; cancel
+                                                                                // gracefully so it sees the
+                                                                                // <bash_detached> marker
+                                                                                // already returned by the bash
+                                                                                // tool and ends cleanly.
+                                                                                tui_cancel_token.cancel();
+                                                                                frame_requester.schedule_frame();
+                                                                                continue;
+                                                                            }
+                                                                            // No payload — bash completed or
+                                                                            // could not hand off after it had
+                                                                            // advertised an active detach window.
+                                                                            _ => {
+                                                                                if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
+                                                                                    *slot = None;
+                                                                                }
+                                                                            }
                                                                         }
+                                                                        }
+                                                                    } else {
+                                                                        bash_detach_listener = Some(listener);
                                                                     }
                                                                 }
-                                                                    if let Some(spawner) = agent_spawner_for_cancel.as_ref() {
-                                                                        if let Some(agent) = spawner
-                                                                            .promote_foreground_agent_to_background(None)
-                                                                            .await
-                                                                        {
-                                                                            chat_widget.commit_system(
-                                                                                history_cell::system::SystemCell::info(
-                                                                                    ctrl_b_promoted_agent_message(
-                                                                                        &agent.agent_id,
-                                                                                        &agent.description,
-                                                                                    ),
+                                                                if let Some(spawner) =
+                                                                    agent_spawner_for_cancel.as_ref()
+                                                                {
+                                                                    if let Some(agent) = spawner
+                                                                        .promote_foreground_agent_to_background(None)
+                                                                        .await
+                                                                    {
+                                                                        chat_widget.commit_system(
+                                                                            history_cell::system::SystemCell::info(
+                                                                                ctrl_b_promoted_agent_message(
+                                                                                    &agent.agent_id,
+                                                                                    &agent.description,
                                                                                 ),
-                                                                            );
-                                                                            let _ = reveal_background_task_view(
-                                                                                &mut background_registry,
-                                                                                agent_spawner_for_cancel.as_ref(),
-                                                                                &restored_local_agent_task_projections,
-                                                                                &mut bottom_pane,
-                                                                                &frame_requester,
-                                                                                Some(&agent.agent_id),
-                                                                            )
-                                                                            .await;
-                                                                            tui_cancel_token.cancel();
-                                                                            frame_requester.schedule_frame();
-                                                                            continue;
-                                                                        }
+                                                                            ),
+                                                                        );
+                                                                        let _ = reveal_background_task_view(
+                                                                            &mut background_registry,
+                                                                            agent_spawner_for_cancel.as_ref(),
+                                                                            &restored_local_agent_task_projections,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                            Some(&agent.agent_id),
+                                                                        )
+                                                                        .await;
+                                                                        tui_cancel_token.cancel();
+                                                                        frame_requester.schedule_frame();
+                                                                        continue;
                                                                     }
+                                                                }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
                                                                         "⏎ Backgrounding unavailable: no active bash or agent can be promoted right now."
@@ -1994,10 +2009,14 @@ pub(crate) async fn run_tui_session(
                                                                         if try_dispatch_background_task_output_sentinel(
                                                                             &result,
                                                                             &mut background_registry,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            &restored_local_agent_task_projections,
                                                                             &mut chat_widget,
                                                                             &mut bottom_pane,
                                                                             &frame_requester,
-                                                                        ) {
+                                                                        )
+                                                                        .await
+                                                                        {
                                                                             continue;
                                                                         }
                                                                         let _ = try_dispatch_agent_kill_sentinel(
@@ -2029,10 +2048,14 @@ pub(crate) async fn run_tui_session(
                                                                         if try_dispatch_background_task_output_sentinel(
                                                                             &name,
                                                                             &mut background_registry,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            &restored_local_agent_task_projections,
                                                                             &mut chat_widget,
                                                                             &mut bottom_pane,
                                                                             &frame_requester,
-                                                                        ) {
+                                                                        )
+                                                                        .await
+                                                                        {
                                                                             continue;
                                                                         }
                                                                         if try_dispatch_agent_kill_sentinel(
@@ -2557,10 +2580,14 @@ pub(crate) async fn run_tui_session(
                                 if try_dispatch_background_task_output_sentinel(
                                     &result,
                                     &mut background_registry,
+                                    state.agent_spawner.clone(),
+                                    &restored_local_agent_task_projections,
                                     &mut chat_widget,
                                     &mut bottom_pane,
                                     &frame_requester,
-                                ) {
+                                )
+                                .await
+                                {
                                     continue;
                                 }
                                 let _ = try_dispatch_agent_kill_sentinel(
@@ -2596,10 +2623,14 @@ pub(crate) async fn run_tui_session(
                                     if try_dispatch_background_task_output_sentinel(
                                         &name,
                                         &mut background_registry,
+                                        state.agent_spawner.clone(),
+                                        &restored_local_agent_task_projections,
                                         &mut chat_widget,
                                         &mut bottom_pane,
                                         &frame_requester,
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         continue;
                                     }
                                     // Kill sentinel: route to the spawner / task service before
@@ -4046,6 +4077,71 @@ mod tests {
         assert_eq!(snapshot.kind, "local agent");
         assert_eq!(snapshot.title.as_deref(), Some("review auth flow"));
         assert_ne!(snapshot.output_ref, "");
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_millis(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_task_output_sentinel_projects_local_agent() {
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        let agent_id = match spawned {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched background agent, got {other:?}"),
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let mut bottom_pane = BottomPane::new();
+        let sentinel = format!(
+            "{}{}",
+            bottom_pane::background_task_view::BACKGROUND_TASK_OUTPUT_SENTINEL,
+            agent_id
+        );
+
+        assert!(
+            try_dispatch_background_task_output_sentinel(
+                &sentinel,
+                &mut registry,
+                Some(spawner.clone()),
+                &[],
+                &mut chat_widget,
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "background task output sentinel should be consumed for local agents"
+        );
+
+        let last_system = chat_widget
+            .history()
+            .last()
+            .and_then(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<history_cell::system::SystemCell>()
+            })
+            .expect("output sentinel should commit a system message");
+        assert!(
+            last_system.message().contains("Read local agent output"),
+            "local agent output should be rendered as local-agent output, got: {}",
+            last_system.message()
+        );
+        assert!(
+            last_system.message().contains("review auth flow"),
+            "local agent output should include the task title, got: {}",
+            last_system.message()
+        );
 
         spawner
             .shutdown_and_wait(std::time::Duration::from_millis(1))

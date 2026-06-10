@@ -57,7 +57,7 @@ impl BackgroundTaskKind {
     }
 
     fn supports_output_action(self) -> bool {
-        matches!(self, Self::Shell)
+        matches!(self, Self::Shell | Self::LocalAgent)
     }
 }
 
@@ -743,6 +743,13 @@ impl BackgroundTaskView {
         }
         timing_parts.push(format!("elapsed {}", format_elapsed(row.elapsed_ms)));
 
+        let title_label = match row.kind {
+            BackgroundTaskKind::Shell => "  command ",
+            BackgroundTaskKind::LocalAgent => "  task ",
+            BackgroundTaskKind::CloudSession
+            | BackgroundTaskKind::MainSession
+            | BackgroundTaskKind::Monitor => "  title ",
+        };
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("  {} · {}", row.id, row.status.label()),
@@ -755,7 +762,7 @@ impl BackgroundTaskView {
                 Span::raw(timing_parts.join(" · ")),
             ]),
             Line::from(vec![
-                Span::styled("  command ", dim),
+                Span::styled(title_label, dim),
                 Span::raw(row.title.clone()),
             ]),
         ];
@@ -1562,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn local_agent_detail_does_not_offer_shell_output_action() {
+    fn local_agent_detail_offers_typed_output_action() {
         let mut view = BackgroundTaskView::new(vec![typed_row(
             "agent-1",
             BackgroundTaskKind::LocalAgent,
@@ -1572,13 +1579,19 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
 
         let detail = render(&view, 80, 12);
-        assert!(detail.contains("actions: stop · return"), "{detail}");
-        assert!(!detail.contains("actions: output"), "{detail}");
+        assert!(
+            detail.contains("actions: output · stop · return"),
+            "{detail}"
+        );
+        assert!(detail.contains("task review auth flow"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('o')));
         assert!(
-            view.take_pending_action().is_none(),
-            "local agent output must not emit shell task_output sentinel"
+            matches!(
+                view.take_pending_action().as_deref(),
+                Some("__background_task_output__\nagent-1")
+            ),
+            "local agent output should emit typed task_output sentinel"
         );
 
         view.handle_key(key(KeyCode::Char('s')));

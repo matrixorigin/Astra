@@ -17,9 +17,11 @@ use astra_turn_core::orchestration_progress::{
 };
 use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
+use futures_util::FutureExt;
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -1271,6 +1273,9 @@ impl DynamicAgentSpawner {
                 reason: format!("{reason:?}"),
             });
         }
+        let Some(executor) = self.executor.as_ref().cloned() else {
+            return Err(SpawnError::ExecutorUnavailable);
+        };
 
         // 4. Reserve active-agent capacity under the same write lock that
         // inserts the agent. This closes the read-check/write-insert TOCTOU
@@ -1522,15 +1527,6 @@ impl DynamicAgentSpawner {
         // foreground sync spawns run through the same task/finalization
         // pipe. Sync mode simply waits for the terminal oneshot unless
         // Ctrl+B promotes the wait into a background `Launched` result.
-        let Some(ref executor) = self.executor else {
-            // No executor available - return as launched (degraded mode)
-            return Ok(SpawnAgentOutput::Launched {
-                agent_id,
-                description: input.description,
-                messaging_address: messaging_address.map(|a| a.to_string()),
-            });
-        };
-
         self.update_status(
             &agent_id,
             AgentStatus::Running {
@@ -1555,7 +1551,7 @@ impl DynamicAgentSpawner {
             .insert(agent_id.clone(), Arc::clone(&notify));
 
         let (terminal_tx, mut terminal_rx) = tokio::sync::oneshot::channel();
-        let executor = Arc::clone(executor);
+        let executor = Arc::clone(&executor);
         let spawner = self.clone_for_task();
         let agent_id_for_task = agent_id.clone();
         let agent_id_for_output = agent_id.clone();
@@ -1569,9 +1565,11 @@ impl DynamicAgentSpawner {
                 }
             }
             let guard = NotifyOnDrop(notify_guard);
-            let result = executor.execute(run_config).await;
+            let result = AssertUnwindSafe(executor.execute(run_config))
+                .catch_unwind()
+                .await;
             let output = match result {
-                Ok(run_result) => {
+                Ok(Ok(run_result)) => {
                     let status = spawn_run_result_to_agent_status(&run_result);
                     spawner
                         .finalize_background_agent(
@@ -1590,7 +1588,7 @@ impl DynamicAgentSpawner {
                         .unwrap_or(0);
                     spawn_run_result_to_sync_output(agent_id_for_output, run_result, duration_ms)
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     spawner
                         .finalize_background_agent(
                             &agent_id_for_task,
@@ -1600,6 +1598,30 @@ impl DynamicAgentSpawner {
                             },
                             "failed",
                             None,
+                            None,
+                            None,
+                            Some(error.as_str()),
+                        )
+                        .await;
+                    SpawnAgentOutput::Failed {
+                        error,
+                        duration_ms: 0,
+                    }
+                }
+                Err(panic) => {
+                    let error = format!(
+                        "agent executor panicked: {}",
+                        panic_payload_message(panic.as_ref())
+                    );
+                    spawner
+                        .finalize_background_agent(
+                            &agent_id_for_task,
+                            AgentStatus::Failed {
+                                error: error.clone(),
+                                finish_reason: Some("panic".to_string()),
+                            },
+                            "failed",
+                            Some("panic"),
                             None,
                             None,
                             Some(error.as_str()),
@@ -2234,6 +2256,9 @@ pub enum SpawnError {
     #[error("Delegation failed: {0}")]
     DelegationFailed(String),
 
+    #[error("Agent executor unavailable: spawned agents cannot run in this context")]
+    ExecutorUnavailable,
+
     /// Fork children are allowed to spawn normal children, but not
     /// another inherit-prefix fork. This mirrors Claude Code's
     /// `isInForkChild()` guard and prevents recursive cache-key drift.
@@ -2267,6 +2292,16 @@ pub enum SpawnError {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
+}
 
 /// Build the [`InheritedChildPrefix`] payload handed to the executor.
 ///
@@ -2417,7 +2452,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_basic() {
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let input = SpawnAgentInput {
             description: "Test agent".to_string(),
             prompt: "Do a test".to_string(),
@@ -2440,6 +2476,44 @@ mod tests {
 
         let result = spawner.spawn(input, &context).await.unwrap();
         assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
+    }
+
+    #[tokio::test]
+    async fn spawn_without_executor_fails_without_reserving_state() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let input = SpawnAgentInput {
+            description: "Test agent".to_string(),
+            prompt: "Do a test".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            fanout_group_id: Some("review-1".to_string()),
+            fanout_target_count: Some(2),
+            fanout_slot_index: Some(0),
+            ..Default::default()
+        };
+
+        let result = spawner.spawn(input, &make_bg_context()).await;
+        assert!(
+            matches!(result, Err(SpawnError::ExecutorUnavailable)),
+            "missing executor must fail explicitly, got {result:?}"
+        );
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "missing executor must not leave fake active agents"
+        );
+        assert!(
+            spawner.completion_notifiers.read().await.is_empty(),
+            "missing executor must not leave completion notifiers"
+        );
+        assert_eq!(
+            spawner.background_task_count(),
+            0,
+            "missing executor must not enqueue a background task"
+        );
+        assert!(
+            spawner.list_fanout_groups().await.is_empty(),
+            "missing executor must not leave fanout rows for a child that never ran"
+        );
     }
 
     #[tokio::test]
@@ -2499,7 +2573,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_agents() {
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -2513,19 +2589,22 @@ mod tests {
             spawn_tool_call_id: None,
         };
 
-        // Spawn two agents
-        for i in 0..2 {
-            let input = SpawnAgentInput {
-                description: format!("Agent {}", i),
-                prompt: "Test".to_string(),
-                agent_type: "explore".to_string(),
-                ..Default::default()
-            };
-            let _ = spawner.spawn(input, &context).await;
-        }
+        let input = SpawnAgentInput {
+            description: "Agent 1".to_string(),
+            prompt: "Test".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let _ = spawner.spawn(input, &context).await.unwrap();
 
         let agents = spawner.list_agents("parent-123").await;
-        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.len(), 1);
+
+        factory.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     #[tokio::test]
@@ -2536,7 +2615,8 @@ mod tests {
         let cache = Arc::new(SharedContextCache::default());
 
         // Create spawner with custom cache
-        let spawner = DynamicAgentSpawner::with_context_cache(mock_router(), Arc::clone(&cache));
+        let spawner = DynamicAgentSpawner::with_context_cache(mock_router(), Arc::clone(&cache))
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
 
         // Verify spawner has the same cache
         assert!(Arc::ptr_eq(&cache, spawner.context_cache()));
@@ -2591,7 +2671,9 @@ mod tests {
     #[tokio::test]
     async fn test_named_spawn_records_parent_routing() {
         let router = mock_router();
-        let spawner = DynamicAgentSpawner::new(router.clone());
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(router.clone())
+            .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
         let mut parent_mailbox = router
             .register(AgentAddress::new("parent-123", "main"), None)
             .await
@@ -2645,6 +2727,11 @@ mod tests {
             MessagePayload::Text { content, .. } => assert_eq!(content, "done"),
             other => panic!("expected text payload, got {other:?}"),
         }
+
+        factory.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     struct ImmediateSuccessExecutor;
@@ -3165,7 +3252,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_inherited_skills_passed_to_run_config() {
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -3417,7 +3505,9 @@ mod tests {
 
     #[tokio::test]
     async fn spawned_agent_state_preserves_fanout_slot_identity() {
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
         let mut input = make_bg_input();
         input.fanout_group_id = Some("review-1".to_string());
         input.fanout_group_title = Some("review fanout".to_string());
@@ -3436,7 +3526,7 @@ mod tests {
         let state = spawner
             .get_agent_state(&agent_id)
             .await
-            .expect("spawned agent should remain active without an executor");
+            .expect("spawned agent should remain active while executor is running");
         let slot = state
             .fanout_slot
             .as_ref()
@@ -3451,6 +3541,11 @@ mod tests {
             .find(|info| info.agent_id == agent_id)
             .expect("list projection should include spawned agent");
         assert_eq!(projected.fanout_slot, state.fanout_slot);
+
+        factory.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     #[tokio::test]
@@ -3474,7 +3569,9 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_group_tracks_acceptance_and_rejects_duplicate_slot() {
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
         let mut input = make_bg_input();
         input.fanout_group_id = Some("review-1".to_string());
         input.fanout_group_title = Some("review fanout".to_string());
@@ -3501,6 +3598,11 @@ mod tests {
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.active, 1);
         assert_eq!(groups[0].slots[1].requested_description, "bg test");
+
+        factory.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     #[tokio::test]
@@ -4396,19 +4498,41 @@ mod tests {
         );
     }
 
-    /// HIGH #5: background agent that panics does not leave a zombie in the JoinSet.
+    /// HIGH #5: background agent that panics must still finalize like a
+    /// normal failed child, not just disappear from the JoinSet.
     #[tokio::test]
-    async fn background_agent_panic_does_not_leave_zombie() {
+    async fn background_agent_panic_finalizes_failed_state() {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(PanicExecutor) as Arc<dyn SpawnAgentExecutor>);
 
-        let _ = spawner
+        let result = spawner
             .spawn(make_bg_input(), &make_bg_context())
             .await
             .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
 
-        // Give the panic time to propagate; shutdown_and_wait catches the JoinError.
-        spawner
+        let status = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(status, Some(AgentStatus::Failed { ref error, .. }) if error.contains("executor panicked")),
+            "panic must surface as failed agent status, got {status:?}"
+        );
+
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("panicked agent should remain queryable as archived failed state");
+        assert!(
+            matches!(archived.status, AgentStatus::Failed { .. }),
+            "archived status must be failed: {:?}",
+            archived.status
+        );
+
+        let _ = spawner
             .shutdown_and_wait(std::time::Duration::from_secs(2))
             .await;
 
@@ -4416,6 +4540,59 @@ mod tests {
             spawner.background_task_count(),
             0,
             "panicked background task must not leave zombie in JoinSet"
+        );
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "panicked background task must not remain active"
+        );
+        assert!(
+            spawner.completion_notifiers.read().await.is_empty(),
+            "panicked background task must not leave completion notifiers"
+        );
+        assert!(
+            spawner
+                .background_agent_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "panicked background task must not remain in background ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_agent_panic_returns_failed_and_archives() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(PanicExecutor) as Arc<dyn SpawnAgentExecutor>);
+        let mut input = make_bg_input();
+        input.run_in_background = false;
+
+        let result = spawner.spawn(input, &make_bg_context()).await.unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Failed { ref error, .. } if error.contains("executor panicked") => {
+                spawner
+                    .completed_agents
+                    .read()
+                    .await
+                    .last()
+                    .expect("foreground panic should archive failed state")
+                    .agent_id
+                    .clone()
+            }
+            other => panic!("expected foreground Failed output for panic, got {other:?}"),
+        };
+
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("foreground panic should remain queryable");
+        assert!(
+            matches!(archived.status, AgentStatus::Failed { .. }),
+            "archived status must be failed: {:?}",
+            archived.status
+        );
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "foreground panic must not leave active agent state"
         );
     }
 
@@ -4640,12 +4817,13 @@ mod tests {
         // additive-only property. Even with inherit_prefix set in
         // the input, spawn must succeed (prefix request silently
         // has no effect without a store).
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let input = child_with_inherit(false);
         let ctx = parent_context("parent-unused");
         let result = spawner.spawn(input, &ctx).await;
         assert!(
-            matches!(result, Ok(SpawnAgentOutput::Launched { .. })),
+            result.is_ok(),
             "spawn must succeed without store even when inherit_prefix is set, got {result:?}"
         );
     }
@@ -4653,15 +4831,19 @@ mod tests {
     #[tokio::test]
     async fn spawn_resolves_matching_captured_prefix() {
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store.clone());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store.clone())
+            .with_executor(exec as Arc<dyn SpawnAgentExecutor>);
         capture_parent_for(&*store, "run-parent-A", TEST_CHILD_MODEL);
 
         let input = child_with_inherit(false);
         let ctx = parent_context("run-parent-A");
         let out = spawner.spawn(input, &ctx).await.unwrap();
         let agent_id = match out {
+            SpawnAgentOutput::Completed { agent_id, .. } => agent_id,
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected Launched, got {other:?}"),
+            other => panic!("expected successful spawn output, got {other:?}"),
         };
         let outcome = spawner
             .last_prefix_resolve(&agent_id)
@@ -4690,13 +4872,16 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_optional_and_missing_prefix_falls_back() {
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store)
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let input = child_with_inherit(false); // not required
         let ctx = parent_context("run-no-capture");
         let out = spawner.spawn(input, &ctx).await.unwrap();
         let agent_id = match out {
+            SpawnAgentOutput::Completed { agent_id, .. } => agent_id,
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected Launched, got {other:?}"),
+            other => panic!("expected successful spawn output, got {other:?}"),
         };
         let outcome = spawner.last_prefix_resolve(&agent_id).await.unwrap();
         assert!(
@@ -4710,7 +4895,9 @@ mod tests {
         // inherit_prefix=None → outcome should be Disabled, regardless
         // of whether a store is configured or the flag is on.
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store)
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let input = SpawnAgentInput {
             description: "child".into(),
             prompt: "work".into(),
@@ -4721,8 +4908,9 @@ mod tests {
         let ctx = parent_context("run-parent");
         let out = spawner.spawn(input, &ctx).await.unwrap();
         let agent_id = match out {
+            SpawnAgentOutput::Completed { agent_id, .. } => agent_id,
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected Launched, got {other:?}"),
+            other => panic!("expected successful spawn output, got {other:?}"),
         };
         let outcome = spawner.last_prefix_resolve(&agent_id).await.unwrap();
         assert!(
@@ -4875,7 +5063,8 @@ mod tests {
 
     #[tokio::test]
     async fn fork_child_can_still_spawn_fresh_child_without_inheritance() {
-        let spawner = DynamicAgentSpawner::new(mock_router());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let mut ctx = parent_context("run-fork-parent");
         ctx.parent_is_fork_child = true;
         let input = SpawnAgentInput {
@@ -4887,7 +5076,7 @@ mod tests {
 
         let result = spawner.spawn(input, &ctx).await;
         assert!(
-            matches!(result, Ok(SpawnAgentOutput::Launched { .. })),
+            result.is_ok(),
             "fork children must still be able to spawn ordinary non-inheriting children: {result:?}"
         );
     }
