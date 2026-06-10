@@ -514,8 +514,8 @@ pub fn project_permissions_hash(workspace: &Path) -> Result<Option<String>, Work
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_workspace_trust_from_path, project_permissions_hash, TrustState,
-        WorkspaceTrustError, WorkspaceTrustLedger, WorkspaceTrustReason,
+        TrustState, WorkspaceTrustError, WorkspaceTrustLedger, WorkspaceTrustReason,
+        evaluate_workspace_trust_from_path, project_permissions_hash,
     };
     use std::path::Path;
 
