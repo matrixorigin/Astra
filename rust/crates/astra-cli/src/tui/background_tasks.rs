@@ -320,9 +320,11 @@ impl BackgroundTaskRegistry {
         command_label: &str,
         partial_stdout: String,
         partial_stderr: String,
-    ) -> String {
+    ) -> Result<String, String> {
         if self.running_count() >= MAX_CONCURRENT_TASKS {
-            return String::new();
+            return Err(format!(
+                "background shell task limit reached ({MAX_CONCURRENT_TASKS} running)"
+            ));
         }
         let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
         let cancel = CancellationToken::new();
@@ -391,7 +393,7 @@ impl BackgroundTaskRegistry {
         // local copy to silence dead-code lint.
         let _ = &status;
 
-        id
+        Ok(id)
     }
 
     pub fn restore_shell_task_projection(
@@ -762,6 +764,10 @@ impl BackgroundTaskRegistry {
                 h.live_control.is_available() && !s.is_terminal() && s != BgTaskStatus::Stalled
             })
             .count()
+    }
+
+    pub fn can_spawn_shell_task(&self) -> bool {
+        self.running_count() < MAX_CONCURRENT_TASKS
     }
 
     /// Number of stalled tasks — surfaced separately on the status
@@ -2404,14 +2410,16 @@ mod tests {
         let partial_stdout = "before-detach\n".to_string();
         let partial_stderr = String::new();
 
-        let id = reg.adopt_detached_shell(
-            child,
-            stdout,
-            stderr,
-            "printf 'before-detach\\n'; sleep 0.1; printf 'after-detach\\n'",
-            partial_stdout,
-            partial_stderr,
-        );
+        let id = reg
+            .adopt_detached_shell(
+                child,
+                stdout,
+                stderr,
+                "printf 'before-detach\\n'; sleep 0.1; printf 'after-detach\\n'",
+                partial_stdout,
+                partial_stderr,
+            )
+            .expect("adopt detached shell");
         assert!(
             id.starts_with("bg-shell-"),
             "adopted task must get a bg-shell-N id; got {id}"

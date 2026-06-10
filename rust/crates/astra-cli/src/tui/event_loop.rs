@@ -1712,6 +1712,16 @@ pub(crate) async fn run_tui_session(
                                                             {
                                                                 let listener = bash_detach_listener.take();
                                                                 if let Some(listener) = listener {
+                                                                    if !background_registry.can_spawn_shell_task() {
+                                                                        bash_detach_listener = Some(listener);
+                                                                        chat_widget.commit_system(
+                                                                            history_cell::system::SystemCell::error(
+                                                                                "⏎ Backgrounding unavailable: background shell task limit reached."
+                                                                            ),
+                                                                        );
+                                                                        frame_requester.schedule_frame();
+                                                                        continue;
+                                                                    }
                                                                     // Fire the watch signal to request detach.
                                                                     // If the runner already completed, send
                                                                     // fails silently — the handler moves on.
@@ -1736,14 +1746,25 @@ pub(crate) async fn run_tui_session(
                                                                             // takes the live child + streams
                                                                             // and emits Started/Completed
                                                                             // events like a normal bg task.
-                                                                            let id = background_registry.adopt_detached_shell(
+                                                                            let id = match background_registry.adopt_detached_shell(
                                                                                 p.child,
                                                                                 p.stdout,
                                                                                 p.stderr,
                                                                                 &p.command,
                                                                                 p.partial_stdout,
                                                                                 p.partial_stderr,
-                                                                            );
+                                                                            ) {
+                                                                                Ok(id) => id,
+                                                                                Err(error) => {
+                                                                                    chat_widget.commit_system(
+                                                                                        history_cell::system::SystemCell::error(
+                                                                                            format!("⏎ Backgrounding failed: {error}")
+                                                                                        ),
+                                                                                    );
+                                                                                    frame_requester.schedule_frame();
+                                                                                    continue;
+                                                                                }
+                                                                            };
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::info(
                                                                                     format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
