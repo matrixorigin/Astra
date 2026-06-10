@@ -198,30 +198,66 @@ pub(crate) struct BackgroundTaskRow {
     pub fanout: Option<BackgroundTaskFanoutMembership>,
 }
 
-impl BackgroundTaskRow {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundTaskRowInit {
+    id: String,
+    kind: BackgroundTaskKind,
+    status: BackgroundTaskStatus,
+    elapsed_ms: u64,
+    title: String,
+    output_ref: Option<String>,
+    output_tail: Option<String>,
+    total_bytes: Option<u64>,
+}
+
+impl BackgroundTaskRowInit {
     pub(crate) fn new(
         id: impl Into<String>,
         kind: BackgroundTaskKind,
         status: impl AsRef<str>,
         elapsed_ms: u64,
         title: impl Into<String>,
-        output_ref: Option<String>,
-        output_tail: Option<String>,
-        total_bytes: Option<u64>,
     ) -> Self {
         Self {
             id: id.into(),
             kind,
             status: BackgroundTaskStatus::from_str(status.as_ref()),
-            live_control: LiveControlState::Available,
             elapsed_ms,
+            title: title.into(),
+            output_ref: None,
+            output_tail: None,
+            total_bytes: None,
+        }
+    }
+
+    pub(crate) fn with_output(
+        mut self,
+        output_ref: Option<String>,
+        output_tail: Option<String>,
+        total_bytes: Option<u64>,
+    ) -> Self {
+        self.output_ref = output_ref;
+        self.output_tail = output_tail;
+        self.total_bytes = total_bytes;
+        self
+    }
+}
+
+impl BackgroundTaskRow {
+    pub(crate) fn new(init: BackgroundTaskRowInit) -> Self {
+        Self {
+            id: init.id,
+            kind: init.kind,
+            status: init.status,
+            live_control: LiveControlState::Available,
+            elapsed_ms: init.elapsed_ms,
             started_at_ms: None,
             ended_at_ms: None,
-            title: title.into(),
-            output_ref,
-            output_tail,
+            title: init.title,
+            output_ref: init.output_ref,
+            output_tail: init.output_tail,
             output_offset: None,
-            total_bytes,
+            total_bytes: init.total_bytes,
             total_lines: None,
             exit_code: None,
             terminal_reason: None,
@@ -239,14 +275,8 @@ impl BackgroundTaskRow {
         total_bytes: Option<u64>,
     ) -> Self {
         Self::new(
-            id,
-            BackgroundTaskKind::Shell,
-            status,
-            elapsed_ms,
-            title,
-            output_ref,
-            output_tail,
-            total_bytes,
+            BackgroundTaskRowInit::new(id, BackgroundTaskKind::Shell, status, elapsed_ms, title)
+                .with_output(output_ref, output_tail, total_bytes),
         )
     }
 
@@ -487,35 +517,69 @@ impl BackgroundTaskView {
     }
 
     fn move_up(&mut self) {
-        if self.rows.is_empty() {
+        let indices = self.selectable_row_indices();
+        if indices.is_empty() {
             return;
         }
-        self.selected = if self.selected == 0 {
-            self.rows.len() - 1
-        } else {
-            self.selected - 1
-        };
+        let pos = self.selected_visual_position(&indices).unwrap_or(0);
+        let next_pos = if pos == 0 { indices.len() - 1 } else { pos - 1 };
+        self.selected = indices[next_pos];
     }
 
     fn move_down(&mut self) {
-        if self.rows.is_empty() {
+        let indices = self.selectable_row_indices();
+        if indices.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1) % self.rows.len();
+        let pos = self.selected_visual_position(&indices).unwrap_or(0);
+        self.selected = indices[(pos + 1) % indices.len()];
     }
 
     fn move_page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(PAGE_STEP);
+        let indices = self.selectable_row_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let pos = self.selected_visual_position(&indices).unwrap_or(0);
+        self.selected = indices[pos.saturating_sub(PAGE_STEP)];
     }
 
     fn move_page_down(&mut self) {
-        if self.rows.is_empty() {
+        let indices = self.selectable_row_indices();
+        if indices.is_empty() {
             return;
         }
-        self.selected = self
-            .selected
-            .saturating_add(PAGE_STEP)
-            .min(self.rows.len().saturating_sub(1));
+        let pos = self.selected_visual_position(&indices).unwrap_or(0);
+        self.selected = indices[pos.saturating_add(PAGE_STEP).min(indices.len() - 1)];
+    }
+
+    fn select_home(&mut self) {
+        if let Some(idx) = self.selectable_row_indices().first() {
+            self.selected = *idx;
+        }
+    }
+
+    fn select_end(&mut self) {
+        if let Some(idx) = self.selectable_row_indices().last() {
+            self.selected = *idx;
+        }
+    }
+
+    fn select_visible_ordinal(&mut self, ordinal: usize) {
+        if let Some(idx) = self.selectable_row_indices().get(ordinal) {
+            self.selected = *idx;
+        }
+    }
+
+    fn selectable_row_indices(&self) -> Vec<usize> {
+        background_task_list_entries(&self.rows)
+            .into_iter()
+            .filter_map(|entry| entry.row_index())
+            .collect()
+    }
+
+    fn selected_visual_position(&self, indices: &[usize]) -> Option<usize> {
+        indices.iter().position(|idx| *idx == self.selected)
     }
 
     fn request_stop(&mut self) {
@@ -597,6 +661,11 @@ impl BackgroundTaskView {
             .position(|entry| entry.row_index() == Some(self.selected))
             .unwrap_or(0);
         let window_start = selected_entry.saturating_add(1).saturating_sub(body_h);
+        let mut visible_row_number = entries
+            .iter()
+            .take(window_start)
+            .filter(|entry| entry.row_index().is_some())
+            .count();
         for (i, entry) in entries.iter().skip(window_start).take(body_h).enumerate() {
             let line = match entry {
                 BackgroundTaskListEntry::FanoutHeader(header) => fanout_header_line(header, dim),
@@ -620,8 +689,9 @@ impl BackgroundTaskView {
                     } else {
                         Style::default().fg(row.status.color())
                     };
+                    visible_row_number += 1;
                     let marker = if selected { "› " } else { "  " };
-                    let index = format!("{}. ", row_idx + 1);
+                    let index = format!("{}. ", visible_row_number);
                     let meta = format!(
                         "{}  {}  {}  ",
                         row.kind.as_str(),
@@ -789,18 +859,15 @@ impl BottomPaneView for BackgroundTaskView {
                 KeyCode::Down | KeyCode::Char('j') => self.move_down(),
                 KeyCode::PageUp => self.move_page_up(),
                 KeyCode::PageDown => self.move_page_down(),
-                KeyCode::Home => self.selected = 0,
-                KeyCode::End if !self.rows.is_empty() => self.selected = self.rows.len() - 1,
+                KeyCode::Home => self.select_home(),
+                KeyCode::End if !self.rows.is_empty() => self.select_end(),
                 KeyCode::Char(ch) if ('1'..='9').contains(&ch) => {
-                    let idx = ch as usize - '1' as usize;
-                    if idx < self.rows.len() {
-                        self.selected = idx;
-                    }
+                    self.select_visible_ordinal(ch as usize - '1' as usize);
                 }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('o') | KeyCode::Char('O') => {
-                    if !self.rows.is_empty() {
-                        self.mode = Mode::Detail;
-                    }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('o') | KeyCode::Char('O')
+                    if !self.rows.is_empty() =>
+                {
+                    self.mode = Mode::Detail;
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('x') | KeyCode::Delete => {
                     self.request_stop();
@@ -1042,14 +1109,11 @@ mod tests {
         title: &str,
     ) -> BackgroundTaskRow {
         BackgroundTaskRow::new(
-            id,
-            kind,
-            status,
-            1500,
-            title,
-            Some(format!("/tmp/{id}.stdout")),
-            Some("line one\nline two".to_string()),
-            Some(17),
+            BackgroundTaskRowInit::new(id, kind, status, 1500, title).with_output(
+                Some(format!("/tmp/{id}.stdout")),
+                Some("line one\nline two".to_string()),
+                Some(17),
+            ),
         )
     }
 
@@ -1185,6 +1249,49 @@ mod tests {
         assert!(text.contains("slot 1: slot task 0"), "{text}");
         assert!(text.contains("slot 2: slot task 1"), "{text}");
         assert!(text.contains("slot 3: slot task 2"), "{text}");
+    }
+
+    #[test]
+    fn list_navigation_follows_visible_fanout_grouping_order() {
+        let mut view = BackgroundTaskView::new(vec![
+            typed_row(
+                "agent-failed",
+                BackgroundTaskKind::LocalAgent,
+                "failed",
+                "failed review",
+            )
+            .with_fanout(fanout("review-1", 2, 0)),
+            typed_row(
+                "standalone",
+                BackgroundTaskKind::Shell,
+                "running",
+                "cargo test",
+            ),
+            typed_row(
+                "agent-done",
+                BackgroundTaskKind::LocalAgent,
+                "completed",
+                "completed review",
+            )
+            .with_fanout(fanout("review-1", 2, 1)),
+        ]);
+
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("agent-failed")
+        );
+
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("agent-done")
+        );
+
+        view.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("standalone")
+        );
     }
 
     #[test]

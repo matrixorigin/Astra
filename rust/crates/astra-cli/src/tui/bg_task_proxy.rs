@@ -402,7 +402,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
         AgentStatus::Failed { error, .. } => ("failed", error.clone()),
         AgentStatus::Cancelled { reason, .. } => ("killed", reason.clone()),
     };
-    let total_bytes = full_output.as_bytes().len() as u64;
+    let total_bytes = full_output.len() as u64;
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
@@ -425,7 +425,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
     max_bytes: usize,
 ) -> crate::edge_tools::BgTaskOutputSnapshot {
     let full_output = projection.output_tail.clone().unwrap_or_default();
-    let total_bytes = full_output.as_bytes().len() as u64;
+    let total_bytes = full_output.len() as u64;
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();

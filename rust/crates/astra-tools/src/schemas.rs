@@ -689,7 +689,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
          ## Execution mode\n\
          - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
-         - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later using the exact returned `agent_id`. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
+         - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await in the current turn; follow up with `get_result` later using the exact returned `agent_id`. Local restarts preserve a visible background-task projection, not a live executor handle.\n\n\
          ## Parallel sub-agent fan-out\n\
          Use `agent_fanout(action='start', target_count=N, slots=[...])` to start a fixed-size parallel group atomically, then `agent_fanout(action='get_results', group_id=...)` to collect every slot. Do not simulate fan-out with an `agents:[...]` payload on `agent`.\n\
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\

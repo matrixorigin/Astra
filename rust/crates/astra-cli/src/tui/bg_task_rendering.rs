@@ -67,7 +67,7 @@ pub(crate) fn background_task_rows(
                             )
                         },
                         |(output, total, lines)| {
-                            let offset = total.saturating_sub(output.as_bytes().len() as u64);
+                            let offset = total.saturating_sub(output.len() as u64);
                             let tail = output.trim_end().to_string();
                             (
                                 Some(tail).filter(|tail| !tail.is_empty()),
@@ -131,7 +131,8 @@ pub(crate) fn background_task_row_for_rejected_fanout_slot(
     slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlot,
 ) -> Option<super::bottom_pane::background_task_view::BackgroundTaskRow> {
     use super::bottom_pane::background_task_view::{
-        BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow, LiveControlState,
+        BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
+        BackgroundTaskRowInit, LiveControlState,
     };
     use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotStatus;
 
@@ -146,27 +147,31 @@ pub(crate) fn background_task_row_for_rejected_fanout_slot(
         .filter(|reason| !reason.is_empty())
         .unwrap_or("spawn rejected")
         .to_string();
-    let title = slot
-        .requested_description
-        .trim()
-        .is_empty()
-        .then(|| label.clone())
-        .unwrap_or_else(|| slot.requested_description.trim().to_string());
-    let total_bytes = reason.as_bytes().len() as u64;
+    let requested_description = slot.requested_description.trim();
+    let title = if requested_description.is_empty() {
+        label.clone()
+    } else {
+        requested_description.to_string()
+    };
+    let total_bytes = reason.len() as u64;
     let total_lines = reason.lines().count() as u64;
     Some(
         BackgroundTaskRow::new(
-            background_task_rejected_fanout_slot_id(&group.group_id, slot.slot_index),
-            BackgroundTaskKind::LocalAgent,
-            "failed",
-            0,
-            title,
-            Some(format!(
-                "fanout_spawn_rejected: {}#{}",
-                group.group_id, slot.slot_index
-            )),
-            Some(reason.clone()),
-            Some(total_bytes),
+            BackgroundTaskRowInit::new(
+                background_task_rejected_fanout_slot_id(&group.group_id, slot.slot_index),
+                BackgroundTaskKind::LocalAgent,
+                "failed",
+                0,
+                title,
+            )
+            .with_output(
+                Some(format!(
+                    "fanout_spawn_rejected: {}#{}",
+                    group.group_id, slot.slot_index
+                )),
+                Some(reason.clone()),
+                Some(total_bytes),
+            ),
         )
         .with_output_stats(None, Some(total_lines))
         .with_terminal(None, Some(reason))
@@ -193,7 +198,7 @@ pub(crate) fn background_task_output_snapshot_for_rejected_fanout_slot(
 ) -> Option<crate::edge_tools::BgTaskOutputSnapshot> {
     let row = background_task_row_for_rejected_fanout_slot(group, slot)?;
     let full_output = row.output_tail.clone().unwrap_or_default();
-    let total_bytes = full_output.as_bytes().len() as u64;
+    let total_bytes = full_output.len() as u64;
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
@@ -220,7 +225,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     fanout_title: Option<&str>,
 ) -> Option<super::bottom_pane::background_task_view::BackgroundTaskRow> {
     use super::bottom_pane::background_task_view::{
-        BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskStatus,
+        BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit, BackgroundTaskStatus,
     };
     use astra_turn_core::orchestration_types::AgentStatus;
 
@@ -281,14 +286,14 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     let total_lines = tail.as_ref().map(|tail| tail.lines().count() as u64);
 
     let row = BackgroundTaskRow::new(
-        agent.agent_id.clone(),
-        BackgroundTaskKind::LocalAgent,
-        status.as_str(),
-        elapsed_ms,
-        agent.description.clone(),
-        None,
-        tail,
-        total_bytes,
+        BackgroundTaskRowInit::new(
+            agent.agent_id.clone(),
+            BackgroundTaskKind::LocalAgent,
+            status.as_str(),
+            elapsed_ms,
+            agent.description.clone(),
+        )
+        .with_output(None, tail, total_bytes),
     )
     .with_output_stats(None, total_lines)
     .with_terminal(None, terminal_reason)
@@ -315,13 +320,13 @@ pub(crate) fn background_task_row_for_local_agent_projection(
     projection: &astra_services::session_workspace::BackgroundLocalAgentTaskProjection,
 ) -> super::bottom_pane::background_task_view::BackgroundTaskRow {
     use super::bottom_pane::background_task_view::{
-        BackgroundTaskKind, BackgroundTaskRow, LiveControlState,
+        BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit, LiveControlState,
     };
 
     let total_bytes = projection
         .output_tail
         .as_ref()
-        .map(|tail| tail.as_bytes().len() as u64);
+        .map(|tail| tail.len() as u64);
     let total_lines = projection
         .output_tail
         .as_ref()
@@ -337,14 +342,18 @@ pub(crate) fn background_task_row_for_local_agent_projection(
         .saturating_sub(projection.started_at_ms);
 
     let row = BackgroundTaskRow::new(
-        projection.id.clone(),
-        BackgroundTaskKind::LocalAgent,
-        projection.status.as_str(),
-        elapsed_ms,
-        projection.title.clone(),
-        Some(format!("workspace_projection: {}", projection.id)),
-        projection.output_tail.clone(),
-        total_bytes,
+        BackgroundTaskRowInit::new(
+            projection.id.clone(),
+            BackgroundTaskKind::LocalAgent,
+            projection.status.as_str(),
+            elapsed_ms,
+            projection.title.clone(),
+        )
+        .with_output(
+            Some(format!("workspace_projection: {}", projection.id)),
+            projection.output_tail.clone(),
+            total_bytes,
+        ),
     )
     .with_output_stats(None, total_lines)
     .with_terminal(None, projection.terminal_reason.clone())
@@ -599,7 +608,7 @@ pub(crate) fn try_dispatch_background_task_output_sentinel(
         .unwrap_or_else(|| (task_id.clone(), "unknown"));
     match background_registry.get_combined_output_stats(&task_id, 8192) {
         Ok((output, total_bytes, total_lines)) => {
-            let offset = total_bytes.saturating_sub(output.as_bytes().len() as u64);
+            let offset = total_bytes.saturating_sub(output.len() as u64);
             chat_widget.commit_system(super::history_cell::system::SystemCell::info(
                 format_background_task_output_system_message(
                     &task_id,

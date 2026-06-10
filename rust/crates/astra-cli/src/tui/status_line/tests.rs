@@ -809,18 +809,16 @@ fn bg_footer_calls_out_active_fanout_group_accounting() {
 fn bg_fanout_summary_from_rows_hides_stopped_only_groups() {
     use crate::tui::bottom_pane::background_task_view::{
         BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
+        BackgroundTaskRowInit,
     };
 
-    let row = BackgroundTaskRow::new(
+    let row = BackgroundTaskRow::new(BackgroundTaskRowInit::new(
         "agent-stopped",
         BackgroundTaskKind::LocalAgent,
         "killed",
         1000,
         "storage review",
-        None,
-        None,
-        None,
-    )
+    ))
     .with_fanout(BackgroundTaskFanoutMembership {
         group_id: "review-1".into(),
         group_title: "review fanout".into(),
@@ -837,78 +835,65 @@ fn bg_fanout_summary_from_rows_hides_stopped_only_groups() {
 
 #[test]
 fn bg_counts_from_rows_uses_typed_active_projection() {
-    use crate::tui::bottom_pane::background_task_view::{BackgroundTaskKind, BackgroundTaskRow};
+    use crate::tui::bottom_pane::background_task_view::{
+        BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit,
+    };
+
+    let row = |id, kind, status, elapsed_ms, title| {
+        BackgroundTaskRow::new(BackgroundTaskRowInit::new(
+            id, kind, status, elapsed_ms, title,
+        ))
+    };
 
     let rows = vec![
-        BackgroundTaskRow::new(
+        row(
             "shell",
             BackgroundTaskKind::Shell,
             "running",
             1_000,
             "cargo test",
-            None,
-            None,
-            None,
         ),
-        BackgroundTaskRow::new(
+        row(
             "agent",
             BackgroundTaskKind::LocalAgent,
             "pending",
             2_000,
             "review auth",
-            None,
-            None,
-            None,
         ),
-        BackgroundTaskRow::new(
+        row(
             "wait",
             BackgroundTaskKind::Shell,
             "waiting_for_input",
             3_000,
             "npm run dev",
-            None,
-            None,
-            None,
         ),
-        BackgroundTaskRow::new(
+        row(
             "failed-cloud",
             BackgroundTaskKind::CloudSession,
             "failed",
             4_000,
             "cloud run",
-            None,
-            None,
-            None,
         ),
-        BackgroundTaskRow::new(
+        row(
             "done",
             BackgroundTaskKind::Monitor,
             "completed",
             5_000,
             "monitor",
-            None,
-            None,
-            None,
         ),
-        BackgroundTaskRow::new(
+        row(
             "stopped",
             BackgroundTaskKind::Shell,
             "killed",
             6_000,
             "old shell",
-            None,
-            None,
-            None,
         ),
-        BackgroundTaskRow::new(
+        row(
             "restored-agent",
             BackgroundTaskKind::LocalAgent,
             "unavailable",
             7_000,
             "restored review",
-            None,
-            None,
-            None,
         ),
     ];
 

@@ -186,12 +186,12 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     .await;
     assert_ne!(introspection, StatusCode::NOT_FOUND);
 
-    let jobs = request_status(
+    let tasks = request_status(
         app.clone(),
-        request("GET", "/jobs", auth_headers, Body::empty()),
+        request("GET", "/tasks", auth_headers, Body::empty()),
     )
     .await;
-    assert_ne!(jobs, StatusCode::NOT_FOUND);
+    assert_ne!(tasks, StatusCode::NOT_FOUND);
 
     let plans = request_status(
         app.clone(),

@@ -353,7 +353,7 @@ pub async fn run_saas_resource_concurrent_cap_recovery() {
     ctx.pool.close().await;
 }
 
-/// Job lease cross-user and auth negative paths.
+/// Task lease cross-user and auth negative paths.
 pub async fn run_saas_task_lease_negative_paths() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -366,7 +366,7 @@ pub async fn run_saas_task_lease_negative_paths() {
 
     let (st_task, task_j) = post_json(
         app,
-        "/jobs",
+        "/tasks",
         Some(auth_a),
         json!({
             "title": "saas lease iso task",
@@ -375,7 +375,7 @@ pub async fn run_saas_task_lease_negative_paths() {
         }),
     )
     .await;
-    assert_eq!(st_task, StatusCode::CREATED, "create job: {task_j}");
+    assert_eq!(st_task, StatusCode::CREATED, "create task: {task_j}");
     let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
 
     let (auth_b, _user_b) = register_login_user(app, "lease_iso_b").await;
@@ -383,7 +383,7 @@ pub async fn run_saas_task_lease_negative_paths() {
     // N: unauthenticated lease claim → 401
     let (st_unauth, unauth_j) = post_json_with_headers(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         None,
         &[],
         json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 300 }),
@@ -398,7 +398,7 @@ pub async fn run_saas_task_lease_negative_paths() {
     // N: empty edge_agent_id → 400
     let (st_empty, empty_j) = post_json(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         Some(auth_a),
         json!({ "edge_agent_id": "  ", "ttl_sec": 300 }),
     )
@@ -410,16 +410,16 @@ pub async fn run_saas_task_lease_negative_paths() {
     );
 
     // N: user B cannot access A's task (404, not 403 leak)
-    let (st_get_b, get_b) = get_json(app, &format!("/jobs/{task_id}"), Some(&auth_b), &[]).await;
-    assert_eq!(st_get_b, StatusCode::NOT_FOUND, "B get job: {get_b}");
+    let (st_get_b, get_b) = get_json(app, &format!("/tasks/{task_id}"), Some(&auth_b), &[]).await;
+    assert_eq!(st_get_b, StatusCode::NOT_FOUND, "B get task: {get_b}");
 
     let (st_lease_b, lease_b) =
-        get_json(app, &format!("/jobs/{task_id}/lease"), Some(&auth_b), &[]).await;
+        get_json(app, &format!("/tasks/{task_id}/lease"), Some(&auth_b), &[]).await;
     assert_eq!(st_lease_b, StatusCode::NOT_FOUND, "B get lease: {lease_b}");
 
     let (st_claim_b, claim_b) = post_json_with_headers(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         Some(&auth_b),
         &[("x-astra-edge-id", "foreign-edge")],
         json!({ "edge_agent_id": "foreign-agent", "ttl_sec": 300 }),
@@ -452,7 +452,7 @@ pub async fn run_saas_task_lease_negative_paths() {
 
     let (st_claim_a, claim_a) = post_json_with_headers(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         Some(auth_a),
         &[("x-astra-edge-id", "saas-neg-edge")],
         json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 300 }),
@@ -580,7 +580,7 @@ pub async fn run_saas_resource_limits_extended_fields() {
     ctx.pool.close().await;
 }
 
-/// Job lease: contested when held; reclaim after forced expiry.
+/// Task lease: contested when held; reclaim after forced expiry.
 pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -594,7 +594,7 @@ pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
 
     let (st_task, task_j) = post_json(
         app,
-        "/jobs",
+        "/tasks",
         Some(auth),
         json!({
             "title": "lease contested task",
@@ -603,7 +603,7 @@ pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
         }),
     )
     .await;
-    assert_eq!(st_task, StatusCode::CREATED, "create job: {task_j}");
+    assert_eq!(st_task, StatusCode::CREATED, "create task: {task_j}");
     let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
 
     for (edge_hdr, agent_id, hostname) in [
@@ -632,7 +632,7 @@ pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
     // P: agent A claims
     let (st_a, claim_a) = post_json_with_headers(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         Some(auth),
         &[("x-astra-edge-id", "edge-a")],
         json!({ "edge_agent_id": agent_a, "ttl_sec": 300 }),
@@ -644,7 +644,7 @@ pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
     // N: agent B contested while A holds active lease
     let (st_b, claim_b) = post_json_with_headers(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         Some(auth),
         &[("x-astra-edge-id", "edge-b")],
         json!({ "edge_agent_id": agent_b, "ttl_sec": 300 }),
@@ -672,7 +672,7 @@ pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
     // P: agent B reclaims after expiry
     let (st_reclaim, reclaim_j) = post_json_with_headers(
         app,
-        &format!("/jobs/{task_id}/lease/claim"),
+        &format!("/tasks/{task_id}/lease/claim"),
         Some(auth),
         &[("x-astra-edge-id", "edge-b")],
         json!({ "edge_agent_id": agent_b, "ttl_sec": 300 }),

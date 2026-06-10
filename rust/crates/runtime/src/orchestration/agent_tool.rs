@@ -101,7 +101,7 @@ pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContex
         "start" => handle_agent_fanout_start_action(args, ctx).await,
         "get_results" => handle_agent_fanout_get_results_action(args, ctx).await,
         "stop_slot" => handle_agent_fanout_stop_slot_action(args, ctx).await,
-        other if other.is_empty() => render_agent_tool_error(
+        "" => render_agent_tool_error(
             None,
             "Missing required field: action. Use one of: start, get_results, stop_slot",
         ),
@@ -682,40 +682,45 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
         .ok_or_else(|| "spawn input must be a JSON object".to_string())?;
 
     if obj.contains_key("spawn") {
-        return Err("invalid `spawn` wrapper for agent.spawn: use top-level fields with `action='spawn'`, for example `agent(action='spawn', description='...', prompt='...')`."
+        return Err("invalid `spawn` wrapper for `agent(action='spawn')`: use top-level fields, for example `agent(action='spawn', description='...', prompt='...')`."
             .to_string());
     }
 
     if obj.contains_key("agents") {
-        return Err("unsupported `agents` payload for agent.spawn: each \
+        return Err(
+            "unsupported `agents` payload for `agent(action='spawn')`: each \
              `agent(action='spawn', ...)` call launches exactly one child. \
              Use `agent_fanout(action='start', target_count=N, slots=[...])` \
              for atomic parallel fan-out."
-            .to_string());
+                .to_string(),
+        );
     }
 
     if obj.contains_key("task") {
-        return Err("unsupported deprecated `task` field for agent.spawn. \
+        return Err(
+            "unsupported deprecated `task` field for `agent(action='spawn')`. \
              Use top-level `prompt` for the full child task brief and \
              `description` for the short UI summary."
-            .to_string());
+                .to_string(),
+        );
     }
 
     if obj.contains_key("type") {
         return Err(
-            "unsupported `type` field for agent.spawn. Use canonical `agent_type`.".to_string(),
+            "unsupported `type` field for `agent(action='spawn')`. Use canonical `agent_type`."
+                .to_string(),
         );
     }
 
     if obj.contains_key("inherit_context") {
         return Err(
-            "unsupported `inherit_context` field for agent.spawn. Use canonical `inherit_prefix`."
+            "unsupported `inherit_context` field for `agent(action='spawn')`. Use canonical `inherit_prefix`."
                 .to_string(),
         );
     }
 
     if obj.contains_key("agent_id") {
-        return Err("unsupported `agent_id` field for agent.spawn. `agent_id` is only valid for agent.get_result; the runtime generates it after spawn."
+        return Err("unsupported `agent_id` field for `agent(action='spawn')`. `agent_id` is only valid for `agent(action='get_result')`; the runtime generates it after spawn."
             .to_string());
     }
 
@@ -1173,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_ignores_stray_agent_id() {
+    async fn handle_spawn_agent_tool_rejects_stray_agent_id() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -1186,8 +1191,12 @@ mod tests {
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
 
-        assert!(result.contains("\"status\":\"completed\""), "{result}");
-        assert!(!result.contains("invalid `agent_id` field"), "{result}");
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("unsupported `agent_id` field"), "{result}");
+        assert!(
+            executor.take_captured_model().is_none(),
+            "invalid spawn input must be rejected before launching an agent"
+        );
     }
 
     #[tokio::test]

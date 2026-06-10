@@ -913,7 +913,7 @@ fn friendly_tool_display_name(name: &str) -> String {
 
 fn background_task_tool_header(name: &str) -> Option<&'static str> {
     match name {
-        "task_output" => Some("Read shell output"),
+        "task_output" => Some("Read background task output"),
         "task_stop" => Some("Stop background task"),
         "task_list" => Some("List background tasks"),
         _ => None,
@@ -1243,10 +1243,10 @@ mod tests {
                 .to_string(),
         );
         let out = render(&t, 120, 5);
-        assert!(out.contains("Read shell output · 28ms"), "{out}");
+        assert!(out.contains("Read background task output · 28ms"), "{out}");
         assert!(out.contains("Read shell output bg-shell-1"), "{out}");
         assert!(!out.contains("Ran Task output"), "{out}");
-        assert!(!out.contains("Ran Read shell output"), "{out}");
+        assert!(!out.contains("Ran Read background task output"), "{out}");
     }
 
     #[test]

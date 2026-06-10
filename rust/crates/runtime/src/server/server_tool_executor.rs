@@ -948,7 +948,7 @@ pub struct ServerToolExecutor {
     /// deferred activation reaches plugin tools. Populated by the server
     /// loop host once MCP servers have been refreshed.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
-    /// Shared dynamic-agent tool context for `agent.spawn/get_result`.
+    /// Shared dynamic-agent tool context for `agent(action='spawn'|'get_result')`.
     agent_tool_context: Option<AgentToolContext>,
     /// Optional live event channel used by the web-agent work surface.
     work_surface_event_tx: Option<tokio::sync::mpsc::Sender<Value>>,

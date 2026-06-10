@@ -642,8 +642,8 @@ fn background_task_output_preview(
         }
     };
     match background_task_id(args) {
-        Some(id) => format!("Read shell output {}", trunc(id, path_budget(18))),
-        None => "Read shell output".to_string(),
+        Some(id) => format!("Read background task output {}", trunc(id, path_budget(18))),
+        None => "Read background task output".to_string(),
     }
 }
 
@@ -831,7 +831,7 @@ mod tests {
     fn typed_background_task_tools_render_previews() {
         assert_eq!(
             p("task_output", json!({"task_id": "bg-shell-3"})),
-            "Read shell output bg-shell-3"
+            "Read background task output bg-shell-3"
         );
         assert_eq!(
             p("task_stop", json!({"task_id": "bg-shell-3"})),

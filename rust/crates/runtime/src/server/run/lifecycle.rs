@@ -2569,7 +2569,7 @@ pub struct AgenticRunLifecycleService {
     run_engine: RunEngine,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
-    /// Session-scoped dynamic-agent spawners used by Web/server `agent.spawn`.
+    /// Session-scoped dynamic-agent spawners used by Web/server `agent(action='spawn')`.
     server_agent_spawners: Arc<RwLock<HashMap<String, ServerAgentSpawnerEntry>>>,
     /// Fallback progress broadcaster for dynamic spawn when no delegation
     /// engine is configured. Normal production wiring uses the delegation
@@ -3595,7 +3595,7 @@ impl AgenticRunLifecycleService {
             builder = builder.with_pool(pool.clone());
         }
         // Wire one shared agent-progress broadcaster for delegation and
-        // dynamic `agent.spawn` trees so Web SSE observes a single lineage.
+        // dynamic `agent(action='spawn')` trees so Web SSE observes a single lineage.
         builder = builder
             .with_progress_broadcaster(self.dynamic_agent_progress_broadcaster())
             .with_progress_root_run_id(run_id.to_string());
@@ -5756,7 +5756,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
 use crate::server::delegation::engine::{SubRunConfig, SubRunExecutor};
 
-/// Server-side executor for dynamic `agent.spawn` children.
+/// Server-side executor for dynamic `agent(action='spawn')` children.
 ///
 /// It reuses the production sub-run loop executor so Web dynamic agents run
 /// with the same server host, tool backend, skill resolver, memory plumbing,
@@ -6928,7 +6928,7 @@ mod tests {
             name: "agent".to_string(),
             ok: true,
             ms: 42,
-            args_preview: Some("agent.spawn: child".to_string()),
+            args_preview: Some("agent(action='spawn'): child".to_string()),
             result_preview: Some("launched child".to_string()),
             round: Some(2),
             args_full: Some(r#"{"action":"spawn","token":"secret"}"#.to_string()),

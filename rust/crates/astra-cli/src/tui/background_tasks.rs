@@ -240,9 +240,11 @@ impl BackgroundTaskRegistry {
     }
 
     /// Spawn a shell command in the background. Returns the task ID.
-    pub fn spawn_shell(&mut self, command: &str, description: &str) -> String {
+    pub fn try_spawn_shell(&mut self, command: &str, description: &str) -> Result<String, String> {
         if self.running_count() >= MAX_CONCURRENT_TASKS {
-            return String::new();
+            return Err(format!(
+                "background shell task limit reached ({MAX_CONCURRENT_TASKS} running)"
+            ));
         }
         let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
         let cancel = CancellationToken::new();
@@ -294,7 +296,13 @@ impl BackgroundTaskRegistry {
             .await
         });
 
-        id
+        Ok(id)
+    }
+
+    #[cfg(test)]
+    pub fn spawn_shell(&mut self, command: &str, description: &str) -> String {
+        self.try_spawn_shell(command, description)
+            .expect("spawn test background shell")
     }
 
     /// Adopt a child process detached from a foreground bash tool
@@ -376,16 +384,16 @@ impl BackgroundTaskRegistry {
         let task_id = id.clone();
         let command_label = command_label.to_string();
         self.join_set.spawn(async move {
-            run_adopted_shell(
+            run_adopted_shell(AdoptedShellRun {
                 child,
                 stdout,
                 stderr,
-                &stdout_path,
-                &stderr_path,
+                stdout_path,
+                stderr_path,
                 cancel,
-                &task_id,
-                &command_label,
-            )
+                task_id,
+                command_label,
+            })
             .await
         });
         // Status reference is kept on the handle; the runner CAS-sets
@@ -1011,18 +1019,31 @@ where
 /// mapping so an adopted task's `Completed` / `Failed` events match
 /// what a freshly-spawned task emits — the LLM downstream can't tell
 /// the difference.
-async fn run_adopted_shell(
-    mut child: tokio::process::Child,
+struct AdoptedShellRun {
+    child: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
-    stdout_path: &std::path::Path,
-    stderr_path: &std::path::Path,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
     cancel: CancellationToken,
-    task_id: &str,
-    command_label: &str,
-) -> TaskCompletion {
-    let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.to_path_buf()));
-    let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.to_path_buf()));
+    task_id: String,
+    command_label: String,
+}
+
+async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
+    let AdoptedShellRun {
+        mut child,
+        stdout,
+        stderr,
+        stdout_path,
+        stderr_path,
+        cancel,
+        task_id,
+        command_label,
+    } = run;
+
+    let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.clone()));
+    let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.clone()));
 
     let result = tokio::select! {
         exit = child.wait() => {
@@ -1035,21 +1056,21 @@ async fn run_adopted_shell(
                     let success = exit_status.success()
                         || code
                             .map(|code| {
-                                !astra_tools::exit_semantics::classify_exit(command_label, code)
+                                !astra_tools::exit_semantics::classify_exit(&command_label, code)
                                     .is_tool_error()
                             })
                             .unwrap_or(false);
-                    let summary = make_summary(stdout_path, code);
+                    let summary = make_summary(&stdout_path, code);
                     if success {
                         TaskCompletion {
-                            id: task_id.to_string(),
+                            id: task_id.clone(),
                             status: BgTaskStatus::Completed,
                             exit_code: code,
                             summary,
                             error: None,
                         }
                     } else {
-                        let err_tail = read_tail_str(stderr_path, 512)
+                        let err_tail = read_tail_str(&stderr_path, 512)
                             .map(|(s, _)| s)
                             .unwrap_or_default();
                         let error_msg = if code == Some(137) {
@@ -1058,7 +1079,7 @@ async fn run_adopted_shell(
                             format!("exit code {}: {}", code.unwrap_or(-1), err_tail.trim())
                         };
                         TaskCompletion {
-                            id: task_id.to_string(),
+                            id: task_id.clone(),
                             status: BgTaskStatus::Failed,
                             exit_code: code,
                             summary: String::new(),
@@ -1067,7 +1088,7 @@ async fn run_adopted_shell(
                     }
                 }
                 Err(e) => TaskCompletion {
-                    id: task_id.to_string(),
+                    id: task_id.clone(),
                     status: BgTaskStatus::Failed,
                     exit_code: None,
                     summary: String::new(),
@@ -1081,7 +1102,7 @@ async fn run_adopted_shell(
             let _ = stdout_drain.await;
             let _ = stderr_drain.await;
             TaskCompletion {
-                id: task_id.to_string(),
+                id: task_id.clone(),
                 status: BgTaskStatus::Killed,
                 exit_code: None,
                 summary: String::new(),
@@ -1491,6 +1512,36 @@ mod tests {
         (handle, dir)
     }
 
+    async fn wait_for_task_status(
+        reg: &mut BackgroundTaskRegistry,
+        id: &str,
+        mut status_matches: impl FnMut(BgTaskStatus) -> bool,
+    ) -> Vec<BgTaskEvent> {
+        let mut events = Vec::new();
+        wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
+            events.extend(reg.poll_completions());
+            reg.get(id)
+                .map(|handle| status_matches(handle.status()))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or_else(|()| {
+            let status = reg
+                .get(id)
+                .map(|handle| handle.status().as_str())
+                .unwrap_or("missing");
+            panic!("background shell {id} did not reach expected status; current status: {status}");
+        });
+        events
+    }
+
+    async fn wait_for_task_terminal(
+        reg: &mut BackgroundTaskRegistry,
+        id: &str,
+    ) -> Vec<BgTaskEvent> {
+        wait_for_task_status(reg, id, BgTaskStatus::is_terminal).await
+    }
+
     #[test]
     fn stalled_status_is_intentionally_recoverable() {
         assert!(
@@ -1504,6 +1555,28 @@ mod tests {
             "real process exit must still replace a stalled placeholder state"
         );
         assert_eq!(handle.status(), BgTaskStatus::Completed);
+    }
+
+    #[test]
+    fn try_spawn_shell_rejects_capacity_without_empty_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let mut dirs = Vec::new();
+        for idx in 0..MAX_CONCURRENT_TASKS {
+            let (mut handle, dir) = test_handle_with_status(BgTaskStatus::Running);
+            handle.id = format!("bg-shell-{idx}");
+            reg.tasks.insert(handle.id.clone(), handle);
+            dirs.push(dir);
+        }
+
+        assert!(!reg.can_spawn_shell_task());
+        let error = reg
+            .try_spawn_shell("true", "overflow")
+            .expect_err("capacity must reject with an explicit error");
+        assert!(
+            error.contains("background shell task limit reached"),
+            "{error}"
+        );
     }
 
     /// REGRESSION (review MED): stall_check must NOT reset
@@ -1553,8 +1626,7 @@ mod tests {
         let id = reg.spawn_shell("echo hello", "test echo");
 
         // Wait for completion
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let events = reg.poll_completions();
+        let events = wait_for_task_terminal(&mut reg, &id).await;
         // The queue carries Started → Completed; pick out the Completed
         // event (Started is also asserted by the dedicated ordering
         // test `progress_events_emitted_during_long_task`).
@@ -1577,8 +1649,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'hello\\nworld\\n'", "test chunks");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
 
         let (first, first_end, total, total_lines) =
             reg.get_output_since(&id, 0, 6).expect("first chunk");
@@ -1602,8 +1673,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "line count");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
 
         let (chunk, end, total, total_lines) = reg.get_output_since(&id, 0, 1024).expect("chunk");
         assert_eq!(chunk, "short");
@@ -1617,8 +1687,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf ok", "cargo test -p astra-cli");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let events = reg.poll_completions();
+        let events = wait_for_task_terminal(&mut reg, &id).await;
         let title = events
             .iter()
             .find_map(|event| match event {
@@ -1636,8 +1705,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("grep needle /dev/null", "grep needle /dev/null");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let events = reg.poll_completions();
+        let events = wait_for_task_terminal(&mut reg, &id).await;
         let completion = events
             .iter()
             .find_map(|event| match event {
@@ -1660,8 +1728,7 @@ mod tests {
             "combined stats",
         );
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
 
         let (tail, total_bytes, total_lines) =
             reg.get_combined_output_stats(&id, 1024).expect("stats");
@@ -1677,16 +1744,15 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr only");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
 
         let expected = "<stderr>\nstderr-line\n\n</stderr>";
         let (chunk, end, total, total_lines) = reg
             .get_combined_output_since(&id, 0, 4096)
             .expect("combined chunk");
         assert_eq!(chunk, expected);
-        assert_eq!(end, expected.as_bytes().len() as u64);
-        assert_eq!(total, expected.as_bytes().len() as u64);
+        assert_eq!(end, expected.len() as u64);
+        assert_eq!(total, expected.len() as u64);
         assert_eq!(total_lines, expected.lines().count() as u64);
     }
 
@@ -1699,8 +1765,7 @@ mod tests {
             "mixed output",
         );
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
 
         let expected = "stdout-line\n\n<stderr>\nstderr-line\n\n</stderr>";
         let (first, first_end, total, total_lines) = reg
@@ -1708,15 +1773,15 @@ mod tests {
             .expect("first combined chunk");
         assert_eq!(first, "stdout-line\n");
         assert_eq!(first_end, "stdout-line\n".len() as u64);
-        assert_eq!(total, expected.as_bytes().len() as u64);
+        assert_eq!(total, expected.len() as u64);
         assert_eq!(total_lines, expected.lines().count() as u64);
 
         let (second, second_end, second_total, second_total_lines) = reg
             .get_combined_output_since(&id, first_end, 4096)
             .expect("second combined chunk");
         assert_eq!(second, "\n<stderr>\nstderr-line\n\n</stderr>");
-        assert_eq!(second_end, expected.as_bytes().len() as u64);
-        assert_eq!(second_total, expected.as_bytes().len() as u64);
+        assert_eq!(second_end, expected.len() as u64);
+        assert_eq!(second_total, expected.len() as u64);
         assert_eq!(second_total_lines, expected.lines().count() as u64);
     }
 
@@ -1726,8 +1791,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "missing stdout");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
         let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
         std::fs::remove_file(&stdout_path).unwrap();
 
@@ -1747,8 +1811,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "test offset bounds");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
 
         let err = reg
             .get_output_since(&id, 99, 16)
@@ -1783,8 +1846,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(reg.kill(&id).is_ok());
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let events = reg.poll_completions();
+        let events =
+            wait_for_task_status(&mut reg, &id, |status| status == BgTaskStatus::Killed).await;
         let has_killed = events
             .iter()
             .any(|e| matches!(e, BgTaskEvent::Killed { .. }));
@@ -1797,8 +1860,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo 'line1'; echo 'line2'", "test output");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
         let (output, _) = reg.get_output(&id, 4096).unwrap();
         assert!(output.contains("line1"));
         assert!(output.contains("line2"));
@@ -1832,8 +1894,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'first\\nlast\\n'", "cargo test");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
         let xml = reg.render_background_task_list_xml();
         let handle = reg.get(&id).expect("handle");
 
@@ -1860,8 +1921,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf done", "missing output");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
         let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
         std::fs::remove_file(&stdout_path).unwrap();
         let xml = reg.render_background_task_list_xml();
@@ -2008,8 +2068,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo stdout-only", "stdout fallback");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
         let stderr_path = reg.get(&id).unwrap().stderr_path.clone();
         std::fs::remove_file(stderr_path).unwrap();
 
@@ -2029,8 +2088,7 @@ mod tests {
             "stdin isolation",
         );
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_terminal(&mut reg, &id).await;
         let (output, _) = reg.get_output(&id, 4096).unwrap();
         assert!(
             output.contains("no-stdin"),
@@ -2044,8 +2102,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("/nonexistent_binary_xyz", "should fail");
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let events = reg.poll_completions();
+        let events = wait_for_task_terminal(&mut reg, &id).await;
         // Skip Started; the terminal event is what we care about
         // (`sh -c /missing` exits 127 without a spawn error).
         let terminal = events
@@ -2211,8 +2268,7 @@ mod tests {
             .parse()
             .expect("pid");
         assert!(reg.kill(&id).is_ok());
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = reg.poll_completions();
+        wait_for_task_status(&mut reg, &id, |status| status == BgTaskStatus::Killed).await;
 
         let alive = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => !stat.contains(") Z "),
@@ -2334,9 +2390,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = reg.kill(&id);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let events = reg.poll_completions();
+        let events =
+            wait_for_task_status(&mut reg, &id, |status| status == BgTaskStatus::Killed).await;
         let killed_count = events
             .iter()
             .filter(|e| matches!(e, BgTaskEvent::Killed { id: eid, .. } if eid == &id))
@@ -2426,8 +2482,7 @@ mod tests {
         );
 
         // Wait for the child to finish.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let events = reg.poll_completions();
+        let events = wait_for_task_terminal(&mut reg, &id).await;
         let completed = events.iter().find_map(|ev| match ev {
             BgTaskEvent::Completed { id: eid, .. } if *eid == id => Some(()),
             _ => None,
@@ -2481,7 +2536,7 @@ mod tests {
         // Task that completes nearly instantly
         let id = reg.spawn_shell("true", "fast task");
         // Wait for it to actually complete first
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = wait_for_task_terminal(&mut reg, &id).await;
         // Now try to kill — should fail because already terminal
         let kill_result = reg.kill(&id);
         assert!(
@@ -2489,7 +2544,6 @@ mod tests {
             "kill on already-terminal task should fail"
         );
 
-        let events = reg.poll_completions();
         let has_completed = events
             .iter()
             .any(|e| matches!(e, BgTaskEvent::Completed { id: eid, .. } if eid == &id));

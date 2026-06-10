@@ -689,7 +689,7 @@ mod tests {
         let caps = lifecycle_server_capabilities(true);
         assert!(
             caps.has(astra_turn_core::capability::Capability::AgentSpawner),
-            "server lifecycle should advertise AgentSpawner because ServerToolExecutor dispatches agent.spawn"
+            "server lifecycle should advertise AgentSpawner because ServerToolExecutor dispatches agent spawn actions"
         );
     }
 

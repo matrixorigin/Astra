@@ -336,7 +336,7 @@ pub struct SpawnContext {
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// DB trace identity shared with the parent Web turn.
     pub trace_context: Option<TraceContext>,
-    /// Tool call id of the parent `agent.spawn` invocation.
+    /// Tool call id of the parent `agent(action='spawn')` invocation.
     pub spawn_tool_call_id: Option<String>,
 }
 

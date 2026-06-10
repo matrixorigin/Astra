@@ -834,49 +834,53 @@ pub async fn run_product_matrix_full_journey(
         "checkpoints list should be a JSON array: {cpl_j}"
     );
 
-    let (st_job, job_j) = post_json(
+    let (st_task, task_j) = post_json(
         app,
-        "/jobs",
+        "/tasks",
         Some(auth_header.as_str()),
         json!({
-            "title": "matrix e2e job",
-            "description": "exercise task-backed jobs endpoint",
+            "title": "matrix e2e task",
+            "description": "exercise task endpoint",
             "session_id": session_id
         }),
     )
     .await;
-    assert_eq!(st_job, StatusCode::CREATED, "submit job: {job_j}");
-    let job_id = job_j["task_id"].as_str().expect("task_id").to_string();
+    assert_eq!(st_task, StatusCode::CREATED, "submit task: {task_j}");
+    let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
 
     let (st_gj, gj) = get_json(
         app,
-        &format!("/jobs/{job_id}"),
+        &format!("/tasks/{task_id}"),
         Some(auth_header.as_str()),
         &[],
     )
     .await;
-    assert_eq!(st_gj, StatusCode::OK, "get job: {gj}");
+    assert_eq!(st_gj, StatusCode::OK, "get task: {gj}");
     assert_eq!(gj["status"].as_str(), Some("pending"));
 
     let (st_wh, wh_j) = put_json(
         app,
-        &format!("/jobs/{job_id}/status"),
+        &format!("/tasks/{task_id}/status"),
         Some(auth_header.as_str()),
         json!({
             "status": "completed"
         }),
     )
     .await;
-    assert_eq!(st_wh, StatusCode::OK, "job status update: {wh_j}");
+    assert_eq!(st_wh, StatusCode::OK, "task status update: {wh_j}");
 
     let (st_gj2, gj2) = get_json(
         app,
-        &format!("/jobs/{job_id}"),
+        &format!("/tasks/{task_id}"),
         Some(auth_header.as_str()),
         &[],
     )
     .await;
-    assert_eq!(st_gj2, StatusCode::OK, "get job after webhook: {gj2}");
+    assert_eq!(
+        st_gj2,
+        StatusCode::OK,
+        "get task after status update: {gj2}"
+    );
     assert_eq!(gj2["status"].as_str(), Some("completed"));
 
     let sb_name = format!("sb_{suffix}");

@@ -284,7 +284,7 @@ fn commit_explain_dag(
 /// sites inside async blocks can pre-clone before awaiting.
 ///
 /// Looks at the spawner first — that's the canonical kill path for
-/// `agent.spawn`-style children — and ALSO fires the durable-task
+/// `agent(action='spawn')`-style children — and ALSO fires the durable-task
 /// service path for task-backed children. Both calls are
 /// fire-and-forget so the UI doesn't block on a hung backend; the
 /// spawner + task_service both honor cooperative cancel and will
@@ -3436,6 +3436,33 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    async fn wait_for_background_shell_terminal(
+        registry: &mut crate::tui::background_tasks::BackgroundTaskRegistry,
+        id: &str,
+    ) {
+        crate::tests::wait_until(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_millis(25),
+            || {
+                registry.drain_join_set();
+                registry
+                    .get(id)
+                    .map(|handle| {
+                        matches!(handle.projected_status(), "completed" | "failed" | "killed")
+                    })
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        .unwrap_or_else(|()| {
+            let status = registry
+                .get(id)
+                .map(|handle| handle.projected_status())
+                .unwrap_or("missing");
+            panic!("background shell {id} did not terminate; current status: {status}");
+        });
+    }
+
     fn agent_info(
         agent_id: &str,
         status: AgentStatus,
@@ -3653,7 +3680,8 @@ mod tests {
         assert_eq!(fanout.target_count, 3);
         assert_eq!(fanout.slot_index, 0);
 
-        let summaries = status_line::BackgroundTaskFanoutSummary::from_rows(&[row.clone()]);
+        let summaries =
+            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].target_count, 3);
         assert_eq!(summaries[0].running, 1);
@@ -3709,11 +3737,12 @@ mod tests {
         assert_eq!(fanout.slot_index, 1);
         assert_eq!(fanout.slot_label, "review API surface");
 
-        let summaries = status_line::BackgroundTaskFanoutSummary::from_rows(&[row.clone()]);
+        let summaries =
+            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].failed, 1);
 
-        let xml = render_background_task_rows_xml(&[row.clone()]);
+        let xml = render_background_task_rows_xml(std::slice::from_ref(&row));
         assert!(
             xml.contains("id=\"fanout:review-1:slot:1:spawn_rejected\""),
             "{xml}"
@@ -4342,7 +4371,7 @@ mod tests {
         );
         let id = registry.spawn_shell("printf 'done\\n'", "quick output");
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        wait_for_background_shell_terminal(&mut registry, &id).await;
         let snapshot =
             background_task_output_snapshot(&mut registry, &id, 0, 1024).expect("snapshot");
 
@@ -4361,7 +4390,7 @@ mod tests {
         );
         let id = registry.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr output");
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        wait_for_background_shell_terminal(&mut registry, &id).await;
         let snapshot =
             background_task_output_snapshot(&mut registry, &id, 0, 1024).expect("snapshot");
 

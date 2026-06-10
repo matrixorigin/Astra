@@ -221,13 +221,17 @@ fn skill_listing_nudge_carves_out_parallel_agent_intent() {
          that was being silently routed through skills). Got:\n{body}"
     );
     assert!(
-        body.contains("agent(action='spawn', ...)"),
-        "nudge must point at `agent(action='spawn', ...)` so the model has a concrete \
-          alternative path when the user wants parallel fan-out. \
+        body.contains("agent_fanout(action='start'")
+            && body.contains("agent_fanout(action='get_results'"),
+        "nudge must point at `agent_fanout(action='start', ...)` and \
+          `agent_fanout(action='get_results', ...)` so the model has a concrete \
+          atomic path when the user wants parallel fan-out. \
           Got:\n{body}"
     );
     assert!(
-        !body.contains("agent.spawn") && !body.contains("agent.get_result"),
+        !body.contains("agent.spawn")
+            && !body.contains("agent.get_result")
+            && !body.contains("agent(action='spawn', ...)"),
         "skill listing must actively reject the legacy dotted agent syntax. Got:\n{body}"
     );
 }
