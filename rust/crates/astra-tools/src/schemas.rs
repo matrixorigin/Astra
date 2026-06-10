@@ -684,19 +684,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
-         For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
          `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
          ## Execution mode\n\
          - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
          - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later using the exact returned `agent_id`. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
          ## Parallel sub-agent fan-out\n\
-         To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, capture each spawn result's returned `agent_id`, then call `agent(action='get_result', agent_id=...)` with that exact value for each one — `get_result` blocks until that child finishes. Do not substitute `name` or invent ids. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
+         Use `agent_fanout(action='start', target_count=N, slots=[...])` to start a fixed-size parallel group atomically, then `agent_fanout(action='get_results', group_id=...)` to collect every slot. Do not simulate fan-out with an `agents:[...]` payload on `agent`.\n\
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
-         Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.
+         Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
          ## agent vs shell work vs task
-         - `agent(spawn)` + `agent(get_result)`: synchronous or background sub-agents you plan to collect results from. Supports fan-out coalescing.
+         - `agent(spawn)` + `agent(get_result)`: one synchronous or background sub-agent you plan to collect results from.
+         - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
          - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
@@ -705,7 +706,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
                         "steps": {"type": "array", "description": "REQUIRED for action='run_chain'. Sequence of chain steps to execute."},
                         "description": {"type": "string", "description": "Spawn summary shown in the UI Task card. Short, specific, non-empty."},
-                        "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty. If omitted, Astra falls back to `description`."},
+                        "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
                         "run_in_background": {"type": "boolean", "description": "If true, return immediately with a runtime-generated agent_id instead of blocking on the sub-agent's final result. Use that exact returned value with get_result. Default false (sync). Applies to spawn."},
@@ -727,6 +728,62 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "run_chain": ["steps"],
                         "get_result": ["agent_id"],
                         "send_message": ["to", "message"]
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "description": "Atomic parallel sub-agent fan-out. Actions: start, get_results, stop_slot.\n\n\
+         - `start`: REQUIRES `action`, `target_count`, `slots`. `slots` length must equal `target_count`; every slot requires `description` and `prompt`. Starts all slots in the background and returns one `group_id` plus per-slot runtime agent ids.\n\
+         - `get_results`: REQUIRES `action`, `group_id`. Blocks until accepted slots finish, then returns every slot result and the fanout summary.\n\
+         - `stop_slot`: REQUIRES `action`, `group_id`, `slot_index`. Cancels one running slot in the group.\n\n\
+         Use this instead of `agent` when the user asks for multiple reviewers, parallel exploration, or N independent sub-agents. Do not pass an `agents:[...]` payload to `agent`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["start","get_results","stop_slot"]},
+                        "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results and stop_slot."},
+                        "title": {"type": "string", "description": "Optional short label for the group."},
+                        "target_count": {"type": "integer", "minimum": 1, "description": "REQUIRED for start. Fixed number of slots to launch; must equal slots.length."},
+                        "slots": {
+                            "type": "array",
+                            "description": "REQUIRED for start. One entry per parallel child.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "description": {"type": "string", "description": "Short UI summary for this slot."},
+                                    "prompt": {"type": "string", "description": "Full child task brief for this slot."},
+                                    "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
+                                    "model": {"type": "string"},
+                                    "name": {"type": "string", "description": "Optional mailbox name; not the runtime agent_id."},
+                                    "max_turns": {"type": "integer"},
+                                    "max_output_tokens": {"type": "integer"},
+                                    "complexity": {"type": "string", "enum": ["light","normal","deep"]},
+                                    "isolated": {"type": "boolean"},
+                                    "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                                },
+                                "required": ["description", "prompt"]
+                            }
+                        },
+                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Default slot agent_type for start."},
+                        "model": {"type": "string", "description": "Default slot model for start. Defaults to parent model."},
+                        "max_turns": {"type": "integer", "description": "Default slot max_turns for start."},
+                        "max_output_tokens": {"type": "integer", "description": "Default slot max_output_tokens for start."},
+                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Default slot complexity for start."},
+                        "isolated": {"type": "boolean", "description": "Default slot isolation for start."},
+                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Default slot tool allowlist for start."},
+                        "slot_index": {"type": "integer", "description": "REQUIRED for stop_slot. Zero-based slot index."}
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false,
+                    "x-astra-per-action-required": {
+                        "start": ["target_count", "slots"],
+                        "get_results": ["group_id"],
+                        "stop_slot": ["group_id", "slot_index"]
                     }
                 }
             }
@@ -776,7 +833,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "notify",
-                "description": "Send a notification to the user. Use for proactive updates (background job done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
+                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -913,80 +970,77 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── job ─────────────────────────────────────────────────────
-        // Background shell execution surface. Split out of `task` in
-        // 2026-05 so the model has one
-        // tool for the session checklist and a different tool for
-        // long-running work — see `task_schema_does_not_advertise_
-        // background_actions`. Inspiration: claudecode
-        // `Bash(run_in_background)`.
+        // ── background task control ─────────────────────────────────
+        // Typed control surface for background tasks. Starting shell work stays
+        // on Bash / Ctrl+B and local agents stay on agent(); control actions
+        // use explicit tools rather than a generic action union.
         json!({
             "type": "function",
             "function": {
-                "name": "job",
-                "description": "Run local shell commands in the background while continuing to chat. Use this when shell work is long-running, can run independently, or you need to do other things in parallel.\n\
-        \n\
-        Actions: shell, list, output, kill.\n\
-        \n\
-        ## When to Use This Tool\n\
-        - **Long-running shell** (builds, test suites, servers, scripts > ~10s): use `shell` instead of blocking `bash` — keeps the conversation responsive.\n\
-        - **Need shell output later**: call `output` with no `job_id` to read the most recent shell job, or pass `job_id` for a specific job. With `block: true` (default), `output` waits up to `timeout_ms` for completion. Use `offset` to resume from the last byte you already consumed.\n\
-        - **Need to inspect running shell work**: use `list` to see job IDs, status, age, and descriptions.\n\
-        - **Cancel a stuck shell command**: `kill` terminates immediately.\n\
-        \n\
-        ## When NOT to Use This Tool\n\
-        - Quick commands (< 5s): use `bash` directly — the round-trip overhead isn't worth it.\n\
-        - Sub-agents: use `agent(action='spawn', ..., run_in_background=true)` and later `agent(action='get_result', agent_id=...)` with the exact returned `agent_id`. Agent results are not readable through `job(action='output')`.\n\
-        - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `job` is for shell processes, not progress markers.\n\
-        \n\
-        ## Notifications\n\
-        You will receive `<background_job_notification>` XML when background shell jobs complete, fail, or stall (no output for ~45s + interactive-prompt pattern). When you see one, decide whether to read its output, acknowledge it, or `kill` and retry with non-interactive flags.\n\
-        \n\
-        ## Examples\n\
-        \n\
-        <example>\n\
-        User: kick off the full test suite, I'll keep working.\n\
-        Assistant: *Calls job(action='shell', command='cargo test --workspace')* — returns job_id `bg-shell-3`. *Continues with other work; later calls job(action='output') to read the latest shell result.*\n\
-        </example>",
+                "name": "task_output",
+                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and an output preview when available. Requires the exact task_id so the model and UI refer to the same background task.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
-                        "action": {
+                        "task_id": {
                             "type": "string",
-                            "enum": ["shell", "list", "output", "kill"],
-                            "description": "Operation to perform"
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "(shell) Shell command to run in the background"
-                        },
-                        "job_id": {
-                            "type": "string",
-                            "description": "(output/kill) The background shell job ID returned by `job(action='shell')`. Optional for output: defaults to the most recent shell job."
+                            "description": "Background task id, such as bg-shell-3 or a local agent id."
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "(output) Wait for the job to complete before returning. Default true."
+                            "description": "Wait for new output or terminal status before returning. Default true."
                         },
                         "offset": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "(output) Resume reading from this byte offset. Default 0."
+                            "description": "Resume reading from this byte offset. Default 0."
                         },
                         "max_bytes": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "(output) Maximum bytes to return from the current offset. Default 8192, max 65536."
+                            "description": "Maximum bytes to return from the current offset. Default 8192, max 65536."
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "(output) Max ms to wait when block=true. Default 30000, max 300000."
+                            "description": "Max ms to wait when block=true. Default 30000, max 300000."
                         }
                     },
-                    "required": ["action"],
-                    "x-astra-per-action-required": {
-                        "shell": ["command"],
-                        "kill": ["job_id"]
+                    "required": ["task_id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_stop",
+                "description": "Stop a running typed background task by id. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Background task id to stop, such as bg-shell-3 or a local agent id."
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_list",
+                "description": "List known typed background tasks for this session with kind, status, and ids. Use when you need to discover which background task to inspect or stop.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "include_terminal": {
+                            "type": "boolean",
+                            "description": "Include recently completed, failed, or killed tasks. Default true."
+                        }
                     }
                 }
             }
@@ -1181,8 +1235,48 @@ mod tests {
             "agent description must name the unsupported `agents` payload so the model stops retrying it"
         );
         assert!(
+            desc.contains("agent_fanout"),
+            "agent description must point parallel fan-out at the atomic tool"
+        );
+        assert!(
+            !desc.contains("ONLY way to fan out"),
+            "agent description must not keep the old N-spawn fanout contract"
+        );
+        assert!(
             desc.contains("exit_plan_mode") && desc.contains("run_chain"),
             "agent description should steer plan lifecycle away from run_chain"
+        );
+    }
+
+    #[test]
+    fn agent_fanout_schema_exposes_atomic_group_contract() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let fanout = find_schema(&schemas, "agent_fanout").expect("agent_fanout schema must exist");
+        let desc = fanout
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = &fanout["function"]["parameters"];
+
+        assert!(desc.contains("Atomic parallel sub-agent fan-out"));
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(
+            params["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["start", "get_results", "stop_slot"]
+        );
+        assert_eq!(
+            params["x-astra-per-action-required"]["start"],
+            json!(["target_count", "slots"])
+        );
+        assert_eq!(
+            params["properties"]["slots"]["items"]["required"],
+            json!(["description", "prompt"])
         );
     }
 
@@ -1223,26 +1317,35 @@ mod tests {
     }
 
     #[test]
-    fn job_schema_keeps_sub_agents_on_agent_tool_lifecycle() {
+    fn typed_background_task_schemas_replace_job_public_contract() {
         let schemas = all_tool_schemas_with_env(|_| None);
-        let job = find_schema(&schemas, "job").expect("job schema must exist");
         assert!(
-            find_schema(&schemas, "agent_job").is_none(),
-            "agent_job must not remain in the model-facing schema; use job for background shell work"
+            find_schema(&schemas, "job").is_none()
+                && find_schema(&schemas, "task_output").is_some()
+                && find_schema(&schemas, "task_stop").is_some()
+                && find_schema(&schemas, "task_list").is_some(),
+            "model-facing schema must expose typed background task tools, not generic job"
         );
-        let desc = job
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
+        assert!(
+            find_schema(&schemas, "agent_job").is_none()
+                && find_schema(&schemas, "task_output").is_some(),
+            "agent_job must not remain in the model-facing schema; use agent background lifecycle separately"
+        );
+        let output_desc = find_schema(&schemas, "task_output")
+            .and_then(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|f| f.get("description"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or_default();
         assert!(
-            desc.contains("agent(action='spawn', ..., run_in_background=true)")
-                && desc.contains("agent(action='get_result', agent_id=...)"),
-            "job description must point sub-agents back to the agent lifecycle"
+            output_desc.contains("background task") && !output_desc.contains("job(action"),
+            "task_output description must teach typed background task vocabulary"
         );
         assert!(
-            !desc.contains("job(action='agent'") && !desc.contains("agent_job"),
-            "job description must not advertise the removed agent_job lifecycle"
+            find_schema(&schemas, "agent_job").is_none(),
+            "agent_job must not remain in the model-facing schema"
         );
     }
 

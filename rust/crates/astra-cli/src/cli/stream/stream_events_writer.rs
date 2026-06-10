@@ -48,6 +48,8 @@ fn event_to_json(event: &StreamEvent) -> String {
             label,
             tool_use_id,
             agent_id,
+            fanout_slot,
+            fanout_title,
         } => {
             serde_json::json!({
                 "type": "agent_control_started",
@@ -55,6 +57,8 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "label": label,
                 "tool_use_id": tool_use_id,
                 "agent_id": agent_id,
+                "fanout_slot": fanout_slot,
+                "fanout_title": fanout_title,
             })
         }
         StreamEvent::ToolCompleted {
@@ -228,6 +232,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_control_started_serializes_fanout_slot() {
+        use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
+
+        let json = event_to_json(&StreamEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "auth reviewer".into(),
+            tool_use_id: "spawn-tu".into(),
+            agent_id: None,
+            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 1).unwrap()),
+            fanout_title: Some("review fanout".into()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "agent_control_started");
+        assert_eq!(v["fanout_title"], "review fanout");
+        assert_eq!(v["fanout_slot"]["group_id"], "review-1");
+        assert_eq!(v["fanout_slot"]["target_count"], 3);
+        assert_eq!(v["fanout_slot"]["slot_index"], 1);
+    }
+
+    #[test]
     fn tool_completed_event_serializes() {
         let json = event_to_json(&StreamEvent::ToolCompleted {
             name: "read_file".into(),
@@ -287,6 +311,14 @@ mod tests {
                 description: "d".into(),
                 tool_use_id: "tu_test".into(),
                 parent_tool_use_id: None,
+            },
+            StreamEvent::AgentControlStarted {
+                action: "spawn".into(),
+                label: "agent".into(),
+                tool_use_id: "tu_agent".into(),
+                agent_id: None,
+                fanout_slot: None,
+                fanout_title: None,
             },
             StreamEvent::ToolCompleted {
                 name: "t".into(),

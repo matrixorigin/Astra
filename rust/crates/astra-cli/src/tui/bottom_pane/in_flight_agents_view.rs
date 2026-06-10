@@ -6,12 +6,10 @@
 //! description, child count, and elapsed time. ↑↓ navigates, Enter
 //! drills into a `TaskDetailView` for the selected agent, Esc/← closes.
 //!
-//! Rows are a snapshot taken at push-time (when Ctrl+G is pressed)
-//! from `chat_widget.live_task_cell()`. They do NOT auto-refresh —
-//! the elapsed/child-count fields freeze at the moment the view
-//! opened. Close+reopen to see updated state. (Live re-rendering
-//! would require holding a reference to ChatWidget across frames,
-//! which would tangle the BottomPaneView lifetime.)
+//! Rows are a snapshot supplied by `ChatWidget`, and the outer event
+//! loop refreshes the snapshot while the monitor is open whenever an
+//! agent lifecycle event can affect row state. The view itself stays
+//! ownership-only: it never holds a reference back into `ChatWidget`.
 //!
 //! Result-prefix sentinel: `__agent_drilldown__\n<agent_id>`. The
 //! outer event loop strips the prefix and pushes a `TaskDetailView`
@@ -107,6 +105,15 @@ impl AgentRowStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentFanoutMembership {
+    pub group_id: String,
+    pub group_title: String,
+    pub target_count: usize,
+    pub slot_index: usize,
+    pub slot_label: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentRow {
     pub agent_id: String,
@@ -114,6 +121,7 @@ pub(crate) struct AgentRow {
     pub child_count: usize,
     pub elapsed_ms: u64,
     pub status: AgentRowStatus,
+    pub fanout: Option<AgentFanoutMembership>,
 }
 
 /// What action the view emitted on completion.
@@ -237,6 +245,111 @@ fn count_rows(rows: &[AgentRow]) -> (usize, usize) {
     (live_count, failed_count)
 }
 
+#[derive(Clone)]
+struct FanoutHeader {
+    title: String,
+    target_count: usize,
+    running: usize,
+    done: usize,
+    failed: usize,
+    stopped: usize,
+}
+
+enum AgentListEntry<'a> {
+    FanoutHeader(FanoutHeader),
+    Row {
+        row_idx: usize,
+        row: &'a AgentRow,
+        grouped: bool,
+    },
+}
+
+impl AgentListEntry<'_> {
+    fn row_index(&self) -> Option<usize> {
+        match self {
+            AgentListEntry::FanoutHeader(_) => None,
+            AgentListEntry::Row { row_idx, .. } => Some(*row_idx),
+        }
+    }
+}
+
+fn agent_list_entries(rows: &[AgentRow]) -> Vec<AgentListEntry<'_>> {
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut rendered = vec![false; rows.len()];
+
+    for idx in 0..rows.len() {
+        if rendered[idx] {
+            continue;
+        }
+
+        let Some(fanout) = rows[idx].fanout.as_ref() else {
+            rendered[idx] = true;
+            entries.push(AgentListEntry::Row {
+                row_idx: idx,
+                row: &rows[idx],
+                grouped: false,
+            });
+            continue;
+        };
+
+        let member_indices = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(member_idx, row)| {
+                row.fanout
+                    .as_ref()
+                    .is_some_and(|member| member.group_id == fanout.group_id)
+                    .then_some(member_idx)
+            })
+            .collect::<Vec<_>>();
+        entries.push(AgentListEntry::FanoutHeader(fanout_header(
+            fanout,
+            &member_indices,
+            rows,
+        )));
+        for member_idx in member_indices {
+            rendered[member_idx] = true;
+            entries.push(AgentListEntry::Row {
+                row_idx: member_idx,
+                row: &rows[member_idx],
+                grouped: true,
+            });
+        }
+    }
+
+    entries
+}
+
+fn fanout_header(
+    fanout: &AgentFanoutMembership,
+    member_indices: &[usize],
+    rows: &[AgentRow],
+) -> FanoutHeader {
+    let mut header = FanoutHeader {
+        title: if fanout.group_title.trim().is_empty() {
+            fanout.group_id.clone()
+        } else {
+            fanout.group_title.clone()
+        },
+        target_count: fanout.target_count,
+        running: 0,
+        done: 0,
+        failed: 0,
+        stopped: 0,
+    };
+
+    for row in member_indices.iter().filter_map(|idx| rows.get(*idx)) {
+        match row.status {
+            AgentRowStatus::Live | AgentRowStatus::Cancelling => header.running += 1,
+            AgentRowStatus::Completed => header.done += 1,
+            AgentRowStatus::Failed => header.failed += 1,
+            AgentRowStatus::Cancelled => header.stopped += 1,
+        }
+    }
+
+    header
+}
+
 fn format_elapsed(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
@@ -287,48 +400,67 @@ impl BottomPaneView for InFlightAgentsView {
 
         let body_y = area.y + 1;
         let body_h = area.height.saturating_sub(1) as usize;
-        let window_start = self.selected.saturating_add(1).saturating_sub(body_h);
-        for (i, (row_idx, row)) in self
-            .rows
+        let entries = agent_list_entries(&self.rows);
+        let selected_entry = entries
             .iter()
-            .enumerate()
-            .skip(window_start)
-            .take(body_h)
-            .enumerate()
-        {
-            let selected = row_idx == self.selected;
-            let marker = if selected { "› " } else { "  " };
-            let status_color = row.status.color();
-            let meta = row_meta(row);
-            let line = Line::from(vec![
-                Span::styled(
-                    marker.to_string(),
-                    if selected {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
+            .position(|entry| entry.row_index() == Some(self.selected))
+            .unwrap_or(0);
+        let window_start = selected_entry.saturating_add(1).saturating_sub(body_h);
+        for (i, entry) in entries.iter().skip(window_start).take(body_h).enumerate() {
+            let line = match entry {
+                AgentListEntry::FanoutHeader(header) => fanout_header_line(header, dim),
+                AgentListEntry::Row {
+                    row_idx,
+                    row,
+                    grouped,
+                } => {
+                    let selected = *row_idx == self.selected;
+                    let marker = if selected { "› " } else { "  " };
+                    let status_color = row.status.color();
+                    let meta = row_meta(row);
+                    let label = if *grouped {
+                        fanout_slot_row_label(*row_idx, row)
                     } else {
-                        dim
-                    },
-                ),
-                Span::styled(
-                    format!("{}. {}", row_idx + 1, truncate_label(&row.name, 38)),
-                    if selected {
-                        Style::default()
-                            .fg(status_color)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(status_color)
-                    },
-                ),
-                Span::styled(format!("  · {meta}"), dim),
-            ]);
+                        format!("{}. {}", row_idx + 1, truncate_label(&row.name, 38))
+                    };
+                    let mut spans = vec![
+                        Span::styled(
+                            marker.to_string(),
+                            if selected {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                dim
+                            },
+                        ),
+                        Span::styled(
+                            label,
+                            if selected {
+                                Style::default()
+                                    .fg(status_color)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(status_color)
+                            },
+                        ),
+                        Span::styled(format!("  · {meta}"), dim),
+                    ];
+                    if *grouped {
+                        spans.push(Span::styled(
+                            format!(" · {}", truncate_label(&row.agent_id, 18)),
+                            dim,
+                        ));
+                    }
+                    Line::from(spans)
+                }
+            };
             buf.set_line(area.x, body_y + i as u16, &line, area.width);
         }
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        let rows = self.rows.len().max(1);
+        let rows = agent_list_entries(&self.rows).len().max(1);
         (rows as u16).saturating_add(1).min(10)
     }
 
@@ -421,6 +553,50 @@ fn row_meta(row: &AgentRow) -> String {
     parts.join(" · ")
 }
 
+fn fanout_header_line(header: &FanoutHeader, dim: Style) -> Line<'static> {
+    let mut parts = vec![format!("{} target", header.target_count)];
+    if header.running > 0 {
+        parts.push(format!("{} running", header.running));
+    }
+    if header.done > 0 {
+        parts.push(format!("{} done", header.done));
+    }
+    if header.failed > 0 {
+        parts.push(format!("{} failed", header.failed));
+    }
+    if header.stopped > 0 {
+        parts.push(format!("{} stopped", header.stopped));
+    }
+
+    Line::from(vec![
+        Span::styled("  ▣ ".to_string(), dim),
+        Span::styled(
+            truncate_label(&header.title, 30),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {}", parts.join(" · ")), dim),
+    ])
+}
+
+fn fanout_slot_row_label(row_idx: usize, row: &AgentRow) -> String {
+    let Some(fanout) = row.fanout.as_ref() else {
+        return format!("{}. {}", row_idx + 1, truncate_label(&row.name, 38));
+    };
+    let label = if fanout.slot_label.trim().is_empty() {
+        row.name.as_str()
+    } else {
+        fanout.slot_label.as_str()
+    };
+    format!(
+        "{}. slot {}: {}",
+        row_idx + 1,
+        fanout.slot_index + 1,
+        truncate_label(label, 30)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,8 +621,19 @@ mod tests {
                 child_count: i,
                 elapsed_ms: 1000 * (i as u64 + 1),
                 status: AgentRowStatus::Live,
+                fanout: None,
             })
             .collect()
+    }
+
+    fn fanout(group_id: &str, target_count: usize, slot_index: usize) -> AgentFanoutMembership {
+        AgentFanoutMembership {
+            group_id: group_id.to_string(),
+            group_title: "review fanout".to_string(),
+            target_count,
+            slot_index,
+            slot_label: format!("slot task {slot_index}"),
+        }
     }
 
     fn render(view: &InFlightAgentsView, width: u16, height: u16) -> String {
@@ -687,6 +874,71 @@ mod tests {
         assert_eq!(v.rows[v.selected].agent_id, "agent-1");
         assert_eq!(v.live_count, 0);
         assert_eq!(v.failed_count, 1);
+    }
+
+    #[test]
+    fn render_groups_fanout_rows_under_header() {
+        let mut rows = rows(4);
+        rows[0].fanout = Some(fanout("review-1", 3, 0));
+        rows[1].fanout = Some(fanout("review-1", 3, 1));
+        rows[2].fanout = Some(fanout("review-1", 3, 2));
+        rows[1].status = AgentRowStatus::Failed;
+        rows[2].status = AgentRowStatus::Completed;
+
+        let out = render(&InFlightAgentsView::new(rows), 100, 7);
+
+        assert!(out.contains("review fanout"), "{out}");
+        assert!(out.contains("3 target"), "{out}");
+        assert!(out.contains("1 running"), "{out}");
+        assert!(out.contains("1 done"), "{out}");
+        assert!(out.contains("1 failed"), "{out}");
+        assert!(out.contains("1. slot 1: slot task 0"), "{out}");
+        assert!(out.contains("2. slot 2: slot task 1"), "{out}");
+        assert!(out.contains("3. slot 3: slot task 2"), "{out}");
+        assert!(out.contains("agent-0"), "{out}");
+        assert!(out.contains("4. task 3"), "{out}");
+    }
+
+    #[test]
+    fn fanout_group_header_is_not_selectable() {
+        let mut rows = rows(2);
+        rows[0].fanout = Some(fanout("review-1", 2, 0));
+        rows[1].fanout = Some(fanout("review-1", 2, 1));
+
+        let mut v = InFlightAgentsView::new(rows);
+        let out = render(&v, 100, 4);
+        assert!(out.contains("review fanout"), "{out}");
+        assert!(out.contains("› 1. slot 1"), "{out}");
+
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            v.completion().and_then(|completion| completion.result),
+            Some("__agent_drilldown__\nagent-1".to_string())
+        );
+    }
+
+    #[test]
+    fn refresh_agent_rows_preserves_selection_for_grouped_rows() {
+        let mut initial_rows = rows(3);
+        initial_rows[0].fanout = Some(fanout("review-1", 3, 0));
+        initial_rows[1].fanout = Some(fanout("review-1", 3, 1));
+        initial_rows[2].fanout = Some(fanout("review-1", 3, 2));
+        let mut v = InFlightAgentsView::new(initial_rows);
+        v.handle_key(key(KeyCode::Down));
+        assert_eq!(v.rows[v.selected].agent_id, "agent-1");
+
+        let mut updated = rows(3);
+        updated[0].fanout = Some(fanout("review-1", 3, 0));
+        updated[1].fanout = Some(fanout("review-1", 3, 1));
+        updated[2].fanout = Some(fanout("review-1", 3, 2));
+        updated[1].status = AgentRowStatus::Completed;
+        assert!(v.refresh_agent_rows(updated));
+
+        assert_eq!(v.rows[v.selected].agent_id, "agent-1");
+        let out = render(&v, 100, 5);
+        assert!(out.contains("1 done"), "{out}");
+        assert!(out.contains("› 2. slot 2"), "{out}");
     }
 
     /// Truncation: char-aware, multi-byte safe.

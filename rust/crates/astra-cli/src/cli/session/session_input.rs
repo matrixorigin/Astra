@@ -81,7 +81,7 @@ pub(crate) async fn finalize_effective_line(
             .collect::<Vec<_>>()
             .join("\n");
         effective_line = format!(
-            "<system-reminder>\nBackground command updates since your last turn:\n{notifications}\n</system-reminder>\n\n{effective_line}"
+            "<system-reminder>\nBackground task updates since your last turn:\n{notifications}\n</system-reminder>\n\n{effective_line}"
         );
     }
 
@@ -567,7 +567,10 @@ mod tests {
     async fn finalize_effective_line_drains_notifications_and_prepends_resume_guidance() {
         let mut state = SessionState {
             diagnostics_context: Some("<diag/>".into()),
-            pending_bg_notifications: vec!["job-1 done".into(), "job-2 failed".into()],
+            pending_bg_notifications: vec![
+                "bg-shell-1 completed".into(),
+                "bg-shell-2 failed".into(),
+            ],
             ..SessionState::default()
         };
 
@@ -579,9 +582,10 @@ mod tests {
         .await;
 
         assert!(finalized.starts_with("Resume the interrupted task."));
-        assert!(finalized.contains("Background command updates since your last turn:"));
-        assert!(finalized.contains("job-1 done"));
-        assert!(finalized.contains("job-2 failed"));
+        assert!(finalized.contains("Background task updates since your last turn:"));
+        assert!(!finalized.contains("Background command updates"));
+        assert!(finalized.contains("bg-shell-1 completed"));
+        assert!(finalized.contains("bg-shell-2 failed"));
         assert!(state.pending_bg_notifications.is_empty());
         assert!(state.diagnostics_context.is_none());
     }

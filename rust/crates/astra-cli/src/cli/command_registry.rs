@@ -243,12 +243,12 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-const JOB_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("list", "List background jobs"),
-    ("pending", "List claimable job queue"),
-    ("run", "Run a background job prompt"),
-    ("result", "Job result (needs id)"),
-    ("status", "Job status (needs id/query)"),
+const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "List background tasks"),
+    ("pending", "List claimable task queue"),
+    ("run", "Run a background task prompt"),
+    ("result", "Task result (needs id)"),
+    ("status", "Task status (needs id/query)"),
 ];
 
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -563,11 +563,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_subcommands(MEMORY_SUBCOMMANDS)
     .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]"),
     CommandMeta::new(
-        "/job",
-        "Background jobs: list, pending, status, run <prompt>, result <id>",
+        "/task",
+        "Background tasks: list, pending, status, run <prompt>, result <id>",
         CommandGroup::MemoryTasks,
     )
-    .with_subcommands(JOB_SUBCOMMANDS)
+    .with_subcommands(TASK_SUBCOMMANDS)
     .with_arg_hint("[list|pending|status <id>|run <prompt>|result <id>]")
     .with_tui_handler(TuiHandler::Fallback),
     // ── Observability ─────────────────────────────────────────────────────
@@ -1243,13 +1243,13 @@ mod tests {
     }
 
     #[test]
-    fn task_slash_command_is_not_registered_as_background_job_surface() {
+    fn task_slash_command_replaces_legacy_job_surface() {
+        let task = resolve_command_meta("/task").expect("should resolve /task");
+        assert_eq!(task.name, "/task");
         assert!(
-            resolve_command_meta("/task").is_none(),
-            "slash /task must remain reserved for the session task-board concept"
+            resolve_command_meta("/job").is_none(),
+            "legacy /job must not remain registered"
         );
-        let job = resolve_command_meta("/job").expect("should resolve /job");
-        assert_eq!(job.name, "/job");
     }
 
     #[test]
@@ -1280,7 +1280,7 @@ mod tests {
             "/diff",
             "/review",
             "/report",
-            "/job",
+            "/task",
             "/debug",
             "/lsp",
             "/telemetry",

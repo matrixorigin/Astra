@@ -5,14 +5,19 @@
 //! runtime semantics. Keep parsing, normalization, lifecycle dispatch, and
 //! result rendering here so Web/server cannot drift from CLI behavior.
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use astra_turn_core::orchestration::agent_result_wire::{
     render_agent_tool_error, render_unknown_agent_result, render_wait_for_agent_status,
     render_wait_timeout_outcome,
+};
+use astra_turn_core::orchestration_fanout_group::{
+    AgentFanoutGroupProjection, AgentFanoutSlotStatus, AgentFanoutStatus,
 };
 
 use super::{
@@ -24,6 +29,7 @@ use astra_turn_core::trace_event::TraceContext;
 /// rejecting the request without echoing the value. Bytes (not chars)
 /// because the limit is really about prompt-injection / log-bloat budget.
 const MAX_AGENT_ID_BYTES: usize = 256;
+static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
 /// structured `agent_id` JSON field, where serde escapes it safely.
@@ -77,12 +83,508 @@ pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> 
         ),
         other if other.is_empty() && args.get("agents").is_some() => render_agent_tool_error(
             None,
-            "Unsupported `agents` batch payload for `agent`. Each `agent(action='spawn', ...)` call launches exactly one child. To fan out in parallel, emit N separate spawn calls in a single assistant message.",
+            "Unsupported `agents` batch payload for `agent`. Each `agent(action='spawn', ...)` call launches exactly one child. Use `agent_fanout(action='start', target_count=N, slots=[...])` for atomic parallel fan-out.",
         ),
         other => render_agent_tool_error(
             None,
             &format!("Unknown agent action: '{other}'. Use one of: spawn, get_result, run_chain"),
         ),
+    }
+}
+
+/// Handle the atomic `agent_fanout` tool.
+pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    match action {
+        "start" => handle_agent_fanout_start_action(args, ctx).await,
+        "get_results" => handle_agent_fanout_get_results_action(args, ctx).await,
+        "stop_slot" => handle_agent_fanout_stop_slot_action(args, ctx).await,
+        other if other.is_empty() => render_agent_tool_error(
+            None,
+            "Missing required field: action. Use one of: start, get_results, stop_slot",
+        ),
+        other => render_agent_tool_error(
+            None,
+            &format!(
+                "Unknown agent_fanout action: '{other}'. Use one of: start, get_results, stop_slot"
+            ),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFanoutStartInput {
+    #[serde(default, rename = "action")]
+    _action: Option<String>,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    target_count: usize,
+    slots: Vec<AgentFanoutStartSlot>,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    complexity: Option<String>,
+    #[serde(default)]
+    isolated: Option<bool>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFanoutStartSlot {
+    description: String,
+    prompt: String,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    complexity: Option<String>,
+    #[serde(default)]
+    isolated: Option<bool>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFanoutGroupInput {
+    #[serde(default, rename = "action")]
+    _action: Option<String>,
+    group_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFanoutStopSlotInput {
+    #[serde(default, rename = "action")]
+    _action: Option<String>,
+    group_id: String,
+    slot_index: usize,
+}
+
+async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    let ctx = match ctx {
+        Some(c) => c,
+        None => {
+            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+        }
+    };
+    let mut input: AgentFanoutStartInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(e) => {
+            return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+        }
+    };
+    if input.target_count == 0 {
+        return render_agent_tool_error(None, "Invalid input: target_count must be >= 1");
+    }
+    if input.slots.len() != input.target_count {
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Invalid input: target_count {} requires exactly {} slots, got {}",
+                input.target_count,
+                input.target_count,
+                input.slots.len()
+            ),
+        );
+    }
+
+    let group_id = match input.group_id.as_deref().map(str::trim) {
+        Some("") => {
+            return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
+        }
+        Some(group_id) => group_id.to_string(),
+        None => next_fanout_group_id(ctx),
+    };
+    let title = input
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&group_id)
+        .to_string();
+
+    let mut agents = Vec::with_capacity(input.slots.len());
+    let slots = std::mem::take(&mut input.slots);
+    for (slot_index, slot) in slots.into_iter().enumerate() {
+        if slot.description.trim().is_empty() {
+            return render_agent_tool_error(
+                None,
+                &format!("Invalid input: slots[{slot_index}].description must be non-empty"),
+            );
+        }
+        if slot.prompt.trim().is_empty() {
+            return render_agent_tool_error(
+                None,
+                &format!("Invalid input: slots[{slot_index}].prompt must be non-empty"),
+            );
+        }
+
+        let spawn_args = fanout_slot_spawn_args(
+            &input,
+            slot,
+            &group_id,
+            &title,
+            input.target_count,
+            slot_index,
+            args.get("_tool_call_id").and_then(Value::as_str),
+        );
+        let rendered = handle_agent_spawn_action(&spawn_args, Some(ctx)).await;
+        let rendered_value = serde_json::from_str::<Value>(&rendered)
+            .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
+        agents.push(json!({
+            "slot_index": slot_index,
+            "agent_id": rendered_value.get("agent_id").cloned().unwrap_or(Value::Null),
+            "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
+            "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),
+        }));
+    }
+
+    let group = find_fanout_group(ctx, &group_id).await;
+    json!({
+        "status": "started",
+        "group_id": group_id,
+        "title": title,
+        "target_count": input.target_count,
+        "agents": agents,
+        "fanout": group.as_ref().map(fanout_group_to_json).unwrap_or(Value::Null),
+    })
+    .to_string()
+}
+
+async fn handle_agent_fanout_get_results_action(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> String {
+    let ctx = match ctx {
+        Some(c) => c,
+        None => {
+            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+        }
+    };
+    let input: AgentFanoutGroupInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(e) => {
+            return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+        }
+    };
+    let group_id = input.group_id.trim();
+    if group_id.is_empty() {
+        return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
+    }
+    let Some(group) = find_fanout_group(ctx, group_id).await else {
+        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
+    };
+
+    let mut results = Vec::with_capacity(group.slots.len());
+    for slot in &group.slots {
+        let Some(agent_id) = slot.agent_id.as_deref() else {
+            results.push(json!({
+                "slot_index": slot.slot_index,
+                "status": fanout_slot_status_label(slot.status),
+                "error": slot.terminal_reason,
+            }));
+            continue;
+        };
+        let rendered = handle_agent_get_result_action(
+            &json!({
+                "agent_id": agent_id,
+                "_tool_call_id": args.get("_tool_call_id").and_then(Value::as_str),
+            }),
+            Some(ctx),
+        )
+        .await;
+        let value = serde_json::from_str::<Value>(&rendered)
+            .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
+        results.push(json!({
+            "slot_index": slot.slot_index,
+            "agent_id": agent_id,
+            "result": value,
+        }));
+    }
+
+    let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
+    json!({
+        "status": fanout_get_results_status_label(&updated),
+        "group_id": group_id,
+        "target_count": updated.target_count,
+        "results": results,
+        "fanout": fanout_group_to_json(&updated),
+    })
+    .to_string()
+}
+
+async fn handle_agent_fanout_stop_slot_action(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> String {
+    let ctx = match ctx {
+        Some(c) => c,
+        None => {
+            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+        }
+    };
+    let input: AgentFanoutStopSlotInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(e) => {
+            return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+        }
+    };
+    let group_id = input.group_id.trim();
+    if group_id.is_empty() {
+        return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
+    }
+    let Some(group) = find_fanout_group(ctx, group_id).await else {
+        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
+    };
+    let Some(slot) = group
+        .slots
+        .iter()
+        .find(|slot| slot.slot_index == input.slot_index)
+    else {
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Invalid input: slot_index {} is outside target_count {}",
+                input.slot_index, group.target_count
+            ),
+        );
+    };
+    let slot_status = fanout_slot_status_label(slot.status);
+    let terminal_reason = slot.terminal_reason.clone();
+    let Some(agent_id) = slot.agent_id.clone() else {
+        return json!({
+            "status": "not_stoppable",
+            "reason": "no_accepted_agent",
+            "group_id": group_id,
+            "slot_index": input.slot_index,
+            "slot_status": slot_status,
+            "terminal_reason": terminal_reason,
+            "fanout": fanout_group_to_json(&group),
+        })
+        .to_string();
+    };
+    if slot.status.is_terminal() {
+        return json!({
+            "status": "not_stoppable",
+            "reason": "already_terminal",
+            "group_id": group_id,
+            "slot_index": input.slot_index,
+            "agent_id": agent_id,
+            "slot_status": slot_status,
+            "terminal_reason": terminal_reason,
+            "fanout": fanout_group_to_json(&group),
+        })
+        .to_string();
+    }
+
+    let stopped = ctx
+        .spawner
+        .cancel_agent(&agent_id, "user-requested via agent_fanout.stop_slot")
+        .await;
+    let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
+    let updated_slot = updated
+        .slots
+        .iter()
+        .find(|slot| slot.slot_index == input.slot_index);
+    json!({
+        "status": if stopped { "stopped" } else { "not_stopped" },
+        "group_id": group_id,
+        "slot_index": input.slot_index,
+        "agent_id": agent_id,
+        "slot_status": updated_slot
+            .map(|slot| fanout_slot_status_label(slot.status))
+            .unwrap_or(slot_status),
+        "terminal_reason": updated_slot
+            .and_then(|slot| slot.terminal_reason.as_deref())
+            .or(terminal_reason.as_deref()),
+        "fanout": fanout_group_to_json(&updated),
+    })
+    .to_string()
+}
+
+fn fanout_slot_spawn_args(
+    input: &AgentFanoutStartInput,
+    slot: AgentFanoutStartSlot,
+    group_id: &str,
+    group_title: &str,
+    target_count: usize,
+    slot_index: usize,
+    tool_call_id: Option<&str>,
+) -> Value {
+    let mut value = json!({
+        "action": "spawn",
+        "description": slot.description,
+        "prompt": slot.prompt,
+        "run_in_background": true,
+        "fanout_group_id": group_id,
+        "fanout_group_title": group_title,
+        "fanout_target_count": target_count,
+        "fanout_slot_index": slot_index,
+    });
+    let object = value.as_object_mut().expect("object");
+    insert_optional_string(
+        object,
+        "agent_type",
+        slot.agent_type.or_else(|| input.agent_type.clone()),
+    );
+    insert_optional_string(object, "model", slot.model.or_else(|| input.model.clone()));
+    insert_optional_u32(object, "max_turns", slot.max_turns.or(input.max_turns));
+    insert_optional_u32(
+        object,
+        "max_output_tokens",
+        slot.max_output_tokens.or(input.max_output_tokens),
+    );
+    insert_optional_string(
+        object,
+        "complexity",
+        slot.complexity.or_else(|| input.complexity.clone()),
+    );
+    insert_optional_bool(object, "isolated", slot.isolated.or(input.isolated));
+    insert_optional_string(object, "name", slot.name);
+    if let Some(allowed_tools) = slot.allowed_tools.or_else(|| input.allowed_tools.clone()) {
+        object.insert("allowed_tools".to_string(), json!(allowed_tools));
+    }
+    if let Some(tool_call_id) = tool_call_id {
+        object.insert(
+            "_tool_call_id".to_string(),
+            Value::String(tool_call_id.to_string()),
+        );
+    }
+    value
+}
+
+fn insert_optional_string(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_optional_u32(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<u32>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn insert_optional_bool(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<bool>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn next_fanout_group_id(ctx: &AgentToolContext) -> String {
+    let id = NEXT_FANOUT_GROUP_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{}-fanout-{id}", ctx.run_id)
+}
+
+async fn find_fanout_group(
+    ctx: &AgentToolContext,
+    group_id: &str,
+) -> Option<AgentFanoutGroupProjection> {
+    ctx.spawner
+        .list_fanout_groups()
+        .await
+        .into_iter()
+        .find(|group| group.group_id == group_id)
+}
+
+fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
+    let summary = group.summary();
+    json!({
+        "group_id": group.group_id,
+        "title": group.title,
+        "target_count": summary.target_count,
+        "status": fanout_group_status_label(group.status),
+        "summary": group.summary_sentence(),
+        "accepted": summary.accepted,
+        "active": summary.active,
+        "terminal": summary.terminal,
+        "completed": summary.completed,
+        "failed": summary.failed,
+        "cancelled_by_user": summary.cancelled_by_user,
+        "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+        "timed_out": summary.timed_out,
+        "spawn_rejected": summary.spawn_rejected,
+        "collected": summary.collected,
+        "uncollected": summary.uncollected,
+        "slots": group.slots.iter().map(|slot| json!({
+            "slot_index": slot.slot_index,
+            "role": slot.role,
+            "requested_description": slot.requested_description,
+            "agent_id": &slot.agent_id,
+            "status": fanout_slot_status_label(slot.status),
+            "result_collected": slot.result_collected,
+            "terminal_reason": &slot.terminal_reason,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'static str {
+    let summary = group.summary();
+    if summary.spawn_rejected > 0 {
+        "failed_to_start"
+    } else if summary.cancelled_by_parent_budget > 0 {
+        "interrupted"
+    } else if summary.failed > 0 || summary.timed_out > 0 {
+        "failed"
+    } else if summary.active > 0 {
+        "incomplete"
+    } else if summary.cancelled_by_user > 0 {
+        "finished"
+    } else {
+        "completed"
+    }
+}
+
+fn fanout_group_status_label(status: AgentFanoutStatus) -> &'static str {
+    match status {
+        AgentFanoutStatus::Planned => "planned",
+        AgentFanoutStatus::Running => "running",
+        AgentFanoutStatus::Finished => "finished",
+        AgentFanoutStatus::Incomplete => "incomplete",
+    }
+}
+
+fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
+    match status {
+        AgentFanoutSlotStatus::Planned => "planned",
+        AgentFanoutSlotStatus::SpawnAccepted => "spawn_accepted",
+        AgentFanoutSlotStatus::SpawnRejected => "spawn_rejected",
+        AgentFanoutSlotStatus::Running => "running",
+        AgentFanoutSlotStatus::Completed => "completed",
+        AgentFanoutSlotStatus::Failed => "failed",
+        AgentFanoutSlotStatus::CancelledByUser => "cancelled_by_user",
+        AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled_by_parent_budget",
+        AgentFanoutSlotStatus::TimedOut => "timed_out",
     }
 }
 
@@ -106,6 +608,9 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
 
     if input.model.is_none() {
         input.model = ctx.current_model.clone();
+    }
+    if let Err(e) = input.validate_fanout_metadata() {
+        return render_agent_tool_error(None, &format!("Invalid input: {e}"));
     }
 
     let mut inherited_permissions = ctx.inherited_permissions.clone();
@@ -140,31 +645,12 @@ fn non_empty_string(value: Option<&Value>) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-fn summarize_prompt(prompt: &str) -> String {
-    const MAX_DESCRIPTION_CHARS: usize = 60;
-    if prompt.chars().count() > MAX_DESCRIPTION_CHARS {
-        let truncated: String = prompt
-            .chars()
-            .take(MAX_DESCRIPTION_CHARS.saturating_sub(1))
-            .collect();
-        format!("{}…", truncated.trim_end())
-    } else {
-        prompt.to_string()
-    }
-}
-
 /// Normalize raw `agent(action='spawn', ...)` arguments into
 /// [`SpawnAgentInput`] wire shape.
 ///
-/// Existing CLI behavior accepts either `prompt` or `description` and derives
-/// the missing counterpart. The shared runtime keeps that compatibility while
-/// still rejecting batch/wrapper/deprecated shapes explicitly.
+/// The shared runtime rejects batch, wrapper, deprecated, and alias shapes
+/// explicitly before deserializing the canonical spawn payload.
 ///
-/// `agent_id` is deliberately tolerated and stripped for `spawn`. Providers do
-/// not receive our internal per-action schema metadata, so models sometimes
-/// leak the `get_result`-only field into otherwise valid spawn calls. Hard
-/// failing that shape creates a needless 1 ms sub-agent failure even though the
-/// field is semantically irrelevant to spawning.
 pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
     let mut patched_args = args.clone();
     let obj = patched_args
@@ -179,9 +665,8 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
     if obj.contains_key("agents") {
         return Err("unsupported `agents` payload for agent.spawn: each \
              `agent(action='spawn', ...)` call launches exactly one child. \
-             To fan out N sub-agents in parallel, emit N separate `agent` \
-             tool calls in a single assistant message, each with \
-             `action='spawn'` and `run_in_background: true`."
+             Use `agent_fanout(action='start', target_count=N, slots=[...])` \
+             for atomic parallel fan-out."
             .to_string());
     }
 
@@ -192,22 +677,35 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
             .to_string());
     }
 
-    obj.remove("agent_id");
+    if obj.contains_key("type") {
+        return Err(
+            "unsupported `type` field for agent.spawn. Use canonical `agent_type`.".to_string(),
+        );
+    }
+
+    if obj.contains_key("inherit_context") {
+        return Err(
+            "unsupported `inherit_context` field for agent.spawn. Use canonical `inherit_prefix`."
+                .to_string(),
+        );
+    }
+
+    if obj.contains_key("agent_id") {
+        return Err("unsupported `agent_id` field for agent.spawn. `agent_id` is only valid for agent.get_result; the runtime generates it after spawn."
+            .to_string());
+    }
+
+    obj.remove("action");
+    obj.remove("_tool_call_id");
 
     let description = non_empty_string(obj.get("description")).map(str::to_string);
     let prompt = non_empty_string(obj.get("prompt")).map(str::to_string);
-    if description.is_none() && prompt.is_none() {
-        return Err("missing required field `prompt` or `description`".to_string());
-    }
-
     if description.is_none() {
-        let derived = summarize_prompt(prompt.as_deref().expect("checked above"));
-        obj.insert("description".to_string(), Value::String(derived));
+        return Err("missing required field `description`".to_string());
     }
 
     if prompt.is_none() {
-        let derived = description.expect("checked above");
-        obj.insert("prompt".to_string(), Value::String(derived));
+        return Err("missing required field `prompt`".to_string());
     }
 
     Ok(patched_args)
@@ -254,7 +752,8 @@ pub async fn handle_agent_get_result_action(
                     &status,
                 )
                 .await;
-            render_wait_for_agent_status(agent_id, &status)
+            let group = ctx.spawner.fanout_group_for_agent(agent_id).await;
+            attach_fanout_to_agent_result(render_wait_for_agent_status(agent_id, &status), group)
         }
         WaitForAgentOutcome::TimedOut => {
             let live_status = ctx
@@ -262,12 +761,64 @@ pub async fn handle_agent_get_result_action(
                 .get_agent_state_any(agent_id)
                 .await
                 .map(|state| state.status);
-            render_wait_timeout_outcome(agent_id, live_status.as_ref(), timeout)
+            let group = ctx.spawner.fanout_group_for_agent(agent_id).await;
+            attach_fanout_to_agent_result(
+                render_wait_timeout_outcome(agent_id, live_status.as_ref(), timeout),
+                group,
+            )
         }
         WaitForAgentOutcome::Unknown => {
             render_unknown_agent_result(agent_id, UNKNOWN_AGENT_ID_ERROR)
         }
     }
+}
+
+fn attach_fanout_to_agent_result(
+    rendered: String,
+    group: Option<AgentFanoutGroupProjection>,
+) -> String {
+    let Some(group) = group else {
+        return rendered;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&rendered) else {
+        return rendered;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return rendered;
+    };
+    let agent_id = object
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let slot_index = agent_id.as_deref().and_then(|agent_id| {
+        group
+            .slots
+            .iter()
+            .find(|slot| slot.agent_id.as_deref() == Some(agent_id))
+            .map(|slot| slot.slot_index)
+    });
+    let summary = group.summary();
+    let group_id = group.group_id.clone();
+    let summary_sentence = group.summary_sentence();
+    object.insert(
+        "fanout".to_string(),
+        json!({
+            "group_id": group_id,
+            "target_count": summary.target_count,
+            "slot_index": slot_index,
+            "summary": summary_sentence,
+            "accepted": summary.accepted,
+            "active": summary.active,
+            "terminal": summary.terminal,
+            "completed": summary.completed,
+            "failed": summary.failed,
+            "cancelled_by_user": summary.cancelled_by_user,
+            "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+            "spawn_rejected": summary.spawn_rejected,
+            "collected": summary.collected,
+        }),
+    );
+    serde_json::to_string(&value).unwrap_or(rendered)
 }
 
 #[cfg(test)]
@@ -294,21 +845,21 @@ mod tests {
     }
 
     #[test]
-    fn spawn_arg_normalization_derives_description_from_unicode_prompt() {
-        let prompt = "审查并发安全、事件顺序、日志因果链、用户交互、失败恢复、批处理、取消传播、状态渲染、详情页滚动".repeat(2);
-        let normalized = normalize_agent_spawn_args(&json!({ "prompt": prompt })).unwrap();
-        let desc = normalized["description"].as_str().unwrap();
-        assert!(desc.ends_with('…'), "{desc}");
-        assert!(desc.chars().count() <= 60);
-        assert_eq!(normalized["prompt"].as_str().unwrap(), prompt);
+    fn spawn_arg_normalization_requires_description_even_with_prompt() {
+        let err = normalize_agent_spawn_args(&json!({
+            "prompt": "Review auth flow"
+        }))
+        .expect_err("description is canonical and required");
+        assert!(err.contains("description"), "{err}");
     }
 
     #[test]
-    fn spawn_arg_normalization_derives_prompt_from_description() {
-        let normalized =
-            normalize_agent_spawn_args(&json!({ "description": "Review auth flow" })).unwrap();
-        assert_eq!(normalized["prompt"], "Review auth flow");
-        assert_eq!(normalized["description"], "Review auth flow");
+    fn spawn_arg_normalization_requires_prompt_even_with_description() {
+        let err = normalize_agent_spawn_args(&json!({
+            "description": "Review auth flow"
+        }))
+        .expect_err("prompt is canonical and required");
+        assert!(err.contains("prompt"), "{err}");
     }
 
     #[test]
@@ -325,19 +876,17 @@ mod tests {
     }
 
     #[test]
-    fn spawn_arg_normalization_strips_agent_id_field() {
-        let normalized = normalize_agent_spawn_args(&json!({
+    fn spawn_arg_normalization_rejects_agent_id_field() {
+        let err = normalize_agent_spawn_args(&json!({
             "description": "Audit auth flow",
             "prompt": "Read src/auth and report token refresh bugs.",
             "agent_id": "security-review"
         }))
-        .expect("spawn should ignore caller-supplied agent_id");
+        .expect_err("spawn must reject caller-supplied agent_id");
         assert!(
-            normalized.get("agent_id").is_none(),
-            "spawn normalization must strip stray agent_id: {normalized}"
+            err.contains("get_result") && err.contains("runtime generates"),
+            "spawn error must name the correct get_result-only contract. Got: {err}"
         );
-        let input: SpawnAgentInput = serde_json::from_value(normalized).unwrap();
-        assert_eq!(input.description, "Audit auth flow");
     }
 
     #[test]
@@ -358,10 +907,29 @@ mod tests {
     fn spawn_arg_normalization_never_fabricates_placeholder_prompt() {
         let err = normalize_agent_spawn_args(&json!({ "name": "reviewer-only" }))
             .expect_err("name alone is not enough to spawn a meaningful agent");
-        assert!(
-            err.contains("prompt") || err.contains("description"),
-            "{err}"
-        );
+        assert!(err.contains("description"), "{err}");
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_type_alias() {
+        let err = normalize_agent_spawn_args(&json!({
+            "description": "Audit auth flow",
+            "prompt": "Use canonical fields.",
+            "type": "task"
+        }))
+        .expect_err("type alias must be rejected");
+        assert!(err.contains("agent_type"), "{err}");
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_inherit_context_alias() {
+        let err = normalize_agent_spawn_args(&json!({
+            "description": "Audit auth flow",
+            "prompt": "Use canonical fields.",
+            "inherit_context": {}
+        }))
+        .expect_err("inherit_context alias must be rejected");
+        assert!(err.contains("inherit_prefix"), "{err}");
     }
 
     #[test]
@@ -376,7 +944,7 @@ mod tests {
         .expect_err("batch payloads must be rejected with an actionable redirect");
         assert!(err.contains("agents"), "{err}");
         assert!(
-            err.contains("single assistant message") || err.contains("separate"),
+            err.contains("agent_fanout") && err.contains("target_count"),
             "error must explain the supported fan-out shape. Got: {err}"
         );
     }
@@ -392,13 +960,17 @@ mod tests {
     }
 
     #[test]
-    fn spawn_arg_normalization_accepts_run_in_background_alias() {
+    fn spawn_arg_normalization_accepts_canonical_run_in_background() {
         let normalized = normalize_agent_spawn_args(&json!({
+            "action": "spawn",
             "description": "Review one",
             "prompt": "p1",
-            "run_in_background": true
+            "run_in_background": true,
+            "_tool_call_id": "call-1"
         }))
         .unwrap();
+        assert!(normalized.get("action").is_none(), "{normalized}");
+        assert!(normalized.get("_tool_call_id").is_none(), "{normalized}");
         let input: SpawnAgentInput = serde_json::from_value(normalized).unwrap();
         assert!(input.run_in_background);
     }
@@ -475,6 +1047,61 @@ mod tests {
         }
     }
 
+    struct FailedSpawnExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for FailedSpawnExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "failed".into(),
+                finish_reason: "error".into(),
+                output: None,
+                error: Some("child failed".into()),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 1,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct EmptyCompletionExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for EmptyCompletionExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "interrupted".into(),
+                finish_reason: "empty_completion".into(),
+                output: Some(String::new()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct PendingExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for PendingExecutor {
+        async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            std::future::pending::<Result<SpawnRunResult, String>>().await
+        }
+    }
+
     fn test_spawner(executor: Arc<dyn SpawnAgentExecutor>) -> Arc<DynamicAgentSpawner> {
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -540,6 +1167,518 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_spawn_agent_tool_rejects_invalid_fanout_slot_before_spawning() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Storage review",
+            "prompt": "Review storage layer",
+            "agent_type": "general-purpose",
+            "run_in_background": true,
+            "fanout_group_id": "review-1",
+            "fanout_target_count": 3,
+            "fanout_slot_index": 3
+        });
+
+        let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("outside target_count"), "{result}");
+        assert_eq!(
+            executor.take_captured_model(),
+            None,
+            "invalid fanout metadata must fail before child execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_start_creates_fixed_group_slots() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "title": "review fanout",
+                "target_count": 2,
+                "slots": [
+                    {
+                        "description": "Review storage",
+                        "prompt": "Review storage changes and report correctness bugs.",
+                        "agent_type": "code-review"
+                    },
+                    {
+                        "description": "Review UI",
+                        "prompt": "Review UI changes and report state bugs.",
+                        "agent_type": "code-review"
+                    }
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "started");
+        assert_eq!(value["group_id"], "review-atomic");
+        assert_eq!(value["title"], "review fanout");
+        assert_eq!(value["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(value["fanout"]["title"], "review fanout");
+        assert_eq!(value["fanout"]["target_count"], 2);
+        assert_eq!(value["fanout"]["accepted"], 2);
+        assert_eq!(value["fanout"]["slots"][0]["slot_index"], 0);
+        assert_eq!(value["fanout"]["slots"][1]["slot_index"], 1);
+
+        let groups = spawner.list_fanout_groups().await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_id, "review-atomic");
+        assert_eq!(groups[0].title, "review fanout");
+        assert_eq!(groups[0].target_count, 2);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_start_rejects_slot_count_mismatch_before_spawning() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 2,
+                "slots": [
+                    {"description": "Review one", "prompt": "Review one"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("requires exactly 2 slots"), "{result}");
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_start_rejects_unknown_top_level_fields_before_spawning() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "agents": [],
+                "slots": [
+                    {"description": "Review one", "prompt": "Review one"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("unknown field"), "{result}");
+        assert!(result.contains("agents"), "{result}");
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_start_rejects_unknown_slot_fields_before_spawning() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {
+                        "description": "Review one",
+                        "prompt": "Review one",
+                        "task": "legacy task field"
+                    }
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("unknown field"), "{result}");
+        assert!(result.contains("task"), "{result}");
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[test]
+    fn fanout_slot_spawn_args_carry_group_title_for_ui_projection() {
+        let input = AgentFanoutStartInput {
+            _action: Some("start".into()),
+            group_id: Some("review-1".into()),
+            title: Some("review fanout".into()),
+            target_count: 3,
+            slots: Vec::new(),
+            agent_type: None,
+            model: None,
+            max_turns: None,
+            max_output_tokens: None,
+            complexity: None,
+            isolated: None,
+            allowed_tools: None,
+        };
+        let slot = AgentFanoutStartSlot {
+            description: "Review storage".into(),
+            prompt: "Review storage layer".into(),
+            agent_type: None,
+            model: None,
+            max_turns: None,
+            max_output_tokens: None,
+            complexity: None,
+            isolated: None,
+            allowed_tools: None,
+            name: None,
+        };
+
+        let args = fanout_slot_spawn_args(&input, slot, "review-1", "review fanout", 3, 1, None);
+
+        assert_eq!(args["fanout_group_id"], "review-1");
+        assert_eq!(args["fanout_group_title"], "review fanout");
+        assert_eq!(args["fanout_target_count"], 3);
+        assert_eq!(args["fanout_slot_index"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_get_results_collects_all_slots() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review storage", "prompt": "Review storage changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(start.contains("\"status\":\"started\""), "{start}");
+
+        let result = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": "review-atomic"}),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["results"].as_array().unwrap().len(), 1);
+        assert_eq!(value["results"][0]["result"]["status"], "completed");
+        assert_eq!(value["fanout"]["collected"], 1);
+        assert_eq!(value["fanout"]["uncollected"], 0);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_get_results_preserves_spawn_rejected_slot_status() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {
+                        "description": "Review storage",
+                        "prompt": "Review storage changes",
+                        "agent_type": "not-a-real-agent-type"
+                    }
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(start.contains("\"status\":\"started\""), "{start}");
+        assert!(start.contains("\"spawn_rejected\":1"), "{start}");
+
+        let result = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": "review-atomic"}),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "failed_to_start");
+        assert_eq!(value["results"].as_array().unwrap().len(), 1);
+        assert_eq!(value["results"][0]["slot_index"], 0);
+        assert_eq!(value["results"][0]["status"], "spawn_rejected");
+        assert!(
+            value["results"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown agent type")),
+            "rejected slot result should preserve the rejection reason: {value}"
+        );
+        assert_eq!(value["fanout"]["target_count"], 1);
+        assert_eq!(value["fanout"]["accepted"], 0);
+        assert_eq!(value["fanout"]["spawn_rejected"], 1);
+        assert_eq!(value["fanout"]["slots"][0]["status"], "spawn_rejected");
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_get_results_reports_failed_child_as_failed_fanout() {
+        let spawner = test_spawner(Arc::new(FailedSpawnExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review storage", "prompt": "Review storage changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(start.contains("\"status\":\"started\""), "{start}");
+
+        let result = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": "review-atomic"}),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["results"].as_array().unwrap().len(), 1);
+        assert_eq!(value["results"][0]["slot_index"], 0);
+        assert_eq!(value["results"][0]["result"]["status"], "failed");
+        assert_eq!(value["fanout"]["failed"], 1);
+        assert_eq!(value["fanout"]["slots"][0]["status"], "failed");
+        assert!(
+            value["fanout"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("1 failed")),
+            "failed fanout summary should name child failure: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_stop_slot_reports_rejected_slot_as_not_stoppable() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {
+                        "description": "Review storage",
+                        "prompt": "Review storage changes",
+                        "agent_type": "not-a-real-agent-type"
+                    }
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(start.contains("\"spawn_rejected\":1"), "{start}");
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "stop_slot",
+                "group_id": "review-atomic",
+                "slot_index": 0
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "not_stoppable");
+        assert_eq!(value["reason"], "no_accepted_agent");
+        assert_eq!(value["slot_index"], 0);
+        assert_eq!(value["slot_status"], "spawn_rejected");
+        assert!(
+            value["terminal_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("unknown agent type")),
+            "stop_slot should preserve why the slot cannot be stopped: {value}"
+        );
+        assert_eq!(value["fanout"]["spawn_rejected"], 1);
+        assert_eq!(value["fanout"]["slots"][0]["status"], "spawn_rejected");
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_stop_slot_reports_terminal_slot_as_not_stoppable() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review storage", "prompt": "Review storage changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(start.contains("\"status\":\"started\""), "{start}");
+
+        let collected = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": "review-atomic"}),
+            Some(&ctx),
+        )
+        .await;
+        assert!(
+            collected.contains("\"status\":\"completed\""),
+            "{collected}"
+        );
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "stop_slot",
+                "group_id": "review-atomic",
+                "slot_index": 0
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "not_stoppable");
+        assert_eq!(value["reason"], "already_terminal");
+        assert_eq!(value["slot_status"], "completed");
+        assert_eq!(value["fanout"]["completed"], 1);
+        assert_eq!(value["fanout"]["slots"][0]["status"], "completed");
+        assert_eq!(value["fanout"]["slots"][0]["result_collected"], true);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_stop_slot_then_get_results_reports_stopped_by_user() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review storage", "prompt": "Review storage changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(start.contains("\"status\":\"started\""), "{start}");
+
+        let stop = handle_agent_fanout_tool(
+            &json!({
+                "action": "stop_slot",
+                "group_id": "review-atomic",
+                "slot_index": 0
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let stop_value: Value = serde_json::from_str(&stop).unwrap();
+        assert_eq!(stop_value["status"], "stopped");
+        assert_eq!(stop_value["slot_status"], "cancelled_by_user");
+        assert_eq!(stop_value["fanout"]["cancelled_by_user"], 1);
+
+        let result = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": "review-atomic"}),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "finished");
+        assert_eq!(value["fanout"]["cancelled_by_user"], 1);
+        assert_eq!(value["fanout"]["active"], 0);
+        assert_eq!(value["fanout"]["slots"][0]["status"], "cancelled_by_user");
+        assert!(
+            value["fanout"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("1 stopped by user")),
+            "fanout summary should preserve intentional user stop: {value}"
+        );
+        assert!(
+            !value["fanout"]["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("partial agents returned"),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn fanout_get_results_status_names_non_successful_terminal_groups() {
+        let mut spawn_rejected = AgentFanoutGroupProjection::new("review-1", "Review", 1);
+        spawn_rejected.record_spawn_rejected(0, "quota").unwrap();
+        assert_eq!(
+            fanout_get_results_status_label(&spawn_rejected),
+            "failed_to_start"
+        );
+
+        let mut failed = AgentFanoutGroupProjection::new("review-2", "Review", 1);
+        failed.record_spawn_accepted(0, "auth@aaa").unwrap();
+        failed
+            .record_terminal_by_agent(
+                "auth@aaa",
+                AgentFanoutSlotStatus::Failed,
+                Some("child failed".into()),
+            )
+            .unwrap();
+        assert_eq!(fanout_get_results_status_label(&failed), "failed");
+
+        let mut stopped_by_user = AgentFanoutGroupProjection::new("review-3", "Review", 1);
+        stopped_by_user
+            .record_spawn_accepted(0, "auth@aaa")
+            .unwrap();
+        stopped_by_user
+            .record_terminal_by_agent(
+                "auth@aaa",
+                AgentFanoutSlotStatus::CancelledByUser,
+                Some("user-requested".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            fanout_get_results_status_label(&stopped_by_user),
+            "finished"
+        );
+    }
+
+    #[test]
+    fn fanout_group_json_exposes_uncollected_terminal_count() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
+        group.record_spawn_accepted(0, "auth@aaa").unwrap();
+        group.record_spawn_accepted(1, "api@bbb").unwrap();
+        group
+            .record_terminal_by_agent("auth@aaa", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        group
+            .record_terminal_by_agent("api@bbb", AgentFanoutSlotStatus::Failed, None)
+            .unwrap();
+
+        let value = fanout_group_to_json(&group);
+
+        assert_eq!(value["terminal"], 2);
+        assert_eq!(value["collected"], 0);
+        assert_eq!(value["uncollected"], 2);
+    }
+
+    #[tokio::test]
     async fn handle_spawn_agent_tool_preserves_explicit_model_override() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
@@ -577,6 +1716,117 @@ mod tests {
         assert_eq!(value["finish_reason"], "budget_exhausted");
         assert_eq!(value["result"], "partial review");
         assert_eq!(value["tool_calls"], 2);
+    }
+
+    #[tokio::test]
+    async fn get_result_includes_fanout_summary_for_completed_slot() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let spawn = handle_agent_spawn_action(
+            &json!({
+                "description": "Storage review",
+                "prompt": "Review storage layer",
+                "agent_type": "general-purpose",
+                "run_in_background": true,
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 1
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let spawned: Value = serde_json::from_str(&spawn).unwrap();
+        let agent_id = spawned["agent_id"].as_str().unwrap();
+
+        let result =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["fanout"]["group_id"], "review-1");
+        assert_eq!(value["fanout"]["target_count"], 3);
+        assert_eq!(value["fanout"]["slot_index"], 1);
+        assert_eq!(value["fanout"]["completed"], 1);
+        assert_eq!(value["fanout"]["collected"], 1);
+    }
+
+    #[tokio::test]
+    async fn get_result_includes_fanout_summary_for_user_cancelled_slot() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let spawn = handle_agent_spawn_action(
+            &json!({
+                "description": "Storage review",
+                "prompt": "Review storage layer",
+                "agent_type": "general-purpose",
+                "run_in_background": true,
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 1
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let spawned: Value = serde_json::from_str(&spawn).unwrap();
+        let agent_id = spawned["agent_id"].as_str().unwrap();
+
+        assert!(
+            spawner
+                .cancel_agent(agent_id, "user-requested via test")
+                .await
+        );
+        let result =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["cancelled_by_user"], true);
+        assert_eq!(value["fanout"]["target_count"], 3);
+        assert_eq!(value["fanout"]["cancelled_by_user"], 1);
+        assert_eq!(value["fanout"]["active"], 0);
+        assert!(
+            value["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("Do NOT respawn")),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_result_fanout_summary_does_not_report_non_budget_interruption_as_parent_budget() {
+        let spawner = test_spawner(Arc::new(EmptyCompletionExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let spawn = handle_agent_spawn_action(
+            &json!({
+                "description": "Storage review",
+                "prompt": "Review storage layer",
+                "agent_type": "general-purpose",
+                "run_in_background": true,
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 1
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let spawned: Value = serde_json::from_str(&spawn).unwrap();
+        let agent_id = spawned["agent_id"].as_str().unwrap();
+
+        let result =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["finish_reason"], "empty_completion");
+        assert_eq!(value["fanout"]["target_count"], 3);
+        assert_eq!(value["fanout"]["failed"], 1);
+        assert_eq!(value["fanout"]["cancelled_by_parent_budget"], 0);
+        assert!(
+            value["fanout"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("1 failed")
+                    && !summary.contains("cancelled by parent budget")),
+            "{value}"
+        );
     }
 
     #[tokio::test]

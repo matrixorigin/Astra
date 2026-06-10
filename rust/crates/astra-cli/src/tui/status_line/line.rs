@@ -38,11 +38,192 @@ pub(crate) struct StatusContext {
     /// the chip glyph (`▼` expanded, `▶` collapsed) so the key's
     /// target state is visible.
     pub task_board_expanded: bool,
-    /// `(running, stalled)` counts of the BackgroundTaskRegistry.
-    /// `None` when the registry has no live state to surface; the
-    /// chip also hides on `Some((0, 0))` so a long-lived registry
-    /// with no live tasks doesn't waste status-line width.
-    pub bg_task_counts: Option<(usize, usize)>,
+    /// Counts of the BackgroundTaskRegistry states that need user
+    /// visibility. `None` when the registry has no live/attention
+    /// state to surface.
+    pub bg_task_counts: Option<BackgroundTaskCounts>,
+    /// Fanout group summaries derived from the same typed background
+    /// task rows. Empty when no active/attention fanout group should
+    /// be called out separately.
+    pub bg_fanout_summaries: Vec<BackgroundTaskFanoutSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BackgroundTaskCounts {
+    /// Running shell tasks.
+    pub running: usize,
+    /// Shell tasks waiting for input.
+    pub waiting: usize,
+    /// Failed typed tasks needing attention.
+    pub failed_shells: usize,
+    pub failed_local_agents: usize,
+    pub failed_cloud_sessions: usize,
+    pub failed_main_sessions: usize,
+    pub failed_monitors: usize,
+    pub unavailable_shells: usize,
+    pub unavailable_local_agents: usize,
+    pub unavailable_cloud_sessions: usize,
+    pub unavailable_main_sessions: usize,
+    pub unavailable_monitors: usize,
+    pub local_agents: usize,
+    pub cloud_sessions: usize,
+    pub main_sessions: usize,
+    pub monitors: usize,
+}
+
+impl BackgroundTaskCounts {
+    pub(crate) fn failed_total(self) -> usize {
+        self.failed_shells
+            + self.failed_local_agents
+            + self.failed_cloud_sessions
+            + self.failed_main_sessions
+            + self.failed_monitors
+    }
+
+    pub(crate) fn unavailable_total(self) -> usize {
+        self.unavailable_shells
+            + self.unavailable_local_agents
+            + self.unavailable_cloud_sessions
+            + self.unavailable_main_sessions
+            + self.unavailable_monitors
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.running == 0
+            && self.waiting == 0
+            && self.failed_total() == 0
+            && self.unavailable_total() == 0
+            && self.local_agents == 0
+            && self.cloud_sessions == 0
+            && self.main_sessions == 0
+            && self.monitors == 0
+    }
+
+    pub(crate) fn from_rows(
+        rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
+    ) -> Self {
+        use crate::tui::bottom_pane::background_task_view::{
+            BackgroundTaskKind, BackgroundTaskStatus,
+        };
+        let mut counts = Self::default();
+        for row in rows {
+            match row.status {
+                BackgroundTaskStatus::Running | BackgroundTaskStatus::Pending => match row.kind {
+                    BackgroundTaskKind::Shell => counts.running += 1,
+                    BackgroundTaskKind::LocalAgent => counts.local_agents += 1,
+                    BackgroundTaskKind::CloudSession => counts.cloud_sessions += 1,
+                    BackgroundTaskKind::MainSession => counts.main_sessions += 1,
+                    BackgroundTaskKind::Monitor => counts.monitors += 1,
+                },
+                BackgroundTaskStatus::WaitingForInput => counts.waiting += 1,
+                BackgroundTaskStatus::Failed => match row.kind {
+                    BackgroundTaskKind::Shell => counts.failed_shells += 1,
+                    BackgroundTaskKind::LocalAgent => counts.failed_local_agents += 1,
+                    BackgroundTaskKind::CloudSession => counts.failed_cloud_sessions += 1,
+                    BackgroundTaskKind::MainSession => counts.failed_main_sessions += 1,
+                    BackgroundTaskKind::Monitor => counts.failed_monitors += 1,
+                },
+                BackgroundTaskStatus::Unavailable => match row.kind {
+                    BackgroundTaskKind::Shell => counts.unavailable_shells += 1,
+                    BackgroundTaskKind::LocalAgent => counts.unavailable_local_agents += 1,
+                    BackgroundTaskKind::CloudSession => counts.unavailable_cloud_sessions += 1,
+                    BackgroundTaskKind::MainSession => counts.unavailable_main_sessions += 1,
+                    BackgroundTaskKind::Monitor => counts.unavailable_monitors += 1,
+                },
+                BackgroundTaskStatus::Killed | BackgroundTaskStatus::Completed => {}
+            }
+        }
+        counts
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BackgroundTaskFanoutSummary {
+    pub group_id: String,
+    pub title: String,
+    pub target_count: usize,
+    pub running: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub stopped: usize,
+    pub unavailable: usize,
+}
+
+impl BackgroundTaskFanoutSummary {
+    pub(crate) fn from_rows(
+        rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
+    ) -> Vec<Self> {
+        let mut groups = Vec::<Self>::new();
+        for row in rows {
+            let Some(fanout) = row.fanout.as_ref() else {
+                continue;
+            };
+            let idx = if let Some(idx) = groups
+                .iter()
+                .position(|group| group.group_id == fanout.group_id)
+            {
+                idx
+            } else {
+                groups.push(Self {
+                    group_id: fanout.group_id.clone(),
+                    title: fanout.group_title.clone(),
+                    target_count: fanout.target_count,
+                    ..Self::default()
+                });
+                groups.len() - 1
+            };
+            let group = &mut groups[idx];
+            group.target_count = group.target_count.max(fanout.target_count);
+            match row.status {
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Pending
+                | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Running
+                | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput => {
+                    group.running += 1;
+                }
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => {
+                    group.done += 1;
+                }
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => {
+                    group.failed += 1;
+                }
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => {
+                    group.stopped += 1;
+                }
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable => {
+                    group.unavailable += 1;
+                }
+            }
+        }
+
+        groups
+            .into_iter()
+            .filter(|group| group.running > 0 || group.failed > 0 || group.unavailable > 0)
+            .collect()
+    }
+
+    fn text(&self) -> String {
+        let mut parts = Vec::new();
+        if self.running > 0 {
+            parts.push(format!(
+                "{}/{} running",
+                self.running,
+                self.target_count.max(self.running)
+            ));
+        }
+        if self.done > 0 {
+            parts.push(format!("{} done", self.done));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if self.stopped > 0 {
+            parts.push(format!("{} stopped", self.stopped));
+        }
+        if self.unavailable > 0 {
+            parts.push(format!("{} unavailable", self.unavailable));
+        }
+        format!("{} {}", truncate_end(&self.title, 24), parts.join(" · "))
+    }
 }
 
 /// A styled text fragment that appears on either side of the line.
@@ -75,6 +256,100 @@ impl Segment {
 pub(crate) struct StatusLine {
     pub left: Vec<Segment>,
     pub right: Vec<Segment>,
+}
+
+fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
+    let mut parts = Vec::new();
+    for (count, singular, plural) in [
+        (counts.failed_shells, "shell", "shells"),
+        (counts.failed_local_agents, "local agent", "local agents"),
+        (
+            counts.failed_cloud_sessions,
+            "cloud session",
+            "cloud sessions",
+        ),
+        (counts.failed_main_sessions, "main session", "main sessions"),
+        (counts.failed_monitors, "monitor", "monitors"),
+    ] {
+        if count > 0 {
+            parts.push(format!(
+                "{} failed",
+                pluralize_with_count(count, singular, plural)
+            ));
+        }
+    }
+    if counts.waiting > 0 {
+        parts.push(pluralize_with_count(
+            counts.waiting,
+            "needs input",
+            "need input",
+        ));
+    }
+    for (count, singular, plural) in [
+        (counts.unavailable_shells, "shell", "shells"),
+        (
+            counts.unavailable_local_agents,
+            "local agent",
+            "local agents",
+        ),
+        (
+            counts.unavailable_cloud_sessions,
+            "cloud session",
+            "cloud sessions",
+        ),
+        (
+            counts.unavailable_main_sessions,
+            "main session",
+            "main sessions",
+        ),
+        (counts.unavailable_monitors, "monitor", "monitors"),
+    ] {
+        if count > 0 {
+            parts.push(format!(
+                "{} unavailable",
+                pluralize_with_count(count, singular, plural)
+            ));
+        }
+    }
+
+    let kind_counts = [
+        (counts.running, "shell", "shells"),
+        (counts.local_agents, "local agent", "local agents"),
+        (counts.cloud_sessions, "cloud session", "cloud sessions"),
+        (counts.main_sessions, "main session", "main sessions"),
+        (counts.monitors, "monitor", "monitors"),
+    ];
+    let visible_kinds: Vec<_> = kind_counts
+        .into_iter()
+        .filter(|(count, _, _)| *count > 0)
+        .collect();
+    if visible_kinds.len() >= 3 {
+        let total = visible_kinds
+            .iter()
+            .map(|(count, _, _)| *count)
+            .sum::<usize>();
+        parts.push(pluralize_with_count(
+            total,
+            "background task",
+            "background tasks",
+        ));
+    } else {
+        parts.extend(
+            visible_kinds
+                .into_iter()
+                .map(|(count, singular, plural)| pluralize_with_count(count, singular, plural)),
+        );
+    }
+
+    parts
 }
 
 /// Threshold below which the budget chip is dim, above which it warns.
@@ -183,30 +458,34 @@ impl StatusLine {
             }
         }
 
-        // BackgroundTaskRegistry chip. Surfaces local shell commands so the
-        // user knows how many are live without opening a separate view.
-        // Style:
-        //   - any stalled → yellow (alarm: process likely waiting on
-        //     interactive input; user should kill or acknowledge)
-        //   - running only → dim (informational)
-        //   - both 0 → chip hidden (registry exists but is idle)
-        if let Some((running, stalled)) = ctx.bg_task_counts {
-            if running > 0 || stalled > 0 {
-                let mut text = if running == 1 {
-                    "1 background command".to_string()
+        for summary in &ctx.bg_fanout_summaries {
+            out.left.push(Segment::styled(
+                summary.text(),
+                Style::default().fg(if summary.failed > 0 {
+                    Color::Red
+                } else if summary.unavailable > 0 {
+                    Color::Yellow
                 } else {
-                    format!("{running} background commands")
-                };
-                if stalled > 0 {
-                    text.push_str(&format!(" · {stalled} waiting"));
-                }
-                let style = if stalled > 0 {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    muted
-                };
-                out.left.push(Segment::styled(text, style));
-            }
+                    Color::Magenta
+                }),
+            ));
+        }
+
+        // BackgroundTaskRegistry chip. Running tasks are informational;
+        // needs-input/failed tasks are attention states and stay visible
+        // even after no shell is making forward progress.
+        if let Some(counts) = ctx.bg_task_counts
+            && !counts.is_empty()
+        {
+            let parts = background_task_count_parts(counts);
+            let style = if counts.failed_total() > 0 {
+                Style::default().fg(Color::Red)
+            } else if counts.waiting > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                muted
+            };
+            out.left.push(Segment::styled(parts.join(" · "), style));
         }
 
         // ── Right: cwd · budget · branch · cost ────────────────────

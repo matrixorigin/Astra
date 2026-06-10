@@ -137,10 +137,15 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
         if state.journal.is_none() {
             return;
         }
-        let start_event = session_journal::JournalEvent::session_start(
+        let mut start_event = session_journal::JournalEvent::session_start(
             Some(session_id),
             astra_core::model_override::normalize_model_override(state.model.as_deref()),
         );
+        start_event.edge_policy = Some(session_journal::EdgePolicySnapshot {
+            permission_mode: Some(state.perm_manager.mode().to_string()),
+            cloud_policy_version: None,
+            rules_fingerprint: None,
+        });
         let start_append = state
             .journal
             .as_ref()
@@ -211,6 +216,13 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
         && (ws.model.is_none() || (!workspace_existed && ws.model.as_deref() != Some(model)))
     {
         ws.model = Some(model.to_string());
+        dirty = true;
+    }
+    let permission_mode = state.perm_manager.mode().to_string();
+    if (!workspace_existed || ws.permission_mode.is_none())
+        && ws.permission_mode.as_deref() != Some(permission_mode.as_str())
+    {
+        ws.permission_mode = Some(permission_mode);
         dirty = true;
     }
     if !workspace_existed {
@@ -1224,6 +1236,7 @@ mod tests {
         let sid = "sess-existing-workspace";
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(sid, "old-model");
         ws.turn_count = 7;
+        ws.permission_mode = Some("plan".into());
         ws.last_context_trace = Some(astra_services::session_workspace::ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: None,
@@ -1259,6 +1272,7 @@ mod tests {
 
         let persisted = astra_services::session_workspace::read_workspace(sid).unwrap();
         assert_eq!(persisted.model.as_deref(), Some("old-model"));
+        assert_eq!(persisted.permission_mode.as_deref(), Some("plan"));
         assert_eq!(persisted.turn_count, 7);
         assert_eq!(
             persisted

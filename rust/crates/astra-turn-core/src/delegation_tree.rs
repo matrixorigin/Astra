@@ -248,6 +248,8 @@ mod tests {
             started_at: SystemTime::now(),
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
+            run_in_background: false,
+            fanout_slot: None,
         }
     }
 

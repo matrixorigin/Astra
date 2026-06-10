@@ -53,7 +53,7 @@ async fn persist_background_task_result(
             svc,
             task_id,
             "persistence_error",
-            format!("failed to save background job result: {error}"),
+            format!("failed to save background task result: {error}"),
         )
         .await);
     }
@@ -65,7 +65,7 @@ async fn persist_background_task_result(
                     svc,
                     task_id,
                     "persistence_error",
-                    format!("failed to mark background job finalized: {error}"),
+                    format!("failed to mark background task finalized: {error}"),
                 )
                 .await);
             }
@@ -79,7 +79,7 @@ async fn persist_background_task_result(
                     svc,
                     task_id,
                     "persistence_error",
-                    format!("failed to mark background job finalized: {error}"),
+                    format!("failed to mark background task finalized: {error}"),
                 )
                 .await);
             }
@@ -126,9 +126,9 @@ pub(crate) async fn handle_task_command(
         None => {
             eprintln!(
                 "{}",
-                "  ⚠ Job service not available (local-only mode).".yellow()
+                "  ⚠ Task service not available (local-only mode).".yellow()
             );
-            eprintln!("{}", "  Use /login to enable cloud job tracking.".dim());
+            eprintln!("{}", "  Use /login to enable cloud task tracking.".dim());
             return;
         }
     };
@@ -144,13 +144,13 @@ pub(crate) async fn handle_task_command(
             Ok(tasks) if tasks.is_empty() => {
                 eprintln!(
                     "  {}",
-                    "No recent jobs. Use /job run <prompt> to start one.".dim()
+                    "No recent tasks. Use /task run <prompt> to start one.".dim()
                 );
             }
             Ok(tasks) => {
                 eprintln!(
                     "\n{}",
-                    "─── Recent Jobs ─────────────────────────────────".bold()
+                    "─── Recent Tasks ─────────────────────────────────".bold()
                 );
                 for t in &tasks {
                     let icon = task_list_item_status_icon(t);
@@ -177,7 +177,7 @@ pub(crate) async fn handle_task_command(
                 }
                 eprintln!(
                     "  {}",
-                    "Use /job pending for the oldest-first claimable queue.".dim()
+                    "Use /task pending for the oldest-first claimable queue.".dim()
                 );
                 eprintln!();
             }
@@ -225,7 +225,7 @@ pub(crate) async fn handle_task_command(
                         let read = load_task_result_read_surface(&t);
                         eprintln!(
                             "\n{}",
-                            "─── Job Detail ──────────────────────────────────".bold()
+                            "─── Task Detail ─────────────────────────────────".bold()
                         );
                         eprintln!("  {:<12} {}", "id:".dim(), t.task_id.as_str().magenta());
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
@@ -259,14 +259,14 @@ pub(crate) async fn handle_task_command(
                         eprintln!();
                     }
                     Ok(None) => {
-                        eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
-                        eprintln!("{}", "  Use /job list to see available jobs.".dim());
+                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                        eprintln!("{}", "  Use /task list to see available tasks.".dim());
                     }
                     Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
                 },
                 Ok(None) => {
-                    eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /job list to see available jobs.".dim());
+                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
                 }
                 Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
@@ -314,7 +314,7 @@ pub(crate) async fn handle_task_command(
             };
             let short_id = task_id[..8.min(task_id.len())].to_string();
 
-            // Clone owned values for the background job
+            // Clone owned values for the background task
             let api_clone = api.clone();
             let prompt = sub_arg.to_string();
             let bg_profile = profile.map(ToString::to_string);
@@ -338,7 +338,7 @@ pub(crate) async fn handle_task_command(
             let bg_root_agent_id = format!("task-{task_id}");
 
             eprintln!(
-                "  {} Background job started: {} ({})",
+                "  {} Background task started: {} ({})",
                 "▶".magenta(),
                 if sub_arg.len() > 50 {
                     format!("{}…", sub_arg.chars().take(50).collect::<String>())
@@ -349,10 +349,10 @@ pub(crate) async fn handle_task_command(
             );
             eprintln!(
                 "  {}",
-                "Use /job status or /job result to check progress.".dim()
+                "Use /task status or /task result to check progress.".dim()
             );
 
-            // Spawn background job
+            // Spawn background task
             let bg_task_id = task_id.clone();
             tokio::spawn(async move {
                 // Mark in-progress
@@ -465,7 +465,7 @@ pub(crate) async fn handle_task_command(
                                     "completed"
                                 };
                                 eprintln!(
-                                    "\n  {} Background job {} {}. Use /job result {} to view.",
+                                    "\n  {} Background task {} {}. Use /task result {} to view.",
                                     icon,
                                     short.magenta(),
                                     terminal,
@@ -474,7 +474,7 @@ pub(crate) async fn handle_task_command(
                             }
                             Err(error) => {
                                 eprintln!(
-                                    "\n  {} Background job {} failed: {}",
+                                    "\n  {} Background task {} failed: {}",
                                     theme::icon_err(),
                                     short.magenta(),
                                     error.red()
@@ -491,7 +491,7 @@ pub(crate) async fn handle_task_command(
                         )
                         .await;
                         eprintln!(
-                            "\n  {} Background job {} failed: {}",
+                            "\n  {} Background task {} failed: {}",
                             theme::icon_err(),
                             short.magenta(),
                             error.red()
@@ -501,7 +501,7 @@ pub(crate) async fn handle_task_command(
             });
         }
         "result" if !sub_arg.is_empty() => {
-            // Show the full result of a background job.
+            // Show the full result of a background task.
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.get_task(&tid).await {
                     Ok(Some(t)) => {
@@ -509,7 +509,7 @@ pub(crate) async fn handle_task_command(
                         let short = &t.task_id[..8.min(t.task_id.len())];
                         eprintln!(
                             "\n{}",
-                            format!("─── Job Result ({short}) ──────────────────────────").bold()
+                            format!("─── Task Result ({short}) ─────────────────────────").bold()
                         );
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
                         for field in task_result_header_fields(&read) {
@@ -549,19 +549,19 @@ pub(crate) async fn handle_task_command(
                         eprintln!();
                     }
                     Ok(None) => {
-                        eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
+                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
                     }
                     Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
                 },
                 Ok(None) => {
-                    eprintln!("{}", format!("  Job not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /job list to see available jobs.".dim());
+                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
                 }
                 Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
         }
         _ => {
-            eprintln!("  Usage: /job [list | pending | status <id> | run <prompt> | result <id>]");
+            eprintln!("  Usage: /task [list | pending | status <id> | run <prompt> | result <id>]");
         }
     }
 }
@@ -974,7 +974,7 @@ mod tests {
                 ),
                 (
                     "persistence_error".to_string(),
-                    serde_json::json!("write job output: permission denied"),
+                    serde_json::json!("write task output: permission denied"),
                 ),
             ]),
         };
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(checkpoint.interruption_kind, Some("budget_exhausted"));
         assert_eq!(
             checkpoint.persistence_error,
-            Some("write job output: permission denied")
+            Some("write task output: permission denied")
         );
     }
 
@@ -1015,10 +1015,10 @@ mod tests {
             ),
             (
                 Some("persistence_error"),
-                "failed to save background job result: disk full"
+                "failed to save background task result: disk full"
             )
         );
-        assert!(err.contains("failed to save background job result"));
+        assert!(err.contains("failed to save background task result"));
     }
 
     #[tokio::test]

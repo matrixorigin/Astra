@@ -144,6 +144,9 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "agent" => agent_preview(args, path_budget, verbose),
         "skill" => skill_preview(args, path_budget, verbose),
         "task" => task_preview(args, path_budget, verbose),
+        "task_output" => background_task_output_preview(args, path_budget, verbose),
+        "task_stop" => background_task_stop_preview(args, path_budget, verbose),
+        "task_list" => "List background tasks".to_string(),
 
         // ── Web ─────────────────────────────────────────────────────
         "web_fetch" => {
@@ -620,6 +623,48 @@ fn task_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: boo
     }
 }
 
+fn background_task_id(args: &Value) -> Option<&str> {
+    args.get("task_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn background_task_output_preview(
+    args: &Value,
+    path_budget: impl Fn(usize) -> usize,
+    verbose: bool,
+) -> String {
+    let trunc = |s: &str, b: usize| -> String {
+        if verbose {
+            s.to_string()
+        } else {
+            truncate_line(s, b)
+        }
+    };
+    match background_task_id(args) {
+        Some(id) => format!("Read shell output {}", trunc(id, path_budget(18))),
+        None => "Read shell output".to_string(),
+    }
+}
+
+fn background_task_stop_preview(
+    args: &Value,
+    path_budget: impl Fn(usize) -> usize,
+    verbose: bool,
+) -> String {
+    let trunc = |s: &str, b: usize| -> String {
+        if verbose {
+            s.to_string()
+        } else {
+            truncate_line(s, b)
+        }
+    };
+    match background_task_id(args) {
+        Some(id) => format!("Stop background task {}", trunc(id, path_budget(22))),
+        None => "Stop background task".to_string(),
+    }
+}
+
 /// LSP preview — the unified Language Server tool. The `operation`
 /// enum covers what were once dozens of individual tool names
 /// (find_references, hover, rename_symbol, …) so one preview branch
@@ -780,6 +825,19 @@ mod tests {
     #[test]
     fn bash_shows_dollar_prefix() {
         assert_eq!(p("bash", json!({"command": "ls -la"})), "$ ls -la");
+    }
+
+    #[test]
+    fn typed_background_task_tools_render_previews() {
+        assert_eq!(
+            p("task_output", json!({"task_id": "bg-shell-3"})),
+            "Read shell output bg-shell-3"
+        );
+        assert_eq!(
+            p("task_stop", json!({"task_id": "bg-shell-3"})),
+            "Stop background task bg-shell-3"
+        );
+        assert_eq!(p("task_list", json!({})), "List background tasks");
     }
 
     #[test]

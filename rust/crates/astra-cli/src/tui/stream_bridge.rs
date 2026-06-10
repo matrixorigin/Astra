@@ -247,11 +247,15 @@ fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             label,
             tool_use_id,
             agent_id,
+            fanout_slot,
+            fanout_title,
         } => TuiAppEvent::AgentControlStarted {
             action,
             label,
             tool_use_id,
             agent_id,
+            fanout_slot,
+            fanout_title,
         },
         StreamEvent::ToolCompleted {
             name,

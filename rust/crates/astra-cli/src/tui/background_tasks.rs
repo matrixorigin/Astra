@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use astra_pipeline::output_stream::OutputStream;
+use astra_services::session_workspace::BackgroundShellTaskProjection;
 use astra_text_utils::str_preview::truncate_line;
 use tokio::process::Command;
 use tokio::task::JoinSet;
@@ -41,14 +42,44 @@ impl BgTaskStatus {
         !matches!(self, Self::Running | Self::Stalled)
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Killed => "killed",
-            Self::Stalled => "stalled",
+            Self::Stalled => "waiting_for_input",
         }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "killed" => Some(Self::Killed),
+            "waiting_for_input" => Some(Self::Stalled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BgTaskLiveControl {
+    Available,
+    StaleHandle,
+}
+
+impl BgTaskLiveControl {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::StaleHandle => "stale_handle",
+        }
+    }
+
+    fn is_available(self) -> bool {
+        matches!(self, Self::Available)
     }
 }
 
@@ -60,23 +91,27 @@ pub(crate) enum BgTaskEvent {
     },
     Completed {
         id: String,
+        title: String,
         exit_code: Option<i32>,
         summary: String,
     },
     Failed {
         id: String,
+        title: String,
         error: String,
     },
     Killed {
         id: String,
+        title: String,
     },
     Stalled {
         id: String,
+        title: String,
         last_output_tail: String,
     },
 }
 
-/// Result collected when a background command's future completes.
+/// Result collected when a background shell's future completes.
 struct TaskCompletion {
     id: String,
     status: BgTaskStatus,
@@ -92,9 +127,14 @@ pub(crate) struct BackgroundTaskHandle {
     pub description: String,
     status: Arc<AtomicU8>,
     pub started_at: Instant,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub live_control: BgTaskLiveControl,
     pub cancel_token: CancellationToken,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
+    pub exit_code: Option<i32>,
+    pub terminal_reason: Option<String>,
     last_output_size: u64,
     last_activity: Instant,
     last_tail_probe_at: Option<Instant>,
@@ -109,6 +149,25 @@ impl BackgroundTaskHandle {
             4 => BgTaskStatus::Stalled,
             _ => BgTaskStatus::Running,
         }
+    }
+
+    pub fn projected_status(&self) -> &'static str {
+        let status = self.status();
+        if !self.live_control.is_available() && !status.is_terminal() {
+            "unavailable"
+        } else {
+            status.as_str()
+        }
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        if let Some(ended_at_ms) = self.ended_at_ms {
+            return ended_at_ms.saturating_sub(self.started_at_ms);
+        }
+        self.started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     fn set_status(&self, s: BgTaskStatus) {
@@ -189,9 +248,14 @@ impl BackgroundTaskRegistry {
             description: description.to_string(),
             status: status.clone(),
             started_at: Instant::now(),
+            started_at_ms: unix_epoch_millis(),
+            ended_at_ms: None,
+            live_control: BgTaskLiveControl::Available,
             cancel_token: cancel.clone(),
             stdout_path: stdout_path.clone(),
             stderr_path: stderr_path.clone(),
+            exit_code: None,
+            terminal_reason: None,
             last_output_size: 0,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
@@ -278,9 +342,14 @@ impl BackgroundTaskRegistry {
             description: command_label.to_string(),
             status: status.clone(),
             started_at: Instant::now(),
+            started_at_ms: unix_epoch_millis(),
+            ended_at_ms: None,
+            live_control: BgTaskLiveControl::Available,
             cancel_token: cancel.clone(),
             stdout_path: stdout_path.clone(),
             stderr_path: stderr_path.clone(),
+            exit_code: None,
+            terminal_reason: None,
             last_output_size: partial_stdout.len() as u64 + partial_stderr.len() as u64,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
@@ -313,7 +382,62 @@ impl BackgroundTaskRegistry {
         id
     }
 
-    /// Kill a background command by ID.
+    pub fn restore_shell_task_projection(
+        &mut self,
+        projection: BackgroundShellTaskProjection,
+    ) -> Result<(), String> {
+        let id = projection.id.trim();
+        if id.is_empty() {
+            return Err("background shell projection id is required".to_string());
+        }
+        let status = BgTaskStatus::from_str(projection.status.as_str()).ok_or_else(|| {
+            format!(
+                "invalid background shell status '{}' for {}",
+                projection.status, projection.id
+            )
+        })?;
+        let stdout_path = PathBuf::from(projection.stdout_path);
+        let stderr_path = PathBuf::from(projection.stderr_path);
+        let last_output_size = std::fs::metadata(&stdout_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+            .saturating_add(
+                std::fs::metadata(&stderr_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            );
+        let handle = BackgroundTaskHandle {
+            id: id.to_string(),
+            description: projection.title,
+            status: Arc::new(AtomicU8::new(status as u8)),
+            started_at: instant_from_unix_epoch_millis(projection.started_at_ms),
+            started_at_ms: projection.started_at_ms,
+            ended_at_ms: projection.ended_at_ms,
+            live_control: BgTaskLiveControl::StaleHandle,
+            cancel_token: CancellationToken::new(),
+            stdout_path,
+            stderr_path,
+            exit_code: projection.exit_code,
+            terminal_reason: projection.terminal_reason,
+            last_output_size,
+            last_activity: Instant::now(),
+            last_tail_probe_at: None,
+        };
+        self.tasks.insert(id.to_string(), handle);
+        Ok(())
+    }
+
+    pub fn restore_shell_task_projections(
+        &mut self,
+        projections: Vec<BackgroundShellTaskProjection>,
+    ) -> Result<(), String> {
+        for projection in projections {
+            self.restore_shell_task_projection(projection)?;
+        }
+        Ok(())
+    }
+
+    /// Kill a background shell by ID.
     pub fn kill(&mut self, id: &str) -> Result<(), String> {
         // Drain any completed futures into pending_completions so we
         // have accurate status. Use the internal drain helper that
@@ -323,9 +447,12 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background command with id '{id}'"))?;
+            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+        if !handle.live_control.is_available() {
+            return Err(format!("background shell '{id}' has a stale handle"));
+        }
         if handle.status().is_terminal() {
-            return Err(format!("background command '{id}' already terminated"));
+            return Err(format!("background shell '{id}' already terminated"));
         }
         // Only signal cancellation. The runner observes this via
         // `cancel.cancelled()`, kills the child, and emits its own
@@ -336,40 +463,81 @@ impl BackgroundTaskRegistry {
         Ok(())
     }
 
-    pub fn latest_job_id(&mut self) -> Option<String> {
+    pub fn render_background_task_list_xml(&mut self) -> String {
         self.drain_join_set();
-        self.tasks
-            .values()
-            .max_by_key(|handle| handle.started_at)
-            .map(|handle| handle.id.clone())
-    }
-
-    pub fn render_job_list_xml(&mut self) -> String {
-        self.drain_join_set();
-        let mut jobs: Vec<_> = self.tasks.values().collect();
-        jobs.sort_by_key(|handle| handle.started_at);
-        if jobs.is_empty() {
-            return "<background_jobs count=\"0\" />".to_string();
+        let mut tasks: Vec<_> = self.tasks.values().collect();
+        tasks.sort_by_key(|handle| {
+            let attention_rank = match handle.projected_status() {
+                "waiting_for_input" | "failed" => 0,
+                "running" => 1,
+                "killed" => 2,
+                "completed" => 3,
+                _ => 4,
+            };
+            (attention_rank, handle.started_at)
+        });
+        if tasks.is_empty() {
+            return "<background_tasks count=\"0\" />".to_string();
         }
 
-        let mut out = format!("<background_jobs count=\"{}\">", jobs.len());
-        for handle in jobs {
-            out.push_str(&format!(
-                "\n<job id=\"{}\" status=\"{}\" elapsed_ms=\"{}\">{}</job>",
-                xml_escape(&handle.id),
-                handle.status().as_str(),
-                handle.started_at.elapsed().as_millis(),
-                xml_escape(&handle.description),
-            ));
+        let mut out = format!("<background_tasks count=\"{}\">", tasks.len());
+        for handle in tasks {
+            let mut attrs = vec![
+                ("id", xml_escape(&handle.id)),
+                ("kind", "shell".to_string()),
+                ("status", handle.projected_status().to_string()),
+                ("live_control", handle.live_control.as_str().to_string()),
+                ("elapsed_ms", handle.elapsed_ms().to_string()),
+                ("started_at_ms", handle.started_at_ms.to_string()),
+                ("command", xml_escape(&handle.description)),
+                (
+                    "output_ref",
+                    xml_escape(&format!(
+                        "stdout: {} · stderr: {}",
+                        handle.stdout_path.display(),
+                        handle.stderr_path.display()
+                    )),
+                ),
+            ];
+            match self.get_combined_output_stats(&handle.id, 8192) {
+                Ok((output, total_bytes, total_lines)) => {
+                    let offset = total_bytes.saturating_sub(output.as_bytes().len() as u64);
+                    attrs.push(("output_offset", offset.to_string()));
+                    attrs.push(("total_output_bytes", total_bytes.to_string()));
+                    attrs.push(("total_output_lines", total_lines.to_string()));
+                    if let Some(preview) = output.lines().next_back().map(str::trim) {
+                        if !preview.is_empty() {
+                            attrs.push(("preview", xml_escape(&truncate_line(preview, 160))));
+                        }
+                    }
+                }
+                Err(error) => {
+                    attrs.push(("output_error", xml_escape(&error)));
+                }
+            }
+            if let Some(exit_code) = handle.exit_code {
+                attrs.push(("exit_code", exit_code.to_string()));
+            }
+            if let Some(ended_at_ms) = handle.ended_at_ms {
+                attrs.push(("ended_at_ms", ended_at_ms.to_string()));
+            }
+            if let Some(reason) = handle.terminal_reason.as_deref() {
+                attrs.push(("terminal_reason", xml_escape(reason)));
+            }
+            out.push_str("\n<task");
+            for (key, value) in attrs {
+                out.push_str(&format!(" {key}=\"{value}\""));
+            }
+            out.push_str(" />");
         }
-        out.push_str("\n</background_jobs>");
+        out.push_str("\n</background_tasks>");
         out
     }
 
     /// Drain the JoinSet without consuming pending_completions.
     /// Collect all completed `JoinSet` futures and push terminal events
     /// into `pending_completions`. Must be called before any method that
-    /// reads task state (`kill`, `latest_job_id`, `render_job_list_xml`,
+    /// reads task state (`kill`, `render_background_task_list_xml`,
     /// `poll_completions`, etc.) to ensure handles reflect the latest
     /// runner-reported status.
     ///
@@ -379,28 +547,48 @@ impl BackgroundTaskRegistry {
         while let Some(result) = self.join_set.try_join_next() {
             match result {
                 Ok(completion) => {
-                    if let Some(handle) = self.tasks.get(&completion.id) {
+                    let mut title = completion.id.clone();
+                    if let Some(handle) = self.tasks.get_mut(&completion.id) {
+                        title = handle.description.clone();
                         if !handle.set_status_if_non_terminal(completion.status) {
                             continue;
                         }
+                        handle.ended_at_ms = Some(unix_epoch_millis());
+                        handle.exit_code = completion.exit_code;
+                        handle.terminal_reason =
+                            completion
+                                .error
+                                .clone()
+                                .or_else(|| match completion.status {
+                                    BgTaskStatus::Completed => {
+                                        completion.exit_code.map(|code| format!("exit code {code}"))
+                                    }
+                                    BgTaskStatus::Killed => Some("stopped by user".to_string()),
+                                    _ => None,
+                                });
                     }
                     let event = match completion.status {
                         BgTaskStatus::Completed => BgTaskEvent::Completed {
                             id: completion.id,
+                            title,
                             exit_code: completion.exit_code,
                             summary: completion.summary,
                         },
                         BgTaskStatus::Failed => BgTaskEvent::Failed {
                             id: completion.id,
+                            title,
                             error: completion.error.unwrap_or_default(),
                         },
-                        BgTaskStatus::Killed => BgTaskEvent::Killed { id: completion.id },
+                        BgTaskStatus::Killed => BgTaskEvent::Killed {
+                            id: completion.id,
+                            title,
+                        },
                         _ => continue,
                     };
                     self.pending_completions.push(event);
                 }
                 Err(e) => {
-                    tracing::warn!("background command join error: {e}");
+                    tracing::warn!("background shell join error: {e}");
                 }
             }
         }
@@ -412,7 +600,7 @@ impl BackgroundTaskRegistry {
         let ids: Vec<String> = self
             .tasks
             .iter()
-            .filter(|(_, h)| !h.status().is_terminal())
+            .filter(|(_, h)| h.live_control.is_available() && !h.status().is_terminal())
             .map(|(id, _)| id.clone())
             .collect();
         for id in &ids {
@@ -426,22 +614,28 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background command with id '{id}'"))?;
+            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+        if handle.status().is_terminal() && !handle.stdout_path.exists() {
+            return Err(missing_output_artifact_error(&handle.stdout_path));
+        }
         read_tail_str(&handle.stdout_path, tail_bytes)
     }
 
     /// Read output from a task's stdout file starting at `offset`.
-    /// Returns `(content, end_offset, total_bytes)`.
+    /// Returns `(content, end_offset, total_bytes, total_lines)`.
     pub fn get_output_since(
         &self,
         id: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<(String, u64, u64), String> {
+    ) -> Result<(String, u64, u64, u64), String> {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background command with id '{id}'"))?;
+            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+        if handle.status().is_terminal() && !handle.stdout_path.exists() {
+            return Err(missing_output_artifact_error(&handle.stdout_path));
+        }
         read_from_str(&handle.stdout_path, offset, max_bytes)
     }
 
@@ -450,7 +644,7 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background command with id '{id}'"))?;
+            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
         read_tail_str(&handle.stderr_path, tail_bytes)
     }
 
@@ -475,6 +669,26 @@ impl BackgroundTaskRegistry {
         Ok((combined, stdout_bytes.saturating_add(stderr_bytes)))
     }
 
+    /// Read stdout/stderr tail plus total byte and line counts for detail views.
+    pub fn get_combined_output_stats(
+        &self,
+        id: &str,
+        tail_bytes: usize,
+    ) -> Result<(String, u64, u64), String> {
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+        let (combined, total_bytes) = self.get_combined_output(id, tail_bytes)?;
+        let stdout_lines = count_file_lines(&handle.stdout_path).unwrap_or(0);
+        let stderr_lines = count_file_lines(&handle.stderr_path).unwrap_or(0);
+        Ok((
+            combined,
+            total_bytes,
+            stdout_lines.saturating_add(stderr_lines),
+        ))
+    }
+
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
@@ -487,6 +701,9 @@ impl BackgroundTaskRegistry {
         self.drain_join_set();
         let mut stall_events = Vec::new();
         for handle in self.tasks.values_mut() {
+            if !handle.live_control.is_available() {
+                continue;
+            }
             if handle.status().is_terminal() {
                 continue;
             }
@@ -503,10 +720,12 @@ impl BackgroundTaskRegistry {
             if current_size > MAX_OUTPUT_BYTES {
                 handle.cancel_token.cancel();
                 if handle.set_status_if_non_terminal(BgTaskStatus::Failed) {
+                    handle.ended_at_ms = Some(unix_epoch_millis());
                     stall_events.push(BgTaskEvent::Failed {
                         id: handle.id.clone(),
+                        title: handle.description.clone(),
                         error: format!(
-                            "background command output exceeded {} bytes; command was terminated",
+                            "background shell output exceeded {} bytes; shell was terminated",
                             MAX_OUTPUT_BYTES
                         ),
                     });
@@ -532,6 +751,7 @@ impl BackgroundTaskRegistry {
                         handle.set_status(BgTaskStatus::Stalled);
                         let event = BgTaskEvent::Stalled {
                             id: handle.id.clone(),
+                            title: handle.description.clone(),
                             last_output_tail: tail,
                         };
                         stall_events.push(event);
@@ -555,14 +775,14 @@ impl BackgroundTaskRegistry {
 
     /// Number of currently running (non-terminal, non-stalled) tasks.
     /// Stalled is excluded so the status-line "BG: N running"
-    /// represents only forward-progress jobs; stalled is reported
+    /// represents only forward-progress tasks; stalled is reported
     /// separately via [`stalled_count`].
     pub fn running_count(&self) -> usize {
         self.tasks
             .values()
             .filter(|h| {
                 let s = h.status();
-                !s.is_terminal() && s != BgTaskStatus::Stalled
+                h.live_control.is_available() && !s.is_terminal() && s != BgTaskStatus::Stalled
             })
             .count()
     }
@@ -572,7 +792,16 @@ impl BackgroundTaskRegistry {
     pub fn stalled_count(&self) -> usize {
         self.tasks
             .values()
-            .filter(|h| h.status() == BgTaskStatus::Stalled)
+            .filter(|h| h.live_control.is_available() && h.status() == BgTaskStatus::Stalled)
+            .count()
+    }
+
+    /// Number of failed tasks. Failed tasks remain visible as footer
+    /// attention until the user can inspect them in the switcher.
+    pub fn failed_count(&self) -> usize {
+        self.tasks
+            .values()
+            .filter(|h| h.status() == BgTaskStatus::Failed)
             .count()
     }
 
@@ -584,6 +813,27 @@ impl BackgroundTaskRegistry {
     /// Get a single task handle by ID.
     pub fn get(&self, id: &str) -> Option<&BackgroundTaskHandle> {
         self.tasks.get(id)
+    }
+
+    pub fn export_shell_task_projections(&mut self) -> Vec<BackgroundShellTaskProjection> {
+        self.drain_join_set();
+        let mut projections: Vec<_> = self
+            .tasks
+            .values()
+            .map(|handle| BackgroundShellTaskProjection {
+                id: handle.id.clone(),
+                status: handle.status().as_str().to_string(),
+                title: handle.description.clone(),
+                started_at_ms: handle.started_at_ms,
+                ended_at_ms: handle.ended_at_ms,
+                stdout_path: handle.stdout_path.display().to_string(),
+                stderr_path: handle.stderr_path.display().to_string(),
+                exit_code: handle.exit_code,
+                terminal_reason: handle.terminal_reason.clone(),
+            })
+            .collect();
+        projections.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms).then(a.id.cmp(&b.id)));
+        projections
     }
 }
 
@@ -633,7 +883,7 @@ async fn run_shell_task(
     #[cfg(unix)]
     {
         // Put shell and its descendants in a fresh process group so cancel can
-        // kill the whole background command, not just the intermediate `sh`.
+        // kill the whole background shell, not just the intermediate `sh`.
         unsafe {
             command.pre_exec(|| {
                 let rc = nix::libc::setpgid(0, 0);
@@ -769,8 +1019,8 @@ where
 
 /// Adopted-shell runner: drains both streams concurrently and waits
 /// for child exit. Mirrors `run_shell_task`'s exit-code → status
-/// mapping so an adopted job's `Completed` / `Failed` events match
-/// what a freshly-spawned job emits — the LLM downstream can't tell
+/// mapping so an adopted task's `Completed` / `Failed` events match
+/// what a freshly-spawned task emits — the LLM downstream can't tell
 /// the difference.
 async fn run_adopted_shell(
     mut child: tokio::process::Child,
@@ -877,6 +1127,26 @@ fn make_summary(stdout_path: &Path, exit_code: Option<i32>) -> String {
     }
 }
 
+fn missing_output_artifact_error(path: &Path) -> String {
+    format!("output artifact missing: {}", path.display())
+}
+
+fn unix_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn instant_from_unix_epoch_millis(started_at_ms: u64) -> Instant {
+    let now_ms = unix_epoch_millis();
+    let age_ms = now_ms.saturating_sub(started_at_ms);
+    Instant::now()
+        .checked_sub(Duration::from_millis(age_ms))
+        .unwrap_or_else(Instant::now)
+}
+
 fn read_tail_str(path: &Path, max_bytes: usize) -> Result<(String, u64), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file =
@@ -894,7 +1164,11 @@ fn read_tail_str(path: &Path, max_bytes: usize) -> Result<(String, u64), String>
     Ok((text, len))
 }
 
-fn read_from_str(path: &Path, offset: u64, max_bytes: usize) -> Result<(String, u64, u64), String> {
+fn read_from_str(
+    path: &Path,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<(String, u64, u64, u64), String> {
     let stream = OutputStream::create(path.to_path_buf())
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let buf = stream
@@ -904,11 +1178,42 @@ fn read_from_str(path: &Path, offset: u64, max_bytes: usize) -> Result<(String, 
     let total_bytes = std::fs::metadata(path)
         .map(|m| m.len())
         .unwrap_or(end_offset);
+    let total_lines = count_file_lines(path).unwrap_or_else(|_| {
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    });
     Ok((
         String::from_utf8_lossy(&buf).into_owned(),
         end_offset,
         total_bytes,
+        total_lines,
     ))
+}
+
+fn count_file_lines(path: &Path) -> Result<u64, String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut buf = [0_u8; 8192];
+    let mut lines = 0_u64;
+    let mut saw_any = false;
+    let mut last_byte = None;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        saw_any = true;
+        lines = lines.saturating_add(buf[..n].iter().filter(|&&b| b == b'\n').count() as u64);
+        last_byte = Some(buf[n - 1]);
+    }
+    if saw_any && last_byte != Some(b'\n') {
+        lines = lines.saturating_add(1);
+    }
+    Ok(lines)
 }
 
 fn read_combined_tail_str(
@@ -945,49 +1250,59 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
     match event {
         BgTaskEvent::Completed {
             id,
+            title,
             exit_code,
             summary,
         } => {
             format!(
-                "<background_job_notification>\n\
-                 <job_id>{id}</job_id>\n\
+                "<background_task_notification>\n\
+                 <task_id>{id}</task_id>\n\
+                 <title>{}</title>\n\
                  <status>completed</status>\n\
                  <exit_code>{}</exit_code>\n\
                  <summary>{}</summary>\n\
-                 </background_job_notification>",
+                 </background_task_notification>",
+                xml_escape(title),
                 exit_code.unwrap_or(0),
                 xml_escape(summary),
             )
         }
-        BgTaskEvent::Failed { id, error } => {
+        BgTaskEvent::Failed { id, title, error } => {
             format!(
-                "<background_job_notification>\n\
-                 <job_id>{id}</job_id>\n\
+                "<background_task_notification>\n\
+                 <task_id>{id}</task_id>\n\
+                 <title>{}</title>\n\
                  <status>failed</status>\n\
                  <error>{}</error>\n\
-                 </background_job_notification>",
+                 </background_task_notification>",
+                xml_escape(title),
                 xml_escape(error),
             )
         }
-        BgTaskEvent::Killed { id } => {
+        BgTaskEvent::Killed { id, title } => {
             format!(
-                "<background_job_notification>\n\
-                 <job_id>{id}</job_id>\n\
+                "<background_task_notification>\n\
+                 <task_id>{id}</task_id>\n\
+                 <title>{}</title>\n\
                  <status>killed</status>\n\
-                 </background_job_notification>",
+                 </background_task_notification>",
+                xml_escape(title),
             )
         }
         BgTaskEvent::Stalled {
             id,
+            title,
             last_output_tail,
         } => {
             format!(
-                "<background_job_notification>\n\
-                 <job_id>{id}</job_id>\n\
-                 <status>stalled</status>\n\
+                "<background_task_notification>\n\
+                 <task_id>{id}</task_id>\n\
+                 <title>{}</title>\n\
+                 <status>waiting_for_input</status>\n\
                  <hint>Process may be waiting for interactive input. Consider killing and re-running with non-interactive flags.</hint>\n\
                  <last_output>{}</last_output>\n\
-                 </background_job_notification>",
+                 </background_task_notification>",
+                xml_escape(title),
                 xml_escape(last_output_tail),
             )
         }
@@ -999,6 +1314,7 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1021,9 +1337,14 @@ mod tests {
             description: "test".into(),
             status: Arc::new(AtomicU8::new(status as u8)),
             started_at: Instant::now(),
+            started_at_ms: unix_epoch_millis(),
+            ended_at_ms: None,
+            live_control: BgTaskLiveControl::Available,
             cancel_token: CancellationToken::new(),
             stdout_path: dir.path().join("stdout.log"),
             stderr_path: dir.path().join("stderr.log"),
+            exit_code: None,
+            terminal_reason: None,
             last_output_size: 0,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
@@ -1120,17 +1441,74 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = reg.poll_completions();
 
-        let (first, first_end, total) = reg.get_output_since(&id, 0, 6).expect("first chunk");
+        let (first, first_end, total, total_lines) =
+            reg.get_output_since(&id, 0, 6).expect("first chunk");
         assert_eq!(first, "hello\n");
         assert_eq!(first_end, 6);
         assert_eq!(total, 12);
+        assert_eq!(total_lines, 2);
 
-        let (second, second_end, second_total) = reg
+        let (second, second_end, second_total, second_total_lines) = reg
             .get_output_since(&id, first_end, 1024)
             .expect("second chunk");
         assert_eq!(second, "world\n");
         assert_eq!(second_end, 12);
         assert_eq!(second_total, 12);
+        assert_eq!(second_total_lines, 2);
+    }
+
+    #[tokio::test]
+    async fn get_output_since_counts_final_line_without_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'short'", "line count");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+
+        let (chunk, end, total, total_lines) = reg.get_output_since(&id, 0, 1024).expect("chunk");
+        assert_eq!(chunk, "short");
+        assert_eq!(end, total);
+        assert_eq!(total_lines, 1);
+    }
+
+    #[tokio::test]
+    async fn completion_event_carries_task_title_for_notifications() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf ok", "cargo test -p astra-cli");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let events = reg.poll_completions();
+        let title = events
+            .iter()
+            .find_map(|event| match event {
+                BgTaskEvent::Completed { id: eid, title, .. } if eid == &id => Some(title.as_str()),
+                _ => None,
+            })
+            .expect("completion event");
+
+        assert_eq!(title, "cargo test -p astra-cli");
+    }
+
+    #[tokio::test]
+    async fn get_combined_output_stats_counts_stdout_and_stderr_source_files() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell(
+            "printf 'out1\\nout2\\n'; printf 'err1\\n' >&2",
+            "combined stats",
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+
+        let (tail, total_bytes, total_lines) =
+            reg.get_combined_output_stats(&id, 1024).expect("stats");
+        assert!(tail.contains("out1"), "{tail}");
+        assert!(tail.contains("err1"), "{tail}");
+        assert_eq!(total_bytes, 15);
+        assert_eq!(total_lines, 3);
     }
 
     #[tokio::test]
@@ -1146,6 +1524,24 @@ mod tests {
             .get_output_since(&id, 99, 16)
             .expect_err("offset beyond end must fail");
         assert!(err.contains("offset 99"), "{err}");
+    }
+
+    #[test]
+    fn terminal_task_with_missing_output_artifact_reports_explicit_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Completed);
+        handle.id = "bg-shell-missing-output".to_string();
+        reg.tasks.insert(handle.id.clone(), handle);
+
+        let err = reg
+            .get_output_since("bg-shell-missing-output", 0, 1024)
+            .expect_err("terminal task with missing stdout ref should be explicit");
+
+        assert!(
+            err.starts_with("output artifact missing:"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1179,31 +1575,204 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_job_id_returns_most_recent_background_job() {
-        let tmp = TempDir::new().unwrap();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let first = reg.spawn_shell("sleep 1", "first");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let second = reg.spawn_shell("sleep 1", "second");
-
-        assert_eq!(reg.latest_job_id().as_deref(), Some(second.as_str()));
-        assert_ne!(first, second);
-        let _ = reg.kill(&first);
-        let _ = reg.kill(&second);
-    }
-
-    #[tokio::test]
-    async fn render_job_list_xml_reports_ids_status_and_escaped_descriptions() {
+    async fn render_background_task_list_xml_reports_typed_rows() {
         let tmp = TempDir::new().unwrap();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("sleep 1", "build <all> & test");
 
-        let xml = reg.render_job_list_xml();
-        assert!(xml.contains("<background_jobs count=\"1\">"), "{xml}");
+        let xml = reg.render_background_task_list_xml();
+        assert!(xml.contains("<background_tasks count=\"1\">"), "{xml}");
+        assert!(xml.contains("<task "), "{xml}");
         assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
+        assert!(xml.contains("kind=\"shell\""), "{xml}");
         assert!(xml.contains("status=\"running\""), "{xml}");
-        assert!(xml.contains("build &lt;all&gt; &amp; test"), "{xml}");
+        assert!(xml.contains("live_control=\"available\""), "{xml}");
+        assert!(
+            xml.contains("command=\"build &lt;all&gt; &amp; test\""),
+            "{xml}"
+        );
+        assert!(!xml.contains("<job"), "{xml}");
+        assert!(!xml.contains("background_jobs"), "{xml}");
         let _ = reg.kill(&id);
+    }
+
+    #[tokio::test]
+    async fn render_background_task_list_xml_reports_output_and_terminal_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'first\\nlast\\n'", "cargo test");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+        let xml = reg.render_background_task_list_xml();
+        let handle = reg.get(&id).expect("handle");
+
+        assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
+        assert!(xml.contains("status=\"completed\""), "{xml}");
+        assert!(xml.contains("started_at_ms=\""), "{xml}");
+        assert!(
+            handle.ended_at_ms.is_some(),
+            "completion must capture ended_at_ms"
+        );
+        assert!(xml.contains("ended_at_ms=\""), "{xml}");
+        assert!(xml.contains("output_ref=\"stdout:"), "{xml}");
+        assert!(xml.contains("output_offset=\"0\""), "{xml}");
+        assert!(xml.contains("total_output_bytes=\"11\""), "{xml}");
+        assert!(xml.contains("total_output_lines=\"2\""), "{xml}");
+        assert!(xml.contains("preview=\"last\""), "{xml}");
+        assert!(xml.contains("exit_code=\"0\""), "{xml}");
+        assert!(xml.contains("terminal_reason=\"exit code 0\""), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn render_background_task_list_xml_reports_missing_output_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf done", "missing output");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+        let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
+        std::fs::remove_file(&stdout_path).unwrap();
+        let xml = reg.render_background_task_list_xml();
+
+        assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
+        assert!(
+            xml.contains("output_error=\"output artifact missing:"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(&xml_escape(&stdout_path.display().to_string())),
+            "{xml}"
+        );
+        assert!(!xml.contains("preview=\"done\""), "{xml}");
+    }
+
+    #[test]
+    fn restored_running_projection_is_visible_stale_and_not_killable() {
+        let tmp = TempDir::new().unwrap();
+        let stdout = tmp.path().join("restored.stdout");
+        let stderr = tmp.path().join("restored.stderr");
+        std::fs::write(&stdout, "still building\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().join("registry"));
+        reg.restore_shell_task_projection(BackgroundShellTaskProjection {
+            id: "bg-shell-restored".into(),
+            status: "running".into(),
+            title: "cargo build".into(),
+            started_at_ms: unix_epoch_millis().saturating_sub(5_000),
+            ended_at_ms: None,
+            stdout_path: stdout.display().to_string(),
+            stderr_path: stderr.display().to_string(),
+            exit_code: None,
+            terminal_reason: None,
+        })
+        .expect("restore projection");
+
+        assert_eq!(reg.running_count(), 0);
+        assert_eq!(
+            reg.kill("bg-shell-restored").unwrap_err(),
+            "background shell 'bg-shell-restored' has a stale handle"
+        );
+        let (output, end, total, lines) = reg
+            .get_output_since("bg-shell-restored", 0, 1024)
+            .expect("restored output remains readable");
+        assert_eq!(output, "still building\n");
+        assert_eq!(end, total);
+        assert_eq!(lines, 1);
+
+        let xml = reg.render_background_task_list_xml();
+        assert!(xml.contains("id=\"bg-shell-restored\""), "{xml}");
+        assert!(xml.contains("status=\"unavailable\""), "{xml}");
+        assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+        assert!(xml.contains("preview=\"still building\""), "{xml}");
+
+        let exported = reg.export_shell_task_projections();
+        assert_eq!(exported[0].status, "running");
+        assert_eq!(exported[0].title, "cargo build");
+    }
+
+    #[test]
+    fn restored_terminal_projection_keeps_terminal_status() {
+        let tmp = TempDir::new().unwrap();
+        let stdout = tmp.path().join("done.stdout");
+        let stderr = tmp.path().join("done.stderr");
+        std::fs::write(&stdout, "done\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().join("registry"));
+        reg.restore_shell_task_projection(BackgroundShellTaskProjection {
+            id: "bg-shell-done".into(),
+            status: "completed".into(),
+            title: "cargo test".into(),
+            started_at_ms: unix_epoch_millis().saturating_sub(5_000),
+            ended_at_ms: Some(1_766_000_005_000),
+            stdout_path: stdout.display().to_string(),
+            stderr_path: stderr.display().to_string(),
+            exit_code: Some(0),
+            terminal_reason: Some("exit code 0".into()),
+        })
+        .expect("restore projection");
+
+        let xml = reg.render_background_task_list_xml();
+        assert!(xml.contains("status=\"completed\""), "{xml}");
+        assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+        assert!(xml.contains("exit_code=\"0\""), "{xml}");
+        assert!(xml.contains("ended_at_ms=\"1766000005000\""), "{xml}");
+        let exported = reg.export_shell_task_projections();
+        assert_eq!(exported[0].ended_at_ms, Some(1_766_000_005_000));
+    }
+
+    #[test]
+    fn render_background_task_list_orders_attention_before_running() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let (mut running, _running_dir) = test_handle_with_status(BgTaskStatus::Running);
+        running.id = "bg-running".into();
+        running.description = "npm run dev".into();
+        running.started_at = Instant::now() - Duration::from_secs(30);
+
+        let (mut failed, _failed_dir) = test_handle_with_status(BgTaskStatus::Failed);
+        failed.id = "bg-failed".into();
+        failed.description = "npm test".into();
+        failed.started_at = Instant::now() - Duration::from_secs(10);
+
+        let (mut waiting, _waiting_dir) = test_handle_with_status(BgTaskStatus::Stalled);
+        waiting.id = "bg-waiting".into();
+        waiting.description = "deploy.sh".into();
+        waiting.started_at = Instant::now() - Duration::from_secs(5);
+
+        reg.tasks.insert(running.id.clone(), running);
+        reg.tasks.insert(failed.id.clone(), failed);
+        reg.tasks.insert(waiting.id.clone(), waiting);
+
+        let xml = reg.render_background_task_list_xml();
+        let waiting_pos = xml.find("id=\"bg-waiting\"").expect("waiting row");
+        let failed_pos = xml.find("id=\"bg-failed\"").expect("failed row");
+        let running_pos = xml.find("id=\"bg-running\"").expect("running row");
+        assert!(waiting_pos < running_pos, "{xml}");
+        assert!(failed_pos < running_pos, "{xml}");
+        assert!(xml.contains("status=\"waiting_for_input\""), "{xml}");
+    }
+
+    #[test]
+    fn attention_counts_include_failed_but_not_completed_or_killed() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        for (id, status) in [
+            ("running", BgTaskStatus::Running),
+            ("waiting", BgTaskStatus::Stalled),
+            ("failed", BgTaskStatus::Failed),
+            ("completed", BgTaskStatus::Completed),
+            ("killed", BgTaskStatus::Killed),
+        ] {
+            let (mut handle, _dir) = test_handle_with_status(status);
+            handle.id = id.to_string();
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+
+        assert_eq!(reg.running_count(), 1);
+        assert_eq!(reg.stalled_count(), 1);
+        assert_eq!(reg.failed_count(), 1);
     }
 
     #[tokio::test]
@@ -1262,7 +1831,7 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("expected terminal event in {events:?}"));
         match terminal {
-            BgTaskEvent::Failed { id: eid, error } => {
+            BgTaskEvent::Failed { id: eid, error, .. } => {
                 assert_eq!(eid, &id);
                 assert!(!error.is_empty());
             }
@@ -1286,11 +1855,30 @@ mod tests {
     fn notification_xml_escapes_special_chars() {
         let event = BgTaskEvent::Failed {
             id: "bg-1".into(),
+            title: "cargo test <unit> & \"quote\"".into(),
             error: "error: <unexpected> & \"bad\"".into(),
         };
         let xml = format_notification_xml(&event);
+        assert!(xml.contains("<background_task_notification>"));
+        assert!(xml.contains("<task_id>bg-1</task_id>"));
+        assert!(xml.contains("<title>cargo test &lt;unit&gt; &amp; &quot;quote&quot;</title>"));
+        assert!(!xml.contains("<job_id>"));
         assert!(xml.contains("&lt;unexpected&gt;"));
         assert!(xml.contains("&amp;"));
+    }
+
+    #[test]
+    fn notification_xml_uses_waiting_for_input_lifecycle_status() {
+        let event = BgTaskEvent::Stalled {
+            id: "bg-1".into(),
+            title: "npm run dev".into(),
+            last_output_tail: "Continue? (y/n)".into(),
+        };
+
+        let xml = format_notification_xml(&event);
+
+        assert!(xml.contains("<status>waiting_for_input</status>"), "{xml}");
+        assert!(!xml.contains("<status>stalled</status>"), "{xml}");
     }
 
     #[tokio::test]
@@ -1305,7 +1893,7 @@ mod tests {
         let err = reg
             .kill(&id)
             .expect_err("terminal command should reject kill");
-        assert_eq!(err, format!("background command '{id}' already terminated"));
+        assert_eq!(err, format!("background shell '{id}' already terminated"));
     }
 
     // ── TDD: output truncation ──────────────────────────────────
@@ -1316,7 +1904,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("yes 'aaaaaaaaaa'", "large output");
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
-            let handle = reg.tasks.get(&id).expect("background command handle");
+            let handle = reg.tasks.get(&id).expect("background shell handle");
             let stdout_size = std::fs::metadata(&handle.stdout_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -1326,14 +1914,14 @@ mod tests {
             stdout_size.saturating_add(stderr_size) > MAX_OUTPUT_BYTES
         })
         .await
-        .expect("background command should exceed output cap");
+        .expect("background shell should exceed output cap");
         reg.stall_check();
 
         let events = reg.poll_completions();
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                BgTaskEvent::Failed { id: eid, error }
+                BgTaskEvent::Failed { id: eid, error, .. }
                     if eid == &id && error.contains("output exceeded")
             )),
             "expected output cap failure event, got {events:?}"
@@ -1371,7 +1959,7 @@ mod tests {
         reg.stall_check();
         assert!(reg.poll_completions().iter().any(|event| matches!(
             event,
-            BgTaskEvent::Stalled { id, last_output_tail }
+            BgTaskEvent::Stalled { id, last_output_tail, .. }
                 if id == "bg-throttle" && last_output_tail.contains("Continue? [y/N]")
         )));
     }
@@ -1405,7 +1993,7 @@ mod tests {
         };
         assert!(
             !alive,
-            "descendant pid {pid} survived background command kill"
+            "descendant pid {pid} survived background shell kill"
         );
     }
 
@@ -1524,7 +2112,7 @@ mod tests {
         let events = reg.poll_completions();
         let killed_count = events
             .iter()
-            .filter(|e| matches!(e, BgTaskEvent::Killed { id: eid } if eid == &id))
+            .filter(|e| matches!(e, BgTaskEvent::Killed { id: eid, .. } if eid == &id))
             .count();
         assert_eq!(
             killed_count, 1,
@@ -1558,7 +2146,7 @@ mod tests {
     //
     // Ctrl+B true promotion: bash tool detaches its child + streams
     // mid-execution, transfers ownership to the registry, and the
-    // job keeps running without restart. The contract:
+    // task keeps running without restart. The contract:
     //
     //   - registry receives a live `tokio::process::Child` plus its
     //     `ChildStdout` / `ChildStderr` streams (already taken from
@@ -1678,7 +2266,7 @@ mod tests {
             .any(|e| matches!(e, BgTaskEvent::Completed { id: eid, .. } if eid == &id));
         let has_killed = events
             .iter()
-            .any(|e| matches!(e, BgTaskEvent::Killed { id: eid } if eid == &id));
+            .any(|e| matches!(e, BgTaskEvent::Killed { id: eid, .. } if eid == &id));
         assert!(
             has_completed,
             "natural completion should be reported: {events:?}"

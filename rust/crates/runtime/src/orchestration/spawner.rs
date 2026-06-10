@@ -9,6 +9,9 @@ use astra_turn_core::fork_resolve::{
     PrefixResolveOutcome, SpawnResolveContext, resolve_inherit_prefix,
 };
 use astra_turn_core::orchestration_context_cache::SharedContextCache;
+use astra_turn_core::orchestration_fanout_group::{
+    AgentFanoutGroupProjection, AgentFanoutSlotIdentity, AgentFanoutSlotStatus,
+};
 use astra_turn_core::orchestration_progress::{
     AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
@@ -16,7 +19,7 @@ use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutpu
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -134,6 +137,75 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
             finish_reason: Some(run_result.finish_reason.clone()),
         },
     }
+}
+
+fn fanout_slot_status_from_agent_status(
+    status: &AgentStatus,
+) -> (AgentFanoutSlotStatus, Option<String>) {
+    match status {
+        AgentStatus::Completed {
+            result: _,
+            finish_reason,
+        } => {
+            let reason = finish_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("normal");
+            if reason == "normal" {
+                (AgentFanoutSlotStatus::Completed, None)
+            } else if is_parent_budget_finish_reason(reason) {
+                (
+                    AgentFanoutSlotStatus::CancelledByParentBudget,
+                    Some(reason.to_string()),
+                )
+            } else {
+                (AgentFanoutSlotStatus::Failed, Some(reason.to_string()))
+            }
+        }
+        AgentStatus::Failed {
+            error,
+            finish_reason,
+        } => (
+            AgentFanoutSlotStatus::Failed,
+            finish_reason.clone().or_else(|| Some(error.clone())),
+        ),
+        AgentStatus::Cancelled { by_user, reason } => {
+            let reason = if reason.is_empty() {
+                None
+            } else {
+                Some(reason.clone())
+            };
+            if *by_user {
+                (AgentFanoutSlotStatus::CancelledByUser, reason)
+            } else {
+                (AgentFanoutSlotStatus::CancelledByParentBudget, reason)
+            }
+        }
+        AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => {
+            (AgentFanoutSlotStatus::TimedOut, None)
+        }
+    }
+}
+
+fn fanout_group_title(identity: &AgentFanoutSlotIdentity, title: Option<&str>) -> String {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} fanout", identity.group_id))
+}
+
+fn is_parent_budget_finish_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "budget_exhausted"
+            | "turn_budget_exhausted"
+            | "token_budget_exceeded"
+            | "context_overflow"
+            | "max_turns_exceeded"
+            | "max_turns"
+    )
 }
 
 fn spawn_run_result_to_sync_output(
@@ -318,6 +390,7 @@ pub struct SpawnedAgentState {
     pub trace_context: Option<TraceContext>,
     pub spawn_tool_call_id: Option<String>,
     pub run_in_background: bool,
+    pub fanout_slot: Option<AgentFanoutSlotIdentity>,
 }
 
 // SpawnedAgentInfo is re-exported from orchestration_types above.
@@ -334,6 +407,8 @@ impl From<&SpawnedAgentState> for SpawnedAgentInfo {
             started_at: state.started_at,
             metrics: state.metrics.clone(),
             has_permission_issues: state.metrics.tools_blocked > 0,
+            run_in_background: state.run_in_background,
+            fanout_slot: state.fanout_slot.clone(),
         }
     }
 }
@@ -547,6 +622,9 @@ pub struct DynamicAgentSpawner {
     background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Completion notifiers: `agent(action='get_result')` awaits these instead of polling.
     completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// Foreground sync agents that the user promoted with Ctrl+B while
+    /// the parent tool call was waiting for the child result.
+    foreground_promotion_requests: Arc<RwLock<HashSet<String>>>,
     /// Optional fork-prefix store for cache inheritance across
     /// parent/child spawns. When `None` (default), spawn behavior is
     /// identical to pre-fork-prefix builds — existing callers are
@@ -574,6 +652,9 @@ pub struct DynamicAgentSpawner {
     /// queue (it sees the rejection in the tool result and can retry
     /// or re-plan).
     max_concurrent_agents: Option<usize>,
+    /// Fanout group accounting keyed by group id. Group target_count
+    /// is a user/model invariant, not a derived live-agent count.
+    fanout_groups: Arc<RwLock<HashMap<String, AgentFanoutGroupProjection>>>,
 }
 
 impl DynamicAgentSpawner {
@@ -593,10 +674,12 @@ impl DynamicAgentSpawner {
             background_abort_handles: Arc::new(RwLock::new(HashMap::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
+            foreground_promotion_requests: Arc::new(RwLock::new(HashSet::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
             trace_writer: None,
             max_concurrent_agents: None,
+            fanout_groups: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -689,6 +772,214 @@ impl DynamicAgentSpawner {
         self.prefix_resolve_outcomes.write().await.remove(agent_id);
     }
 
+    pub async fn list_fanout_groups(&self) -> Vec<AgentFanoutGroupProjection> {
+        let mut groups: Vec<_> = self.fanout_groups.read().await.values().cloned().collect();
+        groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+        groups
+    }
+
+    pub async fn fanout_group_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Option<AgentFanoutGroupProjection> {
+        self.fanout_groups
+            .read()
+            .await
+            .values()
+            .find(|group| {
+                group
+                    .slots
+                    .iter()
+                    .any(|slot| slot.agent_id.as_deref() == Some(agent_id))
+            })
+            .cloned()
+    }
+
+    fn remember_background_agent_id(&self, agent_id: &str) {
+        let mut ids = self
+            .background_agent_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !ids.iter().any(|id| id == agent_id) {
+            ids.push(agent_id.to_string());
+        }
+    }
+
+    fn reap_finished_agent_tasks(&self) {
+        let Ok(mut tasks) = self.background_tasks.lock() else {
+            return;
+        };
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result
+                && error.is_panic()
+            {
+                astra_core::agent_warn!("spawner", "agent task panicked during finished-task reap");
+            }
+        }
+    }
+
+    async fn take_foreground_promotion_request(&self, agent_id: &str) -> bool {
+        self.foreground_promotion_requests
+            .write()
+            .await
+            .remove(agent_id)
+    }
+
+    /// Promote the newest foreground sync agent for `parent_run_id` into
+    /// background mode. The agent keeps running; the waiting
+    /// `agent(action='spawn')` call wakes and returns `Launched`, so the
+    /// parent can continue and collect with `agent(action='get_result')`.
+    pub async fn promote_foreground_agent_to_background(
+        &self,
+        parent_run_id: Option<&str>,
+    ) -> Option<SpawnedAgentInfo> {
+        let promoted = {
+            let mut active_agents = self.active_agents.write().await;
+            let agent_id = active_agents
+                .iter()
+                .filter(|(_, state)| {
+                    !state.run_in_background
+                        && parent_run_id.is_none_or(|run_id| state.parent_run_id == run_id)
+                })
+                .max_by_key(|(_, state)| {
+                    state
+                        .started_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or(0)
+                })
+                .map(|(agent_id, _)| agent_id.clone())?;
+            let state = active_agents.get_mut(&agent_id)?;
+            state.run_in_background = true;
+            SpawnedAgentInfo::from(&*state)
+        };
+
+        self.remember_background_agent_id(&promoted.agent_id);
+        self.foreground_promotion_requests
+            .write()
+            .await
+            .insert(promoted.agent_id.clone());
+        if let Some(notifier) = self
+            .completion_notifiers
+            .read()
+            .await
+            .get(&promoted.agent_id)
+            .cloned()
+        {
+            notifier.notify_waiters();
+        }
+        Some(promoted)
+    }
+
+    async fn record_fanout_spawn_accepted(
+        &self,
+        identity: &AgentFanoutSlotIdentity,
+        group_title: Option<&str>,
+        agent_id: &str,
+        agent_type: &str,
+        description: &str,
+        created_by_tool_use_id: Option<&str>,
+    ) -> Result<(), SpawnError> {
+        let mut groups = self.fanout_groups.write().await;
+        let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
+            let mut group = AgentFanoutGroupProjection::new(
+                identity.group_id.clone(),
+                fanout_group_title(identity, group_title),
+                identity.target_count,
+            );
+            group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+            group
+        });
+        if group.target_count != identity.target_count {
+            return Err(SpawnError::InvalidInput(format!(
+                "fanout group '{}' target_count changed from {} to {}",
+                identity.group_id, group.target_count, identity.target_count
+            )));
+        }
+        group
+            .set_slot_request(identity.slot_index, agent_type, description)
+            .map_err(SpawnError::InvalidInput)?;
+        group
+            .record_spawn_accepted(identity.slot_index, agent_id)
+            .map_err(SpawnError::InvalidInput)
+    }
+
+    async fn record_fanout_spawn_rejected(
+        &self,
+        identity: &AgentFanoutSlotIdentity,
+        group_title: Option<&str>,
+        agent_type: &str,
+        description: &str,
+        reason: impl Into<String>,
+        created_by_tool_use_id: Option<&str>,
+    ) -> Result<(), SpawnError> {
+        let mut groups = self.fanout_groups.write().await;
+        let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
+            let mut group = AgentFanoutGroupProjection::new(
+                identity.group_id.clone(),
+                fanout_group_title(identity, group_title),
+                identity.target_count,
+            );
+            group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+            group
+        });
+        if group.target_count != identity.target_count {
+            return Err(SpawnError::InvalidInput(format!(
+                "fanout group '{}' target_count changed from {} to {}",
+                identity.group_id, group.target_count, identity.target_count
+            )));
+        }
+        group
+            .set_slot_request(identity.slot_index, agent_type, description)
+            .map_err(SpawnError::InvalidInput)?;
+        group
+            .record_spawn_rejected(identity.slot_index, reason)
+            .map_err(SpawnError::InvalidInput)
+    }
+
+    async fn record_fanout_spawn_rejected_for_input(
+        &self,
+        fanout_slot: Option<&AgentFanoutSlotIdentity>,
+        input: &SpawnAgentInput,
+        context: &SpawnContext,
+        reason: impl Into<String>,
+    ) {
+        if let Some(identity) = fanout_slot {
+            let _ = self
+                .record_fanout_spawn_rejected(
+                    identity,
+                    input.fanout_group_title.as_deref(),
+                    &input.agent_type,
+                    &input.description,
+                    reason,
+                    context.spawn_tool_call_id.as_deref(),
+                )
+                .await;
+        }
+    }
+
+    async fn record_fanout_terminal_state(&self, state: &SpawnedAgentState) {
+        let Some(identity) = state.fanout_slot.as_ref() else {
+            return;
+        };
+        let (status, reason) = fanout_slot_status_from_agent_status(&state.status);
+        let mut groups = self.fanout_groups.write().await;
+        let Some(group) = groups.get_mut(&identity.group_id) else {
+            return;
+        };
+        let _ = group.record_terminal_by_agent(&state.agent_id, status, reason);
+    }
+
+    async fn mark_fanout_result_collected(&self, state: &SpawnedAgentState) {
+        let Some(identity) = state.fanout_slot.as_ref() else {
+            return;
+        };
+        let mut groups = self.fanout_groups.write().await;
+        if let Some(group) = groups.get_mut(&identity.group_id) {
+            group.mark_result_collected(&state.agent_id);
+        }
+    }
+
     /// Enable journal persistence for agent lifecycle events.
     pub fn with_session(mut self, session_id: String) -> Self {
         self.session_id = Some(session_id);
@@ -745,6 +1036,11 @@ impl DynamicAgentSpawner {
             "status": "spawned",
             "spawn_tool_call_id": &state.spawn_tool_call_id,
             "run_in_background": state.run_in_background,
+            "fanout_slot": state.fanout_slot.as_ref().map(|slot| serde_json::json!({
+                "group_id": &slot.group_id,
+                "target_count": slot.target_count,
+                "slot_index": slot.slot_index,
+            })),
         });
         self.write_trace_event(event).await;
     }
@@ -824,16 +1120,40 @@ impl DynamicAgentSpawner {
             return Err(SpawnError::NestedForkInheritanceRejected);
         }
 
+        let fanout_slot = input
+            .fanout_slot_identity()
+            .map_err(SpawnError::InvalidInput)?;
+
         // 1. Validate agent type
-        let agent_def = self
-            .agent_registry
-            .get(&input.agent_type)
-            .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
+        let agent_def = match self.agent_registry.get(&input.agent_type) {
+            Some(agent_def) => agent_def,
+            None => {
+                self.record_fanout_spawn_rejected_for_input(
+                    fanout_slot.as_ref(),
+                    &input,
+                    context,
+                    format!("unknown agent type: {}", input.agent_type),
+                )
+                .await;
+                return Err(SpawnError::UnknownAgentType(input.agent_type.clone()));
+            }
+        };
         let child_recursion_depth =
-            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
+            match astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 context.recursion_depth,
-            )
-            .map_err(SpawnError::DepthLimitExceeded)?;
+            ) {
+                Ok(depth) => depth,
+                Err(error) => {
+                    self.record_fanout_spawn_rejected_for_input(
+                        fanout_slot.as_ref(),
+                        &input,
+                        context,
+                        format!("recursion depth limit exceeded: {error}"),
+                    )
+                    .await;
+                    return Err(SpawnError::DepthLimitExceeded(error));
+                }
+            };
 
         // 2. Generate IDs
         let agent_name = input
@@ -856,7 +1176,6 @@ impl DynamicAgentSpawner {
             input.complexity.as_deref(),
             agent_def.max_turns,
         );
-
         // 3b. Resolve fork-prefix inheritance before any side effects
         // (mailbox, worktree, active_agents state). A hard-fail from
         // `required=true` must NOT leave half-constructed state
@@ -897,6 +1216,13 @@ impl DynamicAgentSpawner {
                 PrefixResolveOutcome::Disabled
             };
         if let PrefixResolveOutcome::Failed { reason } = &resolve_outcome {
+            self.record_fanout_spawn_rejected_for_input(
+                fanout_slot.as_ref(),
+                &input,
+                context,
+                format!("required prefix inheritance failed: {reason:?}"),
+            )
+            .await;
             return Err(SpawnError::PrefixInheritanceRequired {
                 reason: format!("{reason:?}"),
             });
@@ -922,12 +1248,26 @@ impl DynamicAgentSpawner {
             trace_context: context.trace_context.clone(),
             spawn_tool_call_id: context.spawn_tool_call_id.clone(),
             run_in_background: input.run_in_background,
+            fanout_slot: fanout_slot.clone(),
         };
         {
             let mut active_agents = self.active_agents.write().await;
             if let Some(limit) = self.max_concurrent_agents {
                 let active = active_agents.len();
                 if active >= limit {
+                    drop(active_agents);
+                    if let Some(identity) = fanout_slot.as_ref() {
+                        let _ = self
+                            .record_fanout_spawn_rejected(
+                                identity,
+                                input.fanout_group_title.as_deref(),
+                                &input.agent_type,
+                                &input.description,
+                                format!("concurrency limit reached: {active}/{limit} active"),
+                                context.spawn_tool_call_id.as_deref(),
+                            )
+                            .await;
+                    }
                     return Err(SpawnError::ConcurrencyLimitExceeded { active, limit });
                 }
             }
@@ -946,6 +1286,13 @@ impl DynamicAgentSpawner {
                 Ok(mb) => Some(mb),
                 Err(e) => {
                     self.active_agents.write().await.remove(&agent_id);
+                    self.record_fanout_spawn_rejected_for_input(
+                        fanout_slot.as_ref(),
+                        &input,
+                        context,
+                        format!("mailbox registration failed: {e}"),
+                    )
+                    .await;
                     return Err(SpawnError::MailboxRegistration(e.to_string()));
                 }
             }
@@ -981,6 +1328,13 @@ impl DynamicAgentSpawner {
                     if let Some(addr) = messaging_address.as_ref() {
                         let _ = self.mailbox_router.unregister(addr).await;
                     }
+                    self.record_fanout_spawn_rejected_for_input(
+                        fanout_slot.as_ref(),
+                        &input,
+                        context,
+                        format!("worktree creation failed: {e}"),
+                    )
+                    .await;
                     return Err(SpawnError::WorktreeCreation(format!(
                         "failed to create worktree for {agent_id}: {e}"
                     )));
@@ -999,6 +1353,24 @@ impl DynamicAgentSpawner {
             state.worktree_path = worktree_path.clone();
             state.clone()
         };
+        if let Some(identity) = fanout_slot.as_ref()
+            && let Err(error) = self
+                .record_fanout_spawn_accepted(
+                    identity,
+                    input.fanout_group_title.as_deref(),
+                    &agent_id,
+                    &input.agent_type,
+                    &input.description,
+                    context.spawn_tool_call_id.as_deref(),
+                )
+                .await
+        {
+            self.active_agents.write().await.remove(&agent_id);
+            if let Some(addr) = messaging_address.as_ref() {
+                let _ = self.mailbox_router.unregister(addr).await;
+            }
+            return Err(error);
+        }
         self.emit_agent_spawned_trace(&spawned_state_for_trace)
             .await;
 
@@ -1025,11 +1397,12 @@ impl DynamicAgentSpawner {
         // 7. Emit started event
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
         emitter.started(&input.description);
-        emitter.agent_spawned(
+        emitter.agent_spawned_with_fanout(
             &run_id,
             &context.parent_run_id,
             &input.agent_type,
             &input.description,
+            fanout_slot.clone(),
         );
 
         // 7. Build parent address for permission requests
@@ -1090,116 +1463,64 @@ impl DynamicAgentSpawner {
             }
         }
 
-        // 8. Execute or launch
-        if input.run_in_background {
-            // Background mode: launch async and return immediately.
-            // The JoinHandle is tracked in `background_tasks` so `shutdown_and_wait`
-            // can drain it and panics are surfaced instead of silently lost.
-
-            // Track for result collection in shutdown_and_wait.
-            self.background_agent_ids
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(agent_id.clone());
-            // Register completion notifier BEFORE spawning the task so
-            // the Notify is visible to NotifyOnDrop even if the child
-            // completes (or panics) immediately.
-            let notify = Arc::new(tokio::sync::Notify::new());
-            self.completion_notifiers
-                .write()
-                .await
-                .insert(agent_id.clone(), Arc::clone(&notify));
-
-            if let Some(ref executor) = self.executor {
-                self.update_status(
-                    &agent_id,
-                    AgentStatus::Running {
-                        activity: "executing".to_string(),
-                    },
-                )
-                .await;
-
-                let executor = Arc::clone(executor);
-                let spawner = self.clone_for_task();
-                let agent_id_clone = agent_id.clone();
-
-                // Notify AFTER handle_completion has written the terminal
-                // status, not before. We use a drop guard *as a fallback*
-                // (panics, abort, future drop) but the happy path notifies
-                // explicitly inside the future so any waiter that wakes
-                // immediately is guaranteed to see the entry in
-                // `completed_agents`.
-                //
-                // On panic the Notify Arc is captured directly so we do
-                // not need a map lookup in Drop (which runs in sync
-                // context). Waiters that wake via the Drop path may still
-                // see no terminal status — `wait_for_agent_outcome` then
-                // falls back to `classify_wait_failure`, which returns
-                // `TimedOut` while the agent is still tracked.
-                let notify_guard = Arc::clone(&notify);
-                let notify_after_completion = Arc::clone(&notify);
-                let spawn_future = async move {
-                    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
-                    impl Drop for NotifyOnDrop {
-                        fn drop(&mut self) {
-                            self.0.notify_waiters();
-                        }
-                    }
-                    let guard = NotifyOnDrop(notify_guard);
-                    let result = executor.execute(run_config).await;
-                    spawner.handle_completion(&agent_id_clone, result).await;
-                    // Status is now written. Wake waiters explicitly and
-                    // disarm the drop guard so we don't double-notify.
-                    notify_after_completion.notify_waiters();
-                    std::mem::forget(guard);
-                };
-                let abort_handle = self
-                    .background_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .spawn(spawn_future);
-                self.background_abort_handles
-                    .write()
-                    .await
-                    .insert(agent_id.clone(), abort_handle);
-            }
-
-            Ok(SpawnAgentOutput::Launched {
+        // 8. Execute or launch. Both explicit background spawns and
+        // foreground sync spawns run through the same task/finalization
+        // pipe. Sync mode simply waits for the terminal oneshot unless
+        // Ctrl+B promotes the wait into a background `Launched` result.
+        let Some(ref executor) = self.executor else {
+            // No executor available - return as launched (degraded mode)
+            return Ok(SpawnAgentOutput::Launched {
                 agent_id,
                 description: input.description,
                 messaging_address: messaging_address.map(|a| a.to_string()),
-            })
-        } else {
-            // Sync mode: wait for completion. Funnel through the same
-            // `finalize_background_agent` path as background spawns so both
-            // modes archive into `completed_agents`, persist the
-            // `agent_terminated` journal event, emit the terminal trace, and
-            // clear `active_agents`. Two parallel finalization paths is how
-            // observers (wait_for_agent / get_agent_history / archive
-            // consumers) drift between modes.
-            if let Some(ref executor) = self.executor {
-                self.update_status(
-                    &agent_id,
-                    AgentStatus::Running {
-                        activity: "executing".to_string(),
-                    },
-                )
-                .await;
+            });
+        };
 
-                let result = executor.execute(run_config).await;
-                let started_at = self
-                    .active_agents
-                    .read()
-                    .await
-                    .get(&agent_id)
-                    .map(|s| s.started_at)
-                    .unwrap_or_else(SystemTime::now);
+        self.update_status(
+            &agent_id,
+            AgentStatus::Running {
+                activity: "executing".to_string(),
+            },
+        )
+        .await;
 
-                match result {
-                    Ok(run_result) => {
-                        let status = spawn_run_result_to_agent_status(&run_result);
-                        self.finalize_background_agent(
-                            &agent_id,
+        let started_at = self
+            .active_agents
+            .read()
+            .await
+            .get(&agent_id)
+            .map(|s| s.started_at)
+            .unwrap_or_else(SystemTime::now);
+        let description = input.description.clone();
+        let messaging_address_text = messaging_address.as_ref().map(|a| a.to_string());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.completion_notifiers
+            .write()
+            .await
+            .insert(agent_id.clone(), Arc::clone(&notify));
+
+        let (terminal_tx, mut terminal_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::clone(executor);
+        let spawner = self.clone_for_task();
+        let agent_id_for_task = agent_id.clone();
+        let agent_id_for_output = agent_id.clone();
+        let notify_guard = Arc::clone(&notify);
+        let notify_after_completion = Arc::clone(&notify);
+        let spawn_future = async move {
+            struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    self.0.notify_waiters();
+                }
+            }
+            let guard = NotifyOnDrop(notify_guard);
+            let result = executor.execute(run_config).await;
+            let output = match result {
+                Ok(run_result) => {
+                    let status = spawn_run_result_to_agent_status(&run_result);
+                    spawner
+                        .finalize_background_agent(
+                            &agent_id_for_task,
                             status,
                             &run_result.status,
                             Some(run_result.finish_reason.as_str()),
@@ -1208,82 +1529,74 @@ impl DynamicAgentSpawner {
                             run_result.error.as_deref(),
                         )
                         .await;
-
-                        let duration_ms = started_at
-                            .elapsed()
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-
-                        Ok(spawn_run_result_to_sync_output(
-                            agent_id,
-                            run_result,
-                            duration_ms,
-                        ))
-                    }
-                    Err(e) => {
-                        self.finalize_background_agent(
-                            &agent_id,
+                    let duration_ms = started_at
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    spawn_run_result_to_sync_output(agent_id_for_output, run_result, duration_ms)
+                }
+                Err(error) => {
+                    spawner
+                        .finalize_background_agent(
+                            &agent_id_for_task,
                             AgentStatus::Failed {
-                                error: e.clone(),
+                                error: error.clone(),
                                 finish_reason: None,
                             },
                             "failed",
                             None,
                             None,
                             None,
-                            Some(e.as_str()),
+                            Some(error.as_str()),
                         )
                         .await;
-
-                        Ok(SpawnAgentOutput::Failed {
-                            error: e,
-                            duration_ms: 0,
-                        })
+                    SpawnAgentOutput::Failed {
+                        error,
+                        duration_ms: 0,
                     }
                 }
-            } else {
-                // No executor available - return as launched (degraded mode)
-                Ok(SpawnAgentOutput::Launched {
-                    agent_id,
-                    description: input.description,
-                    messaging_address: messaging_address.map(|a| a.to_string()),
-                })
-            }
-        }
-    }
+            };
+            let _ = terminal_tx.send(output);
+            notify_after_completion.notify_waiters();
+            std::mem::forget(guard);
+        };
+        let abort_handle = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .spawn(spawn_future);
+        self.background_abort_handles
+            .write()
+            .await
+            .insert(agent_id.clone(), abort_handle);
 
-    /// Handle completion of a background agent.
-    async fn handle_completion(&self, agent_id: &str, result: Result<SpawnRunResult, String>) {
-        match result {
-            Ok(run_result) => {
-                let status = spawn_run_result_to_agent_status(&run_result);
-                let _ = self
-                    .finalize_background_agent(
-                        agent_id,
-                        status,
-                        &run_result.status,
-                        Some(run_result.finish_reason.as_str()),
-                        Some(&run_result),
-                        run_result.output.as_deref(),
-                        run_result.error.as_deref(),
-                    )
-                    .await;
+        if input.run_in_background {
+            self.remember_background_agent_id(&agent_id);
+            return Ok(SpawnAgentOutput::Launched {
+                agent_id,
+                description,
+                messaging_address: messaging_address_text,
+            });
+        }
+
+        loop {
+            if self.take_foreground_promotion_request(&agent_id).await {
+                return Ok(SpawnAgentOutput::Launched {
+                    agent_id,
+                    description,
+                    messaging_address: messaging_address_text,
+                });
             }
-            Err(e) => {
-                let _ = self
-                    .finalize_background_agent(
-                        agent_id,
-                        AgentStatus::Failed {
-                            error: e.clone(),
-                            finish_reason: None,
-                        },
-                        "failed",
-                        None,
-                        None,
-                        None,
-                        Some(e.as_str()),
-                    )
-                    .await;
+
+            tokio::select! {
+                terminal = &mut terminal_rx => {
+                    self.reap_finished_agent_tasks();
+                    return Ok(terminal.unwrap_or_else(|_| SpawnAgentOutput::Failed {
+                        error: "agent task ended before returning a result".to_string(),
+                        duration_ms: 0,
+                    }));
+                }
+                _ = notify.notified() => {}
             }
         }
     }
@@ -1362,6 +1675,7 @@ impl DynamicAgentSpawner {
             (state, messaging_address)
         };
 
+        self.record_fanout_terminal_state(&state).await;
         self.emit_agent_terminal_trace(&state, journal_status, finish_reason, output, error)
             .await;
         self.persist_agent_terminated_state(&state, journal_status, finish_reason)
@@ -1486,6 +1800,7 @@ impl DynamicAgentSpawner {
         let Some(state) = state else {
             return;
         };
+        self.mark_fanout_result_collected(&state).await;
         let Some(trace) = state.trace_context.as_ref() else {
             return;
         };
@@ -1602,6 +1917,7 @@ impl DynamicAgentSpawner {
             background_abort_handles: Arc::clone(&self.background_abort_handles),
             background_agent_ids: Arc::clone(&self.background_agent_ids),
             completion_notifiers: Arc::clone(&self.completion_notifiers),
+            foreground_promotion_requests: Arc::clone(&self.foreground_promotion_requests),
             // Share prefix-store + resolve-outcomes map so clones
             // see/write the same view. The store is an Arc<dyn ...>
             // itself already, so cloning the Option just bumps refcount.
@@ -1609,6 +1925,7 @@ impl DynamicAgentSpawner {
             prefix_resolve_outcomes: Arc::clone(&self.prefix_resolve_outcomes),
             trace_writer: self.trace_writer.clone(),
             max_concurrent_agents: self.max_concurrent_agents,
+            fanout_groups: Arc::clone(&self.fanout_groups),
         }
     }
 
@@ -1795,6 +2112,9 @@ pub struct AgentHistoryRecord {
 /// Errors that can occur during agent spawning.
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
+    #[error("Invalid spawn input: {0}")]
+    InvalidInput(String),
+
     #[error("Unknown agent type: {0}")]
     UnknownAgentType(String),
 
@@ -2397,6 +2717,29 @@ mod tests {
     }
 
     #[test]
+    fn fanout_slot_status_counts_only_budget_interruptions_as_parent_budget_cancel() {
+        let budget_interrupted = AgentStatus::Completed {
+            result: "partial review".to_string(),
+            finish_reason: Some("budget_exhausted".to_string()),
+        };
+        let (status, reason) = fanout_slot_status_from_agent_status(&budget_interrupted);
+        assert_eq!(status, AgentFanoutSlotStatus::CancelledByParentBudget);
+        assert_eq!(reason.as_deref(), Some("budget_exhausted"));
+
+        let empty_completion = AgentStatus::Completed {
+            result: String::new(),
+            finish_reason: Some("empty_completion".to_string()),
+        };
+        let (status, reason) = fanout_slot_status_from_agent_status(&empty_completion);
+        assert_eq!(
+            status,
+            AgentFanoutSlotStatus::Failed,
+            "non-budget interrupted completions are failed slots, not parent-budget cancellations"
+        );
+        assert_eq!(reason.as_deref(), Some("empty_completion"));
+    }
+
+    #[test]
     fn spawn_completion_status_tracks_interrupted_finish_reasons() {
         assert_eq!(
             spawn_completion_status_from_finish_reason(None),
@@ -2961,6 +3304,227 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn spawned_agent_state_preserves_fanout_slot_identity() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("review-1".to_string());
+        input.fanout_group_title = Some("review fanout".to_string());
+        input.fanout_target_count = Some(3);
+        input.fanout_slot_index = Some(1);
+
+        let output = spawner
+            .spawn(input, &make_bg_context())
+            .await
+            .expect("fanout spawn should be accepted");
+        let agent_id = match output {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+
+        let state = spawner
+            .get_agent_state(&agent_id)
+            .await
+            .expect("spawned agent should remain active without an executor");
+        let slot = state
+            .fanout_slot
+            .as_ref()
+            .expect("state should keep fanout slot identity");
+        assert_eq!(slot.group_id, "review-1");
+        assert_eq!(slot.target_count, 3);
+        assert_eq!(slot.slot_index, 1);
+
+        let listed = spawner.list_agents("root").await;
+        let projected = listed
+            .iter()
+            .find(|info| info.agent_id == agent_id)
+            .expect("list projection should include spawned agent");
+        assert_eq!(projected.fanout_slot, state.fanout_slot);
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_invalid_fanout_slot_before_reserving_state() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("review-1".to_string());
+        input.fanout_target_count = Some(3);
+        input.fanout_slot_index = Some(3);
+
+        let result = spawner.spawn(input, &make_bg_context()).await;
+        assert!(
+            matches!(result, Err(SpawnError::InvalidInput(ref message)) if message.contains("outside target_count")),
+            "invalid fanout slot must be rejected as invalid input: {result:?}"
+        );
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "invalid fanout spawn must not reserve active state"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_group_tracks_acceptance_and_rejects_duplicate_slot() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("review-1".to_string());
+        input.fanout_group_title = Some("review fanout".to_string());
+        input.fanout_target_count = Some(3);
+        input.fanout_slot_index = Some(1);
+
+        let first = spawner
+            .spawn(input.clone(), &make_bg_context())
+            .await
+            .expect("first slot spawn should be accepted");
+        assert!(matches!(first, SpawnAgentOutput::Launched { .. }));
+
+        let duplicate = spawner.spawn(input, &make_bg_context()).await;
+        assert!(
+            matches!(duplicate, Err(SpawnError::InvalidInput(ref message)) if message.contains("already accepted")),
+            "duplicate slot must reject instead of adding a fourth child: {duplicate:?}"
+        );
+
+        let groups = spawner.list_fanout_groups().await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "review fanout");
+        let summary = groups[0].summary();
+        assert_eq!(summary.target_count, 3);
+        assert_eq!(summary.accepted, 1);
+        assert_eq!(summary.active, 1);
+        assert_eq!(groups[0].slots[1].requested_description, "bg test");
+    }
+
+    #[tokio::test]
+    async fn fanout_group_records_spawn_rejected_when_capacity_rejects_slot() {
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_max_concurrent_agents(1);
+        let context = make_bg_context();
+
+        let mut first = make_bg_input();
+        first.fanout_group_id = Some("review-1".to_string());
+        first.fanout_target_count = Some(2);
+        first.fanout_slot_index = Some(0);
+        let _ = spawner
+            .spawn(first, &context)
+            .await
+            .expect("first fanout slot should be accepted");
+
+        let mut second = make_bg_input();
+        second.description = "storage review".to_string();
+        second.fanout_group_id = Some("review-1".to_string());
+        second.fanout_target_count = Some(2);
+        second.fanout_slot_index = Some(1);
+        let rejected = spawner.spawn(second, &context).await;
+        assert!(
+            matches!(rejected, Err(SpawnError::ConcurrencyLimitExceeded { .. })),
+            "second slot should hit cap: {rejected:?}"
+        );
+
+        let groups = spawner.list_fanout_groups().await;
+        assert_eq!(groups.len(), 1);
+        let summary = groups[0].summary();
+        assert_eq!(summary.target_count, 2);
+        assert_eq!(summary.accepted, 1);
+        assert_eq!(summary.spawn_rejected, 1);
+        assert_eq!(
+            groups[0].summary_sentence(),
+            "2-agent fanout failed to start fully: 1 accepted, 1 spawn rejected."
+        );
+        assert_eq!(groups[0].slots[1].requested_description, "storage review");
+    }
+
+    #[tokio::test]
+    async fn fanout_group_records_spawn_rejected_when_agent_type_is_unknown() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut input = make_bg_input();
+        input.agent_type = "not-a-real-agent-type".to_string();
+        input.description = "storage review".to_string();
+        input.fanout_group_id = Some("review-1".to_string());
+        input.fanout_group_title = Some("review fanout".to_string());
+        input.fanout_target_count = Some(3);
+        input.fanout_slot_index = Some(2);
+
+        let rejected = spawner.spawn(input, &make_bg_context()).await;
+        assert!(
+            matches!(rejected, Err(SpawnError::UnknownAgentType(ref agent_type)) if agent_type == "not-a-real-agent-type"),
+            "unknown agent type should remain the direct spawn error: {rejected:?}"
+        );
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "failed fanout spawn must not reserve active state"
+        );
+
+        let groups = spawner.list_fanout_groups().await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "review fanout");
+        let summary = groups[0].summary();
+        assert_eq!(summary.target_count, 3);
+        assert_eq!(summary.accepted, 0);
+        assert_eq!(summary.spawn_rejected, 1);
+        assert_eq!(summary.active, 0);
+        assert_eq!(
+            groups[0].slots[2].status,
+            AgentFanoutSlotStatus::SpawnRejected
+        );
+        assert_eq!(groups[0].slots[2].requested_description, "storage review");
+        assert!(
+            groups[0].slots[2]
+                .terminal_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unknown agent type")),
+            "slot should name why spawn failed: {:?}",
+            groups[0].slots[2].terminal_reason
+        );
+        assert_eq!(
+            groups[0].summary_sentence(),
+            "3-agent fanout failed to start fully: 1 spawn rejected."
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_group_tracks_terminal_cancel_and_result_collection() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("review-1".to_string());
+        input.fanout_target_count = Some(3);
+        input.fanout_slot_index = Some(0);
+
+        let agent_id = match spawner.spawn(input, &make_bg_context()).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+        let status = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(2))
+            .await
+            .expect("fanout child should complete");
+        spawner
+            .record_agent_result_collected("root", "root", &agent_id, None, &status)
+            .await;
+
+        let groups = spawner.list_fanout_groups().await;
+        let summary = groups[0].summary();
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.collected, 1);
+
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("review-2".to_string());
+        input.fanout_target_count = Some(2);
+        input.fanout_slot_index = Some(1);
+        let agent_id = match spawner.spawn(input, &make_bg_context()).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+        assert!(spawner.cancel_agent(&agent_id, "user-requested").await);
+        let groups = spawner.list_fanout_groups().await;
+        let summary = groups[0].summary();
+        assert_eq!(summary.cancelled_by_user, 1);
+        assert_eq!(summary.active, 0);
+    }
+
     // ── Spawn-cancel UX unhappy paths ─────────────────────────────────────
 
     #[tokio::test]
@@ -3189,6 +3753,87 @@ mod tests {
             "sync-mode finalize must archive into completed_agents"
         );
         assert!(matches!(completed[0].status, AgentStatus::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn foreground_sync_agent_can_be_promoted_to_background_while_waiting() {
+        let factory = BlockingExecutorFactory::new();
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(mock_router())
+                .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>),
+        );
+
+        let spawn_task = {
+            let spawner = Arc::clone(&spawner);
+            tokio::spawn(async move { spawner.spawn(make_sync_input(), &make_bg_context()).await })
+        };
+
+        for _ in 0..50 {
+            if !spawner.list_all_agents().await.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            spawner
+                .promote_foreground_agent_to_background(Some("not-this-parent"))
+                .await
+                .is_none(),
+            "promotion must respect the parent run filter"
+        );
+
+        let promoted = spawner
+            .promote_foreground_agent_to_background(Some("root"))
+            .await
+            .expect("foreground sync agent should be promotable");
+        let spawn_result = tokio::time::timeout(Duration::from_secs(1), spawn_task)
+            .await
+            .expect("promotion must wake the waiting spawn call")
+            .expect("spawn task must not panic")
+            .expect("spawn must succeed after promotion");
+        assert!(
+            matches!(
+                spawn_result,
+                SpawnAgentOutput::Launched { ref agent_id, .. } if agent_id == &promoted.agent_id
+            ),
+            "promoted sync spawn must return Launched with the same runtime id, got {spawn_result:?}"
+        );
+
+        assert!(
+            spawner
+                .promote_foreground_agent_to_background(Some("root"))
+                .await
+                .is_none(),
+            "already-promoted agents must not be promoted twice"
+        );
+
+        let still_waiting = spawner
+            .wait_for_agent(&promoted.agent_id, Duration::from_millis(20))
+            .await;
+        assert!(
+            still_waiting.is_none(),
+            "promotion must not complete or cancel the child agent"
+        );
+
+        factory.unblock();
+        let terminal = spawner
+            .wait_for_agent(&promoted.agent_id, Duration::from_secs(1))
+            .await
+            .expect("promoted background agent should still finish normally");
+        assert!(matches!(terminal, AgentStatus::Completed { .. }));
+        let archived = spawner
+            .get_agent_state_any(&promoted.agent_id)
+            .await
+            .expect("promoted agent should remain in history");
+        assert!(
+            archived.run_in_background,
+            "promoted agent history must record background mode"
+        );
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(1))
+            .await;
     }
 
     #[tokio::test]

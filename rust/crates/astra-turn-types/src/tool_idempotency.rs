@@ -88,6 +88,8 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "git_blame"
         | "git_file_history"
         | "git_contributors"
+        | "task_output"
+        | "task_list"
         | "git_log_search"
         | "symbols"
         | "find_definition"
@@ -170,6 +172,8 @@ mod tests {
             "github_ci_status",
             "github_repo_stats",
             "mo_query",
+            "task_output",
+            "task_list",
             "web_fetch",
             "get_agent_info",
             "reflect",
@@ -264,7 +268,6 @@ mod tests {
             );
         }
         assert_eq!(classify("task"), ToolIdempotency::NonIdempotent);
-        assert_eq!(classify("task_list"), ToolIdempotency::NonIdempotent);
         assert_eq!(classify("task_get"), ToolIdempotency::NonIdempotent);
     }
 

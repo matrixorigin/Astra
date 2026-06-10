@@ -663,6 +663,7 @@ impl DelegationTracker {
                     parent_run_id: parent_id.clone(),
                     agent_type: "delegated".to_string(),
                     description: format!("Sub-run for delegation {}", &delegation_id),
+                    fanout_slot: None,
                 },
                 timestamp_epoch_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

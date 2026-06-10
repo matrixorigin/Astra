@@ -1,6 +1,7 @@
 pub mod agent_result_wire;
 pub mod builtin_agents;
 pub mod context_cache;
+pub mod fanout_group;
 pub mod progress;
 pub mod spawn_tool;
 pub mod team_config;

@@ -792,7 +792,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     // ToolContext AND it currently holds a handle, run via the
     // sibling runner so Ctrl+B can transfer child + streams to the
     // BackgroundTaskRegistry. Without a slot OR with an empty slot
-    // we fall through to the legacy reader (zero hot-path overhead).
+    // this bash invocation remains a normal foreground command.
     //
     // RAII guard pattern: take handle from slot, wrap in guard that
     // tracks ownership. Callers must explicitly restore() on error
@@ -849,7 +849,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 let mut result = ToolResult::text(
                     "<bash_detached>The bash command was promoted to a background task. \
                      The host will resume reading its output via the BackgroundTaskRegistry; \
-                     poll progress with `job(action='output')` or `job(action='output', job_id=<bg-shell-N>)`.\
+                     poll progress with `task_output(task_id=<bg-shell-N>)` or inspect tasks with `task_list()`.\
                      </bash_detached>"
                         .to_string(),
                 );
@@ -3113,8 +3113,8 @@ pub(crate) async fn run_bash_with_detach(
         stderr_detach.clone(),
     ));
 
-    // Take the watch receiver for detach. If absent, treat as no detach
-    // plumbing (legacy path). The watch receiver is borrowed in select!
+    // Take the watch receiver for detach. If absent, the command
+    // cannot be promoted. The watch receiver is borrowed in select!
     // so we don't need ownership gymnastics.
     let mut signal_rx = detach.signal_rx.lock().await.take();
 

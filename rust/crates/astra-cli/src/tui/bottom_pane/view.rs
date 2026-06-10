@@ -67,6 +67,17 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
+    fn refresh_background_task_rows(
+        &mut self,
+        _rows: Vec<crate::tui::bottom_pane::background_task_view::BackgroundTaskRow>,
+    ) -> bool {
+        false
+    }
+
+    fn accepts_background_task_rows(&self) -> bool {
+        false
+    }
+
     /// Short key-binding hint rendered as a 1-row footer at the bottom
     /// of the view. Return `None` to suppress (no hint bar reserved).
     ///

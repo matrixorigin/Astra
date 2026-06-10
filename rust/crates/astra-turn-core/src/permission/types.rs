@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     /// Auto-approve all tools (except bypass-immune safety checks).
-    #[serde(alias = "yolo", alias = "bypass-safety", alias = "bypass_safety")]
     Auto,
     /// Read-only investigation/planning mode: allow read tools, deny mutations.
     Plan,
@@ -79,7 +78,7 @@ impl std::str::FromStr for PermissionMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "auto" | "yolo" | "bypass-safety" | "bypass_safety" => Ok(Self::Auto),
+            "auto" => Ok(Self::Auto),
             "plan" => Ok(Self::Plan),
             "accept_edits" | "accept-edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
@@ -1172,19 +1171,10 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_legacy_aliases_map_to_auto() {
-        assert_eq!(
-            "yolo".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            "bypass-safety".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            "bypass_safety".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
+    fn permission_mode_rejects_legacy_aliases() {
+        for alias in ["yolo", "bypass-safety", "bypass_safety"] {
+            assert!(alias.parse::<PermissionMode>().is_err());
+        }
     }
 
     #[test]

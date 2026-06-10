@@ -660,24 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn job_shell_is_execute_gated_with_args() {
-        let args = serde_json::json!({
-            "action": "shell",
-            "command": "npm run dev"
-        });
-        assert_eq!(
-            cloud_gated_tool_kind_with_args("job", Some(&args)),
-            Some(CloudGatedToolKind::Execute)
-        );
-
-        let read_only = serde_json::json!({
-            "action": "shell",
-            "command": "git status"
-        });
-        assert_eq!(
-            cloud_gated_tool_kind_with_args("job", Some(&read_only)),
-            None
-        );
+    fn typed_background_task_controls_are_not_cloud_gated() {
+        assert_eq!(cloud_gated_tool_kind("task_output"), None);
+        assert_eq!(cloud_gated_tool_kind("task_list"), None);
+        assert_eq!(cloud_gated_tool_kind("task_stop"), None);
     }
 
     // ── bash_command_is_read_only tests ──

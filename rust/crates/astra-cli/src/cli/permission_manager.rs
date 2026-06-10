@@ -84,6 +84,28 @@ pub(crate) fn format_denied_message(reason: &str) -> String {
     }
 }
 
+fn persist_permission_mode_to_workspace(session_id: &str, mode: PermissionMode) {
+    let update = || -> std::io::Result<()> {
+        let mut workspace =
+            match astra_services::session_workspace::read_workspace_optional(session_id)? {
+                Some(workspace) => workspace,
+                None => return Ok(()),
+            };
+        workspace.permission_mode = Some(mode.to_string());
+        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        astra_services::session_workspace::write_workspace(&workspace)
+    };
+
+    if let Err(error) = update() {
+        tracing::warn!(
+            session_id,
+            mode = %mode,
+            error = %error,
+            "failed to persist permission mode to workspace"
+        );
+    }
+}
+
 fn cloud_always_feedback_message(
     remember_preview: &str,
     workspace_persistence_available: bool,
@@ -1377,6 +1399,9 @@ impl PermissionManager {
             encode_mode_for_mirror(mode),
             std::sync::atomic::Ordering::Release,
         );
+        if let Some(session_id) = self.active_session_id.as_deref() {
+            persist_permission_mode_to_workspace(session_id, mode);
+        }
     }
 
     /// Hand out a cheap clone of the mode mirror so an external
@@ -1398,11 +1423,18 @@ impl PermissionManager {
             decode_mode_for_mirror(self.mode_mirror.load(std::sync::atomic::Ordering::Acquire));
         if self.mode != mirror {
             self.mode = mirror;
+            if let Some(session_id) = self.active_session_id.as_deref() {
+                persist_permission_mode_to_workspace(session_id, mirror);
+            }
         }
     }
 
     pub(crate) fn set_active_session_id(&mut self, session_id: &str) {
         self.active_session_id = Some(session_id.to_string());
+    }
+
+    pub(crate) fn clear_active_session_id(&mut self) {
+        self.active_session_id = None;
     }
 
     fn active_session_id(&self) -> Option<&str> {
@@ -4865,14 +4897,8 @@ mod tests {
             "auto".parse::<PermissionMode>().unwrap(),
             PermissionMode::Auto
         );
-        assert_eq!(
-            "yolo".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            "bypass-safety".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
+        assert!("yolo".parse::<PermissionMode>().is_err());
+        assert!("bypass-safety".parse::<PermissionMode>().is_err());
         assert_eq!(
             "accept_edits".parse::<PermissionMode>().unwrap(),
             PermissionMode::AcceptEdits

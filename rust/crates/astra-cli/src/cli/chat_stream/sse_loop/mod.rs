@@ -356,7 +356,10 @@ pub(crate) async fn stream_chat_sse(
     } else {
         Vec::new()
     };
-    let cli_capabilities = edge_tools::cli_default_capabilities(p.agent_spawner.is_some());
+    let cli_capabilities = edge_tools::cli_default_capabilities(
+        p.agent_spawner.is_some(),
+        p.bg_task_commands.is_some(),
+    );
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
             edge_tools::local_tool_schemas(),

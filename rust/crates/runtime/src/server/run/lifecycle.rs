@@ -6723,6 +6723,7 @@ mod tests {
                 parent_run_id: parent_run_id.to_string(),
                 agent_type: "reviewer".to_string(),
                 description: "review code".to_string(),
+                fanout_slot: None,
             },
         )
     }

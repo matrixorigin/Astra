@@ -1136,7 +1136,7 @@ fn humanize_session_memory_error(turn: &str, reason: &str, detail: &str) -> Stri
 fn humanize_session_memory_skip(turn: &str, reason: &str) -> String {
     match reason {
         "in_flight" => format!(
-            "Session memory extraction was already running before {turn}, so this turn did not start a duplicate job."
+            "Session memory extraction was already running before {turn}, so this turn did not start a duplicate run."
         ),
         "below_init_gate" => format!(
             "Session memory has not started yet because the conversation had not accumulated enough meaningful context by {turn}."
@@ -2329,7 +2329,7 @@ mod tests {
         let hint =
             parse_session_memory_status_hint_from_journal_text(journal).expect("status hint");
         assert!(hint.summary.contains("already running before turn 8"));
-        assert!(hint.summary.contains("did not start a duplicate job"));
+        assert!(hint.summary.contains("did not start a duplicate run"));
         assert!(!hint.summary.contains("in_flight"));
     }
 
@@ -2346,7 +2346,7 @@ mod tests {
                 .contains("Latest extraction completed on turn 8")
         );
         assert!(hint.summary.contains("background extractor"));
-        assert!(!hint.summary.contains("duplicate job"));
+        assert!(!hint.summary.contains("duplicate run"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use astra_runtime::pipeline::persistence::ToolHealthEntry;
+use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_core::turn_event_sink::IncrementalTurnState;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -80,6 +81,8 @@ pub enum StreamEvent {
         label: String,
         tool_use_id: String,
         agent_id: Option<String>,
+        fanout_slot: Option<AgentFanoutSlotIdentity>,
+        fanout_title: Option<String>,
     },
     /// Tool execution completed. `tool_use_id` MUST match the paired
     /// `ToolStarted`. `parent_tool_use_id` is propagated for the same

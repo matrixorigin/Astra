@@ -212,8 +212,8 @@ pub(crate) enum Command {
     /// Team orchestration and shared context management
     #[command(alias = "teams")]
     Team(TeamArgs),
-    /// Local/cloud background job management
-    Job(JobArgs),
+    /// Local/cloud background task management
+    Task(TaskArgs),
     /// Memory search and inspection
     #[command(alias = "memories")]
     Memory(MemoryArgs),
@@ -379,7 +379,6 @@ pub(crate) struct ChatArgs {
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,
     /// Permission mode: auto, plan, accept_edits, prompt (interactive, default), or deny.
-    /// Legacy aliases yolo/bypass-safety map to auto for backward compatibility.
     #[arg(long = "permission-mode", value_parser = parse_permission_mode_arg)]
     pub permission_mode: Option<String>,
     /// Suppress spinner and progress output (result still printed)
@@ -503,36 +502,36 @@ pub(crate) struct TeamRestoreArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra job list\n  astra job pending\n  astra job run 在当前目录补一个最小登录页\n  astra job result abc12345"
+    after_help = "Examples:\n  astra task list\n  astra task pending\n  astra task run 在当前目录补一个最小登录页\n  astra task result abc12345"
 )]
-pub(crate) struct JobArgs {
+pub(crate) struct TaskArgs {
     #[command(subcommand)]
-    pub command: Option<JobSubcommand>,
+    pub command: Option<TaskSubcommand>,
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum JobSubcommand {
-    /// List recent background jobs
+pub(crate) enum TaskSubcommand {
+    /// List recent background tasks
     List,
-    /// List claimable job queue (oldest first)
+    /// List claimable task queue (oldest first)
     Pending,
-    /// Show job status and details
-    Status(JobQueryArgs),
-    /// Run a headless background job with the agent
-    Run(JobRunArgs),
-    /// Queue an API-backed cloud job without executing it locally (cloud-agent ops)
+    /// Show task status and details
+    Status(TaskQueryArgs),
+    /// Run a headless background task with the agent
+    Run(TaskRunArgs),
+    /// Queue an API-backed cloud task without executing it locally (cloud-agent ops)
     #[command(hide = true)]
-    Queue(JobQueueArgs),
-    /// Claim and execute queued API-backed cloud jobs (cloud-agent ops)
+    Queue(TaskQueueArgs),
+    /// Claim and execute queued API-backed cloud tasks (cloud-agent ops)
     #[command(hide = true)]
-    Worker(JobWorkerArgs),
-    /// Show the result of a background job
-    Result(JobResultArgs),
+    Worker(TaskWorkerArgs),
+    /// Show the result of a background task
+    Result(TaskResultArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct JobRunArgs {
-    /// Output job result and metadata as JSON
+pub(crate) struct TaskRunArgs {
+    /// Output task result and metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
     /// Suppress progress output; only print the final answer
@@ -541,27 +540,27 @@ pub(crate) struct JobRunArgs {
     /// Emit structured JSONL lifecycle/stream events to stderr
     #[arg(long = "stream-events", hide = true, default_value_t = false)]
     pub stream_events: bool,
-    /// Job prompt
+    /// Task prompt
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub text: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct JobQueueArgs {
-    /// Output queued job metadata as JSON
+pub(crate) struct TaskQueueArgs {
+    /// Output queued task metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Job prompt to queue
+    /// Task prompt to queue
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub text: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct JobWorkerArgs {
-    /// Edge agent identifier used for job leases
+pub(crate) struct TaskWorkerArgs {
+    /// Edge agent identifier used for task leases
     #[arg(long)]
     pub agent_id: Option<String>,
-    /// Claim and execute at most one job, then exit
+    /// Claim and execute at most one task, then exit
     #[arg(long, default_value_t = false)]
     pub once: bool,
     /// Keep polling for work until interrupted
@@ -576,29 +575,29 @@ pub(crate) struct JobWorkerArgs {
     /// Output lifecycle metadata as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Suppress job output while the worker runs
+    /// Suppress task output while the worker runs
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
     /// Emit structured JSONL lifecycle/stream events to stderr while
-    /// executing the claimed job. Useful for a supervising process
+    /// executing the claimed task. Useful for a supervising process
     /// (e.g. cloud agent) to tail worker progress.
     #[arg(long = "stream-events", hide = true, default_value_t = false)]
     pub stream_events: bool,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct JobQueryArgs {
-    /// Job id or title query
+pub(crate) struct TaskQueryArgs {
+    /// Task id or title query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct JobResultArgs {
+pub(crate) struct TaskResultArgs {
     /// Output result as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Job id or title query
+    /// Task id or title query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
 }

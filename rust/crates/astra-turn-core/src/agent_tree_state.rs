@@ -36,6 +36,7 @@ impl AgentTreeState {
                 parent_run_id,
                 agent_type,
                 description,
+                fanout_slot,
             } => {
                 self.run_id_by_agent_id
                     .insert(event.agent_id.clone(), run_id.clone());
@@ -52,6 +53,8 @@ impl AgentTreeState {
                             started_at: now,
                             metrics: SpawnedAgentMetrics::default(),
                             has_permission_issues: false,
+                            run_in_background: false,
+                            fanout_slot,
                         },
                     },
                 );
@@ -295,6 +298,7 @@ mod tests {
                 parent_run_id: "root".into(),
                 agent_type: "general-purpose".into(),
                 description: "root".into(),
+                fanout_slot: None,
             },
         ));
         state.apply(event(
@@ -304,6 +308,7 @@ mod tests {
                 parent_run_id: "root-run".into(),
                 agent_type: "task".into(),
                 description: "child".into(),
+                fanout_slot: None,
             },
         ));
         state.apply(event(
@@ -333,6 +338,7 @@ mod tests {
                 parent_run_id: "root".into(),
                 agent_type: "general-purpose".into(),
                 description: "root".into(),
+                fanout_slot: None,
             },
         ));
         state.apply(event(
@@ -342,6 +348,7 @@ mod tests {
                 parent_run_id: "root-run".into(),
                 agent_type: "task".into(),
                 description: "child".into(),
+                fanout_slot: None,
             },
         ));
         state.apply(event(
@@ -366,6 +373,7 @@ mod tests {
                 parent_run_id: "root".into(),
                 agent_type: "task".into(),
                 description: "agent".into(),
+                fanout_slot: None,
             },
         ));
         state.apply(event(
@@ -405,6 +413,7 @@ mod tests {
                     parent_run_id: parent,
                     agent_type: "task".into(),
                     description: format!("depth {depth}"),
+                    fanout_slot: None,
                 },
             ));
             parent = run_id;
@@ -434,12 +443,42 @@ mod tests {
                 parent_run_id: "missing-run".into(),
                 agent_type: "task".into(),
                 description: "orphan".into(),
+                fanout_slot: None,
             },
         ));
 
         let snap = state.snapshot();
         assert_eq!(snap.roots.len(), 1);
         assert_eq!(snap.roots[0].run_id, "orphan-run");
+    }
+
+    #[test]
+    fn agent_spawned_event_preserves_fanout_slot_identity() {
+        let mut state = AgentTreeState::default();
+        state.apply(event(
+            "storage@run-1",
+            ProgressEventType::AgentSpawned {
+                run_id: "run-1".into(),
+                parent_run_id: "root".into(),
+                agent_type: "task".into(),
+                description: "review storage".into(),
+                fanout_slot: Some(
+                    crate::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
+                        "review-1", 3, 1,
+                    )
+                    .unwrap(),
+                ),
+            },
+        ));
+
+        let snap = state.snapshot();
+        let slot = snap.roots[0]
+            .fanout_slot
+            .as_ref()
+            .expect("fanout slot should survive progress projection");
+        assert_eq!(slot.group_id, "review-1");
+        assert_eq!(slot.target_count, 3);
+        assert_eq!(slot.slot_index, 1);
     }
 
     #[test]
@@ -454,6 +493,7 @@ mod tests {
                     parent_run_id: "root".into(),
                     agent_type: "task".into(),
                     description: format!("agent {idx}"),
+                    fanout_slot: None,
                 },
                 timestamp_epoch_ms: idx,
             });
@@ -492,6 +532,7 @@ mod tests {
                 parent_run_id: "root".into(),
                 agent_type: "task".into(),
                 description: "active".into(),
+                fanout_slot: None,
             },
             timestamp_epoch_ms: 1,
         });
@@ -514,6 +555,7 @@ mod tests {
                     parent_run_id: "root".into(),
                     agent_type: "task".into(),
                     description: "done".into(),
+                    fanout_slot: None,
                 },
                 timestamp_epoch_ms: timestamp,
             });

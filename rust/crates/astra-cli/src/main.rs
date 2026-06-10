@@ -477,9 +477,9 @@ mod tests {
     use cli::auth_flow::{do_login, do_register};
     use cli::cli_config::cli_args::{
         AgentSubcommand, AuditCmd, AuditShowArgs, AuditToolsArgs, BugSubcommand, Command,
-        ConfigCmd, DiffSubcommand, JobSubcommand, McpCmd, MemorySubcommand, MessagingArgs,
-        MessagingSubcommand, PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd,
-        SessionShowArgs, TeamSubcommand,
+        ConfigCmd, DiffSubcommand, McpCmd, MemorySubcommand, MessagingArgs, MessagingSubcommand,
+        PermissionsSubcommand, ReplayArgs, ReviewSubcommand, SessionCmd, SessionShowArgs,
+        TaskSubcommand, TeamSubcommand,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, prefix_chars, save_credentials,
@@ -2510,15 +2510,9 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn cli_chat_permission_mode_legacy_aliases() {
+    fn cli_chat_permission_mode_rejects_legacy_aliases() {
         for mode in ["yolo", "bypass-safety", "bypass_safety"] {
-            let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).unwrap();
-            match cli.command {
-                Some(Command::Chat(ref args)) => {
-                    assert_eq!(args.permission_mode.as_deref(), Some("auto"));
-                }
-                _ => panic!("expected Chat command"),
-            }
+            assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).is_err());
         }
     }
 
@@ -2897,15 +2891,26 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn cli_job_command_parses_structured_run_subcommand() {
-        let cli = Cli::try_parse_from(["astra", "job", "run", "fix", "login", "page"]).unwrap();
+    fn cli_task_command_parses_structured_run_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "task", "run", "fix", "login", "page"]).unwrap();
         match cli.command {
-            Some(Command::Job(args)) => match args.command {
-                Some(JobSubcommand::Run(run)) => {
+            Some(Command::Task(args)) => match args.command {
+                Some(TaskSubcommand::Run(run)) => {
                     assert_eq!(run.text, vec!["fix", "login", "page"]);
                 }
-                other => panic!("unexpected job subcommand: {other:?}"),
+                other => panic!("unexpected task subcommand: {other:?}"),
             },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_job_command_is_not_registered() {
+        let cli = Cli::try_parse_from(["astra", "job", "run", "fix", "login", "page"]).unwrap();
+        match cli.command {
+            Some(Command::Message(words)) => {
+                assert_eq!(words, vec!["job", "run", "fix", "login", "page"]);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -3471,6 +3476,29 @@ total_tokens_out: 500
         );
     }
 
+    #[test]
+    fn session_state_cli_context_permission_mode_overrides_auto_approve() {
+        let context = cli::cli_config::cli_context::CliContext::from_launch_options(
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            true,
+            None,
+            None,
+        )
+        .expect("cli context")
+        .with_permission_mode(Some("plan".into()));
+
+        let state = initialize_session_state(None, None, &context);
+
+        assert_eq!(
+            state.perm_manager.mode(),
+            permission_manager::PermissionMode::Plan
+        );
+    }
+
     #[tokio::test]
     async fn task_run_stores_result_in_checkpoint() {
         use astra_services::{TaskCreateRequest, TaskService, task_orchestrator::TaskCheckpoint};
@@ -3479,7 +3507,7 @@ total_tokens_out: 500
         let tmp = tempfile::tempdir().unwrap();
         let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
 
-        // Create a task record (simulates what `astra job run` does).
+        // Create a task record (simulates what `astra task run` does).
         let tid = svc
             .create_task(
                 "test-user",
@@ -3526,7 +3554,7 @@ total_tokens_out: 500
         // Complete the task
         svc.complete_task(&tid).await.unwrap();
 
-        // Read back and verify (simulates `astra job result`).
+        // Read back and verify (simulates `astra task result`).
         let record = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         let cp = record.checkpoint.unwrap();

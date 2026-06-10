@@ -29,6 +29,7 @@ pub(crate) fn sync_session_state_to_workspace(
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
     ws.last_persistence_error = state.session_persistence_error.clone();
+    ws.permission_mode = Some(state.perm_manager.mode().to_string());
     ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
     ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
 

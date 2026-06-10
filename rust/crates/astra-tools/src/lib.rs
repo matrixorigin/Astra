@@ -261,8 +261,8 @@ pub struct ToolContext {
     /// signal it transfers child + streams through the embedded
     /// one-shot channel. The TUI refills the slot before each tool
     /// call so each bash invocation gets a fresh one-shot.
-    /// `None` (the default) keeps the legacy cancel-on-Ctrl+B
-    /// behaviour where Ctrl+B kills the bash command.
+    /// `None` means the host did not make this bash invocation
+    /// background-promotable.
     pub detach_shell_handle: Option<crate::detach::DetachShellSlot>,
 }
 

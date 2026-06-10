@@ -23,6 +23,9 @@ use crate::cli::theme;
 use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
 use astra_services::session_journal::{self, JournalEventType};
 use astra_turn_core::delegation_tree::{AgentTreeNode, render_agent_forest};
+use astra_turn_core::orchestration_fanout_group::{
+    AgentFanoutGroupProjection, AgentFanoutSlotStatus,
+};
 use crossterm::style::Stylize;
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -178,10 +181,13 @@ fn show_history(ctx: &AgentCommandContext) {
 }
 
 async fn show_list(ctx: &AgentCommandContext) {
-    let mut recent_agents = if let Some(ref spawner) = ctx.spawner {
-        spawner.get_agent_history(None).await
+    let (mut recent_agents, fanout_groups) = if let Some(ref spawner) = ctx.spawner {
+        (
+            spawner.get_agent_history(None).await,
+            spawner.list_fanout_groups().await,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     recent_agents.sort_by_key(|agent| Reverse(agent.started_at));
     let (active_agents, completed_agents): (Vec<_>, Vec<_>) = recent_agents
@@ -194,6 +200,7 @@ async fn show_list(ctx: &AgentCommandContext) {
 
     if active_agents.is_empty()
         && completed_agents.is_empty()
+        && fanout_groups.is_empty()
         && delegations.is_empty()
         && delegation_error.is_none()
     {
@@ -212,6 +219,9 @@ async fn show_list(ctx: &AgentCommandContext) {
     if !active_agents.is_empty() {
         print_agent_section("🤖 Active Spawned Agents", &active_agents);
     }
+    if !fanout_groups.is_empty() {
+        print_fanout_section(&fanout_groups);
+    }
     if !completed_agents.is_empty() {
         print_agent_section("🕘 Recent Spawned Agents", &completed_agents);
     }
@@ -225,17 +235,24 @@ async fn show_list(ctx: &AgentCommandContext) {
 }
 
 async fn show_tree(ctx: &AgentCommandContext) {
-    let agents = if let Some(ref spawner) = ctx.spawner {
-        spawner.list_all_agents().await
+    let (agents, fanout_groups) = if let Some(ref spawner) = ctx.spawner {
+        (
+            spawner.list_all_agents().await,
+            spawner.list_fanout_groups().await,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let (delegations, delegation_error) = match load_recent_delegations(ctx.session_id.as_deref()) {
         Ok(delegations) => (delegations, None),
         Err(error) => (Vec::new(), Some(error)),
     };
 
-    if agents.is_empty() && delegations.is_empty() && delegation_error.is_none() {
+    if agents.is_empty()
+        && fanout_groups.is_empty()
+        && delegations.is_empty()
+        && delegation_error.is_none()
+    {
         eprintln!(
             "\n  {}",
             "🌲 No agent or delegation tree available".magenta().bold()
@@ -247,7 +264,17 @@ async fn show_tree(ctx: &AgentCommandContext) {
     eprintln!("\n  {}", "🌲 Agent Delegation Tree".magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
 
+    if !fanout_groups.is_empty() {
+        eprintln!("  {}", "Agent fanout groups".white().bold());
+        for line in render_fanout_groups(&fanout_groups) {
+            eprintln!("  {}", line);
+        }
+    }
+
     if !agents.is_empty() {
+        if !fanout_groups.is_empty() {
+            eprintln!();
+        }
         eprintln!("  {}", "Spawned agents".white().bold());
         let forest = AgentTreeNode::build_forest(&agents);
         let rendered = render_agent_forest(&forest);
@@ -304,6 +331,15 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
                 "Parent:".white().bold(),
                 state.parent_run_id.as_str().dim()
             );
+            if let Some(slot) = state.fanout_slot.as_ref() {
+                eprintln!(
+                    "  {} {} slot {}/{}",
+                    "Fanout:".white().bold(),
+                    slot.group_id.as_str().magenta(),
+                    slot.slot_index + 1,
+                    slot.target_count
+                );
+            }
 
             if let Some(ref addr) = state.messaging_address {
                 eprintln!(
@@ -564,6 +600,7 @@ async fn show_watch(ctx: &AgentCommandContext) {
     let throttle_interval = Duration::from_millis(500);
     let mut last_snapshot = build_watch_snapshot_for_session(
         &load_watch_agents(spawner_clone.as_ref()).await,
+        &load_watch_fanout_groups(spawner_clone.as_ref()).await,
         ctx.session_id.as_deref(),
     );
     print_watch_snapshot(&last_snapshot);
@@ -1031,6 +1068,14 @@ fn print_agent_section(title: &str, agents: &[astra_runtime::orchestration::Spaw
     }
 }
 
+fn print_fanout_section(groups: &[AgentFanoutGroupProjection]) {
+    eprintln!("\n  {}", "🧩 Agent Fanout Groups".magenta().bold());
+    eprintln!("  {}", "─".repeat(60).dim());
+    for line in render_fanout_groups(groups) {
+        eprintln!("  {line}");
+    }
+}
+
 fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
     eprintln!("\n  {}", "🤝 Recent Delegations".magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
@@ -1061,6 +1106,48 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
         if let Some(preview) = &entry.aggregated_output_preview {
             eprintln!("    {}", preview.as_str().magenta());
         }
+    }
+}
+
+fn render_fanout_groups(groups: &[AgentFanoutGroupProjection]) -> Vec<String> {
+    let mut groups = groups.to_vec();
+    groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+    let mut lines = Vec::new();
+    for group in groups {
+        lines.push(format!("{} {}", "▣".magenta(), group.summary_sentence()));
+        for slot in &group.slots {
+            let agent = slot
+                .agent_id
+                .as_deref()
+                .map(shorten_run_id)
+                .unwrap_or_else(|| "-".to_string());
+            let description = if slot.requested_description.trim().is_empty() {
+                slot.role.as_str()
+            } else {
+                slot.requested_description.as_str()
+            };
+            lines.push(format!(
+                "  {}. {:<22} {:<26} {}",
+                slot.slot_index + 1,
+                fanout_slot_status_label(slot.status).dim(),
+                description,
+                agent.dim()
+            ));
+        }
+    }
+    lines
+}
+
+fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
+    match status {
+        AgentFanoutSlotStatus::Planned => "planned",
+        AgentFanoutSlotStatus::SpawnAccepted | AgentFanoutSlotStatus::Running => "running",
+        AgentFanoutSlotStatus::SpawnRejected => "spawn rejected",
+        AgentFanoutSlotStatus::Completed => "completed",
+        AgentFanoutSlotStatus::Failed => "failed",
+        AgentFanoutSlotStatus::CancelledByUser => "stopped by user",
+        AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled by parent budget",
+        AgentFanoutSlotStatus::TimedOut => "timed out",
     }
 }
 
@@ -1138,6 +1225,16 @@ async fn load_watch_agents(
     }
 }
 
+async fn load_watch_fanout_groups(
+    spawner: Option<&Arc<DynamicAgentSpawner>>,
+) -> Vec<AgentFanoutGroupProjection> {
+    if let Some(spawner) = spawner {
+        spawner.list_fanout_groups().await
+    } else {
+        Vec::new()
+    }
+}
+
 async fn recv_watch_event(
     rx: &mut Option<
         tokio::sync::broadcast::Receiver<astra_runtime::orchestration::AgentProgressEvent>,
@@ -1188,8 +1285,11 @@ async fn wait_for_watch_snapshot_change(
         if !should_refresh {
             continue;
         }
-        let snapshot =
-            build_watch_snapshot_for_session(&load_watch_agents(spawner).await, session_id);
+        let snapshot = build_watch_snapshot_for_session(
+            &load_watch_agents(spawner).await,
+            &load_watch_fanout_groups(spawner).await,
+            session_id,
+        );
         if snapshot != last_snapshot {
             return snapshot;
         }
@@ -1198,6 +1298,14 @@ async fn wait_for_watch_snapshot_change(
 
 fn build_watch_snapshot(
     agents: &[astra_runtime::orchestration::SpawnedAgentInfo],
+    delegations: &[DelegationHistoryEntry],
+) -> String {
+    build_watch_snapshot_with_fanout(agents, &[], delegations)
+}
+
+fn build_watch_snapshot_with_fanout(
+    agents: &[astra_runtime::orchestration::SpawnedAgentInfo],
+    fanout_groups: &[AgentFanoutGroupProjection],
     delegations: &[DelegationHistoryEntry],
 ) -> String {
     let mut lines = Vec::new();
@@ -1238,7 +1346,18 @@ fn build_watch_snapshot(
         lines.push(String::new());
     }
 
+    if !fanout_groups.is_empty() {
+        lines.push(format!("  Agent fanout groups ({})", fanout_groups.len()));
+        lines.extend(
+            render_fanout_groups(fanout_groups)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
     if !agents.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
         lines.push(format!("  Spawned agents ({})", agents.len()));
         let forest = AgentTreeNode::build_forest(agents);
         let rendered = render_agent_forest(&forest);
@@ -1266,12 +1385,13 @@ fn build_watch_snapshot(
 
 fn build_watch_snapshot_for_session(
     agents: &[astra_runtime::orchestration::SpawnedAgentInfo],
+    fanout_groups: &[AgentFanoutGroupProjection],
     session_id: Option<&str>,
 ) -> String {
     match load_recent_delegations(session_id) {
-        Ok(delegations) => build_watch_snapshot(agents, &delegations),
+        Ok(delegations) => build_watch_snapshot_with_fanout(agents, fanout_groups, &delegations),
         Err(error) => {
-            let mut snapshot = build_watch_snapshot(agents, &[]);
+            let mut snapshot = build_watch_snapshot_with_fanout(agents, fanout_groups, &[]);
             snapshot.push_str("\n\n");
             snapshot.push_str(&format!("  warning: {error}"));
             snapshot
@@ -1803,8 +1923,9 @@ fn delegation_final_preview(entry: &DelegationHistoryEntry) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommandContext, DelegationHistoryEntry, DelegationRetrySummary,
-        DelegationSubRunSummary, build_watch_snapshot, build_watch_snapshot_for_session,
+        AgentCommandContext, AgentFanoutGroupProjection, DelegationHistoryEntry,
+        DelegationRetrySummary, DelegationSubRunSummary, build_watch_snapshot,
+        build_watch_snapshot_for_session, build_watch_snapshot_with_fanout,
         delegation_parent_lifecycle_note, format_delegation_event_brief, format_duration,
         format_status, handle_agent_command, load_delegation_events, load_recent_delegations,
         progress_event_ends_log_stream, progress_event_should_refresh_watch_snapshot,
@@ -1817,6 +1938,7 @@ mod tests {
     };
     use astra_runtime::server::delegation::engine::DelegationTracker;
     use astra_services::session_journal::{self, JournalEvent, JournalEventType};
+    use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotStatus;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -1832,6 +1954,8 @@ mod tests {
             started_at: SystemTime::now(),
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
+            run_in_background: false,
+            fanout_slot: None,
         }
     }
 
@@ -2157,6 +2281,54 @@ mod tests {
     }
 
     #[test]
+    fn build_watch_snapshot_with_fanout_shows_group_summary_and_slots() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "review fanout", 3);
+        group
+            .set_slot_request(0, "auth", "review auth flow")
+            .unwrap();
+        group.record_spawn_accepted(0, "auth@run-1").unwrap();
+        group
+            .set_slot_request(1, "storage", "review storage")
+            .unwrap();
+        group.record_spawn_rejected(1, "model denied").unwrap();
+
+        let snapshot = build_watch_snapshot_with_fanout(&[], &[group], &[]);
+
+        assert!(snapshot.contains("Agent fanout groups (1)"), "{snapshot}");
+        assert!(
+            snapshot.contains("3-agent fanout failed to start fully"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("review auth flow"), "{snapshot}");
+        assert!(snapshot.contains("review storage"), "{snapshot}");
+        assert!(snapshot.contains("spawn rejected"), "{snapshot}");
+    }
+
+    #[test]
+    fn build_watch_snapshot_with_fanout_names_parent_budget_cancellation() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "review fanout", 2);
+        group
+            .set_slot_request(0, "auth", "review auth flow")
+            .unwrap();
+        group.record_spawn_accepted(0, "auth@run-1").unwrap();
+        group
+            .record_terminal_by_agent(
+                "auth@run-1",
+                AgentFanoutSlotStatus::CancelledByParentBudget,
+                Some("turn budget exhausted".to_string()),
+            )
+            .unwrap();
+
+        let snapshot = build_watch_snapshot_with_fanout(&[], &[group], &[]);
+
+        assert!(
+            snapshot.contains("cancelled by parent budget"),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains("cancelled by budget"), "{snapshot}");
+    }
+
+    #[test]
     fn build_watch_snapshot_shows_empty_state() {
         let snapshot = build_watch_snapshot(&[], &[]);
         assert!(snapshot.contains("no agents or delegations yet"));
@@ -2168,7 +2340,7 @@ mod tests {
         let sid = format!("slash-agent-watch-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
-        let snapshot = build_watch_snapshot_for_session(&[], Some(&sid));
+        let snapshot = build_watch_snapshot_for_session(&[], &[], Some(&sid));
 
         assert!(
             snapshot.contains("warning: failed to read session journal"),

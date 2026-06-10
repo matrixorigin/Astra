@@ -3632,6 +3632,7 @@ pub(crate) fn progress_event_to_sse(
             parent_run_id,
             agent_type,
             description,
+            fanout_slot,
         } => Some(json!({
             "type": "agent_spawned",
             "agent_id": agent_id,
@@ -3639,6 +3640,7 @@ pub(crate) fn progress_event_to_sse(
             "parent_run_id": parent_run_id,
             "agent_type": agent_type,
             "description": description,
+            "fanout_slot": fanout_slot,
             "timestamp": ts,
         })),
         ProgressEventType::Started { description } => Some(json!({
@@ -6545,6 +6547,7 @@ mod tests {
                 parent_run_id: "run-000".to_string(),
                 agent_type: "explore".to_string(),
                 description: "Search codebase".to_string(),
+                fanout_slot: None,
             },
             timestamp_epoch_ms: 1000,
         };

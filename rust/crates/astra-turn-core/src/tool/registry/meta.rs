@@ -508,7 +508,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "agent",
-        description: "Multi-agent operations: spawn (create sub-agent), get_result (collect background result), run_chain (execute tool chain). For complex tasks requiring sub-agents. Fan out N agents in parallel by emitting N spawn calls in one assistant message with run_in_background:true.",
+        description: "Multi-agent operations: spawn one sub-agent, collect one background result, send messages, or execute a tool chain.",
         triggers: &["agent", "spawn", "chain", "orchestrate", "代理"],
         pinned: true,
         intents: &[IntentType::CodeEdit],
@@ -517,14 +517,65 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 40,
     },
     ToolMeta {
-        name: "job",
-        description: "Local TUI background shell jobs: shell, list, output, kill.",
-        triggers: &["job", "background", "bg", "server", "long-running"],
+        name: "agent_fanout",
+        description: "Atomic fixed-size parallel sub-agent fan-out: start a group, collect group results, or stop one slot.",
+        triggers: &[
+            "fanout",
+            "parallel agents",
+            "review agents",
+            "multi-agent",
+            "并行代理",
+        ],
+        pinned: true,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::External,
+        requires: &[Capability::AgentSpawner],
+        schema_tokens: 45,
+    },
+    ToolMeta {
+        name: "task_output",
+        description: "Read output and status for a specific typed background task by task_id.",
+        triggers: &[
+            "task output",
+            "background output",
+            "shell output",
+            "bg output",
+        ],
         pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
-        requires: &[Capability::LocalBackgroundJobs],
+        requires: &[Capability::LocalBackgroundTasks],
         schema_tokens: 35,
+    },
+    ToolMeta {
+        name: "task_stop",
+        description: "Stop a specific running typed background task by task_id.",
+        triggers: &[
+            "task stop",
+            "stop background",
+            "kill background",
+            "cancel background",
+        ],
+        pinned: false,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::Local,
+        requires: &[Capability::LocalBackgroundTasks],
+        schema_tokens: 25,
+    },
+    ToolMeta {
+        name: "task_list",
+        description: "List typed background tasks for this session.",
+        triggers: &[
+            "task list",
+            "background list",
+            "list background",
+            "bg tasks",
+        ],
+        pinned: false,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::Local,
+        requires: &[Capability::LocalBackgroundTasks],
+        schema_tokens: 20,
     },
     ToolMeta {
         name: "symbols",
@@ -780,6 +831,7 @@ mod tests {
     fn capability_gated_tools_declare_requires() {
         let cases = [
             ("agent", Capability::AgentSpawner),
+            ("agent_fanout", Capability::AgentSpawner),
             ("memory", Capability::MemoryService),
             ("mo", Capability::Database),
             ("github", Capability::GitHubAuth),
@@ -797,6 +849,26 @@ mod tests {
                 tool.requires.contains(&expected),
                 "{name} must require {expected:?}, got {:?}",
                 tool.requires
+            );
+        }
+    }
+
+    #[test]
+    fn background_task_tool_descriptions_are_not_shell_only() {
+        for name in ["task_output", "task_stop", "task_list"] {
+            let tool = TOOL_CATALOG
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must exist in catalog"));
+            assert!(
+                tool.description.contains("background task"),
+                "{name} should describe typed background tasks: {}",
+                tool.description
+            );
+            assert!(
+                !tool.description.contains("background shell"),
+                "{name} must not narrow the task model to shells: {}",
+                tool.description
             );
         }
     }

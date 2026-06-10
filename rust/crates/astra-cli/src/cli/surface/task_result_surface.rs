@@ -410,7 +410,7 @@ mod tests {
                 ),
                 (
                     "persistence_error".to_string(),
-                    serde_json::json!("write job output: permission denied"),
+                    serde_json::json!("write task output: permission denied"),
                 ),
             ]),
         });
@@ -466,7 +466,7 @@ mod tests {
         task.error_message = Some(
             crate::cli::surface::task_checkpoint_surface::encode_task_failure_message(
                 "persistence_error",
-                "failed to save background job result: disk full",
+                "failed to save background task result: disk full",
             ),
         );
 

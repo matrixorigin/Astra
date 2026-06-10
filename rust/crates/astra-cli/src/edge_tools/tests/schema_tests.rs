@@ -62,7 +62,9 @@ fn tool_schemas_include_core_tools() {
         "session",
         "mo",
         "agent",
-        "job",
+        "task_output",
+        "task_stop",
+        "task_list",
         "introspect",
         "lsp",
         "web_fetch",
@@ -127,7 +129,6 @@ fn every_catalog_tool_has_schema() {
             dyn_tool
         );
     }
-
     for tool in astra_runtime::tool_registry::TOOL_CATALOG {
         if DYNAMIC_SCHEMA_TOOLS.contains(&tool.name) {
             continue;
@@ -466,12 +467,9 @@ fn task_schema_requires_title_and_task_id() {
     );
 }
 
-/// Phase 1 split: `task` is the durable checklist surface (claudecode v2
-/// alignment). All background-execution actions live on a separate
-/// `job` tool. The `task` schema must
-/// no longer advertise background_shell/background_agent/output/kill —
-/// otherwise the model gets two equally-valid paths and picks the wrong
-/// one for ordinary checklist work.
+/// `task` is the durable checklist surface. Background execution control lives
+/// on typed `task_output` / `task_stop` / `task_list` tools, not the checklist
+/// action enum and not a generic job action union.
 #[test]
 fn task_schema_does_not_advertise_background_actions() {
     let schemas = all_tool_schemas();
@@ -486,7 +484,7 @@ fn task_schema_does_not_advertise_background_actions() {
         assert!(
             !actions.contains(banned),
             "task.action enum still advertises `{banned}` — it must move to \
-             the `job` tool. Got: {actions:?}"
+             typed background task control tools. Got: {actions:?}"
         );
     }
     // Sanity: the checklist verbs are still there.
@@ -498,72 +496,81 @@ fn task_schema_does_not_advertise_background_actions() {
     }
 }
 
-/// `job` is the home for local background shell execution.
-/// Background sub-agents keep their own lifecycle on `agent(spawn)` /
-/// `agent(get_result)` because their IDs and result collection are not
-/// managed by the TUI shell registry.
+/// Typed task-control tools are the model-facing background task surface.
+/// The generic `job` action union must not be advertised to the model.
 #[test]
-fn job_schema_exists_with_expected_actions() {
+fn typed_background_task_schemas_exist_without_job_schema() {
     let schemas = all_tool_schemas();
-    let job = schemas
-        .iter()
-        .find(|s| s["function"]["name"].as_str() == Some("job"))
-        .expect("job schema must exist — it owns background shell/output/kill");
     assert!(
         schemas
             .iter()
             .all(|s| s["function"]["name"].as_str() != Some("agent_job")),
         "agent_job must not remain in the model-facing schema"
     );
-    let actions: Vec<&str> = job["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .expect("job.action must be an enum")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    for expected in &["shell", "list", "output", "kill"] {
-        assert!(
-            actions.contains(expected),
-            "job.action must include `{expected}`. Got: {actions:?}"
-        );
-    }
     assert!(
-        !actions.contains(&"agent"),
-        "job.action must not advertise agent: sub-agent lifecycle uses \
-         agent(action='spawn', run_in_background=true) plus get_result. Got: {actions:?}"
+        schemas
+            .iter()
+            .all(|s| s["function"]["name"].as_str() != Some("job")),
+        "generic job action-union must not be model-facing"
     );
-
-    let properties = job["function"]["parameters"]["properties"]
-        .as_object()
-        .expect("job properties must be an object");
-    for removed_agent_field in ["prompt", "agent_type", "model"] {
+    for expected in &["task_output", "task_stop", "task_list"] {
         assert!(
-            !properties.contains_key(removed_agent_field),
-            "job schema must not expose sub-agent field `{removed_agent_field}`"
+            schemas
+                .iter()
+                .any(|s| s["function"]["name"].as_str() == Some(expected)),
+            "typed background task schema `{expected}` must be advertised"
         );
     }
 }
 
 #[test]
-fn job_schema_per_action_required_fields() {
+fn typed_background_task_schema_required_fields() {
     let schemas = all_tool_schemas();
-    let job = tool_schema(&schemas, "job");
+    let task_output = tool_schema(&schemas, "task_output");
+    let task_stop = tool_schema(&schemas, "task_stop");
+    let task_list = tool_schema(&schemas, "task_list");
     assert_eq!(
-        conditional_required_for(job, "shell"),
-        vec!["command".to_string()],
-        "job.shell must require `command` — without it the executor \
-         has no command to run and the model would silently no-op"
+        task_output["function"]["parameters"]["required"],
+        serde_json::json!(["task_id"]),
+        "task_output must require an explicit task_id so the UI/model identify the same task"
     );
     assert_eq!(
-        conditional_required_for(job, "output"),
-        Vec::<String>::new(),
-        "job.output should default to the most recent job so the model \
-         does not have to remember an ID just to read the common case"
+        task_stop["function"]["parameters"]["required"],
+        serde_json::json!(["task_id"]),
+        "task_stop must require an explicit task_id"
     );
-    assert_eq!(
-        conditional_required_for(job, "kill"),
-        vec!["job_id".to_string()],
-        "job.kill must require `job_id` — never bulk-kill all jobs"
+    assert!(
+        task_list["function"]["parameters"]["required"]
+            .as_array()
+            .is_none_or(|required| required.is_empty()),
+        "task_list should not require parameters"
+    );
+}
+
+#[test]
+fn typed_background_task_schema_describes_kinds_beyond_shell() {
+    let schemas = all_tool_schemas();
+    let task_output = tool_schema(&schemas, "task_output");
+    let task_stop = tool_schema(&schemas, "task_stop");
+    let task_list = tool_schema(&schemas, "task_list");
+
+    let output_desc = task_output["function"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    let stop_desc = task_stop["function"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    let list_desc = task_list["function"]["description"]
+        .as_str()
+        .unwrap_or_default();
+
+    assert!(output_desc.contains("typed background task"));
+    assert!(output_desc.contains("task kind"), "{output_desc}");
+    assert!(stop_desc.contains("local agents"), "{stop_desc}");
+    assert!(list_desc.contains("kind"), "{list_desc}");
+    assert!(
+        !list_desc.contains("background shell task"),
+        "task_list must not narrow the product model back to shell-only: {list_desc}"
     );
 }
 
@@ -594,7 +601,7 @@ fn cli_runtime_catalog_includes_plan_mode_wrappers() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false),
+        &crate::edge_tools::cli_default_capabilities(false, false),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -607,6 +614,44 @@ fn cli_runtime_catalog_includes_plan_mode_wrappers() {
         names.iter().any(|n| n == "exit_plan_mode"),
         "runtime-filtered local CLI catalog should still expose exit_plan_mode; got {names:?}"
     );
+}
+
+#[test]
+fn cli_runtime_catalog_hides_background_task_tools_without_registry() {
+    let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
+        crate::edge_tools::local_tool_schemas(),
+        Vec::new(),
+        &crate::edge_tools::cli_default_capabilities(false, false),
+    )
+    .into_iter()
+    .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
+    .collect();
+
+    for name in ["task_output", "task_stop", "task_list"] {
+        assert!(
+            !names.iter().any(|visible| visible == name),
+            "non-interactive CLI must not expose `{name}` without a background registry: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn cli_runtime_catalog_includes_background_task_tools_with_registry() {
+    let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
+        crate::edge_tools::local_tool_schemas(),
+        Vec::new(),
+        &crate::edge_tools::cli_default_capabilities(false, true),
+    )
+    .into_iter()
+    .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
+    .collect();
+
+    for name in ["task_output", "task_stop", "task_list"] {
+        assert!(
+            names.iter().any(|visible| visible == name),
+            "interactive CLI with a background registry must expose `{name}`: {names:?}"
+        );
+    }
 }
 
 #[test]

@@ -206,6 +206,7 @@ pub use permission::types as permission_types;
 // Re-exports: orchestration_* → orchestration::*
 pub use orchestration::builtin_agents as orchestration_builtin_agents;
 pub use orchestration::context_cache as orchestration_context_cache;
+pub use orchestration::fanout_group as orchestration_fanout_group;
 pub use orchestration::progress as orchestration_progress;
 pub use orchestration::spawn_tool as orchestration_spawn_tool;
 pub use orchestration::team_config as orchestration_team_config;

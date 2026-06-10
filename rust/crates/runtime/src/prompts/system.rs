@@ -228,16 +228,12 @@ fn build_skill_listing_section_with_budget_and_caps(
             "EXCEPTION: when the user explicitly asks for parallel / \
              multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
              agents\", \"parallel review\", \"different angles in parallel\"), \
-             route through `agent(action='spawn', ...)` instead — emit N \
-             separate `agent` calls in a single assistant message, each with \
-             `action='spawn'`, top-level `prompt` for the full child brief \
-             (never top-level `task`), and `run_in_background: true`. Do not \
-             prefill `agent_id` on spawn. Then collect with \
-             `agent(action='get_result', agent_id=...)` using the exact \
-             `agent_id` returned by each spawn result (never the optional \
-             spawn `name`). Skills usually run \
-             sequentially inside the parent turn, which contradicts the \
-             user's explicit fan-out intent.",
+             route through `agent_fanout(action='start', target_count=N, \
+             slots=[...])` instead of skill execution or an `agents:[...]` \
+             payload. Put each child's full brief in that slot's `prompt`, \
+             then collect with `agent_fanout(action='get_results', \
+             group_id=...)`. Skills usually run sequentially inside the \
+             parent turn, which contradicts the user's explicit fan-out intent.",
         );
     } else {
         body.push_str(
@@ -3386,7 +3382,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_listing_uses_consolidated_agent_action_syntax_when_available() {
+    fn skill_listing_uses_agent_fanout_when_parallel_agents_available() {
         let skills = vec![astra_skills::traits::SkillToolInfo {
             name: "review_code".to_string(),
             description: "Review code".to_string(),
@@ -3396,16 +3392,17 @@ mod tests {
             .expect("non-empty skill catalog");
 
         assert!(
-            section.text.contains("agent(action='spawn', ...)")
-                && section
-                    .text
-                    .contains("agent(action='get_result', agent_id=...)"),
-            "skill listing must teach consolidated agent(action=...) syntax: {}",
+            section.text.contains("agent_fanout(action='start'")
+                && section.text.contains("agent_fanout(action='get_results'"),
+            "skill listing must route explicit parallel work through agent_fanout: {}",
             section.text
         );
         assert!(
-            section.text.contains("never top-level `task`"),
-            "skill listing must explicitly forbid the deprecated task field: {}",
+            !section.text.contains("agent(action='spawn', ...)")
+                && !section
+                    .text
+                    .contains("agent(action='get_result', agent_id=...)"),
+            "skill listing must not preserve old loose-spawn fanout guidance: {}",
             section.text
         );
         assert!(

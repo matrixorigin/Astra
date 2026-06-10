@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use super::{StatusContext, StatusLine};
+use super::{BackgroundTaskCounts, BackgroundTaskFanoutSummary, StatusContext, StatusLine};
 use crate::tui::status_line::line::PermissionMode;
 
 fn ctx() -> StatusContext {
@@ -540,17 +540,17 @@ fn pending_chip_is_yellow_without_extra_bold() {
 // ── Phase 3b.2: background task chip ────────────────────────────────
 //
 // When the BackgroundTaskRegistry has any non-terminal tasks, the
-// status line shows a compact `N background commands` (and `· M waiting` if any) chip
-// so the user can see at a glance how many fire-and-poll shell commands are in
-// flight without opening a separate view. Hidden when all bg tasks
-// are terminal (or none exist) so the chip doesn't waste space.
+// status line shows a compact typed shell chip (and `· M needs input` if any) so
+// the user can see at a glance how many fire-and-poll shell commands are in
+// flight without opening a separate view. Hidden when all bg tasks are terminal
+// (or none exist) so the chip doesn't waste space.
 
 #[test]
 fn no_bg_tasks_renders_no_chip() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        !plain.contains("background commands"),
+        !plain.contains("shell") && !plain.contains("background commands"),
         "no bg tasks must render no chip; got {plain:?}"
     );
 }
@@ -558,43 +558,56 @@ fn no_bg_tasks_renders_no_chip() {
 #[test]
 fn bg_running_only_renders_count() {
     let c = StatusContext {
-        bg_task_counts: Some((2, 0)),
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 2,
+            waiting: 0,
+            ..BackgroundTaskCounts::default()
+        }),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("2 background commands"),
+        plain.contains("2 shells"),
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
-        !plain.contains("waiting"),
-        "waiting segment must hide when 0; got {plain:?}"
+        !plain.contains("background commands"),
+        "chip must use typed task vocabulary; got {plain:?}"
+    );
+    assert!(
+        !plain.contains("needs input"),
+        "needs-input segment must hide when 0; got {plain:?}"
     );
 }
 
 #[test]
 fn bg_running_and_stalled_appends_stalled_segment() {
     let c = StatusContext {
-        bg_task_counts: Some((3, 1)),
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 3,
+            waiting: 1,
+            ..BackgroundTaskCounts::default()
+        }),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("3 background commands"),
+        plain.contains("3 shells"),
         "must show running count; got {plain:?}"
     );
     assert!(
-        plain.contains("1 waiting"),
-        "must show waiting count when > 0; got {plain:?}"
+        plain.contains("1 needs input"),
+        "must show needs-input count when > 0; got {plain:?}"
     );
 }
 
 #[test]
-fn bg_zero_running_zero_stalled_hides_chip() {
-    // (0, 0) — registry exists but no live tasks. Hide the chip
+fn bg_zero_running_zero_waiting_zero_failed_hides_chip() {
+    // Empty registry counts — registry exists but no live/attention
+    // tasks. Hide the chip
     // rather than render `0 background commands` noise.
     let c = StatusContext {
-        bg_task_counts: Some((0, 0)),
+        bg_task_counts: Some(BackgroundTaskCounts::default()),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
@@ -608,18 +621,305 @@ fn bg_zero_running_zero_stalled_hides_chip() {
 fn bg_stalled_only_chip_uses_yellow_for_attention() {
     // Stalled is the alarm signal — yellow so the user notices.
     let c = StatusContext {
-        bg_task_counts: Some((0, 2)),
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 0,
+            waiting: 2,
+            ..BackgroundTaskCounts::default()
+        }),
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text.contains("waiting"))
+        .find(|seg| seg.text.contains("need input"))
         .expect("bg chip must render even when only stalled (the model needs to know)");
+    assert_eq!(
+        chip.text, "2 need input",
+        "stalled-only chip should be an attention state, not a vague background label"
+    );
     assert_eq!(
         chip.style.fg,
         Some(ratatui::style::Color::Yellow),
         "stalled-only state must surface in yellow so the user notices"
     );
+}
+
+#[test]
+fn bg_failed_only_chip_uses_red_attention() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 0,
+            waiting: 0,
+            failed_shells: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let chip = s
+        .left
+        .iter()
+        .find(|seg| seg.text.contains("failed"))
+        .expect("failed bg shell must stay visible as an attention state");
+    assert_eq!(chip.text, "1 shell failed");
+    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
+}
+
+#[test]
+fn bg_failed_and_running_prioritizes_failed_then_running() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 2,
+            waiting: 0,
+            failed_shells: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("1 shell failed · 2 shells"),
+        "failed attention should lead running count; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_failed_cloud_session_keeps_its_kind_in_footer() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            failed_cloud_sessions: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("1 cloud session failed"),
+        "failed typed task should keep its kind; got {plain:?}"
+    );
+    assert!(
+        !plain.contains("1 shell failed"),
+        "failed non-shell tasks must not be mislabeled as shell failures; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_footer_names_two_task_kinds_explicitly() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 2,
+            local_agents: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("2 shells · 1 local agent"),
+        "two readable kinds should be explicit; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_footer_collapses_three_or_more_task_kinds() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 2,
+            local_agents: 1,
+            cloud_sessions: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("4 background tasks"),
+        "three kinds should collapse to avoid a noisy footer; got {plain:?}"
+    );
+    assert!(!plain.contains("2 shells · 1 local agent · 1 cloud session"));
+}
+
+#[test]
+fn bg_footer_attention_precedes_typed_kind_counts() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 2,
+            waiting: 1,
+            local_agents: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("1 needs input · 2 shells · 1 local agent"),
+        "attention states should lead typed counts; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_footer_names_unavailable_typed_tasks() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            unavailable_local_agents: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("1 local agent unavailable"),
+        "unavailable restored tasks should remain discoverable; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_footer_calls_out_active_fanout_group_accounting() {
+    let c = StatusContext {
+        bg_fanout_summaries: vec![BackgroundTaskFanoutSummary {
+            group_id: "review-1".into(),
+            title: "review fanout".into(),
+            target_count: 3,
+            running: 2,
+            done: 0,
+            failed: 0,
+            stopped: 1,
+            unavailable: 0,
+        }],
+        bg_task_counts: Some(BackgroundTaskCounts {
+            local_agents: 2,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("review fanout 2/3 running · 1 stopped"),
+        "fanout footer must preserve target count and stopped slots; got {plain:?}"
+    );
+    assert!(
+        plain.contains("2 local agents"),
+        "fanout summary should not erase typed task counts; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_fanout_summary_from_rows_hides_stopped_only_groups() {
+    use crate::tui::bottom_pane::background_task_view::{
+        BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
+    };
+
+    let row = BackgroundTaskRow::new(
+        "agent-stopped",
+        BackgroundTaskKind::LocalAgent,
+        "killed",
+        1000,
+        "storage review",
+        None,
+        None,
+        None,
+    )
+    .with_fanout(BackgroundTaskFanoutMembership {
+        group_id: "review-1".into(),
+        group_title: "review fanout".into(),
+        target_count: 3,
+        slot_index: 1,
+        slot_label: "storage review".into(),
+    });
+
+    assert!(
+        BackgroundTaskFanoutSummary::from_rows(&[row]).is_empty(),
+        "stopped-only fanout groups should not pin the footer forever"
+    );
+}
+
+#[test]
+fn bg_counts_from_rows_uses_typed_active_projection() {
+    use crate::tui::bottom_pane::background_task_view::{BackgroundTaskKind, BackgroundTaskRow};
+
+    let rows = vec![
+        BackgroundTaskRow::new(
+            "shell",
+            BackgroundTaskKind::Shell,
+            "running",
+            1_000,
+            "cargo test",
+            None,
+            None,
+            None,
+        ),
+        BackgroundTaskRow::new(
+            "agent",
+            BackgroundTaskKind::LocalAgent,
+            "pending",
+            2_000,
+            "review auth",
+            None,
+            None,
+            None,
+        ),
+        BackgroundTaskRow::new(
+            "wait",
+            BackgroundTaskKind::Shell,
+            "waiting_for_input",
+            3_000,
+            "npm run dev",
+            None,
+            None,
+            None,
+        ),
+        BackgroundTaskRow::new(
+            "failed-cloud",
+            BackgroundTaskKind::CloudSession,
+            "failed",
+            4_000,
+            "cloud run",
+            None,
+            None,
+            None,
+        ),
+        BackgroundTaskRow::new(
+            "done",
+            BackgroundTaskKind::Monitor,
+            "completed",
+            5_000,
+            "monitor",
+            None,
+            None,
+            None,
+        ),
+        BackgroundTaskRow::new(
+            "stopped",
+            BackgroundTaskKind::Shell,
+            "killed",
+            6_000,
+            "old shell",
+            None,
+            None,
+            None,
+        ),
+        BackgroundTaskRow::new(
+            "restored-agent",
+            BackgroundTaskKind::LocalAgent,
+            "unavailable",
+            7_000,
+            "restored review",
+            None,
+            None,
+            None,
+        ),
+    ];
+
+    let counts = BackgroundTaskCounts::from_rows(&rows);
+
+    assert_eq!(counts.running, 1);
+    assert_eq!(counts.local_agents, 1);
+    assert_eq!(counts.waiting, 1);
+    assert_eq!(counts.failed_shells, 0);
+    assert_eq!(counts.failed_cloud_sessions, 1);
+    assert_eq!(counts.unavailable_local_agents, 1);
+    assert_eq!(counts.cloud_sessions, 0);
+    assert_eq!(counts.monitors, 0);
 }

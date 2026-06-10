@@ -26,8 +26,8 @@ pub enum Capability {
     LSPServer,
     /// Server-owned plan lifecycle tools.
     PlanLifecycle,
-    /// Local TUI/REPL background shell job registry.
-    LocalBackgroundJobs,
+    /// Local/edge background task registry and projection control.
+    LocalBackgroundTasks,
 }
 
 /// Session-invariant set of runtime capabilities.

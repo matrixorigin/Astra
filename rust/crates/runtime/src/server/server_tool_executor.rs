@@ -724,12 +724,9 @@ fn render_session_history_rows(
 /// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search)
 /// and session-scoped authoring tools (`task`, memory_retrieve, …) stay
 /// available so the agent can continue exploring while authoring a plan.
-fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
-    if tool == "job" {
-        return !matches!(
-            args.get("action").and_then(Value::as_str),
-            Some("list" | "output")
-        );
+fn is_plan_mode_blocked_tool(tool: &str, _args: &Value) -> bool {
+    if tool == "task_stop" {
+        return true;
     }
     matches!(
         tool,
@@ -2224,6 +2221,13 @@ impl ServerToolExecutor {
                     )),
                 }
             }
+            "agent_fanout" => tool_result_from_output(
+                crate::orchestration::handle_agent_fanout_tool(
+                    args,
+                    self.agent_tool_context.as_ref(),
+                )
+                .await,
+            ),
             // Legacy alias
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
@@ -7296,23 +7300,16 @@ esac
     }
 
     #[test]
-    fn plan_mode_job_guard_blocks_shell_and_kill_but_allows_reads() {
+    fn plan_mode_background_task_guard_blocks_stop_but_allows_reads() {
         assert!(is_plan_mode_blocked_tool(
-            "job",
-            &json!({"action": "shell", "command": "npm run dev"})
-        ));
-        assert!(is_plan_mode_blocked_tool(
-            "job",
-            &json!({"action": "kill", "job_id": "bg-shell-1"})
+            "task_stop",
+            &json!({"task_id": "bg-shell-1"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "job",
-            &json!({"action": "output", "job_id": "bg-shell-1"})
+            "task_output",
+            &json!({"task_id": "bg-shell-1"})
         ));
-        assert!(!is_plan_mode_blocked_tool(
-            "job",
-            &json!({"action": "list"})
-        ));
+        assert!(!is_plan_mode_blocked_tool("task_list", &json!({})));
     }
 
     #[tokio::test]
@@ -7874,7 +7871,7 @@ esac
                 "title": "ship user-visible plan",
                 "owner": "subagent-1",
                 "metadata": {
-                    "source": "background_job",
+                    "source": "background_task",
                     "agent_id": "subagent-1"
                 }
             }))
@@ -7896,7 +7893,7 @@ esac
                     .as_ref()
                     .and_then(|metadata| metadata.get("source"))
                     .and_then(serde_json::Value::as_str)
-                    == Some("background_job")
+                    == Some("background_task")
             }),
             "pre-existing async/subagent task must remain visible"
         );

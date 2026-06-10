@@ -71,6 +71,7 @@ pub(crate) struct TaskCell {
     pub output_summary: Option<String>,
     pub children: Vec<TaskChildEvent>,
     pub error: Option<String>,
+    pub ctrl_b_background_hint: bool,
 }
 
 impl TaskCell {
@@ -85,7 +86,12 @@ impl TaskCell {
             output_summary: None,
             children: Vec::new(),
             error: None,
+            ctrl_b_background_hint: false,
         }
+    }
+
+    pub fn set_ctrl_b_background_hint(&mut self, enabled: bool) {
+        self.ctrl_b_background_hint = enabled;
     }
 
     /// Record a child tool starting inside this task. Idempotent by
@@ -220,23 +226,37 @@ impl HistoryCell for TaskCell {
 
         // Header.
         let task_label = "Task";
-        let desc = trimmed_desc(&self.description, max_child_w);
+        let background_hint = if self.status == TaskStatus::Running && self.ctrl_b_background_hint {
+            " · Ctrl+B to background"
+        } else {
+            ""
+        };
         let header = if self.status == TaskStatus::Running {
+            let meta = format!(" · {}{}", self.elapsed_str(), background_hint);
+            let desc = trimmed_desc(
+                &self.description,
+                w.saturating_sub(2 + task_label.width() + 3 + meta.width()),
+            );
             Line::from(vec![
                 self.arrow(),
                 Span::styled(task_label, Style::default().bold()),
                 Span::styled(" · ", dim),
                 Span::raw(desc),
-                Span::styled(format!(" · {}", self.elapsed_str()), dim),
+                Span::styled(meta, dim),
             ])
         } else {
             let meta = format!("{} · {}", self.title_text(), self.elapsed_str());
+            let meta_text = format!(" · {meta}");
+            let desc = trimmed_desc(
+                &self.description,
+                w.saturating_sub(2 + task_label.width() + 3 + meta_text.width()),
+            );
             Line::from(vec![
                 self.arrow(),
                 Span::styled(task_label, Style::default().bold()),
                 Span::styled(" · ", dim),
                 Span::raw(desc),
-                Span::styled(format!(" · {meta}"), dim),
+                Span::styled(meta_text, dim),
             ])
         };
 
@@ -561,6 +581,18 @@ mod tests {
             !out.contains("✶") && !out.contains("✷") && !out.contains("✹") && !out.contains("✺"),
             "running task header should be calmer than the old shimmer treatment: {out}"
         );
+    }
+
+    #[test]
+    fn running_header_can_advertise_ctrl_b_backgrounding() {
+        let mut t = TaskCell::new_running(
+            "tu_parent",
+            "Spawn agent: reviewer with a deliberately long role label",
+        );
+        t.set_ctrl_b_background_hint(true);
+        let out = render(&t, 48, 2);
+
+        assert!(out.contains("Ctrl+B to background"), "{out}");
     }
 
     #[test]

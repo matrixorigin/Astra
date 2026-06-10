@@ -5,6 +5,8 @@
 
 use std::time::SystemTime;
 
+use super::fanout_group::AgentFanoutSlotIdentity;
+
 /// Current status of a spawned agent.
 ///
 /// `Completed` is reused for every terminal state where progress
@@ -94,6 +96,8 @@ pub struct SpawnedAgentInfo {
     pub started_at: SystemTime,
     pub metrics: SpawnedAgentMetrics,
     pub has_permission_issues: bool,
+    pub run_in_background: bool,
+    pub fanout_slot: Option<AgentFanoutSlotIdentity>,
 }
 
 /// Random `edge_executor_id` values for §5.5 when `ASTRA_EDGE_EXECUTOR_ID` is unset.

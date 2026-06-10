@@ -7,7 +7,9 @@
 
 pub(crate) mod line;
 
-pub(crate) use line::{StatusContext, StatusLine};
+pub(crate) use line::{
+    BackgroundTaskCounts, BackgroundTaskFanoutSummary, StatusContext, StatusLine,
+};
 
 #[cfg(test)]
 mod snapshot_tests;

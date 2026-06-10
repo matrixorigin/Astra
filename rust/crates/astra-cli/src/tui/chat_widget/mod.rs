@@ -95,6 +95,8 @@ pub(crate) enum WireEvent {
         label: String,
         tool_use_id: String,
         agent_id: Option<String>,
+        fanout_slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
+        fanout_title: Option<String>,
     },
 
     /// Tool finished. `status` mirrors the string we receive on
@@ -181,6 +183,10 @@ pub(crate) struct TurnStats {
 struct AgentRunRegistry {
     runs: std::collections::HashMap<String, Box<TaskCell>>,
     order: Vec<String>,
+    fanout_membership: std::collections::HashMap<
+        String,
+        crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership,
+    >,
     /// Map of `tool_use_id → registry key` so a follow-up event for
     /// the same tool call (e.g. a generic `ToolStarted` after a
     /// structured `AgentControlStarted` already established the
@@ -200,6 +206,23 @@ impl AgentRunRegistry {
 
     fn get_mut(&mut self, id: &str) -> Option<&mut TaskCell> {
         self.runs.get_mut(id).map(Box::as_mut)
+    }
+
+    fn fanout_membership(
+        &self,
+        id: &str,
+    ) -> Option<&crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership> {
+        self.fanout_membership.get(id)
+    }
+
+    fn set_fanout_membership(
+        &mut self,
+        id: &str,
+        fanout: Option<crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership>,
+    ) {
+        if let Some(fanout) = fanout {
+            self.fanout_membership.insert(id.to_string(), fanout);
+        }
     }
 
     fn contains_key(&self, id: &str) -> bool {
@@ -261,6 +284,9 @@ impl AgentRunRegistry {
                 self.runs.insert(new.clone(), cell);
             }
         }
+        if let Some(fanout) = self.fanout_membership.remove(old) {
+            self.fanout_membership.entry(new.clone()).or_insert(fanout);
+        }
         for id in &mut self.order {
             if id == old {
                 *id = new.clone();
@@ -291,6 +317,7 @@ fn merge_agent_task_cells(target: &mut TaskCell, source: crate::tui::history_cel
         output_summary,
         children,
         error,
+        ctrl_b_background_hint,
     } = source;
 
     if started_at < target.started_at {
@@ -302,6 +329,7 @@ fn merge_agent_task_cells(target: &mut TaskCell, source: crate::tui::history_cel
     if target.error.is_none() {
         target.error = error;
     }
+    target.ctrl_b_background_hint |= ctrl_b_background_hint;
     if target
         .output_summary
         .as_ref()
@@ -339,6 +367,26 @@ fn merge_agent_task_cells(target: &mut TaskCell, source: crate::tui::history_cel
         if target.duration_ms.is_none() {
             target.duration_ms = duration_ms;
         }
+    }
+}
+
+fn agent_fanout_membership(
+    slot: astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity,
+    group_title: Option<&str>,
+    slot_label: &str,
+) -> crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership {
+    let group_id = slot.group_id;
+    let group_title = group_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&group_id)
+        .to_string();
+    crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership {
+        group_title,
+        group_id,
+        target_count: slot.target_count,
+        slot_index: slot.slot_index,
+        slot_label: slot_label.to_string(),
     }
 }
 
@@ -417,6 +465,10 @@ pub(crate) struct ChatWidget {
     /// Control tool ids cleared at a turn boundary. Used to detect
     /// late `AgentControlCompleted` arrivals after the row was dropped.
     cleared_agent_tool_use_ids: std::collections::HashSet<String>,
+    /// Current-turn UI capability for foreground bash promotion.
+    /// Enabled by the interactive event loop only after it installs a
+    /// detach handle that Ctrl+B can signal.
+    bash_background_hint_enabled: bool,
 }
 
 impl ChatWidget {
@@ -435,7 +487,12 @@ impl ChatWidget {
             cancelled_task_ids: std::collections::HashSet::new(),
             cleared_agent_run_ids: std::collections::HashSet::new(),
             cleared_agent_tool_use_ids: std::collections::HashSet::new(),
+            bash_background_hint_enabled: false,
         }
+    }
+
+    pub fn set_bash_background_hint_enabled(&mut self, enabled: bool) {
+        self.bash_background_hint_enabled = enabled;
     }
 
     /// IDs of currently-live parallel TaskCells in spawn order.
@@ -459,6 +516,17 @@ impl ChatWidget {
 
     pub fn agent_run_cell(&self, id: &str) -> Option<&TaskCell> {
         self.agent_runs.get(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_agent_completed_at_for_test(
+        &mut self,
+        id: &str,
+        completed_at: std::time::Instant,
+    ) {
+        if let Some(tc) = self.agent_runs.get_mut(id) {
+            tc.completed_at = Some(completed_at);
+        }
     }
 
     /// Whether the user has issued a cancel for this agent that has
@@ -550,6 +618,7 @@ impl ChatWidget {
                         .duration_ms
                         .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
                     status: self.agent_row_status(id, tc),
+                    fanout: self.agent_runs.fanout_membership(id).cloned(),
                 })
             })
             .collect();
@@ -610,6 +679,7 @@ impl ChatWidget {
                             } else {
                                 AgentRowStatus::Live
                             },
+                            fanout: None,
                         })
                     }
                 })
@@ -632,6 +702,7 @@ impl ChatWidget {
                         .duration_ms
                         .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
                     status: task_status_to_agent_row_status(tc.status),
+                    fanout: None,
                 })
                 .collect();
             rows.extend(completed);
@@ -668,7 +739,7 @@ impl ChatWidget {
         // the in-flight set so a follow-up Ctrl+C is a no-op (count=0,
         // no banner). Pre-fix the same ids stayed visible to the next
         // press; the task service rejected re-cancels and the user
-        // saw "Cancelled 1 background command." printed once per press
+        // saw "Stopped 1 local agent." printed once per press
         // until they all settled. Cancelling badges (the cancelling
         // map above) keep the strip showing "Cancelling…" until the
         // worker's terminal event prunes the rest.
@@ -678,7 +749,7 @@ impl ChatWidget {
     }
 
     /// Commit a single-line banner into scrollback confirming how
-    /// many background commands were cancelled by the latest Ctrl+C.
+    /// many local agents were stopped by the latest Ctrl+C.
     /// No-op when `count == 0` so a normal Ctrl+C (no live tasks)
     /// doesn't clutter the transcript. Called by the event loop
     /// right after `cancel_fanout::fanout`.
@@ -686,13 +757,17 @@ impl ChatWidget {
         if count == 0 {
             return;
         }
-        let noun = if count == 1 { "command" } else { "commands" };
-        let msg = format!("Stopped {count} background {noun}.");
+        let noun = if count == 1 {
+            "local agent"
+        } else {
+            "local agents"
+        };
+        let msg = format!("Stopped {count} {noun}.");
         self.commit_cell(Box::new(SystemCell::warning(msg)));
     }
 
     /// Commit a resume-time summary banner telling the user what
-    /// background commands finished while they were gone. Called once
+    /// background tasks finished while they were gone. Called once
     /// after replay_session_into_widget finishes, with the message
     /// pre-rendered by `resume_summary::ResumeSummary::render`.
     /// Info-styled because it's neutral history, not an alert.
@@ -844,7 +919,16 @@ impl ChatWidget {
                 label,
                 tool_use_id,
                 agent_id,
-            } => self.on_agent_control_started(action, label, tool_use_id, agent_id),
+                fanout_slot,
+                fanout_title,
+            } => self.on_agent_control_started(
+                action,
+                label,
+                tool_use_id,
+                agent_id,
+                fanout_slot,
+                fanout_title,
+            ),
             WireEvent::ToolCompleted {
                 name,
                 description,
@@ -1061,8 +1145,12 @@ impl ChatWidget {
                 agent_label_from_description(&description),
                 tool_use_id.clone(),
                 None,
+                None,
+                None,
             );
         }
+        let agent_spawn_backgroundable =
+            name == "agent" && agent_action_from_description(&description) == Some("spawn");
 
         // Child event → attach to the matching live parent. Tries
         // both the multi-slot live_tasks register (for parallel
@@ -1092,12 +1180,12 @@ impl ChatWidget {
             // preserved (a duplicate ToolStarted never resets them).
             if let Some(existing) = self.live_tasks.get_mut(&tool_use_id) {
                 existing.description = description;
+                existing.set_ctrl_b_background_hint(agent_spawn_backgroundable);
             } else {
+                let mut task = TaskCell::new_running(tool_use_id.clone(), description);
+                task.set_ctrl_b_background_hint(agent_spawn_backgroundable);
                 self.live_task_order.push(tool_use_id.clone());
-                self.live_tasks.insert(
-                    tool_use_id.clone(),
-                    Box::new(TaskCell::new_running(tool_use_id, description)),
-                );
+                self.live_tasks.insert(tool_use_id.clone(), Box::new(task));
             }
         } else {
             // Non-Task tools (read_file, bash, …) stay in the single
@@ -1105,7 +1193,11 @@ impl ChatWidget {
             // most one of these at a time, so a single slot is
             // sufficient and the prior cell is correctly committed.
             self.commit_active();
-            self.active_cell = Some(Box::new(ToolCell::new_running(name, description)));
+            let mut cell = ToolCell::new_running(name, description);
+            if cell.name == "bash" && self.bash_background_hint_enabled {
+                cell.set_ctrl_b_background_hint(true);
+            }
+            self.active_cell = Some(Box::new(cell));
         }
     }
 
@@ -1126,7 +1218,11 @@ impl ChatWidget {
         label: String,
         tool_use_id: String,
         agent_id: Option<String>,
+        fanout_slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
+        fanout_title: Option<String>,
     ) {
+        let fanout_membership =
+            fanout_slot.map(|slot| agent_fanout_membership(slot, fanout_title.as_deref(), &label));
         // If a prior event already bound this tool_use_id to a row
         // (e.g. structured AgentControlStarted established the real
         // agent_id, then a generic ToolStarted arrives without it),
@@ -1139,9 +1235,12 @@ impl ChatWidget {
         {
             // Refresh the label / status on the existing entry but
             // don't create a new row.
+            let existing_key = existing.clone();
             self.cancelled_task_ids.remove(&existing);
             self.agent_runs
                 .ensure_running_for_tool_use(existing, label, Some(&tool_use_id));
+            self.agent_runs
+                .set_fanout_membership(&existing_key, fanout_membership);
             return;
         }
 
@@ -1185,7 +1284,9 @@ impl ChatWidget {
             self.agent_runs.rename(&existing, key.clone());
         }
         self.agent_runs
-            .ensure_running_for_tool_use(key, label, Some(&tool_use_id));
+            .ensure_running_for_tool_use(key.clone(), label, Some(&tool_use_id));
+        self.agent_runs
+            .set_fanout_membership(&key, fanout_membership);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2108,6 +2209,64 @@ mod tests {
     }
 
     #[test]
+    fn bash_tool_started_carries_ctrl_b_hint_only_when_enabled() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
+        let cell = w
+            .active_cell
+            .as_deref()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .unwrap();
+        assert!(!cell.ctrl_b_background_hint);
+
+        let mut w = fresh();
+        w.set_bash_background_hint_enabled(true);
+        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
+        let cell = w
+            .active_cell
+            .as_deref()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .unwrap();
+        assert!(cell.ctrl_b_background_hint);
+    }
+
+    #[test]
+    fn non_bash_tool_started_ignores_ctrl_b_hint_capability() {
+        let mut w = fresh();
+        w.set_bash_background_hint_enabled(true);
+        w.handle_event(AppEvent::Wire(tool_started("read_file", "src/main.rs")));
+        let cell = w
+            .active_cell
+            .as_deref()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .unwrap();
+        assert!(!cell.ctrl_b_background_hint);
+    }
+
+    #[test]
+    fn agent_spawn_task_started_carries_ctrl_b_hint_but_get_result_does_not() {
+        let mut spawn = fresh();
+        spawn.handle_event(AppEvent::Wire(tool_started(
+            "agent",
+            "Spawn agent: reviewer",
+        )));
+        let spawn_cell = spawn
+            .live_task_cell("tu_test")
+            .expect("agent spawn should render as a live TaskCell");
+        assert!(spawn_cell.ctrl_b_background_hint);
+
+        let mut get_result = fresh();
+        get_result.handle_event(AppEvent::Wire(tool_started(
+            "agent",
+            "Get agent result: reviewer@abc",
+        )));
+        let get_result_cell = get_result
+            .live_task_cell("tu_test")
+            .expect("agent get_result should render as a live TaskCell");
+        assert!(!get_result_cell.ctrl_b_background_hint);
+    }
+
+    #[test]
     fn unpaired_tool_completed_synthesises_cell() {
         // A bare ToolCompleted (no preceding ToolStarted) still
         // yields a committed cell. Defensive: journals can
@@ -2387,6 +2546,8 @@ mod tests {
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
             agent_id: Some("reviewer-A@abc".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
@@ -2489,7 +2650,7 @@ mod tests {
 
     /// CRITICAL: a single Ctrl+C must take ALL live ids out of the
     /// in-flight set so a follow-up press doesn't re-target the same
-    /// tasks. Pre-fix users saw "Cancelled 1 background command." print
+    /// tasks. Pre-fix users saw "Stopped 1 local agent." print
     /// six times for one Ctrl+C burst — every press kept finding the
     /// same ids and the durable task service rejected the
     /// already-cancelled ones, so only one new acked-success per
@@ -2530,7 +2691,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .expect("cancel banner must be a SystemCell");
         assert!(
-            sys.message().contains("Stopped 2 background commands"),
+            sys.message().contains("Stopped 2 local agents"),
             "banner must name the plural count: {}",
             sys.message()
         );
@@ -2545,7 +2706,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .unwrap();
         assert!(
-            sys.message().contains("Stopped 1 background command."),
+            sys.message().contains("Stopped 1 local agent."),
             "singular copy required: {}",
             sys.message()
         );
@@ -2555,7 +2716,7 @@ mod tests {
     fn resume_summary_commits_info_cell_with_message() {
         let mut w = fresh();
         w.commit_resume_summary(
-            "While you were away: 3 background commands finished (2 ok, 1 failed).".into(),
+            "While you were away: 3 background shells finished (2 ok, 1 failed).".into(),
         );
         assert_eq!(w.history.len(), 1);
         let sys = w.history[0]
@@ -2563,7 +2724,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .expect("resume summary must be a SystemCell");
         assert!(sys.message().contains("While you were away"));
-        assert!(sys.message().contains("3 background commands"));
+        assert!(sys.message().contains("3 background shells"));
     }
 
     #[test]
@@ -3147,6 +3308,8 @@ mod tests {
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
             agent_id: Some("reviewer-A@abc".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
@@ -3162,6 +3325,8 @@ mod tests {
             label: "reviewer-B".into(),
             tool_use_id: "spawn-tu-2".into(),
             agent_id: Some("reviewer-B@def".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
@@ -3201,6 +3366,8 @@ mod tests {
             label: "stuck-agent".into(),
             tool_use_id: "spawn-tu-x".into(),
             agent_id: Some("stuck@id".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         // No AgentControlCompleted — the stream dropped.
         assert_eq!(w.agent_run_ids().len(), 1, "agent is live");
@@ -3308,6 +3475,8 @@ mod tests {
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-late".into(),
             agent_id: Some("reviewer-A@late".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
         assert!(
@@ -3857,6 +4026,8 @@ mod tests {
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
             agent_id: Some("reviewer-A@abc12345".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         // Then the generic ToolStarted arrives (stream_render emits both).
         w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
@@ -3898,6 +4069,8 @@ mod tests {
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
             agent_id: Some("reviewer-A@abc12345".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
         w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
             agent_id: "reviewer-A@abc12345".into(),
@@ -4014,6 +4187,8 @@ mod tests {
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
             agent_id: Some("reviewer-A@abc12345".into()),
+            fanout_slot: None,
+            fanout_title: None,
         }));
 
         w.mark_agent_controls_cancelling(&["spawn-tu-1".to_string()]);
@@ -4037,6 +4212,85 @@ mod tests {
             AgentRowStatus::Cancelling,
             "cancelling status must be structural, not parsed from truncated output text"
         );
+    }
+
+    #[test]
+    fn agent_control_started_projects_fanout_membership_to_drilldown_rows_after_rename() {
+        use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
+
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "auth reviewer".into(),
+            tool_use_id: "spawn-tu-fanout".into(),
+            agent_id: None,
+            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 0).unwrap()),
+            fanout_title: Some("review fanout".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "auth reviewer".into(),
+            status: "success".into(),
+            duration_ms: 25,
+            output: Some(r#"{"status":"completed","agent_id":"auth@abc12345"}"#.into()),
+            tool_use_id: "spawn-tu-fanout".into(),
+            agent_id: Some("auth@abc12345".into()),
+        }));
+
+        let rows = w.agents_drilldown_rows(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "auth@abc12345");
+        let fanout = rows[0].fanout.as_ref().expect("fanout membership");
+        assert_eq!(fanout.group_id, "review-1");
+        assert_eq!(fanout.group_title, "review fanout");
+        assert_eq!(fanout.target_count, 3);
+        assert_eq!(fanout.slot_index, 0);
+        assert_eq!(fanout.slot_label, "auth reviewer");
+    }
+
+    #[test]
+    fn fanout_membership_survives_merge_into_live_agent_row() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
+
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "storage reviewer".into(),
+            tool_use_id: "spawn-tu-fanout".into(),
+            agent_id: None,
+            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 1).unwrap()),
+            fanout_title: Some("review fanout".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "storage@abc12345".into(),
+            kind: AgentLiveEventKind::ToolStarted {
+                name: "bash".into(),
+                description: "cargo test".into(),
+                tool_use_id: "child-tu-1".into(),
+            },
+        })));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "storage reviewer".into(),
+            status: "success".into(),
+            duration_ms: 25,
+            output: Some(r#"{"status":"completed","agent_id":"storage@abc12345"}"#.into()),
+            tool_use_id: "spawn-tu-fanout".into(),
+            agent_id: Some("storage@abc12345".into()),
+        }));
+
+        let rows = w.agents_drilldown_rows(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "storage@abc12345");
+        let fanout = rows[0].fanout.as_ref().expect("fanout membership");
+        assert_eq!(fanout.group_id, "review-1");
+        assert_eq!(fanout.group_title, "review fanout");
+        assert_eq!(fanout.slot_index, 1);
+        let detail = w
+            .task_cell_anywhere("storage@abc12345")
+            .expect("merged live row");
+        assert_eq!(detail.children.len(), 1);
     }
 
     /// REGRESSION (reviewer L2-5): a sub-agent that crashes / times

@@ -59,9 +59,9 @@ impl ResumeSummary {
         }
         let breakdown = parts.join(", ");
         let noun = if total == 1 {
-            "background command"
+            "background shell"
         } else {
-            "background commands"
+            "background shells"
         };
         format!("While you were away: {total} {noun} finished ({breakdown}).")
     }
@@ -248,8 +248,12 @@ mod tests {
         };
         let out = s.render();
         assert!(
-            out.contains("1 background command") && !out.contains("1 background commands"),
+            out.contains("1 background shell") && !out.contains("1 background shells"),
             "singular copy required: {out}"
+        );
+        assert!(
+            !out.contains("background command"),
+            "resume summary must use typed task vocabulary: {out}"
         );
         assert!(out.starts_with("While you were away:"));
         assert!(out.contains("1 ok"));
@@ -265,8 +269,12 @@ mod tests {
         };
         let out = s.render();
         assert!(
-            out.contains("5 background commands"),
+            out.contains("5 background shells"),
             "plural copy missing: {out}"
+        );
+        assert!(
+            !out.contains("background command"),
+            "resume summary must use typed task vocabulary: {out}"
         );
         assert!(
             out.contains("2 ok")

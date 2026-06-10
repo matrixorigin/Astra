@@ -6,6 +6,7 @@ use astra_services::{ForkSessionOptions, fork_local_session, session_journal, se
 use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
+use crate::cli::permission_manager::PermissionMode;
 use crate::cli::session::session_restore_client;
 use crate::cli::session::session_runtime;
 use crate::cli::surface::agent_journal_event_surface::{
@@ -4926,6 +4927,9 @@ fn persist_resumed_workspace_metadata(
         ws.git_branch = Some(branch.clone());
     }
     ws.model = astra_core::model_override::normalize_model_override_owned(restored.model.clone());
+    if restored.permission_mode.is_some() {
+        ws.permission_mode = restored.permission_mode.clone();
+    }
     ws.executing_plan_json = restored.executing_plan_json.clone();
     ws.plan_goal = restored.plan_goal.clone();
     ws.plan_config_json = restored.plan_config_json.clone();
@@ -4935,6 +4939,22 @@ fn persist_resumed_workspace_metadata(
     ws.last_context_trace = restored.last_context_trace.clone();
     astra_services::session_workspace::write_workspace(&ws)
         .map_err(|e| format!("write workspace during resume: {e}"))
+}
+
+fn parse_restored_permission_mode(
+    restored: &RestoredSession,
+) -> Result<Option<PermissionMode>, String> {
+    restored
+        .permission_mode
+        .as_deref()
+        .map(str::parse::<PermissionMode>)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "Session {} has invalid persisted permission mode: {error}",
+                restored.session_id
+            )
+        })
 }
 
 fn build_step_resume_guidance(
@@ -5422,6 +5442,7 @@ async fn apply_restored_session(
             restored.session_id
         ));
     }
+    let restored_permission_mode = parse_restored_permission_mode(&restored)?;
 
     let local_state = local_journal.session;
     let total_cache_read_tokens = restored
@@ -5490,6 +5511,9 @@ async fn apply_restored_session(
     state.total_cache_read_tokens = total_cache_read_tokens;
     state.total_cache_creation_tokens = total_cache_creation_tokens;
     state.recent_tools = restored.recent_tools.clone();
+    if let Some(mode) = restored_permission_mode {
+        state.perm_manager.set_mode(mode);
+    }
     apply_prepared_workspace_restore(state, &prepared_workspace);
 
     if let Some(step_restored) = step_restored {
@@ -5537,6 +5561,7 @@ async fn apply_restored_session(
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
         }
     }
+    crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
 
     if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
         state.history = prepared_history.history;
@@ -6088,6 +6113,7 @@ mod resume_tests {
         resume_persistence_warning, session_restore_client, session_runtime, session_startup,
         switch_session_into_state, workspace_summary_line,
     };
+    use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
     use astra_services::session_journal::{self, JournalDirGuard};
     use astra_services::session_restore::RestoredSession;
@@ -7758,7 +7784,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_treats_default_model_as_server_default() {
+    async fn restore_session_into_state_recovers_journal_model_over_workspace_default() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-default-model-{}", uuid::Uuid::new_v4());
@@ -7789,7 +7815,85 @@ mod resume_tests {
             .unwrap();
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(state.model, None);
+        assert_eq!(state.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_session_into_state_restores_permission_mode() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-mode-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let mut ws = session_workspace::read_workspace(&session_id).unwrap();
+        ws.permission_mode = Some("plan".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        state.perm_manager.set_mode(PermissionMode::Auto);
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_session_into_state_rejects_invalid_permission_mode_without_rebinding() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-invalid-mode-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let mut ws = session_workspace::read_workspace(&session_id).unwrap();
+        ws.permission_mode = Some("yolo".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState {
+            session_id: Some("current-session".into()),
+            model: Some("gpt-4o".into()),
+            ..SessionState::default()
+        };
+        state.perm_manager.set_mode(PermissionMode::Auto);
+
+        let error = restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .expect_err("invalid persisted permission mode must fail restore");
+
+        assert!(
+            error.contains("invalid persisted permission mode"),
+            "{error}"
+        );
+        assert_eq!(state.session_id.as_deref(), Some("current-session"));
+        assert_eq!(state.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
     }
 
     #[serial_test::serial]

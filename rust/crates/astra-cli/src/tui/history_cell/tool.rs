@@ -31,6 +31,7 @@ use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
 use crate::tui::wrapping::{RtOptions, word_wrap_lines};
+use astra_tools::exit_semantics::{ExitSemantics, classify_exit};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -61,6 +62,12 @@ pub(crate) struct ToolCell {
     /// breathing animation instead of a line counter).
     pub progress_lines: u64,
     pub progress_bytes: u64,
+    /// Whether the live bash row should advertise Ctrl+B promotion.
+    /// This is a UI capability bit supplied by the TUI event loop,
+    /// not inferred from the tool name: non-interactive render paths
+    /// and edge-less sessions must not promise a shortcut that cannot
+    /// work.
+    pub ctrl_b_background_hint: bool,
     /// Stamped on the live → terminal transition (either
     /// `complete()` or `finalize()`). Lets the active-slot gradient
     /// gutter pin its phase at the freeze moment.
@@ -80,8 +87,13 @@ impl ToolCell {
             ts: None,
             progress_lines: 0,
             progress_bytes: 0,
+            ctrl_b_background_hint: false,
             frozen_at: super::FreezeStamp::default(),
         }
+    }
+
+    pub fn set_ctrl_b_background_hint(&mut self, enabled: bool) {
+        self.ctrl_b_background_hint = enabled;
     }
 
     /// Update mid-flight progress counters from a `ToolOutput`
@@ -166,6 +178,7 @@ impl ToolCell {
             ts,
             progress_lines: 0,
             progress_bytes: 0,
+            ctrl_b_background_hint: false,
             // Resumed from persistence — already settled. See
             // `FreezeStamp::revived` for the launch-independent
             // phase rationale.
@@ -221,19 +234,45 @@ impl ToolCell {
     }
 
     fn display_name(&self) -> String {
-        friendly_tool_display_name(&self.name)
+        friendly_tool_display_name_for_context(&self.name, &self.description)
     }
 
-    fn preview_text(&self) -> Option<&str> {
+    fn preview_text(&self) -> Option<Cow<'_, str>> {
+        if let Some(summary) = self.bash_empty_output_projection() {
+            return Some(Cow::Owned(summary));
+        }
+        if self.name == "task_list"
+            && let Some(preview) = self
+                .output_summary
+                .as_deref()
+                .or(self.output.as_deref())
+                .and_then(background_task_list_preview)
+        {
+            return Some(Cow::Owned(preview));
+        }
         match (self.output_summary.as_deref(), self.output.as_deref()) {
             (Some(summary), Some(output))
                 if !output.trim().is_empty() && is_placeholder_capture_summary(summary) =>
             {
-                Some(output)
+                Some(Cow::Borrowed(output))
             }
-            (Some(summary), _) => Some(summary),
-            (None, Some(output)) => Some(output),
+            (Some(summary), _) => Some(Cow::Borrowed(summary)),
+            (None, Some(output)) => Some(Cow::Borrowed(output)),
             (None, None) => None,
+        }
+    }
+
+    fn bash_empty_output_projection(&self) -> Option<String> {
+        if self.name != "bash" {
+            return None;
+        }
+        let exit_code = bash_exit_code_from_output(self.output.as_deref())?;
+        if !bash_output_has_only_exit_metadata(self.output.as_deref()) {
+            return None;
+        }
+        match classify_exit(bash_command_from_description(&self.description), exit_code) {
+            ExitSemantics::InformationalFailure => Some("no matches".to_string()),
+            _ => Some(format!("exit {exit_code} · no output")),
         }
     }
 
@@ -258,7 +297,7 @@ impl ToolCell {
                             || line.starts_with('+')
                             || line.starts_with('-')
                     });
-                    has_diff.then_some(Cow::Borrowed(text))
+                    has_diff.then_some(text)
                 })
             })?;
 
@@ -317,9 +356,14 @@ impl ToolCell {
 
         // Signal mode: show real counters when the tool actually
         // streamed something.
+        let background_hint = if self.name == "bash" && self.ctrl_b_background_hint {
+            " · Ctrl+B to background"
+        } else {
+            ""
+        };
         if self.progress_lines > 0 || self.progress_bytes > 0 {
             let body = format!(
-                " streaming · {} {} · {}",
+                " streaming · {} {} · {}{}",
                 self.progress_lines,
                 if self.progress_lines == 1 {
                     "line"
@@ -327,6 +371,7 @@ impl ToolCell {
                     "lines"
                 },
                 format_bytes(self.progress_bytes),
+                background_hint,
             );
             return Line::from(vec![
                 Span::styled("    ", dim),
@@ -363,6 +408,7 @@ impl ToolCell {
             spinner,
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(theme.accent)),
+            Span::styled(background_hint.to_string(), dim),
         ])
     }
 }
@@ -429,14 +475,23 @@ impl HistoryCell for ToolCell {
             }
             Line::from(spans)
         } else if self.status == ToolStatus::Running {
-            let text = format!("Ran {label} ({})", self.elapsed_str());
+            let text = if let Some(task_header) = background_task_tool_header(&self.name) {
+                format!("{task_header} ({})", self.elapsed_str())
+            } else {
+                format!("Ran {label} ({})", self.elapsed_str())
+            };
             let mut spans = vec![self.bullet()];
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
+            let title = if let Some(task_header) = background_task_tool_header(&self.name) {
+                task_header.to_string()
+            } else {
+                format!("Ran {label}")
+            };
             let spans = vec![
                 self.bullet(),
-                Span::styled(format!("Ran {label}"), Style::default().bold()),
+                Span::styled(title, Style::default().bold()),
                 Span::styled(" · ", meta_style),
                 Span::styled(self.elapsed_str(), meta_style),
             ];
@@ -523,7 +578,7 @@ impl HistoryCell for ToolCell {
                 );
             }
         } else if let Some(summary) = preview_text {
-            let summary = sanitize_terminal_text(summary);
+            let summary = sanitize_terminal_text(&summary);
             let has_diff = looks_like_unified_diff_preview(&summary);
             if has_diff {
                 let diff_lines = crate::tui::diff_render::render_diff_lines(&summary, 10);
@@ -802,13 +857,43 @@ fn non_empty_tool_text(value: Option<String>) -> Option<String> {
 }
 
 fn failure_detail_fallback(name: &str, description: &str) -> String {
-    let label = friendly_tool_display_name(name);
+    let label = friendly_tool_display_name_for_context(name, description);
     let description = description.trim();
     if description.is_empty() {
         format!("{label} failed before returning output")
     } else {
         format!("{label} failed before returning output: {description}")
     }
+}
+
+fn friendly_tool_display_name_for_context(name: &str, _description: &str) -> String {
+    friendly_tool_display_name(name)
+}
+
+fn bash_command_from_description(description: &str) -> &str {
+    description
+        .trim()
+        .strip_prefix("$ ")
+        .unwrap_or(description.trim())
+}
+
+fn bash_exit_code_from_output(output: Option<&str>) -> Option<i32> {
+    let output = output?.trim();
+    let marker = output
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("[exit code: "))?;
+    marker.strip_suffix(']')?.parse().ok()
+}
+
+fn bash_output_has_only_exit_metadata(output: Option<&str>) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    output.lines().all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || (trimmed.starts_with("[exit code: ") && trimmed.ends_with(']'))
+    })
 }
 
 fn friendly_tool_display_name(name: &str) -> String {
@@ -823,6 +908,86 @@ fn friendly_tool_display_name(name: &str) -> String {
         "memory" => "Memory".into(),
         "tool_search" => "Tool search".into(),
         _ => humanize_tool_name(name),
+    }
+}
+
+fn background_task_tool_header(name: &str) -> Option<&'static str> {
+    match name {
+        "task_output" => Some("Read shell output"),
+        "task_stop" => Some("Stop background task"),
+        "task_list" => Some("List background tasks"),
+        _ => None,
+    }
+}
+
+fn background_task_list_preview(xml: &str) -> Option<String> {
+    let text = xml.trim();
+    if !text.starts_with("<background_tasks") {
+        return None;
+    }
+    let count = xml_attr(text, "count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if count == 0 {
+        return Some("No background tasks.".to_string());
+    }
+
+    let mut lines = vec![format!(
+        "{} background {}",
+        count,
+        if count == 1 { "task" } else { "tasks" }
+    )];
+    for task in text.match_indices("<task ").take(4).map(|(idx, _)| {
+        let rest = &text[idx..];
+        rest.split_once("/>").map(|(tag, _)| tag).unwrap_or(rest)
+    }) {
+        let id = xml_attr(task, "id").unwrap_or_else(|| "?".to_string());
+        let kind = xml_attr(task, "kind").unwrap_or_else(|| "task".to_string());
+        let status = xml_attr(task, "status").unwrap_or_else(|| "unknown".to_string());
+        let elapsed = xml_attr(task, "elapsed_ms")
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .map(format_elapsed_ms_compact)
+            .unwrap_or_else(|| "-".to_string());
+        let command = xml_attr(task, "command").unwrap_or_default();
+        let command = if command.is_empty() {
+            String::new()
+        } else {
+            format!("  {command}")
+        };
+        lines.push(format!("{id}  {kind}  {status}  {elapsed}{command}"));
+    }
+    if count > 4 {
+        lines.push(format!("… +{} more", count - 4));
+    }
+    Some(lines.join("\n"))
+}
+
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(xml_unescape(&rest[..end]))
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn format_elapsed_ms_compact(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let mins = ms / 60_000;
+        let secs = (ms % 60_000) / 1000;
+        format!("{mins}m{secs}s")
     }
 }
 
@@ -1016,6 +1181,110 @@ mod tests {
         let out = render(&t, 100, 4);
         assert!(out.contains("Bash failed before returning output"), "{out}");
         assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn bash_search_exit_one_with_no_output_renders_no_matches() {
+        let mut t = ToolCell::new_running("bash", "$ rg definitely_missing_token src");
+        t.complete(
+            "ok",
+            28,
+            String::new(),
+            Some("1 line captured".into()),
+            Some("[exit code: 1]".into()),
+        );
+        let out = render(&t, 100, 5);
+        assert!(out.contains("no matches"), "{out}");
+        assert!(!out.contains("1 line captured"), "{out}");
+        assert!(!out.contains("failed before returning output"), "{out}");
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn bash_cd_wrapped_grep_exit_one_with_no_output_renders_no_matches() {
+        let mut t = ToolCell::new_running(
+            "bash",
+            "$ cd /work/repo && grep -n definitely_missing_token src/main.rs",
+        );
+        t.complete(
+            "ok",
+            28,
+            String::new(),
+            Some("[exit code: 1]".into()),
+            Some("[exit code: 1]".into()),
+        );
+        let out = render(&t, 120, 5);
+        assert!(out.contains("no matches"), "{out}");
+        assert!(!out.contains("exit 1 · no output"), "{out}");
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn bash_non_search_exit_with_no_output_renders_exit_code() {
+        let mut t = ToolCell::new_running("bash", "$ cd /missing && grep x file");
+        t.complete(
+            "failed",
+            28,
+            String::new(),
+            Some("[exit code: 2]".into()),
+            Some("[exit code: 2]".into()),
+        );
+        let out = render(&t, 100, 5);
+        assert!(out.contains("exit 2 · no output"), "{out}");
+        assert!(!out.contains("failed before returning output"), "{out}");
+        assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn task_output_uses_typed_history_header_not_generic_ran_tool() {
+        let mut t = ok_tool("task_output", "task_id=bg-shell-1", 28);
+        t.output_summary = Some(
+            "Read shell output bg-shell-1\n2 new lines · offset 0 -> 42 · total 42 bytes · still running"
+                .to_string(),
+        );
+        let out = render(&t, 120, 5);
+        assert!(out.contains("Read shell output · 28ms"), "{out}");
+        assert!(out.contains("Read shell output bg-shell-1"), "{out}");
+        assert!(!out.contains("Ran Task output"), "{out}");
+        assert!(!out.contains("Ran Read shell output"), "{out}");
+    }
+
+    #[test]
+    fn task_stop_uses_typed_history_header_not_generic_ran_tool() {
+        let mut t = ok_tool("task_stop", "task_id=bg-shell-2", 31);
+        t.output_summary = Some("Background task bg-shell-2 stopped.".to_string());
+        let out = render(&t, 120, 4);
+        assert!(out.contains("Stop background task · 31ms"), "{out}");
+        assert!(out.contains("Background task bg-shell-2 stopped."), "{out}");
+        assert!(!out.contains("Ran Task stop"), "{out}");
+    }
+
+    #[test]
+    fn task_list_uses_typed_history_header_not_generic_ran_tool() {
+        let mut t = ok_tool("task_list", "", 19);
+        t.output_summary = Some(
+            "<background_tasks count=\"1\">\n<task id=\"bg-shell-1\" kind=\"shell\" status=\"running\" live_control=\"available\" elapsed_ms=\"1200\" command=\"cargo test &amp;&amp; echo ok\" output_ref=\"stdout: /tmp/bg-shell-1.stdout\" output_offset=\"0\" total_output_bytes=\"12\" total_output_lines=\"1\" preview=\"ok\" />\n</background_tasks>"
+                .to_string(),
+        );
+        let out = render(&t, 140, 5);
+        assert!(out.contains("List background tasks · 19ms"), "{out}");
+        assert!(out.contains("1 background task"), "{out}");
+        assert!(out.contains("bg-shell-1  shell  running  1.2s"), "{out}");
+        assert!(out.contains("cargo test && echo ok"), "{out}");
+        assert!(!out.contains("<background_tasks"), "{out}");
+        assert!(!out.contains("live_control"), "{out}");
+        assert!(!out.contains("output_ref"), "{out}");
+        assert!(!out.contains("Ran Task list"), "{out}");
+    }
+
+    #[test]
+    fn task_list_empty_xml_renders_explicit_empty_state() {
+        let mut t = ok_tool("task_list", "", 12);
+        t.output_summary = Some("<background_tasks count=\"0\" />".to_string());
+        let out = render(&t, 100, 4);
+        assert!(out.contains("List background tasks · 12ms"), "{out}");
+        assert!(out.contains("No background tasks."), "{out}");
+        assert!(!out.contains("<background_tasks"), "{out}");
     }
 
     #[test]
@@ -1309,6 +1578,32 @@ mod tests {
         t.set_progress(5, 100);
         assert_eq!(t.progress_lines, 25);
         assert_eq!(t.progress_bytes, 2_048);
+    }
+
+    #[test]
+    fn long_running_bash_row_advertises_ctrl_b_when_enabled() {
+        let mut t = ToolCell::new_running("bash", "$ cargo test");
+        t.set_ctrl_b_background_hint(true);
+        t.started_at = Instant::now() - std::time::Duration::from_secs(4);
+        let out = render(&t, 100, 4);
+        assert!(out.contains("Ctrl+B to background"), "{out}");
+    }
+
+    #[test]
+    fn long_running_bash_row_does_not_advertise_ctrl_b_by_default() {
+        let mut t = ToolCell::new_running("bash", "$ cargo test");
+        t.started_at = Instant::now() - std::time::Duration::from_secs(4);
+        let out = render(&t, 100, 4);
+        assert!(!out.contains("Ctrl+B"), "{out}");
+    }
+
+    #[test]
+    fn long_running_non_shell_row_does_not_advertise_ctrl_b() {
+        let mut t = ToolCell::new_running("read_file", "Reading: src/main.rs");
+        t.set_ctrl_b_background_hint(true);
+        t.started_at = Instant::now() - std::time::Duration::from_secs(4);
+        let out = render(&t, 100, 4);
+        assert!(!out.contains("Ctrl+B"), "{out}");
     }
 
     #[test]

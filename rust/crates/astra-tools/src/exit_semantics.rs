@@ -85,6 +85,9 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     let family = command_family(command);
     match (family.as_deref(), exit_code) {
         (Some("grep" | "rg" | "ripgrep" | "ag"), 1) => ExitSemantics::InformationalFailure,
+        (Some("git"), 1) if command_contains_word(command, "grep") => {
+            ExitSemantics::InformationalFailure
+        }
         (Some("diff" | "cmp"), 1) => ExitSemantics::DomainNegative,
         (Some("false"), 1) => ExitSemantics::DomainNegative,
         (Some("test" | "["), 1) => ExitSemantics::DomainNegative,
@@ -189,7 +192,7 @@ fn command_family(command: &str) -> Option<String> {
     // Extract the *last* command in a pipeline — the last segment determines
     // the exit code, not the first (e.g. `ls | grep foo` → `grep`).
     // Skip escaped `\|` used in regex patterns like `grep 'foo\|bar'`.
-    let mut tokens = last_pipeline_segment(command)
+    let mut tokens = last_shell_list_segment(last_pipeline_segment(command))
         .split_whitespace()
         .skip_while(|t| is_env_assignment(t));
     let family = tokens
@@ -210,6 +213,38 @@ fn command_family(command: &str) -> Option<String> {
         return Some("test".to_string());
     }
     Some(family)
+}
+
+fn last_shell_list_segment(command: &str) -> &str {
+    let bytes = command.as_bytes();
+    let mut last_start = 0;
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !in_single && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => {
+                last_start = i + 1;
+            }
+            b'&' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                last_start = i + 2;
+                i += 1;
+            }
+            b'|' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                last_start = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    command[last_start..].trim()
 }
 
 fn is_env_assignment(token: &str) -> bool {
@@ -310,6 +345,20 @@ mod tests {
     #[test]
     fn grep_no_match_is_informational_not_execution_error() {
         let semantics = classify_exit("grep missing src/main.rs", 1);
+        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn cd_wrapped_grep_no_match_is_informational() {
+        let semantics = classify_exit("cd /work/repo && grep -n missing src/main.rs", 1);
+        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn git_grep_no_match_is_informational() {
+        let semantics = classify_exit("git grep missing -- src", 1);
         assert_eq!(semantics, ExitSemantics::InformationalFailure);
         assert!(!semantics.is_tool_error());
     }

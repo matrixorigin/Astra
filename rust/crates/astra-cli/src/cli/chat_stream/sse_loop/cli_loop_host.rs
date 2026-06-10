@@ -256,7 +256,7 @@ fn permission_mode_change_audit_event(
     to_mode: PermissionMode,
     source: &str,
 ) -> astra_services::session_journal::JournalEvent {
-    astra_services::session_journal::JournalEvent::permission_audit(
+    let mut event = astra_services::session_journal::JournalEvent::permission_audit(
         session_id,
         Some(turn),
         serde_json::json!({
@@ -266,7 +266,13 @@ fn permission_mode_change_audit_event(
             "source": source,
             "changed": from_mode != to_mode,
         }),
-    )
+    );
+    event.edge_policy = Some(astra_services::session_journal::EdgePolicySnapshot {
+        permission_mode: Some(to_mode.to_string()),
+        cloud_policy_version: None,
+        rules_fingerprint: None,
+    });
+    event
 }
 
 fn append_permission_mode_change_audit(

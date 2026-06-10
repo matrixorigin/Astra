@@ -1,5 +1,5 @@
 use crate::cli::arg_render::join_words;
-use crate::cli::cli_config::cli_args::JobResultArgs;
+use crate::cli::cli_config::cli_args::TaskResultArgs;
 use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::exit_code::ExitCode;
 use crate::cli::session::session_runtime;
@@ -23,7 +23,7 @@ pub(crate) async fn resolve_task_result_task_id(
     let user_id = cli_user_id();
     slash_task::find_task_by_query(svc, &user_id, query)
         .await?
-        .ok_or_else(|| format!("no job matching '{query}'"))
+        .ok_or_else(|| format!("no task matching '{query}'"))
 }
 
 pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService + ?Sized>(
@@ -57,7 +57,7 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
                 .await?;
         }
         ExitCode::Unfinished => {
-            unreachable!("unfinished exit code is only valid for job result lookup")
+            unreachable!("unfinished exit code is only valid for task result lookup")
         }
         ExitCode::ToolFailure
         | ExitCode::ForceStop
@@ -71,27 +71,27 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
     Ok(exit_code)
 }
 
-pub(crate) async fn execute_job_result(args: JobResultArgs) -> Result<ExitCode, String> {
+pub(crate) async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode, String> {
     let query = join_words(&args.query);
     if query.trim().is_empty() {
-        return Err("provide a job id or title fragment".to_string());
+        return Err("provide a task id or title fragment".to_string());
     }
 
     // No profile in this CLI subcommand context; HttpTaskService
     // falls back to env-only token resolution which is fine for
-    // one-shot `astra job result <query>` invocations.
+    // one-shot `astra task result <query>` invocations.
     let svc = session_runtime::resolve_task_service(None).await;
     let task_id = resolve_task_result_task_id(&*svc, &query).await?;
     let task = svc
         .get_task(&task_id)
         .await?
-        .ok_or_else(|| format!("job disappeared: {task_id}"))?;
+        .ok_or_else(|| format!("task disappeared: {task_id}"))?;
     let read = load_task_result_read_surface(&task);
 
     let short = &task.task_id[..8.min(task.task_id.len())];
     eprintln!(
         "\n{}",
-        format!("─── Job Result ({short}) ─────────────────────────").bold()
+        format!("─── Task Result ({short}) ─────────────────────────").bold()
     );
     eprintln!("  {:<12} {}", "title:".dim(), task.title);
     for field in task_result_header_fields(&read) {
@@ -356,7 +356,7 @@ mod tests {
         let tid = create_in_progress_task(&svc).await;
 
         let mut sr = stream_result_for_task_checkpoint();
-        sr.session_persistence_error = Some("write job output: permission denied".into());
+        sr.session_persistence_error = Some("write task output: permission denied".into());
 
         let exit_code =
             finalize_headless_task_result(&svc, &tid, &sr, Some("fallback-session"), None)
@@ -371,7 +371,7 @@ mod tests {
         assert!(checkpoint.state.get("output_file").is_none());
         assert_eq!(
             checkpoint.state["persistence_error"],
-            "write job output: permission denied"
+            "write task output: permission denied"
         );
     }
 }

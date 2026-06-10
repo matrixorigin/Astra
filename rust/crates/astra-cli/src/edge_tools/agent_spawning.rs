@@ -21,6 +21,11 @@ pub async fn handle_agent_get_result_action(
     astra_runtime::orchestration::handle_agent_get_result_action(args, ctx).await
 }
 
+/// Handle `agent_fanout(...)` using the shared runtime contract.
+pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentActionContext>) -> String {
+    astra_runtime::orchestration::handle_agent_fanout_tool(args, ctx).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::handle_agent_spawn_action;

@@ -10,6 +10,7 @@ use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
 use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
+use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_core::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
 };
@@ -56,6 +57,21 @@ fn agent_control_label(args: &Value, fallback: String) -> String {
 fn agent_id_from_args(args: &Value) -> Option<String> {
     args.get("agent_id")
         .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn agent_fanout_slot_from_args(args: &Value) -> Option<AgentFanoutSlotIdentity> {
+    let group_id = args.get("fanout_group_id")?.as_str()?;
+    let target_count = args.get("fanout_target_count")?.as_u64()? as usize;
+    let slot_index = args.get("fanout_slot_index")?.as_u64()? as usize;
+    AgentFanoutSlotIdentity::new(group_id, target_count, slot_index).ok()
+}
+
+fn agent_fanout_title_from_args(args: &Value) -> Option<String> {
+    args.get("fanout_group_title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
         .map(str::to_string)
 }
 
@@ -2572,6 +2588,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     label: agent_control_label(args, tool_description.clone()),
                     tool_use_id: request_id.to_string(),
                     agent_id: agent_id_from_args(args),
+                    fanout_slot: agent_fanout_slot_from_args(args),
+                    fanout_title: agent_fanout_title_from_args(args),
                 });
             }
             self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {
@@ -3721,6 +3739,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         label: agent_control_label(&req.args, desc.clone()),
                         tool_use_id: req.request_id.clone(),
                         agent_id: agent_id_from_args(&req.args),
+                        fanout_slot: agent_fanout_slot_from_args(&req.args),
+                        fanout_title: agent_fanout_title_from_args(&req.args),
                     });
                 }
                 self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {

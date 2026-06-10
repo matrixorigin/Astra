@@ -151,9 +151,9 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
 }
 
 /// `task` is only the durable checklist surface. Background process
-/// actions belong to `job`; if they arrive on `task`, treat them
-/// as ordinary unknown task actions rather than preserving per-action
-/// migration branches.
+/// control belongs to the typed `task_output`/`task_stop`/`task_list`
+/// tools; if old background actions arrive on `task`, treat them as
+/// ordinary unknown task actions rather than preserving migration branches.
 #[tokio::test]
 async fn task_background_actions_are_plain_unknown_task_actions() {
     let executor = test_executor();
@@ -736,22 +736,18 @@ async fn setup_blocked_executor(
 }
 
 #[test]
-fn plan_mode_job_guard_blocks_shell_and_kill_but_allows_reads() {
+fn plan_mode_background_task_guard_blocks_stop_but_allows_reads() {
     assert!(crate::edge_tools::is_plan_mode_blocked_tool(
-        "job",
-        &json!({"action": "shell", "command": "npm run dev"})
-    ));
-    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
-        "job",
-        &json!({"action": "kill", "job_id": "bg-shell-1"})
+        "task_stop",
+        &json!({"task_id": "bg-shell-1"})
     ));
     assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
-        "job",
-        &json!({"action": "output", "job_id": "bg-shell-1"})
+        "task_output",
+        &json!({"task_id": "bg-shell-1"})
     ));
     assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
-        "job",
-        &json!({"action": "list"})
+        "task_list",
+        &json!({})
     ));
 }
 
@@ -887,72 +883,62 @@ async fn write_guard_is_inactive_when_no_authoring_plan() {
     }
 }
 
-/// `job` is the entry point. It must dispatch the background
-/// shell actions to the same handlers that previously sat on `task` —
-/// verified here with the cheapest possible smoke: an
+/// Typed task-control tools are the model-facing entry points. They must
+/// dispatch to the background shell handlers instead of falling through to
+/// unknown-tool handling. Verified here with the cheapest possible smoke: an
 /// unwired CLI executor returns a known fail-fast string for each
 /// action (the BackgroundTaskRegistry is wired only inside the TUI
-/// REPL — see `task_background_shell_fails_fast_when_unwired`).
+/// REPL).
 #[tokio::test]
-async fn job_actions_dispatch_through_executor() {
-    let executor = test_executor();
-    // shell — needs `command`; without the registry wired we expect
-    // the unwired-fast-fail path, not the missing-arg path.
-    let result = executor
-        .execute("job", &json!({"action": "shell", "command": "echo hi"}))
-        .await;
-    assert!(
-        result.contains("background_shell")
-            || result.contains("interactive REPL")
-            || result.contains("not available"),
-        "job.shell should reach the same fail-fast path that \
-         task.background_shell used to hit (registry only wired inside \
-         the TUI). Got: {result}"
-    );
-
-    // output — must reach the same handler that returns the unwired
-    // message; both kill and output share the registry dependency.
-    let result = executor
-        .execute("job", &json!({"action": "kill", "job_id": "bg-shell-1"}))
-        .await;
-    assert!(
-        result.contains("background")
-            || result.contains("interactive REPL")
-            || result.contains("Nothing to kill"),
-        "job.kill should reach the registry-unwired fail-fast path. \
-         Got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn job_agent_action_is_rejected_with_agent_tool_guidance() {
-    let executor = test_executor();
-    let result = executor
-        .execute("job", &json!({"action": "agent", "prompt": "audit TODOs"}))
-        .await;
-
-    assert!(result.contains("not a supported user journey"), "{result}");
-    assert!(result.contains("agent(action='spawn'"), "{result}");
-    assert!(result.contains("agent(action='get_result'"), "{result}");
-    assert!(
-        !result.contains("background_agent requires"),
-        "job.agent must not route into the old background_agent shim. Got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn legacy_agent_job_tool_is_rejected_with_job_guidance() {
+async fn typed_background_task_tools_dispatch_through_executor() {
     let executor = test_executor();
     let result = executor
         .execute(
-            "agent_job",
-            &json!({"action": "shell", "command": "echo hi"}),
+            "task_output",
+            &json!({"task_id": "bg-shell-1", "block": false}),
         )
         .await;
+    assert!(
+        (result.contains("background") || result.contains("interactive REPL"))
+            && !result.contains("Unknown tool"),
+        "task_output should reach the registry-unwired fail-fast path. Got: {result}"
+    );
 
-    assert!(result.contains("removed from the user journey"), "{result}");
-    assert!(result.contains("job(action='shell'"), "{result}");
-    assert!(result.contains("agent(action='spawn'"), "{result}");
+    let result = executor
+        .execute("task_stop", &json!({"task_id": "bg-shell-1"}))
+        .await;
+    assert!(
+        (result.contains("background")
+            || result.contains("interactive REPL")
+            || result.contains("Nothing to stop"))
+            && !result.contains("Unknown tool"),
+        "task_stop should reach the registry-unwired fail-fast path. Got: {result}"
+    );
+
+    let result = executor.execute("task_list", &json!({})).await;
+    assert!(
+        (result.contains("background") || result.contains("interactive REPL"))
+            && !result.contains("Unknown tool"),
+        "task_list should reach the registry-unwired fail-fast path. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn removed_background_job_aliases_are_unknown_tools() {
+    let executor = test_executor();
+    for name in ["job", "agent_job"] {
+        let result = executor.execute(name, &json!({})).await;
+        assert!(
+            result.contains("Unknown tool")
+                || result.contains("unknown")
+                || result.contains("not available"),
+            "{name} must not remain executable as a background-task alias. Got: {result}"
+        );
+        assert!(
+            !result.contains("interactive REPL") && !result.contains("task_output"),
+            "{name} must not route through removed background-task compatibility guidance. Got: {result}"
+        );
+    }
 }
 
 /// The `agent` tool's action enum must NOT advertise "delegate" to

@@ -612,7 +612,7 @@ pub(crate) async fn handle_slash_command(
                 .await?;
         }
 
-        "/job" => {
+        "/task" => {
             slash_task::handle_task_command(arg, state, api, profile, token).await;
         }
 

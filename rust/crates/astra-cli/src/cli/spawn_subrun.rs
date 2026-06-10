@@ -70,7 +70,7 @@ pub struct CliSpawnAgentExecutor {
     journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
     /// Shared command queue for the parent's BackgroundTaskRegistry.
     /// Threaded into the child's ToolExecutor so spawned sub-agents
-    /// can also use `job(action='shell')`.
+    /// can inspect or stop background shell tasks promoted in the TUI.
     bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
     /// Session/default model fallback when the spawn request itself omits one.
     default_model: Option<String>,
@@ -373,7 +373,7 @@ impl CliSpawnAgentExecutor {
     }
 
     /// Install the parent's bg task command queue so spawned children
-    /// can use `job(action='shell')`.
+    /// can inspect or stop background shell tasks.
     pub fn with_bg_task_commands(
         mut self,
         commands: Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,

@@ -205,6 +205,58 @@ impl ContextTraceSignal {
     }
 }
 
+/// Durable projection for a background shell owned by a session.
+///
+/// This is intentionally not a process handle. On resume, non-terminal rows
+/// are restored as visible stale handles so the user can inspect captured
+/// output without the UI pretending it can still control an old process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundShellTaskProjection {
+    pub id: String,
+    pub status: String,
+    pub title: String,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+}
+
+/// Durable projection for a background local agent owned by a session.
+///
+/// This stores the user/model-visible lifecycle state, not a runtime handle.
+/// On resume, non-terminal agents are restored as stale/unavailable tasks:
+/// the previous local executor is gone, but the task remains visible with the
+/// latest known tail/result/error for inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundLocalAgentFanoutProjection {
+    pub group_id: String,
+    pub group_title: String,
+    pub target_count: usize,
+    pub slot_index: usize,
+    pub slot_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundLocalAgentTaskProjection {
+    pub id: String,
+    pub status: String,
+    pub title: String,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<BackgroundLocalAgentFanoutProjection>,
+}
+
 /// Session workspace metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
@@ -232,6 +284,13 @@ pub struct WorkspaceMetadata {
         deserialize_with = "deserialize_model_override"
     )]
     pub model: Option<String>,
+    /// Permission mode active for this session.
+    ///
+    /// Stored as the canonical CLI string (`auto`, `plan`,
+    /// `accept_edits`, `prompt`, or `deny`). Missing means the session
+    /// predates mode persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// ISO 8601 creation timestamp.
     pub created_at: String,
     /// ISO 8601 last-updated timestamp.
@@ -290,6 +349,12 @@ pub struct WorkspaceMetadata {
     /// Compact summary of the most recent context-assembly trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_trace: Option<ContextTraceSignal>,
+    /// Durable projection of local background shell tasks for resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_shell_tasks: Vec<BackgroundShellTaskProjection>,
+    /// Durable projection of local background agent tasks for resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_local_agent_tasks: Vec<BackgroundLocalAgentTaskProjection>,
     /// Last turn-commit persistence error observed by the live session.
     /// When present, local resume should assume workspace/journal state may be stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,6 +476,7 @@ impl WorkspaceMetadata {
             git_head,
             model: astra_core::model_override::normalize_model_override(Some(model))
                 .map(str::to_string),
+            permission_mode: None,
             created_at: now.clone(),
             updated_at: now,
             turn_count: 0,
@@ -433,6 +499,8 @@ impl WorkspaceMetadata {
             correlation_id: None,
             agent_role: None,
             last_context_trace: None,
+            background_shell_tasks: Vec::new(),
+            background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
@@ -461,6 +529,7 @@ impl WorkspaceMetadata {
             git_head: None,
             model: astra_core::model_override::normalize_model_override(Some(model))
                 .map(str::to_string),
+            permission_mode: None,
             created_at: now.clone(),
             updated_at: now,
             turn_count: 0,
@@ -483,6 +552,8 @@ impl WorkspaceMetadata {
             correlation_id: None,
             agent_role: None,
             last_context_trace: None,
+            background_shell_tasks: Vec::new(),
+            background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
@@ -984,6 +1055,7 @@ mod tests {
     #[test]
     fn workspace_yaml_round_trip() {
         let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
+        ws.permission_mode = Some("plan".into());
         ws.record_turn(100, 50, 25, 4);
         ws.record_checkpoint();
         ws.mark_completed(Some("Done"));
@@ -993,6 +1065,7 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(parsed.session_id, "sess-1");
+        assert_eq!(parsed.permission_mode.as_deref(), Some("plan"));
         assert_eq!(parsed.turn_count, 1);
         assert_eq!(parsed.checkpoints, vec![1]);
         assert_eq!(parsed.status, "completed");
@@ -1091,6 +1164,57 @@ mod tests {
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.last_context_trace, ws.last_context_trace);
+    }
+
+    #[test]
+    fn background_shell_tasks_round_trip_through_workspace_yaml() {
+        let mut ws = WorkspaceMetadata::with_context("sess-bg", "gpt-4", "/tmp", Some("main"));
+        ws.background_shell_tasks = vec![BackgroundShellTaskProjection {
+            id: "bg-shell-1".into(),
+            status: "running".into(),
+            title: "cargo test -p astra-cli".into(),
+            started_at_ms: 1_766_000_000_123,
+            ended_at_ms: Some(1_766_000_005_678),
+            stdout_path: "/tmp/astra/bg-shell-1.stdout".into(),
+            stderr_path: "/tmp/astra/bg-shell-1.stderr".into(),
+            exit_code: None,
+            terminal_reason: None,
+        }];
+
+        let yaml = serde_yaml_ng::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.background_shell_tasks, ws.background_shell_tasks);
+    }
+
+    #[test]
+    fn background_local_agent_tasks_round_trip_through_workspace_yaml() {
+        let mut ws =
+            WorkspaceMetadata::with_context("sess-bg-agent", "gpt-4", "/tmp", Some("main"));
+        ws.background_local_agent_tasks = vec![BackgroundLocalAgentTaskProjection {
+            id: "agent-1".into(),
+            status: "running".into(),
+            title: "review auth flow".into(),
+            started_at_ms: 1_766_000_000_123,
+            ended_at_ms: None,
+            output_tail: Some("reviewing auth middleware".into()),
+            terminal_reason: None,
+            fanout: Some(BackgroundLocalAgentFanoutProjection {
+                group_id: "review-1".into(),
+                group_title: "review fanout".into(),
+                target_count: 3,
+                slot_index: 1,
+                slot_label: "review auth flow".into(),
+            }),
+        }];
+
+        let yaml = serde_yaml_ng::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
+
+        assert_eq!(
+            parsed.background_local_agent_tasks,
+            ws.background_local_agent_tasks
+        );
     }
 
     #[test]

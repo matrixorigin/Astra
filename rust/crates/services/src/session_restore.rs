@@ -61,6 +61,9 @@ pub struct RestoredSession {
     pub git_branch: Option<String>,
     /// Model used in the session.
     pub model: Option<String>,
+    /// Permission mode used when the session was last active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// Session title (if set).
     pub title: Option<String>,
     /// Whether restoration was from cloud (true) or local only (false).
@@ -123,6 +126,7 @@ pub struct SessionMetadataState {
     pub plan_execution_rounds: usize,
     pub git_branch: Option<String>,
     pub model: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -427,6 +431,7 @@ impl HybridRestoreService {
                     checkpoint_count: checkpoint_count.max(0) as u32,
                     git_branch: metadata_state.git_branch.clone(),
                     model,
+                    permission_mode: metadata_state.permission_mode.clone(),
                     conversation_messages: heavy_state
                         .as_ref()
                         .map(|heavy| heavy.messages.clone())
@@ -891,6 +896,7 @@ struct LocalJournalSummary {
     total_cache_creation_tokens: u64,
     recent_tools: Vec<String>,
     model: Option<String>,
+    permission_mode: Option<String>,
     last_status: String,
 }
 
@@ -920,6 +926,28 @@ fn summarize_local_journal(session_id: &str) -> Result<Option<LocalJournalSummar
     let mut latest_turn_index: Option<usize> = None;
 
     for (idx, event) in events.iter().enumerate() {
+        if let Some(mode) = event
+            .edge_policy
+            .as_ref()
+            .and_then(|policy| policy.permission_mode.clone())
+        {
+            summary.permission_mode = Some(mode);
+        } else if event.event_type == crate::session_journal::JournalEventType::PermissionAudit
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("kind"))
+                .and_then(|kind| kind.as_str())
+                == Some("permission_mode_changed")
+            && let Some(mode) = event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("to_mode"))
+                .and_then(|mode| mode.as_str())
+        {
+            summary.permission_mode = Some(mode.to_string());
+        }
+
         match event.event_type {
             crate::session_journal::JournalEventType::Turn => {
                 summary.turn_count += 1;
@@ -993,6 +1021,16 @@ fn restored_session_from_workspace(
                 .max(summary.total_cache_creation_tokens)
         })
         .unwrap_or(ws.total_cache_creation_tokens);
+    let permission_mode = ws
+        .permission_mode
+        .clone()
+        .or_else(|| local_journal.and_then(|summary| summary.permission_mode.clone()));
+    let model = ws
+        .model
+        .as_deref()
+        .and_then(|model| astra_core::model_override::normalize_model_override(Some(model)))
+        .map(str::to_string)
+        .or_else(|| local_journal.and_then(|summary| summary.model.clone()));
 
     RestoredSession {
         session_id: ws.session_id.clone(),
@@ -1005,7 +1043,8 @@ fn restored_session_from_workspace(
         checkpoint_count,
         last_status: ws.status.clone(),
         git_branch: ws.git_branch.clone(),
-        model: ws.model.clone(),
+        model,
+        permission_mode,
         title: None,
         restored_from_cloud,
         executing_plan_json: ws.executing_plan_json.clone(),
@@ -1171,6 +1210,7 @@ impl SessionRestoreService for HybridRestoreService {
                 checkpoint_count: ckpt_count,
                 last_status: summary.last_status,
                 model: summary.model,
+                permission_mode: summary.permission_mode,
                 restored_from_cloud: false,
                 ..Default::default()
             }));
@@ -1331,6 +1371,9 @@ impl SessionRestoreService for HybridRestoreService {
             }
             if restored.model.is_none() {
                 restored.model = model;
+            }
+            if restored.permission_mode.is_none() {
+                restored.permission_mode = metadata_state.permission_mode.clone();
             }
             restored.restored_from_cloud = true;
             sessions.push(restored);
@@ -2025,6 +2068,10 @@ pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetada
             .and_then(|v| v.as_str())
             .and_then(|s| astra_core::model_override::normalize_model_override(Some(s)))
             .map(str::to_string),
+        permission_mode: obj
+            .get("permission_mode")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     }
 }
 
@@ -2252,6 +2299,98 @@ mod tests {
         assert_eq!(restored.model.as_deref(), Some("test-model"));
         assert_eq!(restored.last_status, "local");
         assert!(!restored.restored_from_cloud);
+    }
+
+    #[tokio::test]
+    async fn local_restore_recovers_permission_mode_from_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        let writer = crate::session_journal::JournalWriter::new(&sid).unwrap();
+        let mut start =
+            crate::session_journal::JournalEvent::session_start(Some(&sid), Some("test-model"));
+        start.edge_policy = Some(crate::session_journal::EdgePolicySnapshot {
+            permission_mode: Some("accept_edits".into()),
+            cloud_policy_version: None,
+            rules_fingerprint: None,
+        });
+        writer.append(&start).unwrap();
+        writer
+            .append(&crate::session_journal::JournalEvent::permission_audit(
+                Some(&sid),
+                Some(1),
+                serde_json::json!({
+                    "kind": "permission_mode_changed",
+                    "from_mode": "accept_edits",
+                    "to_mode": "plan",
+                    "source": "test",
+                    "changed": true
+                }),
+            ))
+            .unwrap();
+        writer
+            .append(&crate::session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                Some("test-model"),
+                "continue",
+                "restored",
+                0,
+                10,
+                5,
+                5,
+            ))
+            .unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let restored = svc
+            .restore_session(&sid)
+            .await
+            .unwrap()
+            .expect("journal-only session should restore");
+
+        assert_eq!(restored.permission_mode.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test]
+    async fn local_restore_uses_journal_model_when_workspace_model_is_symbolic_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        let writer = crate::session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&crate::session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&crate::session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                Some("gpt-5"),
+                "continue",
+                "restored",
+                0,
+                10,
+                5,
+                5,
+            ))
+            .unwrap();
+        let mut ws = session_workspace::WorkspaceMetadata::new(&sid, "default");
+        ws.turn_count = 1;
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let restored = svc
+            .restore_session(&sid)
+            .await
+            .unwrap()
+            .expect("workspace-backed session should restore");
+
+        assert_eq!(restored.model.as_deref(), Some("gpt-5"));
     }
 
     #[tokio::test]

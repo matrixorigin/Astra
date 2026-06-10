@@ -420,17 +420,8 @@ fn cli_chat_subcommand() {
             _ => panic!("expected Chat perm={input}"),
         }
     }
-    // Legacy aliases
     for alias in ["yolo", "bypass-safety", "bypass_safety"] {
-        let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", alias]).unwrap();
-        match &cli.command {
-            Some(Command::Chat(args)) => assert_eq!(
-                args.permission_mode.as_deref(),
-                Some("auto"),
-                "legacy alias {alias}"
-            ),
-            _ => panic!("expected Chat legacy"),
-        }
+        assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", alias]).is_err());
     }
 }
 

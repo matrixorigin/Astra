@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn background_job_tool_is_local_cli_only() {
+    fn background_task_tools_are_local_cli_only() {
         use astra_turn_core::capability::{Capability, CapabilitySet};
         use astra_turn_core::tool_surface::{Surface, resolve};
 
@@ -628,19 +628,32 @@ mod tests {
             .with(Capability::MemoryService)
             .with(Capability::SkillsCatalog)
             .with(Capability::PlanLifecycle)
-            .with(Capability::LocalBackgroundJobs);
+            .with(Capability::LocalBackgroundTasks);
 
         let web = names(resolve(Surface::Web, &server_caps, &pool));
         let remote = names(resolve(Surface::CliRemote, &server_caps, &pool));
         let local = names(resolve(Surface::CliLocal, &local_caps, &pool));
 
         assert!(
-            !web.contains(&"job".to_string()) && !remote.contains(&"job".to_string()),
-            "server-executed turns must not advertise local TUI background jobs: web={web:?}, remote={remote:?}"
+            !web.contains(&"job".to_string())
+                && !remote.contains(&"job".to_string())
+                && !web.contains(&"task_output".to_string())
+                && !remote.contains(&"task_output".to_string())
+                && !web.contains(&"task_stop".to_string())
+                && !remote.contains(&"task_stop".to_string())
+                && !web.contains(&"task_list".to_string())
+                && !remote.contains(&"task_list".to_string()),
+            "server-executed turns must not advertise local TUI background task tools: web={web:?}, remote={remote:?}"
         );
+        for expected in ["task_output", "task_stop", "task_list"] {
+            assert!(
+                local.contains(&expected.to_string()),
+                "local CLI turns should advertise `{expected}`: {local:?}"
+            );
+        }
         assert!(
-            local.contains(&"job".to_string()),
-            "local CLI turns should advertise the background shell job tool: {local:?}"
+            !local.contains(&"job".to_string()),
+            "local CLI turns must not advertise the removed job tool: {local:?}"
         );
     }
 

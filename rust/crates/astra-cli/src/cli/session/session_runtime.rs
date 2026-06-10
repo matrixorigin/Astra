@@ -1,7 +1,7 @@
 use crate::cli::cli_config::cli_utils::{
     credential_store, load_credentials, normalize_model_override, profile_name,
 };
-use crate::cli::permission_manager::PermissionManager;
+use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
 use crate::{manifest_loader, mcp_client};
@@ -37,7 +37,7 @@ pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskSer
 /// Edge-cloud contract: the CLI never connects to MatrixOne
 /// directly. When `cloud_base` is configured (via env or the
 /// authenticated session), we return [`crate::cli::http_task_service::HttpTaskService`]
-/// which proxies trait calls through `POST /jobs:rpc`. Otherwise
+/// which proxies trait calls through `POST /tasks:rpc`. Otherwise
 /// we fall back to the local on-disk store so offline / one-shot
 /// CLI and headless tests stay functional.
 ///
@@ -131,12 +131,12 @@ pub(crate) fn install_task_store(
         std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
 }
 
-/// Resolve the durable cloud background-job runtime (TaskService + lease).
+/// Resolve the durable cloud background-task runtime (TaskService + lease).
 ///
 /// Edge-cloud contract: no direct MO connection from the CLI. Both
 /// services proxy through their REST surfaces:
-/// - TaskService → `POST /jobs:rpc`
-/// - TaskLeaseService → `/jobs/{id}/lease/*`
+/// - TaskService → `POST /tasks:rpc`
+/// - TaskLeaseService → `/tasks/{id}/lease/*`
 ///
 /// `profile` is forwarded to the access-token resolver so a logged-in
 /// CLI invocation gets bearer auth.
@@ -150,7 +150,7 @@ pub(crate) async fn resolve_cloud_task_runtime(
     String,
 > {
     let cloud_base = resolve_cloud_base().ok_or_else(|| {
-        "Cloud job runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
+        "Cloud task runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
             .to_string()
     })?;
     let token = current_access_token(profile);
@@ -676,10 +676,15 @@ pub(crate) fn initialize_session_state(
 ) -> SessionState {
     let mut state = SessionState::default();
     state.cli_context = cli_context.clone();
-    state.perm_manager = PermissionManager::with_workspace_trust(
-        cli_context.auto_approve,
-        &std::env::current_dir().unwrap_or_default(),
-    );
+    let project_root = std::env::current_dir().unwrap_or_default();
+    state.perm_manager = match cli_context.permission_mode.as_deref() {
+        Some(mode) => PermissionManager::with_workspace_trust_mode(
+            mode.parse::<PermissionMode>()
+                .unwrap_or(PermissionMode::Prompt),
+            &project_root,
+        ),
+        None => PermissionManager::with_workspace_trust(cli_context.auto_approve, &project_root),
+    };
     if let Some(session_id) = &cli_context.session_id {
         state.set_session_id(session_id.clone());
     }

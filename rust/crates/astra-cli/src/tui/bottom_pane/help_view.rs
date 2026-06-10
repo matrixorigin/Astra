@@ -12,7 +12,7 @@ use crate::cli::command_registry::{self, CommandGroup, CommandMeta};
 
 const MAX_CMD_ROWS: usize = 10;
 const HELP_HINT: &str =
-    "←/→ switch group  ↑/↓ browse  Enter select  Ctrl+B background bash  Esc close";
+    "←/→ switch group  ↑/↓ browse  Enter select  Ctrl+B background bash/agent  Esc close";
 
 struct GroupData {
     group: CommandGroup,

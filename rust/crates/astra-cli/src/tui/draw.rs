@@ -178,11 +178,11 @@ pub(crate) fn active_viewport(
     // sub-agents run shows both).
     //
     // Visibility rule: show the strip while ANY agent is still live
-    // (running). Completed-only strips linger for `STRIP_LINGER` so
-    // the user can glance at the final state, then dismiss. Failed
-    // entries stay visible until a new turn state replaces them, so
-    // failures are not silently missed after a short linger timeout.
-    // Users can still drill in via Ctrl+G.
+    // (running/cancelling). Completed-only and cancelled-only strips
+    // linger for `STRIP_LINGER` so the user can glance at the final
+    // state, then dismiss. Failed entries stay visible until a new
+    // turn state replaces them, so failures are not silently missed
+    // after a short linger timeout. Users can still drill in via Ctrl+G.
     const STRIP_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
     let _ = inner_w; // retained for future per-row layout decisions
     let agent_ids = chat_widget.agent_run_ids();
@@ -226,12 +226,6 @@ pub(crate) fn active_viewport(
             .collect();
 
         let any_live = cells.iter().any(|entry| entry.live || entry.cancelling);
-        let any_failed = cells.iter().any(|entry| entry.failed);
-        // Treat user-cancelled like failed for visibility: keep the
-        // strip up so the user sees the row reach a stable Cancelled
-        // state instead of disappearing mid-cancel and leaving them
-        // wondering whether the kill landed.
-        let any_cancelled = cells.iter().any(|entry| entry.cancelled);
         let any_recently_terminal = !any_live
             && agent_ids.iter().any(|id| {
                 chat_widget.agent_run_cell(id).is_some_and(|tc| {
@@ -239,7 +233,7 @@ pub(crate) fn active_viewport(
                         .is_some_and(|completed_at| completed_at.elapsed() < STRIP_LINGER)
                 })
             });
-        if any_live || any_failed || any_cancelled || any_recently_terminal {
+        if should_show_multi_agent_strip(&cells, any_recently_terminal) {
             Some(cells)
         } else {
             None
@@ -352,6 +346,12 @@ pub(crate) fn active_viewport(
         task_board,
         resolved_board_expanded: resolved_expanded,
     }
+}
+
+fn should_show_multi_agent_strip(cells: &[MultiAgentEntry], any_recently_terminal: bool) -> bool {
+    let any_live = cells.iter().any(|entry| entry.live || entry.cancelling);
+    let any_failed = cells.iter().any(|entry| entry.failed);
+    any_live || any_failed || any_recently_terminal
 }
 
 /// Pure priority resolver. Priority: **Active > Status > NextHint >
@@ -1025,6 +1025,49 @@ mod task_board_draw_tests {
             "freshly completed logical agents should linger even when child duration exceeds the local registry elapsed time"
         );
     }
+
+    #[test]
+    fn cancelled_only_agent_strip_dismisses_after_linger_but_drilldown_remains() {
+        use crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus;
+        use crate::tui::chat_widget::WireEvent;
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+
+        let mut widget = chat_widget::ChatWidget::new(String::new());
+        widget.handle_event(chat_widget::AppEvent::Wire(WireEvent::AgentLive(
+            AgentLiveEvent {
+                agent_id: "reviewer@cancelled".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: AgentLiveTermination::Cancelled,
+                    duration_ms: 500,
+                    reason: Some("user cancelled".into()),
+                },
+            },
+        )));
+        widget.set_agent_completed_at_for_test(
+            "reviewer@cancelled",
+            std::time::Instant::now() - std::time::Duration::from_secs(6),
+        );
+
+        let frame = active_viewport(
+            &widget,
+            &status_indicator::StatusIndicator::new(),
+            None,
+            false,
+            None,
+            80,
+            24,
+        );
+
+        assert!(
+            frame.multi_agent.is_none(),
+            "cancelled-only agent strip must dismiss after the same short linger as completed-only"
+        );
+        let rows = widget.agents_drilldown_rows(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AgentRowStatus::Cancelled);
+    }
 }
 
 #[cfg(test)]
@@ -1034,7 +1077,10 @@ mod multi_agent_strip_tests {
     //! Each row fits in one line and surfaces label, step count, and
     //! elapsed time, plus a status icon that distinguishes live
     //! agents from completed ones.
-    use super::{MultiAgentEntry, format_short_elapsed, multi_agent_strip_header, truncate_label};
+    use super::{
+        MultiAgentEntry, format_short_elapsed, multi_agent_strip_header,
+        should_show_multi_agent_strip, truncate_label,
+    };
 
     fn entry(live: bool, failed: bool) -> MultiAgentEntry {
         MultiAgentEntry {
@@ -1124,6 +1170,25 @@ mod multi_agent_strip_tests {
         assert!(header.contains("1 live"));
         assert!(header.contains("1 cancelling"));
         assert!(!header.contains("done"));
+    }
+
+    #[test]
+    fn cancelled_only_strip_lingers_then_dismisses() {
+        let cells = vec![cancelled_entry(), cancelled_entry()];
+        assert!(
+            should_show_multi_agent_strip(&cells, true),
+            "freshly cancelled rows should linger long enough to confirm the kill landed"
+        );
+        assert!(
+            !should_show_multi_agent_strip(&cells, false),
+            "cancelled-only rows must dismiss after the same linger window as completed rows"
+        );
+    }
+
+    #[test]
+    fn failed_and_cancelling_rows_keep_strip_visible() {
+        assert!(should_show_multi_agent_strip(&[entry(false, true)], false));
+        assert!(should_show_multi_agent_strip(&[cancelling_entry()], false));
     }
 
     #[test]

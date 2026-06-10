@@ -2,7 +2,7 @@
 //!
 //! Astra is edge-cloud. The CLI MUST NOT connect to MatrixOne
 //! directly — every `TaskService` trait call goes through the
-//! server's `POST /jobs:rpc` endpoint so the server owns
+//! server's `POST /tasks:rpc` endpoint so the server owns
 //! ownership checks, concurrency, and audit. This struct is the
 //! CLI-side `TaskService` implementation that wraps each method
 //! into an HTTP request.
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Deserialize)]
-struct JobRpcResponse {
+struct TaskRpcResponse {
     result: Value,
 }
 
@@ -48,11 +48,11 @@ impl HttpTaskService {
         }
     }
 
-    /// Send `{method, args}` to `/jobs:rpc` and return the parsed
+    /// Send `{method, args}` to `/tasks:rpc` and return the parsed
     /// `result` JSON. All RPC failures map to `Result<_, String>`
     /// matching the `TaskService` trait error type.
     async fn rpc(&self, method: &str, args: Value) -> Result<Value, String> {
-        let url = format!("{}/jobs:rpc", self.cloud_base.trim_end_matches('/'));
+        let url = self.rpc_url();
         let client = reqwest::Client::builder()
             .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
@@ -73,11 +73,15 @@ impl HttpTaskService {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("cloud {status} ({method}): {body}"));
         }
-        let parsed: JobRpcResponse = resp
+        let parsed: TaskRpcResponse = resp
             .json()
             .await
             .map_err(|e| format!("decode response ({method}): {e}"))?;
         Ok(parsed.result)
+    }
+
+    fn rpc_url(&self) -> String {
+        format!("{}/tasks:rpc", self.cloud_base.trim_end_matches('/'))
     }
 }
 
@@ -373,10 +377,10 @@ impl TaskService for HttpTaskService {
     }
 }
 
-// ── Job lease HTTP client ─────────────────────────────────────────
+// ── Task lease HTTP client ─────────────────────────────────────────
 
 /// HTTP-backed `TaskLeaseService`. Mirrors the four trait methods to
-/// the existing `/jobs/{task_id}/lease/*` endpoints. Same auth and
+/// the existing `/tasks/{task_id}/lease/*` endpoints. Same auth and
 /// timeout policy as `HttpTaskService`.
 pub struct HttpTaskLeaseService {
     cloud_base: String,
@@ -467,7 +471,7 @@ impl TaskLeaseService for HttpTaskLeaseService {
     ) -> Result<NextClaimableLeaseClaimResult, String> {
         let result = self
             .post_with_edge_id(
-                "/jobs/lease/claim-next",
+                "/tasks/lease/claim-next",
                 json!({
                     "edge_agent_id": agent_id,
                     "ttl_sec": ttl_sec,
@@ -491,7 +495,7 @@ impl TaskLeaseService for HttpTaskLeaseService {
         // user_id resolved server-side from auth header.
         let result = self
             .post_with_edge_id(
-                &format!("/jobs/{task_id}/lease/claim"),
+                &format!("/tasks/{task_id}/lease/claim"),
                 json!({
                     "edge_agent_id": agent_id,
                     "ttl_sec": ttl_sec,
@@ -511,7 +515,7 @@ impl TaskLeaseService for HttpTaskLeaseService {
     ) -> Result<bool, String> {
         let result = self
             .post(
-                &format!("/jobs/{task_id}/lease/release"),
+                &format!("/tasks/{task_id}/lease/release"),
                 json!({ "edge_agent_id": agent_id }),
             )
             .await?;
@@ -526,7 +530,7 @@ impl TaskLeaseService for HttpTaskLeaseService {
         _user_id: &str,
         task_id: &str,
     ) -> Result<Option<TaskLeaseView>, String> {
-        let result = self.get(&format!("/jobs/{task_id}/lease")).await?;
+        let result = self.get(&format!("/tasks/{task_id}/lease")).await?;
         if result.is_null() {
             return Ok(None);
         }
@@ -545,7 +549,7 @@ impl TaskLeaseService for HttpTaskLeaseService {
     ) -> Result<Option<TaskLeaseView>, String> {
         let result = self
             .post_with_edge_id(
-                &format!("/jobs/{task_id}/lease/renew"),
+                &format!("/tasks/{task_id}/lease/renew"),
                 json!({
                     "edge_agent_id": agent_id,
                     "ttl_sec": ttl_sec,
@@ -560,5 +564,24 @@ impl TaskLeaseService for HttpTaskLeaseService {
         serde_json::from_value(result)
             .map(Some)
             .map_err(|e| format!("decode TaskLeaseView: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HttpTaskLeaseService, HttpTaskService};
+
+    #[test]
+    fn http_task_service_uses_tasks_protocol_paths() {
+        let service = HttpTaskService::new("https://cloud.example/", None);
+        assert_eq!(service.rpc_url(), "https://cloud.example/tasks:rpc");
+        assert!(!service.rpc_url().contains("/jobs"));
+
+        let lease = HttpTaskLeaseService::new("https://cloud.example/", None);
+        assert_eq!(
+            lease.url("/tasks/task-1/lease/claim"),
+            "https://cloud.example/tasks/task-1/lease/claim"
+        );
+        assert!(!lease.url("/tasks/task-1/lease").contains("/jobs"));
     }
 }

@@ -72,11 +72,15 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             label,
             tool_use_id,
             agent_id,
+            fanout_slot,
+            fanout_title,
         } => Some(AppEvent::Wire(WireEvent::AgentControlStarted {
             action,
             label,
             tool_use_id,
             agent_id,
+            fanout_slot,
+            fanout_title,
         })),
         TuiAppEvent::ToolCompleted {
             name,

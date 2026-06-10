@@ -298,7 +298,9 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("env", MU, OR),
     // ── Mutating — task management ───────────────────────────────────
     tool("task", MU, OR),
-    tool("job", MU, OR),
+    tool("task_output", RO, OR),
+    tool("task_list", RO, OR),
+    tool("task_stop", MU, OR),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("BashTool", SH, AE.union(AL)),
@@ -648,23 +650,6 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
-    if name == "job" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some("shell") => {
-                meta_category = ToolCategory::Shell;
-                meta_flags = AE.union(OR);
-            }
-            Some("output") => {
-                meta_category = ToolCategory::ReadOnly;
-                meta_flags = OR;
-            }
-            Some("agent" | "kill") | None | Some(_) => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = OR;
-            }
-        }
-    }
-
     if name == "git" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some(
@@ -728,11 +713,8 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
             Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
         }
-    } else if name == "job" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some("output") => ToolIdempotency::PureRead,
-            _ => ToolIdempotency::NonIdempotent,
-        }
+    } else if matches!(name, "task_output" | "task_list") {
+        ToolIdempotency::PureRead
     } else if name == "git" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some(
@@ -955,32 +937,21 @@ mod tests {
     }
 
     #[test]
-    fn job_tool_is_action_aware_for_shell_vs_read_actions() {
-        use serde_json::json;
-
-        let mutating_shell = classify(
-            "job",
-            Some(&json!({"action": "shell", "command": "npm run dev"})),
-        );
-        assert_eq!(mutating_shell.category, ToolCategory::Shell);
-        assert!(mutating_shell.approval_required);
-        assert!(!mutating_shell.parallelizable);
-
-        let read_shell = classify(
-            "job",
-            Some(&json!({"action": "shell", "command": "git status"})),
-        );
-        assert_eq!(read_shell.category, ToolCategory::ReadOnly);
-        assert!(!read_shell.approval_required);
-        assert!(read_shell.parallelizable);
-
-        let output = classify("job", Some(&json!({"action": "output"})));
+    fn typed_background_task_tools_are_classified_by_operation() {
+        let output = classify("task_output", None);
         assert_eq!(output.category, ToolCategory::ReadOnly);
         assert!(!output.approval_required);
+        assert!(output.parallelizable);
+        assert_eq!(output.idempotency, ToolIdempotency::PureRead);
 
-        let agent = classify("job", Some(&json!({"action": "agent"})));
-        assert_eq!(agent.category, ToolCategory::Mutating);
-        assert!(!agent.approval_required);
+        let list = classify("task_list", None);
+        assert_eq!(list.category, ToolCategory::ReadOnly);
+        assert_eq!(list.idempotency, ToolIdempotency::PureRead);
+
+        let stop = classify("task_stop", None);
+        assert_eq!(stop.category, ToolCategory::Mutating);
+        assert!(!stop.approval_required);
+        assert_eq!(stop.idempotency, ToolIdempotency::NonIdempotent);
     }
 
     #[test]

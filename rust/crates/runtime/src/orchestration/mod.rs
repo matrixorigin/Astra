@@ -17,8 +17,8 @@ pub use agent_result_status::{
     render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
 };
 pub use agent_tool::{
-    AgentToolContext, handle_agent_get_result_action, handle_agent_spawn_action, handle_agent_tool,
-    normalize_agent_spawn_args,
+    AgentToolContext, handle_agent_fanout_tool, handle_agent_get_result_action,
+    handle_agent_spawn_action, handle_agent_tool, normalize_agent_spawn_args,
 };
 pub use agent_trace_status::{
     AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,

@@ -18,6 +18,8 @@ pub(crate) enum TuiAppEvent {
         label: String,
         tool_use_id: String,
         agent_id: Option<String>,
+        fanout_slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
+        fanout_title: Option<String>,
     },
     ToolCompleted {
         name: String,

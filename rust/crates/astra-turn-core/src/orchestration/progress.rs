@@ -1,5 +1,6 @@
 //! Progress events for spawned agents.
 
+use super::fanout_group::AgentFanoutSlotIdentity;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -78,6 +79,7 @@ pub enum ProgressEventType {
         parent_run_id: String,
         agent_type: String,
         description: String,
+        fanout_slot: Option<AgentFanoutSlotIdentity>,
     },
 }
 
@@ -279,11 +281,24 @@ impl AgentProgressEmitter {
         agent_type: impl Into<String>,
         description: impl Into<String>,
     ) {
+        self.agent_spawned_with_fanout(run_id, parent_run_id, agent_type, description, None);
+    }
+
+    /// Emit agent spawned event with fanout slot identity.
+    pub fn agent_spawned_with_fanout(
+        &self,
+        run_id: impl Into<String>,
+        parent_run_id: impl Into<String>,
+        agent_type: impl Into<String>,
+        description: impl Into<String>,
+        fanout_slot: Option<AgentFanoutSlotIdentity>,
+    ) {
         self.emit(ProgressEventType::AgentSpawned {
             run_id: run_id.into(),
             parent_run_id: parent_run_id.into(),
             agent_type: agent_type.into(),
             description: description.into(),
+            fanout_slot,
         });
     }
 

@@ -746,6 +746,7 @@ impl SessionState {
     pub fn set_session_id(&mut self, session_id: impl Into<String>) {
         let sid: String = session_id.into();
         self.task_manager.rebind(&sid);
+        self.perm_manager.set_active_session_id(&sid);
         self.session_id = Some(sid);
     }
 
@@ -753,6 +754,7 @@ impl SessionState {
     /// session binding; the next `set_session_id` rebinds.
     pub fn clear_session_id(&mut self) {
         self.task_manager.rebind("");
+        self.perm_manager.clear_active_session_id();
         self.session_id = None;
         self.clear_resume_recovery_state();
         self.session_persistence_error = None;

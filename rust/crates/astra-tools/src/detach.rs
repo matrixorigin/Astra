@@ -66,7 +66,7 @@ pub struct DetachShellListener {
 
 /// Renewable slot the TUI installs on `ToolContext`. The bash runner
 /// `lock().take()`s the handle on entry; if absent, bash is treated
-/// as if no detach plumbing existed (legacy path). The TUI refills
+/// as a normal foreground invocation. The TUI refills
 /// the slot before the next tool call so each bash invocation gets
 /// a fresh one-shot channel.
 pub type DetachShellSlot = std::sync::Arc<tokio::sync::Mutex<Option<DetachShellHandle>>>;

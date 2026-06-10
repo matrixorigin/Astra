@@ -8,6 +8,7 @@ pub(crate) struct CliContext {
     pub(crate) disallowed_tools: Vec<String>,
     pub(crate) add_dirs: Vec<PathBuf>,
     pub(crate) auto_approve: bool,
+    pub(crate) permission_mode: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) session_name: Option<String>,
 }
@@ -43,9 +44,15 @@ impl CliContext {
             disallowed_tools: resolve_tool_list(disallowed_tools, "ASTRA_CLI_DISALLOWED_TOOLS"),
             add_dirs: resolve_add_dirs(add_dirs),
             auto_approve,
+            permission_mode: None,
             session_id,
             session_name,
         })
+    }
+
+    pub(crate) fn with_permission_mode(mut self, permission_mode: Option<String>) -> Self {
+        self.permission_mode = permission_mode;
+        self
     }
 }
 

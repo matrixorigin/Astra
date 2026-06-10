@@ -1,5 +1,6 @@
 //! Spawn agent tool schema and types.
 
+use super::fanout_group::AgentFanoutSlotIdentity;
 use serde::{Deserialize, Serialize};
 /// Request to inherit the parent's cacheable prefix when spawning.
 ///
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 ///   inheritance and a telemetry event is emitted.
 /// - `required: true` — spawn fails with an error.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InheritPrefixSpec {
     /// Parent run id to inherit from. `None` means "the run calling
     /// `agent(action='spawn')`" — the resolver substitutes the caller's run id
@@ -38,6 +40,7 @@ pub struct InheritPrefixSpec {
 /// The caller never supplies `agent_id` here: the runtime generates the
 /// child agent's id and returns it in [`SpawnAgentOutput`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnAgentInput {
     /// Short (3-5 word) description of the task.
     pub description: String,
@@ -47,7 +50,6 @@ pub struct SpawnAgentInput {
 
     /// Agent type: "explore", "code-review", "task", "general-purpose".
     #[serde(default = "default_agent_type")]
-    #[serde(alias = "type")]
     pub agent_type: String,
 
     /// Optional model override.
@@ -56,14 +58,14 @@ pub struct SpawnAgentInput {
     /// Run in background (async). Default false — synchronous mode
     /// ensures the parent receives the child's result in the tool-call
     /// response before its turn budget is consumed.
-    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    #[serde(default)]
     pub run_in_background: bool,
 
     /// Name for agent-to-agent messaging.
     pub name: Option<String>,
 
     /// Max turns before auto-stopping.
-    #[serde(default, deserialize_with = "deserialize_option_u32_lenient")]
+    #[serde(default)]
     pub max_turns: Option<u32>,
 
     /// Max output tokens for the child's first API call. When a
@@ -72,11 +74,10 @@ pub struct SpawnAgentInput {
     /// clamp the effective thinking budget below the captured
     /// parent value (cache key drift).
     #[serde(default)]
-    #[serde(deserialize_with = "deserialize_option_u32_lenient")]
     pub max_output_tokens: Option<u32>,
 
     /// Create isolated git worktree for this agent.
-    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    #[serde(default)]
     pub isolated: bool,
 
     /// Tool allowlist (overrides agent_type defaults).
@@ -85,19 +86,7 @@ pub struct SpawnAgentInput {
     /// Optional request to reuse a captured parent ForkPrefix for
     /// cache inheritance. When absent, spawn proceeds with a fresh
     /// prefix (no cache reuse). See [`InheritPrefixSpec`].
-    ///
-    /// Uses a custom deserializer so models that serialize the
-    /// "empty opt-in" variant as a string `"{}"` or `""` (observed
-    /// with MiniMax-M2.5: "invalid type: string \"{}\", expected
-    /// struct InheritPrefixSpec") still produce a valid default
-    /// spec instead of the whole tool call failing with a schema
-    /// validation error. Proper JSON objects continue to parse as
-    /// before.
-    #[serde(
-        default,
-        alias = "inherit_context",
-        deserialize_with = "deserialize_inherit_prefix_lenient"
-    )]
+    #[serde(default, deserialize_with = "deserialize_inherit_prefix_strict")]
     pub inherit_prefix: Option<InheritPrefixSpec>,
 
     /// Optional task-complexity hint used to scale the default
@@ -116,175 +105,94 @@ pub struct SpawnAgentInput {
     /// load-bearing for schema cache; do NOT reorder.
     #[serde(default)]
     pub complexity: Option<String>,
+
+    /// Optional fanout group identity. When present with
+    /// `fanout_target_count` and `fanout_slot_index`, this spawn is a
+    /// specific slot in a fixed-size group rather than an independent
+    /// child. The runtime uses it to preserve the user's requested N
+    /// slots across spawn failures, retries, cancellation, and result
+    /// collection.
+    #[serde(default)]
+    pub fanout_group_id: Option<String>,
+
+    /// Optional user-facing title for the fanout group. This does not
+    /// participate in slot identity; it lets UI projections render the
+    /// user's group label instead of falling back to the group id.
+    #[serde(default)]
+    pub fanout_group_title: Option<String>,
+
+    /// Fixed target count for the fanout group. Must be >= 1 when
+    /// provided by callers.
+    #[serde(default)]
+    pub fanout_target_count: Option<usize>,
+
+    /// Zero-based slot index within the fanout group. The slot index
+    /// identifies replacement/retry intent; a later retry for slot 1
+    /// must not silently become a fourth requested agent.
+    #[serde(default)]
+    pub fanout_slot_index: Option<usize>,
 }
 
-/// Lenient bool deserializer: accepts `true`, `false`, `"true"`,
-/// `"false"`, `"1"`, `"0"`, `1`, `0`, or null/absent (→ false).
-/// LLMs frequently serialize booleans as strings (session 7e3fecb5:
-/// `"run_in_background": "true"` caused 3 consecutive InvalidInput errors
-/// that triggered ToolHealthTracker restriction).
-fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de;
-    struct BoolVisitor;
-    impl<'de> de::Visitor<'de> for BoolVisitor {
-        type Value = bool;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("a boolean or string-encoded boolean")
-        }
-        fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
-            Ok(v)
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
-            // Empty string is NOT a valid bool — fail loudly so LLM bugs
-            // surface instead of being silently coerced to `false`.
-            match v.to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => Ok(true),
-                "false" | "0" | "no" => Ok(false),
-                other => Err(E::custom(format!(
-                    "unrecognized boolean string: \"{other}\" (expected true/false/1/0/yes/no)"
-                ))),
-            }
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
-            // Accept only the canonical 0/1 contract; reject arbitrary
-            // integers so malformed input doesn't silently become `true`.
-            match v {
-                0 => Ok(false),
-                1 => Ok(true),
-                other => Err(E::custom(format!(
-                    "unrecognized boolean integer: {other} (expected 0 or 1)"
-                ))),
-            }
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
-            match v {
-                0 => Ok(false),
-                1 => Ok(true),
-                other => Err(E::custom(format!(
-                    "unrecognized boolean integer: {other} (expected 0 or 1)"
-                ))),
-            }
-        }
-        fn visit_none<E: de::Error>(self) -> Result<bool, E> {
-            Ok(false)
-        }
-        fn visit_unit<E: de::Error>(self) -> Result<bool, E> {
-            Ok(false)
-        }
+impl SpawnAgentInput {
+    pub fn validate_fanout_metadata(&self) -> Result<(), String> {
+        self.fanout_slot_identity().map(|_| ())
     }
-    deserializer.deserialize_any(BoolVisitor)
-}
 
-/// Lenient optional-u32 deserializer: accepts bare integers, quoted
-/// decimal strings like `"10"`, null, or absence.
-///
-/// Models sometimes stringify numeric inputs (`"max_turns":"10"`)
-/// which default serde rejects with `invalid type: string "10",
-/// expected u32`, failing the whole spawn call before the child can
-/// launch. Accept only canonical non-negative integer strings; reject
-/// floats, negatives, empty strings, and non-scalar types.
-fn deserialize_option_u32_lenient<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::Number(number) => {
-            let raw = number
-                .as_u64()
-                .ok_or_else(|| Error::custom("expected a non-negative integer"))?;
-            let parsed = u32::try_from(raw)
-                .map_err(|_| Error::custom(format!("integer out of range for u32: {raw}")))?;
-            Ok(Some(parsed))
+    pub fn fanout_slot_identity(&self) -> Result<Option<AgentFanoutSlotIdentity>, String> {
+        let any = self.fanout_group_id.is_some()
+            || self.fanout_group_title.is_some()
+            || self.fanout_target_count.is_some()
+            || self.fanout_slot_index.is_some();
+        if !any {
+            return Ok(None);
         }
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Err(Error::custom(
-                    "unrecognized integer string: \"\" (expected decimal digits)",
-                ));
-            }
-            let raw = trimmed.parse::<u64>().map_err(|_| {
-                Error::custom(format!(
-                    "unrecognized integer string: \"{trimmed}\" (expected decimal digits)"
-                ))
-            })?;
-            let parsed = u32::try_from(raw)
-                .map_err(|_| Error::custom(format!("integer out of range for u32: {raw}")))?;
-            Ok(Some(parsed))
+        if self
+            .fanout_group_title
+            .as_deref()
+            .is_some_and(|title| title.trim().is_empty())
+        {
+            return Err("fanout metadata requires non-empty fanout_group_title".to_string());
         }
-        serde_json::Value::Bool(_) => Err(Error::custom("expected integer; got bool")),
-        serde_json::Value::Array(_) => Err(Error::custom("expected integer; got array")),
-        serde_json::Value::Object(_) => Err(Error::custom("expected integer; got object")),
+        let group_id = self
+            .fanout_group_id
+            .as_deref()
+            .map(str::trim)
+            .ok_or_else(|| "fanout metadata requires non-empty fanout_group_id".to_string())?;
+        let target_count = self
+            .fanout_target_count
+            .ok_or_else(|| format!("fanout group '{group_id}' requires fanout_target_count"))?;
+        let slot_index = self
+            .fanout_slot_index
+            .ok_or_else(|| format!("fanout group '{group_id}' requires fanout_slot_index"))?;
+        AgentFanoutSlotIdentity::new(group_id, target_count, slot_index).map(Some)
     }
 }
 
-/// Lenient deserializer for `inherit_prefix`: accepts a JSON object
-/// (proper shape), a string `"{}"` / `""` / `"default"` (model
-/// fat-fingered the empty object as a string), null, or absence.
-/// Every other shape still fails cleanly — we don't want a literal
-/// `"yes"` or a JSON number silently producing a default.
-fn deserialize_inherit_prefix_lenient<'de, D>(
+fn deserialize_inherit_prefix_strict<'de, D>(
     deserializer: D,
 ) -> Result<Option<InheritPrefixSpec>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
-    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
-    let Some(v) = v else {
-        return Ok(None);
-    };
-    match v {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
         serde_json::Value::Null => Ok(None),
-        serde_json::Value::Object(_) => {
-            // Proper path: parse as the structured type.
-            serde_json::from_value::<InheritPrefixSpec>(v)
-                .map(Some)
-                .map_err(Error::custom)
-        }
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed == "{}" || trimmed.eq_ignore_ascii_case("default") {
-                // Model meant "opt in with defaults"; give them that.
-                Ok(Some(InheritPrefixSpec::default()))
-            } else {
-                // Try to parse the string AS JSON so payloads like
-                // `"{\"required\": true}"` (also observed) still work.
-                let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
-                    Error::custom(format!(
-                        "inherit_prefix string \"{s}\" is not a recognized shorthand \
-                         (allowed: \"\" / \"{{}}\" / \"default\") nor a JSON object literal"
-                    ))
-                })?;
-                if parsed.is_object() {
-                    serde_json::from_value::<InheritPrefixSpec>(parsed)
-                        .map(Some)
-                        .map_err(Error::custom)
-                } else {
-                    Err(Error::custom(format!(
-                        "inherit_prefix must be an object; got stringified non-object: {s}"
-                    )))
-                }
-            }
-        }
-        other => Err(Error::custom(format!(
-            "inherit_prefix must be an object; got {}",
-            match other {
-                serde_json::Value::Bool(_) => "bool",
-                serde_json::Value::Number(_) => "number",
-                serde_json::Value::Array(_) => "array",
-                _ => unreachable!(),
-            }
-        ))),
+        serde_json::Value::Object(_) => serde_json::from_value::<InheritPrefixSpec>(value)
+            .map(Some)
+            .map_err(Error::custom),
+        serde_json::Value::String(_) => Err(Error::custom(
+            "inherit_prefix must be an object or null; got string",
+        )),
+        serde_json::Value::Bool(_) => Err(Error::custom(
+            "inherit_prefix must be an object or null; got bool",
+        )),
+        serde_json::Value::Number(_) => Err(Error::custom(
+            "inherit_prefix must be an object or null; got number",
+        )),
+        serde_json::Value::Array(_) => Err(Error::custom(
+            "inherit_prefix must be an object or null; got array",
+        )),
     }
 }
 
@@ -306,6 +214,10 @@ impl Default for SpawnAgentInput {
             allowed_tools: None,
             inherit_prefix: None,
             complexity: None,
+            fanout_group_id: None,
+            fanout_group_title: None,
+            fanout_target_count: None,
+            fanout_slot_index: None,
         }
     }
 }
@@ -488,10 +400,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_type_accepts_legacy_type_alias() {
+    fn agent_type_rejects_type_alias() {
         let json = r#"{"description":"Test","prompt":"Do the thing","type":"task"}"#;
-        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
-        assert_eq!(input.agent_type, "task");
+        let err = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("type alias must not deserialize");
+        assert!(
+            err.to_string().contains("unknown field `type`"),
+            "canonical field is agent_type; got: {err}"
+        );
     }
 
     #[test]
@@ -536,13 +452,87 @@ mod tests {
     }
 
     #[test]
+    fn fanout_metadata_round_trips_explicit_slot_identity() {
+        let json = r#"{
+            "description": "Review storage",
+            "prompt": "Review storage layer",
+            "run_in_background": true,
+            "fanout_group_id": "review-1",
+            "fanout_group_title": "Review fanout",
+            "fanout_target_count": 3,
+            "fanout_slot_index": 1
+        }"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        input.validate_fanout_metadata().unwrap();
+        assert_eq!(input.fanout_group_id.as_deref(), Some("review-1"));
+        assert_eq!(input.fanout_group_title.as_deref(), Some("Review fanout"));
+        assert_eq!(input.fanout_target_count, Some(3));
+        assert_eq!(input.fanout_slot_index, Some(1));
+    }
+
+    #[test]
+    fn fanout_metadata_rejects_partial_or_out_of_range_identity() {
+        let title_without_identity: SpawnAgentInput = serde_json::from_str(
+            r#"{
+                "description": "Review storage",
+                "prompt": "Review storage layer",
+                "fanout_group_title": "Review fanout"
+            }"#,
+        )
+        .unwrap();
+        let err = title_without_identity
+            .validate_fanout_metadata()
+            .unwrap_err();
+        assert!(err.contains("fanout_group_id"), "{err}");
+
+        let empty_title: SpawnAgentInput = serde_json::from_str(
+            r#"{
+                "description": "Review storage",
+                "prompt": "Review storage layer",
+                "fanout_group_id": "review-1",
+                "fanout_group_title": "   ",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 1
+            }"#,
+        )
+        .unwrap();
+        let err = empty_title.validate_fanout_metadata().unwrap_err();
+        assert!(err.contains("fanout_group_title"), "{err}");
+
+        let missing_slot: SpawnAgentInput = serde_json::from_str(
+            r#"{
+                "description": "Review storage",
+                "prompt": "Review storage layer",
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3
+            }"#,
+        )
+        .unwrap();
+        let err = missing_slot.validate_fanout_metadata().unwrap_err();
+        assert!(err.contains("fanout_slot_index"), "{err}");
+
+        let out_of_range: SpawnAgentInput = serde_json::from_str(
+            r#"{
+                "description": "Review storage",
+                "prompt": "Review storage layer",
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 3
+            }"#,
+        )
+        .unwrap();
+        let err = out_of_range.validate_fanout_metadata().unwrap_err();
+        assert!(err.contains("outside target_count"), "{err}");
+    }
+
+    #[test]
     fn legacy_task_field_is_rejected() {
         let json = r#"{"description":"D","task":"Use the old field"}"#;
         let err = serde_json::from_str::<SpawnAgentInput>(json)
             .expect_err("deprecated task field must not deserialize");
         assert!(
-            err.to_string().contains("missing field `prompt`"),
-            "legacy task payloads should fail because prompt is the only canonical field: {err}"
+            err.to_string().contains("unknown field `task`"),
+            "legacy task payloads should fail because prompt is the only canonical field and task is not accepted: {err}"
         );
     }
 
@@ -575,70 +565,19 @@ mod tests {
     }
 
     #[test]
-    fn inherit_context_alias_populates_inherit_prefix() {
+    fn inherit_context_alias_is_rejected() {
         let json = r#"{
             "description": "D",
             "prompt": "P",
             "inherit_context": {"required": true}
         }"#;
-        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
-        let spec = input
-            .inherit_prefix
-            .expect("inherit_context must opt into prefix inheritance");
-        assert!(spec.required);
-        assert_eq!(spec.from_run_id, None);
-    }
-
-    #[test]
-    fn inherit_context_conflicts_with_inherit_prefix() {
-        let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{
-                "description": "D",
-                "prompt": "P",
-                "inherit_prefix": {"required": false},
-                "inherit_context": {"required": true}
-            }"#,
-        )
-        .expect_err("ambiguous dual inheritance fields must fail");
+        let err = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("inherit_context alias must not deserialize");
         assert!(
-            err.to_string().contains("duplicate field"),
-            "error should reject conflicting inheritance aliases as duplicate fields, got: {err}"
+            err.to_string().contains("unknown field `inherit_context`"),
+            "canonical field is inherit_prefix; got: {err}"
         );
     }
-
-    #[test]
-    fn inherit_context_alias_accepts_empty_object_string() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_context":"{}"}"#)
-                .unwrap();
-        let spec = input
-            .inherit_prefix
-            .expect("inherit_context alias should use the same lenient parser");
-        assert_eq!(spec.from_run_id, None);
-        assert!(!spec.required);
-    }
-
-    #[test]
-    fn inherit_context_alias_accepts_null() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_context":null}"#)
-                .unwrap();
-        assert!(
-            input.inherit_prefix.is_none(),
-            "null alias should behave like null inherit_prefix"
-        );
-    }
-
-    // ─── Lenient deserializer for inherit_prefix (MiniMax regression) ───
-    //
-    // MiniMax-M2.5 was observed sending `"inherit_prefix": "{}"`
-    // (the empty-object shorthand as a JSON *string*) which the
-    // default serde derive rejected with
-    // `invalid type: string "{}", expected struct InheritPrefixSpec`,
-    // failing the entire spawn_agent tool call. These tests pin the
-    // lenient deserializer that accepts a handful of common model
-    // "fat-fingered empty object" shapes while still rejecting
-    // anything that's genuinely ambiguous.
 
     #[test]
     fn inherit_prefix_accepts_proper_object() {
@@ -651,44 +590,48 @@ mod tests {
     }
 
     #[test]
-    fn inherit_prefix_accepts_empty_object_string() {
-        // The observed MiniMax bug shape.
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":"{}"}"#)
-                .unwrap();
-        let spec = input
-            .inherit_prefix
-            .expect("\"{}\" must produce a default InheritPrefixSpec, not None");
-        assert_eq!(spec.from_run_id, None);
-        assert!(!spec.required, "default spec must have required=false");
+    fn inherit_prefix_rejects_empty_object_string() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"d","prompt":"p","inherit_prefix":"{}"}"#,
+        )
+        .expect_err("inherit_prefix must be an object, not a string");
+        assert!(err.to_string().contains("got string"), "{err}");
     }
 
     #[test]
-    fn inherit_prefix_accepts_empty_string() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":""}"#)
-                .unwrap();
-        assert!(input.inherit_prefix.is_some());
+    fn inherit_prefix_rejects_empty_string() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"d","prompt":"p","inherit_prefix":""}"#,
+        )
+        .expect_err("inherit_prefix must be an object, not a string");
+        assert!(err.to_string().contains("got string"), "{err}");
     }
 
     #[test]
-    fn inherit_prefix_accepts_default_keyword() {
-        // Natural-language shorthand some models emit.
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":"default"}"#)
-                .unwrap();
-        assert!(input.inherit_prefix.is_some());
+    fn inherit_prefix_rejects_default_keyword() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"d","prompt":"p","inherit_prefix":"default"}"#,
+        )
+        .expect_err("inherit_prefix must be an object, not a string");
+        assert!(err.to_string().contains("got string"), "{err}");
     }
 
     #[test]
-    fn inherit_prefix_accepts_stringified_object_with_fields() {
-        // Models occasionally stringify the whole JSON object — as
-        // long as it's parseable as an object, we accept.
-        let input: SpawnAgentInput = serde_json::from_str(
+    fn inherit_prefix_rejects_stringified_object_with_fields() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"d","prompt":"p","inherit_prefix":"{\"required\":true}"}"#,
         )
-        .unwrap();
-        assert!(input.inherit_prefix.unwrap().required);
+        .expect_err("inherit_prefix must be an object, not a stringified object");
+        assert!(err.to_string().contains("got string"), "{err}");
+    }
+
+    #[test]
+    fn inherit_prefix_rejects_unknown_object_fields() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"d","prompt":"p","inherit_prefix":{"mode":"default"}}"#,
+        )
+        .expect_err("inherit_prefix object must reject unknown fields");
+        assert!(err.to_string().contains("unknown field `mode`"), "{err}");
     }
 
     #[test]
@@ -701,9 +644,6 @@ mod tests {
 
     #[test]
     fn inherit_prefix_rejects_ambiguous_strings() {
-        // We don't want "yes" / "true" / "on" to silently produce a
-        // default — operators might intend something provider-
-        // specific we don't know about. Hard-fail so they notice.
         for bad in ["yes", "on", "enabled", "1", "prefix"] {
             let json = format!(r#"{{"description":"d","prompt":"p","inherit_prefix":"{bad}"}}"#);
             let out: Result<SpawnAgentInput, _> = serde_json::from_str(&json);
@@ -753,19 +693,16 @@ mod tests {
 }
 
 #[cfg(test)]
-mod bool_lenient_tests {
+mod strict_type_tests {
     use super::SpawnAgentInput;
 
     #[test]
-    fn run_in_background_accepts_string_true() {
-        // Regression (session 7e3fecb5): LLM passed "true" (string)
-        // instead of true (bool) → serde rejected → 3 failures →
-        // tool restricted. Lenient deserializer fixes this.
-        let input: SpawnAgentInput = serde_json::from_str(
+    fn run_in_background_rejects_string_true() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"test","prompt":"p","run_in_background":"true"}"#,
         )
-        .expect("string 'true' must deserialize");
-        assert!(input.run_in_background);
+        .expect_err("string true must not deserialize");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]
@@ -784,81 +721,66 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn isolated_accepts_string_false() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","isolated":"false"}"#)
-                .expect("string 'false' must deserialize");
-        assert!(!input.isolated);
+    fn isolated_rejects_string_false() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","isolated":"false"}"#,
+        )
+        .expect_err("string false must not deserialize");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]
     fn run_in_background_rejects_unknown_string() {
-        // Contract: only {true,false,1,0,yes,no} are accepted. Anything
-        // else must error instead of silently defaulting to false — so
-        // genuine LLM bugs surface rather than masquerading as success.
         let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"test","prompt":"p","run_in_background":"maybe"}"#,
         )
         .expect_err("unknown string must be rejected");
-        assert!(
-            err.to_string().contains("unrecognized boolean string"),
-            "error must name the contract violation; got: {err}"
-        );
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]
     fn run_in_background_rejects_empty_string() {
-        // Regression guard: empty string used to coerce to `false`,
-        // hiding malformed `"run_in_background": ""` input. Now must error.
         let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"test","prompt":"p","run_in_background":""}"#,
         )
         .expect_err("empty string must be rejected");
-        assert!(err.to_string().contains("unrecognized boolean string"));
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]
     fn run_in_background_rejects_arbitrary_integer() {
-        // Contract: only 0/1 are accepted. `42` used to silently
-        // coerce to `true`; now must error.
         let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"test","prompt":"p","run_in_background":42}"#,
         )
         .expect_err("arbitrary integer must be rejected");
-        assert!(
-            err.to_string().contains("unrecognized boolean integer"),
-            "error must name the contract violation; got: {err}"
-        );
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]
-    fn run_in_background_accepts_integer_one() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":1}"#)
-                .expect("integer 1 must deserialize to true");
-        assert!(input.run_in_background);
-    }
-}
-
-#[cfg(test)]
-mod u32_lenient_tests {
-    use super::SpawnAgentInput;
-
-    #[test]
-    fn max_turns_accepts_string_integer() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","max_turns":"10"}"#)
-                .expect("string '10' must deserialize");
-        assert_eq!(input.max_turns, Some(10));
+    fn run_in_background_rejects_integer_one() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","run_in_background":1}"#,
+        )
+        .expect_err("integer 1 must not deserialize");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]
-    fn max_output_tokens_accepts_string_integer() {
-        let input: SpawnAgentInput = serde_json::from_str(
+    fn max_turns_rejects_string_integer() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","max_turns":"10"}"#,
+        )
+        .expect_err("string max_turns must not deserialize");
+        assert!(err.to_string().contains("expected u32"), "{err}");
+    }
+
+    #[test]
+    fn max_output_tokens_rejects_string_integer() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"test","prompt":"p","max_output_tokens":"8000"}"#,
         )
-        .expect("string max_output_tokens must deserialize");
-        assert_eq!(input.max_output_tokens, Some(8000));
+        .expect_err("string max_output_tokens must not deserialize");
+        assert!(err.to_string().contains("expected u32"), "{err}");
     }
 
     #[test]
@@ -867,7 +789,7 @@ mod u32_lenient_tests {
             r#"{"description":"test","prompt":"p","max_turns":""}"#,
         )
         .expect_err("empty string must not silently coerce");
-        assert!(err.to_string().contains("unrecognized integer string"));
+        assert!(err.to_string().contains("expected u32"), "{err}");
     }
 
     #[test]
@@ -876,6 +798,15 @@ mod u32_lenient_tests {
             r#"{"description":"test","prompt":"p","max_turns":"10.5"}"#,
         )
         .expect_err("float string must not deserialize as u32");
-        assert!(err.to_string().contains("unrecognized integer string"));
+        assert!(err.to_string().contains("expected u32"), "{err}");
+    }
+
+    #[test]
+    fn fanout_target_count_rejects_string_integer() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","fanout_group_id":"g","fanout_target_count":"3","fanout_slot_index":0}"#,
+        )
+        .expect_err("string fanout_target_count must not deserialize");
+        assert!(err.to_string().contains("expected usize"), "{err}");
     }
 }
