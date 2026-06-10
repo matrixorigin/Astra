@@ -31,7 +31,9 @@ export async function POST(
   }
 
   try {
-    const result = await stopActiveRun(auth.user.user_id, chatId);
+    const result = await stopActiveRun(auth.user.user_id, chatId, {
+      skipSync: true,
+    });
     if (!result) {
       return NextResponse.json({ error: "chat not found" }, { status: 404 });
     }

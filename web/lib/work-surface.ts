@@ -72,6 +72,7 @@ export type WorkSurfaceState = {
   loading: boolean;
   hydrated: boolean;
   error: string | null;
+  warnings: string[];
   updatedAt: string | null;
 };
 
@@ -81,6 +82,7 @@ export type WorkSurfaceResponse = {
   tasks: SessionTask[];
   events?: Record<string, unknown>[];
   generatedAt?: string;
+  warnings?: string[];
 };
 
 export function createEmptyWorkSurface(
@@ -96,6 +98,7 @@ export function createEmptyWorkSurface(
     loading: false,
     hydrated: false,
     error: null,
+    warnings: [],
     updatedAt: null,
   };
 }
@@ -111,6 +114,7 @@ export function beginWorkSurfaceLoad(
     runId,
     loading: true,
     error: null,
+    warnings: [],
   };
 }
 
@@ -132,6 +136,7 @@ export function resetWorkSurfaceForRun(
     tools: [],
     agents: [],
     error: null,
+    warnings: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -145,6 +150,7 @@ export function failWorkSurfaceLoad(
     loading: false,
     hydrated: true,
     error: message,
+    warnings: [],
   };
 }
 
@@ -162,6 +168,7 @@ export function hydrateWorkSurface(
     loading: false,
     hydrated: true,
     error: null,
+    warnings: response.warnings ?? [],
     updatedAt: response.generatedAt ?? new Date().toISOString(),
   };
   for (const event of response.events ?? []) {

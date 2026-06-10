@@ -845,8 +845,14 @@ export async function queueDeferredRunInput(
   };
 }
 
-export async function stopActiveRun(ownerUserId: string, chatId: string) {
-  await syncBackendSessions(ownerUserId);
+export async function stopActiveRun(
+  ownerUserId: string,
+  chatId: string,
+  options?: { skipSync?: boolean },
+) {
+  if (!options?.skipSync) {
+    await syncBackendSessions(ownerUserId);
+  }
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {

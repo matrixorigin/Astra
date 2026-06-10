@@ -18,7 +18,9 @@
 //! call.  In that case `parse_tool_call_tags` returns `None`.  The `<invoke>`
 //! format is unambiguous and does not need this guard.
 
+use regex::Regex;
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 /// Maximum ratio of non-XML text to total text before we refuse to treat the
@@ -118,11 +120,15 @@ pub fn strip_parsed_invocations(text: &str) -> String {
 
 fn normalize_dsml_tool_call_markup(text: &str) -> String {
     let mut normalized = text.to_string();
-    for prefix in [DSML_FULLWIDTH_PREFIX, DSML_ASCII_PREFIX] {
-        for tag in ["tool_calls", "invoke", "parameter"] {
-            normalized = normalized.replace(&format!("<{prefix}{tag}"), &format!("<{tag}"));
-            normalized = normalized.replace(&format!("</{prefix}{tag}"), &format!("</{tag}"));
-        }
+    for tag in ["tool_calls", "invoke", "parameter"] {
+        let open = dsml_tag_regex(tag, false);
+        let close = dsml_tag_regex(tag, true);
+        normalized = open
+            .replace_all(&normalized, format!("<{tag}").as_str())
+            .into_owned();
+        normalized = close
+            .replace_all(&normalized, format!("</{tag}").as_str())
+            .into_owned();
     }
     normalized
 }
@@ -130,30 +136,64 @@ fn normalize_dsml_tool_call_markup(text: &str) -> String {
 fn strip_parsed_dsml_tool_call_blocks(text: &str) -> Option<String> {
     let mut result = text.to_string();
     let mut changed = false;
+    let open = dsml_tool_calls_open_regex();
+    let close = dsml_tool_calls_close_regex();
 
-    for prefix in [DSML_FULLWIDTH_PREFIX, DSML_ASCII_PREFIX] {
-        let open = format!("<{prefix}tool_calls>");
-        let close = format!("</{prefix}tool_calls>");
-        let mut search_from = 0;
+    let mut search_from = 0;
 
-        while let Some(start) = result[search_from..].find(&open) {
-            let abs_start = search_from + start;
-            let Some(close_start) = result[abs_start..].find(&close) else {
-                search_from = abs_start + open.len();
-                continue;
-            };
-            let block_end = abs_start + close_start + close.len();
-            let block = &result[abs_start..block_end];
-            if parse_xml_tool_calls(block).is_some() {
-                result.replace_range(abs_start..block_end, "");
-                changed = true;
-            } else {
-                search_from = block_end;
-            }
+    while let Some(open_match) = open.find(&result[search_from..]) {
+        let abs_start = search_from + open_match.start();
+        let body_start = search_from + open_match.end();
+        let Some(close_match) = close.find(&result[body_start..]) else {
+            search_from = body_start;
+            continue;
+        };
+        let block_end = body_start + close_match.end();
+        let block = &result[abs_start..block_end];
+        if parse_xml_tool_calls(block).is_some() {
+            result.replace_range(abs_start..block_end, "");
+            changed = true;
+        } else {
+            search_from = block_end;
         }
     }
 
     changed.then(|| result.trim().to_string())
+}
+
+fn dsml_tag_regex(tag: &str, closing: bool) -> Regex {
+    let slash = if closing { r"/\s*" } else { "" };
+    Regex::new(&format!(
+        r"(?i)<\s*{slash}(?:{}|{})\s*{}",
+        regex::escape(DSML_FULLWIDTH_PREFIX),
+        regex::escape(DSML_ASCII_PREFIX),
+        regex::escape(tag)
+    ))
+    .expect("DSML tag regex should compile")
+}
+
+fn dsml_tool_calls_open_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)<\s*(?:{}|{})\s*tool_calls\s*>",
+            regex::escape(DSML_FULLWIDTH_PREFIX),
+            regex::escape(DSML_ASCII_PREFIX)
+        ))
+        .expect("DSML tool_calls open regex should compile")
+    })
+}
+
+fn dsml_tool_calls_close_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)<\s*/\s*(?:{}|{})\s*tool_calls\s*>",
+            regex::escape(DSML_FULLWIDTH_PREFIX),
+            regex::escape(DSML_ASCII_PREFIX)
+        ))
+        .expect("DSML tool_calls close regex should compile")
+    })
 }
 
 // ─── <tool_call> Fallback ────────────────────────────────────────────────────
@@ -503,6 +543,23 @@ mod tests {
         );
 
         assert_eq!(strip_parsed_invocations(dsml), "Web review complete.");
+    }
+
+    #[test]
+    fn strip_dsml_wrapped_invoke_with_tag_whitespace() {
+        let dsml = concat!(
+            "Done.\n",
+            "< ||DSML||tool_calls >",
+            "< ||DSML||invoke name=\"agent\">",
+            "< ||DSML||parameter name=\"action\">get_result",
+            "</ ||DSML||parameter>",
+            "</ ||DSML||invoke>",
+            "</ ||DSML||tool_calls >",
+        );
+
+        let calls = parse_xml_tool_calls(dsml).unwrap();
+        assert_eq!(calls[0]["function"]["name"], "agent");
+        assert_eq!(strip_parsed_invocations(dsml), "Done.");
     }
 
     #[test]

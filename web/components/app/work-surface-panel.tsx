@@ -23,6 +23,7 @@ import type {
   ToolSurfaceItem,
   WorkSurfaceState,
 } from "@/lib/work-surface";
+import type { WorkSurfaceRunResponse } from "@/lib/api/types";
 import { cn } from "@/lib/utils/cn";
 
 export type WorkSurfaceTab = "tasks" | "agents" | "tools";
@@ -34,6 +35,13 @@ type WorkSurfacePanelProps = {
   onTabChange: (tab: WorkSurfaceTab) => void;
   openSignal?: number;
   onRefresh: () => void;
+  onLoadAgentRun: (runId: string) => Promise<WorkSurfaceRunResponse>;
+};
+
+type AgentRunProjectionState = {
+  loading: boolean;
+  error: string | null;
+  projection: WorkSurfaceRunResponse | null;
 };
 
 export function WorkSurfacePanel({
@@ -43,10 +51,14 @@ export function WorkSurfacePanel({
   onTabChange,
   openSignal,
   onRefresh,
+  onLoadAgentRun,
 }: WorkSurfacePanelProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [agentRunDetails, setAgentRunDetails] = useState<
+    Record<string, AgentRunProjectionState>
+  >({});
   const openSignalRef = useRef(openSignal);
   const counts = useMemo(() => taskCounts(state.tasks), [state.tasks]);
   const runningAgents = state.agents.filter((agent) =>
@@ -55,6 +67,69 @@ export function WorkSurfacePanel({
   const runningTools = state.tools.filter(
     (tool) => tool.status === "running",
   ).length;
+  const selectedAgent = selectedAgentId
+    ? state.agents.find((agent) => agent.agentId === selectedAgentId)
+    : undefined;
+
+  useEffect(() => {
+    if (!selectedAgent?.runId) {
+      return;
+    }
+    let cancelled = false;
+    let interval: number | undefined;
+    const runId = selectedAgent.runId;
+    const load = async (quiet = false) => {
+      if (!quiet) {
+        setAgentRunDetails((current) => ({
+          ...current,
+          [runId]: {
+            loading: true,
+            error: null,
+            projection: current[runId]?.projection ?? null,
+          },
+        }));
+      }
+      try {
+        const projection = await onLoadAgentRun(runId);
+        if (cancelled) return;
+        setAgentRunDetails((current) => ({
+          ...current,
+          [runId]: {
+            loading: false,
+            error: null,
+            projection,
+          },
+        }));
+      } catch (error) {
+        if (cancelled) return;
+        setAgentRunDetails((current) => ({
+          ...current,
+          [runId]: {
+            loading: false,
+            error:
+              error instanceof Error
+                ? error.message
+                : "Failed to load subagent run.",
+            projection: current[runId]?.projection ?? null,
+          },
+        }));
+      }
+    };
+
+    void load();
+    if (isAgentActive(selectedAgent.status)) {
+      interval = window.setInterval(() => {
+        void load(true);
+      }, 2_500);
+    }
+
+    return () => {
+      cancelled = true;
+      if (interval) {
+        window.clearInterval(interval);
+      }
+    };
+  }, [onLoadAgentRun, selectedAgent?.runId, selectedAgent?.status]);
 
   useEffect(() => {
     if (openSignal === undefined || openSignalRef.current === openSignal) {
@@ -140,6 +215,11 @@ export function WorkSurfacePanel({
           {state.error}
         </div>
       ) : null}
+      {!state.error && state.warnings.length ? (
+        <div className="border-b border-border/70 px-4 py-3 text-xs leading-5 text-warning">
+          {state.warnings.join(" ")}
+        </div>
+      ) : null}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         {tab === "tasks" ? (
@@ -150,6 +230,7 @@ export function WorkSurfacePanel({
             agents={state.agents}
             loading={state.loading}
             selectedAgentId={selectedAgentId}
+            agentRunDetails={agentRunDetails}
             onSelectAgent={(agentId) =>
               setSelectedAgentId((current) =>
                 current === agentId ? null : agentId,
@@ -364,11 +445,13 @@ function AgentBoard({
   agents,
   loading,
   selectedAgentId,
+  agentRunDetails,
   onSelectAgent,
 }: {
   agents: AgentSurfaceItem[];
   loading: boolean;
   selectedAgentId: string | null;
+  agentRunDetails: Record<string, AgentRunProjectionState>;
   onSelectAgent: (agentId: string) => void;
 }) {
   if (!agents.length) {
@@ -382,6 +465,7 @@ function AgentBoard({
           key={agent.agentId}
           agent={agent}
           selected={selectedAgentId === agent.agentId}
+          runDetails={agent.runId ? agentRunDetails[agent.runId] : undefined}
           onSelect={() => onSelectAgent(agent.agentId)}
         />
       ))}
@@ -392,10 +476,12 @@ function AgentBoard({
 function AgentCard({
   agent,
   selected,
+  runDetails,
   onSelect,
 }: {
   agent: AgentSurfaceItem;
   selected: boolean;
+  runDetails?: AgentRunProjectionState;
   onSelect: () => void;
 }) {
   const active = isAgentActive(agent.status);
@@ -521,7 +607,9 @@ function AgentCard({
           ) : null}
         </div>
       </button>
-      {selected ? <AgentDetails agent={agent} failed={failed} /> : null}
+      {selected ? (
+        <AgentDetails agent={agent} failed={failed} runDetails={runDetails} />
+      ) : null}
     </section>
   );
 }
@@ -529,9 +617,11 @@ function AgentCard({
 function AgentDetails({
   agent,
   failed,
+  runDetails,
 }: {
   agent: AgentSurfaceItem;
   failed: boolean;
+  runDetails?: AgentRunProjectionState;
 }) {
   const updated = new Date(agent.updatedAt);
   const active = isAgentActive(agent.status);
@@ -543,6 +633,9 @@ function AgentDetails({
   return (
     <div className="border-t border-border/60 px-3 pb-3 pt-2">
       <AgentLiveEvents events={agent.events ?? []} active={active} />
+      {agent.runId ? (
+        <AgentRunProjection details={runDetails} active={active} />
+      ) : null}
       {ids.length ? (
         <div className="mt-3 space-y-1.5">
           {ids.map(([label, value]) => (
@@ -610,6 +703,79 @@ function AgentLiveEvents({
           <span>Waiting for subagent activity</span>
         </div>
       )}
+    </div>
+  );
+}
+
+function AgentRunProjection({
+  details,
+  active,
+}: {
+  details?: AgentRunProjectionState;
+  active: boolean;
+}) {
+  const projection = details?.projection;
+  const recent = [...(projection?.events ?? [])].slice(-8).reverse();
+  return (
+    <div className="mt-3 rounded-[8px] border border-border/60 bg-bg p-2.5">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="inline-flex min-w-0 items-center gap-1.5 text-[11px] font-semibold text-text">
+          <Terminal className="size-3.5 text-accent" />
+          <span>Child run events</span>
+        </div>
+        {details?.loading || active ? <MiniLiveDots className="shrink-0" /> : null}
+      </div>
+      {details?.error ? (
+        <div className="rounded-[6px] bg-danger/5 px-2 py-2 text-xs text-danger">
+          {details.error}
+        </div>
+      ) : details?.loading && !projection ? (
+        <div className="flex items-center gap-2 rounded-[6px] bg-surface-muted px-2 py-2 text-xs text-text-muted">
+          <Loader2 className="size-3.5 animate-spin" />
+          <span>Loading child run</span>
+        </div>
+      ) : recent.length ? (
+        <div className="space-y-2">
+          {recent.map((event, index) => (
+            <RunProjectionEventRow key={`${eventType(event)}:${index}`} event={event} />
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-[6px] bg-surface-muted px-2 py-2 text-xs text-text-muted">
+          No child run events yet
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RunProjectionEventRow({ event }: { event: Record<string, unknown> }) {
+  const type = eventType(event);
+  const summary = describeRunProjectionEvent(event, type);
+  return (
+    <div className="grid grid-cols-[12px_1fr] items-start gap-2">
+      <span
+        className={cn(
+          "mt-1.5 size-2 rounded-full",
+          type === "run_finished"
+            ? "bg-success"
+            : type === "run_error"
+              ? "bg-danger"
+              : type.includes("tool")
+                ? "bg-accent"
+                : "bg-border-strong",
+        )}
+      />
+      <div className="min-w-0">
+        <div className="truncate text-xs font-medium text-text">
+          {summary.label}
+        </div>
+        {summary.detail ? (
+          <div className="mt-0.5 line-clamp-3 whitespace-pre-wrap break-words text-[11px] leading-4 text-text-muted">
+            {summary.detail}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -974,6 +1140,90 @@ function formatEventTime(timestamp: number) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function eventType(event: Record<string, unknown>) {
+  return (
+    stringValue(event.type) ??
+    stringValue(event.event_type) ??
+    "event"
+  );
+}
+
+function eventPayload(event: Record<string, unknown>) {
+  return isPlainRecord(event.data) ? event.data : event;
+}
+
+function describeRunProjectionEvent(
+  event: Record<string, unknown>,
+  type: string,
+) {
+  const payload = eventPayload(event);
+  if (type === "text_delta") {
+    return {
+      label: "Text",
+      detail: stringValue(event.content) ?? stringValue(payload.content),
+    };
+  }
+  if (type === "text_done" || type === "turn_complete") {
+    return {
+      label: "Final text",
+      detail:
+        stringValue(payload.full_text) ??
+        stringValue(event.full_text) ??
+        stringValue(payload.assistant_text),
+    };
+  }
+  if (type === "reasoning_delta" || type === "thinking_delta") {
+    return {
+      label: "Reasoning",
+      detail: stringValue(event.content) ?? stringValue(payload.content),
+    };
+  }
+  if (type === "tool_call") {
+    const toolCall = isPlainRecord(event.tool_call) ? event.tool_call : {};
+    const fn = isPlainRecord(toolCall.function) ? toolCall.function : {};
+    return {
+      label: `Tool ${stringValue(fn.name) ?? stringValue(toolCall.name) ?? "call"}`,
+      detail: formatStructuredScalar(fn.arguments ?? toolCall.arguments),
+    };
+  }
+  if (type === "tool_call_start") {
+    return {
+      label: `Tool ${stringValue(event.tool) ?? "started"}`,
+      detail: formatStructuredScalar(event.arguments),
+    };
+  }
+  if (type === "tool_call_end") {
+    return {
+      label: event.success === false ? "Tool failed" : "Tool completed",
+      detail: formatStructuredScalar(event.result),
+    };
+  }
+  if (type === "run_error") {
+    return {
+      label: "Run error",
+      detail: stringValue(payload.error),
+    };
+  }
+  if (type === "run_finished") {
+    return {
+      label: "Run finished",
+      detail: payload.cancelled
+        ? "cancelled"
+        : payload.interrupted
+          ? "interrupted"
+          : undefined,
+    };
+  }
+  return {
+    label: statusLabel(type),
+    detail: formatStructuredScalar(payload),
+  };
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 function parseStructuredValue(value: string): unknown {

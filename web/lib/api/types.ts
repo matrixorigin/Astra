@@ -122,6 +122,15 @@ export type WorkSurfaceResponse = {
   tasks: Array<Record<string, unknown>>;
   events: Array<Record<string, unknown>>;
   generatedAt: string;
+  warnings?: string[];
+};
+
+export type WorkSurfaceRunResponse = {
+  runId: string;
+  sessionId: string | null;
+  status?: string | null;
+  events: Array<Record<string, unknown>>;
+  generatedAt: string;
 };
 
 export type ChatListResponse = {

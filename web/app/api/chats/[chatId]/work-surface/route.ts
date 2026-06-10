@@ -51,26 +51,43 @@ export async function GET(
       auth: "required",
       operation: "load web work surface",
     });
+    const warnings: string[] = [];
     const projection = runId
-      ? await runtime.get<RuntimeRunProjectionResponse>(
-          `/chat/runs/${encodeURIComponent(
-            runId,
-          )}/projection?recent_limit=${WORK_SURFACE_RECENT_EVENT_LIMIT}`,
-          {
-            auth: "required",
-            operation: "load active run projection for web work surface",
-          },
-        )
+      ? await runtime
+          .get<RuntimeRunProjectionResponse>(
+            `/chat/runs/${encodeURIComponent(
+              runId,
+            )}/projection?recent_limit=${WORK_SURFACE_RECENT_EVENT_LIMIT}`,
+            {
+              auth: "required",
+              operation: "load active run projection for web work surface",
+            },
+          )
+          .catch((error: unknown) => {
+            warnings.push(
+              `Run activity is temporarily unavailable: ${runtimeErrorDetail(
+                error,
+              )}`,
+            );
+            return null;
+          })
       : null;
     const resolvedSessionId = sessionId ?? projection?.session_id ?? null;
     const todos = resolvedSessionId
-      ? await runtime.get<RuntimeTodosResponse>(
-          `/sessions/${encodeURIComponent(resolvedSessionId)}/todos`,
-          {
-            auth: "required",
-            operation: "load session todos for web work surface",
-          },
-        )
+      ? await runtime
+          .get<RuntimeTodosResponse>(
+            `/sessions/${encodeURIComponent(resolvedSessionId)}/todos`,
+            {
+              auth: "required",
+              operation: "load session todos for web work surface",
+            },
+          )
+          .catch((error: unknown) => {
+            warnings.push(
+              `Tasks are temporarily unavailable: ${runtimeErrorDetail(error)}`,
+            );
+            return { tasks: [] };
+          })
       : { tasks: [] };
     const events = projection?.recent_events ?? [];
 
@@ -79,6 +96,7 @@ export async function GET(
       runId,
       tasks: Array.isArray(todos.tasks) ? todos.tasks : [],
       events,
+      warnings,
       generatedAt: new Date().toISOString(),
     });
   } catch (error) {

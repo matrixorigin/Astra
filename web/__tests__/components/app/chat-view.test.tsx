@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { ChatView } from "@/components/app/chat-view";
@@ -8,6 +8,7 @@ import type { ChatDetail, ComposerOptions } from "@/lib/api/types";
 import {
   getChat,
   getChatWorkSurface,
+  getChatWorkSurfaceRun,
   queueChatRunInput,
   resumeChatRun,
   stopChatRun,
@@ -135,6 +136,7 @@ jest.mock("@/components/app/composer", () => ({
 jest.mock("@/lib/api/chats", () => ({
   getChat: jest.fn(),
   getChatWorkSurface: jest.fn(),
+  getChatWorkSurfaceRun: jest.fn(),
   queueChatRunInput: jest.fn(),
   resumeChatRun: jest.fn(),
   stopChatRun: jest.fn(),
@@ -146,6 +148,9 @@ jest.mock("@/lib/api/chats", () => ({
 const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
 const mockGetChatWorkSurface = getChatWorkSurface as jest.MockedFunction<
   typeof getChatWorkSurface
+>;
+const mockGetChatWorkSurfaceRun = getChatWorkSurfaceRun as jest.MockedFunction<
+  typeof getChatWorkSurfaceRun
 >;
 const mockQueueChatRunInput = queueChatRunInput as jest.MockedFunction<
   typeof queueChatRunInput
@@ -214,6 +219,14 @@ describe("ChatView deferred-input unhappy paths", () => {
       sessionId: "chat-123",
       runId: "run-123",
       tasks: [],
+      events: [],
+      generatedAt: "2026-06-07T00:00:00.000Z",
+    });
+    mockGetChatWorkSurfaceRun.mockReset();
+    mockGetChatWorkSurfaceRun.mockResolvedValue({
+      runId: "child-run",
+      sessionId: "chat-123",
+      status: "running",
       events: [],
       generatedAt: "2026-06-07T00:00:00.000Z",
     });
@@ -546,7 +559,10 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
     });
-    expect(screen.getByText("Stopping")).toBeInTheDocument();
+    expect(screen.getByText("Stopped.")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Stop run" }),
+    ).not.toBeInTheDocument();
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
@@ -680,6 +696,32 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(screen.getByText("Stopping")).toBeInTheDocument();
     });
+  });
+
+  it("retries active run stream reattach after a transient failure", async () => {
+    jest.useFakeTimers();
+    try {
+      mockStreamExistingChatRun
+        .mockRejectedValueOnce(new Error("temporary stream failure"))
+        .mockResolvedValueOnce("");
+
+      render(<ChatView initial={makeDetail()} />);
+
+      await waitFor(() => {
+        expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(1);
+      });
+
+      await act(async () => {
+        jest.advanceTimersByTime(1_000);
+        await Promise.resolve();
+      });
+
+      await waitFor(() => {
+        expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
+      });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("does not queue input for terminal active-run statuses", async () => {

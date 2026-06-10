@@ -12,6 +12,7 @@ import type {
   SendMessageResponse,
   ActiveRunMutationResponse,
   WorkSurfaceResponse,
+  WorkSurfaceRunResponse,
 } from "@/lib/api/types";
 
 export function listChats(params: {
@@ -38,6 +39,14 @@ export function getChat(chatId: string) {
 export function getChatWorkSurface(chatId: string) {
   return requestJson<WorkSurfaceResponse>(
     `/api/chats/${encodeURIComponent(chatId)}/work-surface`,
+  );
+}
+
+export function getChatWorkSurfaceRun(chatId: string, runId: string) {
+  return requestJson<WorkSurfaceRunResponse>(
+    `/api/chats/${encodeURIComponent(
+      chatId,
+    )}/work-surface/runs/${encodeURIComponent(runId)}`,
   );
 }
 

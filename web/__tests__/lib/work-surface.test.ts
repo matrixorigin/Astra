@@ -129,6 +129,22 @@ describe("work surface reducer", () => {
     expect(hydrated.agents).toEqual([]);
   });
 
+  it("keeps partial hydration warnings separate from fatal errors", () => {
+    const state = hydrateWorkSurface(createEmptyWorkSurface("session-1"), {
+      sessionId: "session-1",
+      runId: "run-1",
+      tasks: [task],
+      events: [],
+      warnings: ["Run activity is temporarily unavailable."],
+    });
+
+    expect(state.error).toBeNull();
+    expect(state.warnings).toEqual([
+      "Run activity is temporarily unavailable.",
+    ]);
+    expect(state.tasks).toEqual([task]);
+  });
+
   it("updates subagents from live current-protocol progress events", () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface(), {
       type: "agent_delegated",
