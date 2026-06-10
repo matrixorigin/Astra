@@ -7,8 +7,8 @@ use astra_turn_core::agent_live_event::AgentLiveEvent;
 use astra_turn_core::agent_live_event::AgentLiveEventKind;
 
 use super::app_event::TuiAppEvent;
-use super::bottom_pane::in_flight_agents_view::InFlightAgentsView;
 use super::bottom_pane::BottomPane;
+use super::bottom_pane::in_flight_agents_view::InFlightAgentsView;
 use super::chat_widget;
 use super::frame_requester::FrameRequester;
 

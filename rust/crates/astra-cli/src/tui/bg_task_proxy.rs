@@ -160,10 +160,10 @@ pub(crate) fn background_task_row_for_rejected_fanout_slot(
     group: &astra_turn_core::orchestration_fanout_group::AgentFanoutGroupProjection,
     slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlot,
 ) -> Option<super::bottom_pane::background_task_view::BackgroundTaskRow> {
-    use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotStatus;
     use super::bottom_pane::background_task_view::{
         BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow, LiveControlState,
     };
+    use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotStatus;
 
     if slot.status != AgentFanoutSlotStatus::SpawnRejected || slot.agent_id.is_some() {
         return None;
@@ -249,10 +249,10 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     agent: &astra_turn_core::orchestration_types::SpawnedAgentInfo,
     fanout_title: Option<&str>,
 ) -> Option<super::bottom_pane::background_task_view::BackgroundTaskRow> {
-    use astra_turn_core::orchestration_types::AgentStatus;
     use super::bottom_pane::background_task_view::{
         BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskStatus,
     };
+    use astra_turn_core::orchestration_types::AgentStatus;
 
     if !agent.run_in_background {
         return None;
@@ -525,130 +525,9 @@ pub(crate) async fn export_background_local_agent_task_projections(
     projections
 }
 
-pub(crate) fn xml_escape_attr(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-pub(crate) fn truncate_xml_attr(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
-
-pub(crate) fn live_control_xml_value(
-    live_control: super::bottom_pane::background_task_view::LiveControlState,
-) -> &'static str {
-    match live_control {
-        super::bottom_pane::background_task_view::LiveControlState::Available => "available",
-        super::bottom_pane::background_task_view::LiveControlState::StaleHandle => "stale_handle",
-        super::bottom_pane::background_task_view::LiveControlState::UnsupportedInMode => {
-            "unsupported_in_mode"
-        }
-    }
-}
-
-pub(crate) fn render_background_task_rows_xml(
-    rows: &[super::bottom_pane::background_task_view::BackgroundTaskRow],
-) -> String {
-    use super::bottom_pane::background_task_view::BackgroundTaskKind;
-
-    if rows.is_empty() {
-        return "<background_tasks count=\"0\" />".to_string();
-    }
-
-    let mut rows = rows.to_vec();
-    rows.sort_by_key(|row| {
-        let attention_rank = match row.status {
-            super::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput
-            | super::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => 0,
-            super::bottom_pane::background_task_view::BackgroundTaskStatus::Running
-            | super::bottom_pane::background_task_view::BackgroundTaskStatus::Pending => 1,
-            super::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => 2,
-            super::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => 3,
-            super::bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable => 4,
-        };
-        (
-            attention_rank,
-            row.started_at_ms.unwrap_or(u64::MAX),
-            row.id.clone(),
-        )
-    });
-
-    let mut out = format!("<background_tasks count=\"{}\">", rows.len());
-    for row in rows {
-        let mut attrs = vec![
-            ("id", xml_escape_attr(&row.id)),
-            ("kind", row.kind.as_str().to_string()),
-            ("status", row.status.as_str().to_string()),
-            (
-                "live_control",
-                live_control_xml_value(row.live_control).to_string(),
-            ),
-            ("elapsed_ms", row.elapsed_ms.to_string()),
-            ("title", xml_escape_attr(&row.title)),
-        ];
-        match row.kind {
-            BackgroundTaskKind::Shell => attrs.push(("command", xml_escape_attr(&row.title))),
-            _ => attrs.push(("description", xml_escape_attr(&row.title))),
-        }
-        if let Some(started_at_ms) = row.started_at_ms {
-            attrs.push(("started_at_ms", started_at_ms.to_string()));
-        }
-        if let Some(ended_at_ms) = row.ended_at_ms {
-            attrs.push(("ended_at_ms", ended_at_ms.to_string()));
-        }
-        if let Some(output_ref) = row.output_ref.as_deref() {
-            attrs.push(("output_ref", xml_escape_attr(output_ref)));
-        }
-        if let Some(output_offset) = row.output_offset {
-            attrs.push(("output_offset", output_offset.to_string()));
-        }
-        if let Some(total_bytes) = row.total_bytes {
-            attrs.push(("total_output_bytes", total_bytes.to_string()));
-        }
-        if let Some(total_lines) = row.total_lines {
-            attrs.push(("total_output_lines", total_lines.to_string()));
-        }
-        if let Some(preview) = row
-            .output_tail
-            .as_deref()
-            .and_then(|tail| tail.lines().next_back())
-            .map(str::trim)
-            .filter(|preview| !preview.is_empty())
-        {
-            attrs.push(("preview", xml_escape_attr(&truncate_xml_attr(preview, 160))));
-        }
-        if let Some(exit_code) = row.exit_code {
-            attrs.push(("exit_code", exit_code.to_string()));
-        }
-        if let Some(reason) = row.terminal_reason.as_deref() {
-            attrs.push(("terminal_reason", xml_escape_attr(reason)));
-        }
-        if let Some(fanout) = row.fanout.as_ref() {
-            attrs.push(("fanout_group_id", xml_escape_attr(&fanout.group_id)));
-            attrs.push(("fanout_group_title", xml_escape_attr(&fanout.group_title)));
-            attrs.push(("fanout_target_count", fanout.target_count.to_string()));
-            attrs.push(("fanout_slot_index", fanout.slot_index.to_string()));
-            attrs.push(("fanout_slot_label", xml_escape_attr(&fanout.slot_label)));
-        }
-
-        out.push_str("\n<task");
-        for (key, value) in attrs {
-            out.push_str(&format!(" {key}=\"{value}\""));
-        }
-        out.push_str(" />");
-    }
-    out.push_str("\n</background_tasks>");
-    out
-}
+#[path = "bg_task_proxy/xml.rs"]
+mod xml;
+pub(crate) use xml::*;
 
 pub(crate) async fn background_task_rows_with_agents(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
@@ -892,7 +771,8 @@ pub(crate) async fn try_dispatch_background_task_stop_sentinel(
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) -> bool {
-    let Some(task_id) = super::bottom_pane::background_task_view::parse_stop_sentinel(sentinel) else {
+    let Some(task_id) = super::bottom_pane::background_task_view::parse_stop_sentinel(sentinel)
+    else {
         return false;
     };
     let task_id = task_id.to_string();
@@ -910,24 +790,27 @@ pub(crate) async fn try_dispatch_background_task_stop_sentinel(
                     .cancel_agent(&task_id, "user-requested via background task switcher")
                     .await
                 {
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(format!(
-                        "Stopping local agent {task_id}."
-                    )));
+                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(
+                        format!("Stopping local agent {task_id}."),
+                    ));
                 } else if spawner.get_agent_state_any(&task_id).await.is_some() {
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(format!(
-                        "Background task {task_id} already finished or cannot be stopped."
-                    )));
+                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(
+                        format!("Background task {task_id} already finished or cannot be stopped."),
+                    ));
                 } else {
                     let message =
                         format_background_task_stop_error_system_message(&task_id, &error);
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::error(message));
+                    chat_widget
+                        .commit_system(super::history_cell::system::SystemCell::error(message));
                 }
             } else {
                 let message = format_background_task_stop_error_system_message(&task_id, &error);
                 if is_background_task_terminal_race_error(&error) {
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(message));
+                    chat_widget
+                        .commit_system(super::history_cell::system::SystemCell::info(message));
                 } else {
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::error(message));
+                    chat_widget
+                        .commit_system(super::history_cell::system::SystemCell::error(message));
                 }
             }
         }
@@ -948,7 +831,10 @@ pub(crate) fn is_background_task_terminal_race_error(error: &str) -> bool {
     error.contains("already terminated")
 }
 
-pub(crate) fn format_background_task_stop_error_system_message(task_id: &str, error: &str) -> String {
+pub(crate) fn format_background_task_stop_error_system_message(
+    task_id: &str,
+    error: &str,
+) -> String {
     if error.contains("no background shell with id") || error.contains("no background task with id")
     {
         format!("Background task not found: {task_id}")
@@ -1011,7 +897,8 @@ pub(crate) fn try_dispatch_background_task_output_sentinel(
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) -> bool {
-    let Some(task_id) = super::bottom_pane::background_task_view::parse_output_sentinel(sentinel) else {
+    let Some(task_id) = super::bottom_pane::background_task_view::parse_output_sentinel(sentinel)
+    else {
         return false;
     };
     let task_id = task_id.to_string();
@@ -1341,4 +1228,3 @@ pub(crate) fn background_task_event_system_messages(
 
     messages
 }
-

@@ -82,6 +82,16 @@ impl<'a> Drop for DetachHandleGuard<'a> {
         }
     }
 }
+
+async fn restore_detach_signal_receiver(
+    detach: &DetachShellHandle,
+    signal_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if let Some(signal_rx) = signal_rx {
+        *detach.signal_rx.lock().await = Some(signal_rx);
+    }
+}
+
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
 /// cannot confidently identify the command family. See [`classify_bash_command`]
@@ -3216,6 +3226,7 @@ pub(crate) async fn run_bash_with_detach(
                     max_stderr_bytes,
                     &mut stderr_capped,
                 );
+                restore_detach_signal_receiver(detach, signal_rx).await;
                 return Err(error_msg);
             }
         }
@@ -3279,6 +3290,7 @@ pub(crate) async fn run_bash_with_detach(
         truncate_partial_line(&mut stderr_text);
     }
 
+    restore_detach_signal_receiver(detach, signal_rx).await;
     Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
         stdout: stdout_text,
         stderr: stderr_text,
@@ -5462,7 +5474,7 @@ printf 'probe.txt:1:needle\n'
     async fn bash_detach_slot_is_reusable_after_normal_completion() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, _listener) = crate::detach::new_slot_with_handle();
+        let (slot, listener) = crate::detach::new_slot_with_handle();
         ctx.detach_shell_handle = Some(slot.clone());
 
         let first = execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})).await;
@@ -5472,13 +5484,34 @@ printf 'probe.txt:1:needle\n'
             "normal bash completion must return the detach handle so later bash calls in the same turn can still be backgrounded"
         );
 
-        let second =
-            execute_bash(&ctx, &serde_json::json!({"command": "printf 'second\\n'"})).await;
-        assert!(second.output.contains("second"), "{}", second.output);
+        let second = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before-second\\n'; sleep 1; printf 'after-second\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+        let payload = listener
+            .payload_rx
+            .await
+            .expect("listener must receive second bash payload");
         assert!(
-            slot.lock().await.is_some(),
-            "second normal bash completion must also return the detach handle"
+            payload.partial_stdout.contains("before-second"),
+            "second bash must still observe Ctrl+B after first normal completion: {:?}",
+            payload.partial_stdout
         );
+        drop(payload);
+
+        let second = second.await.expect("second bash task");
+        assert!(second.output.contains("bash_detached"), "{}", second.output);
     }
 
     /// Sanity: when no detach handle is wired, the bash tool falls

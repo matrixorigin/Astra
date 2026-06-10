@@ -40,8 +40,8 @@ use super::render::line_utils::sanitize_lines_for_terminal;
 use super::task_status::TaskStatus;
 use super::terminal::TerminalGuard;
 
-use super::bg_task_proxy::*;
 use super::agent_view::*;
+use super::bg_task_proxy::*;
 use super::plan_mode::*;
 use super::{
     bottom_pane, chat_widget, history_cell, mention_menu, resume_summary, slash_dispatch,

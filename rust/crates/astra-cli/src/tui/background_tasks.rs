@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use astra_pipeline::output_stream::OutputStream;
@@ -476,74 +476,8 @@ impl BackgroundTaskRegistry {
     }
 
     pub fn render_background_task_list_xml(&mut self) -> String {
-        self.drain_join_set();
-        let mut tasks: Vec<_> = self.tasks.values().collect();
-        tasks.sort_by_key(|handle| {
-            let attention_rank = match handle.projected_status() {
-                "waiting_for_input" | "failed" => 0,
-                "running" => 1,
-                "killed" => 2,
-                "completed" => 3,
-                _ => 4,
-            };
-            (attention_rank, handle.started_at)
-        });
-        if tasks.is_empty() {
-            return "<background_tasks count=\"0\" />".to_string();
-        }
-
-        let mut out = format!("<background_tasks count=\"{}\">", tasks.len());
-        for handle in tasks {
-            let mut attrs = vec![
-                ("id", xml_escape(&handle.id)),
-                ("kind", "shell".to_string()),
-                ("status", handle.projected_status().to_string()),
-                ("live_control", handle.live_control.as_str().to_string()),
-                ("elapsed_ms", handle.elapsed_ms().to_string()),
-                ("started_at_ms", handle.started_at_ms.to_string()),
-                ("command", xml_escape(&handle.description)),
-                (
-                    "output_ref",
-                    xml_escape(&format!(
-                        "stdout: {} · stderr: {}",
-                        handle.stdout_path.display(),
-                        handle.stderr_path.display()
-                    )),
-                ),
-            ];
-            match self.get_combined_output_stats(&handle.id, 8192) {
-                Ok((output, total_bytes, total_lines)) => {
-                    let offset = total_bytes.saturating_sub(output.as_bytes().len() as u64);
-                    attrs.push(("output_offset", offset.to_string()));
-                    attrs.push(("total_output_bytes", total_bytes.to_string()));
-                    attrs.push(("total_output_lines", total_lines.to_string()));
-                    if let Some(preview) = output.lines().next_back().map(str::trim) {
-                        if !preview.is_empty() {
-                            attrs.push(("preview", xml_escape(&truncate_line(preview, 160))));
-                        }
-                    }
-                }
-                Err(error) => {
-                    attrs.push(("output_error", xml_escape(&error)));
-                }
-            }
-            if let Some(exit_code) = handle.exit_code {
-                attrs.push(("exit_code", exit_code.to_string()));
-            }
-            if let Some(ended_at_ms) = handle.ended_at_ms {
-                attrs.push(("ended_at_ms", ended_at_ms.to_string()));
-            }
-            if let Some(reason) = handle.terminal_reason.as_deref() {
-                attrs.push(("terminal_reason", xml_escape(reason)));
-            }
-            out.push_str("\n<task");
-            for (key, value) in attrs {
-                out.push_str(&format!(" {key}=\"{value}\""));
-            }
-            out.push_str(" />");
-        }
-        out.push_str("\n</background_tasks>");
-        out
+        let rows = crate::tui::bg_task_proxy::background_task_rows(self);
+        crate::tui::bg_task_proxy::render_background_task_rows_xml(&rows)
     }
 
     /// Drain the JoinSet without consuming pending_completions.
@@ -1502,10 +1436,7 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    astra_text_utils::xml_escape::xml_escape_attr(s).into_owned()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1919,10 +1850,7 @@ mod tests {
         let xml = reg.render_background_task_list_xml();
 
         assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
-        assert!(
-            xml.contains("output_error=\"output artifact missing:"),
-            "{xml}"
-        );
+        assert!(xml.contains("preview=\"Output artifact missing ·"), "{xml}");
         assert!(
             xml.contains(&xml_escape(&stdout_path.display().to_string())),
             "{xml}"

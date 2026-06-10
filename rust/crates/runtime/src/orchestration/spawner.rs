@@ -1645,6 +1645,12 @@ impl DynamicAgentSpawner {
 
             tokio::select! {
                 terminal = &mut terminal_rx => {
+                    // Remove abort handle for foreground agents that completed
+                    // synchronously. The spawn_future also calls
+                    // finalize_background_agent which removes it, but this explicit
+                    // removal guarantees cleanup even if the spawn_future panics
+                    // or the JoinSet task is dropped before finalization.
+                    self.background_abort_handles.write().await.remove(&agent_id);
                     self.reap_finished_agent_tasks();
                     return Ok(terminal.unwrap_or_else(|_| SpawnAgentOutput::Failed {
                         error: "agent task ended before returning a result".to_string(),
