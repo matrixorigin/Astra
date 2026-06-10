@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.4
+
+FROM public.ecr.aws/docker/library/rust:1.94-bookworm AS builder
+
+WORKDIR /app
+
+ARG ASTRA_BUILD_PROFILE=debug
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG http_proxy
+ARG https_proxy
+
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+ENV CARGO_HTTP_MULTIPLEXING=false
+ENV CARGO_HTTP_TIMEOUT=600
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/rust/target \
+    set -eux; \
+    cd rust; \
+    case "$ASTRA_BUILD_PROFILE" in \
+      debug) release_flag=""; profile_dir="debug" ;; \
+      release) release_flag="--release"; profile_dir="release" ;; \
+      *) echo "ASTRA_BUILD_PROFILE must be debug or release" >&2; exit 1 ;; \
+    esac; \
+    cargo build $release_flag -p astra-runtime --bin astra-server; \
+    cargo build $release_flag -p astra-admin-cli --bin astra-admin; \
+    cp "target/${profile_dir}/astra-server" /tmp/astra-server; \
+    cp "target/${profile_dir}/astra-admin" /tmp/astra-admin
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r appgroup \
+    && useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
+
+COPY --from=builder /tmp/astra-server /usr/local/bin/astra-server
+COPY --from=builder /tmp/astra-admin /usr/local/bin/astra-admin
+
+RUN chown root:appgroup /app && chmod 1770 /app
+USER appuser
+
+EXPOSE 18080
+ENV HOME=/home/appuser
+ENV RUST_API_ADDR=0.0.0.0:18080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS http://localhost:${ASTRA_API_PORT:-18080}/health >/dev/null || exit 1
+
+CMD ["astra-server"]

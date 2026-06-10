@@ -1,7 +1,7 @@
 use crate::storage::database_user_from_row;
 use astra_core::{
-    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, error_response,
-    internal_error, is_duplicate_key_error,
+    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
+    error_response, internal_error, is_duplicate_key_error,
 };
 use async_trait::async_trait;
 use axum::{
@@ -24,10 +24,15 @@ fn bcrypt_cost_from_env() -> u32 {
     })
 }
 use chrono::{Duration as ChronoDuration, Utc};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use sqlx::{MySql, Row, query};
-use tracing::warn;
+use std::{
+    sync::Arc,
+    time::{Duration as StdDuration, Instant},
+};
+use tokio::sync::RwLock;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 mod admin;
@@ -140,7 +145,7 @@ use std::fmt;
 
 #[derive(Clone)]
 struct TrustedMoiJwtSettings {
-    secret_key: String,
+    verifier: TrustedMoiJwtVerifier,
     algorithm: Algorithm,
     expected_issuer: Option<String>,
     expected_audience: Option<String>,
@@ -150,7 +155,7 @@ struct TrustedMoiJwtSettings {
 impl fmt::Debug for TrustedMoiJwtSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TrustedMoiJwtSettings")
-            .field("secret_key", &"[REDACTED]")
+            .field("verifier", &self.verifier)
             .field("algorithm", &self.algorithm)
             .field("expected_issuer", &self.expected_issuer)
             .field("expected_audience", &self.expected_audience)
@@ -162,6 +167,61 @@ impl fmt::Debug for TrustedMoiJwtSettings {
 #[derive(Clone)]
 pub struct TrustedMoiAuthService {
     settings: TrustedMoiJwtSettings,
+}
+
+#[derive(Clone)]
+enum TrustedMoiJwtVerifier {
+    SharedSecret {
+        secret_key: String,
+    },
+    Jwks {
+        jwks_url: String,
+        cache_ttl: StdDuration,
+        client: reqwest::Client,
+        cache: Arc<RwLock<Option<TrustedMoiJwksCache>>>,
+    },
+}
+
+impl fmt::Debug for TrustedMoiJwtVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SharedSecret { .. } => f
+                .debug_struct("SharedSecret")
+                .field("secret_key", &"[REDACTED]")
+                .finish(),
+            Self::Jwks {
+                jwks_url,
+                cache_ttl,
+                ..
+            } => f
+                .debug_struct("Jwks")
+                .field("jwks_url", jwks_url)
+                .field("cache_ttl", cache_ttl)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrustedMoiJwksCache {
+    jwks: TrustedMoiJwks,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TrustedMoiJwks {
+    keys: Vec<TrustedMoiJwk>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TrustedMoiJwk {
+    kty: String,
+    kid: Option<String>,
+    #[serde(rename = "use")]
+    key_use: Option<String>,
+    alg: Option<String>,
+    n: String,
+    e: String,
 }
 
 impl fmt::Debug for TrustedMoiAuthService {
@@ -344,7 +404,10 @@ impl DatabaseAuthService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        crate::require_shared_pool(self.pool.as_ref(), "DatabaseAuthService", &self.matrixone)
+        if let Some(ref p) = self.pool {
+            return Ok(p.get().clone());
+        }
+        connect_matrixone(&self.matrixone).await
     }
 }
 
@@ -356,10 +419,52 @@ impl TrustedMoiAuthService {
         expected_audience: Option<String>,
         leeway_seconds: u64,
     ) -> Result<Self, String> {
+        let algorithm = parse_trusted_moi_algorithm(algorithm)?;
+        if !is_hmac_algorithm(algorithm) {
+            return Err(format!(
+                "ASTRA_EXTERNAL_JWT_SECRET verifier does not support {algorithm:?}"
+            ));
+        }
         Ok(Self {
             settings: TrustedMoiJwtSettings {
-                secret_key: normalize_jwt_secret_for_trusted_mode(secret_key),
-                algorithm: parse_trusted_moi_algorithm(algorithm)?,
+                verifier: TrustedMoiJwtVerifier::SharedSecret {
+                    secret_key: normalize_jwt_secret_for_trusted_mode(secret_key),
+                },
+                algorithm,
+                expected_issuer,
+                expected_audience,
+                leeway_seconds,
+            },
+        })
+    }
+
+    pub fn new_with_jwks_url(
+        jwks_url: &str,
+        algorithm: &str,
+        expected_issuer: Option<String>,
+        expected_audience: Option<String>,
+        leeway_seconds: u64,
+        cache_ttl_seconds: u64,
+    ) -> Result<Self, String> {
+        let algorithm = parse_trusted_moi_algorithm(algorithm)?;
+        if !matches!(algorithm, Algorithm::RS256) {
+            return Err(format!(
+                "ASTRA_EXTERNAL_JWT_JWKS_URL verifier does not support {algorithm:?}"
+            ));
+        }
+        let jwks_url = jwks_url.trim();
+        if jwks_url.is_empty() {
+            return Err("ASTRA_EXTERNAL_JWT_JWKS_URL must not be empty".to_string());
+        }
+        Ok(Self {
+            settings: TrustedMoiJwtSettings {
+                verifier: TrustedMoiJwtVerifier::Jwks {
+                    jwks_url: jwks_url.to_string(),
+                    cache_ttl: StdDuration::from_secs(cache_ttl_seconds.max(1)),
+                    client: reqwest::Client::new(),
+                    cache: Arc::new(RwLock::new(None)),
+                },
+                algorithm,
                 expected_issuer,
                 expected_audience,
                 leeway_seconds,
@@ -368,9 +473,6 @@ impl TrustedMoiAuthService {
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let raw_secret = std::env::var("ASTRA_EXTERNAL_JWT_SECRET")
-            .map_err(|_| "ASTRA_EXTERNAL_JWT_SECRET must be set".to_string())?;
-
         let algorithm =
             std::env::var("ASTRA_EXTERNAL_JWT_ALGORITHM").unwrap_or_else(|_| "HS256".to_string());
 
@@ -385,6 +487,26 @@ impl TrustedMoiAuthService {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
 
+        let parsed_algorithm = parse_trusted_moi_algorithm(&algorithm)?;
+        if matches!(parsed_algorithm, Algorithm::RS256) {
+            let jwks_url = std::env::var("ASTRA_EXTERNAL_JWT_JWKS_URL")
+                .map_err(|_| "ASTRA_EXTERNAL_JWT_JWKS_URL must be set for RS256".to_string())?;
+            let cache_ttl_seconds = std::env::var("ASTRA_EXTERNAL_JWT_JWKS_CACHE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300);
+            return Self::new_with_jwks_url(
+                &jwks_url,
+                &algorithm,
+                expected_issuer,
+                expected_audience,
+                leeway_seconds,
+                cache_ttl_seconds,
+            );
+        }
+
+        let raw_secret = std::env::var("ASTRA_EXTERNAL_JWT_SECRET")
+            .map_err(|_| "ASTRA_EXTERNAL_JWT_SECRET must be set".to_string())?;
         Self::new(
             &raw_secret,
             &algorithm,
@@ -401,7 +523,7 @@ impl TrustedMoiAuthService {
         )
     }
 
-    fn decode_trusted_claims(
+    async fn decode_trusted_claims(
         &self,
         token: &str,
     ) -> Result<TrustedMoiClaims, (StatusCode, Json<ErrorResponse>)> {
@@ -415,13 +537,80 @@ impl TrustedMoiAuthService {
             validation.set_audience(&[expected_audience]);
         }
 
-        decode::<TrustedMoiClaims>(
-            token,
-            &DecodingKey::from_secret(self.settings.secret_key.as_bytes()),
-            &validation,
-        )
-        .map(|data| data.claims)
-        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid trusted_moi token"))
+        let decoding_key = self.decoding_key(token).await?;
+        decode::<TrustedMoiClaims>(token, &decoding_key, &validation)
+            .map(|data| data.claims)
+            .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid trusted_moi token"))
+    }
+
+    async fn decoding_key(
+        &self,
+        token: &str,
+    ) -> Result<DecodingKey, (StatusCode, Json<ErrorResponse>)> {
+        match &self.settings.verifier {
+            TrustedMoiJwtVerifier::SharedSecret { secret_key } => {
+                Ok(DecodingKey::from_secret(secret_key.as_bytes()))
+            }
+            TrustedMoiJwtVerifier::Jwks { .. } => self.jwks_decoding_key(token).await,
+        }
+    }
+
+    async fn jwks_decoding_key(
+        &self,
+        token: &str,
+    ) -> Result<DecodingKey, (StatusCode, Json<ErrorResponse>)> {
+        let header = decode_header(token)
+            .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid trusted_moi token"))?;
+        if header.alg != self.settings.algorithm {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Invalid trusted_moi token",
+            ));
+        }
+
+        let cached = self.current_jwks(false).await?;
+        if let Some(key) = select_jwks_key(&cached, header.kid.as_deref(), self.settings.algorithm)
+        {
+            return decoding_key_from_jwk(key);
+        }
+
+        let refreshed = self.current_jwks(true).await?;
+        let key = select_jwks_key(&refreshed, header.kid.as_deref(), self.settings.algorithm)
+            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid trusted_moi token"))?;
+        decoding_key_from_jwk(key)
+    }
+
+    async fn current_jwks(
+        &self,
+        force_refresh: bool,
+    ) -> Result<TrustedMoiJwks, (StatusCode, Json<ErrorResponse>)> {
+        let TrustedMoiJwtVerifier::Jwks {
+            jwks_url,
+            cache_ttl,
+            client,
+            cache,
+        } = &self.settings.verifier
+        else {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Invalid trusted_moi token",
+            ));
+        };
+
+        if !force_refresh {
+            if let Some(cached) = cache.read().await.as_ref() {
+                if Instant::now() < cached.expires_at {
+                    return Ok(cached.jwks.clone());
+                }
+            }
+        }
+
+        let jwks = fetch_trusted_moi_jwks(client, jwks_url).await?;
+        *cache.write().await = Some(TrustedMoiJwksCache {
+            jwks: jwks.clone(),
+            expires_at: Instant::now() + *cache_ttl,
+        });
+        Ok(jwks)
     }
 }
 
@@ -430,9 +619,99 @@ fn parse_trusted_moi_algorithm(algorithm: &str) -> Result<Algorithm, String> {
         "HS256" => Ok(Algorithm::HS256),
         "HS384" => Ok(Algorithm::HS384),
         "HS512" => Ok(Algorithm::HS512),
+        "RS256" => Ok(Algorithm::RS256),
         _ => Err(format!(
             "unsupported ASTRA_EXTERNAL_JWT_ALGORITHM: {algorithm}"
         )),
+    }
+}
+
+fn is_hmac_algorithm(algorithm: Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+    )
+}
+
+async fn fetch_trusted_moi_jwks(
+    client: &reqwest::Client,
+    jwks_url: &str,
+) -> Result<TrustedMoiJwks, (StatusCode, Json<ErrorResponse>)> {
+    let response = client.get(jwks_url).send().await.map_err(|error| {
+        warn!(
+            target: "astra_services::auth",
+            jwks_url,
+            error = %error,
+            "failed to fetch trusted_moi JWKS"
+        );
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "trusted_moi JWKS unavailable",
+        )
+    })?;
+    if !response.status().is_success() {
+        warn!(
+            target: "astra_services::auth",
+            jwks_url,
+            status = %response.status(),
+            "trusted_moi JWKS endpoint returned non-success status"
+        );
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "trusted_moi JWKS unavailable",
+        ));
+    }
+    response.json::<TrustedMoiJwks>().await.map_err(|error| {
+        warn!(
+            target: "astra_services::auth",
+            jwks_url,
+            error = %error,
+            "trusted_moi JWKS response is invalid"
+        );
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "trusted_moi JWKS unavailable",
+        )
+    })
+}
+
+fn select_jwks_key<'a>(
+    jwks: &'a TrustedMoiJwks,
+    kid: Option<&str>,
+    algorithm: Algorithm,
+) -> Option<&'a TrustedMoiJwk> {
+    let alg = algorithm_name(algorithm);
+    let mut matches = jwks.keys.iter().filter(|key| {
+        key.kty == "RSA"
+            && key.key_use.as_deref().is_none_or(|value| value == "sig")
+            && key.alg.as_deref().is_none_or(|value| value == alg)
+            && kid.is_none_or(|wanted| key.kid.as_deref() == Some(wanted))
+    });
+    let first = matches.next()?;
+    if kid.is_none() && matches.next().is_some() {
+        debug!(
+            target: "astra_services::auth",
+            "trusted_moi token omitted kid and JWKS has multiple compatible keys"
+        );
+        return None;
+    }
+    Some(first)
+}
+
+fn decoding_key_from_jwk(
+    key: &TrustedMoiJwk,
+) -> Result<DecodingKey, (StatusCode, Json<ErrorResponse>)> {
+    DecodingKey::from_rsa_components(&key.n, &key.e)
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid trusted_moi token"))
+}
+
+fn algorithm_name(algorithm: Algorithm) -> &'static str {
+    match algorithm {
+        Algorithm::HS256 => "HS256",
+        Algorithm::HS384 => "HS384",
+        Algorithm::HS512 => "HS512",
+        Algorithm::RS256 => "RS256",
+        _ => "",
     }
 }
 
@@ -854,7 +1133,7 @@ impl AuthService for TrustedMoiAuthService {
         headers: &HeaderMap,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
         let token = bearer_token(headers)?;
-        let claims = self.decode_trusted_claims(token)?;
+        let claims = self.decode_trusted_claims(token).await?;
 
         let user_id = claims
             .sub
@@ -988,6 +1267,42 @@ mod tests {
     use chrono::Utc;
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCmvhq07p6Un447
+pC8wc4oaEYev8uERKYNFF/wUD74/iaoe6VlGWXyat7rClSi0kiLlv+w2yZ4MVgrE
+N4c3GSlXK07/MyZelHqRlbtQ+OLArQrrx72TMiEzdMJLGG6T1DYpOsuCfBVOiwzr
+pfSwi4O6xvybvMKnLbUM/2DDHNqvlTag5THpWmeSyyNjIP+qBaepHqly0rKpCB77
+pPqSA8vqdVRSDeEntnhxncSCllcawRQgxCr5aPQVjOBoKf1AB7C16TYNkpJcX0BX
++V0qiSnqrz/6vIp36WC6H4MnBiWoFKxYPwfbLB4LpGJK61C7wb8vw1s6VezyvpOA
+iC2pg1QZAgMBAAECggEABakY0qvyceeJa73oT4lElsZMkxe4NfMbqTn7YppMN5pO
+o6ur+QbrA3zu7VHPUXNP6vkdJZj/nA9EYKKP8mS7cgxJgMFgRpVczy9u7fydBLR7
+KpjxIcZHDpj39ZZX6VMqyYiHmx+SQO8t2kbGgUMjOYaC0dinylweCYRr6QPEQByk
+ZxCuKopOQaSU42Ax3Hj1TYmM4wmWj7ZDHtAA7jSEWKEipb4EMW5ApwlEsiAfYxRf
+zLrWdsWBUmPU1FSp0r36hlffUSnvWgXDinxq88A6PRraU5CBUzSmI9APPv9SNl+o
+gFHMnsS+MJPkv6NvHRabdhPwyA0w1pabQ5uHylLlWQKBgQDj/RUCEdLXX1uezcEo
+eX0UTpIazMhMYL04QlRfOStAmAbr7CULG8aHMYLYJD90cvQmxhDKcZ3kPZl+Gmu4
+fQe5DslsiQtbapp9UnvHjb+BXEpiJPL3qOL/PO+cZlfe+FxNY365+qBIZgHJhZDj
+BJRxCqPMQfTQI470zPfEShbFTQKBgQC7OqdU2STIzK6lhB/Rb6++HraLoKx+y4Zt
+oPbixzzHaEbLLRZGZPI3Be4KX9FZ6oINlGPOgCoEmTQe/cYm6cys4ZbD0VzK06WN
+gboYsLFEEQBOzMYxGCu3ysGV+Hq9xnXb0rcHfO9e0ywK34dVFs8K1Hlh+xYpFtH5
+Yt6q3IQz/QKBgQDcTO3i3RQt9r/SeKFAGfyqBa4aZWzamNPerAFZLiXEOeLeT4YP
+8NvqQQZdEtGaFYYkfVk2NYlLRdauypryXyZ6RHaQAPDPefgkRvLChg7Z0jMyGOAK
+PdBysBAcwawBEV4njY+j6DC/JIpvjzfMld1WSeCy+7yy7tkxZWm465qLNQKBgQCC
+y4PQA23uFQdAu59auTJFl8Ego9s9LMM5XMR8QoFUMKWcFGBGRwjqpWrYtn1S2j+G
+aw6aWPCBi+FccR53WsdQUrv3ChBP5TD3PRQbYXxEt7fGVMlzzJXl7G/2a8KbRsRZ
+D8grI/04+j7/TY6GQ8vZnfs6FqUxiS6gkJBLPofgpQKBgBH3h12VTZ/jDesexlHm
+OEmW4j/rA5cj4fi8Be6D8f/xXhF1uTmJovixtl4FIqQcCpDbKtDUpUA9DH0UXH+4
+4Zcn3n3fkmvyxVoLvXcsj0wa/CIXY0sBTCAW2n0kavunKjk9f1wHutOYtB0idKeB
+4ITcYBKDm5Lxlq0wofuA6ZEp
+-----END PRIVATE KEY-----"#;
+
+    const TEST_RSA_N: &str = "pr4atO6elJ-OO6QvMHOKGhGHr_LhESmDRRf8FA--P4mqHulZRll8mre6wpUotJIi5b_sNsmeDFYKxDeHNxkpVytO_zMmXpR6kZW7UPjiwK0K68e9kzIhM3TCSxhuk9Q2KTrLgnwVTosM66X0sIuDusb8m7zCpy21DP9gwxzar5U2oOUx6VpnkssjYyD_qgWnqR6pctKyqQge-6T6kgPL6nVUUg3hJ7Z4cZ3EgpZXGsEUIMQq-Wj0FYzgaCn9QAewtek2DZKSXF9AV_ldKokp6q8_-ryKd-lguh-DJwYlqBSsWD8H2yweC6RiSutQu8G_L8NbOlXs8r6TgIgtqYNUGQ";
+    const TEST_RSA_E: &str = "AQAB";
 
     #[derive(Serialize)]
     struct TrustedMoiTestClaims<'a> {
@@ -1020,6 +1335,39 @@ mod tests {
             &EncodingKey::from_secret(normalize_jwt_secret_for_trusted_mode(secret).as_bytes()),
         )
         .expect("encode token")
+    }
+
+    fn make_rs256_token(kid: &str, claims: TrustedMoiTestClaims<'_>) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).expect("test rsa key"),
+        )
+        .expect("encode rs256 token")
+    }
+
+    async fn jwks_url_once(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind jwks listener");
+        let addr = listener.local_addr().expect("jwks local addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept jwks request");
+            let mut buffer = [0_u8; 2048];
+            let _ = socket.read(&mut buffer).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write jwks response");
+        });
+        format!("http://{addr}/oauth/jwks")
     }
 
     fn auth_headers(token: &str) -> HeaderMap {
@@ -1130,6 +1478,49 @@ mod tests {
         assert_eq!(user.username, "Bob");
         assert_eq!(user.email, "");
         assert_eq!(user.display_name.as_deref(), Some("Bob"));
+    }
+
+    #[tokio::test]
+    async fn trusted_moi_current_user_accepts_rs256_jwks_token() {
+        let jwks = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"moi-key-1","use":"sig","alg":"RS256","n":"{}","e":"{}"}}]}}"#,
+            TEST_RSA_N, TEST_RSA_E
+        );
+        let jwks_url = jwks_url_once(jwks).await;
+        let service = TrustedMoiAuthService::new_with_jwks_url(
+            &jwks_url,
+            "RS256",
+            Some("moi".to_string()),
+            Some("astra".to_string()),
+            30,
+            300,
+        )
+        .unwrap();
+        let (iat, exp) = now_exp_pair();
+        let token = make_rs256_token(
+            "moi-key-1",
+            TrustedMoiTestClaims {
+                sub: Some("moi-user-rsa"),
+                uid: None,
+                user_id: None,
+                username: Some("rsa-user"),
+                email: Some("rsa@example.com"),
+                display_name: Some("RSA User"),
+                name: None,
+                iss: Some("moi"),
+                aud: Some("astra"),
+                iat,
+                exp,
+            },
+        );
+        let user = service
+            .current_user(&auth_headers(&token))
+            .await
+            .expect("current_user");
+        assert_eq!(user.user_id, "moi-user-rsa");
+        assert_eq!(user.username, "rsa-user");
+        assert_eq!(user.email, "rsa@example.com");
+        assert_eq!(user.display_name.as_deref(), Some("RSA User"));
     }
 
     #[tokio::test]

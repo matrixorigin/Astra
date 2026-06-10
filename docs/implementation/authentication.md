@@ -14,6 +14,16 @@ The platform does NOT implement RBAC. It does NOT query `mo_catalog.mo_user_gran
 - `ASTRA_AUTH_MODE=local_jwt` (default): astra issues and validates local JWTs via `/auth/login` and `/auth/refresh`.
 - `ASTRA_AUTH_MODE=trusted_moi`: astra trusts externally issued Moi JWTs (`Authorization: Bearer ...`) and disables local auth endpoints (`/auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout` return 403).
 
+In `trusted_moi` mode, production MOI integration should use MOI's RS256 JWKS endpoint:
+
+```bash
+ASTRA_AUTH_MODE=trusted_moi
+ASTRA_EXTERNAL_JWT_ALGORITHM=RS256
+ASTRA_EXTERNAL_JWT_JWKS_URL=http://moi-backend.moi.svc.cluster.local:8050/newmoi/oauth/jwks
+```
+
+The older HMAC verifier remains available for isolated tests by setting `ASTRA_EXTERNAL_JWT_SECRET` and an `HS*` algorithm. Astra does not fall back between verifier types.
+
 ## Authentication: JWT
 
 ```
