@@ -40,6 +40,18 @@ pub(crate) enum TurnToolPhaseControl {
     Return(AgenticLoopOutcome),
 }
 
+fn edge_round_contains_detached_bash(turn_result: &super::host::HostTurnResult) -> bool {
+    turn_result.edge_tool_round.iter().any(|edge_result| {
+        edge_result.tool == "bash"
+            && edge_result
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("bash_detached"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    })
+}
+
 fn build_runtime_session_quality_assessment(
     session_id: &str,
     quality: f64,
@@ -1272,6 +1284,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     record_edge_tool_observability(state, &turn_result.edge_tool_round);
+
+    if edge_round_contains_detached_bash(&turn_result) {
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        state.telemetry.completed_turns_for_tuning += 1;
+        maybe_run_tuning_cycle(state);
+        let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
+        apply_per_turn_adaptation(state, turn_tokens);
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
 
     if let Some(ref registry) = state.skills.registry_for_activation {
         let mut any_newly_activated = false;

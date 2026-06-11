@@ -2646,6 +2646,23 @@ pub(crate) mod tests {
         }
     }
 
+    fn make_detached_bash_edge_tool(task_id: &str) -> EdgeToolExecResult {
+        EdgeToolExecResult {
+            request_id: "req-bash".to_string(),
+            tool: "bash".to_string(),
+            args: json!({"command": "make check 2>&1"}),
+            output: format!(
+                "<bash_detached>The bash command was promoted to background task {task_id}.</bash_detached>"
+            ),
+            tool_result_fields: Some(serde_json::Map::from_iter([
+                ("bash_detached".to_string(), json!(true)),
+                ("background_task_id".to_string(), json!(task_id)),
+            ])),
+            status: "ok".to_string(),
+            duration_ms: 10,
+        }
+    }
+
     fn make_edge_tool_with_args(name: &str, args: Value, output: &str) -> EdgeToolExecResult {
         EdgeToolExecResult {
             request_id: format!("req-{name}"),
@@ -3838,6 +3855,45 @@ pub(crate) mod tests {
             state.messages.len() >= 2,
             "expected >=2 messages from headless round, got {}",
             state.messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_bash_edge_tool_stops_without_followup_poll_round() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_detached_bash_edge_tool("bg-shell-1")],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("task_output", "should not run")],
+                10,
+                5,
+                None,
+            ),
+        ])
+        .with_valid_tools(&["bash", "task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(
+            host.turn_count(),
+            1,
+            "detached bash should end the user turn instead of letting the model poll task_output"
+        );
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(state.telemetry.all_tools_used.contains("bash"));
+        assert!(!state.telemetry.all_tools_used.contains("task_output"));
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("bg-shell-1")),
+            "background task id must remain visible in the tool result messages"
         );
     }
 
