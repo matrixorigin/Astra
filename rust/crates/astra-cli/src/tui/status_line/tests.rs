@@ -736,6 +736,29 @@ fn bg_footer_names_two_task_kinds_explicitly() {
 }
 
 #[test]
+fn bg_footer_stays_discoverable_during_active_foreground_turn() {
+    let c = StatusContext {
+        turn_active: true,
+        current_objective: Some("Waiting for next tool".into()),
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    let open_hint = crate::tui::background_shortcut::background_task_open_hint();
+    assert!(
+        plain.contains("BG 1 shell"),
+        "foreground activity must not hide running background tasks; got {plain:?}"
+    );
+    assert!(
+        plain.contains(&open_hint),
+        "footer must tell the user how to open/switch to background tasks; got {plain:?}"
+    );
+}
+
+#[test]
 fn bg_footer_collapses_three_or_more_task_kinds() {
     let c = StatusContext {
         bg_task_counts: Some(BackgroundTaskCounts {
