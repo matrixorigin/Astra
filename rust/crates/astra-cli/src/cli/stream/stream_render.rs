@@ -6364,6 +6364,14 @@ pub(crate) async fn execute_with_metadata_responsive(
     args: Value,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> crate::edge_tools::ToolExecutionOutcome {
+    if tool_name == "bash"
+        && let Some(outcome) = executor
+            .bash_detachable_with_metadata(&args, cancel_token.as_ref())
+            .await
+    {
+        return outcome;
+    }
+
     if !should_offload_blocking_tool(&tool_name) {
         return executor
             .execute_with_metadata_cancelable(&tool_name, &args, cancel_token.as_ref())
@@ -6929,6 +6937,79 @@ mod tests {
 
         let outcome = execution.await;
         assert!(outcome.output.contains("responsive"), "{}", outcome.output);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn responsive_bash_uses_real_detach_slot_for_ctrl_b_handoff() {
+        let dir = tempdir().expect("tempdir");
+        let (slot, listener) = astra_tools::detach::new_slot_with_handle();
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
+        );
+
+        let execution = tokio::spawn(execute_with_metadata_responsive(
+            executor,
+            "bash".to_string(),
+            serde_json::json!({
+                "command": "printf 'before\\n'; sleep 5; printf 'after\\n'",
+                "timeout": 30.0,
+            }),
+            None,
+        ));
+
+        for _ in 0..100 {
+            if listener.is_active() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            listener.is_active(),
+            "foreground edge bash must activate the TUI detach listener"
+        );
+
+        listener.signal_tx.send(true).expect("signal detach");
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), listener.payload_rx)
+            .await
+            .expect("edge bash should hand off promptly after Ctrl+B")
+            .expect("payload");
+        assert_eq!(
+            payload.command,
+            "printf 'before\\n'; sleep 5; printf 'after\\n'"
+        );
+        assert!(
+            payload.partial_stdout.contains("before"),
+            "partial stdout should include foreground bytes: {:?}",
+            payload.partial_stdout
+        );
+        payload
+            .adoption_tx
+            .send(Ok("bg-shell-edge".to_string()))
+            .expect("ack adoption");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+            .await
+            .expect("detached edge bash should finish the tool call")
+            .expect("join");
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert!(
+            outcome.output.contains("bash_detached"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("bg-shell-edge"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(
+            outcome
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("background_task_id"))
+                .and_then(Value::as_str),
+            Some("bg-shell-edge")
+        );
     }
 
     // ── D-9 regression: speculative success flag must gate reuse ──

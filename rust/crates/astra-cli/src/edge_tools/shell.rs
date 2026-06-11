@@ -6,8 +6,12 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
     sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy};
+use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy, filter_environment};
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command as TokioCommand;
+
+const BASH_DETACH_ADOPTION_ACK_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -2941,8 +2945,16 @@ struct ShellRunConfig {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
-fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::Output, String> {
-    let effective_command = if config.harden_command {
+enum DetachableShellOutput {
+    Completed(std::process::Output),
+    Detached {
+        payload: Box<astra_tools::detach::DetachedShellPayload>,
+        adoption_rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
+    },
+}
+
+fn effective_shell_command(config: &ShellRunConfig) -> String {
+    if config.harden_command {
         if let Some(ref policy) = config.sandbox_policy {
             if !matches!(policy.mode, SandboxMode::Permissive) {
                 wrap_command_with_limits(policy, &config.command)
@@ -2954,7 +2966,11 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         }
     } else {
         config.command.clone()
-    };
+    }
+}
+
+fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::Output, String> {
+    let effective_command = effective_shell_command(&config);
 
     let mut child_cmd = Command::new(&config.program);
     child_cmd
@@ -3064,6 +3080,345 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         stdout: stdout_buf,
         stderr: stderr_buf,
     })
+}
+
+fn detach_signal_observed(signal_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    enum SignalState {
+        Observed,
+        NotObserved,
+        Disconnected,
+    }
+
+    let state = if let Some(rx) = signal_rx.as_mut() {
+        match rx.has_changed() {
+            Ok(true) if *rx.borrow_and_update() => SignalState::Observed,
+            Ok(_) => SignalState::NotObserved,
+            Err(_) => SignalState::Disconnected,
+        }
+    } else {
+        return false;
+    };
+
+    match state {
+        SignalState::Observed => true,
+        SignalState::NotObserved => false,
+        SignalState::Disconnected => {
+            *signal_rx = None;
+            false
+        }
+    }
+}
+
+async fn restore_detach_signal_receiver(
+    detach: &astra_tools::detach::DetachShellHandle,
+    signal_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if let Some(signal_rx) = signal_rx {
+        *detach.signal_rx.lock().await = Some(signal_rx);
+    }
+}
+
+fn apply_overlay_to_tokio_command(cmd: &mut TokioCommand) {
+    cmd.env_clear();
+    for (key, value) in astra_core::session_env_overlay::merged_pairs() {
+        cmd.env(key, value);
+    }
+}
+
+fn configure_detachable_tokio_command(config: &ShellRunConfig) -> TokioCommand {
+    let effective_command = effective_shell_command(config);
+    let mut child_cmd = TokioCommand::new(&config.program);
+    child_cmd
+        .arg(&config.shell_flag)
+        .arg(&effective_command)
+        .current_dir(&config.effective_project_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    apply_overlay_to_tokio_command(&mut child_cmd);
+
+    #[cfg(unix)]
+    child_cmd.process_group(0);
+
+    if let Some(ref policy) = config.sandbox_policy
+        && !matches!(policy.mode, SandboxMode::Permissive)
+    {
+        child_cmd.current_dir(&policy.project_root);
+        child_cmd.env_clear();
+        for (key, value) in filter_environment(policy) {
+            child_cmd.env(key, value);
+        }
+    }
+
+    child_cmd
+}
+
+fn record_async_bash_chunk(
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
+    bytes: &[u8],
+) {
+    if let Some(sink) = sink {
+        sink.record_chunk(bytes);
+    }
+}
+
+async fn drain_tokio_stdout(
+    stdout: &mut tokio::process::ChildStdout,
+    output: &mut Vec<u8>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            read = stdout.read(&mut buf) => {
+                match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_async_bash_chunk(sink, &buf[..n]);
+                        output.extend_from_slice(&buf[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn drain_tokio_stderr(
+    stderr: &mut tokio::process::ChildStderr,
+    output: &mut Vec<u8>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            read = stderr.read(&mut buf) => {
+                match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_async_bash_chunk(sink, &buf[..n]);
+                        output.extend_from_slice(&buf[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn kill_tokio_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id()
+            && let Ok(raw) = i32::try_from(pid)
+        {
+            let pgid = nix::unistd::Pid::from_raw(raw);
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            let _ = child.wait().await;
+            return;
+        }
+    }
+    let _ = child.kill().await;
+}
+
+async fn terminate_detached_shell_payload(
+    mut payload: Box<astra_tools::detach::DetachedShellPayload>,
+) {
+    kill_tokio_process_group(&mut payload.child).await;
+}
+
+async fn run_shell_output_with_detach_config(
+    config: ShellRunConfig,
+    detach: &astra_tools::detach::DetachShellHandle,
+    command_label: &str,
+) -> Result<DetachableShellOutput, String> {
+    let mut child_cmd = configure_detachable_tokio_command(&config);
+    let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Error: failed to capture stdout".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Error: failed to capture stderr".to_string())?;
+
+    let mut signal_rx = detach.signal_rx.lock().await.take();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_read_buf = [0u8; 8192];
+    let mut stderr_read_buf = [0u8; 8192];
+    let mut exit_status = None;
+    let mut detached = false;
+
+    loop {
+        if detach_signal_observed(&mut signal_rx) {
+            detached = true;
+            break;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                kill_tokio_process_group(&mut child).await;
+                restore_detach_signal_receiver(detach, signal_rx).await;
+                return Err(format!("Error: {e}"));
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            kill_tokio_process_group(&mut child).await;
+            restore_detach_signal_receiver(detach, signal_rx).await;
+            return Err(format!(
+                "Error: command timed out after {}s",
+                config.timeout_secs
+            ));
+        }
+
+        if let Some(rx) = signal_rx.as_mut() {
+            tokio::select! {
+                biased;
+                res = rx.changed() => {
+                    match res {
+                        Ok(()) if *rx.borrow_and_update() => {
+                            detached = true;
+                            break;
+                        }
+                        Ok(()) => {}
+                        Err(_) => signal_rx = None,
+                    }
+                }
+                _ = async {
+                    if let Some(token) = config.cancel_token.as_ref() {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    kill_tokio_process_group(&mut child).await;
+                    restore_detach_signal_receiver(detach, signal_rx).await;
+                    return Err("Error: command cancelled by user".to_string());
+                }
+                read = stdout.read(&mut stdout_read_buf), if stdout_open => {
+                    match read {
+                        Ok(0) => stdout_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stdout_read_buf[..n]);
+                            stdout_buf.extend_from_slice(&stdout_read_buf[..n]);
+                        }
+                        Err(_) => stdout_open = false,
+                    }
+                }
+                read = stderr.read(&mut stderr_read_buf), if stderr_open => {
+                    match read {
+                        Ok(0) => stderr_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stderr_read_buf[..n]);
+                            stderr_buf.extend_from_slice(&stderr_read_buf[..n]);
+                        }
+                        Err(_) => stderr_open = false,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(token) = config.cancel_token.as_ref() {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    kill_tokio_process_group(&mut child).await;
+                    restore_detach_signal_receiver(detach, signal_rx).await;
+                    return Err("Error: command cancelled by user".to_string());
+                }
+                read = stdout.read(&mut stdout_read_buf), if stdout_open => {
+                    match read {
+                        Ok(0) => stdout_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stdout_read_buf[..n]);
+                            stdout_buf.extend_from_slice(&stdout_read_buf[..n]);
+                        }
+                        Err(_) => stdout_open = false,
+                    }
+                }
+                read = stderr.read(&mut stderr_read_buf), if stderr_open => {
+                    match read {
+                        Ok(0) => stderr_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stderr_read_buf[..n]);
+                            stderr_buf.extend_from_slice(&stderr_read_buf[..n]);
+                        }
+                        Err(_) => stderr_open = false,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
+
+    if detached {
+        let (adoption_tx, adoption_rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(astra_tools::detach::DetachedShellPayload {
+            child,
+            stdout,
+            stderr,
+            command: command_label.to_string(),
+            partial_stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+            partial_stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+            adoption_tx,
+        });
+        return Ok(DetachableShellOutput::Detached {
+            payload,
+            adoption_rx,
+        });
+    }
+
+    let read_timeout = bash_pipe_read_timeout();
+    drain_tokio_stdout(
+        &mut stdout,
+        &mut stdout_buf,
+        &config.progress_sink,
+        read_timeout,
+    )
+    .await;
+    drain_tokio_stderr(
+        &mut stderr,
+        &mut stderr_buf,
+        &config.progress_sink,
+        read_timeout,
+    )
+    .await;
+
+    restore_detach_signal_receiver(detach, signal_rx).await;
+    Ok(DetachableShellOutput::Completed(std::process::Output {
+        status: exit_status.unwrap_or_else(|| {
+            child
+                .try_wait()
+                .ok()
+                .flatten()
+                .expect("bash child should have exited before normal completion")
+        }),
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    }))
 }
 
 /// Adaptive default bash timeout by command kind. Used when the caller
@@ -4040,6 +4395,114 @@ impl ToolExecutor {
             Ok(Ok(out)) => self.render_bash_output(&command, out),
             Ok(Err(error)) => error,
             Err(error) => format!("Error: bash worker failed: {error}"),
+        }
+    }
+
+    async fn restore_bash_detach_handle(
+        &self,
+        slot: astra_tools::detach::DetachShellSlot,
+        handle: astra_tools::detach::DetachShellHandle,
+    ) {
+        handle.mark_active(false);
+        if !handle.is_retired() {
+            *slot.lock().await = Some(handle);
+        }
+    }
+
+    pub(crate) async fn bash_detachable_with_metadata(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Option<super::ToolExecutionOutcome> {
+        let slot = self.bash_detach_slot.as_ref()?.clone();
+        let handle = slot.lock().await.take()?;
+
+        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
+            Ok(invocation) => invocation,
+            Err(message) => {
+                self.restore_bash_detach_handle(slot, handle).await;
+                return Some(super::ToolExecutionOutcome::error(message));
+            }
+        };
+        let config =
+            self.shell_run_config("bash", "-c", &command, timeout_secs, true, cancel_token);
+
+        handle.mark_active(true);
+        let outcome = run_shell_output_with_detach_config(config, &handle, &command).await;
+        match outcome {
+            Ok(DetachableShellOutput::Completed(out)) => {
+                self.restore_bash_detach_handle(slot, handle).await;
+                let output =
+                    self.finalize_tool_output(self.render_bash_output(&command, out), "bash");
+                self.record_output_size(output.len());
+                Some(if output.starts_with("Error") {
+                    super::ToolExecutionOutcome::error(output)
+                } else {
+                    super::ToolExecutionOutcome::ok(output)
+                })
+            }
+            Ok(DetachableShellOutput::Detached {
+                payload,
+                adoption_rx,
+            }) => {
+                handle.mark_active(false);
+                let Some(sender) = handle.payload_tx.lock().await.take() else {
+                    terminate_detached_shell_payload(payload).await;
+                    return Some(super::ToolExecutionOutcome::error(
+                        "Error: bash detach failed: host payload channel was not available"
+                            .to_string(),
+                    ));
+                };
+                if let Err(payload) = sender.send(*payload) {
+                    terminate_detached_shell_payload(Box::new(payload)).await;
+                    return Some(super::ToolExecutionOutcome::error(
+                        "Error: bash detach failed: host listener dropped before payload arrived"
+                            .to_string(),
+                    ));
+                }
+
+                let task_id =
+                    match tokio::time::timeout(BASH_DETACH_ADOPTION_ACK_WAIT, adoption_rx).await {
+                        Ok(Ok(Ok(task_id))) => task_id,
+                        Ok(Ok(Err(error))) => {
+                            return Some(super::ToolExecutionOutcome::error(format!(
+                                "Error: bash detach failed: host could not adopt process: {error}"
+                            )));
+                        }
+                        Ok(Err(_)) => {
+                            return Some(super::ToolExecutionOutcome::error(
+                                "Error: bash detach failed: host dropped adoption acknowledgement"
+                                    .to_string(),
+                            ));
+                        }
+                        Err(_) => {
+                            return Some(super::ToolExecutionOutcome::error(
+                            "Error: bash detach failed: host did not acknowledge adoption in time"
+                                .to_string(),
+                        ));
+                        }
+                    };
+
+                let output = format!(
+                    "<bash_detached>The bash command was promoted to background task {task_id}. \
+                     Output continues in the BackgroundTaskRegistry; \
+                     poll progress with `task_output(task_id='{task_id}')`, inspect tasks with `task_list()`, \
+                     or stop it with `task_stop(task_id='{task_id}')`.\
+                     </bash_detached>"
+                );
+                let mut tool_result_fields = serde_json::Map::new();
+                tool_result_fields.insert("bash_detached".to_string(), Value::Bool(true));
+                tool_result_fields.insert("background_task_id".to_string(), Value::String(task_id));
+                Some(super::ToolExecutionOutcome {
+                    output,
+                    tool_result_fields: Some(tool_result_fields),
+                    is_error: false,
+                })
+            }
+            Err(error) => {
+                self.restore_bash_detach_handle(slot, handle).await;
+                Some(super::ToolExecutionOutcome::error(error))
+            }
         }
     }
 
