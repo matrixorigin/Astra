@@ -97,6 +97,31 @@ pub(crate) fn background_task_rows(
         .collect()
 }
 
+pub(crate) const PENDING_BASH_HANDOFF_TASK_ID: &str = "bg-shell-handoff";
+
+pub(crate) fn pending_bash_handoff_row(
+    title: &str,
+    elapsed_ms: u64,
+) -> super::bottom_pane::background_task_view::BackgroundTaskRow {
+    let title = title.trim();
+    let title = if title.is_empty() {
+        "Bash handoff"
+    } else {
+        title
+    };
+    let tail = "Waiting for foreground Bash to hand off its process.".to_string();
+    super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
+        PENDING_BASH_HANDOFF_TASK_ID,
+        "pending",
+        elapsed_ms,
+        title,
+        None,
+        Some(tail.clone()),
+        Some(tail.len() as u64),
+    )
+    .with_output_stats(None, Some(1))
+}
+
 pub(crate) fn background_task_fanout_membership(
     slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity,
     group_title: Option<&str>,
@@ -487,6 +512,27 @@ pub(crate) async fn reveal_background_task_view(
     .await
 }
 
+pub(crate) async fn reveal_background_task_view_with_extra_rows(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+    extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
+    selected_id: Option<&str>,
+) -> bool {
+    reveal_background_task_view_rows(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        extra_rows,
+        selected_id,
+    )
+    .await
+}
+
 async fn reveal_background_task_view_with_selected(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
@@ -495,14 +541,48 @@ async fn reveal_background_task_view_with_selected(
     frame_requester: &FrameRequester,
     selected_id: Option<&str>,
 ) -> bool {
-    let rows =
+    reveal_background_task_view_rows(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        Vec::new(),
+        selected_id,
+    )
+    .await
+}
+
+async fn reveal_background_task_view_rows(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+    extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
+    selected_id: Option<&str>,
+) -> bool {
+    let mut rows =
         background_task_rows_with_agents(background_registry, agent_spawner, restored_local_agents)
             .await;
+    rows.extend(extra_rows);
     if rows.is_empty() {
+        sync_background_task_footer_from_rows(bottom_pane, &rows);
+        if bottom_pane.accepts_background_task_rows() {
+            bottom_pane.refresh_background_task_rows(rows);
+            bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+        }
         return false;
     }
     let counts = super::status_line::BackgroundTaskCounts::from_rows(&rows);
     if counts.is_empty() {
+        sync_background_task_footer_from_rows(bottom_pane, &rows);
+        if bottom_pane.accepts_background_task_rows() {
+            bottom_pane.refresh_background_task_rows(rows);
+            bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+        }
         return false;
     }
     sync_background_task_footer_from_rows(bottom_pane, &rows);

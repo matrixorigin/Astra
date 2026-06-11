@@ -593,7 +593,7 @@ impl BackgroundTaskView {
 
     fn request_output(&mut self) {
         if let Some(row) = self.selected_row()
-            && row.kind.supports_output_action()
+            && row_can_open_output(row)
         {
             self.pending_action = Some(format!("{BACKGROUND_TASK_OUTPUT_SENTINEL}{}", row.id));
         }
@@ -815,20 +815,17 @@ impl BackgroundTaskView {
         for line in tail.lines().take(DETAIL_TAIL_LINES) {
             lines.push(Line::from(format!("  {}", line)));
         }
+        let can_output = row_can_open_output(row);
         if row.status.is_killable() && row.live_control.can_stop() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                detail_actions_label(row.kind.supports_output_action(), true, area.width as usize),
+                detail_actions_label(can_output, true, area.width as usize),
                 dim,
             )));
         } else {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                detail_actions_label(
-                    row.kind.supports_output_action(),
-                    false,
-                    area.width as usize,
-                ),
+                detail_actions_label(can_output, false, area.width as usize),
                 dim,
             )));
         }
@@ -1037,6 +1034,10 @@ fn detail_actions_label(can_output: bool, can_stop: bool, width: usize) -> &'sta
     }
 }
 
+fn row_can_open_output(row: &BackgroundTaskRow) -> bool {
+    row.kind.supports_output_action() && row.output_ref.is_some()
+}
+
 fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
@@ -1161,6 +1162,30 @@ mod tests {
         assert_eq!(view.rows[1].id, "fail");
         assert_eq!(view.rows[2].id, "run");
         assert_eq!(view.rows[3].id, "done");
+    }
+
+    #[test]
+    fn pending_shell_without_output_ref_does_not_emit_output_action() {
+        let mut view = BackgroundTaskView::new(vec![BackgroundTaskRow::shell(
+            "bg-shell-handoff",
+            "pending",
+            0,
+            "make build",
+            None,
+            Some("Waiting for foreground Bash to hand off its process.".to_string()),
+            Some(51),
+        )]);
+
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            view.take_pending_action().is_none(),
+            "pending handoff rows do not have a readable output artifact yet"
+        );
+        let text = render(&view, 80, 10);
+        assert!(text.contains("actions: return"), "{text}");
+        assert!(!text.contains("actions: output"), "{text}");
     }
 
     #[test]

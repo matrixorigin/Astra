@@ -2922,6 +2922,47 @@ mod tests {
         assert_eq!(active.name, "read_file");
     }
 
+    #[test]
+    fn backgrounded_bash_normal_completion_commits_once_with_task_id() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
+        assert!(w.mark_active_bash_backgrounded(Some("tu_test"), "bg-shell-1"));
+
+        w.handle_event(AppEvent::Wire(tool_completed(
+            "bash",
+            "$ make check",
+            "success",
+            1200,
+            Some(
+                "<bash_detached>The bash command was promoted to background task bg-shell-1.</bash_detached>",
+            ),
+        )));
+
+        assert!(
+            w.active_cell.is_none(),
+            "normal detached ToolCompleted should finish the foreground Bash cell"
+        );
+        assert_eq!(
+            w.history.len(),
+            1,
+            "detached ToolCompleted must not synthesize a duplicate Bash cell"
+        );
+        assert!(
+            w.backgrounded_bash_tool_use_ids.is_empty(),
+            "detached ToolCompleted should retire the suppression marker"
+        );
+        let tool = w.history[0]
+            .as_any_ref()
+            .downcast_ref::<ToolCell>()
+            .expect("history should contain the backgrounded Bash tool");
+        assert_eq!(tool.status, ToolStatus::Success);
+        let expected = format!(
+            "Running in the background as bg-shell-1 · {}",
+            crate::tui::background_shortcut::background_task_open_hint()
+        );
+        assert_eq!(tool.output_summary.as_deref(), Some(expected.as_str()));
+    }
+
     // ── Invariant: at most one live cell ─────────────────────────
 
     #[test]

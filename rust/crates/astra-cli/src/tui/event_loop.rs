@@ -54,7 +54,6 @@ use super::{
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
-const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 
 fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
     let description = description.trim();
@@ -1651,6 +1650,7 @@ pub(crate) async fn run_tui_session(
                                     >();
                                     let mut bash_detach_request_pending = false;
                                     let mut active_bash_tool_use_id: Option<String> = None;
+                                    let mut active_bash_description: Option<String> = None;
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
@@ -1807,6 +1807,10 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         listener.retire();
                                                                         bash_detach_request_pending = true;
+                                                                        let pending_title =
+                                                                            active_bash_description
+                                                                                .as_deref()
+                                                                                .unwrap_or("Bash");
                                                                         set_bash_background_hint_enabled(
                                                                             &mut chat_widget,
                                                                             &mut status_indicator,
@@ -1817,21 +1821,28 @@ pub(crate) async fn run_tui_session(
                                                                                 "⏎ Backgrounding Bash... waiting for handoff."
                                                                             ),
                                                                         );
+                                                                        let pending_rows = vec![
+                                                                            pending_bash_handoff_row(
+                                                                                pending_title,
+                                                                                0,
+                                                                            ),
+                                                                        ];
+                                                                        let _ = reveal_background_task_view_with_extra_rows(
+                                                                            &mut background_registry,
+                                                                            agent_spawner_for_cancel.as_ref(),
+                                                                            &restored_local_agent_task_projections,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                            pending_rows,
+                                                                            Some(PENDING_BASH_HANDOFF_TASK_ID),
+                                                                        )
+                                                                        .await;
                                                                         let handoff_tx = bash_detach_handoff_tx.clone();
                                                                         tokio::spawn(async move {
-                                                                            let handoff = tokio::time::timeout(
-                                                                                BASH_DETACH_HANDOFF_WAIT,
-                                                                                listener.payload_rx,
-                                                                            )
-                                                                            .await;
-                                                                            let result = match handoff {
-                                                                                Ok(Ok(payload)) => Ok(payload),
-                                                                                Ok(Err(_)) => Err(
-                                                                                    "bash runner ended before handing off the process."
-                                                                                        .to_string(),
-                                                                                ),
+                                                                            let result = match listener.payload_rx.await {
+                                                                                Ok(payload) => Ok(payload),
                                                                                 Err(_) => Err(
-                                                                                    "bash did not hand off the process in time."
+                                                                                    "bash runner ended before handing off the process."
                                                                                         .to_string(),
                                                                                 ),
                                                                             };
@@ -2281,6 +2292,16 @@ pub(crate) async fn run_tui_session(
                                                                         &mut status_indicator,
                                                                         false,
                                                                     );
+                                                                    let _ = reveal_background_task_view_with_extra_rows(
+                                                                        &mut background_registry,
+                                                                        agent_spawner_for_cancel.as_ref(),
+                                                                        &restored_local_agent_task_projections,
+                                                                        &mut bottom_pane,
+                                                                        &frame_requester,
+                                                                        Vec::new(),
+                                                                        None,
+                                                                    )
+                                                                    .await;
                                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                     frame_requester.schedule_frame();
@@ -2333,6 +2354,16 @@ pub(crate) async fn run_tui_session(
                                                                 &mut status_indicator,
                                                                 false,
                                                             );
+                                                            let _ = reveal_background_task_view_with_extra_rows(
+                                                                &mut background_registry,
+                                                                agent_spawner_for_cancel.as_ref(),
+                                                                &restored_local_agent_task_projections,
+                                                                &mut bottom_pane,
+                                                                &frame_requester,
+                                                                Vec::new(),
+                                                                None,
+                                                            )
+                                                            .await;
                                                         }
                                                     }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -2380,12 +2411,14 @@ pub(crate) async fn run_tui_session(
                                                             && match &ae {
                                                                 TuiAppEvent::ToolStarted {
                                                                     name,
+                                                                    description,
                                                                     tool_use_id,
                                                                     parent_tool_use_id,
                                                                     ..
                                                                 } => {
                                                                     if name == "bash" && parent_tool_use_id.is_none() {
                                                                         active_bash_tool_use_id = Some(tool_use_id.clone());
+                                                                        active_bash_description = Some(description.clone());
                                                                     }
                                                                     name == "bash"
                                                                 }
@@ -2395,6 +2428,7 @@ pub(crate) async fn run_tui_session(
                                                                 } => {
                                                                     if active_bash_tool_use_id.as_deref() == Some(tool_use_id.as_str()) {
                                                                         active_bash_tool_use_id = None;
+                                                                        active_bash_description = None;
                                                                     }
                                                                     true
                                                                 }
@@ -4415,6 +4449,58 @@ mod tests {
         assert!(!should_show_ctrl_b_background_hint(false));
     }
 
+    #[test]
+    fn bash_tool_completed_returns_foreground_status_to_thinking() {
+        let mut bottom_pane = BottomPane::new();
+        let mut status_indicator = status_indicator::StatusIndicator::new();
+
+        handle_app_event(
+            &TuiAppEvent::ToolStarted {
+                name: "bash".to_string(),
+                description: "$ make check".to_string(),
+                tool_use_id: "tu_bash".to_string(),
+                parent_tool_use_id: None,
+            },
+            &mut bottom_pane,
+            &mut status_indicator,
+            &FrameRequester::test_dummy(),
+        );
+        status_indicator.set_bash_background_hint_enabled(true);
+        assert!(matches!(
+            status_indicator.state(),
+            status_indicator::IndicatorState::Tool { name, .. } if name == "bash"
+        ));
+        assert!(visible_bash_tool_is_running(&status_indicator));
+
+        handle_app_event(
+            &TuiAppEvent::ToolCompleted {
+                name: "bash".to_string(),
+                description: "$ make check".to_string(),
+                status: "success".to_string(),
+                duration_ms: 1200,
+                output_summary: Some(
+                    "<bash_detached>The bash command was promoted to background task bg-shell-1.</bash_detached>"
+                        .to_string(),
+                ),
+                output: None,
+                tool_use_id: "tu_bash".to_string(),
+                parent_tool_use_id: None,
+            },
+            &mut bottom_pane,
+            &mut status_indicator,
+            &FrameRequester::test_dummy(),
+        );
+
+        assert!(matches!(
+            status_indicator.state(),
+            status_indicator::IndicatorState::Thinking { .. }
+        ));
+        assert!(
+            !visible_bash_tool_is_running(&status_indicator),
+            "backgrounded Bash must no longer be the foreground activity after ToolCompleted"
+        );
+    }
+
     #[tokio::test]
     async fn background_task_rows_include_typed_status_and_combined_tail() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -4762,6 +4848,35 @@ mod tests {
             "failed background tasks must remain reachable from Ctrl+T"
         );
         assert!(bottom_pane.has_active_view());
+    }
+
+    #[tokio::test]
+    async fn background_task_switcher_opens_for_pending_bash_handoff() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("pending"));
+        let mut bottom_pane = BottomPane::new();
+
+        assert!(
+            reveal_background_task_view_with_extra_rows(
+                &mut registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+                vec![pending_bash_handoff_row("$ make build", 0)],
+                Some(PENDING_BASH_HANDOFF_TASK_ID),
+            )
+            .await,
+            "Ctrl+B should open background tasks immediately while Bash handoff is pending"
+        );
+
+        assert!(bottom_pane.has_active_view());
+        let counts = bottom_pane
+            .footer
+            .bg_task_counts
+            .expect("pending handoff row should surface footer counts");
+        assert_eq!(counts.running, 1);
     }
 
     #[tokio::test]
