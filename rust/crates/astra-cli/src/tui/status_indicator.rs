@@ -74,6 +74,7 @@ impl Default for IndicatorState {
 #[derive(Debug, Default)]
 pub(crate) struct StatusIndicator {
     state: IndicatorState,
+    bash_background_hint_enabled: bool,
     /// Per-turn streamed-char count (for the `↓ 5.1k tokens`
     /// counter). Reset on each new turn.
     stream_chars: u64,
@@ -107,6 +108,10 @@ impl StatusIndicator {
         &self.state
     }
 
+    pub fn set_bash_background_hint_enabled(&mut self, enabled: bool) {
+        self.bash_background_hint_enabled = enabled;
+    }
+
     pub fn set_state(&mut self, state: IndicatorState) {
         // The stream counter resets across state changes only when
         // entering a *brand new turn*. Within a turn, tool ↔ thinking
@@ -117,6 +122,7 @@ impl StatusIndicator {
             self.stream_chars = 0;
             self.turn_started_at = None;
             self.turn_label = None;
+            self.bash_background_hint_enabled = false;
         } else if self.turn_started_at.is_none() {
             // Auto-start a turn when transitioning out of Idle. Lets
             // existing callers that drive `set_state(Thinking{...})`
@@ -159,12 +165,13 @@ impl StatusIndicator {
     /// clock without mocking `Instant`. Production callers use
     /// `render()`.
     pub fn render_at(&self, now: Instant) -> Option<Line<'static>> {
-        render_for(
+        render_for_with_bash_hint(
             &self.state,
             self.stream_chars,
             self.turn_started_at,
             self.turn_label,
             now,
+            self.bash_background_hint_enabled,
         )
     }
 }
@@ -179,6 +186,17 @@ fn render_for(
     turn_started_at: Option<Instant>,
     turn_label: Option<&'static str>,
     now: Instant,
+) -> Option<Line<'static>> {
+    render_for_with_bash_hint(state, stream_chars, turn_started_at, turn_label, now, false)
+}
+
+fn render_for_with_bash_hint(
+    state: &IndicatorState,
+    stream_chars: u64,
+    turn_started_at: Option<Instant>,
+    turn_label: Option<&'static str>,
+    now: Instant,
+    bash_background_hint_enabled: bool,
 ) -> Option<Line<'static>> {
     if !state.is_active() {
         return None;
@@ -220,7 +238,14 @@ fn render_for(
 
     let mut spans = vec![Span::styled(format!("{} ", star_frame(now)), star_style)];
     spans.extend(label_spans(label, label_style, now));
-    let suffix = suffix(state, elapsed, stream_chars, thought_for, activity);
+    let suffix = suffix(
+        state,
+        elapsed,
+        stream_chars,
+        thought_for,
+        activity,
+        bash_background_hint_enabled,
+    );
     if !suffix.is_empty() {
         spans.push(Span::styled(format!(" {suffix}"), dim));
     }
@@ -295,6 +320,7 @@ fn suffix(
     stream_chars: u64,
     thought_for: Option<Duration>,
     activity: Option<&str>,
+    bash_background_hint_enabled: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(activity) = activity {
@@ -313,6 +339,11 @@ fn suffix(
         && streamed_tokens >= TOKEN_COUNT_VISIBILITY_THRESHOLD
     {
         parts.push(format!("{} tokens", fmt_tokens(streamed_tokens)));
+    }
+    if bash_background_hint_enabled
+        && matches!(state, IndicatorState::Tool { name, .. } if name == "bash")
+    {
+        parts.push("Ctrl+B to background".into());
     }
     parts.push("Esc to stop".into());
     parts.join(" · ")
@@ -521,6 +552,28 @@ mod tests {
         let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
         let text = text_of(&line);
         assert!(text.contains("Bash"));
+    }
+
+    #[test]
+    fn bash_tool_can_surface_ctrl_b_hint() {
+        let t0 = Instant::now();
+        let mut s = StatusIndicator::new();
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0,
+        });
+        s.set_bash_background_hint_enabled(true);
+
+        let text = text_of(&s.render_at(t0 + Duration::from_secs(18)).unwrap());
+        assert!(text.contains("Bash"), "{text}");
+        assert!(text.contains("Ctrl+B to background"), "{text}");
+        assert!(text.contains("Esc to stop"), "{text}");
+
+        s.set_state(IndicatorState::Idle);
+        assert!(
+            !s.bash_background_hint_enabled,
+            "idle transition must clear stale Ctrl+B affordance"
+        );
     }
 
     #[test]

@@ -3239,6 +3239,19 @@ pub(crate) async fn run_bash_with_detach(
     }
 
     if detached {
+        while !stdout_task.is_finished() || !stderr_task.is_finished() {
+            drain_command_chunks(
+                &mut rx,
+                &mut stdout_text,
+                &mut stderr_text,
+                max_stdout_bytes,
+                &mut stdout_capped,
+                max_stderr_bytes,
+                &mut stderr_capped,
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
         // Recover the live streams from the reader tasks. If a task
         // observed EOF before the detach notify (i.e. the stream
         // ended right at the signal moment) the stream is gone and
@@ -3361,10 +3374,14 @@ where
     let mut buffer = [0u8; 8192];
     loop {
         tokio::select! {
-            // Bias toward the read so a fast EOF doesn't lose data
-            // to a stale detach notification. The detach branch only
-            // wins when the read is actually pending.
+            // Ctrl+B is a job-control signal, so it must win even
+            // while a command is producing continuous output. Any
+            // unread bytes remain on the returned stream and are
+            // drained by the background registry after adoption.
             biased;
+            _ = detach.notified() => {
+                return Some(stream);
+            }
             res = stream.read(&mut buffer) => match res {
                 Ok(0) => return None,
                 Ok(read) => {
@@ -3379,9 +3396,6 @@ where
                     }
                 }
                 Err(_) => return None,
-            },
-            _ = detach.notified() => {
-                return Some(stream);
             }
         }
     }
@@ -5356,6 +5370,56 @@ printf 'probe.txt:1:needle\n'
         // The child is still alive in the payload; clean up so the
         // test doesn't leak a sleeping shell.
         drop(payload);
+    }
+
+    #[tokio::test]
+    async fn bash_detach_signal_wins_for_noisy_output() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "i=0; while true; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done"
+                    }),
+                )
+                .await
+            }
+        });
+
+        for _ in 0..50 {
+            if listener.is_active() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            listener.is_active(),
+            "detach listener should become active for running bash"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
+            .await
+            .expect("noisy bash must hand off promptly after Ctrl+B")
+            .expect("listener must receive noisy bash payload");
+        assert!(
+            payload.partial_stdout.contains("line-"),
+            "partial stdout should include noisy command output"
+        );
+        drop(payload);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
+            .await
+            .expect("detached noisy bash should return promptly")
+            .expect("bash task");
+        assert!(result.output.contains("bash_detached"), "{}", result.output);
     }
 
     #[tokio::test]

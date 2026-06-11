@@ -52,6 +52,7 @@ use super::{
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
+const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 
 fn ctrl_b_promoted_notification(task_id: &str) -> String {
     format!(
@@ -71,6 +72,45 @@ fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
 fn should_show_ctrl_b_background_hint(detach_ready: bool) -> bool {
     detach_ready
 }
+
+fn visible_bash_tool_is_running(status_indicator: &status_indicator::StatusIndicator) -> bool {
+    matches!(
+        status_indicator.state(),
+        status_indicator::IndicatorState::Tool { name, .. } if name == "bash"
+    )
+}
+
+fn set_bash_background_hint_enabled(
+    chat_widget: &mut chat_widget::ChatWidget,
+    status_indicator: &mut status_indicator::StatusIndicator,
+    enabled: bool,
+) {
+    chat_widget.set_bash_background_hint_enabled(enabled);
+    status_indicator.set_bash_background_hint_enabled(enabled);
+}
+
+async fn install_bash_detach_listener(
+    slot: &astra_tools::detach::DetachShellSlot,
+    chat_widget: &mut chat_widget::ChatWidget,
+    status_indicator: &mut status_indicator::StatusIndicator,
+) -> astra_tools::detach::DetachShellListener {
+    let (handle, listener) = astra_tools::detach::new_detach_pair();
+    *slot.lock().await = Some(handle);
+    set_bash_background_hint_enabled(chat_widget, status_indicator, false);
+    listener
+}
+
+fn bash_detach_hint_enabled(
+    listener: Option<&astra_tools::detach::DetachShellListener>,
+    _status_indicator: &status_indicator::StatusIndicator,
+) -> bool {
+    let Some(listener) = listener else {
+        return false;
+    };
+    should_show_ctrl_b_background_hint(listener.is_active())
+}
+
+type BashDetachHandoffResult = Result<astra_tools::detach::DetachedShellPayload, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
@@ -1599,18 +1639,22 @@ pub(crate) async fn run_tui_session(
                                     // payload back. Replaces any stale handle from a
                                     // prior turn that was never consumed (e.g. the model
                                     // didn't run bash last turn).
-                                    let mut bash_detach_listener = {
-                                            let (handle, listener) = astra_tools::detach::new_detach_pair();
-                                            if let Ok(mut slot) = state.bash_detach_slot.try_lock() {
-                                                *slot = Some(handle);
-                                                chat_widget.set_bash_background_hint_enabled(
-                                                    should_show_ctrl_b_background_hint(true),
-                                                );
-                                            } else {
-                                                chat_widget.set_bash_background_hint_enabled(false);
-                                            }
-                                        Some(listener)
-                                    };
+                                    let mut bash_detach_listener =
+                                        Some(
+                                            install_bash_detach_listener(
+                                                &state.bash_detach_slot,
+                                                &mut chat_widget,
+                                                &mut status_indicator,
+                                            )
+                                            .await,
+                                        );
+                                    let (
+                                        bash_detach_handoff_tx,
+                                        mut bash_detach_handoff_rx,
+                                    ) = tokio::sync::mpsc::unbounded_channel::<
+                                        BashDetachHandoffResult,
+                                    >();
+                                    let mut bash_detach_request_pending = false;
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
@@ -1639,6 +1683,7 @@ pub(crate) async fn run_tui_session(
                                         let fut = crate::cli::turn::turn_entry::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
+                                        let mut turn_result_ready: Option<Result<(), String>> = None;
                                         let r: Result<(), String> = loop {
                                             if let Err(e) = guard.ensure_tui_modes() {
                                                 break Err(format!(
@@ -1648,7 +1693,13 @@ pub(crate) async fn run_tui_session(
                                             let itick = tokio::time::sleep(Duration::from_millis(80));
                                             tokio::pin!(itick);
                                             tokio::select! {
-                                                result = &mut fut => { break result; }
+                                                result = &mut fut, if turn_result_ready.is_none() => {
+                                                    if bash_detach_request_pending {
+                                                        turn_result_ready = Some(result);
+                                                        continue;
+                                                    }
+                                                    break result;
+                                                }
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
@@ -1710,6 +1761,19 @@ pub(crate) async fn run_tui_session(
                                                             if k.code == crossterm::event::KeyCode::Char('b')
                                                                 && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                                                             {
+                                                                if bash_detach_request_pending {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::info(
+                                                                            "⏎ Backgrounding Bash... waiting for handoff."
+                                                                        ),
+                                                                    );
+                                                                    frame_requester.schedule_frame();
+                                                                    continue;
+                                                                }
+                                                                let visible_bash_is_running =
+                                                                    visible_bash_tool_is_running(
+                                                                        &status_indicator,
+                                                                    );
                                                                 let listener = bash_detach_listener.take();
                                                                 if let Some(listener) = listener {
                                                                     if listener.is_active() {
@@ -1730,92 +1794,54 @@ pub(crate) async fn run_tui_session(
                                                                         // later bash invocation if handoff loses a race.
                                                                         if listener.signal_tx.send(true).is_err() {
                                                                             listener.retire();
-                                                                            if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
-                                                                                *slot = None;
-                                                                            }
-                                                                        } else {
-                                                                            listener.retire();
-                                                                        // Wait briefly for the runner to ship
-                                                                        // the live child + streams payload.
-                                                                        // 500ms is comfortably more than the
-                                                                        // bash runner's 25ms idle-poll tick;
-                                                                        // longer waits indicate bash wasn't
-                                                                        // actually running when the user hit
-                                                                        // Ctrl+B.
-                                                                        let payload = tokio::time::timeout(
-                                                                            std::time::Duration::from_millis(500),
-                                                                            listener.payload_rx,
-                                                                        )
-                                                                        .await;
-                                                                        match payload {
-                                                                            Ok(Ok(p)) => {
-                                                                                // Drop the bash runner straight
-                                                                                // into the registry. The
-                                                                                // adopt_detached_shell API
-                                                                                // takes the live child + streams
-                                                                                // and emits Started/Completed
-                                                                                // events like a normal bg task.
-                                                                                let id = match background_registry.adopt_detached_shell(
-                                                                                    p.child,
-                                                                                    p.stdout,
-                                                                                    p.stderr,
-                                                                                    &p.command,
-                                                                                    p.partial_stdout,
-                                                                                    p.partial_stderr,
-                                                                                ) {
-                                                                                    Ok(id) => id,
-                                                                                    Err(error) => {
-                                                                                        chat_widget.commit_system(
-                                                                                            history_cell::system::SystemCell::error(
-                                                                                                format!("⏎ Backgrounding failed: {error}")
-                                                                                            ),
-                                                                                        );
-                                                                                        frame_requester.schedule_frame();
-                                                                                        continue;
-                                                                                    }
-                                                                                };
-                                                                                chat_widget.commit_system(
-                                                                                    history_cell::system::SystemCell::info(
-                                                                                        format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
-                                                                                    ),
-                                                                                );
-                                                                                ctrl_b_promoted_task_id = Some(id);
-                                                                                persist_background_task_projections_if_changed(
-                                                                                    &mut background_registry,
-                                                                                    background_registry_turn_session_id.as_deref(),
-                                                                                    background_registry_turn_model.as_deref(),
-                                                                                    &mut background_task_projection_cache,
-                                                                                );
-                                                                                let selected_id = ctrl_b_promoted_task_id.as_deref();
-                                                                                let _ = reveal_background_task_view(
-                                                                                    &mut background_registry,
-                                                                                    agent_spawner_for_cancel.as_ref(),
-                                                                                    &restored_local_agent_task_projections,
-                                                                                    &mut bottom_pane,
-                                                                                    &frame_requester,
-                                                                                    selected_id,
-                                                                                )
-                                                                                .await;
-                                                                                // The turn is over from the
-                                                                                // model's perspective; cancel
-                                                                                // gracefully so it sees the
-                                                                                // <bash_detached> marker
-                                                                                // already returned by the bash
-                                                                                // tool and ends cleanly.
-                                                                                tui_cancel_token.cancel();
-                                                                                frame_requester.schedule_frame();
-                                                                                continue;
-                                                                            }
-                                                                            // No payload — bash completed or
-                                                                            // could not hand off after it had
-                                                                            // advertised an active detach window.
-                                                                            _ => {
-                                                                                if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
-                                                                                    *slot = None;
-                                                                                }
-                                                                            }
+                                                                            *bash_detach_slot_for_ctrl_b.lock().await = None;
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::error(
+                                                                                    "⏎ Backgrounding failed: active bash detach signal channel closed."
+                                                                                ),
+                                                                            );
+                                                                            set_bash_background_hint_enabled(
+                                                                                &mut chat_widget,
+                                                                                &mut status_indicator,
+                                                                                false,
+                                                                            );
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
                                                                         }
-                                                                        }
+                                                                        listener.retire();
+                                                                        bash_detach_request_pending = true;
+                                                                        set_bash_background_hint_enabled(
+                                                                            &mut chat_widget,
+                                                                            &mut status_indicator,
+                                                                            false,
+                                                                        );
+                                                                        chat_widget.commit_system(
+                                                                            history_cell::system::SystemCell::info(
+                                                                                "⏎ Backgrounding Bash... waiting for handoff."
+                                                                            ),
+                                                                        );
+                                                                        let handoff_tx = bash_detach_handoff_tx.clone();
+                                                                        tokio::spawn(async move {
+                                                                            let handoff = tokio::time::timeout(
+                                                                                BASH_DETACH_HANDOFF_WAIT,
+                                                                                listener.payload_rx,
+                                                                            )
+                                                                            .await;
+                                                                            let result = match handoff {
+                                                                                Ok(Ok(payload)) => Ok(payload),
+                                                                                Ok(Err(_)) => Err(
+                                                                                    "bash runner ended before handing off the process."
+                                                                                        .to_string(),
+                                                                                ),
+                                                                                Err(_) => Err(
+                                                                                    "bash did not hand off the process in time."
+                                                                                        .to_string(),
+                                                                                ),
+                                                                            };
+                                                                            let _ = handoff_tx.send(result);
+                                                                        });
+                                                                        frame_requester.schedule_frame();
+                                                                        continue;
                                                                     } else {
                                                                         bash_detach_listener = Some(listener);
                                                                     }
@@ -1849,11 +1875,35 @@ pub(crate) async fn run_tui_session(
                                                                         continue;
                                                                     }
                                                                 }
-                                                                chat_widget.commit_system(
-                                                                    history_cell::system::SystemCell::info(
-                                                                        "⏎ Backgrounding unavailable: no active bash or agent can be promoted right now."
-                                                                    ),
-                                                                );
+                                                                if !bottom_pane.has_active_view()
+                                                                    && open_background_task_view(
+                                                                        &mut background_registry,
+                                                                        agent_spawner_for_cancel.as_ref(),
+                                                                        &restored_local_agent_task_projections,
+                                                                        &mut bottom_pane,
+                                                                        &frame_requester,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                if bottom_pane.has_active_view() {
+                                                                    frame_requester.schedule_frame();
+                                                                    continue;
+                                                                }
+                                                                if visible_bash_is_running {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::info(
+                                                                            "⏎ Backgrounding unavailable: this Bash command is not attached to a backgroundable runner; Esc can stop it."
+                                                                        ),
+                                                                    );
+                                                                } else {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::info(
+                                                                            "⏎ Backgrounding unavailable: no active foreground bash or agent, and no background tasks to show."
+                                                                        ),
+                                                                    );
+                                                                }
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
@@ -2197,6 +2247,90 @@ pub(crate) async fn run_tui_session(
                                                         _ => {}
                                                     }
                                                 }
+                                                Some(handoff) = bash_detach_handoff_rx.recv() => {
+                                                    bash_detach_request_pending = false;
+                                                    match handoff {
+                                                        Ok(p) => {
+                                                            let id = match background_registry.adopt_detached_shell(
+                                                                p.child,
+                                                                p.stdout,
+                                                                p.stderr,
+                                                                &p.command,
+                                                                p.partial_stdout,
+                                                                p.partial_stderr,
+                                                            ) {
+                                                                Ok(id) => id,
+                                                                Err(error) => {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::error(
+                                                                            format!("⏎ Backgrounding failed: {error}")
+                                                                        ),
+                                                                    );
+                                                                    set_bash_background_hint_enabled(
+                                                                        &mut chat_widget,
+                                                                        &mut status_indicator,
+                                                                        false,
+                                                                    );
+                                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                    frame_requester.schedule_frame();
+                                                                    if let Some(result) = turn_result_ready.take() {
+                                                                        break result;
+                                                                    }
+                                                                    continue;
+                                                                }
+                                                            };
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::info(
+                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
+                                                                ),
+                                                            );
+                                                            let selected_id = id.clone();
+                                                            ctrl_b_promoted_task_id = Some(id);
+                                                            set_bash_background_hint_enabled(
+                                                                &mut chat_widget,
+                                                                &mut status_indicator,
+                                                                false,
+                                                            );
+                                                            persist_background_task_projections_if_changed(
+                                                                &mut background_registry,
+                                                                background_registry_turn_session_id.as_deref(),
+                                                                background_registry_turn_model.as_deref(),
+                                                                &mut background_task_projection_cache,
+                                                            );
+                                                            let _ = reveal_background_task_view(
+                                                                &mut background_registry,
+                                                                agent_spawner_for_cancel.as_ref(),
+                                                                &restored_local_agent_task_projections,
+                                                                &mut bottom_pane,
+                                                                &frame_requester,
+                                                                Some(selected_id.as_str()),
+                                                            )
+                                                            .await;
+                                                            tui_cancel_token.cancel();
+                                                        }
+                                                        Err(error) => {
+                                                            *bash_detach_slot_for_ctrl_b.lock().await = None;
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    format!("⏎ Backgrounding failed: {error}")
+                                                                ),
+                                                            );
+                                                            set_bash_background_hint_enabled(
+                                                                &mut chat_widget,
+                                                                &mut status_indicator,
+                                                                false,
+                                                            );
+                                                        }
+                                                    }
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                    frame_requester.schedule_frame();
+                                                    if let Some(result) = turn_result_ready.take() {
+                                                        break result;
+                                                    }
+                                                    continue;
+                                                }
                                                 Some(ae) = tui_rx.recv() => {
                                                     // Track per-turn metrics
                                                     match &ae {
@@ -2229,6 +2363,38 @@ pub(crate) async fn run_tui_session(
                                                         &mut chat_widget,
                                                     );
                                                     handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
+                                                    let should_rearm_bash_detach =
+                                                        bash_detach_listener.is_none()
+                                                            && match &ae {
+                                                                TuiAppEvent::ToolStarted {
+                                                                    name,
+                                                                    ..
+                                                                } => name == "bash",
+                                                                TuiAppEvent::ToolCompleted {
+                                                                    ..
+                                                                } => true,
+                                                                _ => false,
+                                                            };
+                                                    if should_rearm_bash_detach {
+                                                        bash_detach_listener = Some(
+                                                            install_bash_detach_listener(
+                                                                &bash_detach_slot_for_ctrl_b,
+                                                                &mut chat_widget,
+                                                                &mut status_indicator,
+                                                            )
+                                                            .await,
+                                                        );
+                                                    }
+                                                    let bash_hint_enabled =
+                                                        bash_detach_hint_enabled(
+                                                            bash_detach_listener.as_ref(),
+                                                            &status_indicator,
+                                                        );
+                                                    set_bash_background_hint_enabled(
+                                                        &mut chat_widget,
+                                                        &mut status_indicator,
+                                                        bash_hint_enabled,
+                                                    );
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                     {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -2342,6 +2508,16 @@ pub(crate) async fn run_tui_session(
                                                     {
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
                                                     }
+                                                    let bash_hint_enabled =
+                                                        bash_detach_hint_enabled(
+                                                            bash_detach_listener.as_ref(),
+                                                            &status_indicator,
+                                                        );
+                                                    set_bash_background_hint_enabled(
+                                                        &mut chat_widget,
+                                                        &mut status_indicator,
+                                                        bash_hint_enabled,
+                                                    );
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     let frame = active_viewport(
                                         &chat_widget,
@@ -2414,7 +2590,11 @@ pub(crate) async fn run_tui_session(
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    chat_widget.set_bash_background_hint_enabled(false);
+                                    set_bash_background_hint_enabled(
+                                        &mut chat_widget,
+                                        &mut status_indicator,
+                                        false,
+                                    );
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
                                     status_indicator.set_state(

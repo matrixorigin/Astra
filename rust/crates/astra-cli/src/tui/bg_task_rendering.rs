@@ -462,6 +462,25 @@ pub(crate) async fn reveal_background_task_view(
     frame_requester: &FrameRequester,
     selected_id: Option<&str>,
 ) -> bool {
+    reveal_background_task_view_with_selected(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        selected_id,
+    )
+    .await
+}
+
+async fn reveal_background_task_view_with_selected(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+    selected_id: Option<&str>,
+) -> bool {
     let rows =
         background_task_rows_with_agents(background_registry, agent_spawner, restored_local_agents)
             .await;
