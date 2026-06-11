@@ -1258,7 +1258,7 @@ mod tests {
         let out = render(&t, 100, 4);
         assert!(out.contains("Running in the background"), "{out}");
         assert!(
-            out.contains(&crate::tui::background_shortcut::background_task_open_hint()),
+            out.contains(crate::tui::background_shortcut::background_task_open_hint()),
             "{out}"
         );
         assert!(!out.contains("failed before returning output"), "{out}");

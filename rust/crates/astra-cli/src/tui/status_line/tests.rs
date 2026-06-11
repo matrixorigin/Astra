@@ -571,7 +571,7 @@ fn bg_running_only_renders_count() {
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
-        plain.contains(&crate::tui::background_shortcut::background_task_open_hint()),
+        plain.contains(crate::tui::background_shortcut::background_task_open_hint()),
         "running background tasks must expose the foreground switcher shortcut; got {plain:?}"
     );
     assert!(
@@ -753,7 +753,7 @@ fn bg_footer_stays_discoverable_during_active_foreground_turn() {
         "foreground activity must not hide running background tasks; got {plain:?}"
     );
     assert!(
-        plain.contains(&open_hint),
+        plain.contains(open_hint),
         "footer must tell the user how to open/switch to background tasks; got {plain:?}"
     );
 }

@@ -75,6 +75,13 @@ fn visible_bash_tool_is_running(status_indicator: &status_indicator::StatusIndic
     )
 }
 
+fn is_background_task_manage_key(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == crossterm::event::KeyCode::Down
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT)
+}
+
 fn set_bash_background_hint_enabled(
     chat_widget: &mut chat_widget::ChatWidget,
     status_indicator: &mut status_indicator::StatusIndicator,
@@ -811,6 +818,24 @@ pub(crate) async fn run_tui_session(
                         {
                             let _ = guard.terminal.clear();
                             guard.terminal.invalidate_viewport();
+                            frame_requester.schedule_frame();
+                            continue;
+                        }
+                        if is_background_task_manage_key(&key) && !bottom_pane.has_active_view() {
+                            if open_background_task_view(
+                                &mut background_registry,
+                                state.agent_spawner.as_ref(),
+                                &restored_local_agent_task_projections,
+                                &mut bottom_pane,
+                                &frame_requester,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                "No background tasks to manage.",
+                            ));
                             frame_requester.schedule_frame();
                             continue;
                         }
@@ -1737,6 +1762,28 @@ pub(crate) async fn run_tui_session(
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::response(
                                                                         slash_dispatch::permission_mode_feedback(next_mode),
+                                                                    ),
+                                                                );
+                                                                frame_requester.schedule_frame();
+                                                                continue;
+                                                            }
+                                                            if is_background_task_manage_key(&k)
+                                                                && !bottom_pane.has_active_view()
+                                                            {
+                                                                if open_background_task_view(
+                                                                    &mut background_registry,
+                                                                    agent_spawner_for_cancel.as_ref(),
+                                                                    &restored_local_agent_task_projections,
+                                                                    &mut bottom_pane,
+                                                                    &frame_requester,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::info(
+                                                                        "No background tasks to manage."
                                                                     ),
                                                                 );
                                                                 frame_requester.schedule_frame();
@@ -4447,6 +4494,26 @@ mod tests {
     fn ctrl_b_background_hint_requires_detach() {
         assert!(should_show_ctrl_b_background_hint(true));
         assert!(!should_show_ctrl_b_background_hint(false));
+    }
+
+    #[test]
+    fn shift_down_is_background_task_manage_key() {
+        let shift_down = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let plain_down = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let ctrl_b = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('b'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+
+        assert!(is_background_task_manage_key(&shift_down));
+        assert!(!is_background_task_manage_key(&plain_down));
+        assert!(!is_background_task_manage_key(&ctrl_b));
     }
 
     #[test]

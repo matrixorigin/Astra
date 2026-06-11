@@ -2,11 +2,8 @@ pub(crate) fn ctrl_b_background_shortcut() -> &'static str {
     ctrl_b_background_shortcut_for_tmux(is_tmux_session())
 }
 
-pub(crate) fn background_task_open_hint() -> String {
-    format!(
-        "{} open",
-        background_task_open_shortcuts_for_tmux(is_tmux_session())
-    )
+pub(crate) fn background_task_open_hint() -> &'static str {
+    "Shift+↓ manage"
 }
 
 pub(crate) fn ctrl_b_background_shortcut_for_tmux(is_tmux: bool) -> &'static str {
@@ -14,14 +11,6 @@ pub(crate) fn ctrl_b_background_shortcut_for_tmux(is_tmux: bool) -> &'static str
         "Ctrl+B Ctrl+B (twice)"
     } else {
         "Ctrl+B"
-    }
-}
-
-pub(crate) fn background_task_open_shortcuts_for_tmux(is_tmux: bool) -> &'static str {
-    if is_tmux {
-        "Ctrl+B Ctrl+B/Ctrl+T"
-    } else {
-        "Ctrl+B/Ctrl+T"
     }
 }
 
@@ -43,14 +32,7 @@ mod tests {
     }
 
     #[test]
-    fn background_task_open_shortcuts_stay_compact_in_tmux() {
-        assert_eq!(
-            background_task_open_shortcuts_for_tmux(false),
-            "Ctrl+B/Ctrl+T"
-        );
-        assert_eq!(
-            background_task_open_shortcuts_for_tmux(true),
-            "Ctrl+B Ctrl+B/Ctrl+T"
-        );
+    fn background_task_open_hint_uses_navigation_manage_shortcut() {
+        assert_eq!(background_task_open_hint(), "Shift+↓ manage");
     }
 }
