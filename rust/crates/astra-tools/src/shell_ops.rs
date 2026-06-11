@@ -22,7 +22,6 @@ use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exi
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
-const COMMAND_DRAIN_CHUNK_BUDGET: usize = 64;
 
 /// RAII guard for detach handle lifecycle. Takes ownership on creation,
 /// automatically restores to slot on drop unless explicitly consumed.
@@ -3102,11 +3101,13 @@ async fn run_readonly_command_with_partial(
 }
 
 /// Detach-aware bash runner. Same shape as
-/// [`run_readonly_command_with_partial`] but the readers can yield
-/// the streams back when `detach.signal.notified()` fires. Detach
-/// wins over normal completion only while the child is still running
-/// — a child that exits before the user presses Ctrl+B still flows
-/// through the `Completed` path.
+/// [`run_readonly_command_with_partial`] but the runner owns stdout
+/// and stderr directly in its `select!` loop. When Ctrl+B arrives,
+/// it can hand the live child and streams to the host immediately
+/// instead of waiting for helper reader tasks to return ownership.
+/// Detach wins over normal completion only while the child is still
+/// running — a child that exits before the user presses Ctrl+B still
+/// flows through the `Completed` path.
 ///
 /// Returns `Detached(payload)` when the signal fires during reading;
 /// `Completed(output)` otherwise. The caller (bash tool) must
@@ -3120,8 +3121,6 @@ pub(crate) async fn run_bash_with_detach(
     detach: &crate::detach::DetachShellHandle,
     command_label: &str,
 ) -> Result<BashRunOutcome, String> {
-    use std::sync::Arc;
-
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
@@ -3137,25 +3136,8 @@ pub(crate) async fn run_bash_with_detach(
         .stderr
         .take()
         .ok_or_else(|| "Error: failed to capture bash command stderr".to_string())?;
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(StreamKind, String)>(256);
-    // Two private notify halves so the outer detach signal fans out
-    // to both reader tasks without losing notifications. We trip
-    // both manually after observing the shared oneshot signal.
-    let stdout_detach = Arc::new(tokio::sync::Notify::new());
-    let stderr_detach = Arc::new(tokio::sync::Notify::new());
-    let stdout_task = tokio::spawn(read_stream_until_detach(
-        stdout,
-        StreamKind::Stdout,
-        tx.clone(),
-        stdout_detach.clone(),
-    ));
-    let stderr_task = tokio::spawn(read_stream_until_detach(
-        stderr,
-        StreamKind::Stderr,
-        tx,
-        stderr_detach.clone(),
-    ));
+    let mut stdout = stdout;
+    let mut stderr = stderr;
 
     // Take the watch receiver for detach. If absent, the command
     // cannot be promoted. The watch receiver is borrowed in select!
@@ -3171,29 +3153,14 @@ pub(crate) async fn run_bash_with_detach(
     let mut timed_out = false;
     let mut cancelled = false;
     let mut detached = false;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_buffer = [0u8; 8192];
+    let mut stderr_buffer = [0u8; 8192];
 
     loop {
         if detach_signal_observed(&mut signal_rx) {
             detached = true;
-            stdout_detach.notify_one();
-            stderr_detach.notify_one();
-            break;
-        }
-
-        drain_command_chunks_budgeted(
-            &mut rx,
-            &mut stdout_text,
-            &mut stderr_text,
-            max_stdout_bytes,
-            &mut stdout_capped,
-            max_stderr_bytes,
-            &mut stderr_capped,
-        );
-
-        if detach_signal_observed(&mut signal_rx) {
-            detached = true;
-            stdout_detach.notify_one();
-            stderr_detach.notify_one();
             break;
         }
 
@@ -3208,82 +3175,119 @@ pub(crate) async fn run_bash_with_detach(
                     sigkill_process_group(&mut child).await;
                     break;
                 }
-                // Race: detach signal vs cancel vs idle tick.
-                // Watch receiver's `changed()` borrows `&mut self` so it
-                // plays nicely with select! without ownership transfer.
-                if let Some(ref mut rx) = signal_rx {
-                    if let Some(token) = cancel_token {
-                        tokio::select! {
-                            _ = token.cancelled() => {
-                                cancelled = true;
-                                sigkill_process_group(&mut child).await;
-                                break;
-                            }
-                            res = rx.changed() => {
-                                match res {
-                                    Ok(()) if *rx.borrow_and_update() => {
-                                        detached = true;
-                                        stdout_detach.notify_one();
-                                        stderr_detach.notify_one();
-                                        break;
-                                    }
-                                    Ok(()) => {}
-                                    Err(_) => {
-                                        // Sender dropped -> no detach possible.
-                                        signal_rx = None;
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                        }
-                    } else {
-                        tokio::select! {
-                            res = rx.changed() => {
-                                match res {
-                                    Ok(()) if *rx.borrow_and_update() => {
-                                        detached = true;
-                                        stdout_detach.notify_one();
-                                        stderr_detach.notify_one();
-                                        break;
-                                    }
-                                    Ok(()) => {}
-                                    Err(_) => {
-                                        signal_rx = None;
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                        }
-                    }
-                } else if let Some(token) = cancel_token {
-                    // No detach signal available, but cancel is wired.
+
+                if let Some(rx) = signal_rx.as_mut() {
                     tokio::select! {
-                        _ = token.cancelled() => {
+                        biased;
+                        res = rx.changed() => {
+                            match res {
+                                Ok(()) if *rx.borrow_and_update() => {
+                                    detached = true;
+                                    break;
+                                }
+                                Ok(()) => {}
+                                Err(_) => {
+                                    signal_rx = None;
+                                }
+                            }
+                        }
+                        _ = async {
+                            if let Some(token) = cancel_token {
+                                token.cancelled().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
                             cancelled = true;
                             sigkill_process_group(&mut child).await;
                             break;
                         }
+                        read = stdout.read(&mut stdout_buffer), if stdout_open => {
+                            match read {
+                                Ok(0) => stdout_open = false,
+                                Ok(read) => append_command_bytes(
+                                    &mut stdout_text,
+                                    &stdout_buffer[..read],
+                                    max_stdout_bytes,
+                                    &mut stdout_capped,
+                                ),
+                                Err(_) => stdout_open = false,
+                            }
+                        }
+                        read = stderr.read(&mut stderr_buffer), if stderr_open => {
+                            match read {
+                                Ok(0) => stderr_open = false,
+                                Ok(read) => append_command_bytes(
+                                    &mut stderr_text,
+                                    &stderr_buffer[..read],
+                                    max_stderr_bytes,
+                                    &mut stderr_capped,
+                                ),
+                                Err(_) => stderr_open = false,
+                            }
+                        }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                     }
                 } else {
-                    // Neither detach nor cancel: plain tick.
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    tokio::select! {
+                        biased;
+                        _ = async {
+                            if let Some(token) = cancel_token {
+                                token.cancelled().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            cancelled = true;
+                            sigkill_process_group(&mut child).await;
+                            break;
+                        }
+                        read = stdout.read(&mut stdout_buffer), if stdout_open => {
+                            match read {
+                                Ok(0) => stdout_open = false,
+                                Ok(read) => append_command_bytes(
+                                    &mut stdout_text,
+                                    &stdout_buffer[..read],
+                                    max_stdout_bytes,
+                                    &mut stdout_capped,
+                                ),
+                                Err(_) => stdout_open = false,
+                            }
+                        }
+                        read = stderr.read(&mut stderr_buffer), if stderr_open => {
+                            match read {
+                                Ok(0) => stderr_open = false,
+                                Ok(read) => append_command_bytes(
+                                    &mut stderr_text,
+                                    &stderr_buffer[..read],
+                                    max_stderr_bytes,
+                                    &mut stderr_capped,
+                                ),
+                                Err(_) => stderr_open = false,
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
                 }
             }
             Err(e) => {
                 let error_msg = format!("Error: bash command failed: {e}");
                 sigkill_process_group(&mut child).await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                drain_command_chunks(
-                    &mut rx,
-                    &mut stdout_text,
-                    &mut stderr_text,
-                    max_stdout_bytes,
-                    &mut stdout_capped,
-                    max_stderr_bytes,
-                    &mut stderr_capped,
-                );
+                drain_remaining_command_streams(
+                    &mut stdout,
+                    &mut stderr,
+                    CommandStreamDrainState {
+                        stdout_open: &mut stdout_open,
+                        stderr_open: &mut stderr_open,
+                        stdout_text: &mut stdout_text,
+                        stderr_text: &mut stderr_text,
+                        stdout_capped: &mut stdout_capped,
+                        stderr_capped: &mut stderr_capped,
+                        max_stdout_bytes,
+                        max_stderr_bytes,
+                    },
+                )
+                .await;
                 restore_detach_signal_receiver(detach, signal_rx).await;
                 return Err(error_msg);
             }
@@ -3291,70 +3295,34 @@ pub(crate) async fn run_bash_with_detach(
     }
 
     if detached {
-        while !stdout_task.is_finished() || !stderr_task.is_finished() {
-            drain_command_chunks_budgeted(
-                &mut rx,
-                &mut stdout_text,
-                &mut stderr_text,
-                max_stdout_bytes,
-                &mut stdout_capped,
-                max_stderr_bytes,
-                &mut stderr_capped,
-            );
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-
-        // Recover the live streams from the reader tasks. If a task
-        // observed EOF before the detach notify (i.e. the stream
-        // ended right at the signal moment) the stream is gone and
-        // we can't include it in the payload — drop back to
-        // Completed for that branch.
-        let stdout_back = stdout_task.await.ok().flatten();
-        let stderr_back = stderr_task.await.ok().flatten();
-        // Final drain so partial state is accurate.
-        drain_command_chunks(
-            &mut rx,
-            &mut stdout_text,
-            &mut stderr_text,
-            max_stdout_bytes,
-            &mut stdout_capped,
-            max_stderr_bytes,
-            &mut stderr_capped,
-        );
-
-        if let (Some(stdout), Some(stderr)) = (stdout_back, stderr_back) {
-            let payload = Box::new(crate::detach::DetachedShellPayload {
-                child,
-                stdout,
-                stderr,
-                command: command_label.to_string(),
-                partial_stdout: stdout_text,
-                partial_stderr: stderr_text,
-            });
-            return Ok(BashRunOutcome::Detached(payload));
-        }
-        // Detach is an ownership transfer. If either stream is already gone,
-        // the host cannot safely adopt the live process, so terminate it
-        // instead of leaving an orphan or blocking the foreground tool.
-        sigkill_process_group(&mut child).await;
-        return Err(
-            "Error: bash detach failed: child stream closed before handoff completed".to_string(),
-        );
+        let payload = Box::new(crate::detach::DetachedShellPayload {
+            child,
+            stdout,
+            stderr,
+            command: command_label.to_string(),
+            partial_stdout: stdout_text,
+            partial_stderr: stderr_text,
+        });
+        return Ok(BashRunOutcome::Detached(payload));
     }
 
     // Normal completion path: drain remaining bytes and assemble
     // output exactly like the legacy runner.
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-    drain_command_chunks(
-        &mut rx,
-        &mut stdout_text,
-        &mut stderr_text,
-        max_stdout_bytes,
-        &mut stdout_capped,
-        max_stderr_bytes,
-        &mut stderr_capped,
-    );
+    drain_remaining_command_streams(
+        &mut stdout,
+        &mut stderr,
+        CommandStreamDrainState {
+            stdout_open: &mut stdout_open,
+            stderr_open: &mut stderr_open,
+            stdout_text: &mut stdout_text,
+            stderr_text: &mut stderr_text,
+            stdout_capped: &mut stdout_capped,
+            stderr_capped: &mut stderr_capped,
+            max_stdout_bytes,
+            max_stderr_bytes,
+        },
+    )
+    .await;
 
     if timed_out || cancelled {
         truncate_partial_line(&mut stdout_text);
@@ -3400,59 +3368,6 @@ async fn read_stream<R>(
     }
 }
 
-/// Detach-aware variant of [`read_stream`] used by the bash tool when
-/// a `DetachShellHandle` is wired in `ToolContext`. On normal stream
-/// EOF returns `None` (legacy behaviour); when the embedded
-/// `Notify::notified()` fires it returns `Some(stream)` so the caller
-/// can hand the live stream off to the BackgroundTaskRegistry without
-/// reading further bytes (preserving exact byte-stream continuity for
-/// the adopted task).
-///
-/// This is a sibling rather than a parameterized version because:
-///   1. Adding the notify branch to the hot-path `read_stream` would
-///      compile in `tokio::select!` overhead for every bash call
-///      whether or not detach is wired.
-///   2. The return type changes (`()` → `Option<R>`), and changing
-///      `read_stream`'s signature would touch every caller.
-async fn read_stream_until_detach<R>(
-    mut stream: R,
-    kind: StreamKind,
-    tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
-    detach: std::sync::Arc<tokio::sync::Notify>,
-) -> Option<R>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buffer = [0u8; 8192];
-    loop {
-        tokio::select! {
-            // Ctrl+B is a job-control signal, so it must win even
-            // while a command is producing continuous output. Any
-            // unread bytes remain on the returned stream and are
-            // drained by the background registry after adoption.
-            biased;
-            _ = detach.notified() => {
-                return Some(stream);
-            }
-            res = stream.read(&mut buffer) => match res {
-                Ok(0) => return None,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                    if tx.send((kind, text)).await.is_err() {
-                        tracing::warn!(
-                            stream_kind = ?kind,
-                            "detach command output channel closed; {} bytes lost",
-                            read
-                        );
-                        return None;
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
-    }
-}
-
 fn drain_command_chunks(
     rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
     stdout_text: &mut String,
@@ -3471,30 +3386,6 @@ fn drain_command_chunks(
         max_stderr_bytes,
         stderr_capped,
     ) {}
-}
-
-fn drain_command_chunks_budgeted(
-    rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
-    stdout_text: &mut String,
-    stderr_text: &mut String,
-    max_stdout_bytes: usize,
-    stdout_capped: &mut bool,
-    max_stderr_bytes: usize,
-    stderr_capped: &mut bool,
-) {
-    for _ in 0..COMMAND_DRAIN_CHUNK_BUDGET {
-        if !drain_one_command_chunk(
-            rx,
-            stdout_text,
-            stderr_text,
-            max_stdout_bytes,
-            stdout_capped,
-            max_stderr_bytes,
-            stderr_capped,
-        ) {
-            break;
-        }
-    }
 }
 
 fn drain_one_command_chunk(
@@ -3536,6 +3427,73 @@ fn append_capped(output: &mut String, chunk: &str, max_bytes: usize, capped: &mu
         return;
     }
     output.push_str(chunk);
+}
+
+fn append_command_bytes(output: &mut String, bytes: &[u8], max_bytes: usize, capped: &mut bool) {
+    let text = String::from_utf8_lossy(bytes);
+    append_capped(output, &text, max_bytes, capped);
+}
+
+struct CommandStreamDrainState<'a> {
+    stdout_open: &'a mut bool,
+    stderr_open: &'a mut bool,
+    stdout_text: &'a mut String,
+    stderr_text: &'a mut String,
+    stdout_capped: &'a mut bool,
+    stderr_capped: &'a mut bool,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+}
+
+async fn drain_remaining_command_streams<O, E>(
+    stdout: &mut O,
+    stderr: &mut E,
+    state: CommandStreamDrainState<'_>,
+) where
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
+    let CommandStreamDrainState {
+        stdout_open,
+        stderr_open,
+        stdout_text,
+        stderr_text,
+        stdout_capped,
+        stderr_capped,
+        max_stdout_bytes,
+        max_stderr_bytes,
+    } = state;
+    let mut stdout_buffer = [0u8; 8192];
+    let mut stderr_buffer = [0u8; 8192];
+
+    while *stdout_open || *stderr_open {
+        tokio::select! {
+            read = stdout.read(&mut stdout_buffer), if *stdout_open => {
+                match read {
+                    Ok(0) => *stdout_open = false,
+                    Ok(read) => append_command_bytes(
+                        stdout_text,
+                        &stdout_buffer[..read],
+                        max_stdout_bytes,
+                        stdout_capped,
+                    ),
+                    Err(_) => *stdout_open = false,
+                }
+            }
+            read = stderr.read(&mut stderr_buffer), if *stderr_open => {
+                match read {
+                    Ok(0) => *stderr_open = false,
+                    Ok(read) => append_command_bytes(
+                        stderr_text,
+                        &stderr_buffer[..read],
+                        max_stderr_bytes,
+                        stderr_capped,
+                    ),
+                    Err(_) => *stderr_open = false,
+                }
+            }
+        }
+    }
 }
 
 fn annotate_grep_with_scope(grep_output: &str, workspace_root: &Path) -> String {
@@ -5595,7 +5553,7 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_detach_after_stream_eof_kills_child_and_errors() {
+    async fn bash_detach_after_stdout_eof_still_hands_off_child() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
         let (slot, listener) = crate::detach::new_slot_with_handle();
@@ -5617,18 +5575,19 @@ printf 'probe.txt:1:needle\n'
         tokio::time::sleep(Duration::from_millis(200)).await;
         listener.signal_tx.send(true).expect("detach signal send");
 
-        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
+        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
             .await
-            .expect("detach failure should not hang")
+            .expect("stdout-closed bash must still hand off promptly")
+            .expect("listener must receive payload for stdout-closed bash");
+        assert_eq!(payload.command, "exec 1>&-; sleep 30");
+        drop(payload);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
+            .await
+            .expect("detached stdout-closed bash should return promptly")
             .expect("bash task");
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("child stream closed before handoff completed"),
-            "{}",
-            result.output
-        );
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("bash_detached"), "{}", result.output);
     }
 
     #[tokio::test]

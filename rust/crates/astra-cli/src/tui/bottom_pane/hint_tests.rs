@@ -50,7 +50,14 @@ fn context_panel_hint_mentions_close() {
 fn help_hint_mentions_ctrl_b_backgrounding() {
     use super::help_view::HelpView;
     let v = HelpView::new();
-    hint_contains(&v, &["Ctrl+B", "background", "Esc"]);
+    hint_contains(
+        &v,
+        &[
+            crate::tui::background_shortcut::ctrl_b_background_shortcut(),
+            "background",
+            "Esc",
+        ],
+    );
 }
 
 // ─── Timeline ─────────────────────────────────────────────────────
