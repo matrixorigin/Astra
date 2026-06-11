@@ -562,39 +562,84 @@ async fn reveal_background_task_view_rows(
     extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
     selected_id: Option<&str>,
 ) -> bool {
+    reveal_background_task_view_rows_inner(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        extra_rows,
+        selected_id,
+        false,
+    )
+    .await
+}
+
+/// Always open the background task panel, even if the registry is empty.
+/// Used by Ctrl+B so the user always lands in a panel they can navigate or
+/// dismiss. Empty-state rendering ("No background tasks.") lives in
+/// [`BackgroundTaskView::render_list`].
+pub(crate) async fn force_open_background_task_view(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    reveal_background_task_view_rows_inner(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        Vec::new(),
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reveal_background_task_view_rows_inner(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+    extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
+    selected_id: Option<&str>,
+    force_open: bool,
+) -> bool {
     let mut rows =
         background_task_rows_with_agents(background_registry, agent_spawner, restored_local_agents)
             .await;
     rows.extend(extra_rows);
-    if rows.is_empty() {
-        sync_background_task_footer_from_rows(bottom_pane, &rows);
-        if bottom_pane.accepts_background_task_rows() {
-            bottom_pane.refresh_background_task_rows(rows);
-            bottom_pane.sync_popups();
-            frame_requester.schedule_frame();
-        }
-        return false;
-    }
-    let counts = super::status_line::BackgroundTaskCounts::from_rows(&rows);
-    if counts.is_empty() {
-        sync_background_task_footer_from_rows(bottom_pane, &rows);
-        if bottom_pane.accepts_background_task_rows() {
-            bottom_pane.refresh_background_task_rows(rows);
-            bottom_pane.sync_popups();
-            frame_requester.schedule_frame();
-        }
-        return false;
-    }
     sync_background_task_footer_from_rows(bottom_pane, &rows);
     use super::bottom_pane::background_task_view::BackgroundTaskView;
     if bottom_pane.accepts_background_task_rows() {
         bottom_pane.refresh_background_task_rows_selecting(rows, selected_id);
-    } else {
-        bottom_pane.push_view(Box::new(BackgroundTaskView::new_with_selected(
-            rows,
-            selected_id,
-        )));
+        bottom_pane.sync_popups();
+        frame_requester.schedule_frame();
+        return true;
     }
+    // Non-force callers (Ctrl+T, Shift+Down) only want to surface the panel
+    // when there's something actionable: running, waiting-for-input, or
+    // failed tasks. Completed-only or empty registries fall through so the
+    // caller can route the key elsewhere (Ctrl+T toggles task board, etc.).
+    // Ctrl+B forces open regardless: it's the user's "show me background
+    // state" verb, and they get a panel to navigate or dismiss.
+    if !force_open {
+        let counts = super::status_line::BackgroundTaskCounts::from_rows(&rows);
+        if counts.is_empty() {
+            bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+            return false;
+        }
+    }
+    bottom_pane.push_view(Box::new(BackgroundTaskView::new_with_selected(
+        rows,
+        selected_id,
+    )));
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
     true

@@ -56,6 +56,8 @@ use crate::{
 
 use crate::cli::chat_stream::edge_executor::edge_executor_instance_id;
 
+const BASH_BACKGROUND_TASK_CONTROL_TOOLS: &[&str] = &["task_output", "task_list", "task_stop"];
+
 /// Per-phase stderr timings for `/chat/turn`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
     false
@@ -494,6 +496,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 &mut turn_schemas,
                 &mut selection_report,
                 &required_refs,
+                ctx.all_schemas,
+            );
+        }
+        if selection_report
+            .tools_selected
+            .iter()
+            .any(|name| name == "bash")
+        {
+            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                &mut turn_schemas,
+                &mut selection_report,
+                BASH_BACKGROUND_TASK_CONTROL_TOOLS,
                 ctx.all_schemas,
             );
         }
@@ -1704,6 +1718,117 @@ mod tests {
             !edge_tool_names.contains(&"exit_plan_mode"),
             "exit_plan_mode should not be injected when plan_mode_active=false"
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_injects_background_controls_when_bash_selected() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![
+            schema("bash"),
+            schema("task_output"),
+            schema("task_list"),
+            schema("task_stop"),
+            schema("read_file"),
+        ];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let messages = vec![json!({"role": "user", "content": "run make check"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "run make check",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tool_names: Vec<&str> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+        assert!(
+            edge_tool_names.contains(&"bash"),
+            "test requires bash to be selected: {edge_tool_names:?}"
+        );
+        for name in ["task_output", "task_list", "task_stop"] {
+            assert!(
+                edge_tool_names.contains(&name),
+                "Bash selection must force-inject {name} for same-turn Ctrl+B follow-up: {edge_tool_names:?}"
+            );
+        }
     }
 
     #[tokio::test]

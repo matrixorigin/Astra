@@ -36,18 +36,22 @@ pub fn render_bash_detached_marker(task_id: &str) -> String {
     )
 }
 
-fn is_function_style_tool_call(command: &str, tool: &str) -> bool {
+fn is_background_task_tool_shell_invocation(command: &str, tool: &str) -> bool {
     let lower = command.trim().to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix(tool) else {
-        return false;
-    };
-    rest.trim_start().starts_with('(')
+    lower.match_indices(tool).any(|(idx, _)| {
+        let before = lower[..idx].chars().rev().find(|c| !c.is_whitespace());
+        let after = lower[idx + tool.len()..].chars().next();
+        let command_position = before.is_none_or(|c| matches!(c, ';' | '|' | '&' | '('));
+        let command_end = after
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | ';' | '|' | '&' | '<' | '>'));
+        command_position && command_end
+    })
 }
 
 pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
     let tool = ["task_output", "task_list", "task_stop"]
         .into_iter()
-        .find(|tool| is_function_style_tool_call(command, tool))?;
+        .find(|tool| is_background_task_tool_shell_invocation(command, tool))?;
     Some(format!(
         "Error: `{tool}` is a background-task tool, not a bash command. \
          Call the `{tool}` tool directly through the tool interface. \
@@ -4663,8 +4667,11 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_rejects_background_task_pseudo_tool_calls() {
         for command in [
             "task_output(task_id='bg-shell-1')",
+            "task_output bg-shell-1",
             "task_list()",
+            "task_list 2>/dev/null; echo status",
             "task_stop(task_id=\"bg-shell-1\")",
+            "true && task_stop bg-shell-1",
             " task_output ( task_id = 'bg-shell-1' ) ",
         ] {
             let error = validate_execute_bash_command(command).expect_err(command);
@@ -4672,6 +4679,10 @@ printf 'probe.txt:1:needle\n'
             assert!(error.contains("not a bash command"), "{command}: {error}");
             assert!(error.contains("Do not rerun"), "{command}: {error}");
         }
+        assert!(
+            validate_execute_bash_command("echo task_output").is_ok(),
+            "plain text arguments should not be mistaken for shell tool invocations"
+        );
     }
 
     // ── rm path-aware validation ──────────────────────────────────────────────

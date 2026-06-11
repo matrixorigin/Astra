@@ -524,17 +524,20 @@ impl ChatWidget {
         let Some(cell) = self.active_cell.as_mut() else {
             return false;
         };
-        let Some(tool) = cell.as_any_mut().downcast_mut::<ToolCell>() else {
-            return false;
-        };
-        if tool.name != "bash" {
-            return false;
+        {
+            let Some(tool) = cell.as_any_mut().downcast_mut::<ToolCell>() else {
+                return false;
+            };
+            if tool.name != "bash" {
+                return false;
+            }
+            tool.complete_bash_backgrounded(task_id);
         }
-        tool.complete_bash_backgrounded(task_id);
         if let Some(tool_use_id) = tool_use_id {
             self.backgrounded_bash_tool_use_ids
                 .insert(tool_use_id.to_string());
         }
+        self.commit_active();
         true
     }
 
@@ -916,6 +919,10 @@ impl ChatWidget {
     /// as well as the `Session expired` / "token refreshed" banners.
     pub fn commit_system(&mut self, cell: SystemCell) {
         self.commit_active(); // finalise anything live first
+        self.commit_cell(Box::new(cell));
+    }
+
+    pub fn commit_system_preserving_active(&mut self, cell: SystemCell) {
         self.commit_cell(Box::new(cell));
     }
 
@@ -2306,6 +2313,38 @@ mod tests {
             .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
             .unwrap();
         assert!(!cell.ctrl_b_background_hint);
+    }
+
+    #[test]
+    fn backgrounding_note_does_not_finalize_active_bash() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
+
+        w.commit_system_preserving_active(SystemCell::info(
+            "⏎ Backgrounding Bash... waiting for handoff.",
+        ));
+
+        assert_eq!(w.history.len(), 1);
+        let active = w
+            .active_cell
+            .as_deref()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .expect("Bash must remain active while waiting for detach handoff");
+        assert_eq!(active.status, ToolStatus::Running);
+        assert!(active.output_summary.is_none());
+
+        assert!(w.mark_active_bash_backgrounded(Some("tu_test"), "bg-shell-1"));
+        assert_eq!(w.history.len(), 2);
+        let tool = w.history[1]
+            .as_any_ref()
+            .downcast_ref::<ToolCell>()
+            .expect("backgrounded Bash should be committed after the handoff note");
+        assert_eq!(tool.status, ToolStatus::Success);
+        let summary = tool.output_summary.as_deref().unwrap_or_default();
+        assert!(
+            !summary.contains("failed before returning output"),
+            "backgrounded Bash must not carry the failure placeholder: {summary}"
+        );
     }
 
     #[test]
