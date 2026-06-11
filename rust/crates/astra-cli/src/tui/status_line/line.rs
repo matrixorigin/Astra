@@ -354,8 +354,9 @@ fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
 
 fn background_task_chip_text(counts: BackgroundTaskCounts) -> String {
     format!(
-        "BG {} · Ctrl+B/Ctrl+T open",
-        background_task_count_parts(counts).join(" · ")
+        "BG {} · {}",
+        background_task_count_parts(counts).join(" · "),
+        crate::tui::background_shortcut::background_task_open_hint()
     )
 }
 

@@ -377,9 +377,12 @@ impl ToolCell {
         // Signal mode: show real counters when the tool actually
         // streamed something.
         let background_hint = if self.name == "bash" && self.ctrl_b_background_hint {
-            " · Ctrl+B to background"
+            format!(
+                " · {} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )
         } else {
-            ""
+            String::new()
         };
         if self.progress_lines > 0 || self.progress_bytes > 0 {
             let body = format!(
@@ -894,11 +897,12 @@ fn bash_detached_marker_present(output_summary: Option<&str>, output: Option<&st
 }
 
 fn bash_backgrounded_summary(task_id: Option<&str>) -> String {
+    let open_hint = crate::tui::background_shortcut::background_task_open_hint();
     match task_id {
         Some(task_id) if !task_id.trim().is_empty() => {
-            format!("Running in the background as {task_id} · Ctrl+B/Ctrl+T open")
+            format!("Running in the background as {task_id} · {open_hint}")
         }
-        _ => "Running in the background · Ctrl+B/Ctrl+T open".to_string(),
+        _ => format!("Running in the background · {open_hint}"),
     }
 }
 
@@ -1230,13 +1234,17 @@ mod tests {
             Some("<bash_detached>The bash command was promoted.</bash_detached>".into()),
         );
         assert_eq!(t.status, ToolStatus::Success);
-        assert_eq!(
-            t.output_summary.as_deref(),
-            Some("Running in the background · Ctrl+B/Ctrl+T open")
+        let expected = format!(
+            "Running in the background · {}",
+            crate::tui::background_shortcut::background_task_open_hint()
         );
+        assert_eq!(t.output_summary.as_deref(), Some(expected.as_str()));
         let out = render(&t, 100, 4);
         assert!(out.contains("Running in the background"), "{out}");
-        assert!(out.contains("Ctrl+B/Ctrl+T open"), "{out}");
+        assert!(
+            out.contains(&crate::tui::background_shortcut::background_task_open_hint()),
+            "{out}"
+        );
         assert!(!out.contains("failed before returning output"), "{out}");
     }
 
@@ -1245,10 +1253,11 @@ mod tests {
         let mut t = ToolCell::new_running("bash", "$ make check");
         t.complete_bash_backgrounded("bg-shell-7");
         assert_eq!(t.status, ToolStatus::Success);
-        assert_eq!(
-            t.output_summary.as_deref(),
-            Some("Running in the background as bg-shell-7 · Ctrl+B/Ctrl+T open")
+        let expected = format!(
+            "Running in the background as bg-shell-7 · {}",
+            crate::tui::background_shortcut::background_task_open_hint()
         );
+        assert_eq!(t.output_summary.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -1654,7 +1663,13 @@ mod tests {
         t.set_ctrl_b_background_hint(true);
         t.started_at = Instant::now() - std::time::Duration::from_secs(4);
         let out = render(&t, 100, 4);
-        assert!(out.contains("Ctrl+B to background"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "{} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )),
+            "{out}"
+        );
     }
 
     #[test]

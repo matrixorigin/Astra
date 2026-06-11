@@ -2890,10 +2890,11 @@ mod tests {
             .downcast_ref::<ToolCell>()
             .expect("first cell should be the backgrounded bash tool");
         assert_eq!(tool.status, ToolStatus::Success);
-        assert_eq!(
-            tool.output_summary.as_deref(),
-            Some("Running in the background as bg-shell-1 · Ctrl+B/Ctrl+T open")
+        let expected = format!(
+            "Running in the background as bg-shell-1 · {}",
+            crate::tui::background_shortcut::background_task_open_hint()
         );
+        assert_eq!(tool.output_summary.as_deref(), Some(expected.as_str()));
 
         w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
             name: "read_file".into(),

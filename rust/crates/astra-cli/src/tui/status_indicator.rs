@@ -343,7 +343,10 @@ fn suffix(
     if bash_background_hint_enabled
         && matches!(state, IndicatorState::Tool { name, .. } if name == "bash")
     {
-        parts.push("Ctrl+B to background".into());
+        parts.push(format!(
+            "{} to background",
+            crate::tui::background_shortcut::ctrl_b_background_shortcut()
+        ));
     }
     parts.push("Esc to stop".into());
     parts.join(" · ")
@@ -566,7 +569,13 @@ mod tests {
 
         let text = text_of(&s.render_at(t0 + Duration::from_secs(18)).unwrap());
         assert!(text.contains("Bash"), "{text}");
-        assert!(text.contains("Ctrl+B to background"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )),
+            "{text}"
+        );
         assert!(text.contains("Esc to stop"), "{text}");
 
         s.set_state(IndicatorState::Idle);

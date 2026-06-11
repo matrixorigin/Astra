@@ -227,9 +227,12 @@ impl HistoryCell for TaskCell {
         // Header.
         let task_label = "Task";
         let background_hint = if self.status == TaskStatus::Running && self.ctrl_b_background_hint {
-            " · Ctrl+B to background"
+            format!(
+                " · {} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )
         } else {
-            ""
+            String::new()
         };
         let header = if self.status == TaskStatus::Running {
             let meta = format!(" · {}{}", self.elapsed_str(), background_hint);
@@ -592,7 +595,13 @@ mod tests {
         t.set_ctrl_b_background_hint(true);
         let out = render(&t, 48, 2);
 
-        assert!(out.contains("Ctrl+B to background"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "{} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )),
+            "{out}"
+        );
     }
 
     #[test]
