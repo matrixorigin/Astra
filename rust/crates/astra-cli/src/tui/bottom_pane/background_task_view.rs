@@ -473,10 +473,15 @@ impl BackgroundTaskView {
         selected_id: Option<&str>,
     ) -> Self {
         let mut view = Self::new(rows);
+        let mut selected = false;
         if let Some(selected_id) = selected_id
             && let Some(idx) = view.rows.iter().position(|row| row.id == selected_id)
         {
             view.selected = idx;
+            selected = true;
+        }
+        if selected || view.rows.len() == 1 {
+            view.mode = Mode::Detail;
         }
         view
     }
@@ -496,11 +501,15 @@ impl BackgroundTaskView {
         let fallback_idx = current_selected_id
             .and_then(|id| rows.iter().position(|row| row.id == id))
             .or_else(|| rows.first().map(|_| 0));
+        let explicit_selection_found = selected_idx.is_some();
         self.selected = selected_idx
             .or(fallback_idx)
             .unwrap_or(0)
             .min(rows.len().saturating_sub(1));
         self.rows = rows;
+        if explicit_selection_found {
+            self.mode = Mode::Detail;
+        }
         self.clamp_selection();
     }
 
@@ -1200,6 +1209,71 @@ mod tests {
         );
 
         assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("run"));
+    }
+
+    #[test]
+    fn open_view_enters_detail_for_single_background_task() {
+        let view = BackgroundTaskView::new_with_selected(
+            vec![row("bg-shell-1", "running", "cargo test")],
+            None,
+        );
+
+        let text = render(&view, 90, 12);
+        assert!(text.contains("bg-shell-1 · running"), "{text}");
+        assert!(text.contains("command cargo test"), "{text}");
+        assert!(text.contains("Tail"), "{text}");
+        assert_eq!(
+            view.hint_keys().as_deref(),
+            Some("S stop · Esc list · Q close")
+        );
+    }
+
+    #[test]
+    fn open_view_enters_detail_for_explicit_selected_task() {
+        let view = BackgroundTaskView::new_with_selected(
+            vec![
+                row("first", "running", "first command"),
+                row("second", "running", "second command"),
+            ],
+            Some("second"),
+        );
+
+        let text = render(&view, 90, 12);
+        assert!(text.contains("second · running"), "{text}");
+        assert!(text.contains("command second command"), "{text}");
+        assert_eq!(
+            view.hint_keys().as_deref(),
+            Some("S stop · Esc list · Q close")
+        );
+    }
+
+    #[test]
+    fn explicit_refresh_keeps_adopted_handoff_in_detail() {
+        let mut view = BackgroundTaskView::new_with_selected(
+            vec![BackgroundTaskRow::shell(
+                "bg-shell-handoff",
+                "pending",
+                0,
+                "make build",
+                None,
+                Some("Waiting for foreground Bash to hand off its process.".to_string()),
+                Some(51),
+            )],
+            Some("bg-shell-handoff"),
+        );
+        assert!(
+            render(&view, 90, 12).contains("bg-shell-handoff · pending"),
+            "pending handoff should open in detail"
+        );
+
+        view.replace_rows_with_selected(
+            vec![row("bg-shell-7", "running", "make build")],
+            Some("bg-shell-7"),
+        );
+
+        let text = render(&view, 90, 12);
+        assert!(text.contains("bg-shell-7 · running"), "{text}");
+        assert!(text.contains("command make build"), "{text}");
     }
 
     #[test]

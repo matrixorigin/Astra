@@ -2313,7 +2313,7 @@ pub(crate) async fn run_tui_session(
                                                             };
                                                             chat_widget.commit_system(
                                                                 history_cell::system::SystemCell::info(
-                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; ↑↓ move, Enter details, S stop, Esc close.")
+                                                                    format!("⏎ Backgrounded as {id}. Opened background task details; S stop, Esc list, Q close.")
                                                                 ),
                                                             );
                                                             let selected_id = id.clone();
