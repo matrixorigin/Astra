@@ -533,9 +533,11 @@ impl ChatWidget {
             }
             tool.complete_bash_backgrounded(task_id);
         }
-        if let Some(tool_use_id) = tool_use_id {
-            self.backgrounded_bash_tool_use_ids
-                .insert(tool_use_id.to_string());
+        let suppress_tool_use_id = tool_use_id
+            .map(str::to_string)
+            .or_else(|| self.active_tool_use_id.clone());
+        if let Some(tool_use_id) = suppress_tool_use_id {
+            self.backgrounded_bash_tool_use_ids.insert(tool_use_id);
         }
         self.commit_active();
         true
@@ -2989,6 +2991,43 @@ mod tests {
         assert!(
             w.backgrounded_bash_tool_use_ids.is_empty(),
             "detached ToolCompleted should retire the suppression marker"
+        );
+        let tool = w.history[0]
+            .as_any_ref()
+            .downcast_ref::<ToolCell>()
+            .expect("history should contain the backgrounded Bash tool");
+        assert_eq!(tool.status, ToolStatus::Success);
+        let expected = format!(
+            "Running in the background as bg-shell-1 · {}",
+            crate::tui::background_shortcut::background_task_open_hint()
+        );
+        assert_eq!(tool.output_summary.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn backgrounded_bash_without_explicit_tool_use_id_suppresses_late_completion() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
+        assert!(w.mark_active_bash_backgrounded(None, "bg-shell-1"));
+
+        w.handle_event(AppEvent::Wire(tool_completed(
+            "bash",
+            "$ make check",
+            "success",
+            1200,
+            Some(
+                "<bash_detached>The bash command was promoted to background task bg-shell-1.</bash_detached>",
+            ),
+        )));
+
+        assert_eq!(
+            w.history.len(),
+            1,
+            "late detached ToolCompleted must not synthesize a duplicate Bash cell"
+        );
+        assert!(
+            w.backgrounded_bash_tool_use_ids.is_empty(),
+            "late detached ToolCompleted should retire the inferred suppression marker"
         );
         let tool = w.history[0]
             .as_any_ref()

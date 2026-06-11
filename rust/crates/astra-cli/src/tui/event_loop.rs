@@ -18,7 +18,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::lock_recovery::LockRecovery;
 #[cfg(test)]
 use astra_services::session_journal::ToolCallRecord;
 use astra_services::session_journal::{JournalEvent, JournalEventType};
@@ -1692,6 +1691,13 @@ pub(crate) async fn run_tui_session(
                                         let background_registry_turn_session_id =
                                             state.session_id.clone();
                                         let background_registry_turn_model = state.model.clone();
+                                        // Snapshot the bg-task command queue so the inner-tick
+                                        // drainer below can serve `task_output(block=true)` calls
+                                        // mid-turn. Without this, the tool side awaits a reply
+                                        // that the outer-tick drainer can't deliver — the outer
+                                        // loop is parked on this turn future.
+                                        let bg_task_commands_for_tick = state.bg_task_commands.clone();
+                                        let agent_spawner_for_tick = state.agent_spawner.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
@@ -2558,6 +2564,28 @@ pub(crate) async fn run_tui_session(
                                                     {
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
                                                     }
+                                                    // Drain the bg-task command queue so a
+                                                    // tool-side `task_output(block=true)` waiting
+                                                    // for a snapshot reply makes progress while
+                                                    // this turn is still in flight. The outer
+                                                    // tick is parked on `&mut fut`, so without
+                                                    // this drainer the tool waits forever.
+                                                    drain_bg_task_commands(
+                                                        &bg_task_commands_for_tick,
+                                                        &mut background_registry,
+                                                        agent_spawner_for_tick.as_ref(),
+                                                        &restored_local_agent_task_projections,
+                                                    )
+                                                    .await;
+                                                    // Move terminal completions onto the handle
+                                                    // status so the next snapshot reply names
+                                                    // the task as completed/failed/killed.
+                                                    // Inner-tick poll yields events we drop:
+                                                    // the outer tick will pick up the next
+                                                    // `poll_completions()` (events stay queued
+                                                    // until consumed there) and emit the system
+                                                    // message + task_notification.
+                                                    background_registry.drain_join_set();
                                                     let bash_hint_enabled =
                                                         bash_detach_hint_enabled(
                                                             bash_detach_listener.as_ref(),
@@ -3434,69 +3462,44 @@ pub(crate) async fn run_tui_session(
                         &mut background_local_agent_projection_cache,
                     )
                     .await;
-                    background_registry.kill_all();
-                    background_registry = super::background_tasks::BackgroundTaskRegistry::new(
-                        background_task_output_dir(state.session_id.as_deref()),
-                    );
-                    restored_local_agent_task_projections = restore_background_task_projections(
-                        &mut background_registry,
-                        state.session_id.as_deref(),
-                    );
-                    background_task_projection_cache =
-                        background_registry.export_shell_task_projections();
-                    background_local_agent_projection_cache =
-                        restored_local_agent_task_projections.clone();
-                    background_registry_session_id = state.session_id.clone();
-                }
-                // Drain background shell commands from the tool executor.
-                {
-                    let cmds: Vec<_> = {
-                        state.bg_task_commands.lock_recover().drain(..).collect()
-                    };
-                    for cmd in cmds {
-                        match cmd {
-                            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                                let _ = reply.send(
-                                    stop_background_task_with_agents(
-                                        &mut background_registry,
-                                        state.agent_spawner.as_ref(),
-                                        &restored_local_agent_task_projections,
-                                        &task_id,
-                                    )
-                                    .await,
-                                );
-                            }
-                            crate::edge_tools::BgTaskCommand::GetOutputSince {
-                                task_id,
-                                offset,
-                                max_bytes,
-                                reply,
-                            } => {
-                                let _ = reply.send(
-                                    background_task_output_snapshot_with_agents(
-                                        &mut background_registry,
-                                        state.agent_spawner.as_ref(),
-                                        &restored_local_agent_task_projections,
-                                        &task_id,
-                                        offset,
-                                        max_bytes,
-                                    )
-                                    .await,
-                                );
-                            }
-                            crate::edge_tools::BgTaskCommand::List { reply } => {
-                                let _ = reply.send(
-                                    render_background_task_list_xml_with_agents(
-                                        &mut background_registry,
-                                        state.agent_spawner.as_ref(),
-                                        &restored_local_agent_task_projections,
-                                    )
-                                    .await,
-                                );
-                            }
-                        }
+                    let old_session_was_unbound = background_registry_session_id
+                        .as_deref()
+                        .is_none_or(|sid| sid.is_empty());
+                    let new_session_is_bound = state
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|sid| !sid.is_empty());
+                    if old_session_was_unbound && new_session_is_bound {
+                        background_registry
+                            .rebind_output_dir(background_task_output_dir(state.session_id.as_deref()));
+                        background_task_projection_cache = Vec::new();
+                        background_local_agent_projection_cache = Vec::new();
+                        background_registry_session_id = state.session_id.clone();
+                    } else {
+                        background_registry.kill_all();
+                        background_registry = super::background_tasks::BackgroundTaskRegistry::new(
+                            background_task_output_dir(state.session_id.as_deref()),
+                        );
+                        restored_local_agent_task_projections =
+                            restore_background_task_projections(
+                                &mut background_registry,
+                                state.session_id.as_deref(),
+                            );
+                        background_task_projection_cache =
+                            background_registry.export_shell_task_projections();
+                        background_local_agent_projection_cache =
+                            restored_local_agent_task_projections.clone();
+                        background_registry_session_id = state.session_id.clone();
                     }
                 }
+                // Drain background shell commands from the tool executor.
+                drain_bg_task_commands(
+                    &state.bg_task_commands,
+                    &mut background_registry,
+                    state.agent_spawner.as_ref(),
+                    &restored_local_agent_task_projections,
+                )
+                .await;
 
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
@@ -4917,6 +4920,51 @@ mod tests {
         assert!(
             bottom_pane.has_active_view(),
             "force-open must push the view onto the bottom pane stack"
+        );
+    }
+
+    /// Regression: `drain_bg_task_commands` must serve a queued
+    /// `GetOutputSince` so a tool-side `task_output(block=true)` waiting on
+    /// the reply makes progress mid-turn. Pre-fix the drain only ran on the
+    /// outer tick, which was parked on `&mut fut`, hanging tasks for
+    /// minutes (you saw 324s).
+    #[tokio::test]
+    async fn drain_bg_task_commands_serves_get_output_since_synchronously() {
+        use crate::edge_tools::BgTaskCommand;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("drain"));
+        let id = registry.spawn_shell("true", "drain test");
+        for _ in 0..50 {
+            registry.poll_completions();
+            if registry
+                .get(&id)
+                .is_some_and(|h| h.projected_status() == "completed")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let queue: std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>> = Default::default();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        queue.lock().unwrap().push(BgTaskCommand::GetOutputSince {
+            task_id: id.clone(),
+            offset: 0,
+            max_bytes: 4096,
+            reply: tx,
+        });
+
+        drain_bg_task_commands(&queue, &mut registry, None, &[]).await;
+
+        let snapshot = rx
+            .await
+            .expect("drain must reply on the oneshot channel")
+            .expect("snapshot must succeed for a known task id");
+        assert!(
+            snapshot.terminal,
+            "completed task must be reported as terminal so task_output(block=true) can return: {snapshot:?}",
         );
     }
 

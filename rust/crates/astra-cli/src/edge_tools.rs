@@ -2287,7 +2287,15 @@ impl ToolExecutor {
             Err(error) => return error.to_string(),
             Ok(None) => return "Task id is required".to_string(),
         };
-        let block = args.get("block").and_then(Value::as_bool).unwrap_or(true);
+        // Default to snapshot-now. The block-until-terminal mode is opt-in
+        // because polling-with-output-coalescing actively misleads the model:
+        // a long-running cargo build emits new bytes every few hundred ms, so
+        // a "wait for new output" loop returns immediately every iteration
+        // with status=running, training the model to keep polling instead
+        // of ending the turn and trusting the <task_notification>. block=true
+        // here means "wait for the task to TERMINATE", not "wait for the
+        // next chunk".
+        let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let max_bytes = args
             .get("max_bytes")
@@ -2316,9 +2324,14 @@ impl ToolExecutor {
                 }
                 match rx.await {
                     Ok(Ok(snapshot)) => {
+                        // Only exit on true terminal status (completed/failed/
+                        // killed/unavailable) or waiting_for_input. Non-shell
+                        // tasks (local agents) still return immediately because
+                        // they don't have streaming output. New-bytes-arrived
+                        // is NOT an exit condition any more — that was the
+                        // old reverse-incentive trap.
                         if snapshot.kind != "shell"
                             || background_task_status_should_return_immediately(&snapshot.status)
-                            || !snapshot.output.is_empty()
                             || tokio::time::Instant::now() >= deadline
                         {
                             return format_background_task_output(&task_id, offset, &snapshot);

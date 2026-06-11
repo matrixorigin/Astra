@@ -206,6 +206,13 @@ const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 /// beyond this limit are soft-rejected (return an empty id) to prevent
 /// unbounded resource consumption.  The LLM can retry or re-plan.
 const MAX_CONCURRENT_TASKS: usize = 32;
+/// Maximum number of *terminal* (completed/failed/killed) tasks retained
+/// in-memory after they finish. Terminal tasks must remain queryable so
+/// the model can answer "how did make check go?" in the next user turn —
+/// CC's TaskList keeps completed tasks visible until the user dismisses
+/// them; this cap is the equivalent for our HashMap-backed registry. When
+/// the cap is exceeded, the oldest-ended terminal entries are LRU-evicted.
+const MAX_TERMINAL_TASKS_RETAINED: usize = 64;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const PROMPT_PATTERNS: &[&str] = &[
@@ -237,6 +244,14 @@ impl BackgroundTaskRegistry {
             output_dir,
             pending_completions: Vec::new(),
         }
+    }
+
+    /// Rebind the directory used for future background shell output files.
+    /// Existing handles keep their original stdout/stderr paths because live
+    /// runners may still be appending to those files.
+    pub fn rebind_output_dir(&mut self, output_dir: PathBuf) {
+        std::fs::create_dir_all(&output_dir).ok();
+        self.output_dir = output_dir;
     }
 
     /// Spawn a shell command in the background. Returns the task ID.
@@ -552,10 +567,40 @@ impl BackgroundTaskRegistry {
 
     /// Prune terminated tasks from the registry to prevent unbounded
     /// memory growth in long-running sessions.  Tasks that have reached a
-    /// terminal state (completed / failed / killed) are removed from the
-    /// in-memory map; their output files remain on disk.
+    /// LRU-evict terminal tasks once the retained set exceeds
+    /// [`MAX_TERMINAL_TASKS_RETAINED`]. Running tasks are never touched.
+    /// Called from `poll_completions` so the cap is enforced exactly once
+    /// per tick rather than from every read path.
+    ///
+    /// Pre-fix this method dropped *every* terminal task on each tick,
+    /// which made `task_output("bg-shell-1")` start replying "not found"
+    /// the moment a make-check completed — even within the same session,
+    /// even seconds after the task notification fired. Models couldn't
+    /// answer "how did it go?" in the next turn without re-running the
+    /// command. The CC equivalent (`BackgroundTasksDialog`) keeps
+    /// completed entries visible until the user dismisses them; this cap
+    /// gives us the same semantics with a fixed memory ceiling.
     pub fn prune_terminated(&mut self) {
-        self.tasks.retain(|_, h| !h.status().is_terminal());
+        let mut terminal: Vec<(&str, u64)> = self
+            .tasks
+            .iter()
+            .filter(|(_, h)| h.status().is_terminal())
+            .map(|(id, h)| (id.as_str(), h.ended_at_ms.unwrap_or(h.started_at_ms)))
+            .collect();
+        if terminal.len() <= MAX_TERMINAL_TASKS_RETAINED {
+            return;
+        }
+        // Oldest-ended first; evict from the front of the sorted list.
+        terminal.sort_by_key(|(_, ended)| *ended);
+        let to_evict = terminal.len() - MAX_TERMINAL_TASKS_RETAINED;
+        let victims: Vec<String> = terminal
+            .into_iter()
+            .take(to_evict)
+            .map(|(id, _)| id.to_string())
+            .collect();
+        for id in victims {
+            self.tasks.remove(&id);
+        }
     }
 
     /// Kill all running tasks. Returns IDs of killed tasks.
@@ -675,8 +720,10 @@ impl BackgroundTaskRegistry {
 
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
-    /// Also prunes tasks that were terminal on entry, ensuring one
-    /// full tick of display + persist before removal.
+    /// Also LRU-trims the terminal-task pool when it exceeds
+    /// [`MAX_TERMINAL_TASKS_RETAINED`]; recently-finished entries
+    /// remain queryable across user turns so `task_output(id)` can
+    /// answer "how did it go?" instead of "not found".
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
         self.prune_terminated();
         self.drain_join_set();
@@ -1510,6 +1557,32 @@ mod tests {
             last_tail_probe_at: None,
         };
         (handle, dir)
+    }
+
+    #[tokio::test]
+    async fn rebind_output_dir_keeps_existing_handles_and_routes_future_spawns() {
+        let tmp = TempDir::new().unwrap();
+        let old_dir = tmp.path().join("default");
+        let new_dir = tmp.path().join("session");
+        let mut reg = BackgroundTaskRegistry::new(old_dir.clone());
+
+        let old_id = reg.spawn_shell("true", "first turn task");
+        let old_stdout_path = reg.get(&old_id).unwrap().stdout_path.clone();
+        assert_eq!(old_stdout_path.parent(), Some(old_dir.as_path()));
+
+        reg.rebind_output_dir(new_dir.clone());
+
+        assert_eq!(
+            reg.get(&old_id).unwrap().stdout_path,
+            old_stdout_path,
+            "live tasks must keep the paths their runner is still writing"
+        );
+        let new_id = reg.spawn_shell("true", "next turn task");
+        assert_eq!(
+            reg.get(&new_id).unwrap().stdout_path.parent(),
+            Some(new_dir.as_path()),
+            "future tasks should use the rebound session output directory"
+        );
     }
 
     async fn wait_for_task_status(
@@ -2400,6 +2473,87 @@ mod tests {
         assert_eq!(
             killed_count, 1,
             "expected exactly 1 Killed event for {id}, got {killed_count}: {events:?}"
+        );
+    }
+
+    /// Regression for the trace where `task_output("bg-shell-1")` returned
+    /// "Background task not found" right after a successful completion
+    /// in the *previous* user turn. Pre-fix `prune_terminated` removed
+    /// every terminal entry on every `poll_completions`, so the next user
+    /// turn (a few hundred ms later) lost the ability to read the task's
+    /// final output. The fix retains terminal tasks up to a fixed cap.
+    #[tokio::test]
+    async fn terminal_tasks_remain_queryable_across_polls() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("true", "completed task");
+
+        // Wait for completion + drive the poll cycle a few times,
+        // mirroring the outer-tick loop that runs many times per second.
+        wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
+            let _ = reg.poll_completions();
+            reg.get(&id).is_some_and(|h| h.status().is_terminal())
+        })
+        .await
+        .expect("task should complete and stay queryable");
+
+        // Three more ticks: pre-fix this would prune the task. Now it must
+        // remain queryable so the next user turn can `task_output(id)`.
+        for _ in 0..3 {
+            let _ = reg.poll_completions();
+        }
+        let handle = reg
+            .get(&id)
+            .expect("terminal task must remain queryable after multiple poll_completions ticks");
+        assert!(
+            handle.status().is_terminal(),
+            "retained handle must report terminal status, got {:?}",
+            handle.status()
+        );
+    }
+
+    /// Past `MAX_TERMINAL_TASKS_RETAINED` terminal entries the registry
+    /// LRU-evicts the oldest-ended ones so the in-memory map can't grow
+    /// without bound during a long session. Spawn one at a time and wait
+    /// for terminal — `MAX_CONCURRENT_TASKS` caps in-flight runners, but
+    /// retained terminals (after they finish) are bounded by a separate
+    /// cap which this test exercises.
+    #[tokio::test]
+    async fn terminal_tasks_lru_evict_when_over_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let mut ids = Vec::new();
+        let total = MAX_TERMINAL_TASKS_RETAINED + 5;
+        for _ in 0..total {
+            let id = reg.spawn_shell("true", "tiny");
+            wait_until(Duration::from_secs(2), Duration::from_millis(10), || {
+                let _ = reg.poll_completions();
+                reg.get(&id).is_some_and(|h| h.status().is_terminal())
+            })
+            .await
+            .expect("each spawned task must reach terminal before the next spawn");
+            ids.push(id);
+        }
+        // One final poll to enforce the cap once we know everyone is terminal.
+        let _ = reg.poll_completions();
+
+        let retained = ids.iter().filter(|id| reg.get(id).is_some()).count();
+        assert_eq!(
+            retained, MAX_TERMINAL_TASKS_RETAINED,
+            "retained must equal cap exactly after spawning {total} terminal tasks"
+        );
+        // Newest entries are kept. The most recent task id we spawned must
+        // still be reachable — LRU eviction targets oldest-ended first.
+        let last = ids.last().unwrap();
+        assert!(
+            reg.get(last).is_some(),
+            "newest terminal task must survive LRU eviction"
+        );
+        // Oldest must be evicted.
+        let first = ids.first().unwrap();
+        assert!(
+            reg.get(first).is_none(),
+            "oldest terminal task must be evicted under LRU policy"
         );
     }
 

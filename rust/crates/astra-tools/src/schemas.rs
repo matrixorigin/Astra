@@ -978,7 +978,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. This is a tool call, not a Bash command; never invoke it through bash and never rerun the original command just to check progress. Returns explicit task kind, status, byte offsets, total bytes, and the requested output chunk when available. Requires the exact task_id so the model and UI refer to the same background task.",
+                "description": "Read the CURRENT tail of a typed background task's output. Returns immediately with whatever is buffered now (task kind, status, byte offsets, total bytes, chunk) — empty output is normal for tasks that just started. Do NOT poll this tool to track progress: the runtime emits a <task_notification> when the task reaches a terminal state. If you need to wait for terminal completion before continuing, set block=true; this returns only when the task is completed, failed, or killed (or the timeout elapses). This is a tool call, not a Bash command; never invoke it through bash and never read the on-disk task output files directly. Requires the exact task_id so the model and UI refer to the same background task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -989,7 +989,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait for new output or terminal status before returning. Default true."
+                            "description": "If true, wait for the task to reach a terminal status (completed/failed/killed) before returning. Default false (snapshot-now). Only set true when the model genuinely cannot continue without the result."
                         },
                         "offset": {
                             "type": "integer",
@@ -1342,9 +1342,10 @@ mod tests {
         assert!(
             output_desc.contains("background task")
                 && output_desc.contains("not a Bash command")
-                && output_desc.contains("never rerun the original command")
+                && output_desc.contains("never read the on-disk task output files directly")
+                && output_desc.contains("Do NOT poll")
                 && !output_desc.contains("job(action"),
-            "task_output description must teach typed background task vocabulary"
+            "task_output description must teach snapshot-now semantics + forbid bash polling"
         );
         for tool_name in ["task_output", "task_stop", "task_list"] {
             let description = find_schema(&schemas, tool_name)

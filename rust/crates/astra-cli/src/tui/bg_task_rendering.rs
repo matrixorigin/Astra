@@ -887,6 +887,71 @@ pub(crate) async fn background_task_output_snapshot_with_agents(
     }
 }
 
+/// Drain pending [`crate::edge_tools::BgTaskCommand`] entries posted by the
+/// tool-side `task_output` / `task_list` / `task_stop` calls and reply
+/// synchronously. **Must be invoked from any tick that holds the
+/// [`super::background_tasks::BackgroundTaskRegistry`]**, including the
+/// inner per-turn select loop — otherwise a tool calling `task_output` with
+/// `block=true` deadlocks against the outer-tick drainer (the turn future
+/// owns `&mut state`, the outer loop is parked on it, no one drains).
+///
+/// Replies use synchronous `oneshot::Sender::send` so the tool side wakes
+/// on the next poll. Errors during a snapshot/list/stop are propagated to
+/// the tool caller, never silently swallowed.
+pub(crate) async fn drain_bg_task_commands(
+    bg_task_commands: &std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+) {
+    let cmds: Vec<_> = astra_core::sync_poison::recover_mutex_lock(bg_task_commands)
+        .drain(..)
+        .collect();
+    for cmd in cmds {
+        match cmd {
+            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
+                let _ = reply.send(
+                    stop_background_task_with_agents(
+                        background_registry,
+                        agent_spawner,
+                        restored_local_agents,
+                        &task_id,
+                    )
+                    .await,
+                );
+            }
+            crate::edge_tools::BgTaskCommand::GetOutputSince {
+                task_id,
+                offset,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(
+                    background_task_output_snapshot_with_agents(
+                        background_registry,
+                        agent_spawner,
+                        restored_local_agents,
+                        &task_id,
+                        offset,
+                        max_bytes,
+                    )
+                    .await,
+                );
+            }
+            crate::edge_tools::BgTaskCommand::List { reply } => {
+                let _ = reply.send(
+                    render_background_task_list_xml_with_agents(
+                        background_registry,
+                        agent_spawner,
+                        restored_local_agents,
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+}
+
 // ── XML rendering ──
 
 pub(crate) fn xml_escape_attr(value: &str) -> String {

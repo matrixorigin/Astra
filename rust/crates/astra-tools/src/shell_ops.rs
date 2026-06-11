@@ -27,11 +27,13 @@ const BASH_DETACH_ADOPTION_ACK_WAIT: Duration = Duration::from_secs(5);
 pub fn render_bash_detached_marker(task_id: &str) -> String {
     format!(
         "<bash_detached>The bash command was promoted to background task {task_id}. \
-         Output continues in the BackgroundTaskRegistry. \
-         To inspect it, call the `task_output` tool with `task_id` set to `{task_id}`; \
-         call the `task_list` tool to see background tasks; \
-         call the `task_stop` tool with `task_id` set to `{task_id}` to stop it. \
-         Do not run these tool names through Bash, and do not rerun the original bash command just to check progress.\
+         The runtime will deliver a <task_notification> when the task terminates — \
+         end your turn now and let the user drive next steps. \
+         Do NOT poll: do not call `task_output`, do not rerun the bash command, \
+         and do not read the on-disk output files via bash (tail/cat/head/less are denied). \
+         If the user explicitly asks for partial progress, call `task_output` ONCE with \
+         block=false; if they ask you to wait, use `task_output` with block=true. \
+         Use `task_stop` only when the user wants the task cancelled.\
          </bash_detached>"
     )
 }
@@ -46,6 +48,32 @@ fn is_background_task_tool_shell_invocation(command: &str, tool: &str) -> bool {
             .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | ';' | '|' | '&' | '<' | '>'));
         command_position && command_end
     })
+}
+
+/// Reject bash commands that try to read background-task output files
+/// directly off disk (`/tmp/astra/bg_tasks/...` or `${TMPDIR}/astra/bg_tasks/...`).
+/// The model must use `task_output` for this — disk reads bypass the
+/// snapshot protocol, return stale partial bytes mid-write, and miss
+/// the registry's terminal-status accounting. Reading these files via
+/// bash is the canonical "I'm polling" anti-pattern from the trace
+/// where a model burned 12 LLM rounds tail'ing the stderr file.
+pub fn background_task_output_dir_read_error(command: &str) -> Option<String> {
+    if !command.contains("bg_tasks") {
+        return None;
+    }
+    let lower = command.to_ascii_lowercase();
+    let bg_path_marker = "/astra/bg_tasks/";
+    if !lower.contains(bg_path_marker) {
+        return None;
+    }
+    Some(
+        "Error: bash cannot read background task output files directly. \
+         Call the `task_output` tool with the task_id (e.g. `bg-shell-1`) instead. \
+         The runtime delivers a <task_notification> when the task terminates; \
+         polling the on-disk files via bash returns stale partial bytes and \
+         bypasses terminal-status reporting."
+            .into(),
+    )
 }
 
 pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
@@ -712,6 +740,9 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
         return Err("Error: empty bash command".into());
     }
     if let Some(error) = background_task_tool_pseudo_call_error(cmd) {
+        return Err(error);
+    }
+    if let Some(error) = background_task_output_dir_read_error(cmd) {
         return Err(error);
     }
     let lower = cmd.to_ascii_lowercase();
@@ -4682,6 +4713,42 @@ printf 'probe.txt:1:needle\n'
         assert!(
             validate_execute_bash_command("echo task_output").is_ok(),
             "plain text arguments should not be mistaken for shell tool invocations"
+        );
+    }
+
+    /// Regression: bash must refuse to read background task stdout/stderr
+    /// files directly off disk. The trace this guards against had a model
+    /// burn 12 LLM rounds running `tail /tmp/astra/bg_tasks/default/bg-shell-1.stderr`
+    /// instead of calling `task_output` — that's the canonical polling
+    /// anti-pattern. The denial is path-aware (it allows unrelated
+    /// commands that happen to mention "bg_tasks") and unconditional on
+    /// the read tool (tail/cat/head/less/grep all fail equivalently
+    /// because the validator doesn't care HOW you'd read it).
+    #[test]
+    fn validate_execute_bash_rejects_background_task_output_dir_reads() {
+        for command in [
+            "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
+            "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
+            "head -50 /tmp/astra/bg_tasks/some-session/bg-shell-2.stderr",
+            "less /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
+            "wc -l /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
+            "grep error /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
+            "tail -f /var/folders/abc/T/astra/bg_tasks/sess-1/bg-shell-1.stdout",
+        ] {
+            let error = validate_execute_bash_command(command).expect_err(command);
+            assert!(
+                error.contains("background task output files"),
+                "{command}: {error}"
+            );
+            assert!(error.contains("task_output"), "{command}: {error}");
+        }
+        assert!(
+            validate_execute_bash_command("echo bg_tasks is not a path here").is_ok(),
+            "the literal word 'bg_tasks' without the astra path prefix must not trigger"
+        );
+        assert!(
+            validate_execute_bash_command("ls /tmp/astra/").is_ok(),
+            "directories above bg_tasks/ remain freely listable"
         );
     }
 
