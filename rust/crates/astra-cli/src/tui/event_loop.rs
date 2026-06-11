@@ -44,9 +44,11 @@ use super::agent_view::*;
 use super::bg_task_proxy::*;
 use super::bg_task_rendering::*;
 use super::plan_mode::*;
+#[cfg(test)]
+use super::status_line;
 use super::{
     bottom_pane, chat_widget, history_cell, mention_menu, resume_summary, slash_dispatch,
-    slash_menu, status_indicator, status_line, stream_bridge, task_board_observer, ui_adapter,
+    slash_menu, status_indicator, stream_bridge, task_board_observer, ui_adapter,
 };
 
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
@@ -3505,14 +3507,7 @@ pub(crate) async fn run_tui_session(
                 // same typed rows used by the switcher. That keeps
                 // footer and list projection in lock-step as more
                 // task kinds land.
-                let bg_counts = status_line::BackgroundTaskCounts::from_rows(&rows_for_footer);
-                bottom_pane.footer.bg_task_counts = if bg_counts.is_empty() {
-                    None
-                } else {
-                    Some(bg_counts)
-                };
-                bottom_pane.footer.bg_fanout_summaries =
-                    status_line::BackgroundTaskFanoutSummary::from_rows(&rows_for_footer);
+                sync_background_task_footer_from_rows(&mut bottom_pane, &rows_for_footer);
 
                 task_board.maybe_refresh();
                 let snap = task_board.snapshot();

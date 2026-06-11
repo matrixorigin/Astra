@@ -22,6 +22,7 @@ use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exi
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
+const COMMAND_DRAIN_CHUNK_BUDGET: usize = 64;
 
 /// RAII guard for detach handle lifecycle. Takes ownership on creation,
 /// automatically restores to slot on drop unless explicitly consumed.
@@ -92,6 +93,33 @@ async fn restore_detach_signal_receiver(
 ) {
     if let Some(signal_rx) = signal_rx {
         *detach.signal_rx.lock().await = Some(signal_rx);
+    }
+}
+
+fn detach_signal_observed(signal_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    enum SignalState {
+        Observed,
+        NotObserved,
+        Disconnected,
+    }
+
+    let state = if let Some(rx) = signal_rx.as_mut() {
+        match rx.has_changed() {
+            Ok(true) if *rx.borrow_and_update() => SignalState::Observed,
+            Ok(_) => SignalState::NotObserved,
+            Err(_) => SignalState::Disconnected,
+        }
+    } else {
+        return false;
+    };
+
+    match state {
+        SignalState::Observed => true,
+        SignalState::NotObserved => false,
+        SignalState::Disconnected => {
+            *signal_rx = None;
+            false
+        }
     }
 }
 
@@ -3145,7 +3173,14 @@ pub(crate) async fn run_bash_with_detach(
     let mut detached = false;
 
     loop {
-        drain_command_chunks(
+        if detach_signal_observed(&mut signal_rx) {
+            detached = true;
+            stdout_detach.notify_one();
+            stderr_detach.notify_one();
+            break;
+        }
+
+        drain_command_chunks_budgeted(
             &mut rx,
             &mut stdout_text,
             &mut stderr_text,
@@ -3154,6 +3189,13 @@ pub(crate) async fn run_bash_with_detach(
             max_stderr_bytes,
             &mut stderr_capped,
         );
+
+        if detach_signal_observed(&mut signal_rx) {
+            detached = true;
+            stdout_detach.notify_one();
+            stderr_detach.notify_one();
+            break;
+        }
 
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -3178,27 +3220,37 @@ pub(crate) async fn run_bash_with_detach(
                                 break;
                             }
                             res = rx.changed() => {
-                                if res.is_ok() {
-                                    detached = true;
-                                    stdout_detach.notify_one();
-                                    stderr_detach.notify_one();
-                                    break;
+                                match res {
+                                    Ok(()) if *rx.borrow_and_update() => {
+                                        detached = true;
+                                        stdout_detach.notify_one();
+                                        stderr_detach.notify_one();
+                                        break;
+                                    }
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        // Sender dropped -> no detach possible.
+                                        signal_rx = None;
+                                    }
                                 }
-                                // Sender dropped → no detach possible.
-                                signal_rx = None;
                             }
                             _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                         }
                     } else {
                         tokio::select! {
                             res = rx.changed() => {
-                                if res.is_ok() {
-                                    detached = true;
-                                    stdout_detach.notify_one();
-                                    stderr_detach.notify_one();
-                                    break;
+                                match res {
+                                    Ok(()) if *rx.borrow_and_update() => {
+                                        detached = true;
+                                        stdout_detach.notify_one();
+                                        stderr_detach.notify_one();
+                                        break;
+                                    }
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        signal_rx = None;
+                                    }
                                 }
-                                signal_rx = None;
                             }
                             _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                         }
@@ -3240,7 +3292,7 @@ pub(crate) async fn run_bash_with_detach(
 
     if detached {
         while !stdout_task.is_finished() || !stderr_task.is_finished() {
-            drain_command_chunks(
+            drain_command_chunks_budgeted(
                 &mut rx,
                 &mut stdout_text,
                 &mut stderr_text,
@@ -3410,16 +3462,58 @@ fn drain_command_chunks(
     max_stderr_bytes: usize,
     stderr_capped: &mut bool,
 ) {
-    while let Ok((kind, chunk)) = rx.try_recv() {
-        match kind {
-            StreamKind::Stdout => {
-                append_capped(stdout_text, &chunk, max_stdout_bytes, stdout_capped)
-            }
-            StreamKind::Stderr => {
-                append_capped(stderr_text, &chunk, max_stderr_bytes, stderr_capped)
-            }
+    while drain_one_command_chunk(
+        rx,
+        stdout_text,
+        stderr_text,
+        max_stdout_bytes,
+        stdout_capped,
+        max_stderr_bytes,
+        stderr_capped,
+    ) {}
+}
+
+fn drain_command_chunks_budgeted(
+    rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
+    stdout_text: &mut String,
+    stderr_text: &mut String,
+    max_stdout_bytes: usize,
+    stdout_capped: &mut bool,
+    max_stderr_bytes: usize,
+    stderr_capped: &mut bool,
+) {
+    for _ in 0..COMMAND_DRAIN_CHUNK_BUDGET {
+        if !drain_one_command_chunk(
+            rx,
+            stdout_text,
+            stderr_text,
+            max_stdout_bytes,
+            stdout_capped,
+            max_stderr_bytes,
+            stderr_capped,
+        ) {
+            break;
         }
     }
+}
+
+fn drain_one_command_chunk(
+    rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
+    stdout_text: &mut String,
+    stderr_text: &mut String,
+    max_stdout_bytes: usize,
+    stdout_capped: &mut bool,
+    max_stderr_bytes: usize,
+    stderr_capped: &mut bool,
+) -> bool {
+    let Ok((kind, chunk)) = rx.try_recv() else {
+        return false;
+    };
+    match kind {
+        StreamKind::Stdout => append_capped(stdout_text, &chunk, max_stdout_bytes, stdout_capped),
+        StreamKind::Stderr => append_capped(stderr_text, &chunk, max_stderr_bytes, stderr_capped),
+    }
+    true
 }
 
 fn truncate_partial_line(output: &mut String) {

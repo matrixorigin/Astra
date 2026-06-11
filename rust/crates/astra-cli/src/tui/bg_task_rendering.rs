@@ -423,6 +423,20 @@ pub(crate) async fn render_background_task_list_xml_with_agents(
     render_background_task_rows_xml(&rows)
 }
 
+pub(crate) fn sync_background_task_footer_from_rows(
+    bottom_pane: &mut BottomPane,
+    rows: &[super::bottom_pane::background_task_view::BackgroundTaskRow],
+) {
+    let counts = super::status_line::BackgroundTaskCounts::from_rows(rows);
+    bottom_pane.footer.bg_task_counts = if counts.is_empty() {
+        None
+    } else {
+        Some(counts)
+    };
+    bottom_pane.footer.bg_fanout_summaries =
+        super::status_line::BackgroundTaskFanoutSummary::from_rows(rows);
+}
+
 pub(crate) fn background_task_live_control_state(
     live_control: super::background_tasks::BgTaskLiveControl,
 ) -> super::bottom_pane::background_task_view::LiveControlState {
@@ -491,6 +505,7 @@ async fn reveal_background_task_view_with_selected(
     if counts.is_empty() {
         return false;
     }
+    sync_background_task_footer_from_rows(bottom_pane, &rows);
     use super::bottom_pane::background_task_view::BackgroundTaskView;
     if bottom_pane.accepts_background_task_rows() {
         bottom_pane.refresh_background_task_rows_selecting(rows, selected_id);
@@ -564,6 +579,7 @@ pub(crate) async fn try_dispatch_background_task_stop_sentinel(
         restored_local_agents,
     )
     .await;
+    sync_background_task_footer_from_rows(bottom_pane, &rows);
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
@@ -690,6 +706,7 @@ pub(crate) async fn try_dispatch_background_task_output_sentinel(
         restored_local_agents,
     )
     .await;
+    sync_background_task_footer_from_rows(bottom_pane, &rows);
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
