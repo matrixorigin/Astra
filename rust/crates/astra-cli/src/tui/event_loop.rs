@@ -81,6 +81,13 @@ fn is_background_task_manage_key(key: &crossterm::event::KeyEvent) -> bool {
             .contains(crossterm::event::KeyModifiers::SHIFT)
 }
 
+fn is_ctrl_b_background_key(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == crossterm::event::KeyCode::Char('b')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+}
+
 fn set_bash_background_hint_enabled(
     chat_widget: &mut chat_widget::ChatWidget,
     status_indicator: &mut status_indicator::StatusIndicator,
@@ -820,7 +827,7 @@ pub(crate) async fn run_tui_session(
                             frame_requester.schedule_frame();
                             continue;
                         }
-                        if is_background_task_manage_key(&key) && !bottom_pane.has_active_view() {
+                        if is_background_task_manage_key(&key) || is_ctrl_b_background_key(&key) {
                             let _ = force_open_background_task_view(
                                 &mut background_registry,
                                 state.agent_spawner.as_ref(),
@@ -1669,6 +1676,16 @@ pub(crate) async fn run_tui_session(
                                     let mut bash_detach_request_pending = false;
                                     let mut active_bash_tool_use_id: Option<String> = None;
                                     let mut active_bash_description: Option<String> = None;
+                                    // Notifications for tasks that completed mid-turn. We
+                                    // surface the user-visible system message immediately on
+                                    // the inner tick (so the user sees "Background task
+                                    // bg-shell-N completed" while the model is still working),
+                                    // but we hold the model-facing <task_notification> XML
+                                    // here and forward it to `state.pending_bg_notifications`
+                                    // once the turn future releases its `&mut state` borrow.
+                                    // This guarantees a completion mid-turn shows up in the
+                                    // *next* turn's prompt instead of being lost.
+                                    let mut deferred_bg_notifications: Vec<String> = Vec::new();
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
@@ -1773,9 +1790,7 @@ pub(crate) async fn run_tui_session(
                                                             // empty (e.g. during bash detach handoff or while
                                                             // task_output is blocking on stdout). Empty state
                                                             // renders as "No background tasks." inside the view.
-                                                            if is_background_task_manage_key(&k)
-                                                                && !bottom_pane.has_active_view()
-                                                            {
+                                                            if is_background_task_manage_key(&k) {
                                                                 let _ = force_open_background_task_view(
                                                                     &mut background_registry,
                                                                     agent_spawner_for_cancel.as_ref(),
@@ -1807,9 +1822,7 @@ pub(crate) async fn run_tui_session(
                                                             // registry is empty in this instant — so the user has
                                                             // a stable surface to land on. There is no "unavailable"
                                                             // path: any state is a renderable panel state.
-                                                            if k.code == crossterm::event::KeyCode::Char('b')
-                                                                && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                                                            {
+                                                            if is_ctrl_b_background_key(&k) {
                                                                 // Side-effect 1: detach an in-flight backgroundable bash.
                                                                 // Skipped if a detach is already mid-flight (handoff
                                                                 // pending) or if the registry is at the shell-task cap.
@@ -1900,6 +1913,13 @@ pub(crate) async fn run_tui_session(
                                                                     )
                                                                     .await;
                                                                 } else {
+                                                                    // CRITICAL FIX: User feedback when Ctrl+B
+                                                                    // cannot detach bash or promote an agent.
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::info(
+                                                                            "Ctrl+B: Nothing to background. Opening task panel.",
+                                                                        ),
+                                                                    );
                                                                     let _ = force_open_background_task_view(
                                                                         &mut background_registry,
                                                                         agent_spawner_for_cancel.as_ref(),
@@ -2252,10 +2272,66 @@ pub(crate) async fn run_tui_session(
                                                         _ => {}
                                                     }
                                                 }
-                                                Some(handoff) = bash_detach_handoff_rx.recv() => {
+                                                handoff = bash_detach_handoff_rx.recv() => {
                                                     bash_detach_request_pending = false;
+                                                    let handoff = match handoff {
+                                                        Some(h) => h,
+                                                        None => {
+                                                            // Channel closed — bash runner panicked or
+                                                            // was dropped before sending. Clean up
+                                                            // detach state so the UI doesn't wait
+                                                            // forever for a handoff that will never
+                                                            // arrive.
+                                                            tracing::warn!(
+                                                                "bash detach handoff channel closed without payload"
+                                                            );
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    "⏎ Backgrounding failed: runner disconnected",
+                                                                ),
+                                                            );
+                                                            set_bash_background_hint_enabled(
+                                                                &mut chat_widget,
+                                                                &mut status_indicator,
+                                                                false,
+                                                            );
+                                                            frame_requester.schedule_frame();
+                                                            if let Some(result) = turn_result_ready.take() {
+                                                                break result;
+                                                            }
+                                                            continue;
+                                                        }
+                                                    };
                                                     match handoff {
                                                         Ok(p) => {
+                                                            // Cap check before transferring child ownership.
+                                                            // If at capacity, reject adoption gracefully — the
+                                                            // bash runner already returned Detached and will
+                                                            // receive the error on adoption_rx.
+                                                            if !background_registry.can_spawn_shell_task() {
+                                                                let astra_tools::detach::DetachedShellPayload {
+                                                                    adoption_tx, ..
+                                                                } = p;
+                                                                let _ = adoption_tx.send(Err(format!(
+                                                                    "background shell task limit reached ({} running)",
+                                                                    background_registry.running_count()
+                                                                )));
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::error(
+                                                                        "⏎ Backgrounding failed: task limit reached",
+                                                                    ),
+                                                                );
+                                                                set_bash_background_hint_enabled(
+                                                                    &mut chat_widget,
+                                                                    &mut status_indicator,
+                                                                    false,
+                                                                );
+                                                                frame_requester.schedule_frame();
+                                                                if let Some(result) = turn_result_ready.take() {
+                                                                    break result;
+                                                                }
+                                                                continue;
+                                                            }
                                                             let astra_tools::detach::DetachedShellPayload {
                                                                 child,
                                                                 stdout,
@@ -2272,7 +2348,7 @@ pub(crate) async fn run_tui_session(
                                                                 &command,
                                                                 partial_stdout,
                                                                 partial_stderr,
-                                                            ) {
+                                                            ).await {
                                                                 Ok(id) => {
                                                                     let _ = adoption_tx.send(Ok(id.clone()));
                                                                     id
@@ -2577,15 +2653,33 @@ pub(crate) async fn run_tui_session(
                                                         &restored_local_agent_task_projections,
                                                     )
                                                     .await;
-                                                    // Move terminal completions onto the handle
-                                                    // status so the next snapshot reply names
-                                                    // the task as completed/failed/killed.
-                                                    // Inner-tick poll yields events we drop:
-                                                    // the outer tick will pick up the next
-                                                    // `poll_completions()` (events stay queued
-                                                    // until consumed there) and emit the system
-                                                    // message + task_notification.
-                                                    background_registry.drain_join_set();
+                                                    // Surface terminal background-task completions
+                                                    // mid-turn so the user sees "Background task
+                                                    // bg-shell-N completed" immediately, not only
+                                                    // at turn-end. `poll_completions()` consumes
+                                                    // each event exactly once, so we capture the
+                                                    // model-facing <task_notification> XML into
+                                                    // `deferred_bg_notifications` here and forward
+                                                    // it into `state.pending_bg_notifications`
+                                                    // once the turn future releases the `&mut
+                                                    // state` borrow — that way a completion that
+                                                    // fires mid-turn is still delivered to the
+                                                    // model on its next turn rather than lost.
+                                                    let bg_events = background_registry.poll_completions();
+                                                    for ev in &bg_events {
+                                                        let notification = super::background_tasks::format_notification_xml(ev);
+                                                        if !notification.is_empty() {
+                                                            deferred_bg_notifications.push(notification);
+                                                        }
+                                                    }
+                                                    for msg in background_task_event_system_messages(&bg_events) {
+                                                        chat_widget.commit_system(
+                                                            history_cell::system::SystemCell::info(&msg),
+                                                        );
+                                                    }
+                                                    if !bg_events.is_empty() {
+                                                        frame_requester.schedule_frame();
+                                                    }
                                                     let bash_hint_enabled =
                                                         bash_detach_hint_enabled(
                                                             bash_detach_listener.as_ref(),
@@ -2667,6 +2761,17 @@ pub(crate) async fn run_tui_session(
 
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
+                                    // The turn future has resolved, so the &mut state
+                                    // borrow is released — forward any background-task
+                                    // notifications captured mid-turn into the next-turn
+                                    // prompt channel. poll_completions() consumes events
+                                    // exactly once, so without this hand-off a task that
+                                    // finishes mid-turn would never reach the model.
+                                    if !deferred_bg_notifications.is_empty() {
+                                        state
+                                            .pending_bg_notifications
+                                            .append(&mut deferred_bg_notifications);
+                                    }
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     set_bash_background_hint_enabled(
                                         &mut chat_widget,
@@ -3470,13 +3575,40 @@ pub(crate) async fn run_tui_session(
                         .as_deref()
                         .is_some_and(|sid| !sid.is_empty());
                     if old_session_was_unbound && new_session_is_bound {
-                        background_registry
-                            .rebind_output_dir(background_task_output_dir(state.session_id.as_deref()));
+                        if let Err(error) = background_registry
+                            .rebind_output_dir(background_task_output_dir(state.session_id.as_deref()))
+                        {
+                            chat_widget.commit_system(
+                                history_cell::system::SystemCell::error(format!(
+                                    "⚠ Background task storage unavailable: {error}. \
+                                     Background tasks may fail to spawn until this is fixed."
+                                )),
+                            );
+                            frame_requester.schedule_frame();
+                        }
                         background_task_projection_cache = Vec::new();
                         background_local_agent_projection_cache = Vec::new();
                         background_registry_session_id = state.session_id.clone();
                     } else {
-                        background_registry.kill_all();
+                        // Bound→bound (or bound→unbound) session change: tasks
+                        // from the prior session cannot meaningfully follow the
+                        // user across sessions because their projections are
+                        // session-scoped and a new session has its own tasks.
+                        // Kill them — but surface the kill list so the user
+                        // isn't surprised by silently terminated work.
+                        let killed = background_registry.kill_all();
+                        if !killed.is_empty() {
+                            let kind = if killed.len() == 1 { "task" } else { "tasks" };
+                            chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                format!(
+                                    "⚠ Session changed; cancelled {} background {} from the previous session: {}",
+                                    killed.len(),
+                                    kind,
+                                    killed.join(", ")
+                                ),
+                            ));
+                            frame_requester.schedule_frame();
+                        }
                         background_registry = super::background_tasks::BackgroundTaskRegistry::new(
                             background_task_output_dir(state.session_id.as_deref()),
                         );
@@ -3516,7 +3648,7 @@ pub(crate) async fn run_tui_session(
                     frame_requester.schedule_frame();
                 }
                 // Stall check every tick (internal timer gates at 5s intervals).
-                background_registry.stall_check();
+                background_registry.stall_check().await;
                 persist_background_task_projections_if_changed(
                     &mut background_registry,
                     state.session_id.as_deref(),
@@ -4464,6 +4596,26 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_b_is_background_key() {
+        let ctrl_b = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('b'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let plain_b = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('b'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+
+        assert!(is_ctrl_b_background_key(&ctrl_b));
+        assert!(!is_ctrl_b_background_key(&plain_b));
+        assert!(!is_ctrl_b_background_key(&ctrl_c));
+    }
+
+    #[test]
     fn bash_tool_completed_returns_foreground_status_to_thinking() {
         let mut bottom_pane = BottomPane::new();
         let mut status_indicator = status_indicator::StatusIndicator::new();
@@ -4920,6 +5072,59 @@ mod tests {
         assert!(
             bottom_pane.has_active_view(),
             "force-open must push the view onto the bottom pane stack"
+        );
+    }
+
+    struct NonBackgroundPane;
+
+    impl bottom_pane::view::BottomPaneView for NonBackgroundPane {
+        fn render(&self, _area: ratatui::layout::Rect, _buf: &mut ratatui::buffer::Buffer) {}
+
+        fn desired_height(&self, _width: u16) -> u16 {
+            1
+        }
+
+        fn handle_key(&mut self, _key: crossterm::event::KeyEvent) {}
+
+        fn cursor_pos(&self, _area: ratatui::layout::Rect) -> Option<(u16, u16)> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn force_open_background_task_view_preempts_existing_bottom_pane() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("overlay"));
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.push_view(Box::new(NonBackgroundPane));
+
+        assert!(
+            !bottom_pane.accepts_background_task_rows(),
+            "test pane must model a non-background active pane"
+        );
+        assert!(
+            force_open_background_task_view(
+                &mut registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "background manager must open even when another bottom pane is active"
+        );
+        assert!(
+            bottom_pane.accepts_background_task_rows(),
+            "background manager must become the active pane"
+        );
+        assert!(
+            bottom_pane.close_active_view(),
+            "background manager should close normally"
+        );
+        assert!(
+            bottom_pane.has_active_view(),
+            "the previous pane should still be underneath the background manager"
         );
     }
 

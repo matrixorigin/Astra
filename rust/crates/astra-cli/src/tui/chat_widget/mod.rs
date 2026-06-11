@@ -924,10 +924,6 @@ impl ChatWidget {
         self.commit_cell(Box::new(cell));
     }
 
-    pub fn commit_system_preserving_active(&mut self, cell: SystemCell) {
-        self.commit_cell(Box::new(cell));
-    }
-
     /// Commit a user message directly into history without opening a new turn
     /// or draining the current live tool/assistant state.
     ///
@@ -2315,38 +2311,6 @@ mod tests {
             .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
             .unwrap();
         assert!(!cell.ctrl_b_background_hint);
-    }
-
-    #[test]
-    fn backgrounding_note_does_not_finalize_active_bash() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
-
-        w.commit_system_preserving_active(SystemCell::info(
-            "⏎ Backgrounding Bash... waiting for handoff.",
-        ));
-
-        assert_eq!(w.history.len(), 1);
-        let active = w
-            .active_cell
-            .as_deref()
-            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
-            .expect("Bash must remain active while waiting for detach handoff");
-        assert_eq!(active.status, ToolStatus::Running);
-        assert!(active.output_summary.is_none());
-
-        assert!(w.mark_active_bash_backgrounded(Some("tu_test"), "bg-shell-1"));
-        assert_eq!(w.history.len(), 2);
-        let tool = w.history[1]
-            .as_any_ref()
-            .downcast_ref::<ToolCell>()
-            .expect("backgrounded Bash should be committed after the handoff note");
-        assert_eq!(tool.status, ToolStatus::Success);
-        let summary = tool.output_summary.as_deref().unwrap_or_default();
-        assert!(
-            !summary.contains("failed before returning output"),
-            "backgrounded Bash must not carry the failure placeholder: {summary}"
-        );
     }
 
     #[test]

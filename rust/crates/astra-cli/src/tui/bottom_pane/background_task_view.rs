@@ -510,6 +510,7 @@ impl BackgroundTaskView {
         if explicit_selection_found {
             self.mode = Mode::Detail;
         }
+        // CRITICAL FIX: Always clamp after mutation to prevent OOB panic
         self.clamp_selection();
     }
 

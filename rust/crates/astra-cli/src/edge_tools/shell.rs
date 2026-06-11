@@ -7,11 +7,13 @@ use super::{
     sandbox_command, validate_path, wrap_command_with_limits,
 };
 use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy, filter_environment};
+use astra_tools::detach::{
+    AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
+    restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
+};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
-
-const BASH_DETACH_ADOPTION_ACK_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -2820,7 +2822,7 @@ fn run_command_with_cleanup(
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (command + all children)
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -2828,7 +2830,7 @@ fn run_command_with_cleanup(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(format!("Error: {e}"));
             }
@@ -2861,7 +2863,7 @@ const BASH_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 ///
 /// Failures are silently ignored because the child may already have been
 /// reaped by the caller in a race; this helper is strictly best-effort.
-fn sigkill_process_group(child: &mut std::process::Child) {
+fn sync_sigkill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
@@ -2871,7 +2873,7 @@ fn sigkill_process_group(child: &mut std::process::Child) {
         } else {
             tracing::warn!(
                 pid,
-                "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+                "sync_sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
             );
         }
     }
@@ -3040,13 +3042,13 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
                     .as_ref()
                     .is_some_and(|token| token.is_cancelled())
                 {
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     let _ = child.wait();
                     return Err("Error: command cancelled by user".to_string());
                 }
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (bash + all children)
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!(
@@ -3057,7 +3059,7 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(format!("Error: {e}"));
             }
@@ -3080,42 +3082,6 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         stdout: stdout_buf,
         stderr: stderr_buf,
     })
-}
-
-fn detach_signal_observed(signal_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) -> bool {
-    enum SignalState {
-        Observed,
-        NotObserved,
-        Disconnected,
-    }
-
-    let state = if let Some(rx) = signal_rx.as_mut() {
-        match rx.has_changed() {
-            Ok(true) if *rx.borrow_and_update() => SignalState::Observed,
-            Ok(_) => SignalState::NotObserved,
-            Err(_) => SignalState::Disconnected,
-        }
-    } else {
-        return false;
-    };
-
-    match state {
-        SignalState::Observed => true,
-        SignalState::NotObserved => false,
-        SignalState::Disconnected => {
-            *signal_rx = None;
-            false
-        }
-    }
-}
-
-async fn restore_detach_signal_receiver(
-    detach: &astra_tools::detach::DetachShellHandle,
-    signal_rx: Option<tokio::sync::watch::Receiver<bool>>,
-) {
-    if let Some(signal_rx) = signal_rx {
-        *detach.signal_rx.lock().await = Some(signal_rx);
-    }
 }
 
 fn apply_overlay_to_tokio_command(cmd: &mut TokioCommand) {
@@ -3213,27 +3179,6 @@ async fn drain_tokio_stderr(
     }
 }
 
-async fn kill_tokio_process_group(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id()
-            && let Ok(raw) = i32::try_from(pid)
-        {
-            let pgid = nix::unistd::Pid::from_raw(raw);
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-            let _ = child.wait().await;
-            return;
-        }
-    }
-    let _ = child.kill().await;
-}
-
-async fn terminate_detached_shell_payload(
-    mut payload: Box<astra_tools::detach::DetachedShellPayload>,
-) {
-    kill_tokio_process_group(&mut payload.child).await;
-}
-
 async fn run_shell_output_with_detach_config(
     config: ShellRunConfig,
     detach: &astra_tools::detach::DetachShellHandle,
@@ -3274,14 +3219,14 @@ async fn run_shell_output_with_detach_config(
             }
             Ok(None) => {}
             Err(e) => {
-                kill_tokio_process_group(&mut child).await;
+                sigkill_process_group(&mut child).await;
                 restore_detach_signal_receiver(detach, signal_rx).await;
                 return Err(format!("Error: {e}"));
             }
         }
 
         if tokio::time::Instant::now() >= deadline {
-            kill_tokio_process_group(&mut child).await;
+            sigkill_process_group(&mut child).await;
             restore_detach_signal_receiver(detach, signal_rx).await;
             return Err(format!(
                 "Error: command timed out after {}s",
@@ -3309,7 +3254,7 @@ async fn run_shell_output_with_detach_config(
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    kill_tokio_process_group(&mut child).await;
+                    sigkill_process_group(&mut child).await;
                     restore_detach_signal_receiver(detach, signal_rx).await;
                     return Err("Error: command cancelled by user".to_string());
                 }
@@ -3345,7 +3290,7 @@ async fn run_shell_output_with_detach_config(
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    kill_tokio_process_group(&mut child).await;
+                    sigkill_process_group(&mut child).await;
                     restore_detach_signal_receiver(detach, signal_rx).await;
                     return Err("Error: command cancelled by user".to_string());
                 }
@@ -3787,7 +3732,7 @@ fn run_command_streaming(
                         });
                     } else {
                         // Hard kill.
-                        sigkill_process_group(&mut child);
+                        sync_sigkill_process_group(&mut child);
                         let _ = child.wait();
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
@@ -3803,7 +3748,7 @@ fn run_command_streaming(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
@@ -3844,7 +3789,7 @@ fn size_watchdog(
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(_) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 break;
             }
@@ -3852,7 +3797,7 @@ fn size_watchdog(
 
         // Kill if running too long.
         if start.elapsed() > max_duration {
-            sigkill_process_group(&mut child);
+            sync_sigkill_process_group(&mut child);
             let _ = child.wait();
             break;
         }
@@ -3945,7 +3890,7 @@ fn run_readonly_command_with_partial(
                 if std::time::Instant::now() > deadline {
                     // Kill the entire process group (catches child processes).
                     // Fall back to direct kill so child.wait() never blocks forever.
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     let _ = child.wait();
                     let _ = reader.join();
                     let _ = stderr_reader.join();
@@ -3964,7 +3909,7 @@ fn run_readonly_command_with_partial(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 let _ = reader.join();
                 let _ = stderr_reader.join();
@@ -4181,10 +4126,7 @@ impl ToolExecutor {
             Some(c) => c,
             None => return Err("Error: missing 'command'".to_string()),
         };
-        if let Some(error) = astra_tools::shell_ops::background_task_tool_pseudo_call_error(command)
-        {
-            return Err(error);
-        }
+        astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
 
         // Block pure sleep commands — they waste time with no useful output.
         // Only when no explicit timeout is set (explicit timeout = intentional test usage).
@@ -4451,43 +4393,42 @@ impl ToolExecutor {
             }) => {
                 handle.mark_active(false);
                 let Some(sender) = handle.payload_tx.lock().await.take() else {
-                    terminate_detached_shell_payload(payload).await;
+                    terminate_detached_payload(payload).await;
                     return Some(super::ToolExecutionOutcome::error(
                         "Error: bash detach failed: host payload channel was not available"
                             .to_string(),
                     ));
                 };
                 if let Err(payload) = sender.send(*payload) {
-                    terminate_detached_shell_payload(Box::new(payload)).await;
+                    terminate_detached_payload(Box::new(payload)).await;
                     return Some(super::ToolExecutionOutcome::error(
                         "Error: bash detach failed: host listener dropped before payload arrived"
                             .to_string(),
                     ));
                 }
 
-                let task_id =
-                    match tokio::time::timeout(BASH_DETACH_ADOPTION_ACK_WAIT, adoption_rx).await {
-                        Ok(Ok(Ok(task_id))) => task_id,
-                        Ok(Ok(Err(error))) => {
-                            return Some(super::ToolExecutionOutcome::error(format!(
-                                "Error: bash detach failed: host could not adopt process: {error}"
-                            )));
-                        }
-                        Ok(Err(_)) => {
-                            return Some(super::ToolExecutionOutcome::error(
-                                "Error: bash detach failed: host dropped adoption acknowledgement"
-                                    .to_string(),
-                            ));
-                        }
-                        Err(_) => {
-                            return Some(super::ToolExecutionOutcome::error(
+                let task_id = match await_adoption_ack(adoption_rx).await {
+                    AdoptionAckOutcome::Adopted { task_id, .. } => task_id,
+                    AdoptionAckOutcome::Refused(error) => {
+                        return Some(super::ToolExecutionOutcome::error(format!(
+                            "Error: bash detach failed: host could not adopt process: {error}"
+                        )));
+                    }
+                    AdoptionAckOutcome::SenderDropped => {
+                        return Some(super::ToolExecutionOutcome::error(
+                            "Error: bash detach failed: host dropped adoption acknowledgement"
+                                .to_string(),
+                        ));
+                    }
+                    AdoptionAckOutcome::TimedOut => {
+                        return Some(super::ToolExecutionOutcome::error(
                             "Error: bash detach failed: host did not acknowledge adoption in time"
                                 .to_string(),
                         ));
-                        }
-                    };
+                    }
+                };
 
-                let output = astra_tools::shell_ops::render_bash_detached_marker(&task_id);
+                let output = render_bash_detached_marker(&task_id);
                 let mut tool_result_fields = serde_json::Map::new();
                 tool_result_fields.insert("bash_detached".to_string(), Value::Bool(true));
                 tool_result_fields.insert("background_task_id".to_string(), Value::String(task_id));
@@ -5284,6 +5225,37 @@ mod tests {
         assert!(
             !result.contains("syntax error"),
             "pseudo task tool call must not reach bash: {result}"
+        );
+    }
+
+    /// The edge bash entry point must refuse direct disk reads of the
+    /// background-task output directory — the same denial the in-tools
+    /// `validate_execute_bash_command` enforces. Without this, the hot-path
+    /// edge bash silently bypasses the canonical validator and the model
+    /// can still `tail /tmp/astra/bg_tasks/...` to poll task output, which
+    /// is the canonical 12-LLM-round trace this contract was designed
+    /// to defeat.
+    #[test]
+    fn bash_rejects_background_task_output_dir_disk_read() {
+        let executor = test_executor();
+        for command in [
+            "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
+            "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
+            "tail -f /var/folders/abc/T/astra/bg_tasks/sess/bg-shell-2.stdout",
+            "grep error /tmp/astra/bg_tasks/sess/bg-shell-3.stderr",
+        ] {
+            let result = executor.bash(&serde_json::json!({"command": command}));
+            assert!(
+                result.contains("background task output files"),
+                "{command} -> {result}"
+            );
+            assert!(result.contains("task_output"), "{command} -> {result}");
+        }
+        assert!(
+            executor
+                .bash(&serde_json::json!({"command": "echo bg_tasks is unrelated here"}))
+                .contains("bg_tasks is unrelated here"),
+            "literal word 'bg_tasks' without the astra path prefix must not trigger"
         );
     }
 
@@ -8407,7 +8379,7 @@ mod tests {
         // Process should be alive.
         assert!(child.try_wait().unwrap().is_none());
         // Kill it.
-        super::sigkill_process_group(&mut child);
+        super::sync_sigkill_process_group(&mut child);
         // Wait should complete immediately.
         let status = child.wait().expect("wait after sigkill");
         assert!(!status.success(), "process should have been killed");

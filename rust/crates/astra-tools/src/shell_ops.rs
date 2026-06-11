@@ -22,21 +22,8 @@ use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exi
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
-const BASH_DETACH_ADOPTION_ACK_WAIT: Duration = Duration::from_secs(5);
 
-pub fn render_bash_detached_marker(task_id: &str) -> String {
-    format!(
-        "<bash_detached>The bash command was promoted to background task {task_id}. \
-         The runtime will deliver a <task_notification> when the task terminates — \
-         end your turn now and let the user drive next steps. \
-         Do NOT poll: do not call `task_output`, do not rerun the bash command, \
-         and do not read the on-disk output files via bash (tail/cat/head/less are denied). \
-         If the user explicitly asks for partial progress, call `task_output` ONCE with \
-         block=false; if they ask you to wait, use `task_output` with block=true. \
-         Use `task_stop` only when the user wants the task cancelled.\
-         </bash_detached>"
-    )
-}
+pub use crate::detach::render_bash_detached_marker;
 
 fn is_background_task_tool_shell_invocation(command: &str, tool: &str) -> bool {
     let lower = command.trim().to_ascii_lowercase();
@@ -89,6 +76,32 @@ pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
     ))
 }
 
+/// Canonical bash pre-execution validator for the background-task contract.
+///
+/// Returns `Err(message)` for the two anti-patterns that *must* be blocked
+/// at the validator layer in every bash entry point:
+///
+/// 1. Pseudo-tool invocations (`task_output(...)`, `task_list`, `task_stop ...`)
+///    — the model thinks these are shell programs. Blocking here turns the
+///    mistake into an immediate corrective error instead of a `command not
+///    found` round-trip.
+/// 2. Direct disk reads of background-task stdout/stderr files
+///    (`tail /tmp/astra/bg_tasks/...`). The trace this guards against had a
+///    model burn 12 LLM rounds tail'ing a stderr file instead of calling
+///    `task_output`.
+///
+/// All bash entry points (in-process and edge) MUST funnel through this
+/// helper. Adding a new check requires editing one place, not two.
+pub fn validate_bash_background_task_contract(command: &str) -> Result<(), String> {
+    if let Some(err) = background_task_tool_pseudo_call_error(command) {
+        return Err(err);
+    }
+    if let Some(err) = background_task_output_dir_read_error(command) {
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// RAII guard for detach handle lifecycle. Takes ownership on creation,
 /// automatically restores to slot on drop unless explicitly consumed.
 /// This prevents handle leaks on early-return paths (errors, validation failures).
@@ -122,10 +135,6 @@ impl<'a> DetachHandleGuard<'a> {
         self.handle.take()
     }
 
-    fn has_handle(&self) -> bool {
-        self.handle.is_some()
-    }
-
     /// Restore handle to slot. Call this on error/completed paths.
     /// Consumes self and restores the handle to the slot for reuse.
     async fn restore(mut self) {
@@ -152,41 +161,10 @@ impl<'a> Drop for DetachHandleGuard<'a> {
     }
 }
 
-async fn restore_detach_signal_receiver(
-    detach: &DetachShellHandle,
-    signal_rx: Option<tokio::sync::watch::Receiver<bool>>,
-) {
-    if let Some(signal_rx) = signal_rx {
-        *detach.signal_rx.lock().await = Some(signal_rx);
-    }
-}
-
-fn detach_signal_observed(signal_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) -> bool {
-    enum SignalState {
-        Observed,
-        NotObserved,
-        Disconnected,
-    }
-
-    let state = if let Some(rx) = signal_rx.as_mut() {
-        match rx.has_changed() {
-            Ok(true) if *rx.borrow_and_update() => SignalState::Observed,
-            Ok(_) => SignalState::NotObserved,
-            Err(_) => SignalState::Disconnected,
-        }
-    } else {
-        return false;
-    };
-
-    match state {
-        SignalState::Observed => true,
-        SignalState::NotObserved => false,
-        SignalState::Disconnected => {
-            *signal_rx = None;
-            false
-        }
-    }
-}
+use crate::detach::{
+    detach_signal_observed, restore_detach_signal_receiver, sigkill_process_group,
+    terminate_detached_payload,
+};
 
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
@@ -739,12 +717,7 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     if cmd.is_empty() {
         return Err("Error: empty bash command".into());
     }
-    if let Some(error) = background_task_tool_pseudo_call_error(cmd) {
-        return Err(error);
-    }
-    if let Some(error) = background_task_output_dir_read_error(cmd) {
-        return Err(error);
-    }
+    validate_bash_background_task_contract(cmd)?;
     let lower = cmd.to_ascii_lowercase();
     let blocked_substrings = [
         "mkfs",
@@ -923,8 +896,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         },
     );
 
-    let output = if detach_handle_guard.has_handle() {
-        let handle_ref = detach_handle_guard.get_ref().unwrap();
+    let output = if let Some(handle_ref) = detach_handle_guard.get_ref() {
         handle_ref.mark_active(true);
         match run_bash_with_detach(
             &mut cmd,
@@ -950,7 +922,14 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 // through the one-shot reply channel. The host drains
                 // it in its event-loop tick and calls
                 // BackgroundTaskRegistry::adopt_detached_shell.
-                let detach_handle = detach_handle_guard.take().unwrap();
+                let Some(detach_handle) = detach_handle_guard.take() else {
+                    // Handle was somehow consumed between get_ref and take —
+                    // this should not happen, but handle gracefully.
+                    terminate_detached_payload(payload).await;
+                    return ToolResult::error(
+                        "Error: bash detach failed: handle was already consumed".to_string(),
+                    );
+                };
                 let Some(sender) = detach_handle.payload_tx.lock().await.take() else {
                     detach_handle.mark_active(false);
                     terminate_detached_payload(payload).await;
@@ -967,27 +946,31 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                             .to_string(),
                     );
                 }
-                let task_id =
-                    match tokio::time::timeout(BASH_DETACH_ADOPTION_ACK_WAIT, adoption_rx).await {
-                        Ok(Ok(Ok(task_id))) => task_id,
-                        Ok(Ok(Err(error))) => {
-                            return ToolResult::error(format!(
-                                "Error: bash detach failed: host could not adopt process: {error}"
-                            ));
-                        }
-                        Ok(Err(_)) => {
-                            return ToolResult::error(
-                                "Error: bash detach failed: host dropped adoption acknowledgement"
-                                    .to_string(),
-                            );
-                        }
-                        Err(_) => {
-                            return ToolResult::error(
+                use crate::detach::AdoptionAckOutcome;
+                let task_id = match crate::detach::await_adoption_ack(adoption_rx).await {
+                    AdoptionAckOutcome::Adopted { task_id, .. } => task_id,
+                    AdoptionAckOutcome::Refused(error) => {
+                        return ToolResult::error(format!(
+                            "Error: bash detach failed: host could not adopt process: {error}"
+                        ));
+                    }
+                    AdoptionAckOutcome::SenderDropped => {
+                        return ToolResult::error(
+                            "Error: bash detach failed: host dropped adoption acknowledgement"
+                                .to_string(),
+                        );
+                    }
+                    AdoptionAckOutcome::TimedOut => {
+                        // Child was already sent to the host; if adoption timed out,
+                        // the host is responsible for cleanup or the child may have
+                        // already terminated. We cannot access payload.child here
+                        // because *payload was moved into sender.send().
+                        return ToolResult::error(
                             "Error: bash detach failed: host did not acknowledge adoption in time"
                                 .to_string(),
                         );
-                        }
-                    };
+                    }
+                };
                 let mut result = ToolResult::text(render_bash_detached_marker(&task_id));
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("bash_detached".to_string(), serde_json::Value::Bool(true));
@@ -3027,31 +3010,7 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
 
 /// Kill the child's entire process group (SIGKILL via `killpg(2)`) then
 /// reap. Needed so orphaned grandchildren don't hold the stdio pipes open
-/// past the kill — the child must have been spawned with
-/// `process_group(0)` for the pgid to equal its PID.
-///
-/// Uses a direct syscall (best-effort; failures are ignored because the
-/// child may already have exited and been reaped, in which case the pgid
-/// is gone). Falls back to `child.kill()` on non-unix platforms.
-async fn sigkill_process_group(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            if let Ok(raw) = i32::try_from(pid) {
-                let pgid = nix::unistd::Pid::from_raw(raw);
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-            } else {
-                tracing::warn!(
-                    pid,
-                    "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
-                );
-            }
-        }
-    }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-}
-
+/// past the kill.
 fn exit_code_from_status(status: &ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -3064,10 +3023,6 @@ fn exit_code_from_status(status: &ExitStatus) -> i32 {
         }
     }
     -1
-}
-
-async fn terminate_detached_payload(mut payload: Box<crate::detach::DetachedShellPayload>) {
-    sigkill_process_group(&mut payload.child).await;
 }
 
 async fn run_readonly_command_with_partial(
@@ -5576,15 +5531,25 @@ printf 'probe.txt:1:needle\n'
             result.output
         );
         assert!(
-            result.output.contains("call the `task_output` tool"),
-            "result must point the LLM at the real task_output tool: {}",
+            result.output.contains("Do NOT poll"),
+            "result must tell the LLM not to poll task_output: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("do not rerun the bash command"),
+            "result must forbid the rerun anti-pattern: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("tail/cat/head/less are denied"),
+            "result must close the on-disk read escape hatch: {}",
             result.output
         );
         assert!(
             result
                 .output
-                .contains("Do not run these tool names through Bash"),
-            "result must tell the LLM not to execute tool names as shell: {}",
+                .contains("call `task_output` ONCE with block=false"),
+            "result must show the user-asked-for-progress escape hatch: {}",
             result.output
         );
         assert!(

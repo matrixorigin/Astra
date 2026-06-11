@@ -118,11 +118,20 @@ impl StatusIndicator {
         // transitions preserve `stream_chars` so `↓ Nk tokens` keeps
         // climbing instead of flashing back to 0 each time the model
         // fires a tool. `begin_turn` is the explicit reset point.
+        // The Ctrl+B hint is bash-tool-scoped — drop it on any state
+        // that isn't a bash tool so a stale flag can't render under
+        // a different tool or thinking state.
+        let entering_bash_tool = matches!(
+            &state,
+            IndicatorState::Tool { name, .. } if name == "bash"
+        );
+        if !entering_bash_tool {
+            self.bash_background_hint_enabled = false;
+        }
         if matches!(state, IndicatorState::Idle) {
             self.stream_chars = 0;
             self.turn_started_at = None;
             self.turn_label = None;
-            self.bash_background_hint_enabled = false;
         } else if self.turn_started_at.is_none() {
             // Auto-start a turn when transitioning out of Idle. Lets
             // existing callers that drive `set_state(Thinking{...})`
@@ -582,6 +591,47 @@ mod tests {
         assert!(
             !s.bash_background_hint_enabled,
             "idle transition must clear stale Ctrl+B affordance"
+        );
+    }
+
+    /// Bash-only hint state must not survive a transition to any other
+    /// indicator state — even within the same turn. Without this guard,
+    /// a bash → read_file transition would leave `bash_background_hint`
+    /// flipped to true, and any future renderer that forgets to gate on
+    /// `IndicatorState::Tool { name == "bash" }` would draw the Ctrl+B
+    /// affordance under an unrelated tool. Better to drop the flag at
+    /// the source.
+    #[test]
+    fn non_bash_state_transition_clears_ctrl_b_hint() {
+        let t0 = Instant::now();
+        let mut s = StatusIndicator::new();
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0,
+        });
+        s.set_bash_background_hint_enabled(true);
+        assert!(s.bash_background_hint_enabled);
+
+        // bash → another tool: hint must drop.
+        s.set_state(IndicatorState::Tool {
+            name: "read_file".into(),
+            started_at: t0,
+        });
+        assert!(
+            !s.bash_background_hint_enabled,
+            "non-bash tool transition must clear stale Ctrl+B affordance"
+        );
+
+        // re-arming, then bash → thinking must also drop.
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0,
+        });
+        s.set_bash_background_hint_enabled(true);
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+        assert!(
+            !s.bash_background_hint_enabled,
+            "bash → thinking must clear stale Ctrl+B affordance"
         );
     }
 

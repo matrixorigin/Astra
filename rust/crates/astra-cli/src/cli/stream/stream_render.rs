@@ -7003,14 +7003,20 @@ mod tests {
             outcome.output
         );
         assert!(
-            outcome.output.contains("call the `task_output` tool"),
+            outcome.output.contains("end your turn now"),
+            "{}",
+            outcome.output
+        );
+        assert!(outcome.output.contains("Do NOT poll"), "{}", outcome.output);
+        assert!(
+            outcome
+                .output
+                .contains("call `task_output` ONCE with block=false"),
             "{}",
             outcome.output
         );
         assert!(
-            outcome
-                .output
-                .contains("Do not run these tool names through Bash"),
+            outcome.output.contains("tail/cat/head/less are denied"),
             "{}",
             outcome.output
         );

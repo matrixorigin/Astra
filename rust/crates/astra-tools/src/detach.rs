@@ -24,9 +24,162 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+
+/// Maximum wall-clock the bash runner waits for the TUI to acknowledge
+/// adoption of a detached child after the payload has been handed off
+/// through `payload_tx`. Adoption is in-process and normally completes
+/// in well under 100 ms, but the TUI may be parked draining a backlog
+/// of events. 30 s gives enough headroom that a transient stall does
+/// not surface as a "host did not acknowledge adoption in time" error
+/// while still bounding the bash tool call so it cannot hang forever.
+pub const ADOPTION_ACK_WAIT: Duration = Duration::from_secs(30);
+
+/// Soft threshold above which the bash runner emits a warning that the
+/// TUI took longer than expected to acknowledge adoption. Useful as a
+/// canary for inner-tick starvation; below the [`ADOPTION_ACK_WAIT`]
+/// hard ceiling, no error is raised.
+pub const ADOPTION_ACK_SLOW_WARN: Duration = Duration::from_secs(1);
+
+/// Render the model-facing marker the bash tool returns after a
+/// successful detach. Encodes the anti-polling contract: the runtime
+/// will deliver a `<task_notification>` when the task terminates, and
+/// the model must end its turn instead of polling `task_output` or
+/// rerunning the command.
+pub fn render_bash_detached_marker(task_id: &str) -> String {
+    format!(
+        "<bash_detached>The bash command was promoted to background task {task_id}. \
+         The runtime will deliver a <task_notification> when the task terminates — \
+         end your turn now and let the user drive next steps. \
+         Do NOT poll: do not call `task_output`, do not rerun the bash command, \
+         and do not read the on-disk output files via bash (tail/cat/head/less are denied). \
+         If the user explicitly asks for partial progress, call `task_output` ONCE with \
+         block=false; if they ask you to wait, use `task_output` with block=true. \
+         Use `task_stop` only when the user wants the task cancelled.\
+         </bash_detached>"
+    )
+}
+
+/// Race-free check for the watch::Receiver that observes the TUI's
+/// `signal_tx.send(true)`. Returns `true` exactly once when the
+/// detach signal has been observed, drops the receiver if the
+/// sender has been closed, and is a no-op otherwise. Both bash
+/// runners share this so their detach windows agree byte-for-byte
+/// on what counts as "the user pressed Ctrl+B during this command".
+pub fn detach_signal_observed(signal_rx: &mut Option<watch::Receiver<bool>>) -> bool {
+    enum SignalState {
+        Observed,
+        NotObserved,
+        Disconnected,
+    }
+
+    let state = if let Some(rx) = signal_rx.as_mut() {
+        match rx.has_changed() {
+            Ok(true) if *rx.borrow_and_update() => SignalState::Observed,
+            Ok(_) => SignalState::NotObserved,
+            Err(_) => SignalState::Disconnected,
+        }
+    } else {
+        return false;
+    };
+
+    match state {
+        SignalState::Observed => true,
+        SignalState::NotObserved => false,
+        SignalState::Disconnected => {
+            *signal_rx = None;
+            false
+        }
+    }
+}
+
+/// Restore a watch::Receiver back into the handle so a later bash in
+/// the same turn can observe a fresh detach signal. Idempotent: a
+/// `None` receiver is a no-op.
+pub async fn restore_detach_signal_receiver(
+    detach: &DetachShellHandle,
+    signal_rx: Option<watch::Receiver<bool>>,
+) {
+    if let Some(signal_rx) = signal_rx {
+        *detach.signal_rx.lock().await = Some(signal_rx);
+    }
+}
+
+/// SIGKILL a child's process group (when spawned with `process_group(0)`)
+/// and reap. Best-effort on Unix; falls back to `child.kill()` elsewhere.
+/// Centralized here so both bash runners terminate detached payloads
+/// the same way on adoption failure.
+pub async fn sigkill_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            if let Ok(raw) = i32::try_from(pid) {
+                let pgid = nix::unistd::Pid::from_raw(raw);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            } else {
+                tracing::warn!(
+                    pid,
+                    "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+                );
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// SIGKILL the live child carried in a [`DetachedShellPayload`]. Used
+/// when the TUI dropped the listener or the registry refused adoption,
+/// so the runtime cannot leave an orphaned process behind.
+pub async fn terminate_detached_payload(mut payload: Box<DetachedShellPayload>) {
+    sigkill_process_group(&mut payload.child).await;
+}
+
+/// Outcome of waiting for the TUI's adoption acknowledgement on the
+/// `adoption_tx` channel inside [`DetachedShellPayload`]. The runner
+/// turns these into ToolResult variants.
+pub enum AdoptionAckOutcome {
+    /// TUI returned a concrete background task id (`bg-shell-N`).
+    Adopted { task_id: String, waited: Duration },
+    /// TUI tried to adopt but the registry refused (e.g. cap reached).
+    Refused(String),
+    /// TUI dropped the ack sender without responding.
+    SenderDropped,
+    /// `ADOPTION_ACK_WAIT` elapsed without a reply.
+    TimedOut,
+}
+
+/// Wait for the TUI's adoption acknowledgement. Bounded by
+/// [`ADOPTION_ACK_WAIT`]; logs a `tracing::warn!` if the wait crossed
+/// [`ADOPTION_ACK_SLOW_WARN`] so a starved inner-tick is observable
+/// in production logs without surfacing as a user-visible error.
+pub async fn await_adoption_ack(
+    adoption_rx: oneshot::Receiver<Result<String, String>>,
+) -> AdoptionAckOutcome {
+    let started = tokio::time::Instant::now();
+    let outcome = match tokio::time::timeout(ADOPTION_ACK_WAIT, adoption_rx).await {
+        Ok(Ok(Ok(task_id))) => AdoptionAckOutcome::Adopted {
+            task_id,
+            waited: started.elapsed(),
+        },
+        Ok(Ok(Err(error))) => AdoptionAckOutcome::Refused(error),
+        Ok(Err(_)) => AdoptionAckOutcome::SenderDropped,
+        Err(_) => AdoptionAckOutcome::TimedOut,
+    };
+    if let AdoptionAckOutcome::Adopted { waited, task_id } = &outcome
+        && *waited > ADOPTION_ACK_SLOW_WARN
+    {
+        tracing::warn!(
+            task_id = task_id.as_str(),
+            waited_ms = waited.as_millis() as u64,
+            "bash detach adoption ack took longer than expected — TUI inner tick may be starved"
+        );
+    }
+    outcome
+}
 
 /// Live child + streams transferred from the bash runner to the
 /// background registry on Ctrl+B promotion. `partial_stdout` /
