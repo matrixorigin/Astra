@@ -56,12 +56,6 @@ const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 
-fn ctrl_b_promoted_notification(task_id: &str) -> String {
-    format!(
-        "<background_task_notification>\n<status>promoted</status>\n<task_id>{task_id}</task_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell task. Continue normally; use task_output(task_id='{task_id}') for this task, task_list() to inspect tasks, or task_stop(task_id='{task_id}') to stop it.</hint>\n</background_task_notification>"
-    )
-}
-
 fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
     let description = description.trim();
     if description.is_empty() {
@@ -1633,7 +1627,6 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
-                                    let mut ctrl_b_promoted_task_id: Option<String> = None;
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
                                     // we keep the listener so a Ctrl+B keypress can
@@ -1754,9 +1747,10 @@ pub(crate) async fn run_tui_session(
                                                             // listening on the detach signal, fire it: the
                                                             // runner transfers child + live streams to the
                                                             // BackgroundTaskRegistry without kill, output
-                                                            // continues uninterrupted, the turn ends with a
-                                                            // <bash_detached> marker the LLM can reason
-                                                            // about. Otherwise, try to promote a foreground
+                                                            // continues uninterrupted, and the bash tool
+                                                            // returns a <bash_detached> marker with the
+                                                            // concrete background task id. Otherwise, try
+                                                            // to promote a foreground
                                                             // synchronous agent wait into a normal background
                                                             // agent. If neither path is available, the key is
                                                             // explicitly unavailable and does not cancel the
@@ -2254,16 +2248,29 @@ pub(crate) async fn run_tui_session(
                                                     bash_detach_request_pending = false;
                                                     match handoff {
                                                         Ok(p) => {
+                                                            let astra_tools::detach::DetachedShellPayload {
+                                                                child,
+                                                                stdout,
+                                                                stderr,
+                                                                command,
+                                                                partial_stdout,
+                                                                partial_stderr,
+                                                                adoption_tx,
+                                                            } = p;
                                                             let id = match background_registry.adopt_detached_shell(
-                                                                p.child,
-                                                                p.stdout,
-                                                                p.stderr,
-                                                                &p.command,
-                                                                p.partial_stdout,
-                                                                p.partial_stderr,
+                                                                child,
+                                                                stdout,
+                                                                stderr,
+                                                                &command,
+                                                                partial_stdout,
+                                                                partial_stderr,
                                                             ) {
-                                                                Ok(id) => id,
+                                                                Ok(id) => {
+                                                                    let _ = adoption_tx.send(Ok(id.clone()));
+                                                                    id
+                                                                },
                                                                 Err(error) => {
+                                                                    let _ = adoption_tx.send(Err(error.clone()));
                                                                     chat_widget.commit_system(
                                                                         history_cell::system::SystemCell::error(
                                                                             format!("⏎ Backgrounding failed: {error}")
@@ -2289,7 +2296,6 @@ pub(crate) async fn run_tui_session(
                                                                 ),
                                                             );
                                                             let selected_id = id.clone();
-                                                            ctrl_b_promoted_task_id = Some(id);
                                                             let _ = chat_widget.mark_active_bash_backgrounded(
                                                                 active_bash_tool_use_id.as_deref(),
                                                                 selected_id.as_str(),
@@ -2314,7 +2320,6 @@ pub(crate) async fn run_tui_session(
                                                                 Some(selected_id.as_str()),
                                                             )
                                                             .await;
-                                                            tui_cancel_token.cancel();
                                                         }
                                                         Err(error) => {
                                                             *bash_detach_slot_for_ctrl_b.lock().await = None;
@@ -2638,16 +2643,6 @@ pub(crate) async fn run_tui_session(
                                         ) {
                                             chat_widget.handle_event(ev);
                                         }
-                                    }
-
-                                    // Ctrl+B notification: tell the next turn
-                                    // about true promotions. Unavailable
-                                    // keypresses are UI-only and must not
-                                    // perturb model context.
-                                    if let Some(task_id) = ctrl_b_promoted_task_id {
-                                        state
-                                            .pending_bg_notifications
-                                            .push(ctrl_b_promoted_notification(&task_id));
                                     }
 
                                     // Update footer
@@ -3763,20 +3758,6 @@ mod tests {
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
             assert_eq!(decoded, target, "variant {encoded} did not round-trip");
         }
-    }
-
-    #[test]
-    fn ctrl_b_promoted_notification_guides_output_without_rerun() {
-        let notification = ctrl_b_promoted_notification("bg-shell-7");
-
-        assert!(notification.contains("<status>promoted</status>"));
-        assert!(notification.contains("<task_id>bg-shell-7</task_id>"));
-        assert!(notification.contains("task_output(task_id='bg-shell-7')"));
-        assert!(notification.contains("task_list()"));
-        assert!(
-            !notification.contains("job(action='shell'"),
-            "true Ctrl+B promotion must not tell the model to re-run a side-effecting command: {notification}"
-        );
     }
 
     #[test]

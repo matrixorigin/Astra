@@ -132,8 +132,12 @@ impl ToolCell {
         output_summary: Option<String>,
         output: Option<String>,
     ) {
+        let bash_detached_task_id = (self.name == "bash")
+            .then(|| bash_detached_task_id(output_summary.as_deref(), output.as_deref()))
+            .flatten();
         let bash_detached = self.name == "bash"
-            && bash_detached_marker_present(output_summary.as_deref(), output.as_deref());
+            && (bash_detached_task_id.is_some()
+                || bash_detached_marker_present(output_summary.as_deref(), output.as_deref()));
         self.status = if bash_detached || tool_result_status_is_success(status_str) {
             ToolStatus::Success
         } else {
@@ -144,7 +148,7 @@ impl ToolCell {
             self.description = description;
         }
         if bash_detached {
-            self.output_summary = Some(bash_backgrounded_summary(None));
+            self.output_summary = Some(bash_backgrounded_summary(bash_detached_task_id.as_deref()));
             self.output = None;
             self.ctrl_b_background_hint = false;
         } else {
@@ -896,6 +900,18 @@ fn bash_detached_marker_present(output_summary: Option<&str>, output: Option<&st
         .any(|text| text.contains("<bash_detached>"))
 }
 
+fn bash_detached_task_id(output_summary: Option<&str>, output: Option<&str>) -> Option<String> {
+    output_summary
+        .into_iter()
+        .chain(output)
+        .filter(|text| text.contains("<bash_detached>"))
+        .flat_map(|text| {
+            text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        })
+        .find(|token| token.starts_with("bg-shell-"))
+        .map(str::to_string)
+}
+
 fn bash_backgrounded_summary(task_id: Option<&str>) -> String {
     let open_hint = crate::tui::background_shortcut::background_task_open_hint();
     match task_id {
@@ -1246,6 +1262,29 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("failed before returning output"), "{out}");
+    }
+
+    #[test]
+    fn bash_detached_marker_with_task_id_renders_task_id() {
+        let mut t = ToolCell::new_running("bash", "$ make check");
+        t.complete(
+            "success",
+            1200,
+            String::new(),
+            None,
+            Some(
+                "<bash_detached>The bash command was promoted to background task bg-shell-9.</bash_detached>"
+                    .into(),
+            ),
+        );
+        assert_eq!(t.status, ToolStatus::Success);
+        let expected = format!(
+            "Running in the background as bg-shell-9 · {}",
+            crate::tui::background_shortcut::background_task_open_hint()
+        );
+        assert_eq!(t.output_summary.as_deref(), Some(expected.as_str()));
+        let out = render(&t, 100, 4);
+        assert!(out.contains("bg-shell-9"), "{out}");
     }
 
     #[test]

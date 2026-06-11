@@ -12,9 +12,12 @@
 //! Single-shot semantics: each bash invocation gets at most one
 //! detach signal. The signal carries no data; the bash runner sends
 //! the payload back through the [`tokio::sync::oneshot`] reply
-//! channel embedded in [`DetachShellHandle`]. After detach the bash
-//! runner returns a marker `ToolResult` so the LLM sees the
-//! invocation ended via background promotion rather than completion.
+//! channel embedded in [`DetachShellHandle`]. The TUI adopts the
+//! payload into its background registry, then acknowledges the
+//! concrete task id through the payload's adoption channel. After
+//! detach the bash runner returns a marker `ToolResult` with that
+//! concrete task id so the LLM sees the invocation ended via
+//! background promotion rather than completion.
 //!
 //! All types are `Send + 'static` so they cross the runtime/tool
 //! boundary without lifetime gymnastics.
@@ -40,6 +43,10 @@ pub struct DetachedShellPayload {
     pub command: String,
     pub partial_stdout: String,
     pub partial_stderr: String,
+    /// TUI adoption acknowledgement. The bash runner waits for this
+    /// after handing off the child so its ToolResult can include the
+    /// real background task id in the current turn.
+    pub adoption_tx: oneshot::Sender<Result<String, String>>,
 }
 
 /// One-shot handle the bash runner uses to observe a detach request
@@ -201,6 +208,7 @@ mod tests {
             .take()
             .expect("sender available");
 
+        let (adoption_tx, adoption_rx) = tokio::sync::oneshot::channel();
         let payload = DetachedShellPayload {
             child,
             stdout,
@@ -208,6 +216,7 @@ mod tests {
             command: "printf hello; sleep 0.1".into(),
             partial_stdout: "hel".into(),
             partial_stderr: String::new(),
+            adoption_tx,
         };
         if sender.send(payload).is_err() {
             panic!("send payload failed");
@@ -216,5 +225,13 @@ mod tests {
         let received = listener.payload_rx.await.expect("recv payload");
         assert_eq!(received.command, "printf hello; sleep 0.1");
         assert_eq!(received.partial_stdout, "hel");
+        received
+            .adoption_tx
+            .send(Ok("bg-shell-test".into()))
+            .expect("ack adoption");
+        assert_eq!(
+            adoption_rx.await.expect("adoption rx"),
+            Ok("bg-shell-test".into())
+        );
     }
 }

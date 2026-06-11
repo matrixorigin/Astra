@@ -22,6 +22,7 @@ use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exi
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
+const BASH_DETACH_ADOPTION_ACK_WAIT: Duration = Duration::from_secs(5);
 
 /// RAII guard for detach handle lifecycle. Takes ownership on creation,
 /// automatically restores to slot on drop unless explicitly consumed.
@@ -462,7 +463,10 @@ pub(crate) enum BashRunOutcome {
     // The detached variant carries a live `tokio::process::Child` plus
     // two `ChildStdout`/`ChildStderr` handles that are large; box it
     // so the enum stays small for the dominant `Completed` path.
-    Detached(Box<crate::detach::DetachedShellPayload>),
+    Detached {
+        payload: Box<crate::detach::DetachedShellPayload>,
+        adoption_rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
+    },
 }
 
 pub(crate) struct ReadOnlyCommandOutput {
@@ -867,7 +871,10 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 detach_handle_guard.restore().await;
                 output
             }
-            Ok(BashRunOutcome::Detached(payload)) => {
+            Ok(BashRunOutcome::Detached {
+                payload,
+                adoption_rx,
+            }) => {
                 // Hand the live child + streams back to the host
                 // through the one-shot reply channel. The host drains
                 // it in its event-loop tick and calls
@@ -889,15 +896,37 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                             .to_string(),
                     );
                 }
-                let mut result = ToolResult::text(
-                    "<bash_detached>The bash command was promoted to a background task. \
-                     The host will resume reading its output via the BackgroundTaskRegistry; \
-                     poll progress with `task_output(task_id=<bg-shell-N>)` or inspect tasks with `task_list()`.\
+                let task_id =
+                    match tokio::time::timeout(BASH_DETACH_ADOPTION_ACK_WAIT, adoption_rx).await {
+                        Ok(Ok(Ok(task_id))) => task_id,
+                        Ok(Ok(Err(error))) => {
+                            return ToolResult::error(format!(
+                                "Error: bash detach failed: host could not adopt process: {error}"
+                            ));
+                        }
+                        Ok(Err(_)) => {
+                            return ToolResult::error(
+                                "Error: bash detach failed: host dropped adoption acknowledgement"
+                                    .to_string(),
+                            );
+                        }
+                        Err(_) => {
+                            return ToolResult::error(
+                            "Error: bash detach failed: host did not acknowledge adoption in time"
+                                .to_string(),
+                        );
+                        }
+                    };
+                let mut result = ToolResult::text(format!(
+                    "<bash_detached>The bash command was promoted to background task {task_id}. \
+                     Output continues in the BackgroundTaskRegistry; \
+                     poll progress with `task_output(task_id='{task_id}')`, inspect tasks with `task_list()`, \
+                     or stop it with `task_stop(task_id='{task_id}')`.\
                      </bash_detached>"
-                        .to_string(),
-                );
+                ));
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("bash_detached".to_string(), serde_json::Value::Bool(true));
+                metadata.insert("background_task_id".to_string(), task_id.into());
                 result.metadata = Some(metadata);
                 return result;
             }
@@ -3295,6 +3324,7 @@ pub(crate) async fn run_bash_with_detach(
     }
 
     if detached {
+        let (adoption_tx, adoption_rx) = tokio::sync::oneshot::channel();
         let payload = Box::new(crate::detach::DetachedShellPayload {
             child,
             stdout,
@@ -3302,8 +3332,12 @@ pub(crate) async fn run_bash_with_detach(
             command: command_label.to_string(),
             partial_stdout: stdout_text,
             partial_stderr: stderr_text,
+            adoption_tx,
         });
-        return Ok(BashRunOutcome::Detached(payload));
+        return Ok(BashRunOutcome::Detached {
+            payload,
+            adoption_rx,
+        });
     }
 
     // Normal completion path: drain remaining bytes and assemble
@@ -5399,6 +5433,10 @@ printf 'probe.txt:1:needle\n'
             "partial stdout must include the bytes consumed before detach: {:?}",
             payload.partial_stdout
         );
+        payload
+            .adoption_tx
+            .send(Ok("bg-shell-test".into()))
+            .expect("ack adoption");
 
         // The bash invocation must have returned a marker result
         // (not killed, not a normal output) so the LLM sees the
@@ -5407,6 +5445,11 @@ printf 'probe.txt:1:needle\n'
         assert!(
             result.output.contains("bash_detached"),
             "result must announce detach to the LLM: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("bg-shell-test"),
+            "result must include concrete task id: {}",
             result.output
         );
         assert_eq!(
@@ -5418,10 +5461,14 @@ printf 'probe.txt:1:needle\n'
             Some(true),
             "metadata.bash_detached flag must be set so downstream wiring can route correctly"
         );
-
-        // The child is still alive in the payload; clean up so the
-        // test doesn't leak a sleeping shell.
-        drop(payload);
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("background_task_id"))
+                .and_then(|v| v.as_str()),
+            Some("bg-shell-test")
+        );
     }
 
     #[tokio::test]
@@ -5465,13 +5512,21 @@ printf 'probe.txt:1:needle\n'
             payload.partial_stdout.contains("line-"),
             "partial stdout should include noisy command output"
         );
-        drop(payload);
+        payload
+            .adoption_tx
+            .send(Ok("bg-shell-noisy".into()))
+            .expect("ack noisy adoption");
 
         let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
             .await
             .expect("detached noisy bash should return promptly")
             .expect("bash task");
         assert!(result.output.contains("bash_detached"), "{}", result.output);
+        assert!(
+            result.output.contains("bg-shell-noisy"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -5553,6 +5608,51 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_detach_adoption_error_returns_tool_error() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
+            .await
+            .expect("payload should arrive")
+            .expect("listener must receive payload");
+        payload
+            .adoption_tx
+            .send(Err("background shell task limit reached".into()))
+            .expect("ack adoption failure");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
+            .await
+            .expect("adoption failure should not hang")
+            .expect("bash task");
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("host could not adopt process: background shell task limit reached"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn bash_detach_after_stdout_eof_still_hands_off_child() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
@@ -5580,7 +5680,10 @@ printf 'probe.txt:1:needle\n'
             .expect("stdout-closed bash must still hand off promptly")
             .expect("listener must receive payload for stdout-closed bash");
         assert_eq!(payload.command, "exec 1>&-; sleep 30");
-        drop(payload);
+        payload
+            .adoption_tx
+            .send(Ok("bg-shell-stdout-eof".into()))
+            .expect("ack stdout-eof adoption");
 
         let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
             .await
@@ -5588,6 +5691,11 @@ printf 'probe.txt:1:needle\n'
             .expect("bash task");
         assert!(!result.is_error, "{result:?}");
         assert!(result.output.contains("bash_detached"), "{}", result.output);
+        assert!(
+            result.output.contains("bg-shell-stdout-eof"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -5628,10 +5736,18 @@ printf 'probe.txt:1:needle\n'
             "second bash must still observe Ctrl+B after first normal completion: {:?}",
             payload.partial_stdout
         );
-        drop(payload);
+        payload
+            .adoption_tx
+            .send(Ok("bg-shell-second".into()))
+            .expect("ack second adoption");
 
         let second = second.await.expect("second bash task");
         assert!(second.output.contains("bash_detached"), "{}", second.output);
+        assert!(
+            second.output.contains("bg-shell-second"),
+            "{}",
+            second.output
+        );
     }
 
     #[tokio::test]
