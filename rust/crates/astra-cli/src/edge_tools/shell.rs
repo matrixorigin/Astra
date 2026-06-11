@@ -4181,6 +4181,10 @@ impl ToolExecutor {
             Some(c) => c,
             None => return Err("Error: missing 'command'".to_string()),
         };
+        if let Some(error) = astra_tools::shell_ops::background_task_tool_pseudo_call_error(command)
+        {
+            return Err(error);
+        }
 
         // Block pure sleep commands — they waste time with no useful output.
         // Only when no explicit timeout is set (explicit timeout = intentional test usage).
@@ -4483,13 +4487,7 @@ impl ToolExecutor {
                         }
                     };
 
-                let output = format!(
-                    "<bash_detached>The bash command was promoted to background task {task_id}. \
-                     Output continues in the BackgroundTaskRegistry; \
-                     poll progress with `task_output(task_id='{task_id}')`, inspect tasks with `task_list()`, \
-                     or stop it with `task_stop(task_id='{task_id}')`.\
-                     </bash_detached>"
-                );
+                let output = astra_tools::shell_ops::render_bash_detached_marker(&task_id);
                 let mut tool_result_fields = serde_json::Map::new();
                 tool_result_fields.insert("bash_detached".to_string(), Value::Bool(true));
                 tool_result_fields.insert("background_task_id".to_string(), Value::String(task_id));
@@ -5273,6 +5271,20 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "echo hello"}));
         assert!(result.trim().contains("hello"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_rejects_background_task_pseudo_tool_call() {
+        let executor = test_executor();
+        let result =
+            executor.bash(&serde_json::json!({"command": "task_output(task_id='bg-shell-1')"}));
+        assert!(result.contains("background-task tool"), "got: {result}");
+        assert!(result.contains("not a bash command"), "got: {result}");
+        assert!(result.contains("Do not rerun"), "got: {result}");
+        assert!(
+            !result.contains("syntax error"),
+            "pseudo task tool call must not reach bash: {result}"
+        );
     }
 
     /// Regression for the c49bc4a3 inspection-loop deadlock: a model that

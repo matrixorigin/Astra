@@ -24,6 +24,39 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const BASH_DETACH_ADOPTION_ACK_WAIT: Duration = Duration::from_secs(5);
 
+pub fn render_bash_detached_marker(task_id: &str) -> String {
+    format!(
+        "<bash_detached>The bash command was promoted to background task {task_id}. \
+         Output continues in the BackgroundTaskRegistry. \
+         To inspect it, call the `task_output` tool with `task_id` set to `{task_id}`; \
+         call the `task_list` tool to see background tasks; \
+         call the `task_stop` tool with `task_id` set to `{task_id}` to stop it. \
+         Do not run these tool names through Bash, and do not rerun the original bash command just to check progress.\
+         </bash_detached>"
+    )
+}
+
+fn is_function_style_tool_call(command: &str, tool: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix(tool) else {
+        return false;
+    };
+    rest.trim_start().starts_with('(')
+}
+
+pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
+    let tool = ["task_output", "task_list", "task_stop"]
+        .into_iter()
+        .find(|tool| is_function_style_tool_call(command, tool))?;
+    Some(format!(
+        "Error: `{tool}` is a background-task tool, not a bash command. \
+         Call the `{tool}` tool directly through the tool interface. \
+         Use `task_output` with the background task id, for example `bg-shell-1`, \
+         as the `task_id` argument when you need output. \
+         Do not rerun the original bash command just to check background progress."
+    ))
+}
+
 /// RAII guard for detach handle lifecycle. Takes ownership on creation,
 /// automatically restores to slot on drop unless explicitly consumed.
 /// This prevents handle leaks on early-return paths (errors, validation failures).
@@ -674,6 +707,9 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     if cmd.is_empty() {
         return Err("Error: empty bash command".into());
     }
+    if let Some(error) = background_task_tool_pseudo_call_error(cmd) {
+        return Err(error);
+    }
     let lower = cmd.to_ascii_lowercase();
     let blocked_substrings = [
         "mkfs",
@@ -917,13 +953,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                         );
                         }
                     };
-                let mut result = ToolResult::text(format!(
-                    "<bash_detached>The bash command was promoted to background task {task_id}. \
-                     Output continues in the BackgroundTaskRegistry; \
-                     poll progress with `task_output(task_id='{task_id}')`, inspect tasks with `task_list()`, \
-                     or stop it with `task_stop(task_id='{task_id}')`.\
-                     </bash_detached>"
-                ));
+                let mut result = ToolResult::text(render_bash_detached_marker(&task_id));
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("bash_detached".to_string(), serde_json::Value::Bool(true));
                 metadata.insert("background_task_id".to_string(), task_id.into());
@@ -4629,6 +4659,21 @@ printf 'probe.txt:1:needle\n'
         assert!(validate_execute_bash_command("  \t").is_err());
     }
 
+    #[test]
+    fn validate_execute_bash_rejects_background_task_pseudo_tool_calls() {
+        for command in [
+            "task_output(task_id='bg-shell-1')",
+            "task_list()",
+            "task_stop(task_id=\"bg-shell-1\")",
+            " task_output ( task_id = 'bg-shell-1' ) ",
+        ] {
+            let error = validate_execute_bash_command(command).expect_err(command);
+            assert!(error.contains("background-task tool"), "{command}: {error}");
+            assert!(error.contains("not a bash command"), "{command}: {error}");
+            assert!(error.contains("Do not rerun"), "{command}: {error}");
+        }
+    }
+
     // ── rm path-aware validation ──────────────────────────────────────────────
 
     // --- Bug #6: kill variants all blocked via ProcessControl ---
@@ -5450,6 +5495,33 @@ printf 'probe.txt:1:needle\n'
         assert!(
             result.output.contains("bg-shell-test"),
             "result must include concrete task id: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("call the `task_output` tool"),
+            "result must point the LLM at the real task_output tool: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("Do not run these tool names through Bash"),
+            "result must tell the LLM not to execute tool names as shell: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("task_output("),
+            "result must not use misleading pseudo-tool syntax: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("task_list()"),
+            "result must not use misleading pseudo-tool syntax: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("task_stop("),
+            "result must not use misleading pseudo-tool syntax: {}",
             result.output
         );
         assert_eq!(

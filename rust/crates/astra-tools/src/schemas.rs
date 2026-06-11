@@ -978,7 +978,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and the requested output chunk when available. Requires the exact task_id so the model and UI refer to the same background task.",
+                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. This is a tool call, not a Bash command; never invoke it through bash and never rerun the original command just to check progress. Returns explicit task kind, status, byte offsets, total bytes, and the requested output chunk when available. Requires the exact task_id so the model and UI refer to the same background task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1014,7 +1014,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_stop",
-                "description": "Stop a running typed background task by id. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
+                "description": "Stop a running typed background task by id. This is a tool call, not a Bash command; never invoke it through bash. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1032,7 +1032,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_list",
-                "description": "List known typed background tasks for this session with kind, status, and ids. Use when you need to discover which background task to inspect or stop.",
+                "description": "List known typed background tasks for this session with kind, status, and ids. This is a tool call, not a Bash command; never invoke it through bash. Use when you need to discover which background task to inspect or stop.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1340,9 +1340,27 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            output_desc.contains("background task") && !output_desc.contains("job(action"),
+            output_desc.contains("background task")
+                && output_desc.contains("not a Bash command")
+                && output_desc.contains("never rerun the original command")
+                && !output_desc.contains("job(action"),
             "task_output description must teach typed background task vocabulary"
         );
+        for tool_name in ["task_output", "task_stop", "task_list"] {
+            let description = find_schema(&schemas, tool_name)
+                .and_then(|schema| {
+                    schema
+                        .get("function")
+                        .and_then(|f| f.get("description"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_default();
+            assert!(
+                description.contains("not a Bash command")
+                    && description.contains("never invoke it through bash"),
+                "{tool_name} description must forbid shell pseudo-calls: {description}"
+            );
+        }
         assert!(
             find_schema(&schemas, "agent_job").is_none(),
             "agent_job must not remain in the model-facing schema"

@@ -7002,6 +7002,29 @@ mod tests {
             "{}",
             outcome.output
         );
+        assert!(
+            outcome.output.contains("call the `task_output` tool"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome
+                .output
+                .contains("Do not run these tool names through Bash"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            !outcome.output.contains("task_output("),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            !outcome.output.contains("task_list()"),
+            "{}",
+            outcome.output
+        );
+        assert!(!outcome.output.contains("task_stop("), "{}", outcome.output);
         assert_eq!(
             outcome
                 .tool_result_fields
