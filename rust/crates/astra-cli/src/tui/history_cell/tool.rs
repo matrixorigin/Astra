@@ -96,6 +96,18 @@ impl ToolCell {
         self.ctrl_b_background_hint = enabled;
     }
 
+    pub fn complete_bash_backgrounded(&mut self, task_id: &str) {
+        if self.name != "bash" {
+            return;
+        }
+        self.status = ToolStatus::Success;
+        self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
+        self.output_summary = Some(bash_backgrounded_summary(Some(task_id)));
+        self.output = None;
+        self.ctrl_b_background_hint = false;
+        self.frozen_at.stamp_now();
+    }
+
     /// Update mid-flight progress counters from a `ToolOutput`
     /// event. Monotonic by contract — callers pass cumulative
     /// values, so we clamp against regressions that could otherwise
@@ -120,7 +132,9 @@ impl ToolCell {
         output_summary: Option<String>,
         output: Option<String>,
     ) {
-        self.status = if tool_result_status_is_success(status_str) {
+        let bash_detached = self.name == "bash"
+            && bash_detached_marker_present(output_summary.as_deref(), output.as_deref());
+        self.status = if bash_detached || tool_result_status_is_success(status_str) {
             ToolStatus::Success
         } else {
             ToolStatus::Failed
@@ -129,8 +143,14 @@ impl ToolCell {
         if !description.is_empty() {
             self.description = description;
         }
-        self.output_summary = non_empty_tool_text(output_summary);
-        self.output = non_empty_tool_text(output);
+        if bash_detached {
+            self.output_summary = Some(bash_backgrounded_summary(None));
+            self.output = None;
+            self.ctrl_b_background_hint = false;
+        } else {
+            self.output_summary = non_empty_tool_text(output_summary);
+            self.output = non_empty_tool_text(output);
+        }
         self.ensure_failure_details();
         self.frozen_at.stamp_now();
     }
@@ -866,6 +886,22 @@ fn failure_detail_fallback(name: &str, description: &str) -> String {
     }
 }
 
+fn bash_detached_marker_present(output_summary: Option<&str>, output: Option<&str>) -> bool {
+    output_summary
+        .into_iter()
+        .chain(output)
+        .any(|text| text.contains("<bash_detached>"))
+}
+
+fn bash_backgrounded_summary(task_id: Option<&str>) -> String {
+    match task_id {
+        Some(task_id) if !task_id.trim().is_empty() => {
+            format!("Running in the background as {task_id} · Ctrl+B/Ctrl+T open")
+        }
+        _ => "Running in the background · Ctrl+B/Ctrl+T open".to_string(),
+    }
+}
+
 fn friendly_tool_display_name_for_context(name: &str, _description: &str) -> String {
     friendly_tool_display_name(name)
 }
@@ -1181,6 +1217,38 @@ mod tests {
         let out = render(&t, 100, 4);
         assert!(out.contains("Bash failed before returning output"), "{out}");
         assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn bash_detached_marker_renders_backgrounded_success() {
+        let mut t = ToolCell::new_running("bash", "$ make check");
+        t.complete(
+            "failed",
+            1200,
+            String::new(),
+            None,
+            Some("<bash_detached>The bash command was promoted.</bash_detached>".into()),
+        );
+        assert_eq!(t.status, ToolStatus::Success);
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Running in the background · Ctrl+B/Ctrl+T open")
+        );
+        let out = render(&t, 100, 4);
+        assert!(out.contains("Running in the background"), "{out}");
+        assert!(out.contains("Ctrl+B/Ctrl+T open"), "{out}");
+        assert!(!out.contains("failed before returning output"), "{out}");
+    }
+
+    #[test]
+    fn explicit_bash_backgrounded_summary_keeps_task_id() {
+        let mut t = ToolCell::new_running("bash", "$ make check");
+        t.complete_bash_backgrounded("bg-shell-7");
+        assert_eq!(t.status, ToolStatus::Success);
+        assert_eq!(
+            t.output_summary.as_deref(),
+            Some("Running in the background as bg-shell-7 · Ctrl+B/Ctrl+T open")
+        );
     }
 
     #[test]

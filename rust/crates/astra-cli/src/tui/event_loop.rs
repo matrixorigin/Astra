@@ -1657,6 +1657,7 @@ pub(crate) async fn run_tui_session(
                                         BashDetachHandoffResult,
                                     >();
                                     let mut bash_detach_request_pending = false;
+                                    let mut active_bash_tool_use_id: Option<String> = None;
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
@@ -2284,11 +2285,15 @@ pub(crate) async fn run_tui_session(
                                                             };
                                                             chat_widget.commit_system(
                                                                 history_cell::system::SystemCell::info(
-                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
+                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; ↑↓ move, Enter details, S stop, Esc close.")
                                                                 ),
                                                             );
                                                             let selected_id = id.clone();
                                                             ctrl_b_promoted_task_id = Some(id);
+                                                            let _ = chat_widget.mark_active_bash_backgrounded(
+                                                                active_bash_tool_use_id.as_deref(),
+                                                                selected_id.as_str(),
+                                                            );
                                                             set_bash_background_hint_enabled(
                                                                 &mut chat_widget,
                                                                 &mut status_indicator,
@@ -2370,11 +2375,24 @@ pub(crate) async fn run_tui_session(
                                                             && match &ae {
                                                                 TuiAppEvent::ToolStarted {
                                                                     name,
+                                                                    tool_use_id,
+                                                                    parent_tool_use_id,
                                                                     ..
-                                                                } => name == "bash",
+                                                                } => {
+                                                                    if name == "bash" && parent_tool_use_id.is_none() {
+                                                                        active_bash_tool_use_id = Some(tool_use_id.clone());
+                                                                    }
+                                                                    name == "bash"
+                                                                }
                                                                 TuiAppEvent::ToolCompleted {
+                                                                    tool_use_id,
                                                                     ..
-                                                                } => true,
+                                                                } => {
+                                                                    if active_bash_tool_use_id.as_deref() == Some(tool_use_id.as_str()) {
+                                                                        active_bash_tool_use_id = None;
+                                                                    }
+                                                                    true
+                                                                }
                                                                 _ => false,
                                                             };
                                                     if should_rearm_bash_detach {
