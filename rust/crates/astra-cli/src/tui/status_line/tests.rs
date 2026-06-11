@@ -759,6 +759,37 @@ fn bg_footer_stays_discoverable_during_active_foreground_turn() {
 }
 
 #[test]
+fn bg_footer_survives_standard_width_compaction() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("deepseek-v4-pro-overlong-thinking-model".into()),
+        permission_mode: PermissionMode::Auto,
+        pending_approvals: 2,
+        task_counts: Some((3, 5)),
+        bg_task_counts: Some(BackgroundTaskCounts {
+            running: 1,
+            ..BackgroundTaskCounts::default()
+        }),
+        cwd: Some("~/github/astra".into()),
+        git_branch: Some("fix-ctrl-b-background-fallback".into()),
+        ..ctx()
+    };
+    let status = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 80, 1);
+    let mut buf = Buffer::empty(area);
+    status.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(
+        rendered.contains("BG 1 shell"),
+        "standard-width footer must keep background tasks discoverable; got {rendered:?}"
+    );
+}
+
+#[test]
 fn bg_footer_collapses_three_or_more_task_kinds() {
     let c = StatusContext {
         bg_task_counts: Some(BackgroundTaskCounts {
