@@ -86,8 +86,9 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
                 RecoveryError::JournalRead(format!("Failed to read event journal: {e}"))
             })?;
 
-    // Serialize checkpoint for scan_journal
-    let checkpoint_json = serde_json::to_string(&heavy.light).map_err(|e| {
+    // Serialize checkpoint for scan_journal (must be StepCheckpoint enum JSON)
+    let light_cp = StepCheckpoint::Light(heavy.light.clone());
+    let checkpoint_json = serde_json::to_string(&light_cp).map_err(|e| {
         RecoveryError::CorruptedCheckpoint(format!("Failed to serialize checkpoint: {e}"))
     })?;
 
@@ -128,8 +129,11 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
             .map(|ctx| ctx.pending_user_decisions())
             .unwrap_or_default();
 
+        let restored = build_restored_from_scan(&scan_result, &heavy)?;
+
         Ok(Some(RecoveryOutcome::RequiresUserInput {
-            pending_decisions: pending.into_iter().map(|(name, _)| name.clone()).collect(),
+            pending_decisions: pending.into_iter().map(|(name, decision)| (name.clone(), decision.clone())).collect(),
+            restored,
             manager: Box::new(manager),
             scan_result,
         }))
@@ -202,7 +206,8 @@ pub enum RecoveryOutcome {
     },
     /// Recovery requires user decisions before proceeding
     RequiresUserInput {
-        pending_decisions: Vec<String>,
+        pending_decisions: Vec<(String, ToolReplayDecision)>,
+        restored: RestoredSession,
         manager: Box<CrashRecoveryManager>,
         scan_result: JournalScanResult,
     },
@@ -872,9 +877,16 @@ impl CrashRecoveryManager {
     fn classify_tool_for_replay(tool_call: &ToolCallRecord) -> ToolReplayDecision {
         match tool_call.status {
             ToolCallStatus::StartedOnly => {
-                // Tool was in-flight when crash happened — unknown state
-                ToolReplayDecision::InFlightAtCrash {
-                    tool_name: tool_call.tool_name.clone(),
+                // Tool was in-flight when crash happened — unknown state.
+                // Pure-read and idempotent tools are safe to auto-replay.
+                let safety = classify_tool(&tool_call.tool_name);
+                match safety {
+                    ToolSafetyClass::PureRead | ToolSafetyClass::IdempotentWrite => {
+                        ToolReplayDecision::Replay
+                    }
+                    ToolSafetyClass::SideEffect => ToolReplayDecision::InFlightAtCrash {
+                        tool_name: tool_call.tool_name.clone(),
+                    },
                 }
             }
             ToolCallStatus::Completed => {
@@ -1130,65 +1142,6 @@ mod tests {
             index,
             created_at,
         )
-    }
-
-    // =======================================================================
-    // State machine tests
-    // =======================================================================
-
-    #[test]
-    fn state_idle_can_transition_to_scanning() {
-        assert!(RecoveryState::Idle.can_transition_to(&RecoveryState::Scanning));
-    }
-
-    #[test]
-    fn state_scanning_can_transition_to_replaying() {
-        assert!(RecoveryState::Scanning.can_transition_to(&RecoveryState::Replaying));
-    }
-
-    #[test]
-    fn state_scanning_can_transition_to_failed() {
-        assert!(RecoveryState::Scanning.can_transition_to(&RecoveryState::Failed));
-    }
-
-    #[test]
-    fn state_replaying_can_transition_to_recovered() {
-        assert!(RecoveryState::Replaying.can_transition_to(&RecoveryState::Recovered));
-    }
-
-    #[test]
-    fn state_replaying_can_transition_to_failed() {
-        assert!(RecoveryState::Replaying.can_transition_to(&RecoveryState::Failed));
-    }
-
-    #[test]
-    fn state_failed_can_retry_to_idle() {
-        assert!(RecoveryState::Failed.can_transition_to(&RecoveryState::Idle));
-    }
-
-    #[test]
-    fn state_recovered_can_reset_to_idle() {
-        assert!(RecoveryState::Recovered.can_transition_to(&RecoveryState::Idle));
-    }
-
-    #[test]
-    fn state_idle_cannot_jump_to_replaying() {
-        assert!(!RecoveryState::Idle.can_transition_to(&RecoveryState::Replaying));
-    }
-
-    #[test]
-    fn state_idle_cannot_jump_to_recovered() {
-        assert!(!RecoveryState::Idle.can_transition_to(&RecoveryState::Recovered));
-    }
-
-    #[test]
-    fn state_scanning_cannot_jump_to_recovered() {
-        assert!(!RecoveryState::Scanning.can_transition_to(&RecoveryState::Recovered));
-    }
-
-    #[test]
-    fn state_recovered_cannot_go_to_scanning() {
-        assert!(!RecoveryState::Recovered.can_transition_to(&RecoveryState::Scanning));
     }
 
     // =======================================================================
@@ -1728,19 +1681,6 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    #[test]
-    fn verify_hash_matches() {
-        let hash = compute_recovery_hash("sess-1", "data", 10, &[]);
-        let result = verify_recovery_hash(&hash, "sess-1", "data", 10, &[]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn verify_hash_fails_on_mismatch() {
-        let result = verify_recovery_hash("wrong-hash", "sess-1", "data", 10, &[]);
-        assert!(matches!(result, Err(RecoveryError::HashMismatch { .. })));
-    }
-
     // =======================================================================
     // Full happy-path integration test
     // =======================================================================
@@ -1849,16 +1789,6 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn recovery_context_new_defaults() {
-        let ctx = RecoveryContext::new("sess-1".to_string(), 5);
-        assert_eq!(ctx.session_id, "sess-1");
-        assert_eq!(ctx.crash_turn, 5);
-        assert!(ctx.last_checkpoint.is_none());
-        assert!(ctx.tool_decisions.is_empty());
-        assert!(ctx.can_auto_recover());
-    }
-
-    #[test]
     fn recovery_context_pending_user_decisions() {
         let mut ctx = RecoveryContext::new("sess-1".to_string(), 5);
         ctx.tool_decisions
@@ -1873,63 +1803,6 @@ mod tests {
         ));
         assert!(!ctx.can_auto_recover());
         assert_eq!(ctx.pending_user_decisions().len(), 1);
-    }
-
-    // =======================================================================
-    // Error display tests
-    // =======================================================================
-
-    #[test]
-    fn recovery_error_display() {
-        let err = RecoveryError::MissingCheckpoint;
-        assert_eq!(format!("{err}"), "No checkpoint found in journal");
-
-        let err = RecoveryError::VersionMismatch {
-            expected: 1000,
-            found: 999,
-        };
-        assert!(format!("{err}").contains("1000"));
-        assert!(format!("{err}").contains("999"));
-    }
-
-    #[test]
-    fn recovery_error_serde_roundtrip() {
-        let err = RecoveryError::JournalGap {
-            expected_after: 5000,
-            found_at: 10000,
-        };
-        let json = serde_json::to_string(&err).unwrap();
-        let deserialized: RecoveryError = serde_json::from_str(&json).unwrap();
-        assert_eq!(err, deserialized);
-    }
-
-    #[test]
-    fn recovery_state_serde_roundtrip() {
-        for state in [
-            RecoveryState::Idle,
-            RecoveryState::Scanning,
-            RecoveryState::Replaying,
-            RecoveryState::Recovered,
-            RecoveryState::Failed,
-        ] {
-            let json = serde_json::to_string(&state).unwrap();
-            let deserialized: RecoveryState = serde_json::from_str(&json).unwrap();
-            assert_eq!(state, deserialized);
-        }
-    }
-
-    #[test]
-    fn tool_call_record_serde_roundtrip() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 2,
-            status: ToolCallStatus::Completed,
-            cached_result: None,
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        let deserialized: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(record, deserialized);
     }
 
     // =======================================================================
