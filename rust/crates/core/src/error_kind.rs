@@ -655,87 +655,59 @@ mod tests {
     ];
 
     #[test]
-    fn as_str_roundtrip() {
+    fn error_kind_serde_and_exhaustiveness() {
+        // Serialization roundtrip for ALL_VARIANTS
         for &kind in ALL_VARIANTS {
             let json = serde_json::to_string(&kind).unwrap();
             let back: ErrorKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back, "roundtrip failed for {kind:?}");
         }
-    }
-
-    #[test]
-    fn retryable_variants() {
-        assert!(ErrorKind::RateLimit.is_retryable());
-        assert!(ErrorKind::ServerError.is_retryable());
-        assert!(ErrorKind::StreamIdle.is_retryable());
-        assert!(ErrorKind::StreamTransport.is_retryable());
-        assert!(ErrorKind::Network.is_retryable());
-
-        assert!(!ErrorKind::Auth.is_retryable());
-        assert!(!ErrorKind::ContextWindow.is_retryable());
-        assert!(!ErrorKind::Cancelled.is_retryable());
-        assert!(!ErrorKind::ResourceLimit.is_retryable());
-        assert!(!ErrorKind::ToolTimeout.is_retryable());
-    }
-
-    #[test]
-    fn retry_delay_exponential() {
-        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(0), Some(5_000));
-        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(1), Some(10_000));
-        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(2), Some(20_000));
-        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(3), Some(40_000));
-        // Capped at attempt 3
-        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(10), Some(40_000));
-
-        assert_eq!(ErrorKind::StreamIdle.retry_delay_ms(0), Some(0));
-        assert_eq!(ErrorKind::Auth.retry_delay_ms(0), None);
-    }
-
-    #[test]
-    fn all_variants_is_exhaustive() {
-        // `as_str` has an exhaustive `match` that won't compile if a variant
-        // is missing, but `ALL_VARIANTS` is a hand-maintained array. This
-        // test detects drift: every serde round-trip tag must map back to
-        // a variant that's in the array.
-        let tags: std::collections::HashSet<&str> =
-            ALL_VARIANTS.iter().map(|k| k.as_str()).collect();
-        // If ALL_VARIANTS misses a variant, as_str() has more arms than
-        // the set has entries → this assert fires.
-        assert_eq!(
-            tags.len(),
-            ALL_VARIANTS.len(),
-            "ALL_VARIANTS has duplicates or drift"
-        );
-        // Reverse: every tag must parse back to a variant in the array.
+        // ALL_VARIANTS must have no duplicates
+        let tags: std::collections::HashSet<&str> = ALL_VARIANTS.iter().map(|k| k.as_str()).collect();
+        assert_eq!(tags.len(), ALL_VARIANTS.len(), "ALL_VARIANTS has duplicates");
+        // parse_tag must round-trip
         for &kind in ALL_VARIANTS {
-            let rt = ErrorKind::parse_tag(kind.as_str());
-            assert_eq!(rt, Some(kind), "parse_tag roundtrip failed for {kind:?}");
+            assert_eq!(ErrorKind::parse_tag(kind.as_str()), Some(kind));
         }
+        assert_eq!(ErrorKind::parse_tag("nonexistent"), None);
     }
 
     #[test]
-    fn guidance_non_empty() {
+    fn error_kind_meta_properties() {
         for &kind in ALL_VARIANTS {
             assert!(!kind.guidance().is_empty(), "empty guidance for {kind:?}");
             assert!(!kind.as_str().is_empty(), "empty as_str for {kind:?}");
+            assert!(!kind.diagnosis_hint().is_empty(), "empty diagnosis_hint for {kind:?}");
         }
-    }
-
-    #[test]
-    fn display_matches_as_str() {
+        // display matches as_str
         for kind in [ErrorKind::RateLimit, ErrorKind::Auth, ErrorKind::Unknown] {
             assert_eq!(format!("{kind}"), kind.as_str());
         }
     }
 
     #[test]
-    fn retry_delay_all_retryable_variants() {
+    fn retry_behavior() {
+        // Known retryable
+        for kind in [ErrorKind::RateLimit, ErrorKind::ServerError, ErrorKind::StreamIdle, ErrorKind::StreamTransport, ErrorKind::Network] {
+            assert!(kind.is_retryable(), "{kind:?} must be retryable");
+        }
+        // Known non-retryable
+        for kind in [ErrorKind::Auth, ErrorKind::ContextWindow, ErrorKind::Cancelled, ErrorKind::ResourceLimit, ErrorKind::ToolTimeout] {
+            assert!(!kind.is_retryable(), "{kind:?} must NOT be retryable");
+        }
+        // Exponential backoff for RateLimit
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(0), Some(5_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(1), Some(10_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(2), Some(20_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(3), Some(40_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(10), Some(40_000));
+        // Other retry delay behaviors
+        assert_eq!(ErrorKind::StreamIdle.retry_delay_ms(0), Some(0));
+        assert_eq!(ErrorKind::Auth.retry_delay_ms(0), None);
+        // Invariant: delay ↔ retryable for all variants
         for &kind in ALL_VARIANTS {
             match kind.retry_delay_ms(0) {
-                Some(_) => assert!(
-                    kind.is_retryable(),
-                    "non-retryable {kind:?} returned a delay"
-                ),
+                Some(_) => assert!(kind.is_retryable(), "non-retryable {kind:?} returned a delay"),
                 None => assert!(!kind.is_retryable(), "retryable {kind:?} returned no delay"),
             }
         }
@@ -744,65 +716,53 @@ mod tests {
     // ── ClassifiedError ──
 
     #[test]
-    fn llm_feedback_format() {
-        let err = ClassifiedError::new(ErrorKind::StreamIdle, "no chunk in 90000ms");
-        let fb = err.llm_feedback();
+    fn classified_error_display_and_feedback() {
+        // Display: classified error to_string format
+        let err = ClassifiedError::new(ErrorKind::Auth, "401 Unauthorized");
+        assert_eq!(err.to_string(), "[auth] 401 Unauthorized");
+        // Display with empty message
+        let empty = ClassifiedError::new(ErrorKind::Unknown, "");
+        assert_eq!(empty.to_string(), "[unknown] ");
+        // llm_feedback has tag, message, and arrow
+        let fb = ClassifiedError::new(ErrorKind::StreamIdle, "no chunk in 90000ms").llm_feedback();
         assert!(fb.starts_with("[stream_idle]"));
         assert!(fb.contains("no chunk in 90000ms"));
         assert!(fb.contains("→"));
+        // llm_feedback for empty tag
+        let fb_empty = empty.llm_feedback();
+        assert!(fb_empty.contains("[unknown]"));
+        assert!(fb_empty.contains("→"));
     }
 
     #[test]
-    fn display_format() {
-        let err = ClassifiedError::new(ErrorKind::Auth, "401 Unauthorized");
-        assert_eq!(err.to_string(), "[auth] 401 Unauthorized");
-    }
-
-    #[test]
-    fn from_string_recovers_kind_from_prefix() {
-        let original = ClassifiedError::new(ErrorKind::RateLimit, "429 too many requests");
-        let roundtrip = ClassifiedError::from(original.to_string());
-        assert_eq!(roundtrip.kind, ErrorKind::RateLimit);
-        assert_eq!(roundtrip.message, "429 too many requests");
-    }
-
-    #[test]
-    fn from_string_recovers_all_kinds() {
+    fn classified_error_from_string_roundtrip() {
+        // Recover kind from [prefix] in Display string
         for kind in [
-            ErrorKind::RateLimit,
-            ErrorKind::ServerError,
-            ErrorKind::Auth,
-            ErrorKind::ContextWindow,
-            ErrorKind::InvalidRequest,
-            ErrorKind::StreamIdle,
-            ErrorKind::BudgetExhausted,
-            ErrorKind::Cancelled,
+            ErrorKind::RateLimit, ErrorKind::ServerError, ErrorKind::Auth,
+            ErrorKind::ContextWindow, ErrorKind::InvalidRequest, ErrorKind::StreamIdle,
+            ErrorKind::BudgetExhausted, ErrorKind::Cancelled,
         ] {
             let original = ClassifiedError::new(kind, "test");
             let roundtrip = ClassifiedError::from(original.to_string());
             assert_eq!(roundtrip.kind, kind, "round-trip failed for {kind:?}");
         }
+        // Also check message preservation
+        let err = ClassifiedError::new(ErrorKind::RateLimit, "429 too many requests");
+        let rt = ClassifiedError::from(err.to_string());
+        assert_eq!(rt.message, "429 too many requests");
     }
 
     #[test]
-    fn from_string_without_prefix_falls_back_to_classify() {
+    fn from_string_no_prefix_falls_back_to_classify() {
         let err = ClassifiedError::from("connection refused".to_string());
         assert_eq!(err.kind, ErrorKind::Network);
         assert_eq!(err.message, "connection refused");
     }
 
     #[test]
-    fn error_kind_from_str_roundtrip() {
-        for kind in [
-            ErrorKind::RateLimit,
-            ErrorKind::ServerError,
-            ErrorKind::Auth,
-            ErrorKind::ContextWindow,
-            ErrorKind::Unknown,
-        ] {
-            assert_eq!(ErrorKind::parse_tag(kind.as_str()), Some(kind));
-        }
-        assert_eq!(ErrorKind::parse_tag("nonexistent"), None);
+    fn classified_error_is_std_error() {
+        let err = ClassifiedError::new(ErrorKind::Auth, "bad key");
+        let _: &dyn std::error::Error = &err;
     }
 
     // ── classify_tool_output ──
@@ -943,118 +903,50 @@ mod tests {
         );
     }
 
-    // ── ClassifiedError unhappy paths ──
+    // ── New variant & diagnosis-hint checks ──
 
     #[test]
-    fn classified_error_is_std_error() {
-        let err = ClassifiedError::new(ErrorKind::Auth, "bad key");
-        let _: &dyn std::error::Error = &err;
-    }
-
-    #[test]
-    fn classified_error_empty_message() {
-        let err = ClassifiedError::new(ErrorKind::Unknown, "");
-        assert_eq!(err.to_string(), "[unknown] ");
-        let fb = err.llm_feedback();
-        assert!(fb.contains("[unknown]"));
-        assert!(fb.contains("→"));
-    }
-
-    // ── P0.1 TDD: ErrorKind becomes the single taxonomy ─────────────────
-    //
-    // New variants: DatabaseError (MatrixOne/SQLx), Stall (agent looped).
-    // New method: diagnosis_hint() — operator-facing fix, distinct from
-    // guidance() which is LLM-facing.
-
-    #[test]
-    fn database_error_variant_exists() {
+    fn new_error_variants() {
+        // DatabaseError
         let k = ErrorKind::DatabaseError;
         assert_eq!(k.as_str(), "database_error");
         assert_eq!(ErrorKind::parse_tag("database_error"), Some(k));
-        assert!(!k.is_retryable(), "DB errors must not auto-retry blindly");
+        assert!(!k.is_retryable(), "DB errors must not auto-retry");
         assert!(k.retry_delay_ms(0).is_none());
-    }
-
-    #[test]
-    fn stall_variant_exists() {
-        let k = ErrorKind::Stall;
-        assert_eq!(k.as_str(), "stall");
-        assert_eq!(ErrorKind::parse_tag("stall"), Some(k));
-        assert!(!k.is_retryable(), "stall must not auto-retry");
-    }
-
-    #[test]
-    fn classify_tool_output_sql_errors_map_to_database_error() {
-        // DB detection previously lived in services/src/reflect.rs. Now the
-        // single classifier owns it.
-        for s in [
+        // Stall
+        let s = ErrorKind::Stall;
+        assert_eq!(s.as_str(), "stall");
+        assert_eq!(ErrorKind::parse_tag("stall"), Some(s));
+        assert!(!s.is_retryable(), "stall must not auto-retry");
+        // classify_tool_output for SQL/DB errors
+        for st in [
             "SQL syntax error: column must appear in GROUP BY",
             "error returned from database: deadlock found",
             "sqlx: connection pool timed out",
             "deadlock detected on table x",
         ] {
-            assert_eq!(
-                classify_tool_output(s),
-                ErrorKind::DatabaseError,
-                "classify_tool_output({s:?}) should be DatabaseError"
-            );
+            assert_eq!(classify_tool_output(st), ErrorKind::DatabaseError);
         }
     }
 
     #[test]
-    fn diagnosis_hint_exists_for_every_variant() {
-        for &kind in ALL_VARIANTS {
-            assert!(
-                !kind.diagnosis_hint().is_empty(),
-                "empty diagnosis_hint for {kind:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn diagnosis_hint_targets_operators_specifically() {
-        // ResourceLimit → ulimit / process limits
+    fn diagnosis_hint_specific_keywords() {
+        // Operator-specific diagnosis_hint content (vs. LLM-facing guidance)
         assert!(
-            ErrorKind::ResourceLimit
-                .diagnosis_hint()
-                .to_lowercase()
-                .contains("ulimit")
+            ErrorKind::ResourceLimit.diagnosis_hint().to_lowercase().contains("ulimit")
         );
-        // Auth → re-authentication / credentials
         let auth = ErrorKind::Auth.diagnosis_hint().to_lowercase();
         assert!(auth.contains("login") || auth.contains("credential") || auth.contains("token"));
-        // DatabaseError → MatrixOne / SQL schema / connectivity
         let db = ErrorKind::DatabaseError.diagnosis_hint().to_lowercase();
         assert!(db.contains("matrixone") || db.contains("sql") || db.contains("connect"));
-        // Stall → rewind / model switch / loop
         let stall = ErrorKind::Stall.diagnosis_hint().to_lowercase();
         assert!(stall.contains("rewind") || stall.contains("model") || stall.contains("loop"));
-    }
-
-    #[test]
-    fn diagnosis_hint_is_distinct_from_guidance_for_operator_variants() {
+        // Must differ from guidance for operator-relevant variants
         for kind in [
-            ErrorKind::ResourceLimit,
-            ErrorKind::Auth,
-            ErrorKind::DatabaseError,
-            ErrorKind::Stall,
+            ErrorKind::ResourceLimit, ErrorKind::Auth,
+            ErrorKind::DatabaseError, ErrorKind::Stall,
         ] {
-            assert_ne!(
-                kind.diagnosis_hint(),
-                kind.guidance(),
-                "diagnosis_hint must differ from guidance for {kind:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn as_str_roundtrip_covers_new_variants() {
-        for kind in [ErrorKind::DatabaseError, ErrorKind::Stall] {
-            let s = kind.as_str();
-            assert_eq!(ErrorKind::parse_tag(s), Some(kind));
-            let json = serde_json::to_string(&kind).unwrap();
-            let back: ErrorKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(kind, back);
+            assert_ne!(kind.diagnosis_hint(), kind.guidance());
         }
     }
 }
