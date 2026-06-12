@@ -7,7 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Provider-agnostic thinking configuration.
 ///
@@ -1207,28 +1207,20 @@ mod tests {
     // ─── apply_openai_suppression ──────────────────────────────────────
 
     #[test]
-    fn suppression_dashscope_provider_sets_flag() {
+    fn apply_openai_suppression_behavior() {
+        // Dashscope provider sets enable_thinking=false
         let mut body = json!({"model": "qwen3.5-flash", "messages": []});
         ThinkingConfig::Off.apply_openai_suppression(&mut body, "dashscope", "");
         assert_eq!(body["enable_thinking"], false);
-    }
-
-    #[test]
-    fn suppression_dashscope_base_url_sets_flag() {
+        // Dashscope base_url also triggers
         let mut body = json!({"model": "qwen-plus", "messages": []});
         ThinkingConfig::Off.apply_openai_suppression(
             &mut body,
             "openai",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
         );
-        assert_eq!(
-            body["enable_thinking"], false,
-            "provider=openai + dashscope base_url should trigger suppression"
-        );
-    }
-
-    #[test]
-    fn suppression_generic_provider_off_is_noop() {
+        assert_eq!(body["enable_thinking"], false);
+        // Generic provider + Off is noop
         let mut body = json!({"model": "gpt-4o", "messages": []});
         ThinkingConfig::Off.apply_openai_suppression(
             &mut body,
@@ -1236,10 +1228,7 @@ mod tests {
             "https://api.openai.com/v1",
         );
         assert!(body.get("enable_thinking").is_none());
-    }
-
-    #[test]
-    fn suppression_enabled_thinking_is_noop() {
+        // Enabled thinking is noop (don't suppress)
         let mut body = json!({"model": "qwen3.5-flash", "messages": []});
         ThinkingConfig::Enabled {
             budget_tokens: 8000,
@@ -1251,27 +1240,20 @@ mod tests {
     // ─── strip_think_tags ──────────────────────────────────────────────
 
     #[test]
-    fn strip_think_tags_removes_blocks() {
-        let input = "before\n<think>\nreasoning here\n</think>\nafter";
-        assert_eq!(strip_think_tags(input), "before\n\nafter");
-    }
-
-    #[test]
-    fn strip_think_tags_no_tags_passthrough() {
-        let input = "just normal text";
-        assert_eq!(strip_think_tags(input), "just normal text");
-    }
-
-    #[test]
-    fn strip_think_tags_unclosed_discards_rest() {
-        let input = "prefix<think>reasoning without end";
-        assert_eq!(strip_think_tags(input), "prefix");
-    }
-
-    #[test]
-    fn strip_think_tags_multiple_blocks() {
-        let input = "a<think>x</think>b<think>y</think>c";
-        assert_eq!(strip_think_tags(input), "abc");
+    fn strip_think_tags_behavior() {
+        assert_eq!(
+            strip_think_tags("before\n<think>\nreasoning here\n</think>\nafter"),
+            "before\n\nafter"
+        );
+        assert_eq!(strip_think_tags("just normal text"), "just normal text");
+        assert_eq!(
+            strip_think_tags("prefix<think>reasoning without end"),
+            "prefix"
+        );
+        assert_eq!(
+            strip_think_tags("a<think>x</think>b<think>y</think>c"),
+            "abc"
+        );
     }
 
     // ─── provider_may_think_natively ───────────────────────────────────
@@ -1293,8 +1275,26 @@ mod tests {
     // ─── needs_dashscope_thinking_flag ─────────────────────────────────
 
     #[test]
-    fn dashscope_detected_by_provider() {
+    fn provider_thinking_and_dashscope_detection() {
+        // Think natively
+        assert!(provider_may_think_natively("dashscope"));
+        assert!(!provider_may_think_natively("openai"));
+        assert!(!provider_may_think_natively("bedrock"));
+        assert!(!provider_may_think_natively("deepseek"));
+        // Dashscope thinking flag detection
         assert!(needs_dashscope_thinking_flag("dashscope", ""));
+        assert!(needs_dashscope_thinking_flag(
+            "openai",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ));
+        assert!(!needs_dashscope_thinking_flag(
+            "openai",
+            "https://api.openai.com/v1"
+        ));
+        assert!(!needs_dashscope_thinking_flag(
+            "openai",
+            "https://api.deepseek.com"
+        ));
     }
 
     #[test]

@@ -845,41 +845,23 @@ mod tests {
     }
 
     #[test]
-    fn trailing_identical_sig_depth_counts_streak_from_tail() {
+    fn trailing_identical_sig_depth_behavior() {
+        // Counts streak from tail
         assert_eq!(trailing_identical_sig_depth(&[]), 0);
         assert_eq!(trailing_identical_sig_depth(&make_sigs(&[&["bash"]])), 1);
+        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"]])), 2);
+        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[
+            &["bash"], &["bash"], &["bash"], &["bash"], &["bash"]
+        ])), 5);
+        // Resets when last entry differs
+        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[
+            &["bash"], &["bash"], &["bash"], &["git"]
+        ])), 1);
+        // Empty sig sets don't count (avoid double-counting round gaps)
         assert_eq!(
-            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"]])),
-            2,
+            trailing_identical_sig_depth(&[BTreeSet::new(), BTreeSet::new()]),
+            0
         );
-        assert_eq!(
-            trailing_identical_sig_depth(&make_sigs(&[
-                &["bash"],
-                &["bash"],
-                &["bash"],
-                &["bash"],
-                &["bash"],
-            ])),
-            5,
-        );
-    }
-
-    #[test]
-    fn trailing_identical_sig_depth_resets_on_different_last() {
-        // 3 identical then a different call → depth is 1 (just the last).
-        assert_eq!(
-            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"], &["bash"], &["git"],])),
-            1,
-        );
-    }
-
-    #[test]
-    fn trailing_identical_sig_depth_empty_set_does_not_count() {
-        // An empty signature set (e.g. a round with no tool calls) is
-        // degenerate; treating it as "identical" would double-count
-        // round gaps. Return 0.
-        let sigs: Vec<BTreeSet<String>> = vec![BTreeSet::new(), BTreeSet::new()];
-        assert_eq!(trailing_identical_sig_depth(&sigs), 0);
     }
 
     #[test]
@@ -1243,39 +1225,20 @@ mod tests {
     // ── Universal stemming ──
 
     #[test]
-    fn stemming_plurals_match() {
-        let lower = "list all pull requests and issues";
-        assert!(word_boundary_match(lower, "pull request"));
-        assert!(word_boundary_match(lower, "issue"));
-    }
-
-    #[test]
-    fn stemming_gerund_match() {
-        assert!(word_boundary_match(
-            "committing changes to the branch",
-            "commit",
-        ));
-    }
-
-    #[test]
-    fn stemming_past_tense_match() {
-        assert!(word_boundary_match("committed the fix yesterday", "commit",));
-    }
-
-    #[test]
-    fn stemming_no_false_positive() {
+    fn word_boundary_match_stemming() {
+        // Plurals match
+        assert!(word_boundary_match("list all pull requests and issues", "pull request"));
+        assert!(word_boundary_match("list all pull requests and issues", "issue"));
+        // Gerund matches
+        assert!(word_boundary_match("committing changes to the branch", "commit"));
+        // Past tense matches
+        assert!(word_boundary_match("committed the fix yesterday", "commit"));
+        // No false positive on partial substring
         assert!(!word_boundary_match("the community is growing", "commit"));
-    }
-
-    #[test]
-    fn stemming_exact_still_works() {
-        let lower = "git diff";
-        assert!(word_boundary_match(lower, "git"));
-        assert!(word_boundary_match(lower, "diff"));
-    }
-
-    #[test]
-    fn stemming_prs_matches_pr() {
+        // Exact match still works
+        assert!(word_boundary_match("git diff", "git"));
+        assert!(word_boundary_match("git diff", "diff"));
+        // Plurals: "prs" matches "pr"
         assert!(word_boundary_match("show me the prs", "pr"));
     }
 
@@ -1748,50 +1711,26 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn canonical_tool_args_normalizes_whitespace() {
+    fn canonical_tool_args_normalization() {
+        // Normalizes whitespace and key ordering
         let raw = r#"{  "path" :  "src/main.rs" ,  "line": 42 }"#;
-        let canonical = canonical_tool_args(raw);
-        assert_eq!(canonical, r#"{"line":42,"path":"src/main.rs"}"#);
-    }
-
-    #[test]
-    fn canonical_tool_args_invalid_json_returns_raw() {
-        let raw = "not json at all";
-        assert_eq!(canonical_tool_args(raw), raw);
-    }
-
-    #[test]
-    fn canonical_tool_args_empty_string() {
+        assert_eq!(canonical_tool_args(raw), r#"{"line":42,"path":"src/main.rs"}"#);
+        // Invalid JSON returns raw
+        assert_eq!(canonical_tool_args("not json"), "not json");
+        // Empty string passthrough
         assert_eq!(canonical_tool_args(""), "");
-    }
-
-    #[test]
-    fn canonical_tool_args_nested_objects_and_arrays() {
-        let raw = r#"{"a": [1, 2, {"b": 3}]}"#;
-        let canonical = canonical_tool_args(raw);
-        assert_eq!(canonical, r#"{"a":[1,2,{"b":3}]}"#);
-    }
-
-    #[test]
-    fn canonical_tool_args_key_ordering_normalized() {
-        let raw_a = r#"{"z": 1, "a": 2}"#;
-        let raw_b = r#"{"a": 2, "z": 1}"#;
-        assert_eq!(canonical_tool_args(raw_a), canonical_tool_args(raw_b));
-    }
-
-    #[test]
-    fn canonical_tool_args_plain_string_value() {
-        let raw = r#""hello""#;
-        assert_eq!(canonical_tool_args(raw), r#""hello""#);
-    }
-
-    #[test]
-    fn canonical_tool_args_number_value() {
+        // Nested objects/arrays
+        assert_eq!(canonical_tool_args(r#"{"a": [1, 2, {"b": 3}]}"#), r#"{"a":[1,2,{"b":3}]}"#);
+        // Key ordering normalized (two different-order inputs produce same output)
+        assert_eq!(
+            canonical_tool_args(r#"{"z": 1, "a": 2}"#),
+            canonical_tool_args(r#"{"a": 2, "z": 1}"#)
+        );
+        // Plain string
+        assert_eq!(canonical_tool_args(r#""hello""#), r#""hello""#);
+        // Number
         assert_eq!(canonical_tool_args("42"), "42");
-    }
-
-    #[test]
-    fn canonical_tool_args_empty_object() {
+        // Empty object
         assert_eq!(canonical_tool_args("{}"), "{}");
     }
 
