@@ -132,7 +132,10 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
         let restored = build_restored_from_scan(&scan_result, &heavy)?;
 
         Ok(Some(RecoveryOutcome::RequiresUserInput {
-            pending_decisions: pending.into_iter().map(|(name, decision)| (name.clone(), decision.clone())).collect(),
+            pending_decisions: pending
+                .into_iter()
+                .map(|(name, decision)| (name.clone(), decision.clone()))
+                .collect(),
             restored,
             manager: Box::new(manager),
             scan_result,

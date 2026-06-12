@@ -6808,7 +6808,11 @@ impl ServerSubRunExecutor {
     ///
     /// Sub-runs get a subdirectory under the parent session workspace to
     /// keep file operations isolated while sharing the same base.
-    fn provision_subrun_workspace(&self, session_id: &str, run_id: &str) -> Result<std::path::PathBuf, String> {
+    fn provision_subrun_workspace(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<std::path::PathBuf, String> {
         let sanitize = |s: &str| -> String {
             s.chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')

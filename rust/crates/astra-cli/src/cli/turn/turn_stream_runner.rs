@@ -1,7 +1,7 @@
 //! Run a turn stream and collect the raw stream result.
 
 use super::turn_cancellation::drain_after_cancel;
-use crate::cli::chat_stream::{stream_chat_sse, ChatTurnParams};
+use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
@@ -284,7 +284,7 @@ fn notify_server_to_cancel_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_turn_stream_params, prepare_turn_stream_state, PreparedTurnStreamState};
+    use super::{PreparedTurnStreamState, build_turn_stream_params, prepare_turn_stream_state};
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
     use astra_tools::task_mgmt::{SessionTask, TaskStore};

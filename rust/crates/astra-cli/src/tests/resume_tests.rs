@@ -1,7 +1,7 @@
 use super::*;
-use crate::cli::cli_config::cli_utils::{save_credentials, CredentialsFile, Profile};
+use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
 use crate::cli::session::session_runtime;
-use crate::cli::turn::turn_entry::{handle_chat_input, TurnContext};
+
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn env_lock() -> &'static Mutex<()> {
@@ -275,7 +275,6 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     assert!(state.history.is_empty());
     assert_eq!(state.turn, 0);
 }
-
 
 // ── Edge cases ──────────────────────────────────────────────────────────────
 

@@ -12,8 +12,8 @@ use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
 use crossterm::style::Stylize;
 
-fn build_fallback_delegation_engine(
-) -> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
+fn build_fallback_delegation_engine()
+-> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
     let mut registry = astra_services::AgentProfileRegistry::new();
     delegate_subrun::register_default_agents(&mut registry);
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));

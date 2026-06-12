@@ -21,7 +21,7 @@
 //! - Workspace mutation: caller must evict stale PureRead results (see `evict_tool()`)
 
 use crate::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache};
-use astra_turn_types::{classify_tool_idempotency, ToolIdempotency};
+use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
 use serde_json::Value;
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -734,8 +734,7 @@ pub struct ToolExecutor {
     /// When the TUI event loop is active, it writes rendered
     /// task-list XML here every tick so [`Self::task_list_bg`] can
     /// bypass the BG command queue.
-    pub(crate) bg_task_list_cache:
-        Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
+    pub(crate) bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Detach slot for the bash tool. Renewed before each tool call
     /// by the TUI event loop so a fresh one-shot reply channel is
     /// available for every bash invocation. `None` outside the TUI

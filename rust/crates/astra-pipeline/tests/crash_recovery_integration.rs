@@ -9,7 +9,7 @@
 //! - no_checkpoint_returns_none: no checkpoint → Ok(None)
 //! - completed_tools_auto_recover: all tools completed → auto-recover
 
-use astra_pipeline::crash_recovery::{recover_from_crash, RecoveryOutcome};
+use astra_pipeline::crash_recovery::{RecoveryOutcome, recover_from_crash};
 use astra_pipeline::step_checkpoint::write_step_checkpoint;
 use astra_pipeline::step_protocol::{
     ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventType,

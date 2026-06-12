@@ -336,8 +336,8 @@ impl EventCoordinator {
                         Err(e) => {
                             warn!(
                                 "failed to serialize journal event for broadcast: {e}; \
-                                 dropping event (run_id={})",
-                                event.run_id.as_deref().unwrap_or("unknown")
+                                 dropping event (session_id={})",
+                                event.session_id.as_deref().unwrap_or("unknown")
                             );
                             state.mark_broadcasted(guard.sequence());
                             guard.complete();
@@ -347,9 +347,9 @@ impl EventCoordinator {
                     };
                     if let Err(e) = self.broadcast_tx.send(event_value) {
                         warn!(
-                            "broadcast channel closed or full (run_id={}): {e}; \
+                            "broadcast channel closed or full (session_id={}): {e}; \
                              dropping event",
-                            event.run_id.as_deref().unwrap_or("unknown")
+                            event.session_id.as_deref().unwrap_or("unknown")
                         );
                     }
                     state.mark_broadcasted(guard.sequence());

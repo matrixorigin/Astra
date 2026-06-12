@@ -5476,47 +5476,64 @@ async fn apply_restored_session(
                     pending = ?pending_decisions,
                     "crash recovery: requires user input, presenting options"
                 );
-                
+
                 // Present each pending decision to the user
                 eprintln!();
                 eprintln!("  {}", "Crash Recovery Requires User Input".bold().yellow());
                 eprintln!("  {}", "The following tool calls need your decision:".dim());
-                
+
                 for (i, (tool_name, decision)) in pending_decisions.iter().enumerate() {
                     eprintln!();
-                    eprintln!("    {} {}", format!("[{}]", i + 1).bold(), tool_name.clone().bold());
-                    
+                    eprintln!(
+                        "    {} {}",
+                        format!("[{}]", i + 1).bold(),
+                        tool_name.clone().bold()
+                    );
+
                     let reason = match decision {
-                        astra_pipeline::crash_recovery::ToolReplayDecision::RequireUserInput { reason } => {
-                            reason.clone()
-                        }
-                        astra_pipeline::crash_recovery::ToolReplayDecision::InFlightAtCrash { tool_name: tn } => {
+                        astra_pipeline::crash_recovery::ToolReplayDecision::RequireUserInput {
+                            reason,
+                        } => reason.clone(),
+                        astra_pipeline::crash_recovery::ToolReplayDecision::InFlightAtCrash {
+                            tool_name: tn,
+                        } => {
                             format!("Tool '{}' was in-flight when crash occurred", tn)
                         }
-                        _ => "Unknown".to_string()
+                        _ => "Unknown".to_string(),
                     };
                     eprintln!("      Reason: {}", reason.dim());
                 }
-                
+
                 eprintln!();
                 eprintln!("  {}", "Options:".bold());
                 eprintln!("    [r] Replay - Re-execute the tool");
                 eprintln!("    [s] Skip - Skip this tool (use cached result if available)");
                 eprintln!("    [a] Abort - Abort recovery and fail");
                 eprintln!();
-                eprint!("  {} ", "Choose action for all pending tools (r/s/a):".bold());
+                eprint!(
+                    "  {} ",
+                    "Choose action for all pending tools (r/s/a):".bold()
+                );
                 let _ = std::io::stderr().flush();
-                
+
                 let mut input = String::new();
                 if std::io::stdin().read_line(&mut input).is_err() {
                     return Err("Failed to read user input for crash recovery".to_string());
                 }
-                
+
                 let choice = input.trim().to_lowercase();
                 match choice.as_str() {
                     "r" | "replay" | "s" | "skip" => {
-                        let label = if choice.starts_with('r') { "replay" } else { "skip" };
-                        eprintln!("  {} User chose to {} all pending tools", "✓".green(), label);
+                        let label = if choice.starts_with('r') {
+                            "replay"
+                        } else {
+                            "skip"
+                        };
+                        eprintln!(
+                            "  {} User chose to {} all pending tools",
+                            "✓".green(),
+                            label
+                        );
                         // force_complete transitions Replaying -> Recovered, bypassing pending checks
                         if let Err(e) = manager.force_complete() {
                             return Err(format!("Failed to apply {} decisions: {}", label, e));

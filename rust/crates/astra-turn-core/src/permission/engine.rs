@@ -1321,8 +1321,7 @@ fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
                 false
             }
         } else {
-            is_dangerous_file_path(cmd)
-                || crate::permission::redact::matches_sensitive_path(cmd)
+            is_dangerous_file_path(cmd) || crate::permission::redact::matches_sensitive_path(cmd)
         };
         if dangerous {
             return Some(cmd.to_string());
