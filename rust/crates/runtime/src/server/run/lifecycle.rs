@@ -4435,24 +4435,26 @@ impl AgenticRunLifecycleService {
     }
 
     /// Provision a sandboxed workspace directory for server-side tool execution.
-    fn provision_server_workspace(&self, session_id: &str) -> std::path::PathBuf {
+    fn provision_server_workspace(&self, session_id: &str) -> Option<std::path::PathBuf> {
         // Sanitize session_id to prevent path traversal — only allow
         // alphanumeric chars, hyphens, and underscores (covers UUID format).
         let safe_id: String = session_id
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
             .collect();
-        assert!(
-            !safe_id.is_empty(),
-            "session_id must contain at least one valid character"
-        );
+        if safe_id.is_empty() {
+            tracing::warn!(
+                "session_id {session_id:?} contains no valid characters; skipping workspace provisioning"
+            );
+            return None;
+        }
 
         let base = std::env::var("ASTRA_SERVER_WORKSPACES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
         let workspace = base.join(&safe_id);
         let _ = std::fs::create_dir_all(&workspace);
-        workspace
+        Some(workspace)
     }
 
     /// Collect run events into SSE-compatible format.
@@ -4692,7 +4694,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Provision workspace early so build_initial_state and durable
         // run_started metadata use the same execution boundary.
         let server_workspace = if request_uses_server_workspace(&request, !edge_tools.is_empty()) {
-            Some(self.provision_server_workspace(&session_id))
+            self.provision_server_workspace(&session_id)
         } else {
             None
         };
@@ -4704,7 +4706,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         let tool_runtime_workspace = server_workspace.clone().or_else(|| {
             if server_side_tool_catalog && execution_bindings.is_some() {
-                Some(self.provision_server_workspace(&session_id))
+                self.provision_server_workspace(&session_id)
             } else {
                 None
             }
@@ -5251,7 +5253,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Provision workspace early for web-agent mode (no edge tools) so
         // build_initial_state loads stop hooks from the provisioned directory.
         let server_workspace = if request_uses_server_workspace(&request, !edge_tools.is_empty()) {
-            Some(self.provision_server_workspace(&session_id))
+            self.provision_server_workspace(&session_id)
         } else {
             None
         };
@@ -5267,7 +5269,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .spawner;
         let tool_runtime_workspace = server_workspace.clone().or_else(|| {
             if server_side_tool_catalog && execution_bindings.is_some() {
-                Some(self.provision_server_workspace(&session_id))
+                self.provision_server_workspace(&session_id)
             } else {
                 None
             }
