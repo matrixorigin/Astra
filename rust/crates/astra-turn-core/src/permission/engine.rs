@@ -49,7 +49,8 @@
 //! added here first and consumed by call sites instead of being copied.
 
 use astra_sandbox::{
-    GitSafetyViolation, is_dangerous_file_path, is_soft_violation, validate_git_command,
+    GitSafetyViolation, command_mutates_session_tool_result_artifact, is_dangerous_file_path,
+    is_session_tool_result_artifact_reference, is_soft_violation, validate_git_command,
 };
 use serde_json::Value;
 
@@ -573,7 +574,7 @@ pub fn evaluate_permission(
     }
     push_skipped(&mut trace, EvaluationStep::GitSafety, git_safety_skip_note);
 
-    if let Some(path) = sensitive_path_match(args) {
+    if let Some(path) = sensitive_path_match(tool_name, args) {
         if ctx.mode() == PermissionMode::Deny {
             let decision = HardDecision::Deny {
                 reason: "Sensitive path (deny mode)".to_string(),
@@ -1285,18 +1286,28 @@ fn structured_git_command_hint(tool_name: &str, args: &Value) -> Option<String> 
     Some(command)
 }
 
-fn sensitive_path_match(args: &Value) -> Option<String> {
+fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
         && (is_dangerous_file_path(&path)
             || crate::permission::redact::matches_sensitive_path(&path))
     {
+        if is_session_tool_result_artifact_reference(&path)
+            && is_read_only_tool_with_args(tool_name, Some(args))
+        {
+            return None;
+        }
         return Some(path);
     }
     if let Some(cmd) = command_hint_from_args(args)
         && !cmd.is_empty()
         && (is_dangerous_file_path(cmd) || crate::permission::redact::matches_sensitive_path(cmd))
     {
+        if is_session_tool_result_artifact_reference(cmd)
+            && !command_mutates_session_tool_result_artifact(cmd)
+        {
+            return None;
+        }
         return Some(cmd.to_string());
     }
     None
@@ -1452,7 +1463,7 @@ fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
         Some(CloudGatedToolKind::Execute) => {
             push_risk_tag(&mut tags, RiskTag::BashExecute);
         }
-        Some(CloudGatedToolKind::Write) if sensitive_path_match(args).is_some() => {
+        Some(CloudGatedToolKind::Write) if sensitive_path_match(tool_name, args).is_some() => {
             push_risk_tag(&mut tags, RiskTag::WritesSensitiveFile);
         }
         Some(CloudGatedToolKind::Write) => {}
@@ -1864,6 +1875,62 @@ mod tests {
             envelope.source,
             DecisionSource::SensitivePath { .. }
         ));
+    }
+
+    #[test]
+    fn evaluate_reading_session_tool_result_artifact_is_allowed_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let artifact_path = "/Users/test/.astra/sessions/session-1/tool-results/call_abc.txt";
+
+        let read_file = evaluate_permission(
+            "read_file",
+            &serde_json::json!({"path": artifact_path}),
+            &ctx,
+        );
+        assert!(
+            matches!(read_file.decision, HardDecision::Allow),
+            "system-generated tool result artifacts must be readable in Auto mode: {read_file:?}"
+        );
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("cat {artifact_path} | python3 -c 'import sys; print(sys.stdin.read()[:10])'")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::Allow),
+            "read-only processing of tool result artifacts must not require manual approval: {bash_read:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_writing_session_tool_result_artifact_still_requires_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let artifact_path = "/Users/test/.astra/sessions/session-1/tool-results/call_abc.txt";
+
+        let write_file = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path": artifact_path, "content": "tamper"}),
+            &ctx,
+        );
+        assert!(
+            !matches!(write_file.decision, HardDecision::Allow),
+            "tool result artifacts are read-only system state"
+        );
+
+        let bash_rm = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("rm -f {artifact_path}")}),
+            &ctx,
+        );
+        assert!(
+            !matches!(bash_rm.decision, HardDecision::Allow),
+            "destructive shell operations on tool result artifacts must remain gated"
+        );
     }
 
     #[test]

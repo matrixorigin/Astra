@@ -32,11 +32,6 @@ pub enum WorkspaceAuthority {
 pub enum FallbackPolicy {
     /// Never route a tool call away from the selected executor.
     Disabled,
-    /// If the selected edge workspace is unavailable, permit server-side
-    /// read-only inspection but no workspace mutation.
-    ServerReadOnly,
-    /// Ask the user before switching executor/workspace authority.
-    AskUser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,26 +158,15 @@ pub struct ToolExecutionRequest {
     pub policy: ToolPolicySnapshot,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolExecutionResult {
-    pub tool_call_id: String,
-    pub output: String,
-    pub is_error: bool,
-    pub duration_ms: u64,
-    pub executor: ExecutorBinding,
-    pub workspace: WorkspaceBinding,
-    pub transport: ToolTransportKind,
-}
-
-#[async_trait]
-pub trait ToolTransport: Send + Sync {
-    async fn execute(&self, request: ToolExecutionRequest) -> ToolExecutionResult;
-}
-
+pub const TOOL_ERROR_KIND_APPROVAL_TIMEOUT: &str = "approval_timeout";
+pub const TOOL_ERROR_KIND_TOOL_TIMEOUT: &str = "tool_timeout";
+pub const TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH: &str = "workspace_path_mismatch";
+pub const TOOL_ERROR_KIND_AGENT_WAITING: &str = "agent_waiting";
+pub const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
-const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
+pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
 pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
 pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE: &str = "workspace_executor_unavailable";

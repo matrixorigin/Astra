@@ -332,6 +332,10 @@ impl EventCoordinator {
                     self.broadcast_order_notify.notify_waiters();
                     return;
                 }
+                if state.next_to_broadcast > guard.sequence() {
+                    guard.complete();
+                    return;
+                }
             }
             notified.await;
         }
@@ -738,6 +742,24 @@ mod tests {
                 .expect("broadcast channel closed");
         assert_eq!(second_broadcast["metadata"]["label"], "second");
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipped_sequence_does_not_make_broadcast_wait_forever() {
+        let (coord, _journal, _ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let mut guard = coord.reserve_broadcast_sequence();
+        guard.skip();
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            coord.broadcast_in_order(&mut guard, &make_event("obsolete")),
+        )
+        .await
+        .expect("broadcast_in_order must return when its sequence was already skipped");
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "an already skipped sequence must not broadcast stale events"
+        );
     }
 
     #[tokio::test]

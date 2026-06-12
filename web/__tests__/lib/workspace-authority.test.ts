@@ -342,6 +342,15 @@ describe("extractLocalPathMentions", () => {
     ]);
   });
 
+  it("preserves spaces and parentheses inside path mentions", () => {
+    expect(
+      extractLocalPathMentions("fix /Users/test/project (v2)/src/main.ts"),
+    ).toEqual(["/Users/test/project (v2)/src/main.ts"]);
+    expect(
+      extractLocalPathMentions("inspect /Users/test/My Project/src/lib.rs"),
+    ).toEqual(["/Users/test/My Project/src/lib.rs"]);
+  });
+
   it("returns multiple matches", () => {
     expect(
       extractLocalPathMentions("compare ~/project/a.ts with /home/user/b.rs"),
@@ -492,6 +501,15 @@ describe("validateWorkspaceAuthority", () => {
       validateWorkspaceAuthority(
         "fix /Users/test/project/src/bug.ts",
         edgeSelection({ cwd: "/Users/test/project" }),
+      ),
+    ).toBeNull();
+  });
+
+  it("allows owned workspace paths that contain spaces and parentheses", () => {
+    expect(
+      validateWorkspaceAuthority(
+        "fix /Users/test/project (v2)/src/bug.ts",
+        edgeSelection({ cwd: "/Users/test/project (v2)" }),
       ),
     ).toBeNull();
   });

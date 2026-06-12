@@ -6,14 +6,16 @@ use crate::cli::workspace_trust::{
     evaluate_workspace_trust, project_permissions_hash,
 };
 use astra_runtime::tool_sandbox::{
-    CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
-    validate_git_command,
+    CommandRisk, GitSafetyViolation, analyze_command_risks,
+    command_mutates_session_tool_result_artifact, is_dangerous_file_path,
+    is_session_tool_result_artifact_reference, validate_git_command,
 };
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
     cloud_gated_tool_kind_with_args,
 };
+use astra_turn_core::parallel_tool_exec::is_read_only_tool_with_args;
 use astra_turn_core::permission::engine::{
     DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
     allow_rule_preview_for_match_target,
@@ -514,10 +516,10 @@ fn push_unique_fingerprint(
 fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
     match (cloud_gated_tool_kind(tool), detail) {
         (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-            sensitive_path_match(&serde_json::json!({ "command": cmd })).is_some()
+            sensitive_path_match_for_request(tool, &serde_json::json!({ "command": cmd })).is_some()
         }
         (Some(CloudGatedToolKind::Write), Some(path)) => {
-            sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+            sensitive_path_match_for_request(tool, &serde_json::json!({ "path": path })).is_some()
         }
         _ => false,
     }
@@ -565,11 +567,20 @@ fn stored_override_allows_sensitive_path(
 }
 
 fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
+    sensitive_path_match_for_request("__unknown_mutating_tool__", args)
+}
+
+fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
         && (is_dangerous_file_path(&path)
             || astra_turn_core::permission::redact::matches_sensitive_path(&path))
     {
+        if is_session_tool_result_artifact_reference(&path)
+            && is_read_only_tool_with_args(tool_name, Some(args))
+        {
+            return None;
+        }
         return Some(path);
     }
     if let Some(cmd) = command_hint_from_args(args)
@@ -577,6 +588,11 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
         && (is_dangerous_file_path(cmd)
             || astra_turn_core::permission::redact::matches_sensitive_path(cmd))
     {
+        if is_session_tool_result_artifact_reference(cmd)
+            && !command_mutates_session_tool_result_artifact(cmd)
+        {
+            return None;
+        }
         return Some(cmd.to_string());
     }
     None
@@ -2347,17 +2363,17 @@ impl PermissionManager {
     }
 
     /// Check if a file path targets a dangerous location.
-    fn check_dangerous_path(_name: &str, args: &serde_json::Value) -> Option<&'static str> {
+    fn check_dangerous_path(name: &str, args: &serde_json::Value) -> Option<&'static str> {
         if let Some(ref path) = path_hint_from_args(args)
             && !path.is_empty()
-            && is_dangerous_file_path(path)
+            && sensitive_path_match_for_request(name, args).is_some()
         {
             return Some("⚠️ Targets a sensitive file path — requires manual approval");
         }
         // Also check command arguments for file write tools.
         if let Some(cmd) = command_hint_from_args(args)
             && !cmd.is_empty()
-            && is_dangerous_file_path(cmd)
+            && sensitive_path_match_for_request(name, args).is_some()
         {
             return Some("⚠️ Command references a sensitive file path");
         }
@@ -2599,7 +2615,7 @@ impl PermissionManager {
                 let remember_preview = astra_turn_core::permission::match_target::remember_preview(
                     tool, &rule_args, location,
                 );
-                if sensitive_path_match(&rule_args).is_some() {
+                if sensitive_path_match_for_request(tool, &rule_args).is_some() {
                     eprintln!(
                         "{}",
                         cloud_always_feedback_message(

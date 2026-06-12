@@ -142,12 +142,103 @@ export function localCodeIntent(message: string) {
 }
 
 export function extractLocalPathMentions(message: string) {
-  const matches = message.match(
-    /(?:~\/|\$HOME\/|\$\{HOME\}\/|\/Users\/|\/home\/|\/Volumes\/|[A-Za-z]:\\)[^\s`'")\]}，。；、！？]+/g,
+  const mentions: string[] = [];
+  for (let index = 0; index < message.length; index += 1) {
+    if (!pathStartBoundary(message[index - 1])) {
+      continue;
+    }
+    if (!localPathPrefixAt(message, index)) {
+      continue;
+    }
+    const token = collectPathToken(message, index);
+    if (token && !mentions.includes(token)) {
+      mentions.push(token);
+    }
+  }
+  return mentions;
+}
+
+function pathStartBoundary(previous: string | undefined) {
+  return (
+    previous === undefined ||
+    /\s/u.test(previous) ||
+    ["'", '"', "`", "=", ":", "(", "{", "[", ",", "<", ">"].includes(previous)
   );
-  return (matches ?? []).map((match) =>
-    match.replace(/[.,;:!?，。；：！？、]+$/u, ""),
+}
+
+function localPathPrefixAt(message: string, index: number) {
+  const rest = message.slice(index);
+  return (
+    rest.startsWith("~/") ||
+    rest.startsWith("$HOME/") ||
+    rest.startsWith("${HOME}/") ||
+    rest.startsWith("/Users/") ||
+    rest.startsWith("/home/") ||
+    rest.startsWith("/Volumes/") ||
+    /^[A-Za-z]:[\\/]/u.test(rest)
   );
+}
+
+function collectPathToken(message: string, start: number) {
+  const bracedHome = "${HOME}/";
+  if (message.slice(start).startsWith(bracedHome)) {
+    return `${bracedHome}${collectPathToken(message, start + bracedHome.length)}`;
+  }
+
+  let end = message.length;
+  for (let index = start; index < message.length; index += 1) {
+    const ch = message[index];
+    if (pathHardDelimiter(ch)) {
+      end = index;
+      break;
+    }
+    if (/\s/u.test(ch) && !whitespaceContinuesPath(message, index + 1)) {
+      end = index;
+      break;
+    }
+  }
+  return trimPathTokenEnd(message.slice(start, end));
+}
+
+function pathHardDelimiter(ch: string) {
+  return ["'", '"', "`", ";", "|", "&", "<", ">", "{", "[", "]"].includes(ch);
+}
+
+function whitespaceContinuesPath(message: string, index: number) {
+  while (index < message.length && /\s/u.test(message[index])) {
+    index += 1;
+  }
+  for (let cursor = index; cursor < message.length; cursor += 1) {
+    const ch = message[cursor];
+    if (/\s/u.test(ch) || pathHardDelimiter(ch)) {
+      return false;
+    }
+    if (ch === "/" || ch === "\\") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function trimPathTokenEnd(token: string) {
+  let trimmed = token.replace(/[.,;:!?，。；：！？、]+$/u, "");
+  while (
+    trimmed.endsWith(")") &&
+    countChar(trimmed, ")") > countChar(trimmed, "(")
+  ) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  return trimmed;
+}
+
+function countChar(value: string, needle: string) {
+  let count = 0;
+  for (const ch of value) {
+    if (ch === needle) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 export function normalizeSlashPath(path: string) {

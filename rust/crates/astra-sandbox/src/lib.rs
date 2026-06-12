@@ -34,6 +34,7 @@ pub use process_isolation::{
 };
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, SENSITIVE_ENV_VARS, ShellHardeningConfig, build_hardened_command,
-    is_dangerous_file_path, scrub_secrets_from_env,
+    command_mutates_session_tool_result_artifact, is_dangerous_file_path,
+    is_session_tool_result_artifact_reference, scrub_secrets_from_env,
 };
 pub use tier::{ToolTier, classify_tool, effective_tier};

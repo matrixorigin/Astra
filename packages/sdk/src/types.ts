@@ -143,7 +143,7 @@ export type WorkspaceBinding = {
   display_name?: string;
   cwd?: string | null;
   authority?: 'read_only' | 'read_write' | string;
-  fallback_policy?: 'disabled' | 'server_read_only' | 'ask_user' | string;
+  fallback_policy?: 'disabled';
 };
 
 export type ExecutorBinding = {

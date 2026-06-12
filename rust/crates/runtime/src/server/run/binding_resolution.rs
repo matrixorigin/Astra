@@ -407,10 +407,6 @@ fn fallback_policy_from_request(
 ) -> FallbackPolicy {
     match fallback_policy {
         astra_services::runs::FallbackPolicyRequest::Disabled => FallbackPolicy::Disabled,
-        astra_services::runs::FallbackPolicyRequest::ServerReadOnly => {
-            FallbackPolicy::ServerReadOnly
-        }
-        astra_services::runs::FallbackPolicyRequest::AskUser => FallbackPolicy::AskUser,
     }
 }
 
@@ -473,16 +469,6 @@ mod tests {
         assert_eq!(
             fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::Disabled),
             FallbackPolicy::Disabled
-        );
-        assert_eq!(
-            fallback_policy_from_request(
-                astra_services::runs::FallbackPolicyRequest::ServerReadOnly
-            ),
-            FallbackPolicy::ServerReadOnly
-        );
-        assert_eq!(
-            fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::AskUser),
-            FallbackPolicy::AskUser
         );
     }
 }

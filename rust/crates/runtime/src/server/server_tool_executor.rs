@@ -46,10 +46,13 @@ use crate::server::tool_transport::{
     ExecutorBinding, ExecutorStatus, RUN_BLOCKED_REASON_EXECUTOR_OFFLINE,
     RUN_BLOCKED_REASON_FALLBACK_DISABLED, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
     RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE, ServerLocalToolTransport,
-    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
-    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE, ToolExecutionRequest, ToolExecutionRouteKind,
-    ToolExecutionService, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
-    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields, route_binding_event_fields,
+    TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
+    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_FALLBACK_DISABLED,
+    TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
+    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
+    ToolExecutionRequest, ToolExecutionRouteKind, ToolExecutionService, ToolPolicySnapshot,
+    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    binding_event_fields, route_binding_event_fields,
 };
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
@@ -58,13 +61,6 @@ use crate::tool_sandbox::{
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
 use astra_tools::plan_task_mirror;
-
-const TOOL_ERROR_KIND_APPROVAL_TIMEOUT: &str = "approval_timeout";
-const TOOL_ERROR_KIND_TOOL_TIMEOUT: &str = "tool_timeout";
-const TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH: &str = "workspace_path_mismatch";
-const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
-const TOOL_ERROR_KIND_AGENT_WAITING: &str = "agent_waiting";
-const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
@@ -90,12 +86,11 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
     variants
 }
 
-fn shell_path_token_delimiter(ch: char) -> bool {
-    ch.is_whitespace()
-        || matches!(
-            ch,
-            '\'' | '"' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '[' | ']'
-        )
+fn shell_path_hard_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '\'' | '"' | '`' | ';' | '|' | '&' | '<' | '>' | '{' | '}' | '[' | ']'
+    )
 }
 
 fn shell_path_start_boundary(ch: Option<char>) -> bool {
@@ -116,12 +111,55 @@ fn windows_drive_path_at(input: &str, index: usize) -> bool {
 }
 
 fn collect_shell_path_token(input: &str, start: usize) -> String {
-    input[start..]
-        .chars()
-        .take_while(|ch| !shell_path_token_delimiter(*ch))
-        .collect::<String>()
-        .trim_end_matches(['.', ',', ':'])
-        .to_string()
+    let mut end = input.len();
+    for (offset, ch) in input[start..].char_indices() {
+        let index = start + offset;
+        if shell_path_hard_delimiter(ch) {
+            end = index;
+            break;
+        }
+        if ch.is_whitespace() {
+            let after_whitespace = index + ch.len_utf8();
+            if !whitespace_continues_path(input, after_whitespace) {
+                end = index;
+                break;
+            }
+        }
+    }
+    trim_shell_path_token_end(&input[start..end])
+}
+
+fn whitespace_continues_path(input: &str, mut index: usize) -> bool {
+    while let Some(ch) = input[index..].chars().next() {
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    for ch in input[index..].chars() {
+        if ch.is_whitespace() || shell_path_hard_delimiter(ch) {
+            return false;
+        }
+        if ch == '/' || ch == '\\' {
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_shell_path_token_end(token: &str) -> String {
+    let mut trimmed = token.trim_end_matches(['.', ',', ':']).to_string();
+    loop {
+        let closes = trimmed.chars().filter(|ch| *ch == ')').count();
+        let opens = trimmed.chars().filter(|ch| *ch == '(').count();
+        if closes > opens && trimmed.ends_with(')') {
+            trimmed.pop();
+            continue;
+        }
+        break;
+    }
+    trimmed
 }
 
 fn shell_home_path_at(input: &str, index: usize) -> bool {
@@ -134,13 +172,10 @@ fn collect_local_workspace_path_token(input: &str, start: usize) -> String {
     const BRACED_HOME: &str = "${HOME}/";
     if input[start..].starts_with(BRACED_HOME) {
         let suffix_start = start + BRACED_HOME.len();
-        let suffix = input[suffix_start..]
-            .chars()
-            .take_while(|ch| !shell_path_token_delimiter(*ch))
-            .collect::<String>()
-            .trim_end_matches(['.', ',', ':'])
-            .to_string();
-        return format!("{BRACED_HOME}{suffix}");
+        return format!(
+            "{BRACED_HOME}{}",
+            collect_shell_path_token(input, suffix_start)
+        );
     }
     collect_shell_path_token(input, start)
 }
@@ -8806,6 +8841,20 @@ esac
                 &workspace,
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn local_path_mentions_preserve_spaces_and_parentheses() {
+        assert_eq!(
+            extract_local_workspace_path_mentions("fix /Users/test/project (v2)/src/main.rs"),
+            vec!["/Users/test/project (v2)/src/main.rs"]
+        );
+        assert_eq!(
+            extract_local_workspace_path_mentions(
+                "compare /Users/test/My Project/src/lib.rs with README"
+            ),
+            vec!["/Users/test/My Project/src/lib.rs"]
         );
     }
 

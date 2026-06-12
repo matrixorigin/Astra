@@ -445,23 +445,34 @@ impl FileBackedEventStore {
         session_id: &str,
         mut keep: impl FnMut(&StepEvent) -> bool,
     ) -> std::io::Result<Vec<StepEvent>> {
+        let mut events = Vec::new();
+        Self::for_each_event(session_id, |event| {
+            if keep(event) {
+                events.push(event.clone());
+            }
+        })?;
+        Ok(events)
+    }
+
+    /// Stream persisted events without materializing the whole journal.
+    pub fn for_each_event(
+        session_id: &str,
+        mut visit: impl FnMut(&StepEvent),
+    ) -> std::io::Result<()> {
         let path = events_path_for(session_id);
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         use std::io::BufRead;
         let file = std::fs::File::open(&path)?;
         let reader = std::io::BufReader::new(file);
-        let mut events = Vec::new();
         for line in reader.lines() {
             let line = line?;
-            if let Some(event) = Self::parse_event_line(&line)?
-                && keep(&event)
-            {
-                events.push(event);
+            if let Some(event) = Self::parse_event_line(&line)? {
+                visit(&event);
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     /// Load events from JSONL file.

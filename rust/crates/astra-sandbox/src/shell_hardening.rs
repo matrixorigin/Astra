@@ -172,6 +172,42 @@ pub fn is_dangerous_file_path(path: &str) -> bool {
     false
 }
 
+/// Returns true when the text points at a generated per-session tool result.
+///
+/// `.astra/` remains dangerous for writes because it stores agent state and
+/// configuration. Tool-result files are different: they are append-only run
+/// artifacts that the agent must be able to read back in Auto mode to
+/// summarize fanout output.
+pub fn is_session_tool_result_artifact_reference(text: &str) -> bool {
+    let normalized = text.replace('\\', "/");
+    normalized.contains(".astra/sessions/") && normalized.contains("/tool-results/")
+}
+
+/// Returns true when a shell command appears to mutate a session tool result.
+pub fn command_mutates_session_tool_result_artifact(command: &str) -> bool {
+    if !is_session_tool_result_artifact_reference(command) {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    [
+        "rm ",
+        "rm\t",
+        "mv ",
+        "mv\t",
+        "cp ",
+        "cp\t",
+        "truncate ",
+        "chmod ",
+        "chown ",
+        "shred ",
+        "tee ",
+        "sed -i",
+        ">",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn apply_stdin_redirect(config: &ShellHardeningConfig, command: &str) -> String {
     if !config.redirect_stdin {
         return command.to_string();
@@ -359,5 +395,41 @@ mod tests {
         // But actual partial is still matched
         assert!(is_dangerous_file_path("/home/user/.bashrc"));
         assert!(is_dangerous_file_path(".bashrc"));
+    }
+
+    #[test]
+    fn session_tool_result_artifact_detection() {
+        for text in [
+            "/Users/test/.astra/sessions/s1/tool-results/call_abc.txt",
+            "cat ~/.astra/sessions/s1/tool-results/call_abc.txt",
+        ] {
+            assert!(
+                is_session_tool_result_artifact_reference(text),
+                "should detect session tool result artifact: {text}"
+            );
+        }
+
+        for text in [
+            "/Users/test/.astra/config.toml",
+            "/Users/test/.astra/sessions/s1/messages.jsonl",
+        ] {
+            assert!(
+                !is_session_tool_result_artifact_reference(text),
+                "should not treat agent config/session journal as tool result artifact: {text}"
+            );
+        }
+
+        assert!(!command_mutates_session_tool_result_artifact(
+            "cat ~/.astra/sessions/s1/tool-results/call_abc.txt | python3 -c 'print(1)'"
+        ));
+        for command in [
+            "rm -f ~/.astra/sessions/s1/tool-results/call_abc.txt",
+            "cat ~/.astra/sessions/s1/tool-results/call_abc.txt | tee /tmp/out",
+        ] {
+            assert!(
+                command_mutates_session_tool_result_artifact(command),
+                "should flag mutating command: {command}"
+            );
+        }
     }
 }

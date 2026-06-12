@@ -3638,8 +3638,9 @@ impl AgenticRunLifecycleService {
     /// entry is evicted. This prevents unbounded memory growth.
     fn schedule_run_eviction(runs: &Arc<RwLock<HashMap<String, RunState>>>, run_id: String) {
         let runs = Arc::clone(runs);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            tokio::time::sleep_until(deadline).await;
             runs.write().await.remove(&run_id);
         });
     }
@@ -6160,6 +6161,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             de.cancel_children_of(&run_id).await;
         }
         append_result.map_err(|error| Self::durable_persist_error("cancel event", error))?;
+        Self::schedule_run_eviction(&self.runs, run_id.clone());
 
         Ok(CancelRunRecord {
             run_id,
@@ -9409,6 +9411,27 @@ mod tests {
         assert_eq!(
             svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
             Some(true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_run_schedules_in_memory_eviction() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        assert!(
+            svc.test_llm_cancel_token_is_cancelled(&run.run_id)
+                .await
+                .is_some()
+        );
+
+        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        tokio::time::advance(std::time::Duration::from_secs(301)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
+            None,
+            "cancelled runs must not stay pinned in the process-local run cache"
         );
     }
 
