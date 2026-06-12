@@ -167,46 +167,6 @@ pub struct ToolExecutionResult {
     pub transport: ToolTransportKind,
 }
 
-struct EdgeDispatchFailureGuard {
-    dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
-    request_id: String,
-    reason: &'static str,
-    disarmed: bool,
-}
-
-impl EdgeDispatchFailureGuard {
-    fn new(
-        dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
-        request_id: String,
-        reason: &'static str,
-    ) -> Self {
-        Self {
-            dispatch,
-            request_id,
-            reason,
-            disarmed: false,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.disarmed = true;
-    }
-}
-
-impl Drop for EdgeDispatchFailureGuard {
-    fn drop(&mut self) {
-        if self.disarmed {
-            return;
-        }
-        let dispatch = Arc::clone(&self.dispatch);
-        let request_id = self.request_id.clone();
-        let reason = self.reason;
-        tokio::spawn(async move {
-            let _ = dispatch.fail_dispatch(&request_id, reason).await;
-        });
-    }
-}
-
 #[async_trait]
 pub trait ToolTransport: Send + Sync {
     async fn execute(&self, request: ToolExecutionRequest) -> ToolExecutionResult;
@@ -500,8 +460,6 @@ impl ToolExecutionService {
         {
             return EdgeTransportAttempt::TransportDisconnected;
         }
-        let mut failure_guard =
-            EdgeDispatchFailureGuard::new(Arc::clone(&dispatch), request_id.clone(), "cancelled");
         let result_json = dispatch
             .wait_result(
                 &request_id,
@@ -512,10 +470,8 @@ impl ToolExecutionService {
             .flatten();
         let Some(result_json) = result_json else {
             let _ = dispatch.fail_dispatch(&request_id, "expired").await;
-            failure_guard.disarm();
             return EdgeTransportAttempt::TransportDisconnected;
         };
-        failure_guard.disarm();
         let (output, is_error) =
             astra_thin_client::ToolResultRequest::parse_output_and_error(&result_json);
         EdgeTransportAttempt::Delivered(astra_tools::ToolResult {

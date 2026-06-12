@@ -6,6 +6,12 @@ import {
   extractBlockedReason,
   projectRunWaitingState,
 } from "@/lib/run-status-messages";
+import {
+  blockedWaitingFor,
+  eventMessage,
+  explicitEventMessage,
+  isRunBlockedEvent,
+} from "@/lib/api/stream-event-handler";
 import type {
   ChatDetail,
   ChatMessage,
@@ -222,45 +228,8 @@ const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
   "run_blocked",
 ]);
 
-function isRunBlockedEvent(type: string) {
-  return type === "run_blocked";
-}
-
 function isWorkSurfaceStreamEvent(type: string) {
   return WORK_SURFACE_STREAM_EVENT_TYPES.has(type) || isRunBlockedEvent(type);
-}
-
-function streamEventMessage(event: Record<string, unknown>, fallback: string) {
-  for (const key of ["message", "error", "user_message", "reason"]) {
-    const value = event[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-  }
-  return fallback;
-}
-
-function explicitStreamEventMessage(event: Record<string, unknown>) {
-  for (const key of ["message", "error", "user_message"]) {
-    const value = event[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-  }
-  return "";
-}
-
-function blockedWaitingFor(event: Record<string, unknown>) {
-  return (
-    extractBlockedReason(
-      event as {
-        type?: string;
-        reason?: string;
-        error_kind?: string;
-        blocked?: boolean;
-      },
-    ) ?? "blocked"
-  );
 }
 
 function applyAssistantText(
@@ -350,7 +319,7 @@ function applyStreamEvent(
       typeof event.run_id === "string" && event.run_id.trim()
         ? event.run_id
         : state.runId;
-    const message = streamEventMessage(event, "");
+    const message = eventMessage(event, "");
     state.paused = true;
     if (!state.rawText.trim() && message) {
       state.rawText = message;
@@ -376,7 +345,7 @@ function applyStreamEvent(
     const projection = projectRunWaitingState(
       event as { waiting_for?: string; reason?: string; error_kind?: string },
     );
-    const message = explicitStreamEventMessage(event);
+    const message = explicitEventMessage(event);
     state.paused = true;
     if (!state.rawText.trim() && message) {
       state.rawText = message;
@@ -424,7 +393,7 @@ function applyStreamEvent(
 
   if (type === "run_error") {
     handlers.onWorkSurfaceEvent?.(event);
-    const message = streamEventMessage(event, "Astra run failed.");
+    const message = eventMessage(event, "Astra run failed.");
     state.error = message;
     if (typeof event.run_id === "string") {
       state.runId = event.run_id;
@@ -440,7 +409,7 @@ function applyStreamEvent(
   if (type === "run_interrupted") {
     handlers.onWorkSurfaceEvent?.(event);
     state.paused = true;
-    const message = streamEventMessage(event, "");
+    const message = eventMessage(event, "");
     if (!state.rawText.trim() && message) {
       state.rawText = message;
       applyAssistantText(state.rawText, state, handlers);

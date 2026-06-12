@@ -27,7 +27,7 @@ export interface StreamEventState {
   runLifecycle: "running" | "paused" | "waiting" | "blocked" | "finished";
 }
 
-function blockedWaitingFor(event: Record<string, unknown>) {
+export function blockedWaitingFor(event: Record<string, unknown>) {
   return (
     extractBlockedReason(
       event as {
@@ -40,7 +40,10 @@ function blockedWaitingFor(event: Record<string, unknown>) {
   );
 }
 
-function eventMessage(event: Record<string, unknown>, fallback: string) {
+export function eventMessage(
+  event: Record<string, unknown>,
+  fallback: string,
+): string {
   for (const key of ["message", "error", "user_message", "reason"]) {
     const value = event[key];
     if (typeof value === "string" && value.trim()) {
@@ -50,7 +53,7 @@ function eventMessage(event: Record<string, unknown>, fallback: string) {
   return fallback;
 }
 
-function explicitEventMessage(event: Record<string, unknown>) {
+export function explicitEventMessage(event: Record<string, unknown>): string {
   for (const key of ["message", "error", "user_message"]) {
     const value = event[key];
     if (typeof value === "string" && value.trim()) {
@@ -60,7 +63,7 @@ function explicitEventMessage(event: Record<string, unknown>) {
   return "";
 }
 
-function isRunBlockedEvent(type: string) {
+export function isRunBlockedEvent(type: string): boolean {
   return type === "run_blocked";
 }
 

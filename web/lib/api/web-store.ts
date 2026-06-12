@@ -141,7 +141,11 @@ async function settleRuntimeCancel(
           runtimeErrorDetail(settled.error),
         );
       }
-      onLateSettled?.(settled);
+      try {
+        onLateSettled?.(settled);
+      } catch (error) {
+        console.error("Late cancel settlement callback error:", error);
+      }
     });
     return true;
   }
@@ -202,9 +206,7 @@ function isFreshLocalActiveRun(
     activeRun.status.trim().toLowerCase() === "cancelling"
       ? LOCAL_STOPPED_RUN_GRACE_MS
       : LOCAL_ACTIVE_RUN_GRACE_MS;
-  return (
-    Number.isFinite(observedAt) && now - observedAt <= maxAge
-  );
+  return Number.isFinite(observedAt) && now - observedAt <= maxAge;
 }
 
 function pruneLocallyStoppedRuns(chat: ChatRecord, now = Date.now()) {
@@ -880,7 +882,7 @@ export async function queueDeferredRunInput(
   await syncBackendSessions(ownerUserId);
 
   // Re-read chat after every async boundary to avoid TOCTOU races.
-  function findChat(): typeof chat | undefined {
+  function findChat(): ChatRecord | undefined {
     return getStore(ownerUserId).chats.find((item) => item.id === chatId);
   }
 
@@ -991,7 +993,7 @@ export async function queueDeferredRunInput(
   chat.lastMessageAt = timestamp;
   chat.lastMessagePreview = payload.content;
   if (chat.projectId) {
-    touchProjectInStore(store, chat.projectId);
+    touchProjectInStore(getStore(ownerUserId), chat.projectId);
   }
   chat.activeRun = makeActiveRunRecord(
     {

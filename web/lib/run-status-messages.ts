@@ -1,44 +1,22 @@
-export const EXECUTION_BOUNDARY_WAIT_REASONS = new Set([
-  "executor_offline",
-  "transport_disconnected",
-  "fallback_disabled",
-  "workspace_executor_unavailable",
-]);
+import {
+  EXECUTION_BOUNDARY_WAIT_REASONS,
+  isExecutionBoundaryWait,
+  extractWaitingReason,
+  extractBlockedReason,
+} from "@astra/sdk";
 
-export function isExecutionBoundaryWait(reason: string): boolean {
-  return EXECUTION_BOUNDARY_WAIT_REASONS.has(reason);
-}
+export {
+  EXECUTION_BOUNDARY_WAIT_REASONS,
+  isExecutionBoundaryWait,
+  extractWaitingReason,
+  extractBlockedReason,
+};
 
 export type RunWaitingProjection = {
   status: "waiting" | "blocked";
   waitingFor: string;
   blocked: boolean;
 };
-
-export function extractWaitingReason(event: {
-  waiting_for?: string;
-  reason?: string;
-  error_kind?: string;
-}): string {
-  const raw =
-    event.waiting_for ?? event.reason ?? event.error_kind ?? "waiting";
-  return raw.replace(/^waiting:\s*/i, "").trim() || "waiting";
-}
-
-export function extractBlockedReason(event: {
-  type?: string;
-  reason?: string;
-  error_kind?: string;
-  blocked?: boolean;
-}): string | null {
-  if (event.type === "run_blocked") {
-    return event.reason ?? event.error_kind ?? "blocked";
-  }
-  if (event.blocked) {
-    return event.reason ?? event.error_kind ?? "blocked";
-  }
-  return null;
-}
 
 export function projectRunWaitingState(event: {
   waiting_for?: string;
