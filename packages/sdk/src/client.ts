@@ -49,7 +49,7 @@ import type {
   TaskLeaseMutationRequestBody,
   ToolResultRequestBody,
   UserInfo,
-} from './types';
+} from "./types";
 import {
   ASTRA_EDGE_ID_HEADER,
   PATH_AGENTS_EDGE,
@@ -104,9 +104,9 @@ import {
   taskLeasePath,
   taskLeaseReleasePath,
   taskLeaseRenewPath,
-} from './paths';
-import { SSEClient, parseSseDataEvents } from './sse-client';
-import { headersInitToRecord, readAstraErrorDetail } from './http';
+} from "./paths";
+import { SSEClient, parseSseDataEvents } from "./sse-client";
+import { headersInitToRecord, readAstraErrorDetail } from "./http";
 
 type SessionWire = RuntimeSessionResponse;
 type SessionListWire = RuntimeSessionListResponse;
@@ -117,8 +117,8 @@ type RunStatusWire = {
   status: string;
   waiting_for?: string | null;
   events_count: number;
-  workspace?: RunStatus['workspace'];
-  executor?: RunStatus['executor'];
+  workspace?: RunStatus["workspace"];
+  executor?: RunStatus["executor"];
   transport?: string | null;
   fallback_policy?: string | null;
 };
@@ -154,7 +154,7 @@ function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
     runId: w.run_id,
     sessionId: w.session_id,
-    status: w.status as RunStatus['status'],
+    status: w.status as RunStatus["status"],
     eventsCount: Number(w.events_count),
     waitingFor: w.waiting_for ?? undefined,
     workspace: w.workspace,
@@ -187,7 +187,9 @@ function normalizeEventList(raw: EventListResponse): EventListResponse {
     events: raw.events.map((ev) => ({
       ...ev,
       metadata:
-        ev.metadata && typeof ev.metadata === 'object' && !Array.isArray(ev.metadata)
+        ev.metadata &&
+        typeof ev.metadata === "object" &&
+        !Array.isArray(ev.metadata)
           ? (ev.metadata as Record<string, unknown>)
           : {},
     })),
@@ -215,6 +217,8 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   if (req.capabilities?.length) body.capabilities = req.capabilities;
   if (req.allowSkills?.length) body.allow_skills = req.allowSkills;
   if (req.allowTools?.length) body.allow_tools = req.allowTools;
+  if (req.workspaceBinding) body.workspace_binding = req.workspaceBinding;
+  if (req.executorBinding) body.executor_binding = req.executorBinding;
   if (req.skillSearch) {
     body.skill_search = {
       dynamic_surface: req.skillSearch.dynamicSurface,
@@ -245,7 +249,7 @@ export class AstraClient {
   }
 
   private apiPath(path: string): string {
-    const base = this.config.baseUrl.replace(/\/$/, '');
+    const base = this.config.baseUrl.replace(/\/$/, "");
     return `${base}${joinApiPath(this.config.pathPrefix, path)}`;
   }
 
@@ -271,7 +275,10 @@ export class AstraClient {
 
   /** Log in with username/password. Stores tokens automatically. */
   async login(username: string, password: string): Promise<AuthResult> {
-    const result = await this.post<AuthResult>(PATH_AUTH_LOGIN, { username, password });
+    const result = await this.post<AuthResult>(PATH_AUTH_LOGIN, {
+      username,
+      password,
+    });
     this.accessToken = result.access_token;
     this.refreshTokenValue = result.refresh_token;
     return result;
@@ -281,7 +288,9 @@ export class AstraClient {
   async logout(): Promise<void> {
     try {
       if (this.refreshTokenValue) {
-        await this.post(PATH_AUTH_LOGOUT, { refresh_token: this.refreshTokenValue });
+        await this.post(PATH_AUTH_LOGOUT, {
+          refresh_token: this.refreshTokenValue,
+        });
       }
     } finally {
       this.accessToken = null;
@@ -303,8 +312,8 @@ export class AstraClient {
     if (!this.refreshTokenValue) return false;
     try {
       const res = await fetch(this.apiPath(PATH_AUTH_REFRESH), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: this.refreshTokenValue }),
       });
       if (!res.ok) return false;
@@ -321,20 +330,26 @@ export class AstraClient {
     }
   }
 
-  private buildHeaders(init?: RequestInit, extra?: Record<string, string>): Record<string, string> {
+  private buildHeaders(
+    init?: RequestInit,
+    extra?: Record<string, string>,
+  ): Record<string, string> {
     const headers: Record<string, string> = {
       ...this.config.headers,
       ...extra,
     };
-    const method = (init?.method ?? 'GET').toUpperCase();
+    const method = (init?.method ?? "GET").toUpperCase();
     if (
       init?.body != null &&
-      (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')
+      (method === "POST" ||
+        method === "PUT" ||
+        method === "PATCH" ||
+        method === "DELETE")
     ) {
-      headers['Content-Type'] = 'application/json';
+      headers["Content-Type"] = "application/json";
     }
     if (this.accessToken) {
-      headers['Authorization'] = `Bearer ${this.accessToken}`;
+      headers["Authorization"] = `Bearer ${this.accessToken}`;
     }
     return headers;
   }
@@ -363,7 +378,7 @@ export class AstraClient {
       throw new AstraApiError(res.status, body, path);
     }
 
-    if (res.status === 204 || res.headers.get('content-length') === '0') {
+    if (res.status === 204 || res.headers.get("content-length") === "0") {
       return undefined as T;
     }
 
@@ -372,7 +387,8 @@ export class AstraClient {
     try {
       return JSON.parse(text) as T;
     } catch (parseErr) {
-      const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      const msg =
+        parseErr instanceof Error ? parseErr.message : String(parseErr);
       throw new AstraApiError(
         res.status,
         `Invalid JSON response: ${msg}; body starts: ${text.slice(0, 500)}`,
@@ -384,7 +400,7 @@ export class AstraClient {
   async post<T>(path: string, body?: unknown, init?: RequestInit): Promise<T> {
     return this.fetch<T>(path, {
       ...init,
-      method: 'POST',
+      method: "POST",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   }
@@ -392,7 +408,7 @@ export class AstraClient {
   async put<T>(path: string, body?: unknown, init?: RequestInit): Promise<T> {
     return this.fetch<T>(path, {
       ...init,
-      method: 'PUT',
+      method: "PUT",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   }
@@ -413,7 +429,9 @@ export class AstraClient {
   }
 
   /** Raw runtime session creation for clients that need metadata/status fields. */
-  async createRuntimeSession(body: RuntimeSessionCreateBody = {}): Promise<RuntimeSessionResponse> {
+  async createRuntimeSession(
+    body: RuntimeSessionCreateBody = {},
+  ): Promise<RuntimeSessionResponse> {
     return this.post<RuntimeSessionResponse>(PATH_SESSIONS, body);
   }
 
@@ -433,7 +451,9 @@ export class AstraClient {
   }
 
   /** Raw runtime session list for clients that need pagination and metadata. */
-  async listRuntimeSessions(params: RuntimeSessionListParams = {}): Promise<RuntimeSessionListResponse> {
+  async listRuntimeSessions(
+    params: RuntimeSessionListParams = {},
+  ): Promise<RuntimeSessionListResponse> {
     const q = buildQueryString({
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
       ...(params.offset !== undefined ? { offset: params.offset } : {}),
@@ -442,7 +462,7 @@ export class AstraClient {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    await this.fetch(sessionPath(sessionId), { method: 'DELETE' });
+    await this.fetch(sessionPath(sessionId), { method: "DELETE" });
   }
 
   /** Session audit summary (`GET /sessions/{id}/audit/summary`). */
@@ -451,7 +471,10 @@ export class AstraClient {
   }
 
   /** `PUT /sessions/{id}` — update title, metadata, and/or status. */
-  async updateSession(sessionId: string, body: SessionUpdateBody): Promise<SessionInfo> {
+  async updateSession(
+    sessionId: string,
+    body: SessionUpdateBody,
+  ): Promise<SessionInfo> {
     const wire: Record<string, unknown> = {};
     if (body.title !== undefined) wire.title = body.title;
     if (body.metadata !== undefined) wire.metadata = body.metadata;
@@ -473,10 +496,14 @@ export class AstraClient {
     params: RuntimeTranscriptParams = {},
   ): Promise<RuntimeTranscriptResponse> {
     const q = buildQueryString({
-      ...(params.before_seq !== undefined ? { before_seq: params.before_seq } : {}),
+      ...(params.before_seq !== undefined
+        ? { before_seq: params.before_seq }
+        : {}),
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
     });
-    return this.fetch<RuntimeTranscriptResponse>(`${sessionTranscriptPath(sessionId)}${q}`);
+    return this.fetch<RuntimeTranscriptResponse>(
+      `${sessionTranscriptPath(sessionId)}${q}`,
+    );
   }
 
   async listSessionArtifacts(
@@ -487,7 +514,9 @@ export class AstraClient {
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
       ...(params.offset !== undefined ? { offset: params.offset } : {}),
     });
-    return this.fetch<RuntimeArtifactListResponse>(`${sessionArtifactsPath(sessionId)}${q}`);
+    return this.fetch<RuntimeArtifactListResponse>(
+      `${sessionArtifactsPath(sessionId)}${q}`,
+    );
   }
 
   /** `POST /sessions/{id}/close` */
@@ -517,17 +546,24 @@ export class AstraClient {
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
       ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
     });
-    return this.fetch<SessionActivityResponse>(`${sessionActivityPath(sessionId)}${q}`);
+    return this.fetch<SessionActivityResponse>(
+      `${sessionActivityPath(sessionId)}${q}`,
+    );
   }
 
   /** `GET /chat/session/{id}/reflect` */
-  async getSessionReflect(sessionId: string, params?: ReflectQueryParams): Promise<ReflectReport> {
+  async getSessionReflect(
+    sessionId: string,
+    params?: ReflectQueryParams,
+  ): Promise<ReflectReport> {
     const q = buildQueryString({
       ...(params?.focus !== undefined ? { focus: params.focus } : {}),
       ...(params?.last_n !== undefined ? { last_n: params.last_n } : {}),
       ...(params?.question !== undefined ? { question: params.question } : {}),
     });
-    return this.fetch<ReflectReport>(`${chatSessionReflectPath(sessionId)}${q}`);
+    return this.fetch<ReflectReport>(
+      `${chatSessionReflectPath(sessionId)}${q}`,
+    );
   }
 
   /** `GET /chat/session/{id}/decision-trace` (server uses focus `tool_selection`). */
@@ -540,7 +576,9 @@ export class AstraClient {
       ...(params?.last_n !== undefined ? { last_n: params.last_n } : {}),
       ...(params?.question !== undefined ? { question: params.question } : {}),
     });
-    return this.fetch<ReflectReport>(`${chatSessionDecisionTracePath(sessionId)}${q}`);
+    return this.fetch<ReflectReport>(
+      `${chatSessionDecisionTracePath(sessionId)}${q}`,
+    );
   }
 
   /** `GET /events/session/{session_id}` */
@@ -552,7 +590,9 @@ export class AstraClient {
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
       ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
     });
-    const raw = await this.fetch<EventListResponse>(`${eventsSessionPath(sessionId)}${q}`);
+    const raw = await this.fetch<EventListResponse>(
+      `${eventsSessionPath(sessionId)}${q}`,
+    );
     return normalizeEventList(raw);
   }
 
@@ -562,7 +602,9 @@ export class AstraClient {
       ...(filters?.sessionId ? { session_id: filters.sessionId } : {}),
       ...(filters?.eventType ? { event_type: filters.eventType } : {}),
       ...(filters?.agentId ? { agent_id: filters.agentId } : {}),
-      ...(filters?.causalChainId ? { causal_chain_id: filters.causalChainId } : {}),
+      ...(filters?.causalChainId
+        ? { causal_chain_id: filters.causalChainId }
+        : {}),
       ...(filters?.limit !== undefined ? { limit: filters.limit } : {}),
       ...(filters?.offset !== undefined ? { offset: filters.offset } : {}),
     });
@@ -572,11 +614,15 @@ export class AstraClient {
 
   /** `GET /events/causal-chain/{id}` */
   async getCausalChain(causalChainId: string): Promise<EventResponse[]> {
-    const raw = await this.fetch<EventResponse[]>(eventsCausalChainPath(causalChainId));
+    const raw = await this.fetch<EventResponse[]>(
+      eventsCausalChainPath(causalChainId),
+    );
     return raw.map((ev) => ({
       ...ev,
       metadata:
-        ev.metadata && typeof ev.metadata === 'object' && !Array.isArray(ev.metadata)
+        ev.metadata &&
+        typeof ev.metadata === "object" &&
+        !Array.isArray(ev.metadata)
           ? (ev.metadata as Record<string, unknown>)
           : {},
     }));
@@ -590,8 +636,15 @@ export class AstraClient {
   // ─── Runs ──────────────────────────────────────────────────────────
 
   /** Non-streaming chat turn — `POST /chat`. */
-  async createRun(request: ChatRequest, init?: RequestInit): Promise<RunStatus> {
-    const raw = await this.post<ChatResponseWire>(PATH_CHAT, chatRequestToWire(request), init);
+  async createRun(
+    request: ChatRequest,
+    init?: RequestInit,
+  ): Promise<RunStatus> {
+    const raw = await this.post<ChatResponseWire>(
+      PATH_CHAT,
+      chatRequestToWire(request),
+      init,
+    );
     return {
       runId: raw.run_id,
       sessionId: raw.session_id,
@@ -606,14 +659,17 @@ export class AstraClient {
   }
 
   async cancelRun(runId: string): Promise<void> {
-    await this.fetch(chatRunPath(runId), { method: 'DELETE' });
+    await this.fetch(chatRunPath(runId), { method: "DELETE" });
   }
 
   async pauseRun(runId: string): Promise<void> {
     await this.post(chatRunPausePath(runId));
   }
 
-  async submitRunInput(runId: string, body: RunInputRequestBody): Promise<RunInputResponse> {
+  async submitRunInput(
+    runId: string,
+    body: RunInputRequestBody,
+  ): Promise<RunInputResponse> {
     const raw = await this.post<RunInputResponseWire>(chatRunInputPath(runId), {
       idempotency_key: body.idempotencyKey,
       input: body.input,
@@ -632,14 +688,18 @@ export class AstraClient {
   async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
     const path = `${chatRunStreamPath(runId)}?last_index=${encodeURIComponent(String(startIndex))}`;
     const url = this.apiPath(path);
-    const streamHeaders = this.buildHeaders(undefined, { Accept: 'text/event-stream' });
+    const streamHeaders = this.buildHeaders(undefined, {
+      Accept: "text/event-stream",
+    });
     let res = await fetch(url, { headers: streamHeaders });
 
     if (res.status === 401) {
       const refreshed = await this.tryRefreshToken();
       if (refreshed) {
         res = await fetch(url, {
-          headers: this.buildHeaders(undefined, { Accept: 'text/event-stream' }),
+          headers: this.buildHeaders(undefined, {
+            Accept: "text/event-stream",
+          }),
         });
       }
     }
@@ -662,13 +722,20 @@ export class AstraClient {
     opts?: { recentLimit?: number },
   ): Promise<RunProjectionResponse> {
     const q = buildQueryString({
-      ...(opts?.recentLimit !== undefined ? { recent_limit: opts.recentLimit } : {}),
+      ...(opts?.recentLimit !== undefined
+        ? { recent_limit: opts.recentLimit }
+        : {}),
     });
-    return this.fetch<RunProjectionResponse>(`${chatRunProjectionPath(runId)}${q}`);
+    return this.fetch<RunProjectionResponse>(
+      `${chatRunProjectionPath(runId)}${q}`,
+    );
   }
 
   /** `GET /runs` — list durable runs for the current user. */
-  async listRuns(opts?: { limit?: number; offset?: number }): Promise<RunListResponse> {
+  async listRuns(opts?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<RunListResponse> {
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
       ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
@@ -678,7 +745,10 @@ export class AstraClient {
   }
 
   /** `POST /chat/runs/{run_id}/delegate` — multi-agent coordination. */
-  async delegateRun(runId: string, body: DelegationRequestBody): Promise<DelegationResponse> {
+  async delegateRun(
+    runId: string,
+    body: DelegationRequestBody,
+  ): Promise<DelegationResponse> {
     return this.post<DelegationResponse>(chatRunDelegatePath(runId), body);
   }
 
@@ -689,12 +759,16 @@ export class AstraClient {
 
   /** `POST /chat/runs/{run_id}/delegations/pause` */
   async pauseDelegations(runId: string): Promise<DelegationMutationResponse> {
-    return this.post<DelegationMutationResponse>(chatRunDelegationsPausePath(runId));
+    return this.post<DelegationMutationResponse>(
+      chatRunDelegationsPausePath(runId),
+    );
   }
 
   /** `POST /chat/runs/{run_id}/delegations/resume` */
   async resumeDelegations(runId: string): Promise<DelegationMutationResponse> {
-    return this.post<DelegationMutationResponse>(chatRunDelegationsResumePath(runId));
+    return this.post<DelegationMutationResponse>(
+      chatRunDelegationsResumePath(runId),
+    );
   }
 
   // ─── Memory ─────────────────────────────────────────────────────────
@@ -704,11 +778,17 @@ export class AstraClient {
   }
 
   async memorySearch(query: string, topK = 10): Promise<MemorySearchResult[]> {
-    return this.post<MemorySearchResult[]>(PATH_MEMORY_SEARCH, { query, top_k: topK });
+    return this.post<MemorySearchResult[]>(PATH_MEMORY_SEARCH, {
+      query,
+      top_k: topK,
+    });
   }
 
   async memoryRetrieve(query: string, topK = 5): Promise<MemorySearchResult[]> {
-    return this.post<MemorySearchResult[]>(PATH_MEMORY_RETRIEVE, { query, top_k: topK });
+    return this.post<MemorySearchResult[]>(PATH_MEMORY_RETRIEVE, {
+      query,
+      top_k: topK,
+    });
   }
 
   async memoryPurge(topic: string): Promise<void> {
@@ -720,20 +800,24 @@ export class AstraClient {
   async listModels(): Promise<RuntimeModelListItem[]> {
     const payload = await this.fetch<RuntimeModelListResponse>(PATH_MODELS);
     if (Array.isArray(payload)) {
-      return payload.filter((model): model is RuntimeModelListItem => (
-        Boolean(model) && typeof model === 'object'
-      ));
+      return payload.filter(
+        (model): model is RuntimeModelListItem =>
+          Boolean(model) && typeof model === "object",
+      );
     }
     const items = payload.items ?? payload.models ?? [];
-    return items.filter((model): model is RuntimeModelListItem => (
-      Boolean(model) && typeof model === 'object'
-    ));
+    return items.filter(
+      (model): model is RuntimeModelListItem =>
+        Boolean(model) && typeof model === "object",
+    );
   }
 
   // ─── Skills ─────────────────────────────────────────────────────────
 
   /** Raw runtime skill catalog list for clients that need pagination/source/category metadata. */
-  async listRuntimeSkills(params: RuntimeSkillListParams = {}): Promise<RuntimeSkillListResponse> {
+  async listRuntimeSkills(
+    params: RuntimeSkillListParams = {},
+  ): Promise<RuntimeSkillListResponse> {
     const q = buildQueryString({
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
       ...(params.offset !== undefined ? { offset: params.offset } : {}),
@@ -743,12 +827,14 @@ export class AstraClient {
 
   async listSkills(): Promise<SkillInfo[]> {
     const raw = await this.listRuntimeSkills();
-    return (raw.skills ?? []).map((s) => ({
-      id: s.skill_id ?? s.skill_name ?? '',
-      name: s.skill_name ?? s.skill_id ?? '',
-      description: s.description ?? '',
-      status: s.status ?? s.version ?? '',
-    })).filter((s) => s.name.length > 0);
+    return (raw.skills ?? [])
+      .map((s) => ({
+        id: s.skill_id ?? s.skill_name ?? "",
+        name: s.skill_name ?? s.skill_id ?? "",
+        description: s.description ?? "",
+        status: s.status ?? s.version ?? "",
+      }))
+      .filter((s) => s.name.length > 0);
   }
 
   /** `POST /skills` — register a skill draft (returns `SkillRecord`, HTTP 201). */
@@ -762,7 +848,10 @@ export class AstraClient {
   }
 
   /** `GET /skills/{skill_id}` — optional `version` query. */
-  async getSkill(skillId: string, opts?: { version?: string }): Promise<SkillRecord> {
+  async getSkill(
+    skillId: string,
+    opts?: { version?: string },
+  ): Promise<SkillRecord> {
     const q = buildQueryString(
       opts?.version !== undefined ? { version: opts.version } : {},
     );
@@ -793,7 +882,7 @@ export class AstraClient {
     const url = this.apiPath(PATH_CHAT_STREAM);
     const client = new SSEClient({
       url,
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(chatRequestToWire(request)),
       token: this.accessToken ?? undefined,
       headers: this.config.headers,
@@ -819,13 +908,15 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeExecutorId;
     }
     return this.fetch(PATH_TOOLS_RESULT, {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
       headers,
     });
   }
 
-  async postApprovalRespond(body: ApprovalRespondRequestBody): Promise<unknown> {
+  async postApprovalRespond(
+    body: ApprovalRespondRequestBody,
+  ): Promise<unknown> {
     return this.post(PATH_APPROVAL_RESPOND, body);
   }
 
@@ -838,7 +929,7 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(PATH_AGENTS_EDGE, {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
       headers,
     });
@@ -853,7 +944,7 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(PATH_AGENTS_EDGE_HEARTBEAT, {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
       headers,
     });
@@ -873,7 +964,7 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(taskLeaseClaimPath(taskId), {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
       headers,
     });
@@ -889,7 +980,7 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(taskLeaseReleasePath(taskId), {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
       headers,
     });
@@ -905,7 +996,7 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(taskLeaseRenewPath(taskId), {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
       headers,
     });
@@ -921,6 +1012,6 @@ export class AstraApiError extends Error {
     public readonly path: string,
   ) {
     super(`Astra API error ${status} on ${path}: ${body.slice(0, 200)}`);
-    this.name = 'AstraApiError';
+    this.name = "AstraApiError";
   }
 }

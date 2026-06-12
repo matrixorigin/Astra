@@ -18,19 +18,19 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::turn::agentic_loop::host::RequestConstraints;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use astra_services::coordination::{
-    AGENT_RESULT_STATUS_FAILED, AgentProfile, AgentProfileRegistry, AgentResult,
-    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
-    agent_result_status_to_subrun_state, aggregate_results,
+    agent_result_status_to_subrun_state, aggregate_results, AgentProfile, AgentProfileRegistry,
+    AgentResult, AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
+    AGENT_RESULT_STATUS_FAILED,
 };
 use astra_services::runs::{
-    DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
+    durable_run_status_kind, durable_run_status_to_subrun_state, DurableRunStatusKind,
 };
 use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServiceConfig};
 
@@ -3926,6 +3926,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         }
     }
 
@@ -4040,6 +4041,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4073,6 +4075,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4101,6 +4104,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4135,6 +4139,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         assert!(de.execute(req, "writer", None).await.is_err());
@@ -4158,6 +4163,7 @@ mod tests {
             user_id: "u".into(),
             depth: 5,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = de.execute(req, "orch", None).await.unwrap_err();
@@ -4181,6 +4187,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let req2 = DelegationRequest {
             delegation_id: "del-B".into(),
@@ -4194,6 +4201,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         de.execute(req1, "orch", None).await.unwrap();
@@ -4387,6 +4395,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4420,6 +4429,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4476,6 +4486,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4572,6 +4583,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: ctx,
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4627,6 +4639,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de
@@ -4693,6 +4706,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de
@@ -4765,6 +4779,7 @@ mod tests {
                     .to_string(),
                 serde_json::json!({"authorization": "Bearer evil", "x-workspace-id": "ws-001"}),
             )]),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4916,6 +4931,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: ctx,
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -5165,13 +5181,11 @@ mod tests {
         // Fan-out with always-fail gate: result should be verification_failed
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "verification_failed");
-        assert!(
-            result.agent_results[0]
-                .error
-                .as_ref()
-                .unwrap()
-                .contains("quality too low")
-        );
+        assert!(result.agent_results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("quality too low"));
     }
 
     #[tokio::test]
@@ -5194,6 +5208,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5221,6 +5236,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5250,6 +5266,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5489,6 +5506,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5539,13 +5557,11 @@ mod tests {
     async fn gate_verdict_variants() {
         assert!(GateVerdict::Pass.is_pass());
         assert!(GateVerdict::Skip.is_pass());
-        assert!(
-            !GateVerdict::Fail {
-                reason: "x".into(),
-                details: None
-            }
-            .is_pass()
-        );
+        assert!(!GateVerdict::Fail {
+            reason: "x".into(),
+            details: None
+        }
+        .is_pass());
     }
 
     // ── Persistence tests ────────────────────────────────────────────────
@@ -5878,6 +5894,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         }
     }
 
@@ -6149,13 +6166,11 @@ mod tests {
         // Hard errors should be captured as failed agent results, not propagated
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "failed");
-        assert!(
-            result.agent_results[0]
-                .error
-                .as_ref()
-                .unwrap()
-                .contains("crashed")
-        );
+        assert!(result.agent_results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("crashed"));
     }
 
     // ── Sequential: output chaining across stages ───────────────────────────
@@ -6177,6 +6192,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6631,6 +6647,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6671,6 +6688,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6731,6 +6749,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6767,6 +6786,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -7163,11 +7183,11 @@ mod tests {
     #[tokio::test]
     async fn resolve_inherited_prefix_resolves_captured_parent() {
         use astra_turn_core::fork_capture::{
-            CaptureRequest, ForkCaptureOutcome, capture_parent_prefix,
+            capture_parent_prefix, CaptureRequest, ForkCaptureOutcome,
         };
         use astra_turn_core::fork_prefix::{
-            CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
-            hash_tool_schema,
+            hash_tool_schema, CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice,
+            ToolSchemaEntry,
         };
         use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
 

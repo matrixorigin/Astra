@@ -190,9 +190,9 @@ fn fanout_slot_status_from_agent_status(
                 (AgentFanoutSlotStatus::CancelledByParentBudget, reason)
             }
         }
-        AgentStatus::Waiting { reason } => (AgentFanoutSlotStatus::TimedOut, Some(reason.clone())),
+        AgentStatus::Waiting { .. } => (AgentFanoutSlotStatus::Running, None),
         AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => {
-            (AgentFanoutSlotStatus::TimedOut, None)
+            (AgentFanoutSlotStatus::Running, None)
         }
     }
 }

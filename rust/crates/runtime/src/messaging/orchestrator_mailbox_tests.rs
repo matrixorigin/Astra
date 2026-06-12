@@ -135,6 +135,7 @@ mod tests {
                 );
                 ctx
             },
+            execution_metadata: None,
         }
     }
 

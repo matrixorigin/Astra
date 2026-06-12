@@ -133,7 +133,7 @@ mod tests {
                 aggregation: AggregationStrategy::AllResults,
                 timeout_sec: 30,
             },
-            user_id: "user-1".into(),
+            user_id: "test-user".into(),
             depth: 0,
             context: {
                 let mut ctx = HashMap::new();
@@ -143,6 +143,7 @@ mod tests {
                 );
                 ctx
             },
+            execution_metadata: None,
         }
     }
 
