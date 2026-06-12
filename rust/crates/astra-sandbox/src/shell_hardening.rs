@@ -455,6 +455,7 @@ mod tests {
     #[test]
     fn detects_ssh_paths() {
         assert!(is_dangerous_file_path(".ssh/id_rsa"));
+        assert!(is_dangerous_file_path("~/.ssh/id_rsa"));
         assert!(is_dangerous_file_path("/home/user/.ssh/authorized_keys"));
     }
 
@@ -478,13 +479,15 @@ mod tests {
 
     #[test]
     fn dangerous_read_path_excludes_session_tool_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp
+            .path()
+            .join(".astra/sessions/s1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "tool output").unwrap();
+
         // session tool-results are write-dangerous but NOT read-dangerous
-        assert!(!is_dangerous_read_path(
-            "/Users/test/.astra/sessions/s1/tool-results/call_abc.txt"
-        ));
-        assert!(!is_dangerous_read_path(
-            "~/.astra/sessions/s1/tool-results/call_abc.txt"
-        ));
+        assert!(!is_dangerous_read_path(&artifact_path.to_string_lossy()));
         // But other .astra/ paths remain read-dangerous
         assert!(is_dangerous_read_path("/Users/test/.astra/config.toml"));
         assert!(is_dangerous_read_path(

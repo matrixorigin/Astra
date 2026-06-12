@@ -1312,14 +1312,9 @@ fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
         && !cmd.is_empty()
     {
         let dangerous = if is_read {
-            // Layer 1: known safe internal artifact? → allow.
-            if is_internal_safe_path(cmd).is_none() {
-                // Layer 2: known dangerous? → block.
-                is_dangerous_file_path(cmd)
-                    || crate::permission::redact::matches_sensitive_path(cmd)
-            } else {
-                false
-            }
+            command_has_sensitive_ref(cmd) && !command_sensitive_refs_are_internal_artifacts(cmd)
+        } else if command_has_sensitive_ref(cmd) {
+            true
         } else {
             is_dangerous_file_path(cmd) || crate::permission::redact::matches_sensitive_path(cmd)
         };
@@ -1328,6 +1323,61 @@ fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn command_has_sensitive_ref(command: &str) -> bool {
+    shell_like_tokens(command)
+        .iter()
+        .any(|token| is_sensitive_path_ref(token))
+}
+
+fn command_sensitive_refs_are_internal_artifacts(command: &str) -> bool {
+    let mut saw_sensitive_ref = false;
+    for token in shell_like_tokens(command) {
+        if !is_sensitive_path_ref(&token) {
+            continue;
+        }
+        saw_sensitive_ref = true;
+        if is_internal_safe_path(&token).is_none() {
+            return false;
+        }
+    }
+    saw_sensitive_ref
+}
+
+fn is_sensitive_path_ref(token: &str) -> bool {
+    is_dangerous_file_path(token) || crate::permission::redact::matches_sensitive_path(token)
+}
+
+fn shell_like_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in command.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ch if !in_single && !in_double && (ch.is_whitespace() || "|;&<>()".contains(ch)) => {
+                push_shell_like_token(&mut tokens, &mut current);
+            }
+            _ => current.push(ch),
+        }
+    }
+    push_shell_like_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
+    let token = current
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
+        .to_string();
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    current.clear();
 }
 
 fn execute_hard_deny_reason(tool_name: &str, args: &Value) -> Option<String> {
@@ -1899,11 +1949,17 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let artifact_path = "/Users/test/.astra/sessions/session-1/tool-results/call_abc.txt";
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
 
         let read_file = evaluate_permission(
             "read_file",
-            &serde_json::json!({"path": artifact_path}),
+            &serde_json::json!({"path": artifact_path.clone()}),
             &ctx,
         );
         assert!(
@@ -1913,13 +1969,89 @@ mod tests {
 
         let bash_read = evaluate_permission(
             "bash",
-            &serde_json::json!({"command": format!("cat {artifact_path} | python3 -c 'import sys; print(sys.stdin.read()[:10])'")}),
+            &serde_json::json!({"command": format!("cat {artifact_path}")}),
             &ctx,
         );
         assert!(
             matches!(bash_read.decision, HardDecision::Allow),
             "read-only processing of tool result artifacts must not require manual approval: {bash_read:?}"
         );
+    }
+
+    #[test]
+    fn evaluate_interpreter_pipeline_over_tool_result_still_requires_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("cat {artifact_path} | python3 -c 'import sys; print(sys.stdin.read()[:10])'")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::NeedExternal { .. }),
+            "internal artifact paths must not bypass shell approval for interpreter pipelines: {bash_read:?}"
+        );
+        assert!(matches!(
+            bash_read.source,
+            DecisionSource::SensitivePath { .. }
+                | DecisionSource::ExplicitApprovalGate { .. }
+                | DecisionSource::Mode { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_read_only_bash_mixed_internal_and_secret_path_requires_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("cat {artifact_path} ~/.ssh/id_rsa")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::NeedExternal { .. }),
+            "an internal artifact must not mask a separate sensitive path: {bash_read:?}"
+        );
+        assert!(matches!(
+            bash_read.source,
+            DecisionSource::SensitivePath { .. }
+        ));
+    }
+
+    #[test]
+    fn command_sensitive_refs_helper_rejects_mixed_internal_and_secret_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+
+        assert!(command_sensitive_refs_are_internal_artifacts(&format!(
+            "cat {artifact_path}"
+        )));
+        assert!(!command_sensitive_refs_are_internal_artifacts(&format!(
+            "cat {artifact_path} ~/.ssh/id_rsa"
+        )));
     }
 
     #[test]

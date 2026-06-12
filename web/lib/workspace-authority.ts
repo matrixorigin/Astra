@@ -129,7 +129,10 @@ export function localCodeIntent(message: string) {
   // "review" alongside code-related terms (branch, changes, diff, PR, commit, code)
   if (
     /\breview\b/i.test(text) &&
-    /\b(?:branch(?:es)?|changes?|diff|PR|commit|code|repo)s?\b/i.test(text)
+    (/\b(?:branch(?:es)?|changes?|diffs?|prs?|pull\s+requests?|commits?|code|repos?|repositories)\b/i.test(
+      text,
+    ) ||
+      /(?:分支|代码|仓库|改动|变更)/u.test(text))
   ) {
     return true;
   }
@@ -190,7 +193,7 @@ function localPathPrefixAt(message: string, index: number) {
   );
 }
 
-function collectPathToken(message: string, start: number) {
+function collectPathToken(message: string, start: number): string {
   const bracedHome = "${HOME}/";
   if (message.slice(start).startsWith(bracedHome)) {
     return `${bracedHome}${collectPathToken(message, start + bracedHome.length)}`;

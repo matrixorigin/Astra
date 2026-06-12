@@ -73,23 +73,11 @@ function normalizedActiveSkills(skills?: string[]) {
 }
 
 async function verifyLiveWorkspaceSelection(
-  selection: WorkspaceSelection | null,
+  selection: WorkspaceSelection | null | undefined,
   runtime: WebRuntimeClient,
-): Promise<
-  | {
-      selection: WorkspaceSelection | null;
-      error: null;
-    }
-  | {
-      selection: null;
-      error: {
-        code: string;
-        message: string;
-      };
-    }
-> {
+): Promise<WorkspaceSelection | null | undefined> {
   if (selection?.kind !== "edge_workspace") {
-    return { selection, error: null };
+    return selection;
   }
 
   const status = await runtime.get<EdgeStatusResponse>(PATH_EDGES_STATUS, {
@@ -100,13 +88,12 @@ async function verifyLiveWorkspaceSelection(
     (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
   );
   if (!edge) {
-    return {
-      selection: null,
-      error: {
-        code: "workspace_edge_offline",
-        message: `Edge executor ${selection.displayName ?? selection.edgeAgentId} is offline. Reconnect edge or choose a connected workspace. Server fallback is disabled for this workspace.`,
-      },
-    };
+    throw new RuntimeClientError({
+      operation: "verify edge workspace binding",
+      path: PATH_EDGES_STATUS,
+      status: 409,
+      detail: `Edge executor ${selection.displayName ?? selection.edgeAgentId} is offline. Reconnect edge or choose a connected workspace. Server fallback is disabled for this workspace.`,
+    });
   }
 
   const liveCwd = edge.workspace_dir?.trim() ?? "";
@@ -117,23 +104,18 @@ async function verifyLiveWorkspaceSelection(
     const current = liveCwd
       ? `currently reports ${liveCwd}`
       : "does not report a workspace";
-    return {
-      selection: null,
-      error: {
-        code: "workspace_edge_path_unavailable",
-        message: `Edge executor ${edge.hostname ?? selection.displayName ?? selection.edgeAgentId} ${current}, not ${selection.cwd}. Choose the current edge workspace, then retry. Server fallback is disabled for this workspace.`,
-      },
-    };
+    throw new RuntimeClientError({
+      operation: "verify edge workspace binding",
+      path: PATH_EDGES_STATUS,
+      status: 409,
+      detail: `Edge executor ${edge.hostname ?? selection.displayName ?? selection.edgeAgentId} ${current}, not ${selection.cwd}. Choose the current edge workspace, then retry. Server fallback is disabled for this workspace.`,
+    });
   }
 
   return {
-    selection: {
-      ...selection,
-      displayName:
-        edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
-      cwd: liveCwd,
-    },
-    error: null,
+    ...selection,
+    displayName: edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
+    cwd: liveCwd,
   };
 }
 
@@ -152,15 +134,12 @@ async function readSendMessageRequest(
   if (!chat?.pendingTurn) {
     return null;
   }
-  const recovered: SendMessageRequest = {
+  return {
     content: chat.pendingTurn.content,
     options: chat.pendingTurn.options,
     pendingMessageId: chat.pendingTurn.messageId,
-  };
-  if (chat.workspaceSelection) {
-    recovered.workspace = chat.workspaceSelection;
-  }
-  return recovered;
+    ...(chat.workspaceSelection ? { workspace: chat.workspaceSelection } : {}),
+  } satisfies SendMessageRequest;
 }
 
 async function readErrorDetail(response: Response) {
@@ -527,45 +506,15 @@ export async function POST(
       { status: 409 },
     );
   }
-  let liveWorkspaceSelection = workspaceSelection;
-  if (workspaceSelection?.kind === "edge_workspace") {
-    try {
-      const verified = await verifyLiveWorkspaceSelection(
-        workspaceSelection,
-        await getStreamRuntime(),
-      );
-      if (verified.error) {
-        return NextResponse.json(
-          { error: verified.error.message, code: verified.error.code },
-          { status: 409 },
-        );
-      }
-      liveWorkspaceSelection = verified.selection ?? undefined;
-    } catch (error) {
-      const status =
-        error instanceof RuntimeClientError ? (error.status ?? 502) : 502;
-      const message =
-        error instanceof RuntimeClientError
-          ? error.detail
-          : error instanceof Error
-            ? error.message
-            : "Failed to verify edge workspace status.";
-      return NextResponse.json(
-        { error: message, code: "workspace_edge_status_unavailable" },
-        { status },
-      );
-    }
-  }
   if (
-    liveWorkspaceSelection &&
     requestedWorkspaceSelection &&
-    !sameWorkspaceSelection(liveWorkspaceSelection, storedWorkspaceSelection)
+    !sameWorkspaceSelection(requestedWorkspaceSelection, storedWorkspaceSelection)
   ) {
     try {
       const updated = await updateChatWorkspaceSelection(
         ownerUserId,
         chatId,
-        liveWorkspaceSelection,
+        requestedWorkspaceSelection,
       );
       if (!updated) {
         return NextResponse.json({ error: "chat not found" }, { status: 404 });
@@ -578,16 +527,13 @@ export async function POST(
       return NextResponse.json({ error: message }, { status: 502 });
     }
   }
-  const effectiveWorkspaceSelection =
-    liveWorkspaceSelection ?? ({ kind: "server_sandbox" } as const);
-  const workspaceBindings = resolveWorkspaceBindings(
-    effectiveWorkspaceSelection,
-  );
+
+  let runtimeSessionId = chatId;
   const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
 
   const started = beginStreamingMessage(ownerUserId, chatId, {
     ...body,
-    workspaceSelection: liveWorkspaceSelection ?? undefined,
+    workspaceSelection: workspaceSelection ?? undefined,
   });
   if (!started) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
@@ -595,18 +541,36 @@ export async function POST(
   const backendAbortController = new AbortController();
   const knownArtifactIds = new Set<string>();
 
-  // Resolve session ID synchronously before starting stream proxy
-  const runtime = await getStreamRuntime();
-  const [runtimeSessionId, model] = await Promise.all([
-    ensureChatBackendSession(ownerUserId, chatId, {
-      model: body.options?.model ?? chat.chat.model,
-      runtime,
-    }),
-    resolveBackendModelName(runtime, body.options?.model),
-  ]);
-
   return proxyRunStream({
     backendResponse: async (emit) => {
+      const runtime = await getStreamRuntime();
+      const liveWorkspaceSelection = await verifyLiveWorkspaceSelection(
+        workspaceSelection,
+        runtime,
+      );
+      if (
+        liveWorkspaceSelection &&
+        !sameWorkspaceSelection(liveWorkspaceSelection, workspaceSelection)
+      ) {
+        await updateChatWorkspaceSelection(
+          ownerUserId,
+          chatId,
+          liveWorkspaceSelection,
+        );
+      }
+      const effectiveWorkspaceSelection =
+        liveWorkspaceSelection ?? ({ kind: "server_sandbox" } as const);
+      const workspaceBindings = resolveWorkspaceBindings(
+        effectiveWorkspaceSelection,
+      );
+      const [ensuredSessionId, model] = await Promise.all([
+        ensureChatBackendSession(ownerUserId, chatId, {
+          model: body.options?.model ?? chat.chat.model,
+          runtime,
+        }),
+        resolveBackendModelName(runtime, body.options?.model),
+      ]);
+      runtimeSessionId = ensuredSessionId;
       emit({
         type: "session_bound",
         chat_id: chatId,
@@ -656,9 +620,13 @@ export async function POST(
     ownerUserId,
     chatId,
     sessionId: () => runtimeSessionId,
-    runtime,
+    runtime: getStreamRuntime,
     assistantMessageId: started.assistantMessage.id,
     knownArtifactIds,
+    localMessages: {
+      userMessage: started.userMessage,
+      assistantMessage: started.assistantMessage,
+    },
   });
 }
 

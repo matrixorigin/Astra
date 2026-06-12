@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -703,62 +703,6 @@ struct StallDiagnosis {
     restricted_tools: Vec<String>,
 }
 
-fn trailing_single_tool_resume_restrictions(state: &AgenticLoopState) -> Vec<String> {
-    // Reverse-iterate tool_call_records to collect single-tool rounds
-    // from most-recent backwards, stopping at the first multi-tool round.
-    let mut restricted = BTreeSet::new();
-    let mut current_round: Option<u32> = None;
-    let mut current_tools: BTreeSet<String> = BTreeSet::new();
-
-    for record in state
-        .stall
-        .tool_call_records
-        .iter()
-        .rev()
-        .filter(|r| !r.is_synthetic_placeholder())
-    {
-        let Some(round) = record.round else {
-            continue;
-        };
-
-        match current_round {
-            None => {
-                current_round = Some(round);
-                current_tools.insert(record.name.clone());
-            }
-            Some(r) if r == round => {
-                current_tools.insert(record.name.clone());
-            }
-            Some(_) => {
-                if current_tools.len() == 1 {
-                    let Some(name) = current_tools.iter().next() else {
-                        continue; // defensive: skip malformed round
-                    };
-                    for tool in astra_turn_core::interruption::resume_tool_family_for_tool(name) {
-                        restricted.insert((*tool).to_string());
-                    }
-                    current_round = Some(round);
-                    current_tools.clear();
-                    current_tools.insert(record.name.clone());
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    if current_tools.len() == 1 {
-        let Some(name) = current_tools.iter().next() else {
-            return restricted.into_iter().collect(); // defensive
-        };
-        for tool in astra_turn_core::interruption::resume_tool_family_for_tool(name) {
-            restricted.insert((*tool).to_string());
-        }
-    }
-
-    restricted.into_iter().collect()
-}
-
 fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
     let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
 
@@ -789,12 +733,7 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
         return StallDiagnosis {
             signal: Some(format!("exploration_family={family};streak={streak}")),
             summary,
-            restricted_tools: astra_turn_core::interruption::resume_tool_family_for_exploration(
-                family,
-            )
-            .iter()
-            .map(|tool| (*tool).to_string())
-            .collect(),
+            restricted_tools: Vec::new(),
         };
     }
 
@@ -808,7 +747,7 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
             summary: Some(format!(
                 "{redundant_reads} redundant overlapping reads on unchanged files"
             )),
-            restricted_tools: vec!["read_file".to_string(), "view".to_string()],
+            restricted_tools: Vec::new(),
         };
     }
 
@@ -819,7 +758,7 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
             summary: Some(format!(
                 "a single-tool streak of {single_tool_streak} consecutive rounds"
             )),
-            restricted_tools: trailing_single_tool_resume_restrictions(state),
+            restricted_tools: Vec::new(),
         };
     }
 
@@ -2018,7 +1957,8 @@ mod tests {
         );
         assert_eq!(
             summary.resume_restricted_tools,
-            vec!["read_file".to_string(), "view".to_string()]
+            Vec::<String>::new(),
+            "read-heavy stall must preserve guidance without hard-blocking read tools"
         );
         let diagnosis = interruption_diagnosis_summary(&state).expect("diagnosis");
         assert!(
@@ -2032,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn interruption_state_summary_blocks_trailing_single_tool_lane() {
+    fn interruption_state_summary_records_trailing_single_tool_without_hard_block() {
         let mut state = make_state();
         state.stall.tool_call_records = (0..3)
             .map(|round| ToolCallRecord {
@@ -2056,7 +1996,11 @@ mod tests {
             summary.stall_signal.as_deref(),
             Some("single_tool_streak=3")
         );
-        assert_eq!(summary.resume_restricted_tools, vec!["bash".to_string()]);
+        assert_eq!(
+            summary.resume_restricted_tools,
+            Vec::<String>::new(),
+            "single-tool stall must not hard-block the executor needed to finish"
+        );
     }
 
     #[test]

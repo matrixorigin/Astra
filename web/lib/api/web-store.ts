@@ -1029,42 +1029,62 @@ export async function stopActiveRun(
 
   const previousActiveRun = chat.activeRun;
   const runId = previousActiveRun.runId;
-  rememberLocallyStoppedRun(chat, runId);
-
   const client = await requireRuntimeClient({
     auth: "required",
     operation: `cancel active run ${runId}`,
   });
 
-  const cancelPending = await settleRuntimeCancel(
-    client.sdk.cancelRun(runId),
-    options?.cancelTimeoutMs,
-    (settled) => {
-      const currentChat = getStore(ownerUserId).chats.find(
-        (item) => item.id === chatId,
-      );
-      if (currentChat?.activeRun?.runId !== runId) {
-        return;
-      }
-      if (settled.status === "completed") {
-        currentChat.activeRun = undefined;
-        return;
-      }
-      forgetLocallyStoppedRun(currentChat, runId);
-      currentChat.activeRun = makeActiveRunRecord(
-        {
-          runId,
-          status: previousActiveRun.status,
-          waitingFor: previousActiveRun.waitingFor ?? null,
-        },
-        "local_mutation",
-      );
+  rememberLocallyStoppedRun(chat, runId);
+  chat.activeRun = makeActiveRunRecord(
+    {
+      runId,
+      status: "cancelling",
+      waitingFor: previousActiveRun.waitingFor ?? null,
     },
+    "local_mutation",
   );
 
+  const restorePreviousRun = () => {
+    const currentChat = getStore(ownerUserId).chats.find(
+      (item) => item.id === chatId,
+    );
+    if (currentChat?.activeRun?.runId !== runId) {
+      return;
+    }
+    forgetLocallyStoppedRun(currentChat, runId);
+    currentChat.activeRun = makeActiveRunRecord(
+      {
+        runId,
+        status: previousActiveRun.status,
+        waitingFor: previousActiveRun.waitingFor ?? null,
+      },
+      "local_mutation",
+    );
+  };
+
+  let cancelPending: boolean;
+  try {
+    cancelPending = await settleRuntimeCancel(
+      client.sdk.cancelRun(runId),
+      options?.cancelTimeoutMs,
+      (settled) => {
+        if (settled.status === "completed") {
+          return;
+        }
+        restorePreviousRun();
+      },
+    );
+  } catch (error) {
+    restorePreviousRun();
+    throw error;
+  }
+
   if (cancelPending) {
-    if (chat.activeRun?.runId === runId) {
-      chat.activeRun = makeActiveRunRecord(
+    const currentChat = getStore(ownerUserId).chats.find(
+      (item) => item.id === chatId,
+    );
+    if (currentChat?.activeRun?.runId === runId) {
+      currentChat.activeRun = makeActiveRunRecord(
         {
           runId,
           status: "cancelling",
@@ -1073,8 +1093,6 @@ export async function stopActiveRun(
         "local_mutation",
       );
     }
-  } else {
-    chat.activeRun = undefined;
   }
 
   return {

@@ -6603,7 +6603,7 @@ mod resume_tests {
     }
 
     #[test]
-    fn apply_resume_recovery_state_restores_resume_restricted_tools() {
+    fn apply_resume_recovery_state_ignores_stall_derived_resume_restricted_tools() {
         let mut state = SessionState::default();
         apply_resume_recovery_state(
             &mut state,
@@ -6616,7 +6616,10 @@ mod resume_tests {
             None,
         );
 
-        assert_eq!(state.resume_restricted_tools, vec!["read_file", "view"]);
+        assert!(
+            state.resume_restricted_tools.is_empty(),
+            "stall-derived resume restrictions are soft guidance, not hard tool blocks"
+        );
     }
 
     #[test]

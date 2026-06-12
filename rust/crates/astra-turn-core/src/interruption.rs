@@ -142,8 +142,7 @@ pub enum ResumeMode {
     #[default]
     Continue,
     /// Do not broaden execution; synthesize preserved state into user-visible
-    /// output. Tool availability is enforced separately via
-    /// `resume_restricted_tools`.
+    /// output.
     Settle,
 }
 
@@ -223,9 +222,10 @@ pub struct InterruptionRecord {
     /// field deserialize with `stall_signal = None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_signal: Option<String>,
-    /// Tool names that should stay hidden on the resumed turn so the
-    /// model cannot immediately re-enter the exploratory lane that
-    /// already exhausted the budget.
+    /// Explicit hard tool restrictions for the resumed turn.
+    ///
+    /// Loop-stall diagnostics must not populate this field: repeated reads or
+    /// single-tool streaks are soft correction signals, not permission policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resume_restricted_tools: Vec<String>,
 }
@@ -374,7 +374,10 @@ pub struct InterruptionStateSummary {
     /// [`InterruptionRecord::stall_signal`] for semantics. Leave `None`
     /// when no loop-guard condition was active at interruption time.
     pub stall_signal: Option<String>,
-    /// Tool names that should stay restricted when the session resumes.
+    /// Explicit hard tool restrictions when the session resumes.
+    ///
+    /// Do not use this for stall correction. Preserve `stall_signal` and let
+    /// guidance steer the next turn without hiding generic tools.
     pub resume_restricted_tools: Vec<String>,
 }
 
@@ -395,54 +398,23 @@ fn dedup_sorted_tool_names(tools: &[String]) -> Vec<String> {
     vec
 }
 
-#[must_use]
-pub fn resume_tool_family_for_exploration(family: &str) -> &'static [&'static str] {
-    match family {
-        "read" => &["read_file", "view"],
-        "search" => &["glob", "grep", "rg"],
-        "diff" => &["git_diff", "git_log"],
-        _ => &[],
-    }
-}
-
-#[must_use]
-pub fn resume_tool_family_for_tool(tool_name: &str) -> &'static [&'static str] {
-    match tool_name {
-        // Read family
-        "read_file" | "view" => &["read_file", "view"],
-        // Search family — file search and web search
-        "glob" | "grep" | "rg" | "web_search" => &["glob", "grep", "rg", "web_search"],
-        // Diff family
-        "git_diff" | "git_log" => &["git_diff", "git_log"],
-        // Bash
-        "bash" => &["bash"],
-        // Memory family
-        "memory" | "memory_search" | "memory_retrieve" | "memory_profile" => &[
-            "memory",
-            "memory_search",
-            "memory_retrieve",
-            "memory_profile",
-        ],
-        // Skill / consultative family
-        "skill" | "discover_skills" => &["skill", "discover_skills"],
-        _ => &[],
-    }
-}
-
 /// Extract resume restricted tools from an interruption JSON blob.
 ///
 /// **Prefer the typed [`InterruptionRecord::resume_restricted_tools`] field**
 /// when it is available.  This function exists for backward compatibility
 /// with older checkpoints that only carry a `stall_signal` string.
 ///
-/// The primary source is the `resume_restricted_tools` array, computed by the
-/// server at interruption time.  Older interruption records may only carry a
-/// `stall_signal` string; those are accepted as-is and produce an empty list
-/// (the server now always embeds the resolved tool list).
+/// Stall-derived restrictions from older checkpoints are intentionally ignored:
+/// a stall is a correction signal, not a hard permission boundary. Explicit
+/// hard restrictions can still be restored from interruption records that do
+/// not carry a `stall_signal`.
 #[must_use]
 pub fn resume_restricted_tools_from_interruption_json(
     interruption_json: &serde_json::Value,
 ) -> Vec<String> {
+    if interruption_json.get("stall_signal").is_some() {
+        return Vec::new();
+    }
     interruption_json
         .get("resume_restricted_tools")
         .and_then(|v| v.as_array())
@@ -975,6 +947,33 @@ mod tests {
         .with_stall_signal("single_tool_streak=7");
         assert_eq!(record.stall_signal.as_deref(), Some("single_tool_streak=7"));
         assert_eq!(record.to_json()["stall_signal"], "single_tool_streak=7");
+    }
+
+    #[test]
+    fn stall_resume_restricted_tools_are_ignored_on_restore() {
+        let json = serde_json::json!({
+            "kind": "empty_completion",
+            "stall_signal": "redundant_reads=22",
+            "resume_restricted_tools": ["read_file", "view", "bash"]
+        });
+
+        assert!(
+            resume_restricted_tools_from_interruption_json(&json).is_empty(),
+            "stall correction must not become a hard tool restriction on resume"
+        );
+    }
+
+    #[test]
+    fn explicit_resume_restricted_tools_without_stall_are_restored() {
+        let json = serde_json::json!({
+            "kind": "approval_rejected",
+            "resume_restricted_tools": ["write_file", "bash", "write_file"]
+        });
+
+        assert_eq!(
+            resume_restricted_tools_from_interruption_json(&json),
+            vec!["bash", "write_file"]
+        );
     }
 
     #[test]

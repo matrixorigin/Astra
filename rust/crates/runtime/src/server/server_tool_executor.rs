@@ -4008,6 +4008,8 @@ impl ServerToolExecutor {
                 "active_form",
                 "owner",
                 "metadata",
+                "add_blocks",
+                "add_blocked_by",
             ],
             "list" => &["action", "status_filter"],
             "get" => &["action", "task_id"],
@@ -4041,12 +4043,6 @@ impl ServerToolExecutor {
                 continue;
             }
             if !allowed.contains(&key.as_str()) {
-                if action == "create" && Self::is_task_dependency_edge_field(key) {
-                    return Err(format!(
-                        "unknown field '{key}' for task.create. Dependency edge fields (`add_blocks`, `add_blocked_by`, `remove_blocks`, `remove_blocked_by`) are update-only: first call task(action='create', title=...), then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
-                        allowed.join(", ")
-                    ));
-                }
                 return Err(format!(
                     "unknown field '{key}' for task.{action} (valid: {})",
                     allowed.join(", ")
@@ -4054,13 +4050,6 @@ impl ServerToolExecutor {
             }
         }
         Ok(())
-    }
-
-    fn is_task_dependency_edge_field(key: &str) -> bool {
-        matches!(
-            key,
-            "add_blocks" | "add_blocked_by" | "remove_blocks" | "remove_blocked_by"
-        )
     }
 
     fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
@@ -6614,6 +6603,14 @@ esac
             "server list_user should reject unknown fields before returning a filtered list: {list_user_typo}"
         );
 
+        let create_blocker = exec
+            .execute("task", &json!({"action": "create", "title": "Blocker"}))
+            .await;
+        assert!(
+            !create_blocker.starts_with("Error:") && create_blocker.contains("task-1"),
+            "server should create blocker task before dependency create: {create_blocker}"
+        );
+
         let create_dependency_field = exec
             .execute(
                 "task",
@@ -6625,12 +6622,10 @@ esac
             )
             .await;
         assert!(
-            create_dependency_field.starts_with("Error:")
-                && create_dependency_field.contains("update-only")
-                && create_dependency_field.contains("task(action='create'")
-                && create_dependency_field.contains("task(action='update'")
-                && create_dependency_field.contains("<created task_id>"),
-            "server create dependency-field misuse should explain the two-step repair: {create_dependency_field}"
+            !create_dependency_field.starts_with("Error:")
+                && create_dependency_field.contains(r#""task_id":"task-2""#)
+                && create_dependency_field.contains(r#""blocked_by":["task-1"]"#),
+            "server create should accept create-time dependency fields: {create_dependency_field}"
         );
 
         let update_status_field = exec

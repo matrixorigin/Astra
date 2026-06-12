@@ -42,7 +42,7 @@ import {
   updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
-import { RuntimeClientError, requireRuntimeClient } from "@/lib/runtime-client";
+import { requireRuntimeClient } from "@/lib/runtime-client";
 import { PATH_EDGES_STATUS } from "@astra/sdk";
 
 const mockRequireRuntimeUser = requireRuntimeUser as jest.MockedFunction<
@@ -131,6 +131,16 @@ function makeBackendFrameStream(frames: string[]) {
 
 function waitForStreamWork(ms = 0) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitUntil(predicate: () => boolean) {
+  for (let index = 0; index < 20; index += 1) {
+    if (predicate()) {
+      return;
+    }
+    await waitForStreamWork(0);
+  }
+  throw new Error("condition was not met");
 }
 
 const connectedEdge = {
@@ -435,37 +445,14 @@ describe("chat stream route proxy cancellation", () => {
     const first = await reader!.read();
     const text = new TextDecoder().decode(first.value);
     expect(text).toContain('"type":"local_messages"');
-    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
-      "user-a",
-      "chat-1",
-      expect.not.objectContaining({
-        workspaceSelection: expect.anything(),
-      }),
-    );
     expect(fetchResponse).toHaveBeenCalledTimes(1);
-    const fetchCalls = fetchResponse.mock.calls as unknown as Array<
-      [unknown, { json?: Record<string, unknown> }]
-    >;
-    const runtimeRequest = fetchCalls[0]?.[1];
-    expect(runtimeRequest?.json).toEqual(
-      expect.objectContaining({
-        workspace_binding: expect.objectContaining({
-          kind: "server_sandbox",
-          fallback_policy: "disabled",
-        }),
-        executor_binding: expect.objectContaining({
-          kind: "server_local",
-          transport: "server_local",
-        }),
-      }),
-    );
 
     const backend = makeBackendStream();
     resolveFetch({ ok: true, body: backend.body });
     await reader?.cancel();
   });
 
-  it("rejects local code prompts without an explicit edge workspace", async () => {
+  it("rejects local code prompts without workspace authority before creating stream messages", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
 
     const response = await POST(
@@ -493,149 +480,7 @@ describe("chat stream route proxy cancellation", () => {
     expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
   });
 
-  it("rejects $HOME local paths without an explicit edge workspace", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review $HOME/github/astra",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_required",
-      error: expect.stringContaining("Select a connected edge workspace"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("rejects branch review prompts without workspace authority", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review the branch changes",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_required",
-      error: expect.stringContaining("Select a connected edge workspace"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("rejects local code command prompts without workspace authority", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "git status and run tests",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_required",
-      error: expect.stringContaining("Select a connected edge workspace"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
   it("rejects local code prompts when server sandbox is explicitly selected", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review this repo",
-          workspace: { kind: "server_sandbox" },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_local_code_on_server_sandbox",
-      error: expect.stringContaining("Server sandbox cannot access"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("rejects local code commands when server sandbox is explicitly selected", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "npm test and fix failures",
-          workspace: { kind: "server_sandbox" },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_local_code_on_server_sandbox",
-      error: expect.stringContaining("Server sandbox cannot access"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("rejects mixed-language branch review prompts on server sandbox", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
 
     const response = await POST(
@@ -664,36 +509,7 @@ describe("chat stream route proxy cancellation", () => {
     expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
   });
 
-  it("rejects malformed workspace selections instead of falling back", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "hello",
-          workspace: { kind: "edge_workspace", edgeAgentId: "edge-1" },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toEqual({
-      code: "invalid_workspace_selection",
-      error: expect.stringContaining("workspace must"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("forwards selected edge workspace bindings to the runtime stream", async () => {
+  it("forwards selected edge workspace bindings after returning local SSE", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
@@ -723,9 +539,11 @@ describe("chat stream route proxy cancellation", () => {
 
     const reader = response.body?.getReader();
     expect(reader).toBeDefined();
-    await reader?.read();
-    await waitForStreamWork();
+    const first = await reader!.read();
+    const text = new TextDecoder().decode(first.value);
+    expect(text).toContain('"type":"local_messages"');
 
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
     const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
       [unknown, { json?: Record<string, unknown> }]
     >;
@@ -762,7 +580,7 @@ describe("chat stream route proxy cancellation", () => {
     await reader?.cancel();
   });
 
-  it("rejects a selected edge workspace that is not connected before creating stream messages", async () => {
+  it("streams an error after local SSE when the selected edge workspace is offline", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend, []);
@@ -790,352 +608,27 @@ describe("chat stream route proxy cancellation", () => {
       { params: Promise.resolve({ chatId: "chat-1" }) },
     );
 
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_edge_offline",
-      error: expect.stringContaining("Server fallback is disabled"),
-    });
-    expect(runtime.fetchResponse).not.toHaveBeenCalled();
-    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-  });
-
-  it("rejects a connected edge when its live workspace no longer matches the selection", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const backend = makeBackendStream();
-    const runtime = makeRuntimeWithEdgeStatus(backend, [
-      {
-        ...connectedEdge,
-        workspace_dir: "/Users/xupeng/github/other",
-      },
-    ]);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review /Users/xupeng/github/astra/src/lib.rs",
-          workspace: {
-            kind: "edge_workspace",
-            edgeAgentId: "edge-1",
-            displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra",
-          },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_edge_path_unavailable",
-      error: expect.stringContaining("/Users/xupeng/github/other"),
-    });
-    expect(runtime.fetchResponse).not.toHaveBeenCalled();
-    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-  });
-
-  it("preserves runtime status when edge workspace verification cannot read status", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const backend = makeBackendStream();
-    const runtime = makeRuntimeWithEdgeStatus(backend);
-    runtime.get.mockRejectedValue(
-      new RuntimeClientError({
-        operation: "verify edge workspace binding",
-        path: PATH_EDGES_STATUS,
-        status: 401,
-        detail: "Runtime authentication is missing.",
-      }),
-    );
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review /Users/xupeng/github/astra/src/lib.rs",
-          workspace: {
-            kind: "edge_workspace",
-            edgeAgentId: "edge-1",
-            displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra",
-          },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_edge_status_unavailable",
-      error: "Runtime authentication is missing.",
-    });
-    expect(runtime.fetchResponse).not.toHaveBeenCalled();
-    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-  });
-
-  it("persists a request workspace selection before starting the stream", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const edgeWorkspace = {
-      kind: "edge_workspace" as const,
-      edgeAgentId: "edge-1",
-      displayName: "MacBook Pro",
-      cwd: "/Users/xupeng/github/astra",
-    };
-    mockUpdateChatWorkspaceSelection.mockResolvedValue({
-      chat: {
-        id: "chat-1",
-        title: "Chat",
-        projectId: null,
-        createdAt: "2026-06-07T00:00:00.000Z",
-        updatedAt: "2026-06-07T00:00:00.000Z",
-        archivedAt: null,
-        model: "sonnet-4.6-adaptive",
-      },
-      messages: [],
-      workspaceSelection: edgeWorkspace,
-    });
-    const backend = makeBackendStream();
-    const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "hello",
-          workspace: edgeWorkspace,
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
     expect(response.status).toBe(200);
-    expect(mockUpdateChatWorkspaceSelection).toHaveBeenCalledWith(
-      "user-a",
-      "chat-1",
-      edgeWorkspace,
-    );
-    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
-      "user-a",
-      "chat-1",
-      expect.objectContaining({
-        workspaceSelection: edgeWorkspace,
-      }),
-    );
-    expect(
-      mockUpdateChatWorkspaceSelection.mock.invocationCallOrder[0],
-    ).toBeLessThan(mockBeginStreamingMessage.mock.invocationCallOrder[0]);
-    expect(runtime.get).toHaveBeenCalledWith(
-      PATH_EDGES_STATUS,
-      expect.objectContaining({ operation: "verify edge workspace binding" }),
-    );
-  });
-
-  it("inherits chat workspace selection when recovering an empty pending turn request", async () => {
-    const edgeWorkspace = {
-      kind: "edge_workspace" as const,
-      edgeAgentId: "edge-1",
-      displayName: "MacBook Pro",
-      cwd: "/Users/xupeng/github/astra",
-    };
-    mockGetChat.mockReturnValue({
-      chat: {
-        id: "chat-1",
-        title: "Chat",
-        projectId: null,
-        createdAt: "2026-06-07T00:00:00.000Z",
-        updatedAt: "2026-06-07T00:00:00.000Z",
-        archivedAt: null,
-        model: "sonnet-4.6-adaptive",
-      },
-      messages: [
-        {
-          id: "pending-user-1",
-          role: "user" as const,
-          content: "review this repo",
-          createdAt: "2026-06-07T00:00:00.000Z",
-          status: "complete" as const,
-        },
-      ],
-      pendingTurn: {
-        messageId: "pending-user-1",
-        content: "review this repo",
-        options: {
-          model: "sonnet-4.6-adaptive",
-          webSearch: false,
-          thinking: true,
-          activeSkills: [],
-        },
-      },
-      workspaceSelection: edgeWorkspace,
-    });
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const backend = makeBackendStream();
-    const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(200);
-    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
-    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
-      "user-a",
-      "chat-1",
-      expect.objectContaining({
-        workspaceSelection: edgeWorkspace,
-      }),
-    );
-
     const reader = response.body?.getReader();
-    await reader?.read();
-    await waitForStreamWork();
-    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
-      [unknown, { json?: Record<string, unknown> }]
-    >;
-    expect(fetchCalls[0]?.[1].json).toEqual(
+    expect(reader).toBeDefined();
+    const first = await reader!.read();
+    expect(new TextDecoder().decode(first.value)).toContain(
+      '"type":"local_messages"',
+    );
+    const second = await reader!.read();
+    const secondText = new TextDecoder().decode(second.value);
+    expect(secondText).toContain('"type":"error"');
+    expect(secondText).toContain("Server fallback is disabled");
+    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
       expect.objectContaining({
-        workspace_binding: expect.objectContaining({
-          kind: "edge_workspace",
-          cwd: "/Users/xupeng/github/astra",
-        }),
-        executor_binding: expect.objectContaining({
-          kind: "edge_agent",
-          executor_id: "edge-1",
-        }),
+        content: expect.stringContaining("Server fallback is disabled"),
+        status: "failed",
       }),
     );
-    await reader?.cancel();
-  });
-
-  it("rejects local paths outside the selected edge workspace", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review /Users/xupeng/github/astra",
-          workspace: {
-            kind: "edge_workspace",
-            edgeAgentId: "edge-1",
-            displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra/subdir",
-          },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_path_mismatch",
-      error: expect.stringContaining(
-        "Select an edge workspace that owns that path",
-      ),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("rejects local paths even when a Chinese prefix is adjacent to the path", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "切换到目录~/github/astra，然后 review 这个分支",
-          workspace: {
-            kind: "edge_workspace",
-            edgeAgentId: "edge-1",
-            displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra/subdir",
-          },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_path_mismatch",
-      error: expect.stringContaining("~/github/astra"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
-  });
-
-  it("rejects braced HOME paths outside the selected edge workspace", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "review ${HOME}/github/astra",
-          workspace: {
-            kind: "edge_workspace",
-            edgeAgentId: "edge-1",
-            displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra/subdir",
-          },
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_path_mismatch",
-      error: expect.stringContaining("${HOME}/github/astra"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
   });
 
   it("returns local SSE messages before backend session creation and model resolution finish", async () => {
@@ -1265,22 +758,99 @@ describe("chat stream route proxy cancellation", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
-      "user-a",
-      "chat-1",
-      expect.objectContaining({
-        content: "hello from pending",
-        pendingMessageId: "pending-user-1",
+    expect(mockBeginStreamingMessage).toHaveBeenCalledWith("user-a", "chat-1", {
+      content: "hello from pending",
+      pendingMessageId: "pending-user-1",
+      options: {
+        model: "sonnet-4.6-adaptive",
+        webSearch: false,
+        thinking: true,
+        activeSkills: [],
+      },
+    });
+    const reader = response.body?.getReader();
+    await reader?.read();
+    await reader?.cancel();
+  });
+
+  it("inherits chat workspace selection when recovering an empty pending turn request", async () => {
+    const edgeWorkspace = {
+      kind: "edge_workspace" as const,
+      edgeAgentId: "edge-1",
+      displayName: "MacBook Pro",
+      cwd: "/Users/xupeng/github/astra",
+    };
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      messages: [
+        {
+          id: "pending-user-1",
+          role: "user" as const,
+          content: "review this repo",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "complete" as const,
+        },
+      ],
+      pendingTurn: {
+        messageId: "pending-user-1",
+        content: "review this repo",
         options: {
           model: "sonnet-4.6-adaptive",
           webSearch: false,
           thinking: true,
           activeSkills: [],
         },
+      },
+      workspaceSelection: edgeWorkspace,
+    });
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
+    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        workspaceSelection: edgeWorkspace,
       }),
     );
+
     const reader = response.body?.getReader();
     await reader?.read();
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
+    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
+      [unknown, { json?: Record<string, unknown> }]
+    >;
+    expect(fetchCalls[0]?.[1].json).toEqual(
+      expect.objectContaining({
+        workspace_binding: expect.objectContaining({
+          kind: "edge_workspace",
+          cwd: "/Users/xupeng/github/astra",
+        }),
+        executor_binding: expect.objectContaining({
+          kind: "edge_agent",
+          executor_id: "edge-1",
+        }),
+      }),
+    );
     await reader?.cancel();
   });
 

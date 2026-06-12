@@ -280,8 +280,24 @@ describe("localCodeIntent", () => {
     expect(localCodeIntent("inspect current workspace")).toBe(true);
   });
 
+  it("detects code review phrases as local intent", () => {
+    expect(localCodeIntent("code review")).toBe(true);
+    expect(localCodeIntent("review my code")).toBe(true);
+    expect(localCodeIntent("review the pull request")).toBe(true);
+  });
+
+  it("detects mixed Chinese and English review phrases as local intent", () => {
+    expect(localCodeIntent("多角度 review 这个分支的 changes")).toBe(true);
+    expect(localCodeIntent("review 这个分支")).toBe(true);
+    expect(localCodeIntent("review 这些代码改动")).toBe(true);
+  });
+
   it("returns false for generic questions", () => {
     expect(localCodeIntent("what is rust")).toBe(false);
+  });
+
+  it("returns false for generic review requests without code context", () => {
+    expect(localCodeIntent("review the quarterly plan")).toBe(false);
   });
 
   it("returns false for server-only operations", () => {
