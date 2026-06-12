@@ -877,54 +877,35 @@ mod tests {
     // ── Stall detection ──
 
     #[test]
-    fn stall_not_detected_below_window() {
-        let sigs = make_sigs(&[&["bash"], &["bash"]]);
-        assert!(!detect_server_stall(&sigs, 3).unwrap());
-    }
-
-    #[test]
-    fn stall_detected_repeated_exact() {
-        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        assert!(detect_server_stall(&sigs, 3).unwrap());
-    }
-
-    #[test]
-    fn stall_not_detected_different_tools() {
-        let sigs = make_sigs(&[&["bash"], &["read_file"], &["bash"]]);
-        assert!(!detect_server_stall(&sigs, 3).unwrap());
+    fn detect_server_stall_window() {
+        // Below window: no stall
+        assert!(!detect_server_stall(&make_sigs(&[&["bash"], &["bash"]]), 3).unwrap());
+        // Exact repeats at window: stall
+        assert!(detect_server_stall(&make_sigs(&[&["bash"], &["bash"], &["bash"]]), 3).unwrap());
+        // Different tools: no stall
+        assert!(!detect_server_stall(
+            &make_sigs(&[&["bash"], &["read_file"], &["bash"]]),
+            3
+        ).unwrap());
     }
 
     // ── CLI agentic: sig/name helpers + name-only stall ──
 
     #[test]
-    fn round_tool_call_sig_and_names_flat_shape() {
-        let calls = vec![serde_json::json!({
-            "name": "read_file",
-            "arguments": {"path": "a.rs"}
-        })];
-        let (sigs, names) = round_tool_call_sig_and_names(&calls);
-        assert!(
-            sigs.iter()
-                .any(|s| s.contains("read_file") && s.contains("a.rs"))
-        );
+    fn round_tool_call_sig_and_names_shapes() {
+        // Flat shape
+        let c1 = vec![serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}})];
+        let (sigs, names) = round_tool_call_sig_and_names(&c1);
+        assert!(sigs.iter().any(|s| s.contains("read_file") && s.contains("a.rs")));
         assert!(names.contains("read_file"));
-    }
 
-    #[test]
-    fn round_tool_call_sig_and_names_canonical_shape() {
-        let calls = vec![serde_json::json!({
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "arguments": "{\"path\":\"a.rs\"}"
-            }
+        // Canonical (OpenAI) shape
+        let c2 = vec![serde_json::json!({
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
-        let (sigs, names) = round_tool_call_sig_and_names(&calls);
-        assert!(
-            sigs.iter()
-                .any(|s| s.contains("read_file") && s.contains("a.rs"))
-        );
+        let (sigs, names) = round_tool_call_sig_and_names(&c2);
+        assert!(sigs.iter().any(|s| s.contains("read_file") && s.contains("a.rs")));
         assert!(names.contains("read_file"));
     }
 
