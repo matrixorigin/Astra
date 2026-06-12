@@ -141,39 +141,45 @@ mod tests {
     // ── parse_extraction_response ──
 
     #[test]
-    fn parse_valid_json() {
-        let raw = r#"{"rule": "Use real DB in tests", "reason": "Mocks diverged from prod", "apply_when": "Integration tests"}"#;
-        let fb = parse_extraction_response(raw, "correction", 0.9).unwrap();
-        assert_eq!(fb.rule, "Use real DB in tests");
-        assert_eq!(fb.reason, "Mocks diverged from prod");
-        assert_eq!(fb.apply_when, "Integration tests");
-        assert_eq!(fb.source_signal, "correction");
-        assert_eq!(fb.confidence, 0.9);
+    fn parse_success_cases() {
+        let cases: Vec<(&str, &str, f64, &str, &str, &str)> = vec![
+            // (raw, source_signal, confidence, expected_rule, expected_reason, expected_apply_when)
+            (
+                r#"{"rule": "Use real DB in tests", "reason": "Mocks diverged from prod", "apply_when": "Integration tests"}"#,
+                "correction", 0.9,
+                "Use real DB in tests", "Mocks diverged from prod", "Integration tests",
+            ),
+            (
+                "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```",
+                "frustration", 0.7,
+                "No mocks", "Past incident", "Tests",
+            ),
+            (
+                "```\n{\"rule\": \"Run clippy\"}\n```",
+                "correction", 0.8,
+                "Run clippy", "Not stated", "General",
+            ),
+            (
+                "```json\n{\"rule\": \"Check types\"}\n```\n",
+                "correction", 0.8,
+                "Check types", "Not stated", "General",
+            ),
+        ];
+        for (raw, signal, conf, exp_rule, exp_reason, exp_when) in cases {
+            let fb = parse_extraction_response(raw, signal, conf).unwrap();
+            assert_eq!(fb.rule, exp_rule, "rule mismatch for input: {raw}");
+            assert_eq!(fb.reason, exp_reason, "reason mismatch for input: {raw}");
+            assert_eq!(
+                fb.apply_when, exp_when,
+                "apply_when mismatch for input: {raw}"
+            );
+            assert_eq!(fb.source_signal, signal);
+            assert_eq!(fb.confidence, conf);
+        }
     }
 
     #[test]
-    fn parse_json_with_code_fences() {
-        let raw = "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```";
-        let fb = parse_extraction_response(raw, "frustration", 0.7).unwrap();
-        assert_eq!(fb.rule, "No mocks");
-    }
-
-    #[test]
-    fn parse_json_with_bare_code_fences() {
-        let raw = "```\n{\"rule\": \"Run clippy\"}\n```";
-        let fb = parse_extraction_response(raw, "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "Run clippy");
-    }
-
-    #[test]
-    fn parse_json_with_trailing_newline_in_fence() {
-        let raw = "```json\n{\"rule\": \"Check types\"}\n```\n";
-        let fb = parse_extraction_response(raw, "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "Check types");
-    }
-
-    #[test]
-    fn parse_missing_reason_defaults() {
+    fn parse_defaults_when_fields_missing() {
         let raw = r#"{"rule": "Always run clippy"}"#;
         let fb = parse_extraction_response(raw, "correction", 0.8).unwrap();
         assert_eq!(fb.reason, "Not stated");
@@ -181,192 +187,116 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_rule_returns_none() {
-        let raw = r#"{"rule": "", "reason": "x"}"#;
-        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
-    }
-
-    #[test]
-    fn parse_garbage_returns_none() {
-        assert!(parse_extraction_response("not json", "correction", 0.8).is_none());
-    }
-
-    #[test]
-    fn parse_empty_string_returns_none() {
-        assert!(parse_extraction_response("", "correction", 0.8).is_none());
-    }
-
-    #[test]
-    fn parse_json_array_returns_none() {
-        let raw = r#"[{"rule": "x"}]"#;
-        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
-    }
-
-    #[test]
-    fn parse_rule_is_number_returns_none() {
-        let raw = r#"{"rule": 42}"#;
-        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
-    }
-
-    #[test]
-    fn parse_rule_is_object_returns_none() {
-        let raw = r#"{"rule": {"nested": true}}"#;
-        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
+    fn parse_none_cases() {
+        let cases: Vec<(&str, &str)> = vec![
+            (r#"{"rule": "", "reason": "x"}"#, "empty rule"),
+            ("not json", "garbage"),
+            ("", "empty string"),
+            (r#"[{"rule": "x"}]"#, "json array"),
+            (r#"{"rule": 42}"#, "rule is number"),
+            (r#"{"rule": {"nested": true}}"#, "rule is object"),
+        ];
+        for (raw, desc) in cases {
+            assert!(
+                parse_extraction_response(raw, "correction", 0.8).is_none(),
+                "expected None for: {desc}"
+            );
+        }
     }
 
     // ── heuristic_extract ──
 
     #[test]
-    fn heuristic_dont_pattern() {
-        let fb = heuristic_extract("don't use mocks in tests", "correction", 0.9).unwrap();
-        assert_eq!(fb.rule, "don't use mocks in tests");
-        assert_eq!(fb.reason, "Not stated");
+    fn heuristic_directives_at_start() {
+        let cases: Vec<(&str, &str)> = vec![
+            ("don't use mocks in tests", "don't use mocks in tests"),
+            (
+                "do not run tests in parallel",
+                "do not run tests in parallel",
+            ),
+            ("stop summarizing at the end", "stop summarizing at the end"),
+            ("never use force push", "never use force push"),
+            (
+                "always run clippy before commit",
+                "always run clippy before commit",
+            ),
+            (
+                "use moerr instead of fmt.Errorf",
+                "use moerr instead of fmt.Errorf",
+            ),
+            ("should be using cargo test", "should be using cargo test"),
+            ("不要用bash执行git命令", "不要用bash执行git命令"),
+            ("别再用这个方法了", "别再用这个方法了"),
+            ("应该用moerr而不是fmt.Errorf", "应该用moerr而不是fmt.Errorf"),
+        ];
+        for (input, expected_rule) in cases {
+            let fb = heuristic_extract(input, "correction", 0.8).unwrap();
+            assert_eq!(fb.rule, expected_rule, "rule mismatch for: {input}");
+            assert_eq!(fb.reason, "Not stated");
+        }
     }
 
     #[test]
-    fn heuristic_do_not_pattern() {
-        let fb = heuristic_extract("do not run tests in parallel", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "do not run tests in parallel");
+    fn heuristic_directives_after_correction_prefix() {
+        let cases: Vec<(&str, &str)> = vec![
+            ("wrong, don't use mocks", "don't use mocks"),
+            ("no, never force push on main", "never force push on main"),
+            (
+                "that's incorrect, stop using SELECT *",
+                "stop using SELECT *",
+            ),
+            ("不对，不要用bash执行git命令", "不要用bash执行git命令"),
+            // preserves original case
+            ("wrong, Don't Use Mocks", "Don't Use Mocks"),
+        ];
+        for (input, expected_rule) in cases {
+            let fb = heuristic_extract(input, "correction", 0.9).unwrap();
+            assert_eq!(fb.rule, expected_rule, "rule mismatch for: {input}");
+        }
     }
 
     #[test]
-    fn heuristic_stop_pattern() {
-        let fb = heuristic_extract("stop summarizing at the end", "frustration", 0.7).unwrap();
-        assert_eq!(fb.rule, "stop summarizing at the end");
+    fn heuristic_other_separators() {
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "That's wrong. Don't use mocks here.",
+                "Don't use mocks here.",
+            ),
+            (
+                "incorrect; always run tests first",
+                "always run tests first",
+            ),
+        ];
+        for (input, expected_rule) in cases {
+            let fb = heuristic_extract(input, "correction", 0.8).unwrap();
+            assert_eq!(fb.rule, expected_rule);
+        }
     }
 
     #[test]
-    fn heuristic_never_pattern() {
-        let fb = heuristic_extract("never use force push", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "never use force push");
-    }
-
-    #[test]
-    fn heuristic_always_pattern() {
-        let fb = heuristic_extract("always run clippy before commit", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "always run clippy before commit");
-    }
-
-    #[test]
-    fn heuristic_use_pattern() {
-        let fb = heuristic_extract("use moerr instead of fmt.Errorf", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "use moerr instead of fmt.Errorf");
-    }
-
-    #[test]
-    fn heuristic_chinese_bu_yao() {
-        let fb = heuristic_extract("不要用bash执行git命令", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "不要用bash执行git命令");
-    }
-
-    #[test]
-    fn heuristic_chinese_bie() {
-        let fb = heuristic_extract("别再用这个方法了", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "别再用这个方法了");
-    }
-
-    #[test]
-    fn heuristic_should_be_pattern() {
-        let fb = heuristic_extract("should be using cargo test", "correction", 0.7).unwrap();
-        assert_eq!(fb.rule, "should be using cargo test");
-    }
-
-    #[test]
-    fn heuristic_chinese_ying_gai() {
-        let fb = heuristic_extract("应该用moerr而不是fmt.Errorf", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "应该用moerr而不是fmt.Errorf");
-    }
-
-    // ── P0-1: directive after correction prefix ──
-
-    #[test]
-    fn heuristic_wrong_comma_dont() {
-        // Real-world pattern: "wrong, don't use mocks"
-        let fb = heuristic_extract("wrong, don't use mocks", "correction", 0.9).unwrap();
-        assert_eq!(fb.rule, "don't use mocks");
-    }
-
-    #[test]
-    fn heuristic_no_comma_never() {
-        let fb = heuristic_extract("no, never force push on main", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "never force push on main");
-    }
-
-    #[test]
-    fn heuristic_thats_incorrect_stop() {
-        let fb =
-            heuristic_extract("that's incorrect, stop using SELECT *", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "stop using SELECT *");
-    }
-
-    #[test]
-    fn heuristic_chinese_prefix_bu_dui() {
-        let fb = heuristic_extract("不对，不要用bash执行git命令", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "不要用bash执行git命令");
-    }
-
-    #[test]
-    fn heuristic_period_separator() {
-        let fb =
-            heuristic_extract("That's wrong. Don't use mocks here.", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "Don't use mocks here.");
-    }
-
-    #[test]
-    fn heuristic_semicolon_separator() {
-        let fb = heuristic_extract("incorrect; always run tests first", "correction", 0.8).unwrap();
-        assert_eq!(fb.rule, "always run tests first");
-    }
-
-    #[test]
-    fn heuristic_preserves_original_case() {
-        let fb = heuristic_extract("wrong, Don't Use Mocks", "correction", 0.9).unwrap();
-        assert_eq!(fb.rule, "Don't Use Mocks");
-    }
-
-    // ── Negative cases ──
-
-    #[test]
-    fn heuristic_complex_returns_none() {
-        assert!(
-            heuristic_extract(
+    fn heuristic_none_cases() {
+        let cases: Vec<(&str, &str)> = vec![
+            (
                 "the approach you took doesn't work well for this codebase",
-                "correction",
-                0.7,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn heuristic_empty_returns_none() {
-        assert!(heuristic_extract("", "correction", 0.7).is_none());
-    }
-
-    #[test]
-    fn heuristic_whitespace_returns_none() {
-        assert!(heuristic_extract("   ", "correction", 0.7).is_none());
-    }
-
-    #[test]
-    fn heuristic_instead_mid_sentence_not_matched() {
-        assert!(
-            heuristic_extract(
+                "no directive keyword",
+            ),
+            ("", "empty string"),
+            ("   ", "whitespace only"),
+            (
                 "I want to understand the code instead of just running it",
-                "correction",
-                0.7,
-            )
-            .is_none()
-        );
+                "instead mid-sentence",
+            ),
+            ("wrong, the approach is bad", "no directive after prefix"),
+        ];
+        for (input, desc) in cases {
+            assert!(
+                heuristic_extract(input, "correction", 0.7).is_none(),
+                "expected None for: {desc}"
+            );
+        }
     }
 
-    #[test]
-    fn heuristic_no_directive_after_prefix() {
-        // "wrong, the approach is bad" — no directive keyword after comma
-        assert!(heuristic_extract("wrong, the approach is bad", "correction", 0.7,).is_none());
-    }
-
-    // ── extract_directive unit tests ──
+    // ── extract_directive ──
 
     #[test]
     fn extract_directive_at_start() {

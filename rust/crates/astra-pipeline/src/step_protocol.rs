@@ -1515,75 +1515,40 @@ mod tests {
     // ── Protocol Version ──
 
     #[test]
-    fn protocol_version_match_ok() {
-        assert!(check_protocol_version(PROTOCOL_VERSION).is_ok());
-    }
-
-    #[test]
-    fn protocol_version_mismatch_err() {
-        let result = check_protocol_version(PROTOCOL_VERSION + 1);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolError::VersionMismatch { .. }));
-        // Strict policy → "Discard checkpoint and restart"
-        assert!(err.to_string().contains("Discard"));
-    }
-
-    #[test]
-    fn protocol_version_zero_rejected() {
-        assert!(check_protocol_version(0).is_err());
-    }
-
-    // ── Version Policy Negotiation Chain ──
-
-    #[test]
-    fn version_strict_rejects_mismatch() {
-        let result = check_protocol_version_with_policy(999, VersionPolicy::Strict);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn version_strict_accepts_exact() {
-        let result = check_protocol_version_with_policy(PROTOCOL_VERSION, VersionPolicy::Strict);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), VersionVerdict::ExactMatch);
-    }
-
-    #[test]
-    fn version_compatible_same_major() {
-        // PROTOCOL_VERSION = 1000 (v1.0), major = 1. version 1050 → major = 1 (same)
-        let result = check_protocol_version_with_policy(1050, VersionPolicy::Compatible);
-        assert!(result.is_ok());
-        assert!(matches!(
-            result.unwrap(),
-            VersionVerdict::CompatibleDecode { found: 1050 }
-        ));
-    }
-
-    #[test]
-    fn version_compatible_diff_major_rejects() {
-        // version 2000 → major = 2 (different from PROTOCOL_VERSION major = 1)
-        let result = check_protocol_version_with_policy(2000, VersionPolicy::Compatible);
-        assert!(result.is_err());
-        if let Err(ProtocolError::VersionMismatch { policy, .. }) = result {
-            assert_eq!(policy, VersionPolicy::Compatible);
-        } else {
-            panic!("expected VersionMismatch");
-        }
-    }
-
-    #[test]
-    fn version_compatible_zero_rejected() {
-        let result = check_protocol_version_with_policy(0, VersionPolicy::Compatible);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn version_exact_match_both_policies() {
+    fn protocol_version_checks() {
+        // Exact match succeeds for both policies
         for policy in [VersionPolicy::Strict, VersionPolicy::Compatible] {
             let result = check_protocol_version_with_policy(PROTOCOL_VERSION, policy);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), VersionVerdict::ExactMatch);
+        }
+
+        // Default check uses strict and succeeds for current version
+        assert!(check_protocol_version(PROTOCOL_VERSION).is_ok());
+
+        // Mismatched version with strict → error with Discard message
+        let err = check_protocol_version(PROTOCOL_VERSION + 1).unwrap_err();
+        assert!(matches!(err, ProtocolError::VersionMismatch { .. }));
+        assert!(err.to_string().contains("Discard"));
+
+        // Strict rejects mismatch, zero version rejected by both
+        let cases: Vec<(u32, VersionPolicy, bool, &str)> = vec![
+            (999, VersionPolicy::Strict, false, "strict rejects mismatch"),
+            (0, VersionPolicy::Strict, false, "strict rejects zero"),
+            (0, VersionPolicy::Compatible, false, "compatible rejects zero"),
+            (2000, VersionPolicy::Compatible, false, "compatible rejects diff major"),
+            (1050, VersionPolicy::Compatible, true, "compatible accepts same major"),
+        ];
+        for (ver, policy, expect_ok, desc) in cases {
+            let result = check_protocol_version_with_policy(ver, policy);
+            assert_eq!(result.is_ok(), expect_ok, "{desc} (ver={ver})");
+            if !expect_ok {
+                if let Err(ProtocolError::VersionMismatch { policy: p, .. }) = result {
+                    assert_eq!(p, policy);
+                } else {
+                    panic!("expected VersionMismatch for {desc}");
+                }
+            }
         }
     }
 
@@ -2028,19 +1993,15 @@ mod tests {
     // ── Tool Idempotency Classification ──
 
     #[test]
-    fn tool_classification_read_tools() {
+    #[test]
+    fn tool_classification() {
+        use serde_json::json;
+
+        // PureRead tools
         for tool in [
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "git_status",
-            "git_log",
-            "git_diff",
-            "git_blame",
-            "github_list_prs",
-            "github_ci_status",
-            "mo_query",
+            "read_file", "grep", "glob", "list_dir",
+            "git_status", "git_log", "git_diff", "git_blame",
+            "github_list_prs", "github_ci_status", "mo_query",
         ] {
             assert_eq!(
                 classify_tool_idempotency(tool, None),
@@ -2048,12 +2009,8 @@ mod tests {
                 "Expected PureRead for {tool}"
             );
         }
-        // memory is action-sensitive; see dedicated test below.
-    }
 
-    #[test]
-    fn tool_classification_memory_actions() {
-        use serde_json::json;
+        // memory is action-sensitive
         assert_eq!(
             classify_tool_idempotency("memory", Some(&json!({"action": "recall"}))),
             ToolIdempotency::PureRead,
@@ -2070,19 +2027,15 @@ mod tests {
             classify_tool_idempotency("memory", Some(&json!({"action": "forget"}))),
             ToolIdempotency::NonIdempotent,
         );
-    }
 
-    #[test]
-    fn tool_classification_idempotent_write() {
+        // IdempotentWrite
         assert_eq!(
             classify_tool_idempotency("write_file", None),
             ToolIdempotency::IdempotentWrite
         );
-    }
 
-    #[test]
-    fn tool_classification_non_idempotent() {
-        for tool in ["bash", "str_replace", "github_create_issue", "mo_snapshot"] {
+        // NonIdempotent (including unknown tools)
+        for tool in ["bash", "str_replace", "github_create_issue", "mo_snapshot", "some_future_tool"] {
             assert_eq!(
                 classify_tool_idempotency(tool, None),
                 ToolIdempotency::NonIdempotent,
@@ -2091,73 +2044,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unknown_tool_defaults_to_non_idempotent() {
-        assert_eq!(
-            classify_tool_idempotency("some_future_tool", None),
-            ToolIdempotency::NonIdempotent
-        );
-    }
-
     // ── Retry Policy ──
 
     #[test]
-    fn retry_policy_backoff_exponential() {
-        let policy = RetryPolicy::default();
-        assert_eq!(policy.backoff_ms(0), 500);
-        assert_eq!(policy.backoff_ms(1), 1000);
-        assert_eq!(policy.backoff_ms(2), 2000);
-        assert_eq!(policy.backoff_ms(3), 4000);
-    }
-
     #[test]
-    fn retry_policy_backoff_capped() {
-        let policy = RetryPolicy {
-            backoff_max_ms: 5000,
-            ..RetryPolicy::default()
-        };
-        assert_eq!(policy.backoff_ms(10), 5000);
-    }
-
-    #[test]
-    fn retry_policy_should_retry() {
+    fn retry_policy() {
         let policy = RetryPolicy::default();
+
+        // Exponential backoff
+        let backoff_expected = [(0, 500), (1, 1000), (2, 2000), (3, 4000)];
+        for (attempt, expected_ms) in backoff_expected {
+            assert_eq!(policy.backoff_ms(attempt), expected_ms, "backoff at attempt {attempt}");
+        }
+
+        // Capped backoff
+        let capped = RetryPolicy { backoff_max_ms: 5000, ..RetryPolicy::default() };
+        assert_eq!(capped.backoff_ms(10), 5000, "backoff capped at max");
+
+        // Should retry logic
         assert!(policy.should_retry(1, &ErrorCategory::Transient));
         assert!(policy.should_retry(2, &ErrorCategory::Timeout));
-        assert!(!policy.should_retry(3, &ErrorCategory::Transient)); // max_attempts=3
-        assert!(!policy.should_retry(1, &ErrorCategory::AuthFailure)); // not in retry_on
-    }
+        assert!(!policy.should_retry(3, &ErrorCategory::Transient), "max_attempts=3");
+        assert!(!policy.should_retry(1, &ErrorCategory::AuthFailure), "not in retry_on");
 
-    #[test]
-    fn retry_policy_max_retries_caps_max_attempts() {
-        let policy = RetryPolicy {
-            max_attempts: 100,
-            max_retries: 5,
-            ..RetryPolicy::default()
-        };
-        assert!(policy.should_retry(0, &ErrorCategory::Transient));
-        assert!(policy.should_retry(4, &ErrorCategory::Transient));
-        assert!(!policy.should_retry(5, &ErrorCategory::Transient));
+        // max_retries caps retries
+        let limited = RetryPolicy { max_attempts: 100, max_retries: 5, ..RetryPolicy::default() };
+        assert!(limited.should_retry(0, &ErrorCategory::Transient));
+        assert!(limited.should_retry(4, &ErrorCategory::Transient));
+        assert!(!limited.should_retry(5, &ErrorCategory::Transient), "max_retries=5");
     }
 
     // ── Tool Retry Policy ──
 
     #[test]
-    fn tool_retry_policy_pure_read() {
+    #[test]
+    fn tool_retry_policy_by_tool_type() {
+        // PureRead tools get 3 retries with 200ms base
         let policy = tool_retry_policy("grep", None);
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.backoff_base_ms, 200);
-    }
 
-    #[test]
-    fn tool_retry_policy_idempotent_write() {
+        // IdempotentWrite gets 2 retries with 500ms base
         let policy = tool_retry_policy("write_file", None);
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.backoff_base_ms, 500);
-    }
 
-    #[test]
-    fn tool_retry_policy_non_idempotent() {
+        // NonIdempotent gets 1 attempt (no retry)
         let policy = tool_retry_policy("bash", None);
         assert_eq!(policy.max_attempts, 1);
     }
@@ -2165,21 +2097,27 @@ mod tests {
     // ── Canonical JSON ──
 
     #[test]
-    fn canonical_json_sorted_keys() {
-        let args_a = serde_json::json!({"z": 1, "a": 2, "m": 3});
-        let args_b = serde_json::json!({"a": 2, "m": 3, "z": 1});
-        let key_a = IdempotencyKey::semantic("tool", &args_a);
-        let key_b = IdempotencyKey::semantic("tool", &args_b);
+    fn canonical_json_deterministic_ordering() {
+        // Sorted top-level keys → same hash
+        let a = serde_json::json!({"z": 1, "a": 2, "m": 3});
+        let b = serde_json::json!({"a": 2, "m": 3, "z": 1});
+        let key_a = IdempotencyKey::semantic("tool", &a);
+        let key_b = IdempotencyKey::semantic("tool", &b);
         assert_eq!(key_a.content_hash, key_b.content_hash);
-    }
 
-    #[test]
-    fn canonical_json_nested_sorted() {
-        let args_a = serde_json::json!({"outer": {"z": 1, "a": 2}});
-        let args_b = serde_json::json!({"outer": {"a": 2, "z": 1}});
-        let key_a = IdempotencyKey::semantic("tool", &args_a);
-        let key_b = IdempotencyKey::semantic("tool", &args_b);
-        assert_eq!(key_a.content_hash, key_b.content_hash);
+        // Sorted nested keys → same hash
+        let na = serde_json::json!({"outer": {"z": 1, "a": 2}});
+        let nb = serde_json::json!({"outer": {"a": 2, "z": 1}});
+        let nk_a = IdempotencyKey::semantic("tool", &na);
+        let nk_b = IdempotencyKey::semantic("tool", &nb);
+        assert_eq!(nk_a.content_hash, nk_b.content_hash);
+
+        // Special characters in keys are properly escaped
+        let val = serde_json::json!({"key\"with\"quotes": 1, "normal": 2});
+        let result = canonical_json(&val);
+        assert!(result.contains(r#"key\"with\"quotes"#));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["normal"], 2);
     }
 
     #[test]
@@ -2924,19 +2862,6 @@ mod tests {
         assert!(cache.check(&key_s10).is_some());
         // s1 should be gone
         assert!(cache.check(&key_s1).is_none());
-    }
-
-    // ── Canonical JSON Key Escaping ──
-
-    #[test]
-    fn canonical_json_escapes_special_keys() {
-        let val = serde_json::json!({"key\"with\"quotes": 1, "normal": 2});
-        let result = canonical_json(&val);
-        // Keys must be properly escaped — should contain escaped quotes
-        assert!(result.contains(r#"key\"with\"quotes"#));
-        // Should be valid JSON
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["normal"], 2);
     }
 
     // ── Version Scheme Sanity ──
