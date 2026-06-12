@@ -456,14 +456,48 @@ pub fn classify_tool(tool_name: &str) -> ToolSafetyClass {
 // Hash verification
 // ---------------------------------------------------------------------------
 
+/// Compute a Merkle root from a list of string IDs for tamper detection.
+fn compute_merkle_root(ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "empty".to_string();
+    }
+    let mut hashes: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| Sha256::digest(id.as_bytes()).to_vec())
+        .collect();
+    while hashes.len() > 1 {
+        if hashes.len() % 2 != 0 {
+            hashes.push(hashes.last().unwrap().clone());
+        }
+        let mut next = Vec::new();
+        for chunk in hashes.chunks(2) {
+            let mut h = Sha256::new();
+            h.update(&chunk[0]);
+            h.update(&chunk[1]);
+            next.push(h.finalize().to_vec());
+        }
+        hashes = next;
+    }
+    hashes[0].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// Compute a SHA-256 hash of recovery-critical data for tamper detection.
-pub fn compute_recovery_hash(session_id: &str, checkpoint_json: &str, event_count: u64) -> String {
+/// Includes event IDs (via Merkle root) so journal event tampering is detected.
+pub fn compute_recovery_hash(
+    session_id: &str,
+    checkpoint_json: &str,
+    event_count: u64,
+    event_ids: &[String],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(session_id.as_bytes());
     hasher.update(b"|");
     hasher.update(checkpoint_json.as_bytes());
     hasher.update(b"|");
     hasher.update(event_count.to_le_bytes());
+    hasher.update(b"|");
+    let merkle = compute_merkle_root(event_ids);
+    hasher.update(merkle.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -473,8 +507,9 @@ pub fn verify_recovery_hash(
     session_id: &str,
     checkpoint_json: &str,
     event_count: u64,
+    event_ids: &[String],
 ) -> Result<(), RecoveryError> {
-    let actual = compute_recovery_hash(session_id, checkpoint_json, event_count);
+    let actual = compute_recovery_hash(session_id, checkpoint_json, event_count, event_ids);
     if actual == expected {
         Ok(())
     } else {
@@ -647,10 +682,12 @@ impl CrashRecoveryManager {
 
         // Compute recovery hash for tamper detection
         let cp_json = serde_json::to_string(&result.last_checkpoint).unwrap_or_default();
+        let event_ids: Vec<String> = result.events_after.iter().map(|e| e.event_id.clone()).collect();
         self.recovery_hash = Some(compute_recovery_hash(
             session_id,
             &cp_json,
             result.events_after.len() as u64,
+            &event_ids,
         ));
 
         self.scan_result = Some(result.clone());
@@ -674,20 +711,30 @@ impl CrashRecoveryManager {
             return None;
         }
 
-        // Check for out-of-order timestamps
+        /// NTP rollback tolerance — small clock corrections (<5s) are normal.
+        const NTP_TOLERANCE_MS: u64 = 5_000;
+
+        // Check for out-of-order timestamps (with NTP tolerance)
         for window in events.windows(2) {
             let prev = &window[0];
             let curr = &window[1];
             if curr.created_at < prev.created_at {
-                return Some(RecoveryError::JournalGap {
-                    expected_after: prev.created_at,
-                    found_at: curr.created_at,
-                });
+                let rollback = prev.created_at - curr.created_at;
+                if rollback > NTP_TOLERANCE_MS {
+                    return Some(RecoveryError::JournalGap {
+                        expected_after: prev.created_at,
+                        found_at: curr.created_at,
+                    });
+                }
+                tracing::warn!(
+                    rollback_ms = rollback,
+                    "Small NTP rollback detected in journal, tolerating"
+                );
             }
         }
 
-        // Check for large timestamp gaps (> 60 seconds between events is suspicious)
-        const MAX_GAP_MS: u64 = 60_000;
+        // Check for large timestamp gaps (> 5 minutes between events is suspicious)
+        const MAX_GAP_MS: u64 = 300_000;
         for window in events.windows(2) {
             let prev = &window[0];
             let curr = &window[1];
@@ -866,15 +913,23 @@ impl CrashRecoveryManager {
 
     /// Mark recovery as complete — transition Replaying → Recovered.
     pub fn complete_recovery(&mut self) -> Result<(), RecoveryError> {
-        // Check if there are pending user decisions
-        if let Some(ref ctx) = self.context
-            && !ctx.can_auto_recover()
-        {
+        // Check journal gaps first (more fundamental than pending decisions)
+        if let Some(ref ctx) = self.context {
+            if let Some(ref gap) = ctx.journal_gap {
+                return Err(gap.clone());
+            }
+        }
+
+        // Then check for pending user decisions
+        if let Some(ref ctx) = self.context {
             let pending = ctx.pending_user_decisions();
             if !pending.is_empty() {
                 return Err(RecoveryError::ToolStateUnrecoverable {
                     tool_name: pending[0].0.clone(),
-                    reason: "Pending user decisions required before auto-recovery".to_string(),
+                    reason: format!(
+                        "Pending user decisions required ({} tools need input) before auto-recovery",
+                        pending.len()
+                    ),
                 });
             }
         }
@@ -896,6 +951,7 @@ impl CrashRecoveryManager {
         self.scan_result = None;
         self.error = None;
         self.recovery_hash = None;
+        self.attempt_count = 0;
         Ok(())
     }
 
@@ -1257,11 +1313,11 @@ mod tests {
         let mut mgr = CrashRecoveryManager::new();
         mgr.begin_recovery().unwrap();
 
-        // Events with a large timestamp gap: 1000, 2000, 100000 (>60s gap)
+        // Events with a large timestamp gap: 1000, 2000, 400_000 (>300s gap)
         let events = vec![
             tool_started_event("e1", "step-1", "read_file", 0, 1000),
             tool_completed_event("e2", "step-1", "read_file", 0, 2000),
-            tool_started_event("e3", "step-1", "bash", 1, 100_000), // gap: 98 seconds
+            tool_started_event("e3", "step-1", "bash", 1, 400_000), // gap: 398 seconds
         ];
 
         let json = checkpoint_json();
@@ -1275,7 +1331,7 @@ mod tests {
                 found_at,
             } => {
                 assert_eq!(expected_after, 2000);
-                assert_eq!(found_at, 100_000);
+                assert_eq!(found_at, 400_000);
             }
             other => panic!("Expected JournalGap, got {other:?}"),
         }
@@ -1305,10 +1361,10 @@ mod tests {
         let mut mgr = CrashRecoveryManager::new();
         mgr.begin_recovery().unwrap();
 
-        // Events with out-of-order timestamps
+        // Events with out-of-order timestamps (>5s rollback exceeds NTP tolerance)
         let events = vec![
-            tool_started_event("e1", "step-1", "read_file", 0, 1000),
-            tool_completed_event("e2", "step-1", "read_file", 0, 500), // earlier!
+            tool_started_event("e1", "step-1", "read_file", 0, 10000),
+            tool_completed_event("e2", "step-1", "read_file", 0, 2000), // 8s rollback!
         ];
 
         let json = checkpoint_json();
@@ -1617,35 +1673,35 @@ mod tests {
 
     #[test]
     fn recovery_hash_deterministic() {
-        let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42);
-        let h2 = compute_recovery_hash("sess-1", "checkpoint-data", 42);
+        let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42, &[]);
+        let h2 = compute_recovery_hash("sess-1", "checkpoint-data", 42, &[]);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn recovery_hash_differs_on_session_change() {
-        let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42);
-        let h2 = compute_recovery_hash("sess-2", "checkpoint-data", 42);
+        let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42, &[]);
+        let h2 = compute_recovery_hash("sess-2", "checkpoint-data", 42, &[]);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn recovery_hash_differs_on_data_change() {
-        let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42);
-        let h2 = compute_recovery_hash("sess-1", "different-data", 42);
+        let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42, &[]);
+        let h2 = compute_recovery_hash("sess-1", "different-data", 42, &[]);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn verify_hash_matches() {
-        let hash = compute_recovery_hash("sess-1", "data", 10);
-        let result = verify_recovery_hash(&hash, "sess-1", "data", 10);
+        let hash = compute_recovery_hash("sess-1", "data", 10, &[]);
+        let result = verify_recovery_hash(&hash, "sess-1", "data", 10, &[]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn verify_hash_fails_on_mismatch() {
-        let result = verify_recovery_hash("wrong-hash", "sess-1", "data", 10);
+        let result = verify_recovery_hash("wrong-hash", "sess-1", "data", 10, &[]);
         assert!(matches!(result, Err(RecoveryError::HashMismatch { .. })));
     }
 
@@ -1734,11 +1790,11 @@ mod tests {
         let mut mgr = CrashRecoveryManager::new();
         mgr.begin_recovery().unwrap();
 
-        // Large timestamp gap
+        // Large timestamp gap (>5 minutes)
         let events = vec![
             tool_started_event("e1", "step-1", "read_file", 0, 1000),
             tool_completed_event("e2", "step-1", "read_file", 0, 2000),
-            tool_started_event("e3", "step-1", "bash", 1, 200_000),
+            tool_started_event("e3", "step-1", "bash", 1, 500_000), // ~500 seconds
         ];
         let json = checkpoint_json();
         let scan = mgr
