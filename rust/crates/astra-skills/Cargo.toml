@@ -43,6 +43,12 @@ axum = { workspace = true }
 astra-services = { path = "../services" }
 astra-core = { path = "../core" }
 
+# Crash recovery (optional)
+astra-pipeline = { path = "../astra-pipeline", optional = true }
+
+[features]
+crash-recovery = ["astra-pipeline"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"

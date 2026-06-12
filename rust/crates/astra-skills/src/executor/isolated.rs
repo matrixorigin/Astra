@@ -7,12 +7,24 @@
 //! The actual sub-run execution is delegated to a [`SkillSubRunExecutor`] which
 //! is implemented differently for CLI (OwnedCliLoopHost) vs Server
 //! (ServerSubRunExecutor wrapper).
+//!
+//! # Crash Recovery
+//!
+//! When `SkillCheckpointManager` is provided, the executor checkpoints skill state
+//! before and after execution. On crash recovery, interrupted skills can be detected
+//! and re-executed from the beginning (or resumed if partial output is available).
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::manifest::{ExecutionContext, LoadedSkill};
 use crate::traits::{SkillError, SkillExecutionContext, SkillExecutionResult, SkillExecutor};
+
+#[cfg(feature = "crash-recovery")]
+use astra_pipeline::skill_checkpoint::{
+    SkillCheckpoint, SkillCheckpointManager, SkillExecutionState, SkillToolCallRecord,
+};
 
 /// Trait for executing isolated skill sub-runs.
 ///
@@ -51,11 +63,29 @@ pub struct SubRunResult {
 /// Executes skills in an isolated sub-agent loop via a [`SkillSubRunExecutor`].
 pub struct IsolatedSkillExecutor {
     sub_run_executor: Arc<dyn SkillSubRunExecutor>,
+    #[cfg(feature = "crash-recovery")]
+    checkpoint_manager: Option<Arc<Mutex<SkillCheckpointManager>>>,
 }
 
 impl IsolatedSkillExecutor {
     pub fn new(sub_run_executor: Arc<dyn SkillSubRunExecutor>) -> Self {
-        Self { sub_run_executor }
+        Self {
+            sub_run_executor,
+            #[cfg(feature = "crash-recovery")]
+            checkpoint_manager: None,
+        }
+    }
+
+    /// Create an executor with crash recovery support.
+    #[cfg(feature = "crash-recovery")]
+    pub fn with_checkpoint_manager(
+        sub_run_executor: Arc<dyn SkillSubRunExecutor>,
+        checkpoint_manager: Arc<Mutex<SkillCheckpointManager>>,
+    ) -> Self {
+        Self {
+            sub_run_executor,
+            checkpoint_manager: Some(checkpoint_manager),
+        }
     }
 }
 
@@ -67,6 +97,36 @@ impl SkillExecutor for IsolatedSkillExecutor {
         context: &SkillExecutionContext,
     ) -> Result<SkillExecutionResult, SkillError> {
         let start = std::time::Instant::now();
+
+        #[cfg(feature = "crash-recovery")]
+        if let Some(ref mgr) = self.checkpoint_manager {
+            let mut mgr = mgr.lock().await;
+            let checkpoint = SkillCheckpoint {
+                skill_name: skill.manifest.name.clone(),
+                instructions: skill.instructions.clone(),
+                task_context: context.task.clone(),
+                model_override: skill.manifest.model.clone(),
+                max_tokens: skill.manifest.max_tokens,
+                allowed_tools: skill.manifest.allowed_tools.clone(),
+                effort: skill.manifest.effort.as_ref().map(|e| e.to_string()),
+                agent_type: skill.manifest.agent_type.clone(),
+                parent_recursion_depth: context.recursion_depth,
+                state: SkillExecutionState::Running {
+                    turns_completed: 0,
+                    tokens_consumed: 0,
+                    partial_output: String::new(),
+                    tool_history: Vec::new(),
+                },
+                checkpointed_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            };
+            if let Err(e) = mgr.save_checkpoint(checkpoint) {
+                tracing::warn!(error = %e, "Failed to save skill checkpoint");
+            }
+        }
+
         let result = self
             .sub_run_executor
             .execute_skill_subrun(
@@ -85,9 +145,33 @@ impl SkillExecutor for IsolatedSkillExecutor {
                     .as_deref(),
                 skill.manifest.agent_type.as_deref(),
             )
-            .await
-            .map_err(SkillError::ExecutionFailed)?;
+            .await;
+
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        #[cfg(feature = "crash-recovery")]
+        if let Some(ref mgr) = self.checkpoint_manager {
+            let mut mgr = mgr.lock().await;
+            match &result {
+                Ok(r) => {
+                    if let Err(e) = mgr.mark_completed(
+                        &skill.manifest.name,
+                        r.output.clone(),
+                        r.turns,
+                        r.tokens_used,
+                    ) {
+                        tracing::warn!(error = %e, "Failed to mark skill completed");
+                    }
+                }
+                Err(err) => {
+                    if let Err(e) = mgr.mark_failed(&skill.manifest.name, err.clone(), 0, 0) {
+                        tracing::warn!(error = %e, "Failed to mark skill failed");
+                    }
+                }
+            }
+        }
+
+        let result = result.map_err(SkillError::ExecutionFailed)?;
 
         let formatted_output = format!(
             "## Skill Result: {}\n\n{}\n\n---\n\

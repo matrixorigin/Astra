@@ -19,6 +19,7 @@ pub mod output_stream;
 pub mod reflection_feedback;
 pub mod routing;
 pub mod scheduling;
+pub mod skill_checkpoint;
 pub mod stages;
 pub mod state;
 pub mod step_checkpoint;
