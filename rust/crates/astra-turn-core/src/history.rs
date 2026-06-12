@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 /// Shared sentinel tag identifying tool results whose original content was
 /// recovered as an empty JSON object placeholder (the upstream serialization
@@ -543,8 +543,22 @@ mod tests {
     // ── find_tool_call_safe_split ───────────────────────────────────
 
     #[test]
-    fn safe_split_basic() {
-        // user, assistant+tool_calls, tool, user, assistant
+    fn safe_split_edge_cases() {
+        // target=0 → 0
+        assert_eq!(
+            find_tool_call_safe_split(&[user_msg("a"), assistant_msg("b")], 0),
+            0
+        );
+        // target >= len → 0
+        assert_eq!(find_tool_call_safe_split(&[user_msg("a")], 1), 0);
+        assert_eq!(find_tool_call_safe_split(&[user_msg("a")], 5), 0);
+        // single message
+        assert_eq!(find_tool_call_safe_split(&[user_msg("only")], 1), 0);
+    }
+
+    #[test]
+    fn safe_split_with_and_without_tool_calls() {
+        // Basic: user, assistant+tool_calls, tool, user, assistant → split at 3
         let msgs = vec![
             user_msg("hi"),
             assistant_with_tool_calls(&["c1"]),
@@ -552,27 +566,19 @@ mod tests {
             user_msg("thanks"),
             assistant_msg("bye"),
         ];
-        // target_tail=2 → naive split at index 3 (user "thanks"); no tool
-        // role there, so split stays at 3.
         assert_eq!(find_tool_call_safe_split(&msgs, 2), 3);
-    }
 
-    #[test]
-    fn safe_split_no_tool_calls() {
+        // No tool calls: every split is safe
         let msgs = vec![
             user_msg("a"),
             assistant_msg("b"),
             user_msg("c"),
             assistant_msg("d"),
         ];
-        // No tool messages anywhere; every naive split point is safe.
         assert_eq!(find_tool_call_safe_split(&msgs, 2), 2);
         assert_eq!(find_tool_call_safe_split(&msgs, 1), 3);
-    }
 
-    #[test]
-    fn safe_split_tool_call_at_boundary() {
-        // user, assistant+tool_calls, tool, tool, user
+        // Tool call at boundary: backs up past tool messages
         let msgs = vec![
             user_msg("q"),
             assistant_with_tool_calls(&["c1", "c2"]),
@@ -580,30 +586,8 @@ mod tests {
             tool_msg("c2", "r2"),
             user_msg("next"),
         ];
-        // target_tail=3 → naive idx=2 (tool "r1"), back up past tools → idx=1
         assert_eq!(find_tool_call_safe_split(&msgs, 3), 1);
-        // target_tail=1 → naive idx=4 (user "next"), safe already
         assert_eq!(find_tool_call_safe_split(&msgs, 1), 4);
-    }
-
-    #[test]
-    fn safe_split_target_zero_returns_zero() {
-        let msgs = vec![user_msg("a"), assistant_msg("b")];
-        assert_eq!(find_tool_call_safe_split(&msgs, 0), 0);
-    }
-
-    #[test]
-    fn safe_split_target_ge_len_returns_zero() {
-        let msgs = vec![user_msg("a")];
-        assert_eq!(find_tool_call_safe_split(&msgs, 1), 0);
-        assert_eq!(find_tool_call_safe_split(&msgs, 5), 0);
-    }
-
-    #[test]
-    fn safe_split_single_message() {
-        let msgs = vec![user_msg("only")];
-        assert_eq!(find_tool_call_safe_split(&msgs, 1), 0);
-        assert_eq!(find_tool_call_safe_split(&msgs, 0), 0);
     }
 
     // ── merge_tool_results_into_history ─────────────────────────────
@@ -636,24 +620,20 @@ mod tests {
         assert!(consumed.is_empty());
         // Healing should add placeholder for missing c1
         assert_eq!(history.len(), original_len + 1);
-        assert!(
-            history[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("not executed")
-        );
+        assert!(history[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("not executed"));
 
         // Empty slice case
         let mut history2 = vec![user_msg("q"), assistant_with_tool_calls(&["c1"])];
         let consumed2 = merge_tool_results_into_history(&mut history2, Some(&[]));
         assert!(consumed2.is_empty());
         // Healing again
-        assert!(
-            history2[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("not executed")
-        );
+        assert!(history2[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("not executed"));
     }
 
     #[test]
@@ -1076,21 +1056,9 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-    fn json_stringify_object() {
-        let v = json!({"a": 1});
-        let s = json_stringify(&v);
-        assert!(s.contains("\"a\""));
-        assert!(s.contains('1'));
-    }
-
-    #[test]
-    fn json_stringify_string() {
-        let v = json!("hello");
-        assert_eq!(json_stringify(&v), "\"hello\"");
-    }
-
-    #[test]
-    fn json_stringify_null() {
+    fn json_stringify_formats() {
+        assert!(json_stringify(&json!({"a": 1})).contains("\"a\""));
+        assert_eq!(json_stringify(&json!("hello")), "\"hello\"");
         assert_eq!(json_stringify(&Value::Null), "null");
     }
 
@@ -1099,34 +1067,18 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-    fn parsed_object_valid_json() {
+    fn parsed_object_edge_cases() {
+        // valid
         let map = parsed_object(r#"{"key": "value"}"#);
         assert_eq!(map.get("key").unwrap(), "value");
-    }
-
-    #[test]
-    fn parsed_object_invalid_json() {
-        let map = parsed_object("not json");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn parsed_object_json_array() {
-        // Array is valid JSON but not an object
-        let map = parsed_object("[1, 2, 3]");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn parsed_object_empty_string() {
-        let map = parsed_object("");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn parsed_object_json_string() {
-        let map = parsed_object("\"hello\"");
-        assert!(map.is_empty());
+        // invalid JSON
+        assert!(parsed_object("not json").is_empty());
+        // JSON array (valid JSON, not an object)
+        assert!(parsed_object("[1, 2, 3]").is_empty());
+        // empty string
+        assert!(parsed_object("").is_empty());
+        // JSON string (not an object)
+        assert!(parsed_object("\"hello\"").is_empty());
     }
 
     // ──────────────────────────────────────────────────────────
@@ -1134,39 +1086,21 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-    fn parsed_metadata_object() {
+    fn parsed_metadata_edge_cases() {
+        // object
         let map = parsed_metadata(Some(json!({"tool_call_id": "tc1"})));
         assert_eq!(map.get("tool_call_id").unwrap(), "tc1");
-    }
-
-    #[test]
-    fn parsed_metadata_string_json() {
+        // JSON string
         let map = parsed_metadata(Some(json!(r#"{"tool_call_id": "tc2"}"#)));
         assert_eq!(map.get("tool_call_id").unwrap(), "tc2");
-    }
-
-    #[test]
-    fn parsed_metadata_invalid_string() {
-        let map = parsed_metadata(Some(json!("not json")));
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn parsed_metadata_none() {
-        let map = parsed_metadata(None);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn parsed_metadata_null() {
-        let map = parsed_metadata(Some(Value::Null));
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn parsed_metadata_number() {
-        let map = parsed_metadata(Some(json!(42)));
-        assert!(map.is_empty());
+        // invalid string
+        assert!(parsed_metadata(Some(json!("not json"))).is_empty());
+        // None
+        assert!(parsed_metadata(None).is_empty());
+        // null
+        assert!(parsed_metadata(Some(Value::Null)).is_empty());
+        // number (not an object)
+        assert!(parsed_metadata(Some(json!(42))).is_empty());
     }
 
     // ──────────────────────────────────────────────────────────
