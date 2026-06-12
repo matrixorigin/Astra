@@ -158,47 +158,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ascii_basic() {
-        let t = tokenize("Hello World");
+    fn ascii_tokenization() {
+        let t = tokenize("Hello World foo_bar baz");
         assert!(t.contains(&"hello".to_string()));
         assert!(t.contains(&"world".to_string()));
-    }
-
-    #[test]
-    fn ascii_underscore_preserved() {
-        let t = tokenize("foo_bar baz");
         assert!(t.contains(&"foo_bar".to_string()));
         assert!(t.contains(&"baz".to_string()));
-    }
-
-    #[test]
-    fn ascii_short_words_filtered() {
+        // Short words filtered
         assert!(tokenize("a b c").is_empty());
         assert!(tokenize("").is_empty());
     }
 
     #[test]
-    fn cjk_unigrams_and_bigrams() {
+    fn cjk_tokenization() {
         let t = tokenize("帮我分析");
-        assert!(t.contains(&"帮".to_string()));
-        assert!(t.contains(&"我".to_string()));
-        assert!(t.contains(&"帮我".to_string())); // bigram
-        assert!(t.contains(&"我分".to_string())); // bigram
-        assert!(t.contains(&"分析".to_string())); // bigram
-    }
-
-    #[test]
-    fn cjk_single_char() {
+        for term in ["帮", "我", "分", "析", "帮我", "我分", "分析"] {
+            assert!(t.contains(&term.to_string()), "missing CJK term: {term}");
+        }
+        // Single CJK char
         assert_eq!(tokenize("我"), vec!["我".to_string()]);
-    }
-
-    #[test]
-    fn mixed_cjk_ascii() {
-        let t = tokenize("分析 repository code 仓库");
-        assert!(t.contains(&"分析".to_string()));
-        assert!(t.contains(&"repository".to_string()));
-        assert!(t.contains(&"code".to_string()));
-        assert!(t.contains(&"仓库".to_string()));
+        // Mixed CJK + ASCII
+        let mixed = tokenize("分析 repository code 仓库");
+        assert!(mixed.contains(&"分析".to_string()));
+        assert!(mixed.contains(&"repository".to_string()));
+        assert!(mixed.contains(&"code".to_string()));
+        assert!(mixed.contains(&"仓库".to_string()));
     }
 
     #[test]
@@ -208,107 +192,81 @@ mod tests {
         assert!(tf.get("world").unwrap() >= &1.0);
     }
 
-    // ── Stemming tests ──
+    // ── Stemming: data-driven test ──
 
     #[test]
-    fn stem_plurals() {
-        assert_eq!(stem("issues"), "issu");
-        assert_eq!(stem("commits"), "commit");
-        assert_eq!(stem("branches"), "branch");
-        assert_eq!(stem("preferences"), "prefer"); // -ences rule
+    fn stem_rules() {
+        let cases: &[(&str, &str)] = &[
+            // Plurals
+            ("issues", "issu"),
+            ("commits", "commit"),
+            ("branches", "branch"),
+            ("preferences", "prefer"), // -ences rule
+            // Past tense
+            ("committed", "commit"),
+            ("merged", "merg"),
+            ("analyzed", "analyz"),
+            // Gerund
+            ("committing", "commit"),
+            ("merging", "merg"),
+            ("debugging", "debug"),
+            // Derivational
+            ("deployment", "deploy"),
+            ("authorization", "authoriz"),
+            ("execution", "execu"),
+            ("freshness", "fresh"),
+            ("recently", "recent"),
+            // Short words unchanged
+            ("git", "git"),
+            ("pr", "pr"),
+            ("fix", "fix"),
+            // Special: ss-ending words unchanged
+            ("class", "class"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                stem(input),
+                *expected,
+                "stem({input:?}) should be {expected:?}"
+            );
+        }
     }
 
     #[test]
-    fn stem_past_tense() {
-        assert_eq!(stem("committed"), "commit");
-        assert_eq!(stem("merged"), "merg");
-        assert_eq!(stem("analyzed"), "analyz");
-    }
+    fn tokenize_emits_and_matches_stems() {
+        // Emits both original and stemmed forms
+        let t = tokenize("preferences");
+        assert!(t.contains(&"preferences".to_string()));
+        assert!(t.contains(&"prefer".to_string()));
 
-    #[test]
-    fn stem_gerund() {
-        assert_eq!(stem("committing"), "commit");
-        assert_eq!(stem("merging"), "merg");
-        assert_eq!(stem("debugging"), "debug");
-    }
+        // Cross-form: prefer ↔ preferences share tokens
+        let shared: Vec<_> = tokenize("prefer")
+            .iter()
+            .filter(|x| tokenize("preferences").contains(x))
+            .collect();
+        assert!(
+            !shared.is_empty(),
+            "prefer and preferences should share tokens"
+        );
 
-    #[test]
-    fn stem_derivational() {
-        assert_eq!(stem("deployment"), "deploy");
-        assert_eq!(stem("authorization"), "authoriz");
-        assert_eq!(stem("execution"), "execu");
-        assert_eq!(stem("freshness"), "fresh");
-        assert_eq!(stem("recently"), "recent");
-    }
-
-    #[test]
-    fn stem_short_words_unchanged() {
-        assert_eq!(stem("git"), "git");
-        assert_eq!(stem("pr"), "pr");
-        assert_eq!(stem("fix"), "fix");
+        // commit ↔ committed
+        let shared: Vec<_> = tokenize("commit")
+            .iter()
+            .filter(|x| tokenize("committed").contains(x))
+            .collect();
+        assert!(
+            !shared.is_empty(),
+            "commit and committed should share tokens"
+        );
     }
 
     #[test]
     fn stem_no_false_positive_community() {
         // "community" should NOT stem to "commit"
-        let s = stem("community");
-        assert_ne!(s, "commit", "community should not stem to commit");
-    }
-
-    #[test]
-    fn stem_class_unchanged() {
-        // "class" ends with "ss" — don't strip the 's'
-        assert_eq!(stem("class"), "class");
-    }
-
-    #[test]
-    fn tokenize_emits_stems() {
-        let t = tokenize("preferences");
-        assert!(
-            t.contains(&"preferences".to_string()),
-            "original form preserved"
+        assert_ne!(
+            stem("community"),
+            "commit",
+            "community should not stem to commit"
         );
-        assert!(t.contains(&"prefer".to_string()), "stemmed form emitted");
-    }
-
-    #[test]
-    fn tokenize_prefer_matches_preferences_via_stem() {
-        let t1 = tokenize("prefer");
-        let t2 = tokenize("preferences");
-        // Both should share at least one common token (the stem)
-        let shared: Vec<_> = t1.iter().filter(|t| t2.contains(t)).collect();
-        assert!(
-            !shared.is_empty(),
-            "prefer and preferences should share tokens via stemming: {:?} vs {:?}",
-            t1,
-            t2
-        );
-    }
-
-    #[test]
-    fn tokenize_commit_matches_committed() {
-        let t1 = tokenize("commit");
-        let t2 = tokenize("committed");
-        let shared: Vec<_> = t1.iter().filter(|t| t2.contains(t)).collect();
-        assert!(
-            !shared.is_empty(),
-            "commit and committed should share tokens: {:?} vs {:?}",
-            t1,
-            t2
-        );
-    }
-
-    #[test]
-    fn tokenize_issue_matches_issues() {
-        // "issues" stems to "issu", and "issue" remains "issue"
-        // They share overlap via the "issu" substring in TF-IDF when both are long tokens
-        let t2 = tokenize("issues");
-        assert!(
-            t2.contains(&"issu".to_string()),
-            "issues should stem to issu"
-        );
-        // For exact cross-form matching, use "issue" (5 chars) which doesn't stem further
-        // The practical impact: "issues" contains stem "issu" which is a 4-char prefix of "issue"
-        // TF-IDF scoring handles this well enough for tool selection
     }
 }

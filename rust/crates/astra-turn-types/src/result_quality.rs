@@ -143,192 +143,106 @@ pub fn quality_feedback(tool_name: &str, quality: ResultQuality) -> Option<Strin
 mod tests {
     use super::*;
 
-    // ── Empty detection ──
-
     #[test]
-    fn empty_string() {
-        assert_eq!(classify_result(""), ResultQuality::Empty);
+    fn empty_classifications() {
+        let cases: &[&str] = &[
+            "",
+            "   \n  ",
+            "{}",
+            "[]",
+            "null",
+            "\"\"",
+            "{\"status\":\"still_running\",\"agent_id\":\"agent-123\"}",
+        ];
+        for input in cases {
+            assert_eq!(
+                classify_result(input),
+                ResultQuality::Empty,
+                "input: {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn whitespace_only() {
-        assert_eq!(classify_result("   \n  "), ResultQuality::Empty);
+    fn error_classifications() {
+        let cases: &[&str] = &[
+            "{\"error\": \"file not found\"}",
+            "{\"ok\": false, \"message\": \"timeout\"}",
+            "{\"status\":\"failed\",\"agent_id\":\"agent-123\"}",
+            "{\"status\":\"cancelled\",\"agent_id\":\"agent-123\"}",
+            "Error: command not found",
+            "Fatal: repository not found",
+        ];
+        for input in cases {
+            assert_eq!(
+                classify_result(input),
+                ResultQuality::Error,
+                "input: {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn empty_json_object() {
-        assert_eq!(classify_result("{}"), ResultQuality::Empty);
-    }
-
-    #[test]
-    fn empty_json_array() {
-        assert_eq!(classify_result("[]"), ResultQuality::Empty);
-    }
-
-    #[test]
-    fn null_json() {
-        assert_eq!(classify_result("null"), ResultQuality::Empty);
-    }
-
-    #[test]
-    fn empty_string_json() {
-        assert_eq!(classify_result(r#""""#), ResultQuality::Empty);
-    }
-
-    #[test]
-    fn json_still_running_status_is_empty() {
+    fn null_or_empty_error_field_is_not_error() {
         assert_eq!(
-            classify_result(r#"{"status":"still_running","agent_id":"agent-123"}"#),
-            ResultQuality::Empty
-        );
-    }
-
-    #[test]
-    fn json_failed_status_is_error() {
-        assert_eq!(
-            classify_result(r#"{"status":"failed","agent_id":"agent-123"}"#),
-            ResultQuality::Error
-        );
-    }
-
-    #[test]
-    fn json_cancelled_status_is_error() {
-        assert_eq!(
-            classify_result(r#"{"status":"cancelled","agent_id":"agent-123"}"#),
-            ResultQuality::Error
-        );
-    }
-
-    #[test]
-    fn json_completed_status_without_payload_is_success() {
-        assert_eq!(
-            classify_result(r#"{"status":"completed","agent_id":"agent-123"}"#),
+            classify_result("{\"error\": null, \"data\": \"ok\"}"),
             ResultQuality::Success
         );
-    }
-
-    // ── Error detection ──
-
-    #[test]
-    fn json_error_field() {
         assert_eq!(
-            classify_result(r#"{"error": "file not found"}"#),
-            ResultQuality::Error
-        );
-    }
-
-    #[test]
-    fn json_ok_false() {
-        assert_eq!(
-            classify_result(r#"{"ok": false, "message": "timeout"}"#),
-            ResultQuality::Error
-        );
-    }
-
-    #[test]
-    fn plain_text_error_prefix() {
-        assert_eq!(
-            classify_result("Error: command not found"),
-            ResultQuality::Error
-        );
-    }
-
-    #[test]
-    fn plain_text_fatal() {
-        assert_eq!(
-            classify_result("Fatal: repository not found"),
-            ResultQuality::Error
-        );
-    }
-
-    #[test]
-    fn null_error_field_is_not_error() {
-        assert_eq!(
-            classify_result(r#"{"error": null, "data": "ok"}"#),
+            classify_result("{\"error\": \"\", \"data\": \"ok\"}"),
             ResultQuality::Success
         );
     }
 
     #[test]
-    fn empty_error_string_is_not_error() {
+    fn truncation_classifications() {
         assert_eq!(
-            classify_result(r#"{"error": "", "data": "ok"}"#),
-            ResultQuality::Success
-        );
-    }
-
-    // ── Truncation detection ──
-
-    #[test]
-    fn json_string_truncated_marker() {
-        assert_eq!(
-            classify_result(r#""very long output...[truncated]""#),
+            classify_result("\"very long output...[truncated]\""),
             ResultQuality::Truncated
         );
-    }
-
-    #[test]
-    fn plain_text_truncation() {
         let long = "x".repeat(501) + "...";
         assert_eq!(classify_result(&long), ResultQuality::Truncated);
     }
 
-    // ── Success ──
-
     #[test]
-    fn normal_json_object() {
-        assert_eq!(
-            classify_result(r#"{"status": "ok", "count": 42}"#),
-            ResultQuality::Success
-        );
-    }
-
-    #[test]
-    fn normal_json_array() {
-        assert_eq!(
-            classify_result(r#"[{"id": 1}, {"id": 2}]"#),
-            ResultQuality::Success
-        );
-    }
-
-    #[test]
-    fn plain_text_success() {
-        assert_eq!(
-            classify_result("commit abc123: fix bug in parser"),
-            ResultQuality::Success
-        );
+    fn success_classifications() {
+        let cases: &[&str] = &[
+            "{\"status\": \"ok\", \"count\": 42}",
+            "{\"status\":\"completed\",\"agent_id\":\"agent-123\"}",
+            "[{\"id\": 1}, {\"id\": 2}]",
+            "commit abc123: fix bug in parser",
+        ];
+        for input in cases {
+            assert_eq!(
+                classify_result(input),
+                ResultQuality::Success,
+                "input: {input:?}"
+            );
+        }
     }
 
     #[test]
     fn short_ellipsis_not_truncated() {
-        // Short strings ending in "..." are not truncation
         assert_eq!(classify_result("loading..."), ResultQuality::Success);
     }
 
-    // ── Feedback messages ──
-
     #[test]
-    fn success_no_feedback() {
-        assert!(quality_feedback("bash", ResultQuality::Success).is_none());
-    }
-
-    #[test]
-    fn error_feedback_has_tool_name() {
-        let msg = quality_feedback("github_list_prs", ResultQuality::Error).unwrap();
-        assert!(msg.contains("github_list_prs"));
-        assert!(msg.contains("error"));
-    }
-
-    #[test]
-    fn empty_feedback_warns_no_retry() {
-        let msg = quality_feedback("grep", ResultQuality::Empty).unwrap();
-        assert!(msg.contains("grep"));
-        assert!(msg.contains("Do NOT retry"));
-    }
-
-    #[test]
-    fn truncated_feedback_suggests_narrow() {
-        let msg = quality_feedback("git_log", ResultQuality::Truncated).unwrap();
-        assert!(msg.contains("truncated"));
+    fn quality_feedback_messages() {
+        let cases: &[(&str, ResultQuality, Option<&str>)] = &[
+            ("bash", ResultQuality::Success, None),
+            ("github_list_prs", ResultQuality::Error, Some("error")),
+            ("grep", ResultQuality::Empty, Some("Do NOT retry")),
+            ("git_log", ResultQuality::Truncated, Some("truncated")),
+        ];
+        for (tool_name, quality, expected_substr) in cases {
+            let msg = quality_feedback(tool_name, quality);
+            match expected_substr {
+                Some(substr) => assert!(
+                    msg.unwrap().contains(substr),
+                    "tool={tool_name} quality={quality:?}"
+                ),
+                None => assert!(msg.is_none(), "tool={tool_name} quality={quality:?}"),
+            }
+        }
     }
 }
