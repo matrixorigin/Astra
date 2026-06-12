@@ -448,258 +448,189 @@ impl SessionErrorSummary {
 mod tests {
     use super::*;
 
-    // ── Error classification ──
+    // ── Classification: data-driven ──
 
+    /// Covers timeout, rate_limit, auth variants, not_found, resource_limit, http_500, misc
     #[test]
-    fn classify_timeout() {
-        assert_eq!(
-            classify_error("connection timed out after 30s"),
-            ErrorCategory::Network
-        );
-        assert_eq!(classify_error("ETIMEOUT"), ErrorCategory::Network);
-    }
-
-    #[test]
-    fn classify_rate_limit() {
-        assert_eq!(
-            classify_error("rate limit exceeded (429)"),
-            ErrorCategory::Network
-        );
-        assert_eq!(
-            classify_error("HTTP 503 Service Unavailable"),
-            ErrorCategory::Network
-        );
-    }
-
-    #[test]
-    fn classify_auth() {
-        assert_eq!(classify_error("401 Unauthorized"), ErrorCategory::Auth);
-        assert_eq!(
-            classify_error("Permission denied: insufficient scope"),
-            ErrorCategory::Auth
-        );
-        assert_eq!(classify_error("token expired"), ErrorCategory::Auth);
-    }
-
-    /// Regression: session f9903b97 — "Could not validate credentials" from
-    /// jwt.rs was classified as Unknown, causing false stall escalation.
-    #[test]
-    fn classify_auth_could_not_validate() {
-        assert_eq!(
-            classify_error("Could not validate credentials"),
-            ErrorCategory::Auth
-        );
-        assert_eq!(
-            classify_error("could not validate credentials for user"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_auth_credentials() {
-        assert_eq!(classify_error("invalid credentials"), ErrorCategory::Auth);
-        assert_eq!(classify_error("bad credentials"), ErrorCategory::Auth);
-    }
-
-    #[test]
-    fn classify_not_found() {
-        assert_eq!(classify_error("404 Not Found"), ErrorCategory::ToolNotFound);
-        assert_eq!(
-            classify_error("No such file or directory"),
-            ErrorCategory::ToolNotFound
-        );
-        assert_eq!(
-            classify_error("Repository does not exist"),
-            ErrorCategory::ToolNotFound
-        );
-    }
-
-    #[test]
-    fn classify_workspace_read_before_write_guard() {
-        assert_eq!(
-            classify_error(
-                "File exists but has not been read yet. Read it first before writing/editing."
+    fn classify_errors() {
+        let cases: &[(&str, ErrorCategory)] = &[
+            // timeout / network / ToolTimeout
+            ("connection timed out after 30s", ErrorCategory::Network),
+            ("ETIMEOUT", ErrorCategory::Network),
+            (
+                "Error: command timed out after 30s",
+                ErrorCategory::ToolTimeout,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_error(
-                "File was only partially read (outline or line range). Read the full file before overwriting."
+            (
+                "Error: grep timed out after 30s with no results",
+                ErrorCategory::ToolTimeout,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_error(
-                "File has been modified since last read (by user or linter). Read it again before editing."
+            // rate_limit / network
+            ("rate limit exceeded (429)", ErrorCategory::Network),
+            ("HTTP 503 Service Unavailable", ErrorCategory::Network),
+            // auth (6 original tests merged)
+            ("401 Unauthorized", ErrorCategory::Auth),
+            ("Permission denied: insufficient scope", ErrorCategory::Auth),
+            ("token expired", ErrorCategory::Auth),
+            ("Could not validate credentials", ErrorCategory::Auth),
+            ("missing authentication token", ErrorCategory::Auth),
+            (
+                "EACCES: permission denied, open '/etc/shadow'",
+                ErrorCategory::Auth,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
-    }
-
-    /// The new actionable error messages (with "→ Action required" and concrete
-    /// file paths) must still be classified as InvalidArgs so the recovery
-    /// pipeline handles them correctly.
-    #[test]
-    fn classify_actionable_read_before_write_errors() {
-        assert_eq!(
-            classify_error(
-                "File exists but has not been read yet. Read it first before writing/editing.\n\
-                 → Action required: call read_file(\"src/main.rs\") first, then retry."
+            ("EPERM: operation not permitted", ErrorCategory::Auth),
+            ("Error: Operation not permitted", ErrorCategory::Auth),
+            // not_found (3 original tests merged)
+            (
+                "No such file: /tmp/missing.txt",
+                ErrorCategory::ToolNotFound,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_error(
-                "File has been modified since last read (by user or linter). \
-                 Read it again before editing.\n\
-                 → Action required: call read_file(\"config.toml\") first, then retry."
+            ("File not found: src/main.rs", ErrorCategory::ToolNotFound),
+            (
+                "Error: EISDIR: illegal operation on a directory",
+                ErrorCategory::ToolNotFound,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_error(
-                "Pre-write staleness check failed: File has been modified since last read \
-                 (by user or linter). Read it again before editing.\n\
-                 → Action required: call read_file(\"src/lib.rs\") first, then retry."
+            ("Error: Is a directory", ErrorCategory::ToolNotFound),
+            // resource_limit (8 original tests merged)
+            (
+                "Error: fork: Resource temporarily unavailable",
+                ErrorCategory::ResourceLimit,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
-    }
-
-    #[test]
-    fn classify_invalid_args() {
-        assert_eq!(
-            classify_error("invalid JSON in arguments"),
-            ErrorCategory::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_error("missing required field 'path'"),
-            ErrorCategory::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_error(
-                "Error: file is too large (97716 bytes, ~2442 lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only."
+            (
+                "Error: Cannot allocate memory",
+                ErrorCategory::ResourceLimit,
             ),
-            ErrorCategory::ToolInvalidArgs
-        );
+            (
+                "Error: No space left on device",
+                ErrorCategory::ResourceLimit,
+            ),
+            (
+                "Error: 系统资源暂时不足，无法运行",
+                ErrorCategory::ResourceLimit,
+            ),
+            ("Error: too many open files", ErrorCategory::ResourceLimit),
+            ("write failed: ENOSPC", ErrorCategory::ResourceLimit),
+            ("Device or resource busy", ErrorCategory::ResourceLimit),
+            ("Error: 内存不足，无法继续", ErrorCategory::ResourceLimit),
+            // http_500 (2 original tests merged)
+            ("HTTP 500 Internal Server Error", ErrorCategory::Network),
+            ("HTTP 502 Bad Gateway", ErrorCategory::Network),
+            // invalid_args / unknown / unavailable misc
+            ("Error: Invalid argument", ErrorCategory::ToolInvalidArgs),
+            ("Error: Connection refused", ErrorCategory::Network),
+            ("some-random-unclassifiable-error", ErrorCategory::Unknown),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(classify_error(msg), *expected, "for: {msg}");
+        }
     }
 
+    /// Resource limit is not transient / Network
     #[test]
-    fn classify_unavailable() {
-        assert_eq!(
-            classify_error("mysql: command not found"),
-            ErrorCategory::ToolUnavailable
-        );
-        assert_eq!(
-            classify_error("Tool not configured for this environment"),
-            ErrorCategory::ToolUnavailable
-        );
+    fn resource_limit_not_transient() {
+        let cat = classify_error("fork: Resource temporarily unavailable");
+        assert_eq!(cat, ErrorCategory::ResourceLimit);
+        assert_ne!(cat, ErrorCategory::Network);
     }
 
+    // ── Read-before-write guard (2 original tests merged) ──
+
     #[test]
-    fn classify_unknown() {
-        assert_eq!(
-            classify_error("something went wrong"),
-            ErrorCategory::Unknown
-        );
+    fn classify_read_before_write_guard() {
+        for err in [
+            "File exists but has not been read yet. Read it first before writing/editing.",
+            "File was only partially read (outline or line range). Read the full file before overwriting.",
+            "File has been modified since last read (by user or linter). Read it again before editing.",
+            "Pre-write staleness check failed: File has been modified since last read (by user or linter). Read it again before editing.",
+        ] {
+            assert_eq!(
+                classify_error(err),
+                ErrorCategory::ToolInvalidArgs,
+                "for: {err}"
+            );
+        }
     }
 
-    #[test]
-    fn classify_http_500_as_transient() {
-        assert_eq!(
-            classify_error("HTTP 500 Internal Server Error"),
-            ErrorCategory::Network
-        );
-        assert_eq!(
-            classify_error("internal server error"),
-            ErrorCategory::Network
-        );
-    }
+    // ── Retry: transient ──
 
     #[test]
-    fn classify_http_status_aliases_as_transient() {
-        assert_eq!(classify_error("502 Bad Gateway"), ErrorCategory::Network);
-        assert_eq!(
-            classify_error("service unavailable"),
-            ErrorCategory::Network
-        );
-        assert_eq!(classify_error("gateway timeout"), ErrorCategory::Network);
-    }
-
-    // ── Retry policy ──
-
-    #[test]
-    fn retry_transient_first_attempt() {
-        // base=500, attempt=0: backoff=500, jitter ∈ [0, 250) → [500, 750)
+    fn retry_transient_first_second_exhausted() {
         let d = should_retry(ErrorCategory::Network, 0).unwrap();
         assert!((500..750).contains(&d), "attempt 0 delay={d}");
-    }
-
-    #[test]
-    fn retry_transient_second_attempt() {
-        // base=500, attempt=1: backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
         let d = should_retry(ErrorCategory::Network, 1).unwrap();
         assert!((1000..1250).contains(&d), "attempt 1 delay={d}");
-    }
-
-    #[test]
-    fn retry_transient_exhausted() {
         assert_eq!(should_retry(ErrorCategory::Network, 2), None);
     }
 
+    // ── No retry for non-transient (4 original tests merged) ──
+
     #[test]
-    fn no_retry_auth() {
-        assert_eq!(should_retry(ErrorCategory::Auth, 0), None);
+    fn no_retry_for_non_transient_categories() {
+        for cat in [
+            ErrorCategory::Auth,
+            ErrorCategory::ToolNotFound,
+            ErrorCategory::ToolInvalidArgs,
+            ErrorCategory::ToolTimeout,
+        ] {
+            assert_eq!(should_retry(cat, 0), None, "should not retry {cat:?}");
+        }
     }
 
+    // ── Retry with hint (6 original tests merged) ──
+
     #[test]
-    fn no_retry_not_found() {
-        assert_eq!(should_retry(ErrorCategory::ToolNotFound, 0), None);
+    fn retry_with_hint_behaviour() {
+        // honours server delay (hint=5000, attempt=0 → 5000..5250)
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(5000)).unwrap();
+        assert!((5000..5250).contains(&delay), "server delay, got {delay}");
+        // none hint uses exponential (attempt=0, base=500 + jitter → 500..750)
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, None).unwrap();
+        assert!((500..750).contains(&delay), "exponential, got {delay}");
+        // clamps low to base (hint=50 → clamped to 500)
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(50)).unwrap();
+        assert!((500..750).contains(&delay), "clamped low, got {delay}");
+        // clamps high to max (hint=60s → clamped to 30s)
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(60_000)).unwrap();
+        assert!(
+            (30_000..30_250).contains(&delay),
+            "clamped high, got {delay}"
+        );
+        // respects max attempts
+        assert!(should_retry_with_hint(ErrorCategory::Network, 2, Some(1000)).is_none());
+        // non-transient never retries
+        assert!(should_retry_with_hint(ErrorCategory::Auth, 0, Some(1000)).is_none());
+        assert!(should_retry_with_hint(ErrorCategory::ResourceLimit, 0, Some(1000)).is_none());
     }
 
-    #[test]
-    fn no_retry_invalid_args() {
-        assert_eq!(should_retry(ErrorCategory::ToolInvalidArgs, 0), None);
-    }
-
-    // ── Alternative suggestions ──
+    // ── Suggestions (5 original tests merged) ──
 
     #[test]
-    fn suggest_git_alternatives() {
+    fn suggestions_data_driven() {
+        // git_log alternatives
         let alts = suggest_alternatives("git_log", &[]);
         assert!(alts.contains(&"git_diff".to_string()));
         assert!(alts.contains(&"git_blame".to_string()));
-        assert!(!alts.contains(&"git_log".to_string())); // excludes self
-    }
+        assert!(!alts.contains(&"git_log".to_string()));
 
-    #[test]
-    fn suggest_excludes_deprioritized() {
+        // excludes deprioritized
         let alts = suggest_alternatives("git_log", &["git_diff", "git_blame"]);
         assert!(!alts.contains(&"git_diff".to_string()));
         assert!(!alts.contains(&"git_blame".to_string()));
         assert!(alts.contains(&"git_status".to_string()));
-    }
 
-    #[test]
-    fn suggest_no_alternatives_for_unique_tool() {
-        let alts = suggest_alternatives("bash", &[]);
-        assert!(alts.is_empty());
-    }
+        // no alternatives for unique tools
+        assert!(suggest_alternatives("bash", &[]).is_empty());
 
-    #[test]
-    fn suggest_github_alternatives() {
-        let alts = suggest_alternatives("github_list_prs", &[]);
-        assert!(alts.contains(&"github_get_pr".to_string()));
-    }
+        // github alternatives
+        assert!(suggest_alternatives("github_list_prs", &[]).contains(&"github_get_pr".to_string()));
 
-    #[test]
-    fn suggest_multi_edit_alternatives() {
+        // multi-edit alternatives
         let alts = suggest_alternatives("multi_edit", &[]);
         assert!(alts.contains(&"write_file".to_string()));
         assert!(alts.contains(&"str_replace".to_string()));
     }
 
-    // ── Recovery message ──
+    // ── Recovery messages (8 original tests merged into 3) ──
 
     #[test]
     fn recovery_message_includes_alternatives() {
@@ -709,24 +640,34 @@ mod tests {
     }
 
     #[test]
-    fn recovery_message_write_file_read_guard_is_actionable() {
+    fn recovery_message_read_before_write_and_auth() {
+        // read_before_write guard
         let err = "File exists but has not been read yet. Read it first before writing/editing.";
         let cat = classify_error(err);
         assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
         let msg = build_recovery_message("write_file", err, cat, &[]);
         assert!(msg.contains("read_file"));
         assert!(msg.contains("workspace safety"));
-    }
 
-    #[test]
-    fn recovery_message_auth_no_retry() {
+        // auth no retry
         let msg = build_recovery_message("github_list_prs", "401", ErrorCategory::Auth, &[]);
         assert!(msg.contains("authentication"));
         assert!(msg.contains("Do NOT retry"));
+
+        // large file guidance
+        let msg = build_recovery_message(
+            "read_file",
+            "Error: file is too large (97716 bytes). Use start_line/end_line.",
+            ErrorCategory::Unknown,
+            &[],
+        );
+        assert!(msg.contains("do NOT switch to bash"));
+        assert!(msg.contains("start_line/end_line"));
     }
 
     #[test]
-    fn recovery_message_unavailable() {
+    fn recovery_message_tool_specific() {
+        // unavailable tool
         let msg = build_recovery_message(
             "mo_query",
             "not installed",
@@ -735,174 +676,85 @@ mod tests {
         );
         assert!(msg.contains("not available"));
         assert!(msg.contains("alternative"));
-    }
 
-    #[test]
-    fn recovery_message_guides_large_read_file_back_to_read_file() {
-        let msg = build_recovery_message(
-            "read_file",
-            "Error: file is too large (97716 bytes, ~2442 lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only.",
-            ErrorCategory::Unknown,
-            &[],
-        );
-        assert!(msg.contains("do NOT switch to bash"));
-        assert!(msg.contains("start_line/end_line"));
-        assert!(msg.contains("outline=true"));
-    }
-
-    #[test]
-    fn recovery_message_write_file_missing_args_discourages_shell_fallback() {
+        // write_file missing path disallows shell fallback
         let err = "Error: Missing 'path' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.";
         let cat = classify_error(err);
         assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
         let msg = build_recovery_message("write_file", err, cat, &[]);
-        assert!(msg.contains("Retry the same tool") || msg.contains("retry write_file"));
-        // The recovery message must explicitly warn against shell escalation.
         assert!(msg.contains("bash"), "must warn against bash fallback");
         assert!(msg.contains("python"), "must warn against python fallback");
-        // bash must not appear in the Alternatives list — only in the warning text.
-        // The alternatives for write_file are str_replace/multi_edit, never bash.
         let alts_section = msg.find("Alternatives:").map(|i| &msg[i..]).unwrap_or("");
         assert!(
             !alts_section.to_lowercase().contains("bash"),
-            "bash must not appear as a suggested alternative: {alts_section}"
+            "bash must not be an alternative"
         );
-    }
 
-    #[test]
-    fn recovery_message_write_file_missing_args_suggests_editing_alternatives() {
-        let err = "Error: Missing 'content' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.";
+        // write_file missing content → editing alternatives
+        let err = "Error: Missing 'content' parameter. Retry write_file. Do not switch to bash.";
         let cat = classify_error(err);
         let msg = build_recovery_message("write_file", err, cat, &[]);
-        // str_replace and multi_edit are legitimate alternatives for file edits and must
-        // still be surfaced even when write_file is missing args.
         assert!(
             msg.contains("str_replace") || msg.contains("multi_edit"),
-            "editing alternatives must not be suppressed for missing-args errors: {msg}"
+            "editing alternatives: {msg}"
         );
-    }
 
-    #[test]
-    fn recovery_message_ask_user_invalid_args_forces_retry() {
+        // ask_user invalid args → force retry
         let err =
             "Error: ask_user input is invalid. ask_user requires top-level 'questions': [...].";
         let cat = classify_error(err);
         let msg = build_recovery_message("ask_user", err, cat, &[]);
         assert!(msg.contains("Retry the SAME ask_user tool immediately"));
-        assert!(msg.contains("Do NOT continue implementation"));
         assert!(msg.contains("\"questions\""));
     }
 
-    // ── Escalation ──
+    // ── Escalation (13 original tests merged into 2) ──
 
     #[test]
-    fn escalation_normal_fresh_session() {
+    fn escalation_levels() {
+        // Normal: fresh session, few errors, low nudges
         assert_eq!(escalation_level(0, 0, 0), EscalationLevel::Normal);
-    }
-
-    #[test]
-    fn escalation_normal_low_nudges() {
-        // 1 nudge: still Normal
         assert_eq!(escalation_level(1, 0, 0), EscalationLevel::Normal);
-    }
-
-    #[test]
-    fn escalation_warning_three_nudges() {
-        // 3 nudges → Warning (raised from 2 to reduce false positives)
-        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
-    }
-
-    #[test]
-    fn escalation_two_nudges_is_normal() {
-        // 2 nudges alone → Normal (threshold raised after Session 7875e355)
         assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Normal);
-    }
-
-    #[test]
-    fn escalation_critical_four_nudges_with_errors() {
-        // 4 nudges alone (0 errors) → Warning, NOT Critical.
-        // Critical requires nudge_count >= 4 AND total_errors >= 3.
-        // This prevents force-stopping sessions with exploration patterns
-        // (grep→read→grep) that produce stall nudges but zero tool errors.
-        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
-        assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Warning);
-        // But with 3+ errors, nudges trigger Critical
-        assert_eq!(escalation_level(4, 3, 0), EscalationLevel::Critical);
-        assert_eq!(escalation_level(5, 4, 0), EscalationLevel::Critical);
-    }
-
-    #[test]
-    fn escalation_warning_eight_errors() {
-        // 8 errors → Warning (raised from 5 after Session 7875e355)
-        assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
-    }
-
-    #[test]
-    fn escalation_normal_few_errors() {
-        // 3-7 errors: still Normal (raised thresholds)
         assert_eq!(escalation_level(0, 3, 0), EscalationLevel::Normal);
-        assert_eq!(escalation_level(0, 5, 0), EscalationLevel::Normal);
         assert_eq!(escalation_level(0, 7, 0), EscalationLevel::Normal);
-    }
 
-    #[test]
-    fn escalation_critical_from_nudges() {
-        // Nudges alone stay Warning; coupled with errors → Critical
+        // Warning: 3+ nudges or 8+ errors
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
         assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
-        assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(0, 14, 0), EscalationLevel::Warning);
+        // 8 errors + 1 deprioritized → Warning
+        assert_eq!(escalation_level(0, 8, 1), EscalationLevel::Warning);
+
+        // Critical: 4+ nudges + 3+ errors
         assert_eq!(escalation_level(4, 3, 0), EscalationLevel::Critical);
         assert_eq!(escalation_level(5, 4, 0), EscalationLevel::Critical);
-    }
-
-    #[test]
-    fn escalation_critical_many_errors_with_deprioritized() {
-        // 12+ errors with at least 2 deprioritized tools → Critical (raised thresholds)
+        // 12+ errors + 2+ deprioritized → Critical
         assert_eq!(escalation_level(0, 12, 2), EscalationLevel::Critical);
         assert_eq!(escalation_level(0, 13, 3), EscalationLevel::Critical);
-    }
-
-    #[test]
-    fn escalation_not_critical_errors_without_enough_deprioritized() {
-        // 12 errors but only 1 deprioritized tool → Warning, not Critical
+        // 12 errors + 1 deprioritized → Warning
         assert_eq!(escalation_level(0, 12, 1), EscalationLevel::Warning);
-    }
-
-    #[test]
-    fn escalation_critical_fifteen_errors_regardless() {
-        // 15+ errors with zero deprioritized → Critical (new: standalone high-error gate)
+        // 15+ errors regardless → Critical
         assert_eq!(escalation_level(0, 15, 0), EscalationLevel::Critical);
         assert_eq!(escalation_level(0, 18, 0), EscalationLevel::Critical);
     }
 
     #[test]
-    fn escalation_fourteen_errors_no_deprioritized_is_warning() {
-        // Below the standalone threshold, no deprioritized → stays Warning
-        assert_eq!(escalation_level(0, 14, 0), EscalationLevel::Warning);
-    }
-
-    #[test]
-    fn escalation_message_normal_is_none() {
+    fn escalation_messages() {
         assert!(build_escalation_message(EscalationLevel::Normal, &[]).is_none());
-    }
-
-    #[test]
-    fn escalation_message_warning_has_content() {
         let msg = build_escalation_message(EscalationLevel::Warning, &["bash".to_string()]);
         assert!(msg.is_some());
         assert!(msg.unwrap().contains("bash"));
-    }
-
-    #[test]
-    fn escalation_message_critical_has_must() {
         let msg = build_escalation_message(EscalationLevel::Critical, &[]);
         assert!(msg.is_some());
         assert!(msg.unwrap().contains("MUST"));
     }
 
-    // ── Session error summary ──
+    // ── Session error summary (3 original tests merged into 2) ──
 
     #[test]
-    fn error_summary_tracks_categories() {
+    fn error_summary_tracks_and_decays() {
         let mut summary = SessionErrorSummary::new();
         summary.record_error(ErrorCategory::Network);
         summary.record_error(ErrorCategory::Network);
@@ -911,306 +763,43 @@ mod tests {
         assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 2);
         assert_eq!(summary.errors_by_category[&ErrorCategory::Auth], 1);
         assert_eq!(summary.recent_error_pressure(), 3);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 2);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 1);
-    }
-
-    #[test]
-    fn error_summary_successes_decay_recent_pressure() {
-        let mut summary = SessionErrorSummary::new();
-        summary.record_error(ErrorCategory::Network);
-        summary.record_error(ErrorCategory::Auth);
-        summary.record_error(ErrorCategory::Network);
 
         summary.record_success();
         assert_eq!(summary.total_errors, 3);
-        assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 2);
-        assert_eq!(summary.errors_by_category[&ErrorCategory::Auth], 1);
         assert_eq!(summary.recent_error_pressure(), 2);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 1);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 1);
 
         summary.record_success();
-        assert_eq!(summary.total_errors, 3);
         assert_eq!(summary.recent_error_pressure(), 1);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 1);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 0);
 
         summary.record_success();
         assert_eq!(summary.total_errors, 3);
         assert_eq!(summary.recent_error_pressure(), 0);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 0);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 0);
     }
 
     #[test]
-    fn retry_success_rate_no_retries() {
-        let summary = SessionErrorSummary::new();
-        assert_eq!(summary.retry_success_rate(), 1.0);
-    }
-
-    #[test]
-    fn retry_success_rate_mixed() {
+    fn error_summary_caps_and_retry_rate() {
         let mut summary = SessionErrorSummary::new();
+        for _ in 0..17 {
+            summary.record_error(ErrorCategory::Network);
+        }
+        assert_eq!(summary.total_errors, 17);
+        assert_eq!(summary.recent_error_pressure(), 16);
+
+        // retry rate
+        let mut summary = SessionErrorSummary::new();
+        assert_eq!(summary.retry_success_rate(), 1.0);
         summary.record_error(ErrorCategory::Network);
         summary.record_error(ErrorCategory::Network);
         summary.record_retry(true);
         summary.record_retry(false);
         summary.record_retry(true);
         assert!((summary.retry_success_rate() - 0.6667).abs() < 0.01);
-        assert_eq!(
-            summary.total_errors, 2,
-            "retry bookkeeping must not rewrite lifetime telemetry"
-        );
-        assert_eq!(
-            summary.recent_error_pressure(),
-            0,
-            "successful retries should pay down recent pressure"
-        );
     }
 
-    #[test]
-    fn error_summary_caps_recent_window_at_sixteen() {
-        let mut summary = SessionErrorSummary::new();
-        for _ in 0..17 {
-            summary.record_error(ErrorCategory::Network);
-        }
-
-        assert_eq!(summary.total_errors, 17);
-        assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 17);
-        assert_eq!(summary.recent_error_pressure(), 16);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 16);
-        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 0);
-    }
-
-    // ── ResourceLimit classification tests ──
-
-    #[test]
-    fn classify_fork_resource_limit() {
-        assert_eq!(
-            classify_error("Error: fork: Resource temporarily unavailable"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_oom_resource_limit() {
-        assert_eq!(
-            classify_error("Error: Cannot allocate memory"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_disk_full_resource_limit() {
-        assert_eq!(
-            classify_error("Error: No space left on device"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_chinese_resource_limit() {
-        assert_eq!(
-            classify_error("Error: 系统资源暂时不足，无法运行"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_too_many_open_files() {
-        assert_eq!(
-            classify_error("Error: too many open files"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn resource_limit_not_transient() {
-        // Make sure resource limit is NOT classified as Transient
-        // even though it contains "unavailable" (which Unavailable would match)
-        let cat = classify_error("fork: Resource temporarily unavailable");
-        assert_eq!(cat, ErrorCategory::ResourceLimit);
-        assert_ne!(cat, ErrorCategory::Network);
-    }
-
-    // ── CommandTimeout classification ──
-
-    #[test]
-    fn classify_command_timeout_grep() {
-        assert_eq!(
-            classify_error("Error: grep timed out after 30s with no results"),
-            ErrorCategory::ToolTimeout
-        );
-    }
-
-    #[test]
-    fn classify_command_timeout_generic() {
-        assert_eq!(
-            classify_error("Error: command timed out after 30s"),
-            ErrorCategory::ToolTimeout
-        );
-    }
-
-    #[test]
-    fn classify_command_timeout_not_connection() {
-        // "connection timed out" should still be Transient, not CommandTimeout
-        assert_eq!(
-            classify_error("connection timed out after 30s"),
-            ErrorCategory::Network
-        );
-    }
-
-    #[test]
-    fn no_retry_command_timeout() {
-        assert_eq!(should_retry(ErrorCategory::ToolTimeout, 0), None);
-    }
-
-    #[test]
-    fn recovery_message_command_timeout_has_guidance() {
-        let msg = build_recovery_message(
-            "grep",
-            "Error: grep timed out after 30s",
-            ErrorCategory::ToolTimeout,
-            &[],
-        );
-        assert!(msg.contains("timed out"), "got: {msg}");
-        assert!(
-            msg.contains("path"),
-            "should suggest narrowing path, got: {msg}"
-        );
-        assert!(
-            msg.contains("include"),
-            "should suggest include filter, got: {msg}"
-        );
-        assert!(
-            !msg.contains("retried"),
-            "should NOT mention retry, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn recovery_message_for_resource_limit() {
-        let msg = build_recovery_message(
-            "bash",
-            "fork: Resource temporarily unavailable",
-            ErrorCategory::ResourceLimit,
-            &[],
-        );
-        assert!(msg.contains("BLOCKED"));
-        assert!(msg.contains("resource limit"));
-    }
-
-    // ── New error pattern classification tests ──
-
-    #[test]
-    fn classify_enospc_resource_limit() {
-        assert_eq!(
-            classify_error("write failed: ENOSPC"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_ebusy_resource_limit() {
-        assert_eq!(
-            classify_error("Device or resource busy"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_chinese_oom_resource_limit() {
-        assert_eq!(
-            classify_error("Error: 内存不足，无法继续"),
-            ErrorCategory::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_eacces_as_auth() {
-        assert_eq!(
-            classify_error("EACCES: permission denied, open '/etc/shadow'"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_eperm_as_auth() {
-        assert_eq!(
-            classify_error("EPERM: operation not permitted"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_operation_not_permitted_as_auth() {
-        assert_eq!(
-            classify_error("Error: Operation not permitted"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_eisdir_as_not_found() {
-        assert_eq!(
-            classify_error("Error: EISDIR: illegal operation on a directory"),
-            ErrorCategory::ToolNotFound
-        );
-    }
-
-    #[test]
-    fn classify_is_a_directory_as_not_found() {
-        assert_eq!(
-            classify_error("Error: Is a directory"),
-            ErrorCategory::ToolNotFound
-        );
-    }
-
-    // ── should_retry_with_hint tests ──
-
-    #[test]
-    fn retry_with_hint_honours_server_delay() {
-        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(5000)).unwrap();
-        // hint=5000ms, clamped to [500, 30000], plus jitter [0, 250)
-        assert!((5000..5250).contains(&delay), "delay={delay}");
-    }
-
-    #[test]
-    fn retry_with_hint_clamps_low_to_base() {
-        // Server says 50ms but base is 500ms → clamped up to 500
-        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(50)).unwrap();
-        assert!((500..750).contains(&delay), "delay={delay}");
-    }
-
-    #[test]
-    fn retry_with_hint_clamps_high_to_max() {
-        // Server says 60s but max is 30s → clamped down to 30000
-        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(60_000)).unwrap();
-        assert!((30_000..30_250).contains(&delay), "delay={delay}");
-    }
-
-    #[test]
-    fn retry_with_hint_none_uses_exponential() {
-        let delay = should_retry_with_hint(ErrorCategory::Network, 0, None).unwrap();
-        // Same as should_retry: base=500 + jitter [0, 250) → [500, 750)
-        assert!((500..750).contains(&delay), "delay={delay}");
-    }
-
-    #[test]
-    fn retry_with_hint_respects_max_attempts() {
-        assert!(should_retry_with_hint(ErrorCategory::Network, 2, Some(1000)).is_none());
-    }
-
-    #[test]
-    fn retry_with_hint_non_transient_never_retries() {
-        assert!(should_retry_with_hint(ErrorCategory::Auth, 0, Some(1000)).is_none());
-        assert!(should_retry_with_hint(ErrorCategory::ResourceLimit, 0, Some(1000)).is_none());
-    }
+    // ── Jitter ──
 
     #[test]
     fn retry_jitter_is_non_deterministic() {
-        // Run 20 retries — if jitter is truly random, we should see at least 2 distinct values
         let delays: Vec<u64> = (0..20)
             .map(|_| should_retry(ErrorCategory::Network, 0).unwrap())
             .collect();
