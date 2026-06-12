@@ -2,11 +2,11 @@ use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_core::turn_event_sink::IncrementalTurnState;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::{ExplainMode, cli::permission_manager::PermissionManager};
+use crate::{cli::permission_manager::PermissionManager, ExplainMode};
 
 /// Atomic counter pair published by streaming tools (currently
 /// bash) while they run. Consumers read `lines` / `bytes` on a
@@ -443,6 +443,11 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, tool executor pushes spawn/kill/output commands here.
     pub(crate) bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Shared background task list cache.
+    /// When the TUI is active the event loop refreshes this every tick.
+    /// [`ToolExecutor::task_list_bg`] reads it directly, bypassing the
+    /// BG command queue and avoiding event-loop tick latency.
+    pub(crate) bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Detach slot for bash Ctrl+B promotion. When present, the
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
@@ -513,6 +518,8 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     pub bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Shared background task list cache for direct reads.
+    pub bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Shared detach slot for bash Ctrl+B promotion. The TUI refills
     /// this between tool calls; the bash runner takes from it on
     /// entry. `None` for headless paths.
@@ -598,6 +605,7 @@ impl<'a> ChatTurnParams<'a> {
             task_manager: ctx.task_manager.clone(),
             task_notify_tx: ctx.task_notify_tx.clone(),
             bg_task_commands: ctx.bg_task_commands.clone(),
+            bg_task_list_cache: ctx.bg_task_list_cache.clone(),
             bash_detach_slot: ctx.bash_detach_slot.clone(),
             turn_index: 0,
             pipeline_state: None,

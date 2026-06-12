@@ -121,6 +121,7 @@ impl<'a> CompactCtx<'a> {
             task_manager: None,
             task_notify_tx: None,
             bg_task_commands: None,
+            bg_task_list_cache: None,
             bash_detach_slot: None,
             turn_index: 0,
             pipeline_state: None,

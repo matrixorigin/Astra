@@ -253,6 +253,11 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref cache) = p.bg_task_list_cache {
+            ex.with_bg_task_list_cache(cache.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(ref slot) = p.bash_detach_slot {
             ex.with_bash_detach_slot(slot.clone())
         } else {

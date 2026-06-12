@@ -236,7 +236,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
     .with_default_model(state.model.clone())
     .with_skill_resolver(skill_resolver)
     .with_skill_search(state.skill_search.clone())
-    .with_bg_task_commands(state.bg_task_commands.clone());
+    .with_bg_task_commands(state.bg_task_commands.clone())
+    .with_bg_task_list_cache(state.bg_task_list_cache.clone());
     // Wire a token provider so each spawn reads the freshest access
     // token at execution time. Without this, sub-agents fail with 401
     // in long-running sessions after the parent's auth refresh

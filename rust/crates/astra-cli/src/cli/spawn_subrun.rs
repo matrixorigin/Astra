@@ -72,6 +72,9 @@ pub struct CliSpawnAgentExecutor {
     /// Threaded into the child's ToolExecutor so spawned sub-agents
     /// can inspect or stop background shell tasks promoted in the TUI.
     bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Threaded from `SessionState.bg_task_list_cache` so spawned
+    /// sub-agents can read the latest task-list snapshot directly.
+    bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Session/default model fallback when the spawn request itself omits one.
     default_model: Option<String>,
 }
@@ -324,6 +327,7 @@ impl CliSpawnAgentExecutor {
             fork_cache_sink: None,
             journal: None,
             bg_task_commands: None,
+            bg_task_list_cache: None,
             default_model: None,
         }
     }
@@ -379,6 +383,16 @@ impl CliSpawnAgentExecutor {
         commands: Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
     ) -> Self {
         self.bg_task_commands = Some(commands);
+        self
+    }
+
+    /// Install the parent's bg task list cache so spawned children
+    /// can read the latest task-list snapshot directly.
+    pub fn with_bg_task_list_cache(
+        mut self,
+        cache: std::sync::Arc<tokio::sync::RwLock<String>>,
+    ) -> Self {
+        self.bg_task_list_cache = Some(cache);
         self
     }
 
@@ -483,6 +497,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             .with_cloud(self.api.api_origin(), &token);
         if let Some(ref cmds) = self.bg_task_commands {
             executor = executor.with_bg_task_commands(cmds.clone());
+        }
+        if let Some(ref cache) = self.bg_task_list_cache {
+            executor = executor.with_bg_task_list_cache(cache.clone());
         }
         if let Some(session_id) = self.active_session_id.as_deref() {
             executor.set_active_session_id(session_id.to_string());

@@ -1,7 +1,7 @@
 //! Run a turn stream and collect the raw stream result.
 
 use super::turn_cancellation::drain_after_cancel;
-use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+use crate::cli::chat_stream::{stream_chat_sse, ChatTurnParams};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
@@ -171,6 +171,7 @@ fn build_turn_stream_params<'a>(
         task_manager: Some(state.task_manager.clone()),
         task_notify_tx: state.task_notify_tx.clone(),
         bg_task_commands: Some(state.bg_task_commands.clone()),
+        bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
         turn_index: state.turn,
         pipeline_state: None,
@@ -283,7 +284,7 @@ fn notify_server_to_cancel_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedTurnStreamState, build_turn_stream_params, prepare_turn_stream_state};
+    use super::{build_turn_stream_params, prepare_turn_stream_state, PreparedTurnStreamState};
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
     use astra_tools::task_mgmt::{SessionTask, TaskStore};

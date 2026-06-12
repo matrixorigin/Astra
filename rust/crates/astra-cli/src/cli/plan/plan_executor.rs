@@ -1087,6 +1087,9 @@ pub(crate) struct BackgroundPlanContext {
     /// can inspect or stop background shell tasks. `None` for non-TUI
     /// plan executions (headless test paths).
     pub bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Threaded from `SessionState.bg_task_list_cache` so plan subtasks
+    /// can read the latest task-list snapshot directly.
+    pub bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Detach slot for bash Ctrl+B promotion in plan subtasks.
     /// Threaded the same way as `bg_task_commands`. `None` for
     /// headless plan executions.
@@ -1583,6 +1586,7 @@ async fn plan_executor_task(
                     task_manager: Some(ctx.task_manager.clone()),
                     task_notify_tx: None,
                     bg_task_commands: ctx.bg_task_commands.clone(),
+                    bg_task_list_cache: ctx.bg_task_list_cache.clone(),
                     bash_detach_slot: ctx.bash_detach_slot.clone(),
                     turn_index: ctx.turn,
                     pipeline_state: None,
@@ -2141,6 +2145,7 @@ mod tests {
             )),
             task_manager: Arc::new(crate::edge_tools::TaskManager::in_memory()),
             bg_task_commands: None,
+            bg_task_list_cache: None,
             bash_detach_slot: None,
             #[cfg(feature = "harness")]
             harness_sink: None,

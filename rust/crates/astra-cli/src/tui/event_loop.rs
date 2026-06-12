@@ -3265,14 +3265,16 @@ pub(crate) async fn run_tui_session(
                                 );
                             }
                             crate::edge_tools::BgTaskCommand::List { reply } => {
-                                let _ = reply.send(
-                                    render_background_task_list_xml_with_agents(
-                                        &mut background_registry,
-                                        state.agent_spawner.as_ref(),
-                                        &restored_local_agent_task_projections,
-                                    )
-                                    .await,
-                                );
+                                let rendered = render_background_task_list_xml_with_agents(
+                                    &mut background_registry,
+                                    state.agent_spawner.as_ref(),
+                                    &restored_local_agent_task_projections,
+                                )
+                                .await;
+                                // Populate shared cache so task_list_bg can read
+                                // directly without queue latency.
+                                *state.bg_task_list_cache.write().await = rendered.clone();
+                                let _ = reply.send(rendered);
                             }
                         }
                     }
@@ -3316,6 +3318,12 @@ pub(crate) async fn run_tui_session(
                         &restored_local_agent_task_projections,
                     )
                     .await;
+                // Refresh shared cache every tick so task_list_bg
+                // always sees the latest state without queue latency.
+                {
+                    let xml = render_background_task_rows_xml(&rows_for_footer);
+                    *state.bg_task_list_cache.write().await = xml;
+                }
                 if bottom_pane.accepts_background_task_rows() {
                     bottom_pane.refresh_background_task_rows(rows_for_footer.clone());
                     frame_requester.schedule_frame();

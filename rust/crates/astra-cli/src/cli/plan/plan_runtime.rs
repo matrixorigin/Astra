@@ -12,8 +12,8 @@ use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
 use crossterm::style::Stylize;
 
-fn build_fallback_delegation_engine()
--> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
+fn build_fallback_delegation_engine(
+) -> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
     let mut registry = astra_services::AgentProfileRegistry::new();
     delegate_subrun::register_default_agents(&mut registry);
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
@@ -79,6 +79,7 @@ fn take_plan_context(
         session_state_journal: state.session_state_journal.clone(),
         task_manager: state.task_manager.clone(),
         bg_task_commands: Some(state.bg_task_commands.clone()),
+        bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),

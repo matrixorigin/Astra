@@ -534,6 +534,7 @@ async fn execute_headless_task_body(
         task_manager: Some(task_manager),
         task_notify_tx: None,
         bg_task_commands: None,
+            bg_task_list_cache: None,
         bash_detach_slot: None,
         stream_event_tx,
         #[cfg(feature = "harness")]
@@ -1287,6 +1288,7 @@ pub(crate) async fn execute_cli_command(
                 task_manager: None,
                 task_notify_tx: None,
                 bg_task_commands: None,
+            bg_task_list_cache: None,
                 bash_detach_slot: None,
                 stream_event_tx: None,
                 #[cfg(feature = "harness")]
@@ -1839,6 +1841,7 @@ pub(crate) async fn execute_cli_command(
                 task_manager: Some(chat_task_manager),
                 task_notify_tx: None,
                 bg_task_commands: None,
+            bg_task_list_cache: None,
                 bash_detach_slot: None,
                 stream_event_tx,
                 #[cfg(feature = "harness")]
@@ -2584,6 +2587,7 @@ pub(crate) async fn run_print_mode(
         task_manager: Some(print_task_manager),
         task_notify_tx: None,
         bg_task_commands: None,
+            bg_task_list_cache: None,
         bash_detach_slot: None,
         stream_event_tx: None,
         #[cfg(feature = "harness")]

@@ -730,12 +730,12 @@ pub struct ToolExecutor {
     /// task actions fail fast with a clear error rather than pushing
     /// to a queue nobody drains (which would hang the LLM turn forever).
     pub(crate) bg_task_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>>,
-    /// Shared background task registry slot for direct reads.
-    /// When the TUI event loop is active, the live
-    /// [`crate::tui::background_tasks::BackgroundTaskRegistry`] is placed
-    /// here so [`Self::task_list_bg`] can bypass the BG command queue.
-    pub(crate) bg_registry:
-        Option<std::sync::Arc<std::sync::Mutex<Option<crate::tui::background_tasks::BackgroundTaskRegistry>>>>,
+    /// Shared background task list cache.
+    /// When the TUI event loop is active, it writes rendered
+    /// task-list XML here every tick so [`Self::task_list_bg`] can
+    /// bypass the BG command queue.
+    pub(crate) bg_task_list_cache:
+        Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Detach slot for the bash tool. Renewed before each tool call
     /// by the TUI event loop so a fresh one-shot reply channel is
     /// available for every bash invocation. `None` outside the TUI
@@ -894,7 +894,7 @@ impl ToolExecutor {
             task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
             task_notify_tx: None,
             bg_task_commands: None,
-            bg_registry: None,
+            bg_task_list_cache: None,
             bash_detach_slot: None,
             spawn_context: None,
             context_cache: None,
@@ -1372,13 +1372,11 @@ impl ToolExecutor {
         self
     }
 
-    pub(crate) fn with_bg_registry(
+    pub(crate) fn with_bg_task_list_cache(
         mut self,
-        registry: std::sync::Arc<
-            std::sync::Mutex<Option<crate::tui::background_tasks::BackgroundTaskRegistry>>,
-        >,
+        cache: std::sync::Arc<tokio::sync::RwLock<String>>,
     ) -> Self {
-        self.bg_registry = Some(registry);
+        self.bg_task_list_cache = Some(cache);
         self
     }
 
@@ -2305,16 +2303,20 @@ impl ToolExecutor {
     }
 
     async fn task_list_bg(&self) -> String {
-        // Fast path: read directly from the shared registry slot,
-        // bypassing the BG command queue and event-loop tick latency.
-        if let Some(ref slot) = self.bg_registry {
-            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref mut registry) = *guard {
-                let rows = crate::tui::bg_task_rendering::background_task_rows(registry);
-                return crate::tui::bg_task_rendering::render_background_task_rows_xml(&rows);
+        // Fast path: read the latest snapshot directly from the shared
+        // cache. The TUI event loop refreshes this every tick, so we
+        // completely bypass the BG command queue and event-loop tick
+        // latency.
+        if let Some(ref cache) = self.bg_task_list_cache {
+            let cached = cache.read().await;
+            if !cached.is_empty() {
+                return cached.clone();
             }
+            // Cache not yet populated (first call before the event
+            // loop has rendered). Fall through to the queue path so
+            // we still return a valid response.
         }
-        // Fallback: queue path for when no registry is available
+        // Fallback: queue path for when no cache is available
         let Some(ref bg_commands) = self.bg_task_commands else {
             return format_background_task_unavailable(self.cloud_base.is_some());
         };

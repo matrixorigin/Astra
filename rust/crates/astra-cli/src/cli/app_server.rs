@@ -438,6 +438,7 @@ async fn run_turn(
         task_manager: Some(chat_task_manager),
         task_notify_tx: None,
         bg_task_commands: None,
+        bg_task_list_cache: None,
         bash_detach_slot: None,
         stream_event_tx: Some(stream_tx),
         #[cfg(feature = "harness")]
