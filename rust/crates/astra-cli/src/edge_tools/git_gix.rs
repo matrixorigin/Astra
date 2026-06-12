@@ -1701,7 +1701,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn current_branch_and_head_short_return_empty_on_bad_path() {
         assert!(current_branch(Path::new("/nonexistent/repo")).is_empty());
         assert!(head_short(Path::new("/nonexistent/repo")).is_empty());
@@ -1829,7 +1828,6 @@ mod tests {
 
     // ── Pressure-aware output limit tests ──
 
-    #[test]
     #[test]
     fn pressure_scaled_limit_scales_and_floors() {
         // Zero pressure returns base verbatim.

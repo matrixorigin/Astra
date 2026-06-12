@@ -1,5 +1,5 @@
-use super::{ToolExecutor, test_executor};
-use serde_json::{Value, json};
+use super::{test_executor, ToolExecutor};
+use serde_json::{json, Value};
 
 // ── Env tool tests ────────────────────────────────────────────────────────
 
@@ -16,27 +16,24 @@ fn env_list_returns_variables() {
 }
 
 #[test]
-fn env_get_existing_var() {
+fn env_get_variables() {
     let exe = test_executor();
+
+    // Existing variable
     let result = exe.env_tool(&json!({
         "operation": "get",
         "name": "HOME"
     }));
     let parsed: Value = serde_json::from_str(&result).unwrap();
-
     assert_eq!(parsed.get("name").unwrap(), "HOME");
     assert_eq!(parsed.get("exists").unwrap(), true);
-}
 
-#[test]
-fn env_get_missing_var() {
-    let exe = test_executor();
+    // Missing variable
     let result = exe.env_tool(&json!({
         "operation": "get",
         "name": "DEFINITELY_NOT_A_REAL_VAR_12345"
     }));
     let parsed: Value = serde_json::from_str(&result).unwrap();
-
     assert_eq!(parsed.get("exists").unwrap(), false);
 }
 
@@ -100,27 +97,24 @@ fn env_set_invalid_name() {
 }
 
 #[test]
-fn env_search_basic() {
+fn env_search() {
     let exe = test_executor();
+
+    // Basic search
     let result = exe.env_tool(&json!({
         "operation": "search",
         "pattern": "PATH"
     }));
     let parsed: Value = serde_json::from_str(&result).unwrap();
-
     assert!(parsed.get("count").is_some());
     assert!(parsed.get("matches").is_some());
-}
 
-#[test]
-fn env_search_redos_protection() {
-    let exe = test_executor();
+    // ReDoS protection
     let long_pattern = "a".repeat(600);
     let result = exe.env_tool(&json!({
         "operation": "search",
         "pattern": long_pattern
     }));
-
     assert!(result.contains("error"));
     assert!(result.contains("too long"));
 }

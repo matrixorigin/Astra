@@ -1636,61 +1636,22 @@ total_tokens_out: 500
     // ── slash_health::format_sync_age tests ────────────────────────────────────────────
 
     #[test]
-    fn format_sync_age_rfc3339() {
+    fn format_sync_age_various_durations() {
         let now = chrono::Utc::now();
-        let ts = now.to_rfc3339();
-        let age = slash_health::format_sync_age(&ts);
-        // Should be "just now" or "0s ago" or "1s ago"
-        assert!(
-            age.contains("s ago") || age == "just now",
-            "unexpected age for just-now timestamp: {age}"
-        );
-    }
-
-    #[test]
-    fn format_sync_age_minutes_ago() {
-        let now = chrono::Utc::now();
-        let five_min_ago = now - chrono::Duration::minutes(5);
-        let ts = five_min_ago.to_rfc3339();
-        let age = slash_health::format_sync_age(&ts);
-        assert!(
-            age.contains("m ago"),
-            "expected minutes-ago format, got: {age}"
-        );
-    }
-
-    #[test]
-    fn format_sync_age_hours_ago() {
-        let now = chrono::Utc::now();
-        let two_hours_ago = now - chrono::Duration::hours(2);
-        let ts = two_hours_ago.to_rfc3339();
-        let age = slash_health::format_sync_age(&ts);
-        assert!(
-            age.contains("h ago"),
-            "expected hours-ago format, got: {age}"
-        );
-    }
-
-    #[test]
-    fn format_sync_age_days_ago() {
-        let now = chrono::Utc::now();
-        let three_days_ago = now - chrono::Duration::days(3);
-        let ts = three_days_ago.to_rfc3339();
-        let age = slash_health::format_sync_age(&ts);
-        assert!(
-            age.contains("d ago"),
-            "expected days-ago format, got: {age}"
-        );
-    }
-
-    #[test]
-    fn format_sync_age_mysql_datetime() {
-        // MySQL DATETIME without timezone — should parse as UTC
-        let age = slash_health::format_sync_age("2020-01-01 00:00:00");
-        assert!(
-            age.contains("d ago"),
-            "expected days-ago for old mysql datetime, got: {age}"
-        );
+        let cases = [
+            (now.to_rfc3339(), "s ago", "just now / seconds"),
+            ((now - chrono::Duration::minutes(5)).to_rfc3339(), "m ago", "minutes"),
+            ((now - chrono::Duration::hours(2)).to_rfc3339(), "h ago", "hours"),
+            ((now - chrono::Duration::days(3)).to_rfc3339(), "d ago", "days"),
+            ("2020-01-01 00:00:00".to_string(), "d ago", "mysql datetime"),
+        ];
+        for (ts, expected, label) in cases {
+            let age = slash_health::format_sync_age(&ts);
+            assert!(
+                age.contains(expected) || age == "just now",
+                "{label}: expected '{expected}', got: {age}"
+            );
+        }
     }
 
     #[test]
@@ -1931,74 +1892,47 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn format_duration_short_zero() {
-        assert_eq!(
-            format_duration_short(std::time::Duration::from_secs(0)),
-            "0s"
-        );
+    fn format_duration_short_values() {
+        let cases = [
+            (0u64, "0s"),
+            (45, "45s"),
+            (92, "1m32s"),
+            (7500, "2h5m"),
+        ];
+        for (secs, expected) in cases {
+            assert_eq!(
+                format_duration_short(std::time::Duration::from_secs(secs)),
+                expected,
+                "failed for {secs}s"
+            );
+        }
     }
 
     #[test]
-    fn format_duration_short_seconds() {
-        assert_eq!(
-            format_duration_short(std::time::Duration::from_secs(45)),
-            "45s"
-        );
-    }
-
-    #[test]
-    fn format_duration_short_minutes() {
-        assert_eq!(
-            format_duration_short(std::time::Duration::from_secs(92)),
-            "1m32s"
-        );
-    }
-
-    #[test]
-    fn format_duration_short_hours() {
-        assert_eq!(
-            format_duration_short(std::time::Duration::from_secs(7500)),
-            "2h5m"
-        );
-    }
-
-    #[test]
-    fn format_plan_progress_empty() {
+    fn format_plan_progress_values() {
+        // empty
         let s = format_plan_progress(0, 0, None, std::time::Duration::from_secs(0));
         assert!(s.contains("0/0 (0%)"));
         assert!(s.contains("0s elapsed"));
-    }
 
-    #[test]
-    fn format_plan_progress_first_subtask() {
+        // first subtask, no ETA when done==0
         let s = format_plan_progress(0, 5, None, std::time::Duration::from_secs(10));
         assert!(s.contains("0/5 (0%)"));
-        assert!(s.contains("10s elapsed"));
-        // No ETA when done==0
         assert!(!s.contains("remaining"));
-    }
 
-    #[test]
-    fn format_plan_progress_midway_with_eta() {
+        // midway with ETA
         let avg = Some(std::time::Duration::from_secs(60));
         let s = format_plan_progress(3, 7, avg, std::time::Duration::from_secs(180));
         assert!(s.contains("3/7 (42%)"));
-        assert!(s.contains("3m0s elapsed"));
-        assert!(s.contains("~4m0s remaining")); // 4 remaining × 60s avg
-    }
+        assert!(s.contains("~4m0s remaining"));
 
-    #[test]
-    fn format_plan_progress_complete() {
+        // complete
         let avg = Some(std::time::Duration::from_secs(30));
         let s = format_plan_progress(5, 5, avg, std::time::Duration::from_secs(150));
         assert!(s.contains("5/5 (100%)"));
-        // 0 remaining → "~0s remaining"
         assert!(s.contains("remaining"));
-    }
 
-    #[test]
-    fn format_plan_progress_bar_fills() {
-        // At 50% with 16-width bar, should have 8 filled + 8 empty
+        // bar fills at 50%
         let s = format_plan_progress(3, 6, None, std::time::Duration::from_secs(0));
         assert!(s.contains("████████░░░░░░░░"));
     }
@@ -2006,81 +1940,31 @@ total_tokens_out: 500
     // ── Cost Tracking Tests ──────────────────────────────────────────────
 
     #[test]
-    fn cost_for_tokens_basic() {
-        let pricing = astra_services::models::PricingData {
-            prompt: 0.003,     // $0.003 per 1K tokens = $3 per 1M
-            completion: 0.015, // $0.015 per 1K tokens = $15 per 1M
-            cache_read: None,
-            cache_write: None,
-        };
-        let cost = slash_stats::cost_for_tokens(1000, 500, 0, 0, &pricing);
-        // 1000 * 0.003/1000 + 500 * 0.015/1000 = 0.003 + 0.0075 = 0.0105
-        assert!(
-            (cost - 0.0105).abs() < 1e-10,
-            "cost should be $0.0105, got {cost}"
-        );
-    }
-
-    #[test]
-    fn cost_for_tokens_zero() {
+    fn cost_for_tokens_calculations() {
         let pricing = astra_services::models::PricingData {
             prompt: 0.003,
             completion: 0.015,
             cache_read: None,
             cache_write: None,
         };
-        assert_eq!(slash_stats::cost_for_tokens(0, 0, 0, 0, &pricing), 0.0);
-    }
+        // basic: 1000 prompt + 500 completion
+        assert!((slash_stats::cost_for_tokens(1000, 500, 0, 0, &pricing) - 0.0105).abs() < 1e-10);
+        // large: 1M prompt + 500K completion
+        assert!((slash_stats::cost_for_tokens(1_000_000, 500_000, 0, 0, &pricing) - 10.5).abs() < 1e-6);
 
-    #[test]
-    fn cost_for_tokens_zero_pricing() {
-        let pricing = astra_services::models::PricingData::default();
-        assert_eq!(
-            slash_stats::cost_for_tokens(10000, 5000, 0, 0, &pricing),
-            0.0
-        );
-    }
-
-    #[test]
-    fn cost_for_tokens_large_values() {
+        // with explicit cache rates
         let pricing = astra_services::models::PricingData {
             prompt: 0.003,
             completion: 0.015,
-            cache_read: None,
-            cache_write: None,
+            cache_read: Some(0.0003),
+            cache_write: Some(0.00375),
         };
-        // 1M prompt + 500K completion
-        let cost = slash_stats::cost_for_tokens(1_000_000, 500_000, 0, 0, &pricing);
-        // 1M * 0.003/1K + 500K * 0.015/1K = 3.0 + 7.5 = 10.5
-        assert!(
-            (cost - 10.5).abs() < 1e-6,
-            "large token cost should be $10.50, got {cost}"
-        );
-    }
-
-    #[test]
-    fn cost_for_tokens_with_cache() {
-        let pricing = astra_services::models::PricingData {
-            prompt: 0.003,
-            completion: 0.015,
-            cache_read: Some(0.0003),   // 10% of prompt
-            cache_write: Some(0.00375), // 125% of prompt
-        };
-        // 500 prompt + 200 completion + 1000 cache_read + 100 cache_write
         let cost = slash_stats::cost_for_tokens(500, 200, 1000, 100, &pricing);
-        let expected = (500.0 * 0.003 / 1000.0)
-            + (200.0 * 0.015 / 1000.0)
-            + (1000.0 * 0.0003 / 1000.0)
-            + (100.0 * 0.00375 / 1000.0);
-        assert!(
-            (cost - expected).abs() < 1e-10,
-            "cache cost should be {expected}, got {cost}"
-        );
-    }
+        let expected = (500.0 * 0.003 / 1000.0) + (200.0 * 0.015 / 1000.0)
+            + (1000.0 * 0.0003 / 1000.0) + (100.0 * 0.00375 / 1000.0);
+        assert!((cost - expected).abs() < 1e-10);
 
-    #[test]
-    fn cost_for_tokens_cache_fallback_rates() {
-        // When cache_read/cache_write are None, uses 10%/125% of prompt rate
+        // cache fallback rates (None → 10%/125% of prompt)
         let pricing = astra_services::models::PricingData {
             prompt: 0.003,
             completion: 0.015,
@@ -2089,158 +1973,97 @@ total_tokens_out: 500
         };
         let cost = slash_stats::cost_for_tokens(0, 0, 1000, 1000, &pricing);
         let expected = (1000.0 * 0.003 * 0.1 / 1000.0) + (1000.0 * 0.003 * 1.25 / 1000.0);
-        assert!(
-            (cost - expected).abs() < 1e-10,
-            "fallback cache cost should be {expected}, got {cost}"
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cost_for_tokens_edge_cases() {
+        let pricing = astra_services::models::PricingData {
+            prompt: 0.003,
+            completion: 0.015,
+            cache_read: None,
+            cache_write: None,
+        };
+        assert_eq!(slash_stats::cost_for_tokens(0, 0, 0, 0, &pricing), 0.0);
+        assert_eq!(
+            slash_stats::cost_for_tokens(10000, 5000, 0, 0, &astra_services::models::PricingData::default()),
+            0.0
         );
     }
 
-    #[test]
-    fn format_cost_sub_cent() {
-        assert_eq!(slash_stats::format_cost(0.0001), "$0.0001");
-        assert_eq!(slash_stats::format_cost(0.0099), "$0.0099");
-    }
+    // ── Format Cost Tests ──────────────────────────────────────────────
 
     #[test]
-    fn format_cost_sub_dollar() {
-        assert_eq!(slash_stats::format_cost(0.01), "$0.010");
-        assert_eq!(slash_stats::format_cost(0.123), "$0.123");
-        assert_eq!(slash_stats::format_cost(0.999), "$0.999");
+    fn format_cost_values() {
+        let cases = [
+            (0.0, "$0.0000"),
+            (0.0001, "$0.0001"),
+            (0.0099, "$0.0099"),
+            (0.01, "$0.010"),
+            (0.123, "$0.123"),
+            (0.999, "$0.999"),
+            (1.0, "$1.00"),
+            (12.345, "$12.35"),
+            (100.0, "$100.00"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(slash_stats::format_cost(input), expected, "failed for {input}");
+        }
     }
 
-    #[test]
-    fn format_cost_dollars() {
-        assert_eq!(slash_stats::format_cost(1.0), "$1.00");
-        assert_eq!(slash_stats::format_cost(12.345), "$12.35"); // rounds
-        assert_eq!(slash_stats::format_cost(100.0), "$100.00");
-    }
+    // ── Pricing extraction + fallback tests ────────────────────────────────────────
 
     #[test]
-    fn format_cost_zero() {
-        assert_eq!(slash_stats::format_cost(0.0), "$0.0000");
-    }
-
-    #[test]
-    fn extract_pricing_from_nested_object() {
-        let models = vec![serde_json::json!({
-            "name": "gpt-4",
-            "pricing": {
-                "prompt": 0.03,
-                "completion": 0.06
-            }
-        })];
+    fn extract_pricing_for_model_all_cases() {
+        let models = vec![
+            serde_json::json!({"name": "gpt-4", "pricing": {"prompt": 0.03, "completion": 0.06}}),
+            serde_json::json!({"name": "claude-3", "pricing_prompt": 0.008, "pricing_completion": 0.024}),
+        ];
+        // nested object
         let p = slash_stats::extract_pricing_for_model(&models, "gpt-4").unwrap();
         assert!((p.prompt - 0.03).abs() < 1e-10);
-        assert!((p.completion - 0.06).abs() < 1e-10);
-    }
-
-    #[test]
-    fn extract_pricing_from_flat_fields() {
-        let models = vec![serde_json::json!({
-            "name": "claude-3",
-            "pricing_prompt": 0.008,
-            "pricing_completion": 0.024
-        })];
+        // flat fields
         let p = slash_stats::extract_pricing_for_model(&models, "claude-3").unwrap();
         assert!((p.prompt - 0.008).abs() < 1e-10);
-        assert!((p.completion - 0.024).abs() < 1e-10);
-    }
-
-    #[test]
-    fn extract_pricing_model_not_found() {
-        let models = vec![
-            serde_json::json!({"name": "gpt-4", "pricing_prompt": 0.03, "pricing_completion": 0.06}),
-        ];
+        // not found
         assert!(slash_stats::extract_pricing_for_model(&models, "nonexistent").is_none());
-    }
-
-    #[test]
-    fn extract_pricing_empty_models() {
-        let models: Vec<serde_json::Value> = vec![];
-        assert!(slash_stats::extract_pricing_for_model(&models, "any").is_none());
-    }
-
-    #[test]
-    fn extract_pricing_zero_values_returns_none() {
-        let models = vec![serde_json::json!({
-            "name": "test",
-            "pricing_prompt": 0.0,
-            "pricing_completion": 0.0
-        })];
+        // empty models
+        assert!(slash_stats::extract_pricing_for_model(&[], "any").is_none());
+        // zero values
+        let models = vec![serde_json::json!({"name": "test", "pricing_prompt": 0.0, "pricing_completion": 0.0})];
         assert!(slash_stats::extract_pricing_for_model(&models, "test").is_none());
     }
 
-    // ── slash_stats::fallback_pricing tests ───────────────────────────────────────────
-
     #[test]
-    fn fallback_sonnet_pricing() {
+    fn fallback_pricing_known_models() {
+        let cases = [
+            ("claude-sonnet-4-20250514", 0.003, 0.015),
+            ("claude-opus-4-20250514", 0.015, 0.075),
+        ];
+        for (model, prompt, completion) in cases {
+            let p = slash_stats::fallback_pricing(model);
+            assert!((p.prompt - prompt).abs() < 1e-6, "prompt mismatch for {model}");
+            assert!((p.completion - completion).abs() < 1e-6, "completion mismatch for {model}");
+        }
+        // sonnet cache_read
         let p = slash_stats::fallback_pricing("claude-sonnet-4-20250514");
-        assert!((p.prompt - 0.003).abs() < 1e-6);
-        assert!((p.completion - 0.015).abs() < 1e-6);
         assert!(p.cache_read.is_some());
         assert!((p.cache_read.unwrap() - 0.0003).abs() < 1e-8);
+        // prompt-only checks for remaining models
+        assert!((slash_stats::fallback_pricing("claude-opus-4.5-20250415").prompt - 0.005).abs() < 1e-6);
+        assert!((slash_stats::fallback_pricing("claude-haiku-4.5-20250514").prompt - 0.001).abs() < 1e-6);
+        assert!((slash_stats::fallback_pricing("gpt-4o-2024-08-06").prompt - 0.0025).abs() < 1e-6);
+        assert!((slash_stats::fallback_pricing("deepseek-chat").prompt - 0.00027).abs() < 1e-8);
+        // unknown → sonnet pricing
+        assert!((slash_stats::fallback_pricing("some-unknown-model").prompt - 0.003).abs() < 1e-6);
     }
 
     #[test]
-    fn fallback_opus_4_pricing() {
-        let p = slash_stats::fallback_pricing("claude-opus-4-20250514");
-        assert!(
-            (p.prompt - 0.015).abs() < 1e-6,
-            "opus-4 prompt should be $15/Mtok"
-        );
-        assert!((p.completion - 0.075).abs() < 1e-6);
-    }
-
-    #[test]
-    fn fallback_opus_45_pricing() {
-        let p = slash_stats::fallback_pricing("claude-opus-4.5-20250415");
-        assert!(
-            (p.prompt - 0.005).abs() < 1e-6,
-            "opus 4.5 should be $5/Mtok"
-        );
-    }
-
-    #[test]
-    fn fallback_haiku_pricing() {
-        let p = slash_stats::fallback_pricing("claude-haiku-4.5-20250514");
-        assert!(
-            (p.prompt - 0.001).abs() < 1e-6,
-            "haiku 4.5 should be $1/Mtok"
-        );
-    }
-
-    #[test]
-    fn fallback_gpt4o_pricing() {
-        let p = slash_stats::fallback_pricing("gpt-4o-2024-08-06");
-        assert!((p.prompt - 0.0025).abs() < 1e-6);
-    }
-
-    #[test]
-    fn fallback_deepseek_pricing() {
-        let p = slash_stats::fallback_pricing("deepseek-chat");
-        assert!((p.prompt - 0.00027).abs() < 1e-8);
-    }
-
-    #[test]
-    fn fallback_unknown_uses_sonnet() {
-        let p = slash_stats::fallback_pricing("some-unknown-model");
-        assert!(
-            (p.prompt - 0.003).abs() < 1e-6,
-            "unknown model should default to sonnet pricing"
-        );
-    }
-
-    #[test]
-    fn fallback_cost_calculation_with_cache() {
-        // Sonnet: 1000 prompt + 500 completion + 2000 cache_read + 100 cache_creation
+    fn fallback_pricing_cost_calculation_with_cache() {
         let p = slash_stats::fallback_pricing("claude-sonnet-4-20250514");
         let cost = slash_stats::cost_for_tokens(1000, 500, 2000, 100, &p);
-        // $0.003/Ktok * 1 + $0.015/Ktok * 0.5 + $0.0003/Ktok * 2 + $0.00375/Ktok * 0.1
         let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
-        assert!(
-            (cost - expected).abs() < 1e-8,
-            "cost={cost} expected={expected}"
-        );
+        assert!((cost - expected).abs() < 1e-8);
     }
 
     // ── CLI arg parsing tests ─────────────────────────────────────────────

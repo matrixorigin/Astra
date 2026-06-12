@@ -5212,206 +5212,56 @@ mod tests {
         );
     }
 
+    /// Data-driven: covers explicit user path trust for affirmative phrasing
+    /// (Chinese quoted/unquoted, English, ASCII brackets, full-width punctuation),
+    /// negation (Chinese/English), and substring false positives.
     #[test]
-    fn explicit_user_path_trust_allows_named_outside_file() {
+    fn explicit_user_path_trust_respects_intent_and_punctuation() {
+        let cases: Vec<(&str, &str, bool)> = vec![
+            // ── affirmative (Allow) ──
+            ("请读取 '{}', 然后修复问题", "notes.txt", true),
+            ("分析和修复: {}", "evidence.jsonl", true),
+            ("please read {}", "evidence.jsonl", true),
+            ("please read [{}]", "notes.txt", true),
+            ("分析和修复：{}", "evidence.jsonl", true),
+            // ── negated / false-positive (NeedApproval) ──
+            ("already {}", "notes.txt", false),
+            ("不要碰 {}", "passwd", false),
+            ("don't touch {}", "passwd", false),
+        ];
+
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "hello").unwrap();
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("请读取 '{}', 然后修复问题", target.display()));
+        for (idx, (template, filename, expect_allow)) in cases.iter().enumerate() {
+            let target = outside.path().join(filename);
+            std::fs::write(&target, "test").unwrap();
 
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "user-explicit file path should be trusted for this session; got {decision:?}"
-        );
-    }
+            let mut pm =
+                PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+            pm.trust_explicit_user_paths(&template.replace("{}", &target.display().to_string()));
 
-    #[test]
-    fn explicit_user_path_trust_accepts_unquoted_action_target() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("evidence.jsonl");
-        std::fs::write(&target, "hello").unwrap();
+            let args = serde_json::json!({
+                "reason": format!(
+                    "Path '{}' is outside the project directory '{}'.",
+                    target.display(),
+                    project.path().display()
+                ),
+            });
+            let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("分析和修复: {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "affirmative action request should trust the named path; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_accepts_english_action_target() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("evidence.jsonl");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("please read {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "english affirmative request should trust the named path; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_rejects_ascii_substring_false_positive() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("already {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "substring overlap like 'already' must not count as 'read'; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_rejects_negated_mentions() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("passwd");
-        std::fs::write(&target, "root:x:0:0").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("不要碰 {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "negated path mention must not auto-trust; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_rejects_english_negation() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("passwd");
-        std::fs::write(&target, "root:x:0:0").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("don't touch {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "english negation must not auto-trust; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_handles_ascii_brackets() {
-        // Real user phrasing wraps paths in ASCII brackets when quoting
-        // them inside commentary — e.g. "please look at (/tmp/x) carefully".
-        // Tokenizing on whitespace alone leaves the bracket characters
-        // attached to the path and the trust path never matches.
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("please read [{}]", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "ASCII square brackets must split off the path; got {decision:?}",
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_handles_fullwidth_punctuation() {
-        // Real-world Chinese input often uses full-width punctuation
-        // (`：`, `，`, `。`).  `str::split_whitespace` does NOT split on
-        // these characters, so a naive tokenizer collapses
-        // `"修复：/tmp/x"` into a single token and never recognizes the
-        // path. Trust must still kick in for affirmative phrasing using
-        // full-width punctuation.
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("evidence.jsonl");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("分析和修复：{}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "full-width colon must not block tokenization of the path; got {decision:?}",
-        );
+            if *expect_allow {
+                assert!(
+                    matches!(decision, PermissionDecision::Allow),
+                    "[{idx}] '{template}' — expected Allow, got {decision:?}"
+                );
+            } else {
+                assert!(
+                    matches!(decision, PermissionDecision::NeedApproval { .. }),
+                    "[{idx}] '{template}' — expected NeedApproval, got {decision:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6882,69 +6732,35 @@ mod tests {
 
     // ── explicit cloud approval + Auto-run ────────────────────────────────────
 
+    /// Data-driven: explicit cloud approval respects auto-run / deny / quiet combos.
     #[test]
-    fn explicit_cloud_approval_auto_mode_allows() {
-        let mut pm = PermissionManager::new(true);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            false,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Allow),
-            "explicit approval should be allowed in Auto mode"
-        );
-    }
+    fn explicit_cloud_approval_respects_mode_and_quiet() {
+        let cases: Vec<(&str, fn() -> PermissionManager, bool, astra_thin_client::ApprovalDecision)> = vec![
+            ("Auto", || PermissionManager::new(true), false, astra_thin_client::ApprovalDecision::Allow),
+            ("Deny", || {
+                let mut pm = PermissionManager::new(false);
+                pm.set_mode(PermissionMode::Deny);
+                pm
+            }, false, astra_thin_client::ApprovalDecision::Deny),
+            ("quiet+Auto", || PermissionManager::new(true), true, astra_thin_client::ApprovalDecision::Allow),
+            ("quiet+Prompt", || PermissionManager::new(false), true, astra_thin_client::ApprovalDecision::Deny),
+        ];
 
-    #[test]
-    fn explicit_cloud_approval_deny_mode_denies() {
-        let mut pm = PermissionManager::new(false);
-        pm.set_mode(PermissionMode::Deny);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            false,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Deny),
-            "explicit approval should be denied in Deny mode"
-        );
-    }
-
-    #[test]
-    fn explicit_cloud_approval_quiet_auto_allows() {
-        let mut pm = PermissionManager::new(true);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            true,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Allow),
-            "quiet + Auto should allow explicit"
-        );
-    }
-
-    #[test]
-    fn explicit_cloud_approval_quiet_prompt_denies() {
-        let mut pm = PermissionManager::new(false);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            true,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Deny),
-            "quiet + Prompt should deny explicit"
-        );
+        for (label, setup, quiet, expected) in &cases {
+            let mut pm = setup();
+            let decision = pm.resolve_cloud_approval(
+                "bash",
+                Some("echo hello"),
+                None,
+                ApprovalKind::Explicit,
+                *quiet,
+            );
+            let expected_dbg = format!("{expected:?}");
+            assert!(
+                format!("{decision:?}") == expected_dbg,
+                "[{label}] expected {expected:?}, got {decision:?}"
+            );
+        }
     }
 
     // ── apply_cloud_approval_choice ────────────────────────────────────────────

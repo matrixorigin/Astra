@@ -5140,13 +5140,13 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_simple() {
-        assert_eq!(shell_escape("hello"), "'hello'");
-    }
-
-    #[test]
-    fn shell_escape_with_quotes() {
-        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    fn test_shell_escape() {
+        for (input, expected) in [
+            ("hello", "'hello'"),
+            ("it's", "'it'\\''s'"),
+        ] {
+            assert_eq!(super::shell_escape(input), expected);
+        }
     }
 
     #[test]
@@ -7196,90 +7196,30 @@ mod tests {
     // ── HTML detection ──────────────────────────────────────────────────────
 
     #[test]
-    fn looks_like_html_detects_doctype() {
-        assert!(looks_like_html(
-            "<!DOCTYPE html><html><body>hello</body></html>"
-        ));
-        assert!(looks_like_html("<!doctype html>\n<html>"));
-    }
-
-    #[test]
-    fn looks_like_html_detects_html_tag() {
-        assert!(looks_like_html("<html lang=\"en\"><head></head></html>"));
-        assert!(looks_like_html("<HTML><BODY>hi</BODY></HTML>"));
-    }
-
-    #[test]
-    fn looks_like_html_rejects_plain_text() {
-        assert!(!looks_like_html("Hello world, this is plain text."));
-        assert!(!looks_like_html("{\"key\": \"value\"}"));
-        assert!(!looks_like_html("# Markdown heading\n\nSome text."));
-    }
-
-    #[test]
-    fn looks_like_html_rejects_xml_without_body() {
-        assert!(!looks_like_html("<root><item>data</item></root>"));
+    fn looks_like_html_classification() {
+        let positive: &[&str] = &[
+            "<!DOCTYPE html><html><body>hello</body></html>",
+            "<!doctype html>\n<html>",
+            "<html lang=\"en\"><head></head></html>",
+            "<HTML><BODY>hi</BODY></HTML>",
+        ];
+        let negative: &[&str] = &[
+            "Hello world, this is plain text.",
+            "{\"key\": \"value\"}",
+            "# Markdown heading\n\nSome text.",
+            "<root><item>data</item></root>",
+            r#"{"name": "test", "value": 42}"#,
+            "This is just plain text\nwith some newlines.",
+        ];
+        for s in positive {
+            assert!(looks_like_html(s), "should detect HTML: {s}");
+        }
+        for s in negative {
+            assert!(!looks_like_html(s), "should reject non-HTML: {s}");
+        }
     }
 
     // ── HTML-to-text conversion ─────────────────────────────────────────────
-
-    #[test]
-    fn html_to_text_strips_tags() {
-        let html = "<p>Hello <b>world</b></p>";
-        let text = html_to_text(html);
-        assert!(text.contains("Hello"));
-        assert!(text.contains("world"));
-        assert!(!text.contains("<p>"));
-        assert!(!text.contains("<b>"));
-    }
-
-    #[test]
-    fn html_to_text_removes_script_and_style() {
-        let html = "<html><head><style>body{color:red}</style></head>\
-                     <body><script>alert('xss')</script><p>content</p></body></html>";
-        let text = html_to_text(html);
-        assert!(text.contains("content"), "got: {text}");
-        assert!(!text.contains("alert"), "script not stripped: {text}");
-        assert!(!text.contains("color:red"), "style not stripped: {text}");
-    }
-
-    #[test]
-    fn html_to_text_decodes_entities() {
-        let html = "<p>A &amp; B &lt; C &gt; D &quot;E&quot; F&apos;s</p>";
-        let text = html_to_text(html);
-        assert!(text.contains("A & B"), "got: {text}");
-        assert!(text.contains("< C >"), "got: {text}");
-        assert!(text.contains("\"E\""), "got: {text}");
-        assert!(text.contains("F's"), "got: {text}");
-    }
-
-    #[test]
-    fn html_to_text_decodes_numeric_entities() {
-        let html = "<p>&#65;&#66;&#67;</p>"; // ABC
-        let text = html_to_text(html);
-        assert!(text.contains("ABC"), "got: {text}");
-    }
-
-    #[test]
-    fn html_to_text_inserts_newlines_for_blocks() {
-        let html = "<h1>Title</h1><p>Paragraph one.</p><p>Paragraph two.</p>";
-        let text = html_to_text(html);
-        // Block elements should create line breaks
-        assert!(text.contains("Title"), "got: {text}");
-        assert!(
-            text.contains("Paragraph one.") && text.contains("Paragraph two."),
-            "got: {text}"
-        );
-    }
-
-    #[test]
-    fn html_to_text_collapses_whitespace() {
-        let html = "<p>  lots   of    spaces  </p>\n\n\n\n\n<p>many newlines</p>";
-        let text = html_to_text(html);
-        assert!(!text.contains("     "), "excessive spaces: {text}");
-        // No more than 2 consecutive newlines
-        assert!(!text.contains("\n\n\n"), "excessive newlines: {text}");
-    }
 
     #[test]
     fn html_to_text_handles_real_page() {
@@ -7294,35 +7234,35 @@ mod tests {
 <body>
   <div id="main">
     <h1>Welcome</h1>
-    <p>This is a <a href="/about">test page</a> with links.</p>
+    <p>This is a <a href="/about">test page</a> with links &amp; entities &lt;&gt;.</p>
+    <p>&#65;&#66;&#67; numeric</p>
     <ul>
-      <li>Item 1</li>
-      <li>Item 2</li>
+      <li>Item 1 &quot;quoted&quot;</li>
+      <li>Item 2&apos;s</li>
     </ul>
   </div>
   <script src="analytics.js"></script>
 </body>
 </html>"#;
         let text = html_to_text(html);
+        // tag stripping
         assert!(text.contains("Welcome"), "missing heading: {text}");
         assert!(text.contains("test page"), "missing link text: {text}");
         assert!(text.contains("Item 1"), "missing list item: {text}");
-        assert!(!text.contains("<"), "tags not stripped: {text}");
+        assert!(!text.contains("<p>"), "HTML tags not stripped: {text}");
+        assert!(!text.contains("<h1>"), "HTML tags not stripped: {text}");
+        assert!(!text.contains("<div"), "HTML tags not stripped: {text}");
+        // script/style removal
         assert!(!text.contains("window.ga"), "script not removed: {text}");
         assert!(!text.contains("margin: 0"), "style not removed: {text}");
-    }
-
-    #[test]
-    fn html_to_text_passthrough_json() {
-        // JSON is not HTML, so it passes through unchanged
-        let json = r#"{"name": "test", "value": 42}"#;
-        assert!(!looks_like_html(json));
-    }
-
-    #[test]
-    fn html_to_text_passthrough_plain_text() {
-        let plain = "This is just plain text\nwith some newlines.";
-        assert!(!looks_like_html(plain));
+        // entity decoding (named and numeric)
+        assert!(text.contains("&"), "named entity not decoded: {text}");
+        assert!(text.contains("<"), "lt entity not decoded: {text}");
+        assert!(text.contains("ABC"), "numeric entity not decoded: {text}");
+        assert!(text.contains("\"quoted\""), "quot entity not decoded: {text}");
+        assert!(text.contains("Item 2's"), "apos entity not decoded: {text}");
+        // whitespace collapse: no triple newlines
+        assert!(!text.contains("\n\n\n"), "excessive newlines: {text}");
     }
 
     // ── grep context_lines and max_matches ───────────────────────────────────
@@ -7920,42 +7860,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn interpret_grep_exit_1_is_not_error() {
-        let r = interpret_exit_code("grep -r foo .", 1);
-        assert!(!r.is_error);
-        assert_eq!(r.note, Some("No matches found"));
-    }
-
-    #[test]
-    fn interpret_grep_exit_2_is_error() {
-        let r = interpret_exit_code("grep -r foo .", 2);
-        assert!(r.is_error);
-    }
-
-    #[test]
-    fn interpret_diff_exit_1_is_not_error() {
-        let r = interpret_exit_code("diff a b", 1);
-        assert!(!r.is_error);
-    }
-
-    #[test]
-    fn interpret_test_exit_1_is_not_error() {
-        let r = interpret_exit_code("test -f /tmp/x", 1);
-        assert!(!r.is_error);
-    }
-
-    #[test]
-    fn interpret_pipeline_uses_last_command() {
-        // `cat file | grep pattern` — grep is the last command
-        let r = interpret_exit_code("cat file | grep pattern", 1);
-        assert!(!r.is_error);
-        assert_eq!(r.note, Some("No matches found"));
-    }
-
-    #[test]
-    fn interpret_unknown_command_exit_1_is_error() {
-        let r = interpret_exit_code("cargo build", 1);
-        assert!(r.is_error);
+    fn interpret_exit_code_rules() {
+        let cases: &[(&str, i32, bool, Option<&str>)] = &[
+            ("grep -r foo .", 1, false, Some("No matches found")),
+            ("grep -r foo .", 2, true, None),
+            ("diff a b", 1, false, None),
+            ("test -f /tmp/x", 1, false, None),
+            ("cat file | grep pattern", 1, false, Some("No matches found")),
+            ("cargo build", 1, true, None),
+        ];
+        for (cmdline, code, is_error, note) in cases {
+            let r = interpret_exit_code(cmdline, *code);
+            assert_eq!(r.is_error, *is_error, "cmd={cmdline} code={code}");
+            assert_eq!(r.note.as_deref(), *note, "cmd={cmdline} code={code}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7963,26 +7881,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn destructive_warning_git_reset_hard() {
-        assert!(destructive_command_warning("git reset --hard HEAD~1").is_some());
-    }
-
-    #[test]
-    fn destructive_warning_git_push_force() {
-        assert!(destructive_command_warning("git push --force origin main").is_some());
-        assert!(destructive_command_warning("git push -f origin main").is_some());
-    }
-
-    #[test]
-    fn destructive_warning_safe_commands() {
-        assert!(destructive_command_warning("git status").is_none());
-        assert!(destructive_command_warning("ls -la").is_none());
-        assert!(destructive_command_warning("cargo test").is_none());
-    }
-
-    #[test]
-    fn destructive_warning_no_verify() {
-        assert!(destructive_command_warning("git commit --no-verify -m 'x'").is_some());
+    fn destructive_command_warning_rules() {
+        // dangerous commands
+        for cmd in [
+            "git reset --hard HEAD~1",
+            "git push --force origin main",
+            "git push -f origin main",
+            "git commit --no-verify -m 'x'",
+        ] {
+            assert!(destructive_command_warning(cmd).is_some(), "dangerous: {cmd}");
+        }
+        // safe commands
+        for cmd in ["git status", "ls -la", "cargo test"] {
+            assert!(destructive_command_warning(cmd).is_none(), "safe: {cmd}");
+        }
     }
 
     #[test]

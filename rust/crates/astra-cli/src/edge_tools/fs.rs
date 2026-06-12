@@ -3950,19 +3950,21 @@ type Handler interface {
     // ── normalize_ws ─────────────────────────────────────────────────────────
 
     #[test]
-    fn normalize_ws_collapses_whitespace() {
+    fn text_utility_functions() {
+        // normalize_ws collapses whitespace
         assert_eq!(normalize_ws("  fn   hello(  ) "), "fn hello( )");
-    }
 
-    #[test]
-    fn truncate_str_within_limit() {
+        // truncate_str within limit returns unchanged
         assert_eq!(truncate_str("short", 10), "short");
-    }
+        // truncate_str over limit truncates with ellipsis
+        assert_eq!(truncate_str("this is a long string", 7), "this is…");
 
-    #[test]
-    fn truncate_str_over_limit_uses_runtime_helper() {
-        let result = truncate_str("this is a long string", 7);
-        assert_eq!(result, "this is…");
+        // similarity_score: exact match = 100
+        assert_eq!(similarity_score("test.rs", "test.rs"), 100);
+        // same extension scores higher than different extension
+        let with_ext = similarity_score("config.rs", "setting.rs");
+        let without_ext = similarity_score("config.rs", "setting.py");
+        assert!(with_ext > without_ext, "same ext should score higher");
     }
 
     // ── file_outline: generic fallback ───────────────────────────────────────
@@ -4048,12 +4050,10 @@ type Handler interface {
     }
 
     #[test]
-    fn similarity_score_exact_match_highest() {
+    fn similarity_and_utility_functions() {
+        // similarity_score: exact match = 100
         assert_eq!(similarity_score("test.rs", "test.rs"), 100);
-    }
-
-    #[test]
-    fn similarity_score_same_extension_bonus() {
+        // same extension scores higher than different extension
         let with_ext = similarity_score("config.rs", "setting.rs");
         let without_ext = similarity_score("config.rs", "setting.py");
         assert!(with_ext > without_ext, "same ext should score higher");
@@ -4062,33 +4062,24 @@ type Handler interface {
     // ── auto_format_file tests ──────────────────────────────────────────────
 
     #[test]
-    fn auto_format_unknown_extension_returns_none() {
+    fn auto_format_skips_without_project_config() {
+        // Unknown extension
         let tmpdir = tempfile::tempdir().unwrap();
         let file = tmpdir.path().join("data.xyz");
         std::fs::write(&file, "content").unwrap();
         assert!(auto_format_file(&file, tmpdir.path()).is_none());
-    }
 
-    #[test]
-    fn auto_format_rs_without_cargo_toml_returns_none() {
-        let tmpdir = tempfile::tempdir().unwrap();
+        // .rs without Cargo.toml
         let file = tmpdir.path().join("main.rs");
         std::fs::write(&file, "fn main() {}").unwrap();
-        // No Cargo.toml in tmpdir → should skip
         assert!(auto_format_file(&file, tmpdir.path()).is_none());
-    }
 
-    #[test]
-    fn auto_format_py_without_pyproject_returns_none() {
-        let tmpdir = tempfile::tempdir().unwrap();
+        // .py without pyproject.toml
         let file = tmpdir.path().join("main.py");
         std::fs::write(&file, "print('hello')").unwrap();
         assert!(auto_format_file(&file, tmpdir.path()).is_none());
-    }
 
-    #[test]
-    fn auto_format_ts_without_package_json_returns_none() {
-        let tmpdir = tempfile::tempdir().unwrap();
+        // .ts without package.json
         let file = tmpdir.path().join("app.ts");
         std::fs::write(&file, "const x = 1;").unwrap();
         assert!(auto_format_file(&file, tmpdir.path()).is_none());
@@ -4199,36 +4190,27 @@ type Handler interface {
     }
 
     #[test]
-    fn delete_file_rejects_missing() {
+    fn delete_file_rejects_invalid_targets() {
         let tmpdir = tempfile::tempdir().unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
-        let result = exe.delete_file(&json!({"path": "nope.txt"}));
-        assert!(result.contains("not found"), "result: {result}");
-    }
 
-    #[test]
-    fn delete_file_rejects_directory() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmpdir.path().join("subdir")).unwrap();
-        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
-        let result = exe.delete_file(&json!({"path": "subdir"}));
+        // Missing file
         assert!(
-            result.contains("refusing to delete a directory"),
-            "result: {result}"
+            exe.delete_file(&json!({"path": "nope.txt"})).contains("not found")
         );
-    }
 
-    #[test]
-    fn delete_file_rejects_git_contents() {
-        let tmpdir = tempfile::tempdir().unwrap();
+        // Directory
+        std::fs::create_dir(tmpdir.path().join("subdir")).unwrap();
+        assert!(
+            exe.delete_file(&json!({"path": "subdir"})).contains("refusing to delete a directory")
+        );
+
+        // Path inside .git
         let git_dir = tmpdir.path().join(".git");
         std::fs::create_dir(&git_dir).unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
-        let result = exe.delete_file(&json!({"path": ".git/HEAD"}));
         assert!(
-            result.contains("refusing to delete .git"),
-            "result: {result}"
+            exe.delete_file(&json!({"path": ".git/HEAD"})).contains("refusing to delete .git")
         );
     }
 

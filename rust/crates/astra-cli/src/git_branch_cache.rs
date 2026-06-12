@@ -89,43 +89,29 @@ mod tests {
     use super::{clear_cache, detect_git_branch_cached, detect_with_ttl, lookup_branch};
     use std::time::{Duration, Instant};
 
-    /// Calling the cached lookup twice in quick succession should not re-run
-    /// `gix::discover`. We verify this indirectly: the second call must return
-    /// the same value as the first within the TTL window, **and** completing
-    /// 1k consecutive calls must take well under the cost of 1k gix discoveries
-    /// (which is ms-level on real repos). We check elapsed time as a coarse
-    /// regression guard against accidentally bypassing the cache.
     #[test]
-    fn second_call_within_ttl_is_fast() {
+    fn cache_hit_is_fast_and_stale_refreshes() {
         clear_cache();
+
+        // TTL=2s: 1000 consecutive cached calls must be fast
         let first = detect_git_branch_cached();
         let start = Instant::now();
         for _ in 0..1000 {
             let _ = detect_git_branch_cached();
         }
         let elapsed = start.elapsed();
-        // 1000 cached lookups must complete in well under what 1000
-        // uncached `gix::discover` calls would take. 200ms is a generous
-        // ceiling — uncached we'd typically be in the seconds range.
         assert!(
             elapsed < Duration::from_millis(200),
-            "1000 cached lookups took {:?}; cache likely bypassed",
-            elapsed
+            "1000 cached lookups took {elapsed:?}; cache likely bypassed"
         );
-        // And the answer should be stable within the TTL window.
         let again = detect_git_branch_cached();
         assert_eq!(first, again, "cached branch must be stable within TTL");
-    }
 
-    /// After expiring the TTL, the cache must refresh. Use a zero TTL so every
-    /// call refreshes — this checks the refresh path doesn't panic and still
-    /// returns a value consistent with the inline `lookup_branch`.
-    #[test]
-    fn expired_ttl_refreshes() {
+        // TTL=0: every call refreshes — must match direct lookup
         clear_cache();
         let cwd = std::env::current_dir().unwrap();
         let direct = lookup_branch(&cwd);
         let cached = detect_with_ttl(Duration::from_secs(0));
-        assert_eq!(direct, cached);
+        assert_eq!(direct, cached, "zero-TTL must match direct lookup");
     }
 }
