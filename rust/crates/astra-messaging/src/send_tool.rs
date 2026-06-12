@@ -201,7 +201,8 @@ mod tests {
     }
 
     #[test]
-    fn is_send_message_matches() {
+    fn is_send_message_call_cases() {
+        // matches
         let call = serde_json::json!({
             "id": "call_123",
             "type": "function",
@@ -211,38 +212,28 @@ mod tests {
             }
         });
         assert!(is_send_message_call(&call));
-    }
 
-    #[test]
-    fn is_send_message_rejects_other() {
+        // rejects other tools
         let call = serde_json::json!({
             "id": "call_456",
             "type": "function",
             "function": { "name": "delegate", "arguments": "{}" }
         });
         assert!(!is_send_message_call(&call));
+
+        // case-insensitive + whitespace-tolerant
+        for name in &["SEND_MESSAGE", " Send_Message "] {
+            let call = serde_json::json!({
+                "id": "x",
+                "function": {"name": name, "arguments": "{}"}
+            });
+            assert!(is_send_message_call(&call), "name={name}");
+        }
     }
 
     #[test]
-    fn is_send_message_call_is_case_insensitive() {
-        // Mixed-case must still detect — runtime allowlist gating lowercases,
-        // and this detector must agree on what "send_message" means or a
-        // mixed-case call would fall through as an unknown tool.
-        let upper = serde_json::json!({
-            "id": "x",
-            "function": {"name": "SEND_MESSAGE", "arguments": "{}"}
-        });
-        assert!(is_send_message_call(&upper));
-
-        let with_space = serde_json::json!({
-            "id": "x",
-            "function": {"name": " Send_Message ", "arguments": "{}"}
-        });
-        assert!(is_send_message_call(&with_space));
-    }
-
-    #[test]
-    fn parse_extracts_args() {
+    fn parse_send_message_call_cases() {
+        // extracts args
         let call = serde_json::json!({
             "id": "call_789",
             "type": "function",
@@ -255,10 +246,8 @@ mod tests {
         assert_eq!(id, "call_789");
         assert_eq!(args["target"], "broadcast");
         assert_eq!(args["content"], "hello peers");
-    }
 
-    #[test]
-    fn parse_fails_on_bad_json() {
+        // fails on bad JSON
         let call = serde_json::json!({
             "id": "call_bad",
             "type": "function",
