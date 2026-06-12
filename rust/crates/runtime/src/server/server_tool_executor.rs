@@ -1587,7 +1587,7 @@ impl ServerToolExecutor {
         )
     }
 
-    fn emit_work_surface_event(&self, mut event: Map<String, Value>, unavailable_label: &str) {
+    fn try_emit_work_surface_event(&self, mut event: Map<String, Value>, unavailable_label: &str) {
         let Some(tx) = &self.work_surface_event_tx else {
             return;
         };
@@ -1595,6 +1595,27 @@ impl ServerToolExecutor {
             event.entry(key).or_insert(value);
         }
         if let Err(error) = tx.try_send(Value::Object(event)) {
+            tracing::debug!(
+                target: "astra_runtime::work_surface",
+                session_id = %self.session_id,
+                error = %error,
+                "{unavailable_label}"
+            );
+        }
+    }
+
+    async fn emit_work_surface_event(
+        &self,
+        mut event: Map<String, Value>,
+        unavailable_label: &str,
+    ) {
+        let Some(tx) = &self.work_surface_event_tx else {
+            return;
+        };
+        for (key, value) in self.binding_event_fields() {
+            event.entry(key).or_insert(value);
+        }
+        if let Err(error) = tx.send(Value::Object(event)).await {
             tracing::debug!(
                 target: "astra_runtime::work_surface",
                 session_id = %self.session_id,
@@ -1614,7 +1635,7 @@ impl ServerToolExecutor {
             "session_id".to_string(),
             Value::String(self.session_id.clone()),
         );
-        self.emit_work_surface_event(
+        self.try_emit_work_surface_event(
             workspace_event,
             "work-surface workspace binding event channel unavailable",
         );
@@ -1628,7 +1649,7 @@ impl ServerToolExecutor {
             "session_id".to_string(),
             Value::String(self.session_id.clone()),
         );
-        self.emit_work_surface_event(
+        self.try_emit_work_surface_event(
             executor_event,
             "work-surface executor binding event channel unavailable",
         );
@@ -1640,7 +1661,7 @@ impl ServerToolExecutor {
         }
     }
 
-    fn emit_tool_routing_decision(
+    async fn emit_tool_routing_decision(
         &self,
         name: &str,
         args: &Value,
@@ -1665,10 +1686,11 @@ impl ServerToolExecutor {
         if let Some(route_fields) = route_fields {
             Self::insert_event_binding_fields(&mut event, route_fields);
         }
-        self.emit_work_surface_event(event, "work-surface tool routing event channel unavailable");
+        self.emit_work_surface_event(event, "work-surface tool routing event channel unavailable")
+            .await;
     }
 
-    fn emit_tool_transport_started(
+    async fn emit_tool_transport_started(
         &self,
         name: &str,
         args: &Value,
@@ -1689,10 +1711,11 @@ impl ServerToolExecutor {
         if let Some(route_fields) = route_fields {
             Self::insert_event_binding_fields(&mut event, route_fields);
         }
-        self.emit_work_surface_event(event, "work-surface tool start event channel unavailable");
+        self.emit_work_surface_event(event, "work-surface tool start event channel unavailable")
+            .await;
     }
 
-    fn emit_tool_transport_finished(
+    async fn emit_tool_transport_finished(
         &self,
         name: &str,
         args: &Value,
@@ -1729,12 +1752,14 @@ impl ServerToolExecutor {
         self.emit_work_surface_event(
             event,
             "work-surface tool transport completion event channel unavailable",
-        );
-        self.emit_executor_blocked_if_needed(name, args, result);
-        self.emit_agent_waiting_if_needed(name, args, result);
+        )
+        .await;
+        self.emit_executor_blocked_if_needed(name, args, result)
+            .await;
+        self.emit_agent_waiting_if_needed(name, args, result).await;
     }
 
-    fn emit_agent_waiting_if_needed(
+    async fn emit_agent_waiting_if_needed(
         &self,
         name: &str,
         args: &Value,
@@ -1784,10 +1809,11 @@ impl ServerToolExecutor {
         self.emit_work_surface_event(
             event,
             "work-surface agent waiting event channel unavailable",
-        );
+        )
+        .await;
     }
 
-    fn emit_executor_blocked_if_needed(
+    async fn emit_executor_blocked_if_needed(
         &self,
         name: &str,
         args: &Value,
@@ -1838,7 +1864,8 @@ impl ServerToolExecutor {
         self.emit_work_surface_event(
             executor_event,
             "work-surface executor status event channel unavailable",
-        );
+        )
+        .await;
 
         let mut blocked_event = Map::new();
         blocked_event.insert("type".to_string(), Value::String("run_blocked".to_string()));
@@ -1855,13 +1882,13 @@ impl ServerToolExecutor {
             blocked_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
         }
         blocked_event.insert("tool".to_string(), Value::String(name.to_string()));
-        blocked_event.insert("reason".to_string(), Value::String(reason.to_string()));
         blocked_event.insert("message".to_string(), Value::String(result.output.clone()));
         copy_result_routing_metadata(&mut blocked_event, result);
         self.emit_work_surface_event(
             blocked_event,
             "work-surface run blocked event channel unavailable",
-        );
+        )
+        .await;
     }
 
     fn attach_binding_metadata(&self, result: &mut astra_tools::ToolResult) {
@@ -2498,8 +2525,10 @@ impl ServerToolExecutor {
         let request = self.tool_execution_request(name, args);
         let route = self.tool_execution_service.routing_decision(&request);
         let route_fields = route_binding_event_fields(route, &request);
-        self.emit_tool_routing_decision(name, args, route, route_fields.as_ref());
-        self.emit_tool_transport_started(name, args, route_fields.as_ref());
+        self.emit_tool_routing_decision(name, args, route, route_fields.as_ref())
+            .await;
+        self.emit_tool_transport_started(name, args, route_fields.as_ref())
+            .await;
 
         let execution = self.tool_execution_service.execute(request, self);
         let mut result = if let Some(token) = self.cancel_token.as_ref() {
@@ -2514,8 +2543,10 @@ impl ServerToolExecutor {
 
         self.attach_binding_metadata(&mut result);
         let duration_ms = started_at.elapsed().as_millis() as u64;
-        self.emit_tool_transport_finished(name, args, &result, duration_ms);
-        self.emit_tool_call_end(name, args, &result, duration_ms);
+        self.emit_tool_transport_finished(name, args, &result, duration_ms)
+            .await;
+        self.emit_tool_call_end(name, args, &result, duration_ms)
+            .await;
 
         result
     }
@@ -4208,10 +4239,11 @@ impl ServerToolExecutor {
         Self::insert_run_id(&mut event, args);
         event.insert("reason".to_string(), Value::String(reason.to_string()));
         event.insert("tasks".to_string(), json!(tasks));
-        self.emit_work_surface_event(event, "work-surface task board event channel unavailable");
+        self.emit_work_surface_event(event, "work-surface task board event channel unavailable")
+            .await;
     }
 
-    fn emit_tool_call_end(
+    async fn emit_tool_call_end(
         &self,
         name: &str,
         args: &Value,
@@ -4239,7 +4271,8 @@ impl ServerToolExecutor {
         self.emit_work_surface_event(
             event,
             "work-surface tool completion event channel unavailable",
-        );
+        )
+        .await;
     }
 
     #[allow(dead_code)]
@@ -6115,7 +6148,8 @@ mod tests {
             &json!({"_tool_call_id": "call-agent"}),
             &result,
             12,
-        );
+        )
+        .await;
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -7076,11 +7110,18 @@ esac
     #[tokio::test]
     async fn edge_bound_binding_does_not_fallback_to_server_local_when_offline() {
         let (mut exec, _dir) = test_executor();
-        exec.set_edge_workspace_binding(
-            "edge-macbook-1",
-            "MacBook Pro",
-            "/Users/test/project",
-            WorkspaceAuthority::ReadWrite,
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-macbook-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+            ),
         );
 
         let result = exec
@@ -7176,11 +7217,18 @@ esac
         let (mut exec, _dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
-        exec.set_edge_workspace_binding(
-            "edge-macbook-1",
-            "MacBook Pro",
-            "/Users/test/project",
-            WorkspaceAuthority::ReadWrite,
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-macbook-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+            ),
         );
 
         let result = exec

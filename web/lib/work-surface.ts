@@ -272,7 +272,7 @@ export function applyWorkSurfaceEvent(
   event: Record<string, unknown>,
 ): WorkSurfaceState {
   const type = typeof event.type === "string" ? event.type : "";
-  if (type.startsWith("run_blocked_")) {
+  if (type === "run_blocked") {
     return applyRunBlockedEvent(state, event);
   }
   switch (type) {

@@ -1022,6 +1022,8 @@ fn build_ws_chat_request(
         allow_skills,
         allow_skill_sources,
         allow_tools,
+        workspace_binding: None,
+        executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
         mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),

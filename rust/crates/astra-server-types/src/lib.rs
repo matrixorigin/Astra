@@ -94,6 +94,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub allow_tools: Option<Vec<String>>,
     #[serde(default)]
+    pub workspace_binding: Option<astra_services::runs::WorkspaceBindingRequest>,
+    #[serde(default)]
+    pub executor_binding: Option<astra_services::runs::ExecutorBindingRequest>,
+    #[serde(default)]
     pub runtime_mcp_bindings: Vec<astra_services::runs::RuntimeMcpBindingRequest>,
     #[serde(default)]
     pub mcp_binding_ids: Option<Vec<i64>>,
@@ -1047,6 +1051,8 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,
+        workspace_binding: request.workspace_binding,
+        executor_binding: request.executor_binding,
         runtime_mcp_bindings: request.runtime_mcp_bindings,
         mcp_binding_ids: request.mcp_binding_ids,
         context,

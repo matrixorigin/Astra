@@ -1271,13 +1271,11 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
 
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(
-        find_events(&events, "run_blocked_executor_offline")
-            .iter()
-            .any(|event| {
-                event["call_id"].as_str() == Some("call-edge-offline-bash")
-                    && event["reason"].as_str() == Some("executor_offline")
-                    && event["executor"]["status"].as_str() == Some("offline")
-            }),
+        find_events(&events, "run_blocked").iter().any(|event| {
+            event["call_id"].as_str() == Some("call-edge-offline-bash")
+                && event["reason"].as_str() == Some("executor_offline")
+                && event["executor"]["status"].as_str() == Some("offline")
+        }),
         "edge offline tool should emit actionable blocked event: {serialized}"
     );
     assert!(
@@ -1376,13 +1374,11 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
         "child waiting state should stream as structured agent tool failure metadata: {serialized}"
     );
     assert!(
-        find_events(&events, "run_blocked_executor_offline")
-            .iter()
-            .any(|event| {
-                event["call_id"].as_str() == Some("call-spawn-offline-child")
-                    && event["tool"].as_str() == Some("agent")
-                    && event["reason"].as_str() == Some("executor_offline")
-            }),
+        find_events(&events, "run_blocked").iter().any(|event| {
+            event["call_id"].as_str() == Some("call-spawn-offline-child")
+                && event["tool"].as_str() == Some("agent")
+                && event["reason"].as_str() == Some("executor_offline")
+        }),
         "parent agent tool should emit an actionable executor-offline blocked event: {serialized}"
     );
     assert!(

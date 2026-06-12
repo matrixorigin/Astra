@@ -60,10 +60,11 @@ pub struct RunEngine {
 
 /// Optional run-start interaction context persisted into the durable
 /// `run_started` event so replay/status surfaces can explain policy decisions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunStartContext {
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: Option<bool>,
+    pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
@@ -76,7 +77,7 @@ fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
     }
 }
 
-fn effective_mode_label(context: RunStartContext) -> Option<&'static str> {
+fn effective_mode_label(context: &RunStartContext) -> Option<&'static str> {
     if let Some(mode) = context.interaction_mode {
         return Some(requested_mode_label(mode));
     }
@@ -87,7 +88,7 @@ fn effective_mode_label(context: RunStartContext) -> Option<&'static str> {
 
 fn run_started_event_data(context: RunStartContext) -> serde_json::Value {
     let mut data = serde_json::Map::new();
-    if let Some(mode_label) = effective_mode_label(context) {
+    if let Some(mode_label) = effective_mode_label(&context) {
         data.insert(
             "interaction_mode".to_string(),
             serde_json::Value::String(mode_label.to_string()),
@@ -102,6 +103,11 @@ fn run_started_event_data(context: RunStartContext) -> serde_json::Value {
             "interactive_client".to_string(),
             serde_json::Value::Bool(interactive_client),
         );
+    }
+    if let Some(metadata) = context.execution_metadata {
+        for (key, value) in metadata {
+            data.entry(key).or_insert(value);
+        }
     }
     serde_json::Value::Object(data)
 }
@@ -916,6 +922,7 @@ mod tests {
                 RunStartContext {
                     interaction_mode: Some(RequestedTurnInteractionMode::Auto),
                     interactive_client: Some(true),
+                    execution_metadata: None,
                 },
             )
             .await
@@ -938,6 +945,7 @@ mod tests {
                 RunStartContext {
                     interaction_mode: None,
                     interactive_client: Some(true),
+                    execution_metadata: None,
                 },
             )
             .await
@@ -959,6 +967,7 @@ mod tests {
                 RunStartContext {
                     interaction_mode: Some(RequestedTurnInteractionMode::NonInteractive),
                     interactive_client: Some(false),
+                    execution_metadata: None,
                 },
             )
             .await

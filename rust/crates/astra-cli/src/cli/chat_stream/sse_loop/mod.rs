@@ -288,6 +288,7 @@ pub(crate) async fn stream_chat_sse(
                 active_skills: Vec::new(), // root agent — no inherited skills
                 live_event_sink: p.agent_live_event_sink.clone(),
                 trace_context: None,
+                execution_metadata: None,
             };
             ex.with_spawn_context(spawn_ctx)
         } else {

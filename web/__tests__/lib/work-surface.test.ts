@@ -644,7 +644,7 @@ describe("work surface reducer", () => {
       fallback_policy: "disabled",
     });
     state = applyWorkSurfaceEvent(state, {
-      type: "run_blocked_executor_offline",
+      type: "run_blocked",
       call_id: "call-offline",
       tool: "bash",
       reason: "executor_offline",
@@ -763,7 +763,7 @@ describe("work surface reducer", () => {
 
   it("projects explicit transport-disconnected run blocked events", () => {
     const state = applyWorkSurfaceEvent(createEmptyWorkSurface("session-1"), {
-      type: "run_blocked_transport_disconnected",
+      type: "run_blocked",
       call_id: "call-disconnect",
       tool: "bash",
       reason: "transport_disconnected",
@@ -844,7 +844,7 @@ describe("work surface reducer", () => {
 
   it("projects generic run_waiting events without stale blocked state", () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface("session-1"), {
-      type: "run_blocked_fallback_disabled",
+      type: "run_blocked",
       reason: "fallback_disabled",
       message: "Server fallback is disabled for this workspace.",
     });
@@ -860,11 +860,12 @@ describe("work surface reducer", () => {
     expect(state.blocked).toBeNull();
   });
 
-  it("projects future run_blocked reasons without a reducer release", () => {
+  it("projects run_blocked reason fields without a reducer release", () => {
     const state = applyWorkSurfaceEvent(createEmptyWorkSurface("session-1"), {
-      type: "run_blocked_fallback_disabled",
+      type: "run_blocked",
       call_id: "call-write",
       tool: "write_file",
+      reason: "fallback_disabled",
       message: "Server fallback is disabled for this workspace.",
       workspace: {
         kind: "edge_workspace",

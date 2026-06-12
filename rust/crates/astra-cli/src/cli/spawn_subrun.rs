@@ -1200,6 +1200,7 @@ mod tests {
                 inherited_skills: Vec::new(),
                 live_event_sink: Some(live_sink.clone()),
                 inherited_prefix: None,
+                execution_metadata: None,
                 is_fork_child: false,
             })
             .await

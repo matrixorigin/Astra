@@ -219,10 +219,11 @@ const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
   "agent_cancelled",
   "agent_interrupted",
   "run_waiting",
+  "run_blocked",
 ]);
 
 function isRunBlockedEvent(type: string) {
-  return type.startsWith("run_blocked_");
+  return type === "run_blocked";
 }
 
 function isWorkSurfaceStreamEvent(type: string) {

@@ -2,6 +2,7 @@
 
 use super::fanout_group::AgentFanoutSlotIdentity;
 use serde::Serialize;
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::broadcast;
@@ -12,6 +13,8 @@ pub struct AgentProgressEvent {
     pub agent_id: String,
     pub event_type: ProgressEventType,
     pub timestamp_epoch_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 /// Types of progress events.
@@ -147,6 +150,19 @@ impl ProgressBroadcaster {
         AgentProgressEmitter {
             broadcaster: Arc::clone(self),
             agent_id,
+            metadata: None,
+        }
+    }
+
+    pub fn for_agent_with_metadata(
+        self: &Arc<Self>,
+        agent_id: String,
+        metadata: Option<Value>,
+    ) -> AgentProgressEmitter {
+        AgentProgressEmitter {
+            broadcaster: Arc::clone(self),
+            agent_id,
+            metadata,
         }
     }
 }
@@ -156,6 +172,7 @@ impl ProgressBroadcaster {
 pub struct AgentProgressEmitter {
     broadcaster: Arc<ProgressBroadcaster>,
     agent_id: String,
+    metadata: Option<Value>,
 }
 
 impl AgentProgressEmitter {
@@ -314,6 +331,7 @@ impl AgentProgressEmitter {
             agent_id: self.agent_id.clone(),
             event_type,
             timestamp_epoch_ms,
+            metadata: self.metadata.clone(),
         });
     }
 }

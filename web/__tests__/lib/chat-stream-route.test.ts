@@ -330,7 +330,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
       'data: {"type":"run_started","run_id":"run-blocked"}\n\n',
-      'data: {"type":"run_blocked_executor_offline","session_id":"chat-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
+      'data: {"type":"run_blocked","session_id":"chat-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {

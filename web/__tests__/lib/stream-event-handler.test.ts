@@ -162,7 +162,7 @@ describe("applyStreamEvent", () => {
     applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
     applyStreamEvent(
       {
-        type: "run_blocked_transport_disconnected",
+        type: "run_blocked",
         session_id: "session-1",
         reason: "transport_disconnected",
         message: "Edge transport disconnected.",
@@ -305,7 +305,7 @@ describe("applyStreamEvent", () => {
     applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
     applyStreamEvent(
       {
-        type: "run_blocked_fallback_disabled",
+        type: "run_blocked",
         run_id: "run-1",
         reason: "fallback_disabled",
       },
@@ -334,14 +334,15 @@ describe("applyStreamEvent", () => {
     );
   });
 
-  it("derives waitingFor from future run_blocked event names", () => {
+  it("derives waitingFor from run_blocked reason fields", () => {
     const state = makeState();
 
     applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
     applyStreamEvent(
       {
-        type: "run_blocked_fallback_disabled",
+        type: "run_blocked",
         session_id: "session-1",
+        reason: "fallback_disabled",
         message: "Server fallback is disabled for this workspace.",
       },
       ctx,

@@ -31,12 +31,8 @@ export function extractBlockedReason(event: {
   error_kind?: string;
   blocked?: boolean;
 }): string | null {
-  if (event.type?.startsWith("run_blocked_")) {
-    return (
-      event.reason ??
-      event.error_kind ??
-      event.type.slice("run_blocked_".length)
-    );
+  if (event.type === "run_blocked") {
+    return event.reason ?? event.error_kind ?? "blocked";
   }
   if (event.blocked) {
     return event.reason ?? event.error_kind ?? "blocked";

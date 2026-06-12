@@ -415,7 +415,7 @@ test('work surface shows actionable edge executor blocked state', async ({ page 
           },
         },
         {
-          type: 'run_blocked_executor_offline',
+          type: 'run_blocked',
           call_id: 'call-bash',
           tool: 'bash',
           reason: 'executor_offline',
@@ -481,7 +481,7 @@ test('work surface distinguishes transport disconnect from executor offline', as
           },
         },
         {
-          type: 'run_blocked_transport_disconnected',
+          type: 'run_blocked',
           call_id: 'call-bash',
           tool: 'bash',
           reason: 'transport_disconnected',

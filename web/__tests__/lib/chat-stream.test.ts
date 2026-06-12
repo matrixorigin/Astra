@@ -206,7 +206,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
-        'data: {"type":"run_blocked_executor_offline","session_id":"session-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
+        'data: {"type":"run_blocked","session_id":"session-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
         'data: {"type":"run_waiting","run_id":"run-123","reason":"waiting: executor_offline"}\n\n',
       ]),
     });
@@ -230,7 +230,7 @@ describe('streamChatMessage cancellation semantics', () => {
       waitingFor: 'executor_offline',
     });
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'run_blocked_executor_offline' }),
+      expect.objectContaining({ type: 'run_blocked' }),
     );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_waiting' }),
@@ -279,7 +279,7 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onDone).not.toHaveBeenCalled();
   });
 
-  it('projects future blocked run event names into active-run state', async () => {
+  it('projects blocked run events into active-run state from reason fields', async () => {
     const onPaused = jest.fn();
     const onDone = jest.fn();
     const onRunUpdated = jest.fn();
@@ -290,7 +290,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
-        'data: {"type":"run_blocked_fallback_disabled","session_id":"session-1","message":"Server fallback is disabled for this workspace."}\n\n',
+        'data: {"type":"run_blocked","session_id":"session-1","reason":"fallback_disabled","message":"Server fallback is disabled for this workspace."}\n\n',
       ]),
     });
 
@@ -313,7 +313,7 @@ describe('streamChatMessage cancellation semantics', () => {
       waitingFor: 'fallback_disabled',
     });
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'run_blocked_fallback_disabled' }),
+      expect.objectContaining({ type: 'run_blocked' }),
     );
     expect(onPaused).toHaveBeenCalledWith(
       'Server fallback is disabled for this workspace.',

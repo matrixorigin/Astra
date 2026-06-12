@@ -22,6 +22,23 @@ thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
+fn merge_execution_boundary_metadata(
+    metadata: &mut serde_json::Value,
+    execution_metadata: Option<&serde_json::Value>,
+) {
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    let Some(execution_metadata) = execution_metadata.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for key in ["workspace", "executor", "transport", "fallback_policy"] {
+        if let Some(value) = execution_metadata.get(key).cloned() {
+            metadata.entry(key.to_string()).or_insert(value);
+        }
+    }
+}
+
 /// Bounded cache for session-start state to prevent unbounded memory growth
 /// in long-running `astra serve` processes.  Uses FIFO eviction: when the
 /// entry count reaches `MAX`, the oldest inserted entry is evicted before
@@ -3830,9 +3847,10 @@ impl JournalEvent {
         description: &str,
         model: Option<&str>,
         inherit_prefix: bool,
+        execution_metadata: Option<&serde_json::Value>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::AgentSpawned, session_id);
-        evt.metadata = Some(serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": agent_id,
             "run_id": run_id,
             "parent_run_id": parent_run_id,
@@ -3840,7 +3858,9 @@ impl JournalEvent {
             "description": description,
             "model": model,
             "inherit_prefix": inherit_prefix,
-        }));
+        });
+        merge_execution_boundary_metadata(&mut metadata, execution_metadata);
+        evt.metadata = Some(metadata);
         evt
     }
 
@@ -3858,6 +3878,7 @@ impl JournalEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         duration_ms: u64,
+        execution_metadata: Option<&serde_json::Value>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::AgentTerminated, session_id);
         let mut metadata = serde_json::json!({
@@ -3874,6 +3895,7 @@ impl JournalEvent {
         if let Some(finish_reason) = finish_reason.filter(|reason| !reason.is_empty()) {
             metadata["finish_reason"] = serde_json::Value::String(finish_reason.to_string());
         }
+        merge_execution_boundary_metadata(&mut metadata, execution_metadata);
         evt.metadata = Some(metadata);
         evt
     }

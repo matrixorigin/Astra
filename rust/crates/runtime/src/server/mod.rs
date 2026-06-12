@@ -54,6 +54,7 @@ mod state_builder;
 pub mod sweeper_lease;
 mod task_handlers;
 pub mod team;
+pub mod tool_transport;
 mod user_skill_handlers;
 mod ws_handler;
 

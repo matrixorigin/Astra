@@ -2773,6 +2773,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "run_interrupted",
     "run_finished",
     "run_waiting",
+    "run_blocked",
     "run_paused",
     "run_resumed",
     "context_meta",
@@ -2840,7 +2841,7 @@ fn copy_execution_boundary_fields(
 }
 
 fn is_external_client_event_type(event_type: &str) -> bool {
-    EXTERNAL_CLIENT_ALLOWLIST.contains(&event_type) || event_type.starts_with("run_blocked_")
+    EXTERNAL_CLIENT_ALLOWLIST.contains(&event_type)
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -3110,8 +3111,8 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
-        event_type if event_type.starts_with("run_blocked_") => {
-            let mut out = serde_json::json!({ "type": event_type });
+        "run_blocked" => {
+            let mut out = serde_json::json!({ "type": "run_blocked" });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
                     obj.insert(k.clone(), v.clone());
@@ -3800,25 +3801,25 @@ mod tests {
                 "error": "offline",
             }),
             json!({
-                "type": "run_blocked_executor_offline",
+                "type": "run_blocked",
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "executor_offline",
             }),
             json!({
-                "type": "run_blocked_transport_disconnected",
+                "type": "run_blocked",
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "transport_disconnected",
             }),
             json!({
-                "type": "run_blocked_fallback_disabled",
+                "type": "run_blocked",
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "fallback_disabled",
             }),
             json!({
-                "type": "run_blocked_workspace_executor_unavailable",
+                "type": "run_blocked",
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
@@ -3831,9 +3832,9 @@ mod tests {
     }
 
     #[test]
-    fn durable_run_blocked_namespace_events_transform_for_client() {
+    fn durable_blocked_run_event_transform_for_client() {
         let out = transform_run_event_for_client(json!({
-            "event_type": "run_blocked_workspace_executor_unavailable",
+            "event_type": "run_blocked",
             "data": {
                 "call_id": "c1",
                 "tool": "bash",
@@ -3850,7 +3851,7 @@ mod tests {
         assert_eq!(
             out,
             json!({
-                "type": "run_blocked_workspace_executor_unavailable",
+                "type": "run_blocked",
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",

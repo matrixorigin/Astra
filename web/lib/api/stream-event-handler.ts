@@ -61,7 +61,7 @@ function explicitEventMessage(event: Record<string, unknown>) {
 }
 
 function isRunBlockedEvent(type: string) {
-  return type.startsWith("run_blocked_");
+  return type === "run_blocked";
 }
 
 export function applyStreamEvent(
