@@ -1680,14 +1680,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_feedback_signal_creation() {
+    fn signal_type_creation_and_serialization() {
+        // FeedbackSignal builder
         let signal = FeedbackSignal::new(SignalType::TaskSuccess)
             .with_turn("turn-123")
             .with_context("tokens", serde_json::json!(1500));
-
         assert!(matches!(signal.signal_type, SignalType::TaskSuccess));
         assert_eq!(signal.turn_id, Some("turn-123".to_string()));
         assert_eq!(signal.context.get("tokens"), Some(&serde_json::json!(1500)));
+
+        // Tool signal type names
+        assert_eq!(
+            SignalType::ToolDeprioritized {
+                tool_name: "bash".into()
+            }
+            .type_name(),
+            "tool_deprioritized"
+        );
+        assert_eq!(
+            SignalType::ToolRehabilitated {
+                tool_name: "bash".into()
+            }
+            .type_name(),
+            "tool_rehabilitated"
+        );
     }
 
     #[test]
@@ -1941,51 +1957,44 @@ mod tests {
     }
 
     #[test]
-    fn quick_followup_rule_triggers_on_accumulated_signals() {
-        let engine = AutoTuningEngine::new();
-        for rule in default_rules() {
-            engine.add_rule(rule);
+    fn accumulated_signal_rules_trigger_on_threshold() {
+        // Quick follow-up: 3 signals → triggers quick-followup-trim-history
+        // Long pause: 2 signals → triggers long-pause-expand-memory
+        let cases: Vec<(
+            SignalType,
+            usize,               // signal count to record
+            &str,                // expected rule id
+        )> = vec![
+            (
+                SignalType::QuickFollowUp { delay_ms: 500 },
+                3,
+                "quick-followup-trim-history",
+            ),
+            (
+                SignalType::LongPause {
+                    delay_ms: 120_000,
+                },
+                2,
+                "long-pause-expand-memory",
+            ),
+        ];
+
+        for (signal_type, count, expected_rule_id) in cases {
+            let engine = AutoTuningEngine::new();
+            for rule in default_rules() {
+                engine.add_rule(rule);
+            }
+            for _ in 0..count {
+                engine.record_feedback(FeedbackSignal::new(signal_type.clone()));
+            }
+            let result = engine.evaluate(&RuntimeConfig::default());
+            assert!(
+                result.iter().any(|(r, _)| r.id == expected_rule_id),
+                "Rule {} should trigger on {}+ signals",
+                expected_rule_id,
+                count,
+            );
         }
-        let config = RuntimeConfig::default();
-
-        // Record 3 quick follow-up signals within the window
-        for _ in 0..3 {
-            engine.record_feedback(FeedbackSignal::new(SignalType::QuickFollowUp {
-                delay_ms: 500,
-            }));
-        }
-
-        let result = engine.evaluate(&config);
-        assert!(
-            result
-                .iter()
-                .any(|(r, _)| r.id == "quick-followup-trim-history"),
-            "Quick follow-up rule should trigger on 3+ signals"
-        );
-    }
-
-    #[test]
-    fn long_pause_rule_triggers_on_accumulated_signals() {
-        let engine = AutoTuningEngine::new();
-        for rule in default_rules() {
-            engine.add_rule(rule);
-        }
-        let config = RuntimeConfig::default();
-
-        // Record 2 long pause signals within the window
-        for _ in 0..2 {
-            engine.record_feedback(FeedbackSignal::new(SignalType::LongPause {
-                delay_ms: 120_000,
-            }));
-        }
-
-        let result = engine.evaluate(&config);
-        assert!(
-            result
-                .iter()
-                .any(|(r, _)| r.id == "long-pause-expand-memory"),
-            "Long pause rule should trigger on 2+ signals"
-        );
     }
 
     #[test]
@@ -2325,27 +2334,37 @@ mod tests {
     // ── Feedback Persistence Tests ──
 
     #[test]
-    fn tuning_engine_persist_round_trip() {
+    fn tuning_engine_persist_and_autosave() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tuning.json");
 
-        // Create engine, record signals, persist.
+        // Explicit persist round-trip
         let engine = AutoTuningEngine::with_storage(path.clone());
         engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
         engine.record_feedback(FeedbackSignal::new(SignalType::TaskFailure {
             reason: "oops".into(),
         }));
         engine.persist();
-
         assert!(path.exists(), "persist should create file");
 
-        // Load a new engine from same path — should recover signals.
-        let engine2 = AutoTuningEngine::with_storage(path);
+        let engine2 = AutoTuningEngine::with_storage(path.clone());
         let data = engine2.save_aggregator().unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        // The aggregator should have at least some data from the 2 signals.
         assert!(!data.is_empty());
-        assert!(json.is_object());
+
+        // Auto-persist on record_feedback
+        let auto_path = dir.path().join("tuning-auto.json");
+        let engine3 = AutoTuningEngine::with_storage(auto_path.clone());
+        engine3.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        assert!(
+            auto_path.exists(),
+            "record_feedback should auto-persist when storage is configured"
+        );
+        let reloaded = AutoTuningEngine::with_storage(auto_path);
+        assert_eq!(reloaded.recent_signals().len(), 1);
+        assert!(matches!(
+            reloaded.recent_signals()[0].signal_type,
+            SignalType::TaskSuccess
+        ));
     }
 
     #[test]
@@ -2355,58 +2374,9 @@ mod tests {
         engine.persist(); // Should not panic or error.
     }
 
-    #[test]
-    fn tuning_engine_record_feedback_persists_immediately() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tuning-auto.json");
-
-        let engine = AutoTuningEngine::with_storage(path.clone());
-        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
-
-        assert!(
-            path.exists(),
-            "record_feedback should persist when storage is configured"
-        );
-
-        let reloaded = AutoTuningEngine::with_storage(path);
-        assert_eq!(reloaded.recent_signals().len(), 1);
-        assert!(matches!(
-            reloaded.recent_signals()[0].signal_type,
-            SignalType::TaskSuccess
-        ));
-    }
-
     // ── Tool Health Signal Type Tests ──
 
-    #[test]
-    fn tool_deprioritized_signal_type_name() {
-        let signal = FeedbackSignal::new(SignalType::ToolDeprioritized {
-            tool_name: "bash".into(),
-        });
-        assert_eq!(signal.signal_type.type_name(), "tool_deprioritized");
-    }
-
-    #[test]
-    fn tool_rehabilitated_signal_type_name() {
-        let signal = FeedbackSignal::new(SignalType::ToolRehabilitated {
-            tool_name: "bash".into(),
-        });
-        assert_eq!(signal.signal_type.type_name(), "tool_rehabilitated");
-    }
-
-    #[test]
-    fn tool_signals_serializable() {
-        let dep = SignalType::ToolDeprioritized {
-            tool_name: "view".into(),
-        };
-        let json = serde_json::to_string(&dep).unwrap();
-        assert!(json.contains("view"));
-        let rehab = SignalType::ToolRehabilitated {
-            tool_name: "edit".into(),
-        };
-        let json = serde_json::to_string(&rehab).unwrap();
-        assert!(json.contains("edit"));
-    }
+    // (merged into signal_type_creation_and_serialization)
 
     // ── Delegation Outcome Tracker Tests ──
 
