@@ -1701,15 +1701,10 @@ mod tests {
     }
 
     #[test]
-    fn current_branch_bad_path_returns_empty() {
-        let branch = current_branch(Path::new("/nonexistent/repo"));
-        assert!(branch.is_empty());
-    }
-
     #[test]
-    fn head_short_bad_path_returns_empty() {
-        let short = head_short(Path::new("/nonexistent/repo"));
-        assert!(short.is_empty());
+    fn current_branch_and_head_short_return_empty_on_bad_path() {
+        assert!(current_branch(Path::new("/nonexistent/repo")).is_empty());
+        assert!(head_short(Path::new("/nonexistent/repo")).is_empty());
     }
 
     // ─── Robustness regression tests ────────────────────────────────────────
@@ -1835,50 +1830,35 @@ mod tests {
     // ── Pressure-aware output limit tests ──
 
     #[test]
-    fn pressure_scaled_limit_zero_pressure_returns_base() {
+    #[test]
+    fn pressure_scaled_limit_scales_and_floors() {
+        // Zero pressure returns base verbatim.
         assert_eq!(super::pressure_scaled_limit(12_000, 0.0), 12_000);
         assert_eq!(super::pressure_scaled_limit(16_000, 0.0), 16_000);
+
+        // Moderate pressure: scale = 1.0 - 0.6*0.6 = 0.64 → 12000 * 0.64 = 7680
+        assert_eq!(super::pressure_scaled_limit(12_000, 0.6), 7_680);
+
+        // Max pressure floors at 40%. scale = 1.0 - 1.0*0.6 = 0.4 → 4800
+        assert_eq!(super::pressure_scaled_limit(12_000, 1.0), 4_800);
+
+        // Beyond 1.0 still floors at 40%. scale = max(1.0 - 1.5*0.6, 0.4) = 0.4 → 4000
+        assert_eq!(super::pressure_scaled_limit(10_000, 1.5), 4_000);
     }
 
     #[test]
-    fn pressure_scaled_limit_moderate_pressure_reduces() {
-        let limit = super::pressure_scaled_limit(12_000, 0.6);
-        assert!(limit < 12_000, "moderate pressure should reduce limit");
-        assert!(limit > 4_800, "should stay above 40% minimum");
-        // scale = 1.0 - 0.6*0.6 = 0.64 → 12000 * 0.64 = 7680
-        assert_eq!(limit, 7_680);
-    }
-
-    #[test]
-    fn pressure_scaled_limit_max_pressure_reaches_floor() {
-        let limit = super::pressure_scaled_limit(12_000, 1.0);
-        // scale = 1.0 - 1.0*0.6 = 0.4 → 12000 * 0.4 = 4800
-        assert_eq!(limit, 4_800);
-    }
-
-    #[test]
-    fn pressure_scaled_limit_never_goes_below_forty_percent() {
-        let limit = super::pressure_scaled_limit(10_000, 1.5);
-        // scale = max(1.0 - 1.5*0.6, 0.4) = max(0.1, 0.4) = 0.4 → 4000
-        assert_eq!(limit, 4_000);
-    }
-
-    #[test]
-    fn git_show_under_pressure_truncates_earlier() {
+    fn git_show_and_diff_truncate_under_high_pressure() {
         let root = std::env::current_dir().unwrap();
+        // git_show
         let normal = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
         let pressed = git_show(&root, &json!({"commit": "HEAD"}), 0.9, 0);
         assert!(
             pressed.len() <= normal.len(),
-            "high-pressure output ({}) should not exceed normal ({})",
+            "high-pressure show ({}) should not exceed normal ({})",
             pressed.len(),
             normal.len()
         );
-    }
-
-    #[test]
-    fn git_diff_under_pressure_truncates_earlier() {
-        let root = std::env::current_dir().unwrap();
+        // git_diff
         let normal = git_diff(&root, &json!({}), 0.0, 0);
         let pressed = git_diff(&root, &json!({}), 0.9, 0);
         assert!(
@@ -1892,29 +1872,22 @@ mod tests {
     // ─── git_commit tests ───────────────────────────────────────────────────
 
     #[test]
-    fn git_commit_rejects_empty_message() {
+    fn git_commit_rejects_invalid_messages() {
         let root = repo_root();
-        let result = git_commit(&root, &json!({}));
+        // Missing or blank message
         assert!(
-            result.starts_with("Error:"),
-            "should reject missing message: {result}"
+            git_commit(&root, &json!({})).starts_with("Error:"),
+            "should reject missing message"
         );
-
-        let result2 = git_commit(&root, &json!({"message": "  "}));
         assert!(
-            result2.starts_with("Error:"),
-            "should reject blank message: {result2}"
+            git_commit(&root, &json!({"message": "  "})).starts_with("Error:"),
+            "should reject blank message"
         );
-    }
-
-    #[test]
-    fn git_commit_rejects_long_message() {
-        let root = repo_root();
+        // Over-long message
         let long_msg = "x".repeat(5001);
-        let result = git_commit(&root, &json!({"message": long_msg}));
         assert!(
-            result.contains("too long"),
-            "should reject over-long message: {result}"
+            git_commit(&root, &json!({"message": long_msg})).contains("too long"),
+            "should reject over-long message"
         );
     }
 
@@ -2038,22 +2011,15 @@ mod tests {
     // ─── git_stash tests ────────────────────────────────────────────────────
 
     #[test]
-    fn git_stash_requires_action() {
+    fn git_stash_rejects_missing_or_unknown_action() {
         let root = repo_root();
-        let result = git_stash(&root, &json!({}));
         assert!(
-            result.starts_with("Error:"),
-            "should require action: {result}"
+            git_stash(&root, &json!({})).starts_with("Error:"),
+            "should require action"
         );
-    }
-
-    #[test]
-    fn git_stash_rejects_unknown_action() {
-        let root = repo_root();
-        let result = git_stash(&root, &json!({"action": "fly"}));
         assert!(
-            result.contains("unknown stash action"),
-            "should reject unknown: {result}"
+            git_stash(&root, &json!({"action": "fly"})).contains("unknown stash action"),
+            "should reject unknown action"
         );
     }
 
@@ -2108,50 +2074,30 @@ mod tests {
     // ─── git_checkout_file tests ────────────────────────────────────────────
 
     #[test]
-    fn git_checkout_file_requires_path() {
+    fn git_checkout_file_rejects_invalid_inputs() {
         let root = repo_root();
-        let result = git_checkout_file(&root, &json!({}));
+        // Missing / empty path
         assert!(
-            result.starts_with("Error:"),
-            "should require path: {result}"
-        );
-
-        let result2 = git_checkout_file(&root, &json!({"path": ""}));
-        assert!(
-            result2.starts_with("Error:"),
-            "should reject empty path: {result2}"
-        );
-    }
-
-    #[test]
-    fn git_checkout_file_rejects_path_traversal() {
-        let root = repo_root();
-        let result = git_checkout_file(&root, &json!({"path": "../../../etc/passwd"}));
-        assert!(
-            result.contains("path traversal"),
-            "should reject traversal: {result}"
-        );
-    }
-
-    #[test]
-    fn git_checkout_file_rejects_dangerous_ref() {
-        let root = repo_root();
-        let result = git_checkout_file(
-            &root,
-            &json!({"path": "README.md", "ref": "HEAD; rm -rf /"}),
+            git_checkout_file(&root, &json!({})).starts_with("Error:"),
+            "should require path"
         );
         assert!(
-            result.contains("invalid ref"),
-            "should reject dangerous ref: {result}"
+            git_checkout_file(&root, &json!({"path": ""})).starts_with("Error:"),
+            "should reject empty path"
         );
-
-        let result2 = git_checkout_file(
-            &root,
-            &json!({"path": "README.md", "ref": "main|cat /etc/passwd"}),
+        // Path traversal
+        assert!(
+            git_checkout_file(&root, &json!({"path": "../../../etc/passwd"})).contains("path traversal"),
+            "should reject traversal"
+        );
+        // Dangerous ref injection
+        assert!(
+            git_checkout_file(&root, &json!({"path": "README.md", "ref": "HEAD; rm -rf /"})).contains("invalid ref"),
+            "should reject shell injection in ref"
         );
         assert!(
-            result2.contains("invalid ref"),
-            "should reject pipe ref: {result2}"
+            git_checkout_file(&root, &json!({"path": "README.md", "ref": "main|cat /etc/passwd"})).contains("invalid ref"),
+            "should reject pipe in ref"
         );
     }
 
@@ -2171,22 +2117,15 @@ mod tests {
     // ── Git Worktree Tests ──────────────────────────────────────────────
 
     #[test]
-    fn git_worktree_missing_action() {
+    fn git_worktree_rejects_missing_or_unknown_action() {
         let root = repo_root();
-        let result = git_worktree(&root, &json!({}));
         assert!(
-            result.contains("Error") && result.contains("action"),
-            "should require action: {result}"
+            git_worktree(&root, &json!({})).contains("action"),
+            "should require action"
         );
-    }
-
-    #[test]
-    fn git_worktree_unknown_action() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "teleport"}));
         assert!(
-            result.contains("Error") && result.contains("unknown"),
-            "should reject unknown action: {result}"
+            git_worktree(&root, &json!({"action": "teleport"})).contains("unknown"),
+            "should reject unknown action"
         );
     }
 
@@ -2221,23 +2160,18 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_list_runs() {
+    fn git_worktree_list_and_ls_alias() {
         let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "list"}));
-        // Should contain at least the main worktree path
+        let list = git_worktree(&root, &json!({"action": "list"}));
         assert!(
-            !result.contains("Error: git") || result.contains("worktree"),
-            "list should succeed or show worktree info: {result}"
+            !list.contains("Error: git") || list.contains("worktree"),
+            "list should succeed: {list}"
         );
-    }
-
-    #[test]
-    fn git_worktree_list_alias_ls() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "ls"}));
+        // "ls" is an alias for "list"
+        let ls = git_worktree(&root, &json!({"action": "ls"}));
         assert!(
-            !(result.contains("Error") && result.contains("unknown action")),
-            "ls should be accepted as alias for list: {result}"
+            !(ls.contains("Error") && ls.contains("unknown action")),
+            "ls should be accepted as alias: {ls}"
         );
     }
 
