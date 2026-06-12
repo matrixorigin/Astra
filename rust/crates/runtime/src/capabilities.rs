@@ -499,8 +499,10 @@ mod tests {
             .collect()
     }
 
+    // ── tool surface routing ──
+
     #[test]
-    fn web_and_remote_cli_only_see_server_sources() {
+    fn tool_surface_routing() {
         let sources = vec![
             ToolSchemaSource::new(ToolCapabilitySource::ServerBuiltin, vec![schema("server")]),
             ToolSchemaSource::new(ToolCapabilitySource::ServerMcp, vec![schema("server_mcp")]),
@@ -508,40 +510,26 @@ mod tests {
             ToolSchemaSource::new(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
         ];
 
+        // Web / remote CLI: server-only tools
         let web = names(resolve_tool_schemas(ToolCatalogRequest {
             surface: CapabilitySurface::Web,
             sources: sources.clone(),
         }));
-        let remote_cli = names(resolve_tool_schemas(ToolCatalogRequest {
+        let remote_names = names(resolve_tool_schemas(ToolCatalogRequest {
             surface: CapabilitySurface::CliRemote,
             sources,
         }));
+        assert_eq!(web, vec!["server", "server_mcp"], "web must expose only server tools");
+        assert_eq!(remote_names, web, "remote CLI must match web");
 
-        assert_eq!(
-            web,
-            vec!["server".to_string(), "server_mcp".to_string()],
-            "web must not expose client-local tools"
-        );
-        assert_eq!(
-            remote_cli, web,
-            "remote/thin CLI capability visibility must match web"
-        );
-    }
-
-    #[test]
-    fn local_cli_only_sees_client_sources() {
-        let resolved = names(resolve_tool_schemas(
+        // Local CLI: client-only tools
+        let local = names(resolve_tool_schemas(
             ToolCatalogRequest::new(CapabilitySurface::CliLocal)
                 .with_source(ToolCapabilitySource::ServerBuiltin, vec![schema("server")])
                 .with_source(ToolCapabilitySource::ClientBuiltin, vec![schema("client")])
                 .with_source(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
         ));
-
-        assert_eq!(
-            resolved,
-            vec!["client".to_string(), "client_mcp".to_string()],
-            "local CLI must not claim server-only tools as locally executable"
-        );
+        assert_eq!(local, vec!["client", "client_mcp"], "local CLI must use client tools only");
     }
 
     #[test]
@@ -582,47 +570,34 @@ mod tests {
         );
     }
 
+    // ── surface-routed lifecycle tools ──
+
     #[test]
-    fn real_plan_lifecycle_tools_are_server_only() {
+    fn surface_routed_lifecycle_tools() {
         use astra_turn_core::capability::{Capability, CapabilitySet};
         use astra_turn_core::tool_surface::{Surface, resolve};
 
         let pool = astra_tools::schemas::all_tool_schemas();
-        let without_plan = CapabilitySet::empty()
+
+        // ── Plan lifecycle: server-only ──
+        let base_caps = CapabilitySet::empty()
             .with(Capability::AgentSpawner)
             .with(Capability::MemoryService)
             .with(Capability::Database)
             .with(Capability::SkillsCatalog)
             .with(Capability::GitHubAuth)
             .with(Capability::LSPServer);
-        let with_plan = without_plan.clone().with(Capability::PlanLifecycle);
+        let plan_caps = base_caps.clone().with(Capability::PlanLifecycle);
 
-        let local = names(resolve(Surface::CliLocal, &without_plan, &pool));
-        let web = names(resolve(Surface::Web, &with_plan, &pool));
-        let remote = names(resolve(Surface::CliRemote, &with_plan, &pool));
+        let local_plan = names(resolve(Surface::CliLocal, &base_caps, &pool));
+        let web_plan = names(resolve(Surface::Web, &plan_caps, &pool));
+        let remote_plan = names(resolve(Surface::CliRemote, &plan_caps, &pool));
 
-        assert!(
-            !local.contains(&"enter_plan_mode".to_string())
-                && !local.contains(&"exit_plan_mode".to_string()),
-            "local CLI must not expose plan lifecycle tools without PlanLifecycle"
-        );
-        assert!(
-            web.contains(&"enter_plan_mode".to_string())
-                && web.contains(&"exit_plan_mode".to_string()),
-            "web must expose the server-owned plan lifecycle tools"
-        );
-        assert_eq!(
-            remote, web,
-            "remote/thin CLI should expose the same server-owned lifecycle tools as web"
-        );
-    }
+        assert!(!local_plan.contains(&"enter_plan_mode".to_string()), "plan lifecycle tools are server-only");
+        assert!(web_plan.contains(&"enter_plan_mode".to_string()), "web must expose plan lifecycle");
+        assert_eq!(remote_plan, web_plan, "remote CLI plan visibility must match web");
 
-    #[test]
-    fn background_task_tools_are_local_cli_only() {
-        use astra_turn_core::capability::{Capability, CapabilitySet};
-        use astra_turn_core::tool_surface::{Surface, resolve};
-
-        let pool = astra_tools::schemas::all_tool_schemas();
+        // ── Background task tools: local-only ──
         let server_caps = lifecycle_server_capabilities(true);
         let local_caps = CapabilitySet::empty()
             .with(Capability::MemoryService)
@@ -630,31 +605,16 @@ mod tests {
             .with(Capability::PlanLifecycle)
             .with(Capability::LocalBackgroundTasks);
 
-        let web = names(resolve(Surface::Web, &server_caps, &pool));
-        let remote = names(resolve(Surface::CliRemote, &server_caps, &pool));
-        let local = names(resolve(Surface::CliLocal, &local_caps, &pool));
+        let web_bg = names(resolve(Surface::Web, &server_caps, &pool));
+        let remote_bg = names(resolve(Surface::CliRemote, &server_caps, &pool));
+        let local_bg = names(resolve(Surface::CliLocal, &local_caps, &pool));
 
-        assert!(
-            !web.contains(&"job".to_string())
-                && !remote.contains(&"job".to_string())
-                && !web.contains(&"task_output".to_string())
-                && !remote.contains(&"task_output".to_string())
-                && !web.contains(&"task_stop".to_string())
-                && !remote.contains(&"task_stop".to_string())
-                && !web.contains(&"task_list".to_string())
-                && !remote.contains(&"task_list".to_string()),
-            "server-executed turns must not advertise local TUI background task tools: web={web:?}, remote={remote:?}"
-        );
-        for expected in ["task_output", "task_stop", "task_list"] {
-            assert!(
-                local.contains(&expected.to_string()),
-                "local CLI turns should advertise `{expected}`: {local:?}"
-            );
+        for bg_tool in &["task_output", "task_stop", "task_list"] {
+            assert!(!web_bg.contains(&bg_tool.to_string()), "web must not advertise {bg_tool}");
+            assert!(!remote_bg.contains(&bg_tool.to_string()), "remote CLI must not advertise {bg_tool}");
+            assert!(local_bg.contains(&bg_tool.to_string()), "local CLI must advertise {bg_tool}");
         }
-        assert!(
-            !local.contains(&"job".to_string()),
-            "local CLI turns must not advertise the removed job tool: {local:?}"
-        );
+        assert!(!local_bg.contains(&"job".to_string()), "removed job tool must not appear");
     }
 
     #[test]
@@ -685,42 +645,30 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_capabilities_include_agent_spawner() {
+    fn server_lifecycle_capabilities() {
+        use astra_turn_core::capability::Capability;
+
+        // AgentSpawner is always included
         let caps = lifecycle_server_capabilities(true);
-        assert!(
-            caps.has(astra_turn_core::capability::Capability::AgentSpawner),
-            "server lifecycle should advertise AgentSpawner because ServerToolExecutor dispatches agent spawn actions"
-        );
+        assert!(caps.has(Capability::AgentSpawner), "server lifecycle must include AgentSpawner");
+
+        // Database is gated on pool availability
+        assert!(!lifecycle_server_capabilities(false).has(Capability::Database));
+        assert!(caps.has(Capability::Database));
+
+        // Web resolve with lifecycle caps advertises agent tool
+        let tool_names = names(server_runtime_tool_schemas(&caps));
+        assert!(tool_names.contains(&"agent".to_string()), "production lifecycle must advertise agent tool");
+
+        // full_server_capabilities_for_tests also includes AgentSpawner
+        assert!(full_server_capabilities_for_tests().has(Capability::AgentSpawner));
     }
 
-    #[test]
-    fn lifecycle_capabilities_gate_database_on_pool() {
-        let without_pool = lifecycle_server_capabilities(false);
-        let with_pool = lifecycle_server_capabilities(true);
-        assert!(!without_pool.has(astra_turn_core::capability::Capability::Database));
-        assert!(with_pool.has(astra_turn_core::capability::Capability::Database));
-    }
+    // ── remote skill validation ──
 
     #[test]
-    fn web_resolve_with_lifecycle_caps_advertises_agent() {
-        let caps = lifecycle_server_capabilities(true);
-        let names = names(server_runtime_tool_schemas(&caps));
-        assert!(
-            names.contains(&"agent".to_string()),
-            "production lifecycle should advertise agent — got {names:?}"
-        );
-    }
-
-    #[test]
-    fn full_server_capabilities_for_tests_includes_agent_spawner() {
-        assert!(
-            full_server_capabilities_for_tests()
-                .has(astra_turn_core::capability::Capability::AgentSpawner)
-        );
-    }
-
-    #[test]
-    fn remote_skill_record_requires_real_instructions() {
+    fn remote_skill_validation() {
+        // Missing instructions → LoadFailed
         let record = SkillRecord {
             skill_id: "empty@1.0.0".to_string(),
             skill_name: "empty".to_string(),
@@ -729,26 +677,13 @@ mod tests {
             metadata: Some(json!({})),
             created_at: None,
         };
-
         let err = loaded_skill_from_record(record).expect_err("missing instructions must fail");
-        assert!(
-            matches!(err, SkillError::LoadFailed(message) if message.contains("metadata.instructions")),
-            "remote provider must not synthesize empty skill bodies"
-        );
-    }
+        assert!(matches!(err, SkillError::LoadFailed(m) if m.contains("metadata.instructions")));
 
-    #[test]
-    fn remote_skill_provider_requires_a_live_token() {
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
-            .expect("test api origin");
+        // Missing token → LoadFailed
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("test api origin");
         let provider = RemoteSkillCatalogProvider::new(api, std::sync::Arc::new(|| None));
-
-        let err = provider
-            .current_token()
-            .expect_err("missing token must be surfaced as a load failure");
-        assert!(
-            matches!(err, SkillError::LoadFailed(message) if message.contains("no valid access token available")),
-            "provider should emit an auth-shaped error when the token provider returns None"
-        );
+        let err = provider.current_token().expect_err("missing token must fail");
+        assert!(matches!(err, SkillError::LoadFailed(m) if m.contains("no valid access token")));
     }
 }

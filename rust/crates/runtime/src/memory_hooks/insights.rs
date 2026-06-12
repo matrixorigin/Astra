@@ -174,14 +174,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_input_returns_none() {
-        assert!(render_digest(&[]).is_none());
-    }
-
-    #[test]
-    fn short_hits_filtered_out() {
-        let hits = vec!["hi".to_string(), "ok".to_string()];
-        assert!(render_digest(&hits).is_none());
+    fn test_render_empty_and_too_short() {
+        assert!(render_digest(&[]).is_none(), "empty");
+        assert!(render_digest(&["hi".to_string()]).is_none(), "too short");
+        assert!(
+            render_digest(&["hi".to_string(), "ok".to_string()]).is_none(),
+            "all too short"
+        );
     }
 
     #[test]
@@ -373,90 +372,65 @@ mod tests {
     }
 
     // ── Noise rejection: L1 protocol markers and session-replay fragments
-    //    burn a whole bullet (MAX_BULLETS=4) on scaffolding. Pinned after
-    //    session `69657ca7` showed `[session-memory:v1] # Session Title hi`
-    //    and `[session:…] Recent conversation: Assistant: Step 15 done…`
-    //    eating 2 of 4 bullets with no useful signal.
 
     #[test]
-    fn rejects_session_memory_v1_marker() {
-        let hits = vec![
-            "[session-memory:v1] # Session Title hi # Task Specification hi".to_string(),
-            "User prefers Rust for CLI work.".to_string(),
+    fn test_rejects_noise_markers() {
+        let noise_cases: &[(&str, &str)] = &[
+            (
+                "[session-memory:v1] # Session Title hi",
+                "session-memory:v1",
+            ),
+            ("[attention:v1] turn budget 2k", "attention:v1"),
+            (
+                "[session:abc123] Recent conversation: Assistant: Step 15 done.",
+                "[session:",
+            ),
+            (
+                "[compaction:055932d7-22bd] ### Primary Request: review PR 42",
+                "[compaction:",
+            ),
+            (
+                "[session-knowledge:abc] ## User Corrections - Use RS256",
+                "[session-knowledge:",
+            ),
         ];
-        let out = render_digest(&hits).expect("digest");
-        assert!(
-            !out.contains("session-memory:v1"),
-            "L1 session-memory marker must be filtered, got:\n{out}"
-        );
-        assert!(out.contains("User prefers Rust"));
+        let real = "Real fact that should survive.".to_string();
+        for (noise, needle) in noise_cases {
+            let hits = vec![noise.to_string(), real.clone()];
+            let out = render_digest(&hits).expect("digest");
+            assert!(
+                !out.contains(needle),
+                "noise marker '{needle}' leaked: {out}"
+            );
+            assert!(
+                out.contains("Real fact"),
+                "real fact missing for '{needle}'"
+            );
+        }
     }
 
     #[test]
-    fn rejects_attention_v1_marker() {
+    fn test_keeps_valid_entries() {
+        // [@ns/type] structured tags must pass.
+        assert!(render_digest(&["[@swap/archived] Turns 1-1 swapped".to_string()]).is_some());
+        // [@session] and [@pref] filtering: session namespace rejected, others kept.
         let hits = vec![
-            "[attention:v1] turn budget 2k".to_string(),
-            "Real insight worth surfacing here.".to_string(),
-        ];
-        let out = render_digest(&hits).expect("digest");
-        assert!(!out.contains("attention:v1"), "got:\n{out}");
-    }
-
-    #[test]
-    fn rejects_session_replay_lines() {
-        let hits = vec![
-            "[session:abc123] Recent conversation: Assistant: Step 15 done.".to_string(),
-            "Real fact that should survive.".to_string(),
-        ];
-        let out = render_digest(&hits).expect("digest");
-        assert!(
-            !out.contains("[session:"),
-            "session-replay line must be filtered, got:\n{out}"
-        );
-        assert!(out.contains("Real fact"));
-    }
-
-    #[test]
-    fn keeps_structured_tagged_entries() {
-        // `[@ns/type] body` is semantically distinct from `[session:…]`
-        // and must always pass — it's the canonical shape for typed
-        // context-source memories.
-        let hits = vec!["[@swap/archived] Turns 1-1 swapped out: hi → response".to_string()];
-        let out = render_digest(&hits).expect("digest");
-        assert!(
-            out.contains("[@swap/archived]"),
-            "structured-tagged entries must pass filter, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn rejects_structured_session_namespace_entries() {
-        let hits = vec![
-            "[@session/active] Session 33f9703d-566f-4824-81e7-c3012903650a: Turn 4 Task specification: review uncommitted changes".to_string(),
-            "[@session/memory] session_id=05126755-33ec-4a9d-bc95-e846a6f80369 # Session Memory ## Session Title review uncommitted changes".to_string(),
+            "[@session/active] Session abc: Turn 4".to_string(),
+            "[@session/memory] session_id=xyz # Session Memory".to_string(),
             "[@pref/active] prefer Rust for CLI work".to_string(),
         ];
         let out = render_digest(&hits).expect("digest");
-        assert!(!out.contains("[@session/active]"), "leaked: {out}");
-        assert!(!out.contains("[@session/memory]"), "leaked: {out}");
-        assert!(out.contains("prefer Rust for CLI work"), "got:\n{out}");
-    }
-
-    #[test]
-    fn rejects_pre_l2_compaction_and_session_knowledge() {
-        // Pre-L2 auto-writers emitted `[compaction:<sid>] <summary>`
-        // and `[session-knowledge:<sid>] ## …`. L2 now refuses those
-        // at write, but pre-existing entries linger in Memoria until
-        // their confidence decays. Filter them here for parity with
-        // `memory_prefetch::is_memory_worthy`.
-        let hits = vec![
-            "[compaction:055932d7-22bd] ### Primary Request: review PR 42".to_string(),
-            "[session-knowledge:abc] ## User Corrections - Use RS256".to_string(),
-            "Real curated fact that survives the filter.".to_string(),
-        ];
-        let out = render_digest(&hits).expect("digest");
-        assert!(!out.contains("[compaction:"), "leaked: {out}");
-        assert!(!out.contains("[session-knowledge:"), "leaked: {out}");
-        assert!(out.contains("Real curated fact"));
+        assert!(
+            !out.contains("[@session/active]"),
+            "leaked session/active: {out}"
+        );
+        assert!(
+            !out.contains("[@session/memory]"),
+            "leaked session/memory: {out}"
+        );
+        assert!(
+            out.contains("prefer Rust for CLI work"),
+            "missing pref: {out}"
+        );
     }
 }

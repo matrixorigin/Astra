@@ -265,29 +265,24 @@ mod tests {
         assert_eq!(back, original);
     }
 
-    // ── Dialect routing ────────────────────────────────────────────────────
+    // ── Dialect routing ────────────────────────────────────────────────��───
 
     #[test]
-    fn dialect_bedrock_for_bedrock_provider() {
-        assert_eq!(
-            UsageDialect::for_provider("bedrock"),
-            UsageDialect::BedrockConverse
-        );
-    }
-
-    #[test]
-    fn dialect_anthropic_for_anthropic_provider() {
-        assert_eq!(
-            UsageDialect::for_provider("anthropic"),
-            UsageDialect::AnthropicMessages
-        );
-    }
-
-    #[test]
-    fn dialect_openai_for_unknown_provider() {
-        assert_eq!(UsageDialect::for_provider("glm"), UsageDialect::OpenAi);
-        assert_eq!(UsageDialect::for_provider("openai"), UsageDialect::OpenAi);
-        assert_eq!(UsageDialect::for_provider("qwen"), UsageDialect::OpenAi);
+    fn test_dialect_routing() {
+        let cases: &[(&str, UsageDialect)] = &[
+            ("bedrock", UsageDialect::BedrockConverse),
+            ("anthropic", UsageDialect::AnthropicMessages),
+            ("openai", UsageDialect::OpenAi),
+            ("glm", UsageDialect::OpenAi),
+            ("qwen", UsageDialect::OpenAi),
+        ];
+        for (provider, expected) in cases {
+            assert_eq!(
+                UsageDialect::for_provider(provider),
+                *expected,
+                "dialect for {provider}"
+            );
+        }
     }
 
     // ── OpenAI extractor ───────────────────────────────────────────────────
@@ -538,35 +533,31 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_messages_empty_usage_returns_none() {
-        let u = obj(json!({}));
-        assert!(extract_usage(UsageDialect::AnthropicMessages, &u).is_none());
-    }
-
-    #[test]
-    fn anthropic_messages_cache_only_usage_returns_some() {
-        // A response with cache_read but zero input/output should still be Some
-        let u = obj(json!({
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 500
-        }));
-        let t = extract_usage(UsageDialect::AnthropicMessages, &u).unwrap();
+    fn test_anthropic_messages_extraction() {
+        // Empty usage returns None.
+        assert!(extract_usage(UsageDialect::AnthropicMessages, &obj(json!({}))).is_none());
+        // All-zero returns None.
+        assert!(extract_usage(
+            UsageDialect::AnthropicMessages,
+            &obj(json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }))
+        )
+        .is_none());
+        // Cache-only should still be Some.
+        let t = extract_usage(
+            UsageDialect::AnthropicMessages,
+            &obj(json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 500
+            })),
+        )
+        .unwrap();
         assert_eq!(t.cached_input_tokens, 500);
-    }
-
-    #[test]
-    fn anthropic_messages_all_zero_returns_none() {
-        let u = obj(json!({
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0
-        }));
-        assert!(
-            extract_usage(UsageDialect::AnthropicMessages, &u).is_none(),
-            "all-zero Anthropic usage should return None"
-        );
     }
 
     // ── Canonical JSON shape used in SSE events ────────────────────────────

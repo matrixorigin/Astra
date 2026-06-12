@@ -174,48 +174,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_json_array() {
-        assert_eq!(parse_relevance_response("[0, 2, 4]", 5), vec![0, 2, 4]);
+    fn test_parse_relevance_response() {
+        // (input, max_items) → expected
+        let cases: &[(&str, usize, &[usize])] = &[
+            ("[0, 2, 4]", 5, &[0, 2, 4]),
+            ("[0, 2, 10]", 3, &[0, 2]),
+            ("```json\n[1, 3]\n```", 5, &[1, 3]),
+            ("0, 2", 5, &[0, 2]),
+            ("[]", 5, &[]),
+            ("no relevant memories", 5, &[]),
+            ("[10, 20, 30]", 5, &[]),
+            ("[0, 99, 2, 150]", 5, &[0, 2]),
+        ];
+        for (input, max, expected) in cases {
+            assert_eq!(
+                parse_relevance_response(input, *max),
+                *expected,
+                "input={input:?}, max={max}"
+            );
+        }
+        // Negative indices: JSON parse fails, fallback digit extraction yields [1,0,2]
+        assert_eq!(parse_relevance_response("[-1, 0, 2]", 5), vec![1, 0, 2]);
     }
 
     #[test]
-    fn parse_json_array_filters_out_of_bounds() {
-        assert_eq!(parse_relevance_response("[0, 2, 10]", 3), vec![0, 2]);
-    }
-
-    #[test]
-    fn parse_markdown_wrapped() {
-        assert_eq!(
-            parse_relevance_response("```json\n[1, 3]\n```", 5),
-            vec![1, 3]
-        );
-    }
-
-    #[test]
-    fn parse_bare_numbers() {
-        assert_eq!(parse_relevance_response("0, 2", 5), vec![0, 2]);
-    }
-
-    #[test]
-    fn parse_empty_array() {
-        assert!(parse_relevance_response("[]", 5).is_empty());
-    }
-
-    #[test]
-    fn parse_garbage_returns_empty() {
-        assert!(parse_relevance_response("no relevant memories", 5).is_empty());
-    }
-
-    #[test]
-    fn filter_by_indices_preserves_order() {
+    fn test_filter_by_indices() {
         let items = vec!["a", "b", "c", "d", "e"];
-        let filtered = filter_by_indices(&items, &[4, 1]);
-        assert_eq!(filtered, vec!["e", "b"]);
-    }
-
-    #[test]
-    fn filter_empty_indices_returns_empty() {
-        let items = vec!["a", "b"];
+        assert_eq!(filter_by_indices(&items, &[4, 1]), vec!["e", "b"]);
         assert!(filter_by_indices(&items, &[]).is_empty());
     }
 
@@ -238,24 +223,10 @@ mod tests {
         assert!(query.len() < 500 + 200); // truncated message + memory
     }
 
-    // ── parse_relevance_response edge cases ──
-
-    #[test]
-    fn parse_all_out_of_bounds_returns_empty() {
-        assert!(parse_relevance_response("[10, 20, 30]", 5).is_empty());
-    }
-
-    #[test]
-    fn parse_mixed_valid_invalid_indices() {
-        assert_eq!(parse_relevance_response("[0, 99, 2, 150]", 5), vec![0, 2]);
-    }
-
-    #[test]
-    fn parse_negative_in_json_falls_back_to_digit_extraction() {
-        // JSON parse fails (usize can't be negative), fallback extracts digits:
-        // "-1" splits on '-' → "1", so [1, 0, 2] are the extracted indices.
-        assert_eq!(parse_relevance_response("[-1, 0, 2]", 5), vec![1, 0, 2]);
-    }
+    // ── parse_relevance_response edge cases (negatives) ──
+    // Negative in JSON: JSON parse fails (usize can't be negative),
+    // fallback digit extraction: "-1" splits on '-' → "1", so [1,0,2].
+    // This case is included in test_parse_relevance_response above.
 
     // ── LlmConnParams tests ──
 
@@ -333,7 +304,7 @@ mod tests {
         captured: Arc<Mutex<Option<serde_json::Value>>>,
         response_content: &'static str,
     ) -> String {
-        use axum::{Router, routing::post};
+        use axum::{routing::post, Router};
 
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
             let captured = captured.clone();

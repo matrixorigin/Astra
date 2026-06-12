@@ -391,122 +391,68 @@ mod tests {
         assert!(intent("pnpm install").mutating);
     }
 
-    // ─── Read-target extraction (NEW, fixes c49bc4a3 deadlock) ───────────
+    // ─── Read-target extraction (data-driven) ───────────────────────────
 
     #[test]
-    fn cat_extracts_single_file_target() {
-        let r = intent("cat rust/crates/astra-sandbox/src/policy.rs");
-        assert!(!r.mutating);
-        assert_eq!(
-            r.read_targets,
-            vec!["rust/crates/astra-sandbox/src/policy.rs"]
-        );
+    fn test_read_verbs_extract_targets() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            (
+                "cat rust/crates/astra-sandbox/src/policy.rs",
+                &["rust/crates/astra-sandbox/src/policy.rs"],
+                false,
+            ),
+            ("cat a.rs b.rs c.rs", &["a.rs", "b.rs", "c.rs"], false),
+            ("head -n 50 src/main.rs", &["src/main.rs"], false),
+            ("head -n50 src/main.rs", &["src/main.rs"], false),
+            ("tail --lines=20 log.txt", &["log.txt"], false),
+            ("wc -l src/main.rs", &["src/main.rs"], false),
+            ("sed -n '80,140p' lifecycle.rs", &["lifecycle.rs"], false),
+        ];
+        for (cmd, expected, is_mutating) in cases {
+            let r = intent(cmd);
+            assert_eq!(r.mutating, *is_mutating, "mutating mismatch for: {cmd}");
+            assert_eq!(r.read_targets, *expected, "targets mismatch for: {cmd}");
+        }
     }
 
     #[test]
-    fn cat_extracts_multiple_file_targets() {
-        let r = intent("cat a.rs b.rs c.rs");
-        assert_eq!(r.read_targets, vec!["a.rs", "b.rs", "c.rs"]);
-    }
-
-    #[test]
-    fn head_with_flag_value_skips_value_token() {
-        let r = intent("head -n 50 src/main.rs");
-        assert_eq!(r.read_targets, vec!["src/main.rs"]);
-    }
-
-    #[test]
-    fn head_with_compact_flag_still_extracts_path() {
-        let r = intent("head -n50 src/main.rs");
-        assert_eq!(r.read_targets, vec!["src/main.rs"]);
-    }
-
-    #[test]
-    fn tail_with_long_flag() {
-        let r = intent("tail --lines=20 log.txt");
-        assert_eq!(r.read_targets, vec!["log.txt"]);
-    }
-
-    #[test]
-    fn sed_n_script_is_not_counted_as_path() {
-        let r = intent("sed -n '80,140p' rust/crates/runtime/src/turn/agentic_loop/lifecycle.rs");
-        assert!(!r.mutating);
-        assert_eq!(
-            r.read_targets,
-            vec!["rust/crates/runtime/src/turn/agentic_loop/lifecycle.rs"]
-        );
-    }
-
-    #[test]
-    fn sed_without_n_flag_does_not_register_paths() {
-        // Bare `sed 's/a/b/' file` is still technically a read (sed defaults
-        // to print) but we stay conservative — the model should use `sed -n`
-        // for read-only inspection explicitly.
-        let r = intent("sed 's/a/b/' foo.rs");
-        assert!(r.read_targets.is_empty());
-    }
-
-    #[test]
-    fn wc_extracts_path() {
-        assert_eq!(
-            intent("wc -l src/main.rs").read_targets,
-            vec!["src/main.rs"]
-        );
-    }
-
-    #[test]
-    fn compound_reads_harvested_per_segment() {
+    fn test_compound_read_targets() {
+        // &&, pipe, mixed mutating — read targets harvested correctly.
         let r = intent("cat a.rs && cat b.rs");
         assert!(!r.mutating);
         assert_eq!(r.read_targets, vec!["a.rs", "b.rs"]);
-    }
 
-    #[test]
-    fn compound_mixed_does_not_harvest_from_mutating_segment() {
-        // Mutating segment must NOT contribute its positional token as a
-        // read target — we don't want to falsely mark a file "read" just
-        // because it's being overwritten.
         let r = intent("cat a.rs && rm b.rs");
         assert!(r.mutating);
         assert_eq!(r.read_targets, vec!["a.rs"]);
-    }
 
-    #[test]
-    fn globs_and_special_tokens_are_not_registered() {
-        let r = intent("cat *.rs");
-        assert!(r.read_targets.is_empty());
-        let r = intent("cat -");
-        assert!(r.read_targets.is_empty());
-    }
-
-    #[test]
-    fn ambiguous_verbs_are_ignored() {
-        // `grep`, `find`, `awk` intentionally not extracted — too
-        // ambiguous (patterns, recursive modes, multiple positional args).
-        assert!(intent("grep pat src/main.rs").read_targets.is_empty());
-        assert!(intent("find . -name '*.rs'").read_targets.is_empty());
-        assert!(intent("awk '{print}' src/main.rs").read_targets.is_empty());
-    }
-
-    #[test]
-    fn quoted_paths_are_unquoted() {
-        let r = intent("cat \"path with spaces.rs\"");
-        assert_eq!(r.read_targets, vec!["path with spaces.rs"]);
-        let r = intent("cat 'another path.rs'");
-        assert_eq!(r.read_targets, vec!["another path.rs"]);
-    }
-
-    #[test]
-    fn pipe_to_head_harvests_cat_target() {
         let r = intent("cat big.log | head -n 50");
         assert!(!r.mutating);
         assert!(r.read_targets.contains(&"big.log".to_string()));
     }
 
     #[test]
-    fn duplicates_deduped() {
-        let r = intent("cat a.rs && cat a.rs");
-        assert_eq!(r.read_targets, vec!["a.rs"]);
+    fn test_boundary_read_targets() {
+        // Globs and special tokens not registered.
+        assert!(intent("cat *.rs").read_targets.is_empty());
+        assert!(intent("cat -").read_targets.is_empty());
+        // Ambiguous verbs (grep, find, awk) intentionally not extracted.
+        assert!(intent("grep pat src/main.rs").read_targets.is_empty());
+        assert!(intent("find . -name '*.rs'").read_targets.is_empty());
+        assert!(intent("awk '{print}' src/main.rs").read_targets.is_empty());
+        // Quoted paths are unquoted.
+        assert_eq!(
+            intent("cat \"path with spaces.rs\"").read_targets,
+            vec!["path with spaces.rs"]
+        );
+        assert_eq!(
+            intent("cat 'another path.rs'").read_targets,
+            vec!["another path.rs"]
+        );
+        // Duplicates deduped.
+        assert_eq!(intent("cat a.rs && cat a.rs").read_targets, vec!["a.rs"]);
+        // Bare sed (no -n) — do not register paths.
+        assert!(intent("sed 's/a/b/' foo.rs").read_targets.is_empty());
     }
 
     #[test]

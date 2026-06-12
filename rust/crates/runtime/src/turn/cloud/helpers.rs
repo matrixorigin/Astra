@@ -276,90 +276,51 @@ mod tests {
     // ── protected_head_end ──────────────────────────────────────────────
 
     #[test]
-    fn protected_head_end_empty() {
-        assert_eq!(protected_head_end(&[]), 0);
-    }
-
-    #[test]
-    fn protected_head_end_system_only() {
-        let msgs = vec![msg("system", "You are helpful.", None)];
-        // No user message after system → returns sys_count = 1.
-        assert_eq!(protected_head_end(&msgs), 1);
-    }
-
-    #[test]
-    fn protected_head_end_system_plus_user() {
-        let msgs = vec![msg("system", "System", None), msg("user", "hello", None)];
-        // Protected head = first system + first user → index 2.
-        assert_eq!(protected_head_end(&msgs), 2);
-    }
-
-    #[test]
-    fn protected_head_end_two_systems_plus_user() {
-        let msgs = vec![
-            msg("system", "S1", None),
-            msg("system", "S2", None),
-            msg("user", "U1", None),
+    fn test_protected_head_end() {
+        let cases: &[(&[(&str, &str)], usize)] = &[
+            (&[], 0),
+            (&[("system", "S")], 1),
+            (&[("system", "S"), ("user", "U1")], 2),
+            (&[("system", "S1"), ("system", "S2"), ("user", "U1")], 3),
+            (
+                &[
+                    ("system", "S"),
+                    ("user", "U1"),
+                    ("assistant", "A1"),
+                    ("user", "U2"),
+                    ("assistant", "A2"),
+                ],
+                2,
+            ),
+            (&[("user", "U1"), ("assistant", "A1")], 1),
         ];
-        // Protected head through the first user after systems.
-        assert_eq!(protected_head_end(&msgs), 3);
-    }
-
-    #[test]
-    fn protected_head_end_multiple_turns() {
-        let msgs = vec![
-            msg("system", "S", None),
-            msg("user", "U1", None),
-            msg("assistant", "A1", None),
-            msg("user", "U2", None),
-            msg("assistant", "A2", None),
-        ];
-        // Protected head = index after first user = 2.
-        assert_eq!(protected_head_end(&msgs), 2);
-    }
-
-    #[test]
-    fn protected_head_end_no_system() {
-        let msgs = vec![msg("user", "U1", None), msg("assistant", "A1", None)];
-        assert_eq!(protected_head_end(&msgs), 1);
+        for (input, expected) in cases {
+            let msgs: Vec<Message> = input.iter().map(|(r, c)| msg(r, c, None)).collect();
+            assert_eq!(protected_head_end(&msgs), *expected, "input: {input:?}");
+        }
     }
 
     // ── affected_turn_indices ──────────────────────────────────────────
 
     #[test]
-    fn affected_turns_single_message() {
-        // Message 0 → turn 0 (uses idx/2 fallback when no round_index).
-        assert_eq!(affected_turn_indices(&[], 0..1), vec![0]);
-    }
-
-    #[test]
-    fn affected_turns_full_turn_pair() {
-        // Messages 0,1 → turn 0.
-        assert_eq!(affected_turn_indices(&[], 0..2), vec![0]);
-    }
-
-    #[test]
-    fn affected_turns_cross_turn_boundary() {
-        // Messages 1..3 → turns 0 and 1.
-        assert_eq!(affected_turn_indices(&[], 1..3), vec![0, 1]);
-    }
-
-    #[test]
-    fn affected_turns_empty_range() {
-        let result: Vec<u32> = affected_turn_indices(&[], 5..5);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn affected_turns_large_range() {
-        // Messages 4..10 → turns 2,3,4.
-        assert_eq!(affected_turn_indices(&[], 4..10), vec![2, 3, 4]);
-    }
-
-    #[test]
-    fn affected_turns_dedup() {
-        // Messages 0..4 → turns 0,1 (dedup since we iterate individual indices).
-        assert_eq!(affected_turn_indices(&[], 0..4), vec![0, 1]);
+    fn test_affected_turn_indices() {
+        // (messages_len, range_start, range_end) → expected turns
+        let cases: &[(usize, usize, usize, &[u32])] = &[
+            (0, 0, 1, &[0]),
+            (0, 0, 2, &[0]),
+            (0, 1, 3, &[0, 1]),
+            (0, 5, 5, &[]),
+            (0, 4, 10, &[2, 3, 4]),
+            (0, 0, 4, &[0, 1]),
+        ];
+        for (msgs_len, start, end, expected) in cases {
+            let msgs: Vec<Message> = (0..*msgs_len).map(|_| msg("user", "x", None)).collect();
+            assert_eq!(
+                affected_turn_indices(&msgs, *start..*end).as_slice(),
+                *expected,
+                "msgs_len={msgs_len}, range={start}..{end}"
+            );
+        }
     }
 
     #[test]
