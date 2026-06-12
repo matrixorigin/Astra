@@ -224,8 +224,13 @@ fn lock_broadcast_order(state: &Mutex<BroadcastOrderState>) -> MutexGuard<'_, Br
     match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            warn!("broadcast order state mutex was poisoned; recovering inner state");
-            poisoned.into_inner()
+            // Do NOT recover from poisoned state — the internal counter / skip
+            // set is unreliable. Panic to surface the original failure rather
+            // than silently corrupting broadcast ordering.
+            panic!(
+                "broadcast order state mutex was poisoned; refusing to continue \
+                 with corrupted ordering state. Original error: {poisoned}"
+            );
         }
     }
 }

@@ -1,11 +1,16 @@
-import type { ChatDetail } from '@/lib/api/types';
-import { isExecutionBoundaryWait } from '@/lib/run-status-messages';
+import type { ChatDetail } from "@/lib/api/types";
+import { isExecutionBoundaryWait } from "@/lib/run-status-messages";
 
-const QUEUEABLE_RUN_STATUSES = new Set(['running', 'input-queued', 'waiting']);
-const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const QUEUEABLE_RUN_STATUSES = new Set([
+  "running",
+  "input-queued",
+  "waiting",
+  "blocked",
+]);
+const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const RUN_STATUS_PRIORITY: Record<string, number> = {
   waiting: 4,
-  'input-queued': 4,
+  "input-queued": 4,
   cancelling: 3,
   running: 2,
   paused: 1,
@@ -26,13 +31,16 @@ export function runBlocksChatTurn(status?: string | null): boolean {
   return Boolean(normalized && !TERMINAL_RUN_STATUSES.has(normalized));
 }
 
-export function activeRunPriority(run: { status: string; waitingFor?: string | null }): number {
+export function activeRunPriority(run: {
+  status: string;
+  waitingFor?: string | null;
+}): number {
   const normalized = normalizeChatRunStatus(run.status);
   if (!normalized) {
     return 0;
   }
-  if (normalized === 'paused' && run.waitingFor === 'user_input') {
-    return RUN_STATUS_PRIORITY['input-queued'];
+  if (normalized === "paused" && run.waitingFor === "user_input") {
+    return RUN_STATUS_PRIORITY["input-queued"];
   }
   return RUN_STATUS_PRIORITY[normalized] ?? 0;
 }
@@ -40,26 +48,29 @@ export function activeRunPriority(run: { status: string; waitingFor?: string | n
 function statusLabel(status: string): string {
   return status
     .trim()
-    .replace(/^waiting:\s*/i, '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/^waiting:\s*/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function activeRunDisplayLabel(run: ChatDetail['activeRun'], archived: boolean): string {
+function activeRunDisplayLabel(
+  run: ChatDetail["activeRun"],
+  archived: boolean,
+): string {
   const status = normalizeChatRunStatus(run?.status);
   const waitingFor = run?.waitingFor?.trim();
   if (!run?.runId || !status) {
-    return archived ? 'Archived' : 'Active';
+    return archived ? "Archived" : "Active";
   }
-  if (status === 'cancelling') {
-    return 'Stopping';
+  if (status === "cancelling") {
+    return "Stopping";
   }
-  if (status === 'input-queued') {
-    return 'Input Queued';
+  if (status === "input-queued") {
+    return "Input Queued";
   }
-  if (status === 'blocked') {
-    return waitingFor ? `Blocked: ${statusLabel(waitingFor)}` : 'Blocked';
+  if (status === "blocked") {
+    return waitingFor ? `Blocked: ${statusLabel(waitingFor)}` : "Blocked";
   }
   if (waitingFor) {
     const label = statusLabel(waitingFor);
@@ -67,14 +78,14 @@ function activeRunDisplayLabel(run: ChatDetail['activeRun'], archived: boolean):
       ? `Blocked: ${label}`
       : `Waiting: ${label}`;
   }
-  if (status === 'waiting') {
-    return 'Waiting';
+  if (status === "waiting") {
+    return "Waiting";
   }
-  if (status === 'running') {
-    return 'Running';
+  if (status === "running") {
+    return "Running";
   }
-  if (status === 'paused') {
-    return 'Paused';
+  if (status === "paused") {
+    return "Paused";
   }
   if (isTerminalChatRunStatus(status)) {
     return statusLabel(status);
@@ -95,7 +106,7 @@ export type ChatRunUiState = {
 };
 
 export function deriveChatRunUiState(params: {
-  activeRun: ChatDetail['activeRun'];
+  activeRun: ChatDetail["activeRun"];
   archived: boolean;
   startingRun: boolean;
   queueingDeferredInput: boolean;
@@ -105,34 +116,42 @@ export function deriveChatRunUiState(params: {
   const activeRunStatus = normalizeChatRunStatus(params.activeRun?.status);
   const hasActiveRun = Boolean(params.activeRun?.runId && activeRunStatus);
   const canQueueDeferredInput = Boolean(
-    hasActiveRun && activeRunStatus && QUEUEABLE_RUN_STATUSES.has(activeRunStatus),
+    hasActiveRun &&
+    activeRunStatus &&
+    QUEUEABLE_RUN_STATUSES.has(activeRunStatus),
   );
-  const canResumeRun = Boolean(hasActiveRun && activeRunStatus === 'paused');
-  const canStopRun = Boolean(hasActiveRun && activeRunStatus !== 'cancelling');
+  const canResumeRun = Boolean(hasActiveRun && activeRunStatus === "paused");
+  const canStopRun = Boolean(hasActiveRun && activeRunStatus !== "cancelling");
   const activeRunBlocksNewInput = Boolean(
-    hasActiveRun
-      && activeRunStatus
-      && !isTerminalChatRunStatus(activeRunStatus)
-      && !canQueueDeferredInput
-      && !canResumeRun
-      && activeRunStatus !== 'cancelling',
+    hasActiveRun &&
+    activeRunStatus &&
+    !isTerminalChatRunStatus(activeRunStatus) &&
+    !canQueueDeferredInput &&
+    !canResumeRun &&
+    activeRunStatus !== "cancelling",
   );
-  const runControlBusy = params.queueingDeferredInput || params.resumingRun || params.stoppingRun;
-  const composerDisabled = params.startingRun
-    || runControlBusy
-    || activeRunStatus === 'paused'
-    || activeRunStatus === 'cancelling'
-    || activeRunBlocksNewInput;
-  const composerPlaceholder = activeRunStatus === 'paused'
-    ? 'Run paused. Resume or stop it to continue.'
-    : activeRunStatus === 'cancelling'
-      ? 'Stopping current run...'
-      : activeRunBlocksNewInput
-        ? `Run status is ${params.activeRun?.status ?? 'unknown'}. Stop it or refresh before sending.`
-        : canQueueDeferredInput
-          ? 'Queue a follow-up for the next tool call...'
-          : 'Reply to Astra...';
-  const activeRunLabel = activeRunDisplayLabel(params.activeRun, params.archived);
+  const runControlBusy =
+    params.queueingDeferredInput || params.resumingRun || params.stoppingRun;
+  const composerDisabled =
+    params.startingRun ||
+    runControlBusy ||
+    activeRunStatus === "paused" ||
+    activeRunStatus === "cancelling" ||
+    activeRunBlocksNewInput;
+  const composerPlaceholder =
+    activeRunStatus === "paused"
+      ? "Run paused. Resume or stop it to continue."
+      : activeRunStatus === "cancelling"
+        ? "Stopping current run..."
+        : activeRunBlocksNewInput
+          ? `Run status is ${params.activeRun?.status ?? "unknown"}. Stop it or refresh before sending.`
+          : canQueueDeferredInput
+            ? "Queue a follow-up for the next tool call..."
+            : "Reply to Astra...";
+  const activeRunLabel = activeRunDisplayLabel(
+    params.activeRun,
+    params.archived,
+  );
 
   return {
     activeRunStatus,

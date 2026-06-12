@@ -1194,6 +1194,7 @@ export function useStreamLifecycle(
     const assistantMessageId =
       existingAssistantMessageId ?? crypto.randomUUID();
     setResumingRun(true);
+    let optimisticMessageId: string | null = null;
     try {
       const result = await resumeChatRun(detail.chat.id);
       if (!result.activeRun?.runId) {
@@ -1202,6 +1203,12 @@ export function useStreamLifecycle(
       const runId = result.activeRun.runId;
       attachedRunRef.current = runId;
       resetWorkSurfaceRun(runId);
+      const appendedOptimistic =
+        !existingAssistantMessageId &&
+        !detail.messages.some((message) => message.id === assistantMessageId);
+      if (appendedOptimistic) {
+        optimisticMessageId = assistantMessageId;
+      }
       setDetail((current) => ({
         ...current,
         activeRun: result.activeRun,
@@ -1327,6 +1334,15 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
+        // Roll back optimistic message on stream error
+        if (optimisticMessageId) {
+          setDetail((current) => ({
+            ...current,
+            messages: current.messages.filter(
+              (message) => message.id !== optimisticMessageId,
+            ),
+          }));
+        }
         try {
           const refreshed = await getChat(detail.chat.id);
           setDetail(refreshed);
@@ -1359,6 +1375,15 @@ export function useStreamLifecycle(
       if (isNotFoundError(error)) {
         router.replace(chatListHref);
         return;
+      }
+      // Roll back optimistic message on resume error
+      if (optimisticMessageId) {
+        setDetail((current) => ({
+          ...current,
+          messages: current.messages.filter(
+            (message) => message.id !== optimisticMessageId,
+          ),
+        }));
       }
       addToast(
         error instanceof Error

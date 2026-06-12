@@ -225,6 +225,48 @@ pub fn is_dangerous_read_path(path: &str) -> bool {
 pub fn is_internal_safe_path(path: &str) -> Option<InternalPathKind> {
     use std::path::Path;
     let p = Path::new(path);
+
+    // First pass: string-based component check (fast path, no I/O).
+    let kind = match_internal_safe_pattern(p)?;
+
+    // Second pass: resolve symlinks to prevent symlink escape attacks.
+    // e.g. `.astra/sessions/s1/tool-results/evil.txt -> /etc/passwd`
+    // would pass the string check but write to an arbitrary location.
+    //
+    // Strategy:
+    // 1. If the path exists, canonicalize it and re-check the pattern.
+    // 2. If the path doesn't exist (new file), canonicalize the nearest
+    //    existing ancestor and verify it's within `.astra/sessions/`.
+    if let Ok(canonical) = p.canonicalize() {
+        // File exists — re-verify the resolved path matches the safe pattern.
+        if match_internal_safe_pattern(&canonical).as_ref() != Some(&kind) {
+            return None; // Symlink resolved to an unsafe location.
+        }
+    } else {
+        // File doesn't exist yet — walk up to find an existing ancestor and
+        // verify it resolves within a `.astra/sessions/` directory.
+        let mut ancestor = p.parent();
+        while let Some(dir) = ancestor {
+            if let Ok(resolved_dir) = dir.canonicalize() {
+                let components: Vec<_> = resolved_dir.components().collect();
+                let has_astra_sessions = components
+                    .windows(2)
+                    .any(|w| w[0].as_os_str() == ".astra" && w[1].as_os_str() == "sessions");
+                if !has_astra_sessions {
+                    return None; // Ancestor resolved outside .astra/sessions/.
+                }
+                break;
+            }
+            ancestor = dir.parent();
+        }
+    }
+
+    Some(kind)
+}
+
+/// Pure string-based pattern match for internal safe paths.
+/// Checks path components without any filesystem I/O.
+fn match_internal_safe_pattern(p: &std::path::Path) -> Option<InternalPathKind> {
     let components: Vec<_> = p.components().collect();
 
     // Look for pattern: .astra/sessions/<session_id>/tool-results/<file>.
