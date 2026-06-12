@@ -969,8 +969,19 @@ impl CrashRecoveryManager {
         Ok(())
     }
 
-    /// Reset to Idle after successful recovery (session continues).
+    /// Reset to Idle after **successful** recovery (session continues normally).
+    ///
+    /// Clears all recovery state, context, and **resets** `attempt_count` to 0.
+    /// Use this after `complete_recovery()` when the session can proceed.
+    ///
+    /// # Precondition
+    /// The state must NOT be `Failed`. Callers in `Failed` state must use
+    /// `reset_after_failure()` instead, which preserves the retry-storm counter.
     pub fn reset(&mut self) -> Result<(), RecoveryError> {
+        debug_assert!(
+            self.state != RecoveryState::Failed,
+            "reset() called while in Failed state — use reset_after_failure() to preserve attempt_count"
+        );
         self.transition_to(RecoveryState::Idle)?;
         self.context = None;
         self.scan_result = None;
@@ -980,7 +991,15 @@ impl CrashRecoveryManager {
         Ok(())
     }
 
-    /// Reset to Idle after failure (allows retry).
+    /// Reset to Idle after **failed** recovery (enables retry).
+    ///
+    /// Preserves `attempt_count` so the retry gate in exactly-once processing and
+    /// crash-recovery loop can detect infinite-retry patterns. Each call increments
+    /// the internal attempt counter; after `MAX_RECOVERY_ATTEMPTS` the system
+    /// refuses further recovery with `RecoveryError::RecursiveCrash`.
+    ///
+    /// # Precondition
+    /// The state must be `Failed`. Use `reset()` for successful recovery paths.
     pub fn reset_after_failure(&mut self) -> Result<(), RecoveryError> {
         if self.state != RecoveryState::Failed {
             return Err(RecoveryError::InvalidSessionState(

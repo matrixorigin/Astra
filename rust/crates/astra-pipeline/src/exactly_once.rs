@@ -21,7 +21,7 @@
 //! - Workspace mutation: caller must evict stale PureRead results (see `evict_tool()`)
 
 use crate::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache};
-use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
+use astra_turn_types::{classify_tool_idempotency, ToolIdempotency};
 use serde_json::Value;
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,6 +109,11 @@ pub struct ExactlyOnceExecutor {
     cache: InMemoryIdempotencyCache,
     /// Policy: whether to re-execute PureRead tools on cache hit
     pure_read_policy: PureReadPolicy,
+    /// Max consecutive failures for same key before caching the error to
+    /// prevent retry storms during crash recovery.
+    max_retries: u32,
+    /// Consecutive failure counts per key. Reset on first success.
+    retry_counts: std::collections::HashMap<IdempotencyKey, u32>,
 }
 
 /// Policy for PureRead tools on cache hit
@@ -135,7 +140,17 @@ impl ExactlyOnceExecutor {
         Self {
             cache: InMemoryIdempotencyCache::new(),
             pure_read_policy: PureReadPolicy::ReexecuteOnWorkspaceChange,
+            max_retries: 5,
+            retry_counts: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set max_retries for retry-storm protection. After `max_retries`
+    /// consecutive failures for the same tool+args, even the error result
+    /// is cached to prevent infinite re-execution on crash recovery.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     /// Set PureRead policy
@@ -272,6 +287,8 @@ impl ExactlyOnceExecutor {
         // effects, while an error is often retryable transport/runtime state.
         match result {
             Ok(output) => {
+                // Success clears the retry counter for this key.
+                self.retry_counts.remove(&key);
                 let cached_result = CachedToolResult {
                     tool_name: tool_name.to_string(),
                     output: output.clone(),
@@ -286,25 +303,32 @@ impl ExactlyOnceExecutor {
                     from_cache: false,
                 })
             }
-            Err(error_msg) => Err(ExactlyOnceError::ToolExecutionError(error_msg)),
+            Err(error_msg) => {
+                // Retry-storm protection: after max_retries consecutive
+                // failures for the same tool+args, cache the error result
+                // to prevent infinite re-execution on crash recovery.
+                let count = self.retry_counts.entry(key.clone()).or_insert(0);
+                *count += 1;
+                if *count >= self.max_retries {
+                    tracing::warn!(
+                        tool_name = %tool_name,
+                        step_id = %step_id,
+                        retry_count = *count,
+                        max_retries = self.max_retries,
+                        "Exactly-once: retry-storm guard engaged, caching error to break loop"
+                    );
+                    let cached_result = CachedToolResult {
+                        tool_name: tool_name.to_string(),
+                        output: error_msg.clone(),
+                        is_error: true,
+                        cached_at: unix_timestamp_secs(),
+                        context_signature: key.context_signature.clone(),
+                    };
+                    self.cache.record(&key, cached_result);
+                }
+                Err(ExactlyOnceError::ToolExecutionError(error_msg))
+            }
         }
-    }
-
-    /// Record an error result (for tools that failed during original execution).
-    ///
-    /// Errors are intentionally not written to the exactly-once cache. A
-    /// failure is not proof that a side effect was applied, and caching it
-    /// would convert transient network/runtime failures into permanent replay
-    /// failures. The method remains as a semantic no-op for callers that
-    /// report failed original executions.
-    pub fn record_error(
-        &mut self,
-        _step_id: &str,
-        _tool_index: u32,
-        _tool_name: &str,
-        _args: &Value,
-        _error: String,
-    ) {
     }
 
     /// Evict all cache entries for a step (after step completes successfully).
@@ -425,25 +449,6 @@ mod tests {
         assert_eq!(second.output, "retried successfully");
     }
 
-    #[test]
-    fn record_error_skips_transient_failures() {
-        let mut executor = ExactlyOnceExecutor::new();
-        let args = json!({"command": "curl https://example.invalid"});
-        executor.record_error(
-            "step-1",
-            0,
-            "bash",
-            &args,
-            "transport disconnected: timed out".to_string(),
-        );
-
-        assert_eq!(
-            executor.cache_size(),
-            0,
-            "record_error must not freeze retryable transport failures"
-        );
-    }
-
     #[tokio::test]
     async fn test_cache_hit_idempotent_write_returns_cached() {
         let mut executor = ExactlyOnceExecutor::new();
@@ -495,34 +500,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_is_not_cached() {
-        let mut executor = ExactlyOnceExecutor::new();
+    async fn test_error_is_not_cached_below_retry_limit() {
+        let mut executor = ExactlyOnceExecutor::new().with_max_retries(3);
         let args = json!({"command": "exit 1"});
 
-        // First call: returns error
-        let result1 = executor
-            .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
-                Err("command failed".to_string())
-            })
-            .await;
+        // Fail 2 times — still below max_retries, errors not cached
+        for i in 0..2 {
+            let result = executor
+                .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                    Err(format!("command failed attempt {}", i + 1))
+                })
+                .await;
+            assert!(result.is_err(), "attempt {} should fail", i + 1);
+        }
+        assert_eq!(
+            executor.cache_size(),
+            0,
+            "errors not cached below max_retries"
+        );
 
-        // Error should be propagated
-        assert!(result1.is_err());
-
-        // Manually recording the error must still leave the cache empty.
-        executor.record_error("step-1", 0, "bash", &args, "command failed".to_string());
-        assert_eq!(executor.cache_size(), 0);
-
-        // Second call: executes again, because failed attempts are retryable.
-        let result2 = executor
+        // Retry succeeds — cache empty because previous were errors
+        let result = executor
             .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
                 Ok("success".to_string())
             })
             .await
             .unwrap();
-        assert!(!result2.from_cache);
-        assert!(!result2.is_error);
-        assert_eq!(result2.output, "success");
+        assert!(!result.from_cache);
+        assert!(!result.is_error);
+        assert_eq!(result.output, "success");
+    }
+
+    #[tokio::test]
+    async fn test_retry_storm_guard_engages() {
+        let mut executor = ExactlyOnceExecutor::new().with_max_retries(3);
+        let args = json!({"command": "curl https://down.example"});
+
+        // Fail 3 times — hits max_retries, error gets cached
+        for _i in 0..3 {
+            let result = executor
+                .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                    Err("network timeout".to_string())
+                })
+                .await;
+            assert!(result.is_err());
+        }
+        assert_eq!(
+            executor.cache_size(),
+            1,
+            "error should be cached after hitting max_retries"
+        );
+
+        // 4th attempt: returns cached error, no re-execution
+        let result4 = executor
+            .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                Ok("should not execute".to_string())
+            })
+            .await
+            .unwrap();
+        assert!(
+            result4.from_cache && result4.is_error,
+            "4th attempt should return cached error"
+        );
     }
 
     #[tokio::test]

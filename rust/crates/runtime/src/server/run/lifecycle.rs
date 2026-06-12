@@ -6808,7 +6808,7 @@ impl ServerSubRunExecutor {
     ///
     /// Sub-runs get a subdirectory under the parent session workspace to
     /// keep file operations isolated while sharing the same base.
-    fn provision_subrun_workspace(&self, session_id: &str, run_id: &str) -> std::path::PathBuf {
+    fn provision_subrun_workspace(&self, session_id: &str, run_id: &str) -> Result<std::path::PathBuf, String> {
         let sanitize = |s: &str| -> String {
             s.chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
@@ -6816,15 +6816,23 @@ impl ServerSubRunExecutor {
         };
         let safe_session = sanitize(session_id);
         let safe_run = sanitize(run_id);
-        assert!(!safe_session.is_empty(), "session_id must be non-empty");
-        assert!(!safe_run.is_empty(), "run_id must be non-empty");
+        if safe_session.is_empty() {
+            return Err(format!(
+                "session_id {session_id:?} contains no valid characters for workspace path"
+            ));
+        }
+        if safe_run.is_empty() {
+            return Err(format!(
+                "run_id {run_id:?} contains no valid characters for workspace path"
+            ));
+        }
 
         let base = std::env::var("ASTRA_SERVER_WORKSPACES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
         let workspace = base.join(&safe_session).join(&safe_run);
         let _ = std::fs::create_dir_all(&workspace);
-        workspace
+        Ok(workspace)
     }
 }
 
@@ -7114,7 +7122,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // Without this, the headless pipeline fallback cannot execute tools
         // server-side and sub-agents would get edge-protocol errors.
         {
-            let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id);
+            let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id)?;
             let execution_bindings =
                 execution_bindings_from_metadata(config.execution_metadata.as_ref(), &workspace);
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
