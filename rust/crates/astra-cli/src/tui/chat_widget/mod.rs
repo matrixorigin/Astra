@@ -152,6 +152,42 @@ pub(crate) enum WireEvent {
     Compaction(CompactionEvent),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTaskOutputInfoKind {
+    Other,
+    RunningSnapshot,
+    Snapshot,
+}
+
+fn background_task_output_info_kind(msg: &str) -> BackgroundTaskOutputInfoKind {
+    let first_line = msg.lines().next().unwrap_or_default().trim_start();
+    let is_background_output = [
+        "Read shell output ",
+        "Read local agent output ",
+        "Read cloud session output ",
+        "Read main session output ",
+        "Read monitor output ",
+    ]
+    .iter()
+    .any(|prefix| first_line.starts_with(prefix));
+    if !is_background_output {
+        return BackgroundTaskOutputInfoKind::Other;
+    }
+
+    let metadata = msg.split("\nOutput chunk:").next().unwrap_or(msg);
+    if metadata.contains("still running")
+        || metadata.contains("Pending ·")
+        || metadata.contains(" · pending")
+        || metadata.contains("needs input")
+        || metadata.contains("Waiting for input")
+        || metadata.contains("No result yet")
+    {
+        BackgroundTaskOutputInfoKind::RunningSnapshot
+    } else {
+        BackgroundTaskOutputInfoKind::Snapshot
+    }
+}
+
 /// Per-turn metrics the outer loop collects and hands to
 /// `TurnComplete` for the summary band. Boxed in the event enum
 /// so the enum stays small (clippy::large_enum_variant guard).
@@ -1790,7 +1826,15 @@ impl ChatWidget {
     }
 
     fn on_turn_info(&mut self, msg: String) {
-        self.commit_cell(Box::new(SystemCell::info(msg)));
+        match background_task_output_info_kind(&msg) {
+            BackgroundTaskOutputInfoKind::RunningSnapshot => {}
+            BackgroundTaskOutputInfoKind::Snapshot => {
+                self.commit_cell(Box::new(SystemCell::background_task(msg)));
+            }
+            BackgroundTaskOutputInfoKind::Other => {
+                self.commit_cell(Box::new(SystemCell::info(msg)));
+            }
+        }
     }
 
     fn on_explain_report(&mut self, items: Vec<serde_json::Value>) {
@@ -2347,6 +2391,65 @@ mod tests {
             .live_task_cell("tu_test")
             .expect("agent get_result should render as a live TaskCell");
         assert!(!get_result_cell.ctrl_b_background_hint);
+    }
+
+    #[test]
+    fn turn_info_suppresses_running_background_output_snapshot() {
+        let mut w = fresh();
+
+        w.handle_event(AppEvent::Wire(WireEvent::TurnInfo(
+            "Read shell output bg-shell-1 · \"make check\"\n\
+             9 new lines · offset 0 -> 178 · total 178 bytes · 5 total lines · still running\n\
+             Output chunk:\n\
+             Running clippy..."
+                .into(),
+        )));
+
+        assert!(
+            w.history().is_empty(),
+            "running background output snapshots belong in the background detail view, not scrollback"
+        );
+    }
+
+    #[test]
+    fn turn_info_keeps_terminal_background_output_as_background_cell() {
+        let mut w = fresh();
+
+        w.handle_event(AppEvent::Wire(WireEvent::TurnInfo(
+            "Read shell output bg-shell-1 · \"make check\"\n\
+             1 new line · offset 178 -> 210 · total 210 bytes · 6 total lines · completed\n\
+             Output chunk:\n\
+             All checks passed"
+                .into(),
+        )));
+
+        assert_eq!(w.history().len(), 1);
+        let cell = w
+            .history()
+            .last()
+            .and_then(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
+            })
+            .expect("terminal background output should render as a system cell");
+        let first = cell
+            .display_lines(100)
+            .first()
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert!(first.starts_with("↳ Background · "), "{first}");
+        assert!(!first.contains("Note ·"), "{first}");
+    }
+
+    #[test]
+    fn turn_info_keeps_non_background_info() {
+        let mut w = fresh();
+
+        w.handle_event(AppEvent::Wire(WireEvent::TurnInfo(
+            "token refreshed".into(),
+        )));
+
+        assert_eq!(w.history().len(), 1);
     }
 
     #[test]
