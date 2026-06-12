@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::cloud::approval_policy::{
-    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
+    bash_command_is_read_only, cloud_gated_tool_kind_with_args, CloudGatedToolKind,
 };
 use crate::tool::result::semantics::is_resource_limit_output;
-use astra_sandbox::{CommandRisk, analyze_command_risks};
+use astra_sandbox::{analyze_command_risks, CommandRisk};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -987,97 +987,86 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn write_file_requires_pre_state_capture() {
-        let profile = tool_action_profile("write_file", &json!({"path": "src/lib.rs"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Write);
-        assert!(profile.reversible);
-        assert!(profile.requires_pre_state);
+    fn file_write_and_delete_compensation() {
+        // write_file: requires pre-state capture, RestoreOrDeleteFile
+        let p = tool_action_profile("write_file", &json!({"path": "src/lib.rs"}));
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Write);
+        assert!(p.reversible);
+        assert!(p.requires_pre_state);
         assert_eq!(
-            profile.compensation_kind,
+            p.compensation_kind,
             Some(CompensationKind::RestoreOrDeleteFile)
         );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_file_edits")
-        );
-    }
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_file_edits"));
 
-    #[test]
-    fn create_file_uses_delete_compensation() {
-        let profile = tool_action_profile("create_file", &json!({"path": "tmp.txt"}));
-        assert_eq!(profile.category, ActionCategory::Write);
-        assert!(!profile.requires_pre_state);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::DeleteFile)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_file_edits")
-        );
-    }
+        // create_file: DeleteFile (no pre-state needed)
+        let p = tool_action_profile("create_file", &json!({"path": "tmp.txt"}));
+        assert_eq!(p.category, ActionCategory::Write);
+        assert!(!p.requires_pre_state);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::DeleteFile));
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_file_edits"));
 
-    #[test]
-    fn multi_edit_uses_file_restore_compensation() {
-        let profile = tool_action_profile("multi_edit", &json!({"path": "src/lib.rs"}));
-        assert_eq!(profile.category, ActionCategory::Write);
-        assert!(profile.requires_pre_state);
+        // multi_edit: RestoreFileContents
+        let p = tool_action_profile("multi_edit", &json!({"path": "src/lib.rs"}));
+        assert_eq!(p.category, ActionCategory::Write);
+        assert!(p.requires_pre_state);
         assert_eq!(
-            profile.compensation_kind,
+            p.compensation_kind,
             Some(CompensationKind::RestoreFileContents)
         );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_file_edits")
-        );
-    }
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_file_edits"));
 
-    #[test]
-    fn delete_file_uses_file_restore_compensation() {
-        let profile = tool_action_profile("delete_file", &json!({"path": "src/lib.rs"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Destructive);
-        assert!(profile.reversible);
-        assert!(profile.requires_pre_state);
+        // delete_file: destructive, RestoreFileContents
+        let p = tool_action_profile("delete_file", &json!({"path": "src/lib.rs"}));
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Destructive);
+        assert!(p.reversible);
+        assert!(p.requires_pre_state);
         assert_eq!(
-            profile.compensation_kind,
+            p.compensation_kind,
             Some(CompensationKind::RestoreFileContents)
         );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_file_edits")
-        );
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_file_edits"));
     }
 
     #[test]
-    fn rollback_database_snapshots_is_destructive_manual() {
-        let profile = tool_action_profile("rollback_database_snapshots", &json!({}));
-        assert_eq!(profile.category, ActionCategory::Destructive);
-        assert!(!profile.requires_pre_state);
-        assert!(!profile.reversible);
-        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
-    }
+    fn destructive_manual_and_shell_compensation() {
+        // rollback_database_snapshots
+        let p = tool_action_profile("rollback_database_snapshots", &json!({}));
+        assert_eq!(p.category, ActionCategory::Destructive);
+        assert!(!p.requires_pre_state);
+        assert!(!p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
 
-    #[test]
-    fn rollback_turn_actions_is_destructive_manual() {
-        let profile = tool_action_profile("rollback_turn_actions", &json!({}));
-        assert_eq!(profile.category, ActionCategory::Destructive);
-        assert!(!profile.requires_pre_state);
-        assert!(!profile.reversible);
-        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+        // rollback_turn_actions
+        let p = tool_action_profile("rollback_turn_actions", &json!({}));
+        assert_eq!(p.category, ActionCategory::Destructive);
+        assert!(!p.requires_pre_state);
+        assert!(!p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
+
+        // destructive shell (rm -rf, force push, etc.)
+        let p = tool_action_profile("bash", &json!({"command": "rm -rf /tmp/test"}));
+        assert_eq!(p.category, ActionCategory::Destructive);
+        assert!(!p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
     }
 
     #[test]
@@ -1093,13 +1082,11 @@ mod tests {
             adjust.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            adjust
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_session_state")
-        );
+        assert!(adjust
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_session_state"));
 
         let prioritize = tool_action_profile("prioritize_tool", &json!({"tool": "bash"}));
         assert!(prioritize.bounded);
@@ -1109,13 +1096,11 @@ mod tests {
             prioritize.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            prioritize
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("prior preference state")
-        );
+        assert!(prioritize
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("prior preference state"));
 
         let set_goal = tool_action_profile("set_goal", &json!({"goal": "ship rollback shell"}));
         assert!(set_goal.bounded);
@@ -1125,13 +1110,11 @@ mod tests {
             set_goal.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            set_goal
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("previous_goal")
-        );
+        assert!(set_goal
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("previous_goal"));
 
         let compress = tool_action_profile("compress_context", &json!({"turns": 4}));
         assert!(compress.bounded);
@@ -1141,13 +1124,11 @@ mod tests {
             compress.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            compress
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("session-local compression state")
-        );
+        assert!(compress
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("session-local compression state"));
     }
 
     #[test]
@@ -1160,13 +1141,11 @@ mod tests {
             create.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            create
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_session_state")
-        );
+        assert!(create
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_session_state"));
 
         let update = tool_action_profile(
             "task",
@@ -1179,20 +1158,16 @@ mod tests {
             update.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            update
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("pre-update task snapshot")
-        );
-        assert!(
-            update
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("new_status='<previous_status>'")
-        );
+        assert!(update
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pre-update task snapshot"));
+        assert!(update
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("new_status='<previous_status>'"));
 
         let stop = tool_action_profile("task", &json!({"action": "stop", "task_id": "task-1"}));
         assert!(stop.bounded);
@@ -1202,18 +1177,16 @@ mod tests {
             stop.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(
-            stop.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("previous_status")
-        );
-        assert!(
-            stop.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("new_status='<previous_status>'")
-        );
+        assert!(stop
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("previous_status"));
+        assert!(stop
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("new_status='<previous_status>'"));
     }
 
     #[test]
@@ -1235,15 +1208,96 @@ mod tests {
         assert!(profile.compensation_kind.is_none());
     }
 
+    // ── git compensation ──
+
     #[test]
-    fn git_commit_has_compensation_summary() {
-        let profile = tool_action_profile("bash", &json!({"command": "git commit -m 'x'"}));
-        assert!(!profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
+    fn git_commit_compensation() {
+        // bash git commit
+        let p = tool_action_profile("bash", &json!({"command": "git commit -m 'x'"}));
+        assert!(!p.bounded);
+        assert_eq!(p.category, ActionCategory::Execute);
+        assert!(p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
+
+        // git_commit tool
+        let p = tool_action_profile("git_commit", &json!({"message": "x"}));
+        assert!(!p.bounded);
+        assert_eq!(p.category, ActionCategory::Execute);
+        assert!(p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("git_revert_commit"));
+    }
+
+    #[test]
+    fn git_worktree_compensation() {
+        // list: read-only
+        let p = tool_action_profile("git_worktree", &json!({"action": "list"}));
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Read);
+        assert_eq!(p.compensation_kind, None);
+
+        // enter: reversible via GitRestoreWorktree
+        let p = tool_action_profile(
+            "git_worktree",
+            &json!({"action": "enter", "branch": "demo"}),
+        );
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Execute);
+        assert!(p.reversible);
         assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitRevertCommit)
+            p.compensation_kind,
+            Some(CompensationKind::GitRestoreWorktree)
+        );
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_turn_actions"));
+
+        // add: same compensation
+        let p = tool_action_profile("git_worktree", &json!({"action": "add", "branch": "demo"}));
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Execute);
+        assert!(p.reversible);
+        assert_eq!(
+            p.compensation_kind,
+            Some(CompensationKind::GitRestoreWorktree)
+        );
+    }
+
+    #[test]
+    fn git_irreversible_and_file_compensation() {
+        // revert commit: manual (irreversible)
+        let p = tool_action_profile("git_revert_commit", &json!({"commit_sha": "abc123"}));
+        assert!(!p.bounded);
+        assert_eq!(p.category, ActionCategory::Execute);
+        assert!(!p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
+
+        // stash push: reversible via GitApplyStash
+        let p = tool_action_profile("git_stash", &json!({"action": "push"}));
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Execute);
+        assert!(p.reversible);
+        assert_eq!(p.compensation_kind, Some(CompensationKind::GitApplyStash));
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stash_ref"));
+
+        // checkout file: destructive but bounded + reversible
+        let p = tool_action_profile("git_checkout_file", &json!({"path": "src/lib.rs"}));
+        assert!(p.bounded);
+        assert_eq!(p.category, ActionCategory::Destructive);
+        assert!(p.reversible);
+        assert_eq!(
+            p.compensation_kind,
+            Some(CompensationKind::RestoreOrDeleteFile)
         );
     }
 
@@ -1257,13 +1311,11 @@ mod tests {
             profile.compensation_kind,
             Some(CompensationKind::GitRevertCommit)
         );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("git_revert_commit")
-        );
+        assert!(profile
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("git_revert_commit"));
     }
 
     #[test]
@@ -1296,150 +1348,74 @@ mod tests {
             profile.compensation_kind,
             Some(CompensationKind::GitRestoreWorktree)
         );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_turn_actions")
-        );
-    }
-
-    #[test]
-    fn git_worktree_add_is_compensated() {
-        let profile =
-            tool_action_profile("git_worktree", &json!({"action": "add", "branch": "demo"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-    }
-
-    #[test]
-    fn git_stash_push_has_compensation_summary() {
-        let profile = tool_action_profile("git_stash", &json!({"action": "push"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitApplyStash)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("stash_ref")
-        );
-    }
-
-    #[test]
-    fn git_checkout_file_uses_bounded_file_rollback() {
-        let profile = tool_action_profile("git_checkout_file", &json!({"path": "src/lib.rs"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Destructive);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::RestoreOrDeleteFile)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_file_edits")
-        );
-    }
-
-    #[test]
-    fn consolidated_git_profiles_are_action_aware() {
-        let read = tool_action_profile("git", &json!({"action": "status"}));
-        assert_eq!(read.category, ActionCategory::Read);
-        assert!(!tool_requires_explicit_approval(
-            "git",
-            &json!({"action": "status"})
-        ));
-
-        let push = tool_action_profile(
-            "git",
-            &json!({"action": "push", "remote": "origin", "branch": "feature/x"}),
-        );
-        assert_eq!(push.category, ActionCategory::Execute);
-        assert!(!push.bounded);
-        assert!(!push.reversible);
-        assert!(tool_requires_explicit_approval(
-            "git",
-            &json!({"action": "push", "remote": "origin", "branch": "feature/x"})
-        ));
+        assert!(profile
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_turn_actions"));
     }
 
     #[test]
     fn rename_symbol_uses_turn_rollback_hint() {
         let profile = tool_action_profile(
             "rename_symbol",
-            &json!({"symbol": "old_name", "new_name": "new_name"}),
+            &json!({"path": "src/lib.rs", "old_name": "foo", "new_name": "bar"}),
         );
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Write);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::RestoreFileContents)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_turn_actions")
-        );
+        assert!(profile
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_turn_actions"));
     }
 
     #[test]
-    fn notebook_edit_uses_file_rollback_hint() {
-        let profile = tool_action_profile(
-            "notebook_edit",
-            &json!({"notebook_path": "analysis.ipynb", "edit_mode": "replace"}),
-        );
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Write);
-        assert!(profile.reversible);
+    fn mo_query_and_read_only_tools() {
+        // mo_query write: snapshot compensation
+        let p = tool_action_profile("mo_query", &json!({"sql": "INSERT INTO t VALUES(1)"}));
+        assert_eq!(p.category, ActionCategory::Write);
         assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::RestoreOrDeleteFile)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_file_edits")
-        );
-    }
-
-    #[test]
-    fn destructive_shell_is_marked_manual() {
-        let profile = tool_action_profile("bash", &json!({"command": "rm -rf tmp"}));
-        assert_eq!(profile.category, ActionCategory::Destructive);
-        assert!(!profile.reversible);
-        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
-    }
-
-    #[test]
-    fn mo_query_write_uses_snapshot_compensation() {
-        let profile = tool_action_profile("mo_query", &json!({"sql": "UPDATE t SET x = 1"}));
-        assert_eq!(profile.category, ActionCategory::Write);
-        assert!(profile.reversible);
-        assert!(profile.requires_pre_state);
-        assert_eq!(
-            profile.compensation_kind,
+            p.compensation_kind,
             Some(CompensationKind::RestoreDatabaseSnapshot)
         );
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("snapshot"));
+
+        // read-only tools: no compensation prompt
+        for tool in ["read_file", "list_dir", "glob", "grep", "lsp"] {
+            let p = tool_action_profile(tool, &json!({}));
+            assert_eq!(p.category, ActionCategory::Read);
+            assert!(p.compensation_kind.is_none());
+        }
+    }
+
+    // ── remaining tool-specific tests ──
+
+    #[test]
+    fn notebook_and_rename_symbol_compensation() {
+        // notebook_edit: uses turn rollback hint
+        let p = tool_action_profile(
+            "notebook_edit",
+            &json!({"cell_id": "cell-1", "content": "x"}),
+        );
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_turn_actions"));
+
+        // rename_symbol: uses turn rollback hint
+        let p = tool_action_profile(
+            "rename_symbol",
+            &json!({"path": "src/lib.rs", "old_name": "foo", "new_name": "bar"}),
+        );
+        assert!(p
+            .compensation_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rollback_turn_actions"));
     }
 
     #[test]
@@ -1522,23 +1498,86 @@ mod tests {
 
     // ── Execution outcome classification tests ──
 
+    // ── classify outcomes ──
+
     #[test]
-    fn classify_success_result() {
+    fn classify_failure_outcomes() {
+        let cases: &[(&str, FailureCategory)] = &[
+            (
+                "error[E0433]: failed to resolve: use of undeclared crate or module `foo`",
+                FailureCategory::CompileError,
+            ),
+            (
+                "error: build failed, waiting for other jobs to finish...",
+                FailureCategory::CompileError,
+            ),
+            (
+                "thread 'main' panicked at 'assertion failed: x == 1'",
+                FailureCategory::TestFailure,
+            ),
+            (
+                "thread 'test_foo' panicked at 'assert_eq! failed'",
+                FailureCategory::TestFailure,
+            ),
+            (
+                "Error: Permission denied (publickey)",
+                FailureCategory::PermissionDenied,
+            ),
+            (
+                "Error: No such file or directory: /tmp/missing.txt",
+                FailureCategory::ResourceNotFound,
+            ),
+            (
+                r#"{"ok":false,"error":"connection refused"}"#,
+                FailureCategory::NetworkError,
+            ),
+            (
+                "SyntaxError: unexpected token '{' at line 42",
+                FailureCategory::SyntaxError,
+            ),
+            (
+                "Error: invalid argument: value must be positive",
+                FailureCategory::ValidationError,
+            ),
+            (
+                "Segmentation fault (core dumped)",
+                FailureCategory::RuntimeError,
+            ),
+            (
+                r#"{"ok":false,"error":"something unexpected"}"#,
+                FailureCategory::Unknown,
+            ),
+            // Chinese error messages
+            ("错误：编译错误 at line 10", FailureCategory::CompileError),
+            ("错误：权限不足", FailureCategory::PermissionDenied),
+            ("错误：连接被拒绝", FailureCategory::NetworkError),
+        ];
+        for (text, expected) in cases {
+            let c = classify_execution_outcome(text, true, 2000, false);
+            assert_eq!(c.failure_category, Some(*expected), "for input: {text}");
+        }
+        // timeout keyword with short duration → Failure + Timeout
+        let c = classify_execution_outcome("Error: timed out waiting", true, 5_000, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
+    }
+
+    #[test]
+    fn classify_success_and_edge_outcomes() {
+        // success
         let c = classify_execution_outcome(r#"{"ok":true,"result":"done"}"#, false, 500, false);
         assert_eq!(c.outcome, ExecutionOutcome::Success);
         assert!(c.failure_category.is_none());
         assert!(c.error_snippet.is_none());
-    }
-
-    #[test]
-    fn classify_rejected_result() {
+        // rejected
         let c = classify_execution_outcome("rejected by policy", true, 0, true);
         assert_eq!(c.outcome, ExecutionOutcome::Rejected);
         assert!(c.failure_category.is_none());
-    }
-
-    #[test]
-    fn classify_resource_limit_result() {
+        // rejected takes priority over content
+        let c = classify_execution_outcome("error[E0433]: some compile error", true, 100, true);
+        assert_eq!(c.outcome, ExecutionOutcome::Rejected);
+        assert!(c.failure_category.is_none());
+        // resource limit
         let c = classify_execution_outcome(
             "bash: fork: Resource temporarily unavailable",
             true,
@@ -1550,165 +1589,17 @@ mod tests {
             c.failure_category,
             Some(FailureCategory::ResourceExhaustion)
         );
-    }
-
-    #[test]
-    fn classify_timeout_with_long_duration() {
+        // timeout with long duration
         let c = classify_execution_outcome("Error: connection timed out", true, 130_000, false);
         assert_eq!(c.outcome, ExecutionOutcome::Timeout);
         assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
+        // success with resource-limit text stays success (didn't fail)
+        let c = classify_execution_outcome("Killed", false, 100, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Success);
     }
 
     #[test]
-    fn classify_timeout_keyword_short_duration_still_failure() {
-        let c = classify_execution_outcome("Error: timed out waiting", true, 5_000, false);
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
-    }
-
-    #[test]
-    fn classify_compile_error() {
-        let c = classify_execution_outcome(
-            "error[E0433]: failed to resolve: use of undeclared crate or module `foo`",
-            true,
-            2000,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::CompileError));
-    }
-
-    #[test]
-    fn classify_build_failed() {
-        let c = classify_execution_outcome(
-            "error: build failed, waiting for other jobs to finish...",
-            true,
-            5000,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::CompileError));
-    }
-
-    #[test]
-    fn classify_test_failure() {
-        let c = classify_execution_outcome(
-            "thread 'main' panicked at 'assertion failed: x == 1'",
-            true,
-            1000,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::TestFailure));
-    }
-
-    #[test]
-    fn classify_test_failure_assert_eq() {
-        let c = classify_execution_outcome(
-            "thread 'test_foo' panicked at 'assert_eq! failed'",
-            true,
-            1000,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::TestFailure));
-    }
-
-    #[test]
-    fn classify_permission_denied() {
-        let c =
-            classify_execution_outcome("Error: Permission denied (publickey)", true, 300, false);
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::PermissionDenied));
-    }
-
-    #[test]
-    fn classify_resource_not_found() {
-        let c = classify_execution_outcome(
-            "Error: No such file or directory: /tmp/missing.txt",
-            true,
-            50,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::ResourceNotFound));
-    }
-
-    #[test]
-    fn classify_network_error() {
-        let c = classify_execution_outcome(
-            r#"{"ok":false,"error":"connection refused"}"#,
-            true,
-            1000,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::NetworkError));
-    }
-
-    #[test]
-    fn classify_syntax_error() {
-        let c = classify_execution_outcome(
-            "SyntaxError: unexpected token '{' at line 42",
-            true,
-            100,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::SyntaxError));
-    }
-
-    #[test]
-    fn classify_validation_error() {
-        let c = classify_execution_outcome(
-            "Error: invalid argument: value must be positive",
-            true,
-            50,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::ValidationError));
-    }
-
-    #[test]
-    fn classify_runtime_error() {
-        let c = classify_execution_outcome("Segmentation fault (core dumped)", true, 200, false);
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::RuntimeError));
-    }
-
-    #[test]
-    fn classify_unknown_error() {
-        let c = classify_execution_outcome(
-            r#"{"ok":false,"error":"something unexpected"}"#,
-            true,
-            100,
-            false,
-        );
-        assert_eq!(c.outcome, ExecutionOutcome::Failure);
-        assert_eq!(c.failure_category, Some(FailureCategory::Unknown));
-    }
-
-    #[test]
-    fn classify_chinese_compile_error() {
-        let c = classify_execution_outcome("错误：编译错误 at line 10", true, 2000, false);
-        assert_eq!(c.failure_category, Some(FailureCategory::CompileError));
-    }
-
-    #[test]
-    fn classify_chinese_permission_error() {
-        let c = classify_execution_outcome("错误：权限不足", true, 100, false);
-        assert_eq!(c.failure_category, Some(FailureCategory::PermissionDenied));
-    }
-
-    #[test]
-    fn classify_chinese_network_error() {
-        let c = classify_execution_outcome("错误：连接被拒绝", true, 100, false);
-        assert_eq!(c.failure_category, Some(FailureCategory::NetworkError));
-    }
-
-    #[test]
-    fn classify_outcome_serde_roundtrip() {
+    fn classify_outcome_serde() {
         let c = ExecutionOutcomeClassification {
             outcome: ExecutionOutcome::Failure,
             failure_category: Some(FailureCategory::CompileError),
@@ -1717,10 +1608,7 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let roundtrip: ExecutionOutcomeClassification = serde_json::from_str(&json).unwrap();
         assert_eq!(c, roundtrip);
-    }
-
-    #[test]
-    fn classify_outcome_skip_none_fields_in_json() {
+        // success with None fields → skip in JSON
         let c = ExecutionOutcomeClassification {
             outcome: ExecutionOutcome::Success,
             failure_category: None,
@@ -1736,18 +1624,5 @@ mod tests {
         let long_error = format!("error[E0433]: {}", "x".repeat(500));
         let c = classify_execution_outcome(&long_error, true, 2000, false);
         assert!(c.error_snippet.as_ref().unwrap().len() <= 210);
-    }
-
-    #[test]
-    fn classify_success_with_resource_limit_text_stays_success() {
-        let c = classify_execution_outcome("Killed", false, 100, false);
-        assert_eq!(c.outcome, ExecutionOutcome::Success);
-    }
-
-    #[test]
-    fn classify_rejected_takes_priority_over_content() {
-        let c = classify_execution_outcome("error[E0433]: some compile error", true, 100, true);
-        assert_eq!(c.outcome, ExecutionOutcome::Rejected);
-        assert!(c.failure_category.is_none());
     }
 }
