@@ -407,6 +407,7 @@ pub(crate) fn parse_delegation_request(
         user_id: "system".to_string(),
         depth: u32::from(recursion_depth),
         context,
+        execution_metadata: None,
     })
 }
 

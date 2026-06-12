@@ -764,6 +764,7 @@ mod tests {
             user_id: "test-user".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         // This should succeed now that source_agent_id is "main" (registered)

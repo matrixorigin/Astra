@@ -379,6 +379,7 @@ pub fn resolve_team(
         user_id: team.user_id.clone(),
         depth: 0,
         context,
+        execution_metadata: None,
     };
 
     Ok((request, profiles))
@@ -1711,10 +1712,9 @@ mod tests {
             max_delegation_depth: 0,
         });
         let err = validate_team(&team).unwrap_err();
-        assert!(
-            err.iter()
-                .any(|e| matches!(e, TeamValidationError::AdversarialMemberCount(3)))
-        );
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, TeamValidationError::AdversarialMemberCount(3))));
     }
 
     #[test]
@@ -1733,10 +1733,9 @@ mod tests {
         // Make both members have the same role
         team.members[1].role = team.members[0].role.clone();
         let err = validate_team(&team).unwrap_err();
-        assert!(
-            err.iter()
-                .any(|e| matches!(e, TeamValidationError::DuplicateRoles(_)))
-        );
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, TeamValidationError::DuplicateRoles(_))));
     }
 
     #[test]
@@ -1745,10 +1744,9 @@ mod tests {
         team.members[0].agent_id = Some("same-id".to_string());
         team.members[1].agent_id = Some("same-id".to_string());
         let err = validate_team(&team).unwrap_err();
-        assert!(
-            err.iter()
-                .any(|e| matches!(e, TeamValidationError::DuplicateAgentIds(_)))
-        );
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, TeamValidationError::DuplicateAgentIds(_))));
     }
 
     #[test]
@@ -1766,10 +1764,9 @@ mod tests {
             max_duration_secs: 60,
         });
         let errs = validate_team(&team).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, TeamValidationError::InvalidBudget(_)))
-        );
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, TeamValidationError::InvalidBudget(_))));
     }
 
     #[test]
@@ -2394,20 +2391,16 @@ mod tests {
         };
         store.save_snapshot(&snap).await.unwrap();
 
-        assert!(
-            store
-                .find_snapshot("snap-shared-id", "bob")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .list_snapshots("team-x", "bob", 50)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .find_snapshot("snap-shared-id", "bob")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_snapshots("team-x", "bob", 50)
+            .await
+            .unwrap()
+            .is_empty());
 
         let deleted = store
             .delete_snapshot("snap-shared-id", "bob")
@@ -2415,13 +2408,11 @@ mod tests {
             .unwrap();
         assert!(!deleted, "other user must not delete alice snapshot");
 
-        assert!(
-            store
-                .find_snapshot("snap-shared-id", "alice")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .find_snapshot("snap-shared-id", "alice")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

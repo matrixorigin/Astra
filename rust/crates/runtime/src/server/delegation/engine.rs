@@ -2262,7 +2262,7 @@ impl DelegationEngine {
                 live_event_sink: None,
                 cancel_token: Some(child_cancel),
                 inherited_prefix,
-                execution_metadata: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             });
@@ -2550,7 +2550,7 @@ impl DelegationEngine {
                                 live_event_sink: None,
                                 cancel_token: cancel_for_retry.clone(),
                                 inherited_prefix,
-                                execution_metadata: None,
+                                execution_metadata: request.execution_metadata.clone(),
                                 #[cfg(feature = "harness")]
                                 harness_sink: None,
                             }
@@ -2731,7 +2731,7 @@ impl DelegationEngine {
                 live_event_sink: None,
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
-                execution_metadata: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -2844,7 +2844,7 @@ impl DelegationEngine {
                         live_event_sink: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
-                        execution_metadata: None,
+                        execution_metadata: request.execution_metadata.clone(),
                         #[cfg(feature = "harness")]
                         harness_sink: None,
                     },
@@ -3033,7 +3033,7 @@ impl DelegationEngine {
                 live_event_sink: None,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
-                execution_metadata: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3140,7 +3140,7 @@ impl DelegationEngine {
                         live_event_sink: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
-                        execution_metadata: None,
+                        execution_metadata: request.execution_metadata.clone(),
                         #[cfg(feature = "harness")]
                         harness_sink: None,
                     },
@@ -3250,7 +3250,7 @@ impl DelegationEngine {
                 live_event_sink: None,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
-                execution_metadata: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3489,7 +3489,7 @@ impl DelegationEngine {
                 live_event_sink: None,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
-                execution_metadata: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
