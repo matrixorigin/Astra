@@ -11,8 +11,8 @@ use serde_json::{Map, Value};
 
 use crate::server::run::engine::RunStartContext;
 use crate::server::tool_transport::{
-    binding_event_fields, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
-    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
 };
 
 pub(crate) fn resolve_request_execution_bindings(

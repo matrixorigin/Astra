@@ -790,6 +790,10 @@ fn run_status_record_to_response() {
         status: "waiting".into(),
         waiting_for: Some("tool_call".into()),
         events_count: 7,
+        workspace: None,
+        executor: None,
+        transport: None,
+        fallback_policy: None,
     };
     let resp: RunStatusResponse = record.into();
     assert_eq!(resp.status, "waiting");
@@ -803,6 +807,10 @@ fn run_status_record_to_response() {
         status: "completed".into(),
         waiting_for: None,
         events_count: 10,
+        workspace: None,
+        executor: None,
+        transport: None,
+        fallback_policy: None,
     };
     let resp: RunStatusResponse = record.into();
     assert!(resp.waiting_for.is_none());
@@ -882,6 +890,8 @@ fn chat_request_into_data_maps_all_fields() {
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
         model: Some("gpt-4".into()),
+        workspace_binding: None,
+        executor_binding: None,
         llm_token_service: Some(astra_services::LlmTokenServiceRequest {
             url: "http://catalog:8081/api/v1/llm-token".into(),
             timeout_ms: Some(2500),
@@ -973,6 +983,8 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         session_id: None,
         agent_id: None,
         model: None,
+        workspace_binding: None,
+        executor_binding: None,
         llm_token_service: None,
         skill_search: None,
         allow_skills: None,

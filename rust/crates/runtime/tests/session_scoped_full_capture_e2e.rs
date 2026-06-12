@@ -224,6 +224,10 @@ impl RunLifecycleService for RecordingLifecycle {
             status: "completed".to_string(),
             waiting_for: None,
             events_count: 1,
+            workspace: None,
+            executor: None,
+            transport: None,
+            fallback_policy: None,
         })
     }
 

@@ -302,6 +302,10 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             status: run.status,
             waiting_for: run.waiting_for,
             events_count: run.events.len() as i64,
+            workspace: None,
+            executor: None,
+            transport: None,
+            fallback_policy: None,
         })
     }
 

@@ -113,10 +113,11 @@ fn wire_executor_into_state(
 }
 
 use crate::server::run::binding_resolution::{
-    agent_working_dir_for_bindings, binding_snapshot_events, execution_bindings_from_edge_profile,
-    execution_bindings_from_metadata, executor_binding_from_request,
-    resolve_request_execution_bindings, resolve_request_execution_bindings_without_server_workspace,
-    request_uses_server_workspace, run_start_context_from_request, RunExecutionBindingSnapshot,
+    RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
+    execution_bindings_from_edge_profile, execution_bindings_from_metadata,
+    executor_binding_from_request, request_uses_server_workspace,
+    resolve_request_execution_bindings,
+    resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
 };
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
