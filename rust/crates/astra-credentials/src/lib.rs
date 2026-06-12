@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_name_priority() {
+    fn resolve_profile_name_priority_and_legacy_fallback() {
         // cli_override wins
         assert_eq!(
             CredentialStore::resolve_profile_name(Some("staging"), Some("prod")),
@@ -415,10 +415,8 @@ mod tests {
         temp_env::with_var("ASTRA_PROFILE", None::<&str>, || {
             assert_eq!(CredentialStore::resolve_profile_name(None, None), "default");
         });
-    }
 
-    #[test]
-    fn resolve_profile_name_supports_legacy_admin_default() {
+        // Legacy admin default
         temp_env::with_var("ASTRA_PROFILE", None::<&str>, || {
             assert_eq!(
                 CredentialStore::resolve_profile_name_with_default(None, None, "admin"),
@@ -462,28 +460,21 @@ mod tests {
     }
 
     #[test]
-    fn file_permissions_are_restricted() {
+    fn file_permissions_are_restricted_0600() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let dir = TempDir::new().unwrap();
+
+            // CredentialStore creates restricted files
             let store = store_in(&dir);
             store.mutate(|_| {}).unwrap();
             let meta = fs::metadata(store.path()).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        }
-    }
 
-    #[test]
-    fn private_tmp_writer_creates_restricted_file() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = TempDir::new().unwrap();
+            // Private tmp writer also creates restricted files
             let tmp = dir.path().join("credentials.json.tmp");
-
             write_private_file(&tmp, "secret-token").unwrap();
-
             let meta = fs::metadata(&tmp).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
             assert_eq!(fs::read_to_string(&tmp).unwrap(), "secret-token");
