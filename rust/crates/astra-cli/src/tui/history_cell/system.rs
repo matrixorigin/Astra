@@ -20,7 +20,14 @@ use crate::tui::turn_event::{SystemLevel, TurnEvent};
 pub(crate) struct SystemCell {
     message: String,
     level: SystemLevel,
+    presentation: SystemPresentation,
     ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemPresentation {
+    Standard,
+    BackgroundTask,
 }
 
 impl SystemCell {
@@ -28,6 +35,16 @@ impl SystemCell {
         Self {
             message: message.into(),
             level: SystemLevel::Info,
+            presentation: SystemPresentation::Standard,
+            ts: None,
+        }
+    }
+
+    pub fn background_task(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            level: SystemLevel::Info,
+            presentation: SystemPresentation::BackgroundTask,
             ts: None,
         }
     }
@@ -43,6 +60,7 @@ impl SystemCell {
         Self {
             message: message.into(),
             level: SystemLevel::Response,
+            presentation: SystemPresentation::Standard,
             ts: None,
         }
     }
@@ -52,6 +70,7 @@ impl SystemCell {
         Self {
             message: message.into(),
             level: SystemLevel::Warning,
+            presentation: SystemPresentation::Standard,
             ts: None,
         }
     }
@@ -67,6 +86,7 @@ impl SystemCell {
         Self {
             message: humanize_error(raw.as_ref()),
             level: SystemLevel::Error,
+            presentation: SystemPresentation::Standard,
             ts: None,
         }
     }
@@ -84,6 +104,7 @@ impl SystemCell {
             TurnEvent::System { ts, level, text } => Some(Self {
                 message: text,
                 level,
+                presentation: SystemPresentation::Standard,
                 ts,
             }),
             _ => None,
@@ -101,31 +122,38 @@ impl SystemCell {
 
 impl HistoryCell for SystemCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let (prefix, label_style, body_style) = match self.level {
-            SystemLevel::Info => (
-                "ℹ Note · ",
-                Style::default()
-                    .fg(crate::tui::theme::current().dim)
-                    .add_modifier(ratatui::style::Modifier::DIM),
-                Style::default().fg(Color::Gray),
-            ),
-            SystemLevel::Response => (
-                "Result · ",
-                Style::default()
-                    .fg(crate::tui::theme::current().dim)
-                    .add_modifier(ratatui::style::Modifier::DIM),
+        let (prefix, label_style, body_style) = match self.presentation {
+            SystemPresentation::BackgroundTask => (
+                "↳ Background · ",
+                Style::default().cyan().bold(),
                 Style::default().fg(Color::White),
             ),
-            SystemLevel::Warning => (
-                "⚠ Warning · ",
-                Style::default().yellow().bold(),
-                Style::default().yellow(),
-            ),
-            SystemLevel::Error => (
-                "✖ Error · ",
-                Style::default().red().bold(),
-                Style::default().red(),
-            ),
+            SystemPresentation::Standard => match self.level {
+                SystemLevel::Info => (
+                    "ℹ Note · ",
+                    Style::default()
+                        .fg(crate::tui::theme::current().dim)
+                        .add_modifier(ratatui::style::Modifier::DIM),
+                    Style::default().fg(Color::Gray),
+                ),
+                SystemLevel::Response => (
+                    "Result · ",
+                    Style::default()
+                        .fg(crate::tui::theme::current().dim)
+                        .add_modifier(ratatui::style::Modifier::DIM),
+                    Style::default().fg(Color::White),
+                ),
+                SystemLevel::Warning => (
+                    "⚠ Warning · ",
+                    Style::default().yellow().bold(),
+                    Style::default().yellow(),
+                ),
+                SystemLevel::Error => (
+                    "✖ Error · ",
+                    Style::default().red().bold(),
+                    Style::default().red(),
+                ),
+            },
         };
         let continuation = "  ".to_string();
         self.message
@@ -244,6 +272,17 @@ mod tests {
     }
 
     #[test]
+    fn background_task_renders_dedicated_label() {
+        let cell =
+            SystemCell::background_task("Opened bg-shell-1 details · S stop · Esc list · Q close");
+        let out = render(&cell, 90, 1);
+
+        assert!(out.starts_with("↳ Background · "), "label missing: {out:?}");
+        assert!(out.contains("Opened bg-shell-1 details"), "{out}");
+        assert!(!out.contains("Note ·"), "{out}");
+    }
+
+    #[test]
     fn response_continuation_lines_hang_indent() {
         // Multi-line responses must keep the label only on row 0 and
         // align continuation lines under the body so the block reads
@@ -282,6 +321,7 @@ mod tests {
     fn persist_roundtrip_for_each_level() {
         for (mk, lv) in [
             (SystemCell::info("a") as SystemCell, SystemLevel::Info),
+            (SystemCell::background_task("bg"), SystemLevel::Info),
             (SystemCell::response("d"), SystemLevel::Response),
             (SystemCell::warning("b"), SystemLevel::Warning),
             (SystemCell::error("c"), SystemLevel::Error),

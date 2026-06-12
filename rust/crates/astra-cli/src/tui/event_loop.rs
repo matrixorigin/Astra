@@ -57,9 +57,9 @@ const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
     let description = description.trim();
     if description.is_empty() {
-        format!("Backgrounded agent {agent_id}. Opened background tasks.")
+        format!("Opened agent {agent_id} details")
     } else {
-        format!("Backgrounded agent {agent_id} ({description}). Opened background tasks.")
+        format!("Opened agent {agent_id} ({description}) details")
     }
 }
 
@@ -1871,7 +1871,7 @@ pub(crate) async fn run_tui_session(
                                                                         .await
                                                                 {
                                                                     chat_widget.commit_system(
-                                                                        history_cell::system::SystemCell::info(
+                                                                        history_cell::system::SystemCell::background_task(
                                                                             ctrl_b_promoted_agent_message(
                                                                                 &agent.agent_id,
                                                                                 &agent.description,
@@ -2390,8 +2390,8 @@ pub(crate) async fn run_tui_session(
                                                                 selected_id.as_str(),
                                                             );
                                                             chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::info(
-                                                                    format!("⏎ Backgrounded as {id}. Opened background task details; S stop, Esc list, Q close.")
+                                                                history_cell::system::SystemCell::background_task(
+                                                                    format!("Opened {id} details · S stop · Esc list · Q close")
                                                                 ),
                                                             );
                                                             set_bash_background_hint_enabled(
@@ -3924,9 +3924,9 @@ mod tests {
     fn ctrl_b_promoted_agent_message_is_user_facing() {
         let message = ctrl_b_promoted_agent_message("reviewer@run-1", "review auth");
 
-        assert!(message.contains("Backgrounded agent reviewer@run-1"));
+        assert!(message.contains("Opened agent reviewer@run-1"));
         assert!(message.contains("review auth"));
-        assert!(message.contains("Opened background tasks"));
+        assert!(message.contains("details"));
         assert!(!message.contains("agent(action="), "{message}");
         assert!(!message.contains("task_output"), "{message}");
         assert!(!message.contains("job("), "{message}");

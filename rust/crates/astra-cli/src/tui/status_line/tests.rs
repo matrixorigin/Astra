@@ -582,6 +582,12 @@ fn bg_running_only_renders_count() {
         !plain.contains("needs input"),
         "needs-input segment must hide when 0; got {plain:?}"
     );
+    let chip = StatusLine::from_context(&c)
+        .left
+        .into_iter()
+        .find(|seg| seg.text.contains("Background"))
+        .expect("running background chip must render");
+    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
 }
 
 #[test]
@@ -641,7 +647,7 @@ fn bg_stalled_only_chip_uses_yellow_for_attention() {
     assert_eq!(
         chip.text,
         format!(
-            "BG 2 need input · {}",
+            "Background · 2 need input · {}",
             crate::tui::background_shortcut::background_task_open_hint()
         ),
         "stalled-only chip should be an attention state, not a vague background label"
@@ -673,7 +679,7 @@ fn bg_failed_only_chip_uses_red_attention() {
     assert_eq!(
         chip.text,
         format!(
-            "BG 1 shell failed · {}",
+            "Background · 1 shell failed · {}",
             crate::tui::background_shortcut::background_task_open_hint()
         )
     );
@@ -749,7 +755,7 @@ fn bg_footer_stays_discoverable_during_active_foreground_turn() {
     let plain = StatusLine::from_context(&c).plain();
     let open_hint = crate::tui::background_shortcut::background_task_open_hint();
     assert!(
-        plain.contains("BG 1 shell"),
+        plain.contains("Background · 1 shell"),
         "foreground activity must not hide running background tasks; got {plain:?}"
     );
     assert!(
@@ -784,7 +790,7 @@ fn bg_footer_survives_standard_width_compaction() {
         .map(|x| buf[(x, 0)].symbol().to_string())
         .collect();
     assert!(
-        rendered.contains("BG 1 shell"),
+        rendered.contains("Background"),
         "standard-width footer must keep background tasks discoverable; got {rendered:?}"
     );
 }

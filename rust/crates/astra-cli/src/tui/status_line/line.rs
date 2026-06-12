@@ -354,10 +354,22 @@ fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
 
 fn background_task_chip_text(counts: BackgroundTaskCounts) -> String {
     format!(
-        "BG {} · {}",
+        "Background · {} · {}",
         background_task_count_parts(counts).join(" · "),
         crate::tui::background_shortcut::background_task_open_hint()
     )
+}
+
+fn background_task_chip_style(counts: BackgroundTaskCounts) -> Style {
+    if counts.failed_total() > 0 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if counts.waiting > 0 || counts.unavailable_total() > 0 {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    }
 }
 
 /// Threshold below which the budget chip is dim, above which it warns.
@@ -440,15 +452,10 @@ impl StatusLine {
         if let Some(counts) = ctx.bg_task_counts
             && !counts.is_empty()
         {
-            let style = if counts.failed_total() > 0 {
-                Style::default().fg(Color::Red)
-            } else if counts.waiting > 0 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                muted
-            };
-            out.left
-                .push(Segment::styled(background_task_chip_text(counts), style));
+            out.left.push(Segment::styled(
+                background_task_chip_text(counts),
+                background_task_chip_style(counts),
+            ));
         }
 
         for summary in &ctx.bg_fanout_summaries {
