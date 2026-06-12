@@ -23,7 +23,7 @@ use crate::traits::{SkillError, SkillExecutionContext, SkillExecutionResult, Ski
 
 #[cfg(feature = "crash-recovery")]
 use astra_pipeline::skill_checkpoint::{
-    SkillCheckpoint, SkillCheckpointManager, SkillExecutionState, SkillToolCallRecord,
+    SkillCheckpoint, SkillCheckpointManager, SkillExecutionState,
 };
 
 /// Trait for executing isolated skill sub-runs.

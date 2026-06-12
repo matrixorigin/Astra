@@ -429,6 +429,7 @@ mod tests {
                 output: format!("cached {path}"),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
 

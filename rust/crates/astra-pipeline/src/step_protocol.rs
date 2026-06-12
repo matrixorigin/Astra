@@ -1262,7 +1262,7 @@ impl Default for InMemoryIdempotencyCache {
     fn default() -> Self {
         Self {
             cache: HashMap::new(),
-            max_entries: 10_000,  // ~100MB at 10KB per entry
+            max_entries: 10_000, // ~100MB at 10KB per entry
         }
     }
 }

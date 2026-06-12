@@ -29,7 +29,7 @@
 //! - Crypto hash mismatch (tamper/corruption) → `Failed(HashMismatch)`
 //! - Double crash (recovery itself crashes) → `Failed(RecursiveCrash)`
 
-use astra_turn_types::{classify_tool_idempotency, ToolIdempotency};
+use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -188,6 +188,7 @@ fn build_restored_from_scan(
 
 /// Outcome of crash recovery attempt
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum RecoveryOutcome {
     /// Session automatically recovered, ready to continue
     AutoRecovered {
@@ -466,7 +467,7 @@ fn compute_merkle_root(ids: &[String]) -> String {
         .map(|id| Sha256::digest(id.as_bytes()).to_vec())
         .collect();
     while hashes.len() > 1 {
-        if hashes.len() % 2 != 0 {
+        if !hashes.len().is_multiple_of(2) {
             hashes.push(hashes.last().unwrap().clone());
         }
         let mut next = Vec::new();
@@ -682,7 +683,11 @@ impl CrashRecoveryManager {
 
         // Compute recovery hash for tamper detection
         let cp_json = serde_json::to_string(&result.last_checkpoint).unwrap_or_default();
-        let event_ids: Vec<String> = result.events_after.iter().map(|e| e.event_id.clone()).collect();
+        let event_ids: Vec<String> = result
+            .events_after
+            .iter()
+            .map(|e| e.event_id.clone())
+            .collect();
         self.recovery_hash = Some(compute_recovery_hash(
             session_id,
             &cp_json,
@@ -915,10 +920,10 @@ impl CrashRecoveryManager {
     /// Mark recovery as complete — transition Replaying → Recovered.
     pub fn complete_recovery(&mut self) -> Result<(), RecoveryError> {
         // Check journal gaps first (more fundamental than pending decisions)
-        if let Some(ref ctx) = self.context {
-            if let Some(ref gap) = ctx.journal_gap {
-                return Err(gap.clone());
-            }
+        if let Some(ref ctx) = self.context
+            && let Some(ref gap) = ctx.journal_gap
+        {
+            return Err(gap.clone());
         }
 
         // Then check for pending user decisions
@@ -1003,6 +1008,7 @@ mod tests {
     }
 
     // -- Helper: build a minimal event --
+    #[allow(dead_code)]
     fn make_event(
         event_id: &str,
         step_id: &str,
@@ -1078,6 +1084,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn tool_completed_with_result(
         event_id: &str,
         step_id: &str,

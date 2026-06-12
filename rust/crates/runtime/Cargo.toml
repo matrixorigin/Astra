@@ -11,6 +11,8 @@ bridge-e2e-hooks = []
 otel = ["astra-logging/otel"]
 # Observation + verification harness (zero cost when disabled).
 harness = ["dep:astra-harness"]
+# Crash recovery with skill checkpointing (Phase 3).
+crash-recovery = ["astra-skills/crash-recovery"]
 
 [[test]]
 name = "chat_turn_bridge_ledger_inject_e2e"

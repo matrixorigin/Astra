@@ -286,6 +286,12 @@ pub mod mock_journal_writer {
         pub should_fail: Mutex<bool>,
     }
 
+    impl Default for MockJournalWriter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockJournalWriter {
         pub fn new() -> Self {
             Self {
@@ -323,6 +329,7 @@ mod tests {
     use crate::session_journal::JournalEventType;
     use std::time::Duration;
 
+    #[allow(unused_variables)]
     fn make_event(event_type: &str) -> JournalEvent {
         JournalEvent {
             event_type: JournalEventType::Turn,
@@ -521,7 +528,7 @@ mod tests {
             .collect();
 
         // Confirm DB in order
-        for i in 1..=3 {
+        for _i in 1..=3 {
             let request = ingestion_rx
                 .recv()
                 .await

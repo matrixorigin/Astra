@@ -1123,7 +1123,12 @@ impl ServerToolExecutor {
     }
 
     /// Record tool result in exactly-once cache after execution.
-    fn record_exactly_once_result(&self, name: &str, args: &Value, result: &astra_tools::ToolResult) {
+    fn record_exactly_once_result(
+        &self,
+        name: &str,
+        args: &Value,
+        result: &astra_tools::ToolResult,
+    ) {
         use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
         use std::time::{SystemTime, UNIX_EPOCH};
 
