@@ -235,10 +235,8 @@ mod tests {
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/project/src")));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
-    }
 
-    #[test]
-    fn standard_no_allowlist_allows_all_env() {
+        // Standard policy without project-scoped allowlist allows any env
         let p = SandboxPolicy::for_project("/");
         assert!(p.is_env_allowed("ANYTHING"));
     }

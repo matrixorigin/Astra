@@ -69,58 +69,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bash_is_isolated() {
-        assert_eq!(classify_tool("bash"), ToolTier::Isolated);
+    fn classify_tool_known_tiers() {
+        for (tool, expected) in [
+            ("bash", ToolTier::Isolated),
+            ("read_file", ToolTier::InProcess),
+            ("grep", ToolTier::Sandboxed),
+            ("unknown_danger", ToolTier::Isolated),
+        ] {
+            assert_eq!(classify_tool(tool), expected, "classify_tool({tool:?})");
+        }
     }
 
     #[test]
-    fn read_file_is_in_process() {
-        assert_eq!(classify_tool("read_file"), ToolTier::InProcess);
-    }
-
-    #[test]
-    fn grep_is_sandboxed() {
-        assert_eq!(classify_tool("grep"), ToolTier::Sandboxed);
-    }
-
-    #[test]
-    fn unknown_tool_is_isolated() {
-        assert_eq!(classify_tool("unknown_danger"), ToolTier::Isolated);
-    }
-
-    #[test]
-    fn permissive_mode_downgrades_all() {
-        assert_eq!(
-            effective_tier("bash", SandboxMode::Permissive),
-            ToolTier::InProcess
-        );
-    }
-
-    #[test]
-    fn standard_mode_downgrades_isolated_to_sandboxed() {
-        assert_eq!(
-            effective_tier("bash", SandboxMode::Standard),
-            ToolTier::Sandboxed
-        );
-        assert_eq!(
-            effective_tier("grep", SandboxMode::Standard),
-            ToolTier::Sandboxed
-        );
-    }
-
-    #[test]
-    fn strict_mode_preserves_tiers() {
-        assert_eq!(
-            effective_tier("bash", SandboxMode::Strict),
-            ToolTier::Isolated
-        );
-        assert_eq!(
-            effective_tier("grep", SandboxMode::Strict),
-            ToolTier::Sandboxed
-        );
-        assert_eq!(
-            effective_tier("read_file", SandboxMode::Strict),
-            ToolTier::InProcess
-        );
+    fn effective_tier_by_mode() {
+        for (tool, mode, expected) in [
+            ("bash", SandboxMode::Permissive, ToolTier::InProcess),
+            ("bash", SandboxMode::Standard, ToolTier::Sandboxed),
+            ("grep", SandboxMode::Standard, ToolTier::Sandboxed),
+            ("bash", SandboxMode::Strict, ToolTier::Isolated),
+            ("grep", SandboxMode::Strict, ToolTier::Sandboxed),
+            ("read_file", SandboxMode::Strict, ToolTier::InProcess),
+        ] {
+            assert_eq!(
+                effective_tier(tool, mode),
+                expected,
+                "effective_tier({tool:?}, {mode:?})"
+            );
+        }
     }
 }

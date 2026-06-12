@@ -680,7 +680,8 @@ mod tests {
     }
 
     #[test]
-    fn isolated_output_combined() {
+    fn isolated_output_display() {
+        // Normal output
         let out = IsolatedOutput {
             stdout: "hello".to_string(),
             stderr: "warn".to_string(),
@@ -695,10 +696,8 @@ mod tests {
         assert!(combined.contains("hello"));
         assert!(combined.contains("stderr:\nwarn"));
         assert!(combined.contains("exit code: 1"));
-    }
 
-    #[test]
-    fn isolated_output_timeout() {
+        // Timeout output
         let out = IsolatedOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -724,18 +723,16 @@ mod tests {
 
     // ── apply_cgroup / CgroupGuard public API ────────────────────────────
 
-    /// Zero limits → inactive guard, no cgroup, no side effects.
+    /// Zero or negative limits → inactive guard, no cgroup, no side effects.
     #[test]
-    fn apply_cgroup_zero_limits_inactive_guard() {
+    fn apply_cgroup_zero_or_negative_limits_inactive() {
+        // Zero memory, zero cpu
         let mut cmd = tokio::process::Command::new("true");
         let guard = apply_cgroup(&mut cmd, 0, 0.0);
         assert!(!guard.active(), "zero limits must not create a cgroup");
         assert!(guard.path().is_none());
-    }
 
-    /// Negative cpu_quota is treated as "no limit".
-    #[test]
-    fn apply_cgroup_negative_cpu_is_no_limit() {
+        // Zero memory, negative cpu
         let mut cmd = tokio::process::Command::new("true");
         let guard = apply_cgroup(&mut cmd, 0, -1.0);
         assert!(!guard.active());

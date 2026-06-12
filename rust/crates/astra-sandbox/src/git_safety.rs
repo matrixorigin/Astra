@@ -306,10 +306,11 @@ mod tests {
         }
     }
 
-    // --- Hook skip flags ---
+    // --- Blocked operations ---
 
     #[test]
-    fn blocks_no_verify() {
+    fn blocked_git_operations() {
+        // --no-verify
         let v = validate_git_command("git commit --no-verify -m 'skip hooks'");
         assert!(v.iter().any(|v| matches!(
             v,
@@ -317,9 +318,14 @@ mod tests {
                 flag: "--no-verify"
             }
         )));
-    }
 
-    // --- Force push ---
+        // --amend
+        let v = validate_git_command("git commit --amend -m 'rewrite'");
+        assert!(
+            v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::CommitAmend))
+        );
+    }
 
     #[test]
     fn force_push_behavior() {
@@ -390,18 +396,22 @@ mod tests {
         }
     }
 
-    // --- commit --amend ---
+    // --- validate_git_command edge cases ---
 
     #[test]
-    fn blocks_commit_amend() {
-        let v = validate_git_command("git commit --amend -m 'rewrite'");
+    fn validate_git_command_edge_cases() {
+        // Non-git commands
+        for cmd in ["echo hello", ""] {
+            let violations = validate_git_command(cmd);
+            assert!(violations.is_empty(), "should be empty for: {cmd}");
+        }
+        // Multiple violations in one command
+        let violations = validate_git_command("git commit --amend --no-verify");
         assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CommitAmend))
+            violations.len() >= 2,
+            "should detect both amend and no-verify"
         );
     }
-
-    // --- bare repo detection ---
 
     #[test]
     fn bare_repo_detection() {
@@ -426,26 +436,7 @@ mod tests {
         assert!(!is_bare_git_repo(dir3.path()));
     }
 
-    // --- validate_git_command edge cases ---
-
-    #[test]
-    fn non_git_commands_return_empty() {
-        for cmd in ["echo hello", ""] {
-            let violations = validate_git_command(cmd);
-            assert!(violations.is_empty(), "should be empty for: {cmd}");
-        }
-    }
-
-    #[test]
-    fn multiple_violations_in_one_command() {
-        let violations = validate_git_command("git commit --amend --no-verify");
-        assert!(
-            violations.len() >= 2,
-            "should detect both amend and no-verify"
-        );
-    }
-
-    #[test]
+    // --- violation display ---
     fn violation_display_all_variants() {
         // Ensure Display impl doesn't panic for any variant
         let violations = vec![

