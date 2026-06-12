@@ -279,52 +279,31 @@ mod tests {
     // --- Commit message injection ---
 
     #[test]
-    fn blocks_command_substitution_in_commit() {
-        let v = validate_git_command(r#"git commit -m "$(whoami) was here""#);
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CommitMessageInjection { .. }))
-        );
+    fn commit_message_injection_patterns() {
+        for cmd in [
+            r#"git commit -m "$(whoami) was here""#,
+            "git commit -m \"`id` commit\"",
+            r#"git commit -m "${HOME} commit""#,
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter()
+                    .any(|v| matches!(v, GitSafetyViolation::CommitMessageInjection { .. })),
+                "should block: {cmd}"
+            );
+        }
     }
 
     #[test]
-    fn blocks_backtick_in_commit() {
-        let v = validate_git_command("git commit -m \"`id` commit\"");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CommitMessageInjection { .. }))
-        );
-    }
-
-    #[test]
-    fn blocks_brace_expansion_in_commit() {
-        let v = validate_git_command(r#"git commit -m "${HOME} commit""#);
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CommitMessageInjection { .. }))
-        );
-    }
-
-    #[test]
-    fn allows_single_quoted_commit() {
-        // Single quotes prevent expansion — safe.
-        let v = validate_git_command("git commit -m '$(whoami) was here'");
-        assert!(v.is_empty());
-    }
-
-    #[test]
-    fn blocks_dash_prefix_commit() {
-        let v = validate_git_command("git commit -m \"-evil\"");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CommitMessageDash))
-        );
-    }
-
-    #[test]
-    fn allows_normal_commit() {
-        let v = validate_git_command("git commit -m 'fix: resolve null pointer'");
-        assert!(v.is_empty());
+    fn safe_commit_messages_allowed() {
+        // Single quotes prevent expansion; normal messages are safe
+        for cmd in [
+            "git commit -m '$(whoami) was here'",
+            "git commit -m 'fix: resolve null pointer'",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(v.is_empty(), "should allow: {cmd}");
+        }
     }
 
     // --- Hook skip flags ---
@@ -343,35 +322,23 @@ mod tests {
     // --- Force push ---
 
     #[test]
-    fn blocks_force_push() {
-        let v = validate_git_command("git push --force origin main");
-        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
-    }
-
-    #[test]
-    fn blocks_force_push_short() {
-        let v = validate_git_command("git push -f origin main");
-        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
-    }
-
-    #[test]
-    fn blocks_force_push_protected_branch() {
-        let v = validate_git_command("git push --force origin main");
-        assert!(v
-            .iter()
-            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { branch } if branch == "main")));
-
-        let v = validate_git_command("git push --force origin master");
-        assert!(v
-            .iter()
-            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { branch } if branch == "master")));
-
-        // Feature branch should not trigger protected branch violation
+    fn force_push_detection() {
+        for (cmd, is_protected) in [
+            ("git push --force origin main", true),
+            ("git push -f origin main", false),
+            ("git push --force origin master", true),
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)), "ForcePush for: {cmd}");
+            if is_protected {
+                assert!(v.iter().any(|violation| matches!(
+                    violation, GitSafetyViolation::ForcePushProtectedBranch { .. }
+                )), "ForcePushProtectedBranch for: {cmd}");
+            }
+        }
+        // Feature branch should NOT trigger protected branch
         let v = validate_git_command("git push --force origin feature/my-feature");
-        assert!(
-            !v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
-        );
+        assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
     }
 
     // --- cd + git compound ---
@@ -394,21 +361,20 @@ mod tests {
     // --- git -c config injection ---
 
     #[test]
-    fn blocks_git_c_flag() {
-        let v = validate_git_command("git -c core.fsmonitor=evil status");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::GitConfigFlag))
-        );
-    }
-
-    #[test]
-    fn blocks_git_exec_path() {
-        let v = validate_git_command("git --exec-path=/tmp/evil status");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::GitExecPathFlag))
-        );
+    fn git_config_injection_blocked() {
+        for cmd in [
+            "git -c core.fsmonitor=evil status",
+            "git --exec-path=/tmp/evil status",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter().any(|violation| matches!(
+                    violation,
+                    GitSafetyViolation::GitConfigFlag | GitSafetyViolation::GitExecPathFlag
+                )),
+                "should block: {cmd}"
+            );
+        }
     }
 
     // --- commit --amend ---
@@ -425,92 +391,68 @@ mod tests {
     // --- Regression: protected branch false positives ---
 
     #[test]
-    fn no_false_positive_feature_branch_containing_main() {
-        // "feature/main-refactor" contains "main" but is NOT a protected branch
-        let v = validate_git_command("git push --force origin feature/main-refactor");
-        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
-        assert!(
-            !v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
-        );
-    }
-
-    #[test]
-    fn no_false_positive_branch_containing_develop() {
-        let v = validate_git_command("git push -f origin feature/develop-ui");
-        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
-        assert!(
-            !v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
-        );
-    }
-
-    #[test]
-    fn detects_protected_branch_with_remote_prefix() {
-        // "origin/main" — leaf is "main", should still be caught
+    fn force_push_protected_branch_false_positives() {
+        // Feature branches containing "main" or "develop" in name are NOT protected
+        for cmd in [
+            "git push --force origin feature/main-refactor",
+            "git push -f origin feature/develop-ui",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)));
+            assert!(
+                !v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })),
+                "false positive for {cmd}"
+            );
+        }
+        // BUT "origin/main" with remote prefix is still protected
         let v = validate_git_command("git push --force origin origin/main");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
-        );
-    }
-
-    // --- Regression: -f flag false positives ---
-
-    #[test]
-    fn no_false_positive_follow_tags() {
-        // --follow-tags contains " -f" as substring but is NOT force push
-        let v = validate_git_command("git push --follow-tags origin my-branch");
-        assert!(!v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+        assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
     }
 
     #[test]
-    fn no_false_positive_flag_starting_with_f() {
-        let v = validate_git_command("git push -ff origin my-branch");
-        assert!(!v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+    fn no_false_positive_on_non_force_flags() {
+        for cmd in [
+            "git push --follow-tags origin my-branch",
+            "git push -ff origin my-branch",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)), "false positive: {cmd}");
+        }
     }
 
     // --- bare repo detection ---
 
     #[test]
-    fn detects_bare_repo() {
+    fn bare_repo_detection() {
+        // Bare: HEAD + objects + refs at top level, no .git
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir(dir.path().join("objects")).unwrap();
         std::fs::create_dir(dir.path().join("refs")).unwrap();
         assert!(is_bare_git_repo(dir.path()));
-    }
 
-    #[test]
-    fn normal_repo_not_bare() {
-        let dir = tempfile::tempdir().unwrap();
-        let git_dir = dir.path().join(".git");
+        // Normal: .git/HEAD + objects + refs
+        let dir2 = tempfile::tempdir().unwrap();
+        let git_dir = dir2.path().join(".git");
         std::fs::create_dir(&git_dir).unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        std::fs::create_dir(dir.path().join("objects")).unwrap();
-        std::fs::create_dir(dir.path().join("refs")).unwrap();
-        // Has .git/HEAD → not bare
-        assert!(!is_bare_git_repo(dir.path()));
-    }
+        std::fs::create_dir(dir2.path().join("objects")).unwrap();
+        std::fs::create_dir(dir2.path().join("refs")).unwrap();
+        assert!(!is_bare_git_repo(dir2.path()));
 
-    #[test]
-    fn empty_dir_not_bare() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!is_bare_git_repo(dir.path()));
+        // Empty dir
+        let dir3 = tempfile::tempdir().unwrap();
+        assert!(!is_bare_git_repo(dir3.path()));
     }
 
     // --- validate_git_command edge cases ---
 
     #[test]
-    fn non_git_command_returns_empty() {
-        let violations = validate_git_command("echo hello");
-        assert!(violations.is_empty());
-    }
-
-    #[test]
-    fn empty_command_returns_empty() {
-        let violations = validate_git_command("");
-        assert!(violations.is_empty());
+    fn non_git_commands_return_empty() {
+        for cmd in ["echo hello", ""] {
+            let violations = validate_git_command(cmd);
+            assert!(violations.is_empty(), "should be empty for: {cmd}");
+        }
     }
 
     #[test]

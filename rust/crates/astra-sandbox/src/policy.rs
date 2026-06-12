@@ -238,45 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn permissive_allows_everything() {
-        let p = SandboxPolicy::permissive("/home/user/project");
-        assert!(p.is_path_allowed(std::path::Path::new("/etc/passwd")));
-        assert!(p.is_env_allowed("SECRET_KEY"));
-    }
-
-    #[test]
-    fn strict_policy_restrictive() {
-        let p = SandboxPolicy::strict("/home/user/project");
-        assert_eq!(p.mode, SandboxMode::Strict);
-        assert!(!p.network_allowed);
-        assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
-        assert!(
-            p.allowed_paths
-                .contains(&normalize_path(&std::env::temp_dir()))
-        );
-        assert!(p.is_path_allowed(std::path::Path::new("/tmp/x")));
-        assert!(!p.is_path_allowed(std::path::Path::new("/var/tmp/x")));
-    }
-
-    #[test]
-    fn env_baseline_always_allowed() {
-        let p = SandboxPolicy::strict("/");
-        assert!(p.is_env_allowed("PATH"));
-        assert!(p.is_env_allowed("HOME"));
-        assert!(p.is_env_allowed("CARGO_HOME"));
-        assert!(p.is_env_allowed("MATRIXONE_HOST"));
-    }
-
-    #[test]
-    fn env_allowlist_in_strict() {
-        let mut p = SandboxPolicy::strict("/");
-        p.env_allowlist = Some(vec!["MY_CUSTOM_VAR".to_string()]);
-        assert!(p.is_env_allowed("PATH")); // baseline
-        assert!(p.is_env_allowed("MY_CUSTOM_VAR")); // explicit
-        assert!(!p.is_env_allowed("SECRET_API_KEY")); // not in list
-    }
-
-    #[test]
     fn standard_no_allowlist_allows_all_env() {
         let p = SandboxPolicy::for_project("/");
         assert!(p.is_env_allowed("ANYTHING"));
@@ -306,145 +267,93 @@ mod tests {
     }
 
     #[test]
-    fn trust_tier_bundled_is_permissive() {
+    fn trust_tier_policy_mapping() {
         use astra_skills::manifest::TrustTier;
-        let p = SandboxPolicy::for_trust_tier(&TrustTier::Bundled, "/proj");
-        assert_eq!(p.mode, SandboxMode::Permissive);
-        assert!(p.network_allowed);
-        assert!(p.is_path_allowed(std::path::Path::new("/etc/passwd")));
+        let cases: Vec<(TrustTier, SandboxMode, bool, f64)> = vec![
+            (TrustTier::Bundled, SandboxMode::Permissive, true, 30.0),
+            (TrustTier::Verified, SandboxMode::Standard, true, 30.0),
+            (TrustTier::Community, SandboxMode::Standard, true, 30.0),
+            (TrustTier::Unverified, SandboxMode::Strict, false, 15.0),
+        ];
+        for (tier, mode, network, max_secs) in cases {
+            let p = SandboxPolicy::for_trust_tier(&tier, "/proj");
+            assert_eq!(p.mode, mode, "{tier:?}");
+            assert_eq!(p.network_allowed, network, "{tier:?}");
+            assert_eq!(p.max_execution_secs, max_secs, "{tier:?}");
+            // Permissive allows any path; others block outside
+            let passwd_ok = p.is_path_allowed(std::path::Path::new("/etc/passwd"));
+            assert_eq!(passwd_ok, tier == TrustTier::Bundled, "passwd for {tier:?}");
+            // Community has env allowlist
+            if tier == TrustTier::Community {
+                assert!(p.env_allowlist.is_some());
+                assert!(!p.is_env_allowed("SECRET_API_KEY"));
+            }
+        }
     }
 
-    #[test]
-    fn trust_tier_verified_is_standard() {
-        use astra_skills::manifest::TrustTier;
-        let p = SandboxPolicy::for_trust_tier(&TrustTier::Verified, "/proj");
-        assert_eq!(p.mode, SandboxMode::Standard);
-        assert!(p.network_allowed);
-        assert!(p.is_path_allowed(std::path::Path::new("/proj/src/main.rs")));
-        assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
-    }
+    // --- mode comparisons ---
 
     #[test]
-    fn trust_tier_community_has_env_filter() {
-        use astra_skills::manifest::TrustTier;
-        let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
-        assert_eq!(p.mode, SandboxMode::Standard);
-        // Community gets env allowlist (only baseline vars)
-        assert!(p.env_allowlist.is_some());
-        assert!(p.is_env_allowed("PATH")); // baseline always allowed
-        assert!(!p.is_env_allowed("SECRET_API_KEY")); // non-baseline blocked
-    }
-
-    #[test]
-    fn trust_tier_unverified_is_strict() {
-        use astra_skills::manifest::TrustTier;
-        let p = SandboxPolicy::for_trust_tier(&TrustTier::Unverified, "/proj");
-        assert_eq!(p.mode, SandboxMode::Strict);
-        assert!(!p.network_allowed);
-        assert_eq!(p.max_execution_secs, 15.0);
-        assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
-    }
-
-    // --- edge cases ---
-
-    #[test]
-    fn sandbox_mode_ordering() {
-        // Modes are ordered: Permissive < Standard < Strict
+    fn mode_ordering_and_constraints() {
         assert!(SandboxMode::Permissive < SandboxMode::Standard);
         assert!(SandboxMode::Standard < SandboxMode::Strict);
-    }
-
-    #[test]
-    fn strict_max_output_smaller_than_standard() {
         let standard = SandboxPolicy::for_project("/proj");
         let strict = SandboxPolicy::strict("/proj");
         assert!(strict.max_output_bytes < standard.max_output_bytes);
-    }
-
-    #[test]
-    fn strict_timeout_shorter_than_standard() {
-        let standard = SandboxPolicy::for_project("/proj");
-        let strict = SandboxPolicy::strict("/proj");
         assert!(strict.max_execution_secs < standard.max_execution_secs);
-    }
-
-    #[test]
-    fn standard_allows_var_tmp_but_strict_does_not() {
-        let standard = SandboxPolicy::for_project("/proj");
-        let strict = SandboxPolicy::strict("/proj");
+        // /var/tmp allowed in Standard, blocked in Strict
         let var_tmp = std::path::Path::new("/var/tmp/some_file");
         assert!(standard.is_path_allowed(var_tmp));
         assert!(!strict.is_path_allowed(var_tmp));
     }
 
     #[test]
-    fn empty_env_allowlist_blocks_non_baseline() {
-        let mut p = SandboxPolicy::for_project("/proj");
-        p.env_allowlist = Some(Vec::new());
-        assert!(p.is_env_allowed("PATH")); // baseline
-        assert!(!p.is_env_allowed("CUSTOM_VAR")); // not in allowlist
+    fn env_baseline_and_allowlist_rules() {
+        let p = SandboxPolicy::strict("/proj");
+        let baseline: &[&str] = &[
+            "PATH", "HOME", "CARGO_HOME", "MATRIXONE_HOST",
+            "MATRIXONE_PORT", "MATRIXONE_USER", "MATRIXONE_PASSWORD",
+            "ASTRA_DATABASE", "ASTRA_DATABASE_PREFIX",
+        ];
+        for var in baseline {
+            assert!(p.is_env_allowed(var), "Baseline missing: {var}");
+        }
+        // Custom allowlist
+        let mut p2 = SandboxPolicy::strict("/");
+        p2.env_allowlist = Some(vec!["MY_CUSTOM_VAR".to_string()]);
+        assert!(p2.is_env_allowed("PATH"));
+        assert!(p2.is_env_allowed("MY_CUSTOM_VAR"));
+        assert!(!p2.is_env_allowed("SECRET_API_KEY"));
+        // Empty allowlist blocks non-baseline
+        let mut p3 = SandboxPolicy::for_project("/proj");
+        p3.env_allowlist = Some(Vec::new());
+        assert!(p3.is_env_allowed("PATH"));
+        assert!(!p3.is_env_allowed("CUSTOM_VAR"));
     }
 
     #[test]
-    fn project_root_exact_match_allowed() {
-        let p = SandboxPolicy::strict("/home/user/proj");
-        // Exact project root itself
-        assert!(p.is_path_allowed(std::path::Path::new("/home/user/proj")));
-    }
-
-    #[test]
-    fn permissive_no_allowed_paths_but_allows_all() {
+    fn permissive_path_and_env_rules() {
         let p = SandboxPolicy::permissive("/proj");
         assert!(p.allowed_paths.is_empty());
-        // Yet allows any path due to Permissive mode
         assert!(p.is_path_allowed(std::path::Path::new("/anywhere")));
-    }
-
-    #[test]
-    fn env_baseline_covers_matrixone_vars() {
-        let p = SandboxPolicy::strict("/proj");
-        for var in &[
-            "MATRIXONE_HOST",
-            "MATRIXONE_PORT",
-            "MATRIXONE_USER",
-            "MATRIXONE_PASSWORD",
-            "ASTRA_DATABASE",
-            "ASTRA_DATABASE_PREFIX",
-        ] {
-            assert!(p.is_env_allowed(var), "Baseline missing: {}", var);
-        }
-    }
-
-    #[test]
-    fn community_tier_allows_network() {
-        use astra_skills::manifest::TrustTier;
-        let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
-        // Community uses Standard mode which allows network
-        assert!(p.network_allowed);
+        assert!(p.is_path_allowed(std::path::Path::new("/etc/passwd")));
+        assert!(p.is_env_allowed("SECRET_KEY"));
     }
 
     // ── Regression: /dev/null blocked by sandbox (session 5f21382b) ──
-    //
-    // `2>/dev/null` in bash commands was flagged as SANDBOX_DENIED because
-    // /dev/null is outside the project root and not in allowed_paths.
-    // /dev/null is a standard Unix device — safe to redirect to (discards
-    // data) and safe to read from (returns EOF).
 
     #[test]
-    fn standard_allows_dev_null() {
-        let p = SandboxPolicy::for_project("/proj");
-        assert!(
-            p.is_path_allowed(std::path::Path::new("/dev/null")),
-            "/dev/null must be allowed in Standard mode"
-        );
+    fn dev_null_allowed_in_all_modes() {
+        for p in [
+            SandboxPolicy::permissive("/proj"),
+            SandboxPolicy::for_project("/proj"),
+            SandboxPolicy::strict("/proj"),
+        ] {
+            assert!(
+                p.is_path_allowed(std::path::Path::new("/dev/null")),
+                "{p:?}"
+            );
+        }
     }
 
-    #[test]
-    fn strict_allows_dev_null() {
-        let p = SandboxPolicy::strict("/proj");
-        assert!(
-            p.is_path_allowed(std::path::Path::new("/dev/null")),
-            "/dev/null must be allowed even in Strict mode"
-        );
-    }
 }

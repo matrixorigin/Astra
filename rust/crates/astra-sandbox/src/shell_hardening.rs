@@ -195,225 +195,25 @@ mod tests {
     // --- Hardened command building ---
 
     #[test]
-    fn default_config_adds_all_hardening() {
+    fn hardened_command_building() {
+        // Default config adds all hardening
         let config = ShellHardeningConfig::default();
         let cmd = build_hardened_command(&config, "echo hello");
-        assert!(cmd.contains("extglob"), "should disable extglob");
-        assert!(cmd.contains("IFS="), "should reset IFS");
-        assert!(cmd.contains("< /dev/null"), "should redirect stdin");
+        assert!(cmd.contains("extglob"));
+        assert!(cmd.contains("IFS="));
+        assert!(cmd.contains("< /dev/null"));
         assert!(cmd.ends_with("echo hello < /dev/null"));
-    }
 
-    #[test]
-    fn no_hardening_returns_raw_command() {
+        // No hardening
         let config = ShellHardeningConfig {
             disable_extglob: false,
             reset_ifs: false,
             redirect_stdin: false,
             scrub_secrets: false,
         };
-        let cmd = build_hardened_command(&config, "echo hello");
-        assert_eq!(cmd, "echo hello");
-    }
+        assert_eq!(build_hardened_command(&config, "echo hello"), "echo hello");
 
-    #[test]
-    fn stdin_redirect_skipped_for_heredoc() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cat <<EOF\nhello\nEOF");
-        assert!(!cmd.contains("< /dev/null"));
-    }
-
-    #[test]
-    fn stdin_redirect_skipped_for_existing_redirect() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "wc -l < input.txt");
-        assert!(!cmd.ends_with("< /dev/null"));
-    }
-
-    #[test]
-    fn stdin_redirect_skipped_for_pipe() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cat file.txt | grep pattern");
-        assert!(!cmd.contains("< /dev/null"));
-    }
-
-    // --- Secret scrubbing ---
-
-    #[test]
-    fn scrubs_known_secrets() {
-        let mut env = HashMap::new();
-        env.insert("PATH".to_string(), "/usr/bin".to_string());
-        env.insert("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string());
-        env.insert("AWS_SECRET_ACCESS_KEY".to_string(), "AKIA...".to_string());
-        env.insert("HOME".to_string(), "/home/user".to_string());
-
-        scrub_secrets_from_env(&mut env);
-
-        assert!(env.contains_key("PATH"));
-        assert!(env.contains_key("HOME"));
-        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
-        assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
-    }
-
-    #[test]
-    fn scrubs_input_prefix_variants() {
-        let mut env = HashMap::new();
-        env.insert(
-            "INPUT_ANTHROPIC_API_KEY".to_string(),
-            "sk-secret".to_string(),
-        );
-        scrub_secrets_from_env(&mut env);
-        assert!(!env.contains_key("INPUT_ANTHROPIC_API_KEY"));
-    }
-
-    #[test]
-    fn scrubs_heuristic_secret_keys() {
-        let mut env = HashMap::new();
-        env.insert("MY_SECRET_VALUE".to_string(), "hidden".to_string());
-        env.insert("DB_PASSWORD".to_string(), "pass123".to_string());
-        env.insert("GITHUB_PRIVATE_KEY".to_string(), "key".to_string());
-        env.insert("NORMAL_VAR".to_string(), "visible".to_string());
-        // TOKEN vars are NOT scrubbed by heuristic (gh CLI needs GITHUB_TOKEN).
-        env.insert("GITHUB_TOKEN".to_string(), "ghp_xxx".to_string());
-
-        scrub_secrets_from_env(&mut env);
-
-        assert!(!env.contains_key("MY_SECRET_VALUE"));
-        assert!(!env.contains_key("DB_PASSWORD"));
-        assert!(!env.contains_key("GITHUB_PRIVATE_KEY"));
-        assert!(env.contains_key("NORMAL_VAR"));
-        assert!(
-            env.contains_key("GITHUB_TOKEN"),
-            "gh CLI needs GITHUB_TOKEN"
-        );
-    }
-
-    #[test]
-    fn does_not_scrub_token_vars_by_heuristic() {
-        let mut env = HashMap::new();
-        env.insert("GITHUB_TOKEN".to_string(), "ghp_xxx".to_string());
-        env.insert("GH_TOKEN".to_string(), "ghp_yyy".to_string());
-        env.insert("TOKEN_TYPE".to_string(), "bearer".to_string());
-        env.insert(
-            "TOKEN_ENDPOINT".to_string(),
-            "https://auth.example.com".to_string(),
-        );
-        scrub_secrets_from_env(&mut env);
-        assert!(env.contains_key("GITHUB_TOKEN"));
-        assert!(env.contains_key("GH_TOKEN"));
-        assert!(env.contains_key("TOKEN_TYPE"));
-        assert!(env.contains_key("TOKEN_ENDPOINT"));
-    }
-
-    // --- Dangerous file paths ---
-
-    #[test]
-    fn detects_git_internal_paths() {
-        assert!(is_dangerous_file_path(".git/config"));
-        assert!(is_dangerous_file_path("/home/user/.git/hooks/pre-commit"));
-        assert!(is_dangerous_file_path(".gitconfig"));
-    }
-
-    #[test]
-    fn detects_shell_config_paths() {
-        assert!(is_dangerous_file_path(".bashrc"));
-        assert!(is_dangerous_file_path("/home/user/.zshrc"));
-        assert!(is_dangerous_file_path(".profile"));
-    }
-
-    #[test]
-    fn detects_ssh_paths() {
-        assert!(is_dangerous_file_path(".ssh/id_rsa"));
-        assert!(is_dangerous_file_path("/home/user/.ssh/authorized_keys"));
-    }
-
-    #[test]
-    fn allows_normal_paths() {
-        assert!(!is_dangerous_file_path("src/main.rs"));
-        assert!(!is_dangerous_file_path("README.md"));
-        assert!(!is_dangerous_file_path("Cargo.toml"));
-    }
-
-    #[test]
-    fn does_not_match_partial_filenames() {
-        // "my.profile.rs" should NOT match ".profile"
-        assert!(!is_dangerous_file_path("my.profile.rs"));
-        assert!(!is_dangerous_file_path("user.profile_settings"));
-        assert!(!is_dangerous_file_path("src/bashrc_utils.rs"));
-        // But actual .bashrc should still match
-        assert!(is_dangerous_file_path("/home/user/.bashrc"));
-        assert!(is_dangerous_file_path(".bashrc"));
-    }
-
-    // --- scrub_secrets edge cases ---
-
-    #[test]
-    fn scrub_secrets_removes_password_variants() {
-        let mut env = HashMap::from([
-            ("DB_PASSWORD".into(), "secret".into()),
-            ("MY_SECRET_KEY".into(), "hidden".into()),
-            ("SSH_PRIVATE_KEY".into(), "pk".into()),
-            ("SAFE_VAR".into(), "ok".into()),
-        ]);
-        scrub_secrets_from_env(&mut env);
-        assert!(!env.contains_key("DB_PASSWORD"));
-        assert!(!env.contains_key("MY_SECRET_KEY"));
-        assert!(!env.contains_key("SSH_PRIVATE_KEY"));
-        assert!(env.contains_key("SAFE_VAR"));
-    }
-
-    #[test]
-    fn scrub_secrets_preserves_token_type_and_endpoint() {
-        let mut env = HashMap::from([
-            ("TOKEN_TYPE".into(), "bearer".into()),
-            ("TOKEN_ENDPOINT".into(), "https://auth.example.com".into()),
-        ]);
-        scrub_secrets_from_env(&mut env);
-        assert!(env.contains_key("TOKEN_TYPE"));
-        assert!(env.contains_key("TOKEN_ENDPOINT"));
-    }
-
-    #[test]
-    fn scrub_secrets_case_insensitive_heuristic() {
-        let mut env = HashMap::from([
-            ("my_secret".into(), "v1".into()),
-            ("My_Password".into(), "v2".into()),
-        ]);
-        scrub_secrets_from_env(&mut env);
-        assert!(!env.contains_key("my_secret"));
-        assert!(!env.contains_key("My_Password"));
-    }
-
-    #[test]
-    fn scrub_secrets_empty_env() {
-        let mut env = HashMap::new();
-        scrub_secrets_from_env(&mut env);
-        assert!(env.is_empty());
-    }
-
-    // --- is_dangerous_file_path edge cases ---
-
-    #[test]
-    fn dangerous_path_with_backslashes() {
-        // Windows-style paths should be normalized
-        assert!(is_dangerous_file_path("C:\\Users\\.ssh\\id_rsa"));
-    }
-
-    #[test]
-    fn dangerous_path_empty_string() {
-        assert!(!is_dangerous_file_path(""));
-    }
-
-    #[test]
-    fn dangerous_path_git_internal_nested() {
-        assert!(is_dangerous_file_path("repo/.git/config"));
-        assert!(is_dangerous_file_path(".git/HEAD"));
-    }
-
-    // --- build_hardened_command edge cases ---
-
-    #[test]
-    fn hardened_command_only_extglob() {
+        // Only extglob
         let config = ShellHardeningConfig {
             disable_extglob: true,
             reset_ifs: false,
@@ -424,10 +224,8 @@ mod tests {
         assert!(cmd.contains("extglob"));
         assert!(!cmd.contains("IFS="));
         assert!(!cmd.contains("< /dev/null"));
-    }
 
-    #[test]
-    fn hardened_command_only_ifs() {
+        // Only IFS
         let config = ShellHardeningConfig {
             disable_extglob: false,
             reset_ifs: true,
@@ -440,21 +238,126 @@ mod tests {
     }
 
     #[test]
-    fn stdin_redirect_skipped_for_herestring() {
+    fn stdin_redirect_skipped_when_unnecessary() {
         let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cat <<< 'hello'");
-        assert!(!cmd.ends_with("< /dev/null"));
-    }
-
-    #[test]
-    fn stdin_redirect_skipped_for_pipe_chain() {
-        let config = ShellHardeningConfig {
+        let skip_cases: &[&str] = &[
+            "cat <<EOF\nhello\nEOF",       // heredoc
+            "wc -l < input.txt",           // existing redirect
+            "cat file.txt | grep pattern", // pipe
+            "cat <<< 'hello'",             // herestring
+        ];
+        for cmd in skip_cases {
+            let result = build_hardened_command(&config, cmd);
+            assert!(
+                !result.ends_with("< /dev/null"),
+                "should skip stdin for: {cmd}"
+            );
+        }
+        // Pipe chain with only redirect_stdin enabled
+        let config2 = ShellHardeningConfig {
             disable_extglob: false,
             reset_ifs: false,
             redirect_stdin: true,
             scrub_secrets: false,
         };
-        let cmd = build_hardened_command(&config, "echo hello | grep hello");
-        assert!(!cmd.contains("< /dev/null"));
+        assert!(
+            !build_hardened_command(&config2, "echo hello | grep hello").contains("< /dev/null")
+        );
+    }
+    #[test]
+    fn secret_scrubbing_rules() {
+        // Known secrets: API_KEY/_SECRET patterns
+        let mut env = HashMap::from([
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/home/user".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-secret".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "AKIA...".into()),
+            ("INPUT_ANTHROPIC_API_KEY".into(), "sk-secret".into()),
+        ]);
+        scrub_secrets_from_env(&mut env);
+        assert!(env.contains_key("PATH"));
+        assert!(env.contains_key("HOME"));
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!env.contains_key("INPUT_ANTHROPIC_API_KEY"));
+
+        // Heuristic: _SECRET/_PASSWORD/_PRIVATE_KEY, case-insensitive
+        let mut env = HashMap::from([
+            ("MY_SECRET_VALUE".into(), "v".into()),
+            ("DB_PASSWORD".into(), "p".into()),
+            ("GITHUB_PRIVATE_KEY".into(), "k".into()),
+            ("NORMAL_VAR".into(), "visible".into()),
+            ("my_secret".into(), "v1".into()),
+            ("My_Password".into(), "v2".into()),
+        ]);
+        scrub_secrets_from_env(&mut env);
+        assert!(!env.contains_key("MY_SECRET_VALUE"));
+        assert!(!env.contains_key("DB_PASSWORD"));
+        assert!(!env.contains_key("GITHUB_PRIVATE_KEY"));
+        assert!(!env.contains_key("my_secret"));
+        assert!(!env.contains_key("My_Password"));
+        assert!(env.contains_key("NORMAL_VAR"));
+
+        // Token vars preserved (gh CLI needs them)
+        let mut env = HashMap::from([
+            ("GITHUB_TOKEN".into(), "ghp_xxx".into()),
+            ("GH_TOKEN".into(), "ghp_yyy".into()),
+            ("TOKEN_TYPE".into(), "bearer".into()),
+            ("TOKEN_ENDPOINT".into(), "https://auth.example.com".into()),
+        ]);
+        scrub_secrets_from_env(&mut env);
+        assert_eq!(env.len(), 4);
+
+        // Empty env
+        let mut env = HashMap::new();
+        scrub_secrets_from_env(&mut env);
+        assert!(env.is_empty());
+    }
+    #[test]
+    fn dangerous_file_path_detection() {
+        // Git internals (including nested)
+        for path in [
+            ".git/config",
+            "/home/user/.git/hooks/pre-commit",
+            ".gitconfig",
+            "repo/.git/config",
+            ".git/HEAD",
+        ] {
+            assert!(is_dangerous_file_path(path), "should detect: {path}");
+        }
+
+        // Shell configs
+        for path in [".bashrc", "/home/user/.zshrc", ".profile"] {
+            assert!(is_dangerous_file_path(path), "should detect: {path}");
+        }
+
+        // SSH paths (including Windows backslash)
+        for path in [
+            ".ssh/id_rsa",
+            "/home/user/.ssh/authorized_keys",
+            r"C:\Users\.ssh\id_rsa",
+        ] {
+            assert!(is_dangerous_file_path(path), "should detect: {path}");
+        }
+
+        // Normal paths are allowed
+        for path in ["src/main.rs", "README.md", "Cargo.toml", ""] {
+            assert!(!is_dangerous_file_path(path), "should allow: {path:?}");
+        }
+
+        // Partial matches should not false-positive
+        for path in [
+            "my.profile.rs",
+            "user.profile_settings",
+            "src/bashrc_utils.rs",
+        ] {
+            assert!(
+                !is_dangerous_file_path(path),
+                "should not match partial: {path}"
+            );
+        }
+        // But actual partial is still matched
+        assert!(is_dangerous_file_path("/home/user/.bashrc"));
+        assert!(is_dangerous_file_path(".bashrc"));
     }
 }

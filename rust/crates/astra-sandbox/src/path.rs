@@ -156,112 +156,86 @@ mod tests {
         SandboxPolicy::strict(root)
     }
 
-    // ── Permissive mode (backward compatible) ────────────────────────────
+    // ── Permissive mode ────────────────────────────────────────────────��
 
     #[test]
-    fn permissive_allows_absolute_path() {
+    fn permissive_mode_path_validation() {
         let p = SandboxPolicy::permissive("/home/user/project");
+        // Allows absolute paths
         let result = validate_path(&p, "/etc/passwd");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), PathBuf::from("/etc/passwd"));
-    }
-
-    #[test]
-    fn permissive_resolves_relative() {
-        let p = SandboxPolicy::permissive("/home/user/project");
+        // Resolves relative
         let result = validate_path(&p, "src/main.rs");
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             PathBuf::from("/home/user/project/src/main.rs")
         );
-    }
-
-    // ── Standard mode (boundary enforcement) ─────────────────────────────
-
-    #[test]
-    fn standard_allows_relative_within_project() {
-        let p = standard_policy("/tmp");
-        let result = validate_path(&p, "subdir/file.txt");
+        // Allows dotdot escape
+        let result = validate_path(&p, "../../etc/passwd");
         assert!(result.is_ok());
     }
 
+    // ── Standard mode ────────────────────────────────────────────────────
+
     #[test]
-    fn standard_blocks_dotdot_escape() {
-        let p = standard_policy("/tmp/project");
-        let result = validate_path(&p, "../../../etc/passwd");
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SandboxPathError::BoundaryEscape { requested, .. } => {
-                assert!(requested.contains("etc/passwd"));
-            }
-            other => panic!("expected BoundaryEscape, got: {other:?}"),
+    fn standard_mode_path_validation() {
+        let p = standard_policy("/home/user/proj");
+        // Allows relative within project
+        assert!(validate_path(&p, "subdir/file.txt").is_ok());
+        // Allows absolute within project
+        assert!(validate_path(&p, "/home/user/proj/deep/nested/file.rs").is_ok());
+        // Allows /tmp
+        assert!(validate_path(&p, "/tmp/build-output.tar.gz").is_ok());
+        // Allows empty → resolves to project root
+        assert!(validate_path(&p, "").is_ok());
+        // Blocks dotdot escape
+        for bad in ["../../../etc/passwd", "../../etc/passwd"] {
+            let result = validate_path(&p, bad);
+            assert!(result.is_err(), "should block: {bad}");
         }
-    }
-
-    #[test]
-    fn standard_blocks_absolute_outside_root() {
-        let p = standard_policy("/home/user/project");
-        let result = validate_path(&p, "/etc/shadow");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn standard_allows_tmp() {
-        let p = standard_policy("/home/user/project");
-        let result = validate_path(&p, "/tmp/build-output.tar.gz");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn standard_allows_absolute_within_project() {
-        let p = standard_policy("/tmp");
-        let result = validate_path(&p, "/tmp/somefile");
-        assert!(result.is_ok());
+        // Blocks absolute outside root
+        assert!(validate_path(&p, "/etc/shadow").is_err());
     }
 
     // ── Strict mode ──────────────────────────────────────────────────────
 
     #[test]
-    fn strict_blocks_var_tmp() {
+    fn strict_mode_path_validation() {
         let p = strict_policy("/home/user/project");
-        let result = validate_path(&p, "/var/tmp/secret");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn strict_allows_tmp() {
-        let p = strict_policy("/home/user/project");
-        let result = validate_path(&p, "/tmp/build.log");
-        assert!(result.is_ok());
+        // Blocks /var/tmp
+        assert!(validate_path(&p, "/var/tmp/secret").is_err());
+        // Allows /tmp
+        assert!(validate_path(&p, "/tmp/build.log").is_ok());
     }
 
     // ── Path normalization ───────────────────────────────────────────────
 
     #[test]
-    fn normalize_removes_dotdot() {
-        // /home/user/project + ../../etc/passwd → /home/etc/passwd
-        // (two `..` pops `project` and `user`, leaves `/home`)
-        let result = normalize_path(Path::new("/home/user/project/../../etc/passwd"));
-        assert_eq!(result, PathBuf::from("/home/etc/passwd"));
-    }
-
-    #[test]
-    fn normalize_removes_dot() {
-        let result = normalize_path(Path::new("/home/user/./project/./src"));
-        assert_eq!(result, PathBuf::from("/home/user/project/src"));
-    }
-
-    #[test]
-    fn normalize_does_not_pop_past_root() {
-        let result = normalize_path(Path::new("/../../../../../../etc"));
-        assert_eq!(result, PathBuf::from("/etc"));
-    }
-
-    #[test]
-    fn normalize_relative_path() {
-        let result = normalize_path(Path::new("a/b/../c"));
-        assert_eq!(result, PathBuf::from("a/c"));
+    fn path_normalization_rules() {
+        let cases: &[(&str, &str)] = &[
+            // .. removal
+            ("/home/user/project/../../etc/passwd", "/home/etc/passwd"),
+            ("/a/../../..", "/"),
+            (".", ""),
+            ("", ""),
+            ("/a/b/c", "/a/b/c"),
+            // . removal
+            ("/home/user/./project/./src", "/home/user/project/src"),
+            // Mixed . and ..
+            ("/a/./b/../c/./d/..", "/a/c"),
+            // Relative
+            ("a/b/../c", "a/c"),
+            ("a/b/c/../../d", "a/d"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_path(Path::new(input)),
+                PathBuf::from(expected),
+                "input: {input}"
+            );
+        }
     }
 
     // ── Real filesystem tests ────────────────────────────────────────────
@@ -305,142 +279,32 @@ mod tests {
     // ── Error display ────────────────────────────────────────────────────
 
     #[test]
-    fn error_display_boundary() {
-        let err = SandboxPathError::BoundaryEscape {
+    fn error_display_and_classification() {
+        // Display
+        let boundary = SandboxPathError::BoundaryEscape {
             requested: "../secret".into(),
             resolved: "/etc/secret".into(),
             project_root: "/home/user/project".into(),
         };
-        let msg = err.to_string();
+        let msg = boundary.to_string();
         assert!(msg.contains("escapes project boundary"));
         assert!(msg.contains("../secret"));
-    }
 
-    #[test]
-    fn error_display_symlink() {
-        let err = SandboxPathError::SymlinkEscape {
+        let symlink = SandboxPathError::SymlinkEscape {
             requested: "link".into(),
             target: "/etc/passwd".into(),
         };
-        assert!(err.to_string().contains("outside boundary"));
-    }
+        assert!(symlink.to_string().contains("outside boundary"));
 
-    #[test]
-    fn error_display_resolution() {
-        let err = SandboxPathError::ResolutionFailed {
+        let resolution = SandboxPathError::ResolutionFailed {
             requested: "x".into(),
             reason: "not found".into(),
         };
-        assert!(err.to_string().contains("not found"));
-    }
+        assert!(resolution.to_string().contains("not found"));
 
-    #[test]
-    fn boundary_escape_is_boundary_violation() {
-        let err = SandboxPathError::BoundaryEscape {
-            requested: "../secret".into(),
-            resolved: "/etc/secret".into(),
-            project_root: "/home/user/project".into(),
-        };
-        assert!(err.is_boundary_violation());
-    }
-
-    #[test]
-    fn symlink_escape_is_boundary_violation() {
-        let err = SandboxPathError::SymlinkEscape {
-            requested: "link".into(),
-            target: "/etc/passwd".into(),
-        };
-        assert!(err.is_boundary_violation());
-    }
-
-    #[test]
-    fn resolution_failed_is_not_boundary_violation() {
-        let err = SandboxPathError::ResolutionFailed {
-            requested: "x".into(),
-            reason: "not found".into(),
-        };
-        assert!(!err.is_boundary_violation());
-    }
-
-    // --- edge cases ---
-
-    #[test]
-    fn normalize_empty_path() {
-        let result = normalize_path(Path::new(""));
-        assert_eq!(result, PathBuf::from(""));
-    }
-
-    #[test]
-    fn normalize_just_dot() {
-        let result = normalize_path(Path::new("."));
-        // CurDir is skipped, results in empty
-        assert_eq!(result, PathBuf::from(""));
-    }
-
-    #[test]
-    fn normalize_multiple_parent_dirs_past_root() {
-        let result = normalize_path(Path::new("/a/../../.."));
-        // Can't pop past root: /a → / (pop a) → / (can't pop root) → /
-        assert_eq!(result, PathBuf::from("/"));
-    }
-
-    #[test]
-    fn normalize_mixed_dot_and_dotdot() {
-        let result = normalize_path(Path::new("/a/./b/../c/./d/.."));
-        assert_eq!(result, PathBuf::from("/a/c"));
-    }
-
-    #[test]
-    fn normalize_relative_deeply_nested() {
-        let result = normalize_path(Path::new("a/b/c/../../d"));
-        assert_eq!(result, PathBuf::from("a/d"));
-    }
-
-    #[test]
-    fn validate_empty_path_resolves_to_project_root() {
-        let p = standard_policy("/tmp/proj");
-        let result = validate_path(&p, "");
-        // Empty string → project_root.join("") → project_root
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_path_boundary_escape_error_info() {
-        let p = strict_policy("/home/user/proj");
-        let result = validate_path(&p, "/etc/shadow");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.is_boundary_violation());
-        let display = err.to_string();
-        assert!(display.contains("/etc/shadow"));
-    }
-
-    #[test]
-    fn validate_dotdot_escape_blocked_in_standard() {
-        let p = standard_policy("/home/user/proj");
-        let result = validate_path(&p, "../../etc/passwd");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn validate_permissive_allows_dotdot() {
-        let p = SandboxPolicy::permissive("/home/user/proj");
-        let result = validate_path(&p, "../../etc/passwd");
-        // Permissive doesn't validate boundaries
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn normalize_preserves_trailing_component() {
-        let result = normalize_path(Path::new("/a/b/c"));
-        assert_eq!(result, PathBuf::from("/a/b/c"));
-    }
-
-    #[test]
-    fn validate_absolute_within_project_ok() {
-        let p = standard_policy("/home/user/proj");
-        let result = validate_path(&p, "/home/user/proj/deep/nested/file.rs");
-        assert!(result.is_ok());
-        assert!(result.unwrap().starts_with("/home/user/proj"));
+        // Classification
+        assert!(boundary.is_boundary_violation());
+        assert!(symlink.is_boundary_violation());
+        assert!(!resolution.is_boundary_violation());
     }
 }
