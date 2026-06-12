@@ -29,6 +29,7 @@
 //! - Crypto hash mismatch (tamper/corruption) → `Failed(HashMismatch)`
 //! - Double crash (recovery itself crashes) → `Failed(RecursiveCrash)`
 
+use astra_turn_types::{classify_tool_idempotency, ToolIdempotency};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -434,51 +435,20 @@ pub enum ToolSafetyClass {
 }
 
 /// Known tool safety classifications.
+///
+/// **Single source of truth**: delegates to `classify_tool_idempotency()` in
+/// `astra-turn-types`. This eliminates drift between crash recovery and
+/// exactly-once executor classifications.
+///
+/// Mapping: `PureRead` → `PureRead`, `IdempotentWrite` → `IdempotentWrite`,
+/// `NonIdempotent` → `SideEffect`.
 pub fn classify_tool(tool_name: &str) -> ToolSafetyClass {
-    // Pure reads — no side effects, always safe to replay
-    const PURE_READS: &[&str] = &[
-        "read_file",
-        "grep",
-        "glob",
-        "list_dir",
-        "git_status",
-        "git_log",
-        "git_diff",
-        "git_show",
-        "git_blame",
-        "find_definition",
-        "find_references",
-        "call_graph",
-        "symbol_search",
-        "hover_info",
-        "type_hierarchy",
-        "extract_members",
-        "dead_code",
-        "introspect",
-        "memory_recall",
-        "memory_profile",
-        "web_search",
-        "web_fetch",
-    ];
-
-    // Idempotent writes — safe to replay with same args
-    const IDEMPOTENT_WRITES: &[&str] = &[
-        "write_file",
-        "str_replace",
-        "git_commit",
-        "lsp_rename",
-        "lsp_format",
-    ];
-
-    let name_lower = tool_name.to_lowercase();
-
-    if PURE_READS.iter().any(|r| name_lower == *r) {
-        ToolSafetyClass::PureRead
-    } else if IDEMPOTENT_WRITES.iter().any(|r| name_lower == *r) {
-        ToolSafetyClass::IdempotentWrite
-    } else {
-        // Default: assume side-effect (conservative — safe default)
-        ToolSafetyClass::SideEffect
+    // Normalize to lowercase for case-insensitive matching
+    let normalized = tool_name.to_lowercase();
+    match classify_tool_idempotency(&normalized, None) {
+        ToolIdempotency::PureRead => ToolSafetyClass::PureRead,
+        ToolIdempotency::IdempotentWrite => ToolSafetyClass::IdempotentWrite,
+        ToolIdempotency::NonIdempotent => ToolSafetyClass::SideEffect,
     }
 }
 
@@ -1368,14 +1338,10 @@ mod tests {
             classify_tool("write_file"),
             ToolSafetyClass::IdempotentWrite
         );
-        assert_eq!(
-            classify_tool("str_replace"),
-            ToolSafetyClass::IdempotentWrite
-        );
-        assert_eq!(
-            classify_tool("git_commit"),
-            ToolSafetyClass::IdempotentWrite
-        );
+        // str_replace depends on file state — NOT safe to replay blindly
+        assert_eq!(classify_tool("str_replace"), ToolSafetyClass::SideEffect);
+        // git_commit has permanent side effects — NOT safe to replay
+        assert_eq!(classify_tool("git_commit"), ToolSafetyClass::SideEffect);
     }
 
     #[test]
