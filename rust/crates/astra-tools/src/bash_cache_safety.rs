@@ -222,8 +222,9 @@ mod tests {
     // ── Allowlist: these MUST be cacheable ─────────────────────────
 
     #[test]
-    fn simple_read_tools_are_cache_safe() {
+    fn cache_safe_cases() {
         for cmd in [
+            // simple read tools
             "ls",
             "ls -la",
             "pwd",
@@ -234,32 +235,12 @@ mod tests {
             "which cargo",
             "uname -a",
             "date",
-        ] {
-            assert!(
-                bash_command_is_cache_safe(cmd),
-                "expected cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn search_tools_are_cache_safe() {
-        for cmd in [
+            // search tools
             "grep -rn foo .",
             "rg 'pattern' src/",
             "find . -name '*.rs'",
             "fd -e rs",
-        ] {
-            assert!(
-                bash_command_is_cache_safe(cmd),
-                "expected cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn git_readonly_subcommands_are_cache_safe() {
-        for cmd in [
+            // git readonly
             "git status",
             "git log --oneline -20",
             "git diff HEAD~1",
@@ -269,87 +250,43 @@ mod tests {
             "git stash list",
             "git config user.name",
             "git remote -v",
-        ] {
-            assert!(
-                bash_command_is_cache_safe(cmd),
-                "expected cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn version_queries_are_cache_safe() {
-        for cmd in [
+            // version queries
             "cargo --version",
             "node --version",
             "rustc --version",
             "python3 --version",
+            "cargo -V",
+            "cargo -v",
+            "cargo --version",
+            // cargo metadata
+            "cargo metadata --format-version 1",
+            "cargo tree",
+            // env prefix passthrough (real command determines safety)
+            "LANG=C ls",
+            "FOO=1 BAR=2 pwd",
         ] {
             assert!(
                 bash_command_is_cache_safe(cmd),
                 "expected cache-safe: {cmd}"
             );
         }
+
+        // bare version query (no subcommand) is safe
+        assert!(bash_command_is_cache_safe("node --version"));
+        assert!(bash_command_is_cache_safe("python3 --version"));
     }
 
     #[test]
-    fn cargo_metadata_is_cache_safe() {
-        assert!(bash_command_is_cache_safe(
-            "cargo metadata --format-version 1"
-        ));
-        assert!(bash_command_is_cache_safe("cargo tree"));
-    }
-
-    /// Regression: `-v` / `-V` must only be cache-safe when they are
-    /// the ENTIRE command (version query), not when they're a
-    /// verbose flag before a real subcommand like `cargo -v build`
-    /// or `cargo -v test`. Those actually build/test; returning a
-    /// cached output would replay a prior build's log while the
-    /// real target/ has already advanced.
-    #[test]
-    fn cargo_dash_v_with_subcommand_is_not_cache_safe() {
+    fn not_cache_safe_cases() {
         for cmd in [
+            // cargo -v/-V followed by subcommand is NOT cache-safe (actually builds/tests)
             "cargo -v build",
             "cargo -v test",
             "cargo -v run",
             "cargo -V build",
             "cargo --verbose build",
             "cargo -v --release build",
-        ] {
-            assert!(
-                !bash_command_is_cache_safe(cmd),
-                "cargo -v/-V followed by a subcommand mutates; must NOT be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn cargo_bare_version_query_is_cache_safe() {
-        // These are pure version queries — safe.
-        for cmd in ["cargo -V", "cargo -v", "cargo --version"] {
-            assert!(
-                bash_command_is_cache_safe(cmd),
-                "bare version query must be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn generic_version_query_requires_no_trailing_args() {
-        // `node --version` is the canonical pure query — safe.
-        assert!(bash_command_is_cache_safe("node --version"));
-        assert!(bash_command_is_cache_safe("python3 --version"));
-        // With trailing arg we can't prove the tool is still in
-        // query mode. Fail-closed: not cache-safe.
-        assert!(!bash_command_is_cache_safe("node --version extra"));
-        assert!(!bash_command_is_cache_safe("python3 --version foo.py"));
-    }
-
-    // ── Denylist: these MUST NOT be cacheable ──────────────────────
-
-    #[test]
-    fn mutating_commands_are_not_cache_safe() {
-        for cmd in [
+            // mutating commands
             "rm -rf /tmp/foo",
             "rm file.txt",
             "mv a b",
@@ -361,17 +298,7 @@ mod tests {
             "ln -s a b",
             "tar -czf out.tgz src",
             "dd if=/dev/zero of=file",
-        ] {
-            assert!(
-                !bash_command_is_cache_safe(cmd),
-                "must NOT be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn network_commands_are_not_cache_safe() {
-        for cmd in [
+            // network commands
             "curl https://example.com",
             "wget https://example.com",
             "ssh host echo hi",
@@ -380,17 +307,7 @@ mod tests {
             "git fetch",
             "git pull",
             "git push",
-        ] {
-            assert!(
-                !bash_command_is_cache_safe(cmd),
-                "must NOT be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn build_and_install_commands_are_not_cache_safe() {
-        for cmd in [
+            // build and install commands
             "cargo build",
             "cargo test",
             "cargo run",
@@ -402,17 +319,7 @@ mod tests {
             "make clean",
             "rustup update",
             "pip install foo",
-        ] {
-            assert!(
-                !bash_command_is_cache_safe(cmd),
-                "must NOT be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn git_mutating_subcommands_are_not_cache_safe() {
-        for cmd in [
+            // git mutating subcommands
             "git commit -m msg",
             "git checkout main",
             "git reset --hard",
@@ -429,19 +336,7 @@ mod tests {
             "git branch --delete feat",
             "git tag v1",
             "git tag -d v1",
-        ] {
-            assert!(
-                !bash_command_is_cache_safe(cmd),
-                "must NOT be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    // ── Shell compound / redirection disqualifies outright ─────────
-
-    #[test]
-    fn compound_commands_are_not_cache_safe() {
-        for cmd in [
+            // compound/redirect commands
             "ls && cat foo",
             "ls || echo fail",
             "ls ; pwd",
@@ -453,19 +348,7 @@ mod tests {
             "echo `pwd`",
             "sleep 1 &",
             "ls\npwd",
-        ] {
-            assert!(
-                !bash_command_is_cache_safe(cmd),
-                "compound/redirect must NOT be cache-safe: {cmd}"
-            );
-        }
-    }
-
-    // ── Unknown tools default to NOT cache-safe (fail-closed) ──────
-
-    #[test]
-    fn unknown_commands_are_not_cache_safe() {
-        for cmd in [
+            // unknown commands (fail-closed)
             "totally-unknown-tool",
             "my_script.sh",
             "./run-this",
@@ -474,27 +357,20 @@ mod tests {
         ] {
             assert!(
                 !bash_command_is_cache_safe(cmd),
-                "unknown command must NOT be cache-safe (fail-closed): {cmd}"
+                "must NOT be cache-safe: {cmd}"
             );
         }
-    }
 
-    #[test]
-    fn empty_and_whitespace_are_not_cache_safe() {
+        // empty/whitespace
         assert!(!bash_command_is_cache_safe(""));
         assert!(!bash_command_is_cache_safe("   "));
         assert!(!bash_command_is_cache_safe("\n"));
-    }
 
-    // ── Env var prefix handling ────────────────────────────────────
+        // version query with trailing args → NOT cache-safe (can't prove query mode)
+        assert!(!bash_command_is_cache_safe("node --version extra"));
+        assert!(!bash_command_is_cache_safe("python3 --version foo.py"));
 
-    #[test]
-    fn env_prefix_passes_to_classifier_for_the_real_command() {
-        // env-var assignments are stripped before lookup, so
-        // `LANG=C ls` classifies via `ls`.
-        assert!(bash_command_is_cache_safe("LANG=C ls"));
-        assert!(bash_command_is_cache_safe("FOO=1 BAR=2 pwd"));
-        // But a denylisted command stays denied even with env prefix.
+        // env prefix on denylisted command → still NOT cache-safe
         assert!(!bash_command_is_cache_safe("FOO=1 rm file"));
     }
 }

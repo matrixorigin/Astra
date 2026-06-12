@@ -781,17 +781,9 @@ mod tests {
     // ─── Levenshtein ────────────────────────────────────────────────────────
 
     #[test]
-    fn levenshtein_identical() {
+    fn levenshtein_cases() {
         assert_eq!(levenshtein("hello", "hello"), 0);
-    }
-
-    #[test]
-    fn levenshtein_basic() {
         assert_eq!(levenshtein("kitten", "sitting"), 3);
-    }
-
-    #[test]
-    fn levenshtein_empty() {
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(levenshtein("abc", ""), 3);
     }
@@ -807,217 +799,90 @@ mod tests {
     }
 
     #[test]
-    fn has_line_number_prefix_rejects_non_prefixes() {
-        assert!(!has_line_number_prefix("hello"));
-        assert!(!has_line_number_prefix("v1.2.3"));
-        assert!(!has_line_number_prefix("  abc: test"));
+    fn has_line_number_prefix_cases() {
+        // recognizes supported prefixes
+        assert!(has_line_number_prefix("1  let x = 5;"));
+        assert!(has_line_number_prefix("42  let x = 5;"));
+        // rejects non-prefixes
+        assert!(!has_line_number_prefix("  1  let x = 5;"));
+        assert!(!has_line_number_prefix("let x = 5;"));
+        assert!(!has_line_number_prefix(""));
     }
 
     #[test]
-    fn strip_line_number_prefix_removes_prefix() {
+    fn strip_line_number_prefix_and_stripped_find_cases() {
+        // strip_line_number_prefix
         assert_eq!(strip_line_number_prefix("12. hello"), "hello");
         assert_eq!(strip_line_number_prefix("  42: world"), "world");
         assert_eq!(strip_line_number_prefix("7| value"), "value");
         assert_eq!(strip_line_number_prefix("no prefix"), "no prefix");
-    }
 
-    #[test]
-    fn line_number_stripped_finds_exact_match() {
+        // line_number_stripped_find: exact match
         let content = "fn demo() {\n    println!(\"hi\");\n}";
         let search = "1. fn demo() {\n2.     println!(\"hi\");\n3. }";
         let matches = line_number_stripped_find(content, search);
         assert_eq!(matches, vec![content.to_string()]);
+
+        // requires majority prefixed lines
+        let search2 = "1. fn demo() {\n    println!(\"hi\");\n}";
+        assert!(line_number_stripped_find(content, search2).is_empty());
+
+        // handles colon and pipe prefixes
+        let c2 = "alpha\nbeta\ngamma";
+        let s3 = "10: alpha\n11| beta\n12: gamma";
+        assert_eq!(line_number_stripped_find(c2, s3), vec![c2.to_string()]);
     }
 
     #[test]
-    fn line_number_stripped_requires_majority_prefixed_lines() {
-        let content = "fn demo() {\n    println!(\"hi\");\n}";
-        let search = "1. fn demo() {\n    println!(\"hi\");\n}";
-        let matches = line_number_stripped_find(content, search);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn line_number_stripped_handles_colon_and_pipe_prefixes() {
-        let content = "alpha\nbeta\ngamma";
-        let search = "10: alpha\n11| beta\n12: gamma";
-        let matches = line_number_stripped_find(content, search);
-        assert_eq!(matches, vec![content.to_string()]);
-    }
-
-    #[test]
-    fn normalize_quotes_curly_to_straight() {
+    fn normalize_quotes_and_match_cases() {
         assert_eq!(
             normalize_quotes("say \u{201C}hello\u{201D}"),
             "say \"hello\""
         );
         assert_eq!(normalize_quotes("it\u{2019}s"), "it's");
-    }
 
-    #[test]
-    fn quote_normalized_match_count_handles_curly_quotes() {
         let content = "let x = \"hello\";\nlet y = \"hello\";";
         let search = "let x = \u{201C}hello\u{201D};";
         assert_eq!(quote_normalized_match_count(content, search), 1);
     }
 
     #[test]
-    fn preserve_quote_style_applies_curly_double_quotes() {
+    fn preserve_quote_style_cases() {
+        // curly double quotes
         let result = preserve_quote_style(
             "let x = \"hello\";",
             "let x = \u{201C}hello\u{201D};",
             "let x = \"world\";",
         );
         assert_eq!(result, "let x = \u{201C}world\u{201D};");
-    }
 
-    #[test]
-    fn preserve_quote_style_keeps_apostrophes_as_right_single_quotes() {
+        // keeps apostrophes as right single quotes
         let result = preserve_quote_style("\"don't\"", "\u{201C}don\u{2019}t\u{201D}", "\"won't\"");
         assert_eq!(result, "\u{201C}won\u{2019}t\u{201D}");
-    }
 
-    #[test]
-    fn fuzzy_replace_all_aborts_on_distinct_actual_matches() {
-        // Safety: when replace_all finds distinct actual substrings (different
-        // indentation), abort the entire cascade to avoid partial/wrong replacements.
-        let content = "  fn hi() {\n    a();\n  }\n\n\tfn hi() {\n\t  a();\n\t}\n";
-        let search = "fn hi() {\n  a();\n}";
-        let result = fuzzy_find_replacement(content, search, true);
-        assert!(result.is_none(), "got unexpected match");
-    }
-
-    #[test]
-    fn fuzzy_replace_all_quote_normalized_with_identical_matches() {
-        let content = "say \u{201C}hi\u{201D} and \u{201C}hi\u{201D} again";
-        let search = "\"hi\"";
-        let result = fuzzy_find_replacement(content, search, true);
-        assert!(
-            result.is_some(),
-            "should match identical curly-quoted strings"
-        );
-        let m = result.unwrap();
-        assert_eq!(m.strategy, STRATEGY_QUOTE_NORMALIZED);
-    }
-
-    #[test]
-    fn is_quote_normalized_returns_false_for_other_strategies() {
-        let content = "    fn foo() {\n        bar();\n    }";
-        let search = "fn foo() {\n    bar();\n}";
-        let result = fuzzy_find_replacement(content, search, false);
-        assert!(result.is_some());
-        assert!(!result.unwrap().is_quote_normalized());
-    }
-
-    #[test]
-    fn preserve_quote_style_both_double_and_single_quotes() {
+        // both double and single quotes
         let result = preserve_quote_style(
             "She said \"don't\"",
             "She said \u{201C}don\u{2019}t\u{201D}",
             "She said \"won't\"",
         );
         assert_eq!(result, "She said \u{201C}won\u{2019}t\u{201D}");
-    }
 
-    #[test]
-    fn preserve_quote_style_no_curly_quotes_returns_unchanged() {
-        let result = preserve_quote_style("hello", "hello", "world");
-        assert_eq!(result, "world");
+        // no curly quotes → unchanged
+        assert_eq!(preserve_quote_style("hello", "hello", "world"), "world");
     }
-
     #[test]
-    fn apply_curly_double_quotes_no_quotes_returns_unchanged() {
-        assert_eq!(
-            apply_curly_double_quotes("no quotes here"),
-            "no quotes here"
-        );
-    }
+    fn replace_all_and_quote_normalized_cases() {
+        // abort on distinct actual matches (different indentation)
+        let content = "  fn hi() {\n    a();\n  }\n\n\tfn hi() {\n\t  a();\n\t}\n";
+        assert!(fuzzy_find_replacement(content, "fn hi() {\n  a();\n}", true).is_none());
 
-    #[test]
-    fn apply_curly_double_quotes_opening_and_closing() {
-        assert_eq!(
-            apply_curly_double_quotes("say \"hi\" ok"),
-            "say \u{201C}hi\u{201D} ok"
-        );
-    }
+        // quote-normalized with identical matches → succeeds
+        let content = "say \u{201C}hi\u{201D} and \u{201C}hi\u{201D} again";
+        let result = fuzzy_find_replacement(content, "\"hi\"", true).unwrap();
+        assert_eq!(result.strategy, STRATEGY_QUOTE_NORMALIZED);
 
-    #[test]
-    fn apply_curly_double_quotes_after_open_paren() {
-        assert_eq!(
-            apply_curly_double_quotes("(\"test\")"),
-            "(\u{201C}test\u{201D})"
-        );
-    }
-
-    #[test]
-    fn apply_curly_single_quotes_contraction() {
-        assert_eq!(apply_curly_single_quotes("don't"), "don\u{2019}t");
-    }
-
-    #[test]
-    fn apply_curly_single_quotes_opening_closing() {
-        assert_eq!(
-            apply_curly_single_quotes("say 'hi' ok"),
-            "say \u{2018}hi\u{2019} ok"
-        );
-    }
-
-    #[test]
-    fn apply_curly_single_quotes_at_string_start() {
-        assert_eq!(
-            apply_curly_single_quotes("'hello'"),
-            "\u{2018}hello\u{2019}"
-        );
-    }
-
-    #[test]
-    fn apply_curly_single_quotes_trailing_apostrophe() {
-        assert_eq!(apply_curly_single_quotes("test'"), "test\u{2019}");
-    }
-
-    #[test]
-    fn is_opening_quote_context_after_em_dash() {
-        let chars: Vec<char> = "x\u{2014}\"y".chars().collect();
-        assert!(is_opening_quote_context(&chars, 2));
-    }
-
-    #[test]
-    fn is_opening_quote_context_after_en_dash() {
-        let chars: Vec<char> = "x\u{2013}\"y".chars().collect();
-        assert!(is_opening_quote_context(&chars, 2));
-    }
-
-    #[test]
-    fn is_opening_quote_context_at_index_zero() {
-        let chars: Vec<char> = "\"hi".chars().collect();
-        assert!(is_opening_quote_context(&chars, 0));
-    }
-
-    #[test]
-    fn is_opening_quote_context_after_letter_is_false() {
-        let chars: Vec<char> = "x\"y".chars().collect();
-        assert!(!is_opening_quote_context(&chars, 1));
-    }
-
-    // Issue #2: strategy functions should return distinct matches, not count copies
-    #[test]
-    fn quote_normalized_find_returns_distinct_match_not_count_copies() {
-        let content = "\u{201C}a\u{201D} and \u{201C}a\u{201D}";
-        let matches = quote_normalized_find(content, "\"a\"");
-        // Should return 1 distinct match, not 2 copies of the same string.
-        // The cascade can check content.matches(actual).count() for replace_all.
-        assert_eq!(
-            matches.len(),
-            1,
-            "should return distinct matches only, got: {matches:?}"
-        );
-    }
-
-    // ─── Issue #1: mixed curly-quote forms should all be found ──────────
-    #[test]
-    fn quote_normalized_find_returns_all_distinct_forms() {
-        // Content has \u{201C}a\u{201D} (open-close) AND \u{201C}a\u{201C} (open-open, malformed)
-        // Both normalize to "a", but they are different actual byte sequences.
+        // quote_normalized_find: returns all distinct curly-quote forms
         let content = "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done";
         let matches = quote_normalized_find(content, "\"a\"");
         assert_eq!(
@@ -1025,177 +890,118 @@ mod tests {
             2,
             "should find both distinct curly-quote forms, got: {matches:?}"
         );
-        let mut sorted = matches.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 2, "the two forms should be distinct strings");
-    }
 
-    #[test]
-    fn replace_all_mixed_curly_quotes_aborts_on_distinct_forms() {
-        // Safety: when replace_all finds distinct actual substrings (different
-        // curly-quote styles), abort to avoid partial replacement.
-        let content = "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done";
-        let result = fuzzy_find_replacement(content, "\"a\"", true);
-        assert!(
-            result.is_none(),
-            "should abort on distinct curly-quote forms, got: {result:?}"
-        );
-    }
+        // replace_all with distinct curly-quote forms → abort
+        assert!(fuzzy_find_replacement(
+            "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done",
+            "\"a\"",
+            true
+        )
+        .is_none());
 
-    // ─── Cascade: replace_all with identical duplicate matches ──────────
-    #[test]
-    fn replace_all_with_duplicate_strategy_results_should_succeed() {
-        // Two identical blocks at different positions. line_trimmed_find returns
-        // two results with the same actual string. replace_all should still work
-        // because content.replace(actual, new) handles all occurrences.
+        // replace_all with duplicate identical strategy results → succeeds
         let content = "  foo()\n  bar()\n\n  foo()\n  bar()";
-        let search = "foo()\nbar()";
-        let result = fuzzy_find_replacement(content, search, true);
-        assert!(
-            result.is_some(),
-            "replace_all should succeed when strategy returns identical matches"
-        );
-        let m = result.unwrap();
-        assert_eq!(m.strategy, "line-trimmed");
+        let result = fuzzy_find_replacement(content, "foo()\nbar()", true).unwrap();
+        assert_eq!(result.strategy, "line-trimmed");
     }
 
     // ─── LineTrimmedReplacer ────────────────────────────────────────────────
 
     #[test]
-    fn line_trimmed_ignores_leading_whitespace() {
+    fn line_trimmed_cases() {
         let content = "    fn foo() {\n        bar();\n    }";
         let search = "fn foo() {\n    bar();\n}";
         let matches = line_trimmed_find(content, search);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], content);
-    }
 
-    #[test]
-    fn line_trimmed_no_match() {
-        let content = "fn foo() {\n    bar();\n}";
-        let search = "fn baz() {\n    bar();\n}";
-        let matches = line_trimmed_find(content, search);
+        // no match
+        let matches = line_trimmed_find("fn foo() {\n    bar();\n}", "fn baz() {\n    bar();\n}");
         assert!(matches.is_empty());
-    }
 
-    #[test]
-    fn line_trimmed_trailing_empty_line() {
-        let content = "  a\n  b";
-        let search = "a\nb\n";
-        let matches = line_trimmed_find(content, search);
+        // trailing empty line in search
+        let matches = line_trimmed_find("  a\n  b", "a\nb\n");
         assert_eq!(matches.len(), 1);
     }
 
     // ─── BlockAnchorReplacer ────────────────────────────────────────────────
 
     #[test]
-    fn block_anchor_matching_anchors_fuzzy_middle() {
+    fn block_anchor_cases() {
         let content = "fn foo() {\n    let x = 1;\n    let y = 2;\n}";
-        // LLM changed middle line slightly
         let search = "fn foo() {\n    let x = 10;\n    let y = 20;\n}";
         let matches = block_anchor_find(content, search);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], content);
-    }
 
-    #[test]
-    fn block_anchor_no_last_line_match() {
-        let content = "fn foo() {\n    bar();\n}";
-        let search = "fn foo() {\n    bar();\nend";
-        let matches = block_anchor_find(content, search);
+        // no last line match
+        let matches = block_anchor_find("fn foo() {\n    bar();\n}", "fn foo() {\n    bar();\nend");
         assert!(matches.is_empty());
     }
 
     // ─── WhitespaceNormalizedReplacer ───────────────────────────────────────
 
     #[test]
-    fn whitespace_normalized_single_line() {
-        let content = "    let   x  =   42;";
-        let search = "let x = 42;";
-        let matches = whitespace_normalized_find(content, search);
+    fn whitespace_normalized_cases() {
+        let matches = whitespace_normalized_find("    let   x  =   42;", "let x = 42;");
         assert_eq!(matches.len(), 1);
-    }
-
-    #[test]
-    fn whitespace_normalized_multiline() {
-        let content = "  fn foo()  {\n    bar() ; \n  }";
-        let search = "fn foo() {\nbar() ;\n}";
-        let matches = whitespace_normalized_find(content, search);
+        let matches = whitespace_normalized_find(
+            "  fn foo()  {\n    bar() ; \n  }",
+            "fn foo() {\nbar() ;\n}",
+        );
         assert_eq!(matches.len(), 1);
     }
 
     // ─── IndentationFlexibleReplacer ────────────────────────────────────────
 
     #[test]
-    fn indentation_flexible_different_indent() {
+    fn indentation_flexible_cases() {
         let content = "        fn foo() {\n            bar();\n        }";
         let search = "    fn foo() {\n        bar();\n    }";
         let matches = indentation_flexible_find(content, search);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], content);
-    }
 
-    #[test]
-    fn indentation_flexible_no_match() {
-        let content = "    fn foo() {\n        bar();\n    }";
-        let search = "    fn baz() {\n        bar();\n    }";
-        let matches = indentation_flexible_find(content, search);
+        // no match (different function name)
+        let matches = indentation_flexible_find(
+            "    fn foo() {\n        bar();\n    }",
+            "    fn baz() {\n        bar();\n    }",
+        );
         assert!(matches.is_empty());
     }
 
     // ─── EscapeNormalizedReplacer ───────────────────────────────────────────
 
     #[test]
-    fn escape_normalized_newline() {
+    fn escape_normalized_cases() {
         let content = "hello\nworld";
-        let search = "hello\\nworld";
-        let matches = escape_normalized_find(content, search);
+        let matches = escape_normalized_find(content, "hello\\nworld");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], content);
-    }
 
-    #[test]
-    fn escape_normalized_tab() {
-        let content = "col1\tcol2";
-        let search = "col1\\tcol2";
-        let matches = escape_normalized_find(content, search);
+        let matches = escape_normalized_find("col1\tcol2", "col1\\tcol2");
         assert_eq!(matches.len(), 1);
-    }
 
-    #[test]
-    fn escape_normalized_no_escapes() {
-        let content = "hello world";
-        let search = "hello world";
-        let matches = escape_normalized_find(content, search);
-        assert!(matches.is_empty()); // No escapes → skip strategy
+        // no escapes → skip strategy
+        assert!(escape_normalized_find("hello world", "hello world").is_empty());
     }
 
     // ─── SequenceSimilarityReplacer ────────────────────────────────────────
 
     #[test]
-    fn sequence_similarity_matches_near_block_without_exact_anchors() {
+    fn sequence_similarity_cases() {
         let content = "let count = 1;\nprintln!(\"hello\");";
-        let search = "let count = 2;\nprintln!(\"hullo\");";
-        let matches = sequence_similarity_find(content, search);
+        let matches = sequence_similarity_find(content, "let count = 2;\nprintln!(\"hullo\");");
         assert_eq!(matches, vec![content.to_string()]);
-    }
 
-    #[test]
-    fn sequence_similarity_below_threshold_returns_none() {
-        let content = "let count = 1;\nprintln!(\"hello\");";
-        let search = "totally different\ncompletely unrelated";
-        let matches = sequence_similarity_find(content, search);
-        assert!(matches.is_empty());
-    }
+        // below threshold → none
+        assert!(
+            sequence_similarity_find(content, "totally different\ncompletely unrelated").is_empty()
+        );
 
-    #[test]
-    fn sequence_similarity_ambiguous_returns_none() {
-        let content =
-            "let count = 1;\nprintln!(\"hello\");\n\nlet count = 1;\nprintln!(\"hello\");";
-        let search = "let count = 2;\nprintln!(\"hullo\");";
-        let matches = sequence_similarity_find(content, search);
-        assert!(matches.is_empty());
+        // ambiguous → none
+        let dup = "let count = 1;\nprintln!(\"hello\");\n\nlet count = 1;\nprintln!(\"hello\");";
+        assert!(sequence_similarity_find(dup, "let count = 2;\nprintln!(\"hullo\");").is_empty());
     }
 
     // ─── unescape_str ──────────────────────────────────────────────────────
@@ -1212,66 +1018,41 @@ mod tests {
     // ─── remove_common_indent ───────────────────────────────────────────────
 
     #[test]
-    fn remove_indent_basic() {
+    fn remove_indent_cases() {
         assert_eq!(remove_common_indent("    a\n    b\n    c"), "a\nb\nc");
-    }
-
-    #[test]
-    fn remove_indent_mixed() {
         assert_eq!(remove_common_indent("    a\n      b\n    c"), "a\n  b\nc");
-    }
-
-    #[test]
-    fn remove_indent_with_empty_lines() {
         assert_eq!(remove_common_indent("    a\n\n    c"), "a\n\nc");
     }
 
     // ─── fuzzy_find_replacement (integration) ───────────────────────────────
 
     #[test]
-    fn cascade_prefers_earlier_strategy() {
-        // LineTrimmed should match before BlockAnchor
+    fn cascade_cases() {
+        // prefers line-trimmed over block-anchor
         let content = "  fn foo() {\n    bar();\n  }";
         let search = "fn foo() {\n  bar();\n}";
-        let result = fuzzy_find_replacement(content, search, false);
-        assert!(result.is_some());
-        let m = result.unwrap();
-        assert_eq!(m.strategy, "line-trimmed");
-        assert_eq!(m.actual, content);
-    }
+        let result = fuzzy_find_replacement(content, search, false).unwrap();
+        assert_eq!(result.strategy, "line-trimmed");
+        assert_eq!(result.actual, content);
 
-    #[test]
-    fn cascade_no_match_returns_none() {
-        let content = "completely different content";
-        let search = "fn foo() {\n    bar();\n}";
-        let result = fuzzy_find_replacement(content, search, false);
-        assert!(result.is_none());
-    }
+        // no match → none
+        assert!(fuzzy_find_replacement("completely different content", search, false).is_none());
 
-    #[test]
-    fn cascade_ambiguous_skips_to_next() {
-        // Two identical blocks → LineTrimmed finds 2 → skips to next strategies
-        let content = "  foo\n  bar\n\n  foo\n  bar";
-        let search = "foo\nbar";
-        let result = fuzzy_find_replacement(content, search, false);
-        // All strategies should find 2 matches → None
-        assert!(result.is_none());
-    }
+        // ambiguous (2 identical blocks) → skip to next strategies → none
+        let amb = "  foo\n  bar\n\n  foo\n  bar";
+        assert!(fuzzy_find_replacement(amb, "foo\nbar", false).is_none());
 
-    #[test]
-    fn cascade_uses_line_number_stripped_before_other_strategies() {
+        // line-number-stripped before other strategies
         let content = "fn demo() {\n    println!(\"hi\");\n}";
         let search = "1. fn demo() {\n2.     println!(\"hi\");\n3. }";
         let result = fuzzy_find_replacement(content, search, false).unwrap();
         assert_eq!(result.strategy, "line-number-stripped");
         assert_eq!(result.actual, content);
-    }
 
-    #[test]
-    fn cascade_uses_sequence_similarity_as_last_resort() {
+        // sequence-similarity as last resort
         let content = "let count = 1;\nprintln!(\"hello\");";
-        let search = "let count = 2;\nprintln!(\"hullo\");";
-        let result = fuzzy_find_replacement(content, search, false).unwrap();
+        let result =
+            fuzzy_find_replacement(content, "let count = 2;\nprintln!(\"hullo\");", false).unwrap();
         assert_eq!(result.strategy, "sequence-similarity");
         assert_eq!(result.actual, content);
     }

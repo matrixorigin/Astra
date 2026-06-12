@@ -148,112 +148,52 @@ mod tests {
     }
 
     #[test]
-    fn exact_name_match_scores_20() {
-        let i = item("bash", "Execute commands");
-        assert_eq!(relevance_score(&i, &["bash"]), 20 + 8); // exact name + exact part
+    fn relevance_score_cases() {
+        // (name, desc, extra, query_terms, expected)
+        let score_cases: &[(&str, &str, Option<&str>, &[&str], usize)] = &[
+            ("bash", "Execute commands", None, &["bash"], 28),                      // exact name(20)+exact part(8)
+            ("read_file", "Read file contents", None, &["read"], 20),                // name contains(10)+part exact(8)+desc(2)
+            ("git_log_search", "Search git log", None, &["log"], 20),                // name contains(10)+part exact(8)+desc(2)
+            ("readFile", "Read file contents", None, &["file"], 20),                 // camelCase part exact(8)+name contains(10)+desc(2)
+            ("xyz", "Deploy application to kubernetes cluster", None, &["kubernetes"], 2), // desc only
+            ("verify", "Run checks", Some("User wants to validate code quality"), &["validate"], 1), // extra only
+            ("bash", "Execute shell commands", None, &["kubernetes"], 0),            // no match
+            ("read_file", "Read file contents from workspace", None, &["read", "workspace"], 22), // multi-term
+            ("ReadFile", "Read file contents", None, &["readfile"], 28),             // case insensitive exact+parts
+            ("bash", "Execute commands", None, &[], 0),                              // empty query
+        ];
+        for (name, desc, extra, terms, expected) in score_cases {
+            let item = if let Some(e) = extra {
+                item_with_extra(name, desc, e)
+            } else {
+                item(name, desc)
+            };
+            assert_eq!(relevance_score(&item, terms), *expected,
+                "name={name}, terms={terms:?}");
+        }
     }
 
     #[test]
-    fn name_contains_term_scores_10() {
-        let i = item("read_file", "Read file contents");
-        // "read" is contained in "read_file" (+10), and "read" is exact part (+8), desc has "read" (+2)
-        let s = relevance_score(&i, &["read"]);
-        assert!(s >= 10, "expected at least 10, got {s}");
-    }
-
-    #[test]
-    fn snake_case_parts_match_individually() {
-        let i = item("git_log_search", "Search git log");
-        // "log" → name contains (+10), part exact "log" (+8), desc contains (+2)
-        let s = relevance_score(&i, &["log"]);
-        assert!(s >= 18, "expected >=18, got {s}");
-    }
-
-    #[test]
-    fn camel_case_parts_match_individually() {
-        let i = item("readFile", "Read file contents");
-        // "file" → name contains (+10), part exact "file" (+8), desc has "file" (+2)
-        let s = relevance_score(&i, &["file"]);
-        assert!(s >= 18, "expected >=18, got {s}");
-    }
-
-    #[test]
-    fn description_match_scores_2() {
-        let i = item("xyz", "Deploy application to kubernetes cluster");
-        let s = relevance_score(&i, &["kubernetes"]);
-        assert_eq!(s, 2);
-    }
-
-    #[test]
-    fn extra_text_match_scores_1() {
-        let i = item_with_extra(
-            "verify",
-            "Run checks",
-            "User wants to validate code quality",
-        );
-        // "validate" only in extra → +1
-        let s = relevance_score(&i, &["validate"]);
-        assert_eq!(s, 1);
-    }
-
-    #[test]
-    fn no_match_returns_zero() {
-        let i = item("bash", "Execute shell commands");
-        assert_eq!(relevance_score(&i, &["kubernetes"]), 0);
-    }
-
-    #[test]
-    fn multi_term_accumulates_scores() {
-        let i = item("read_file", "Read file contents from workspace");
-        // "read" → name contains(10) + part exact(8) + desc(2) = 20
-        // "workspace" → desc(2) = 2
-        let s = relevance_score(&i, &["read", "workspace"]);
-        assert_eq!(s, 22);
-    }
-
-    #[test]
-    fn matching_is_case_insensitive() {
-        let i = item("ReadFile", "Read file contents");
-        let s = relevance_score(&i, &["readfile"]);
-        // exact name match (case insensitive) → 20 + parts: "read"(4 partial) + "file"(4 partial)
-        assert!(s >= 20, "expected >=20, got {s}");
-    }
-
-    #[test]
-    fn empty_query_returns_zero() {
-        let i = item("bash", "Execute commands");
-        assert_eq!(relevance_score(&i, &[]), 0);
-    }
-
-    #[test]
-    fn rank_returns_sorted_and_capped() {
+    fn rank_by_relevance_cases() {
         let items = vec![
             item("bash", "Execute commands"),
             item("read_file", "Read file contents"),
             item("write_file", "Write file contents"),
             item("git_log", "Show git log"),
         ];
+
+        // sorted and capped
         let ranked = rank_by_relevance(&items, "file", 2);
-        assert_eq!(ranked.len(), 2, "capped at max_results=2");
-        // read_file and write_file should be top 2
+        assert_eq!(ranked.len(), 2);
         let indices: Vec<usize> = ranked.iter().map(|(idx, _)| *idx).collect();
-        assert!(indices.contains(&1), "read_file should be in top 2");
-        assert!(indices.contains(&2), "write_file should be in top 2");
-        // First result has higher or equal score
+        assert!(indices.contains(&1)); // read_file
+        assert!(indices.contains(&2)); // write_file
         assert!(ranked[0].1 >= ranked[1].1);
-    }
 
-    #[test]
-    fn rank_empty_query_returns_empty() {
-        let items = vec![item("bash", "Execute commands")];
-        let ranked = rank_by_relevance(&items, "", 10);
-        assert!(ranked.is_empty());
-    }
+        // empty query → empty
+        assert!(rank_by_relevance(&items, "", 10).is_empty());
 
-    #[test]
-    fn rank_no_matches_returns_empty() {
-        let items = vec![item("bash", "Execute commands")];
-        let ranked = rank_by_relevance(&items, "kubernetes", 10);
-        assert!(ranked.is_empty());
+        // no match → empty
+        assert!(rank_by_relevance(&items, "kubernetes", 10).is_empty());
     }
 }
