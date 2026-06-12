@@ -49,8 +49,8 @@
 //! added here first and consumed by call sites instead of being copied.
 
 use astra_sandbox::{
-    GitSafetyViolation, command_mutates_session_tool_result_artifact, is_dangerous_file_path,
-    is_session_tool_result_artifact_reference, is_soft_violation, validate_git_command,
+    GitSafetyViolation, is_dangerous_file_path, is_internal_safe_path, is_soft_violation,
+    validate_git_command,
 };
 use serde_json::Value;
 
@@ -1287,28 +1287,46 @@ fn structured_git_command_hint(tool_name: &str, args: &Value) -> Option<String> 
 }
 
 fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
+    let is_read = is_read_only_tool_with_args(tool_name, Some(args));
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
-        && (is_dangerous_file_path(&path)
-            || crate::permission::redact::matches_sensitive_path(&path))
     {
-        if is_session_tool_result_artifact_reference(&path)
-            && is_read_only_tool_with_args(tool_name, Some(args))
-        {
-            return None;
+        let dangerous = if is_read {
+            // Layer 1: known safe internal artifact? → allow.
+            if is_internal_safe_path(&path).is_none() {
+                // Layer 2: known dangerous? → block.
+                is_dangerous_file_path(&path)
+                    || crate::permission::redact::matches_sensitive_path(&path)
+            } else {
+                false
+            }
+        } else {
+            is_dangerous_file_path(&path)
+                || crate::permission::redact::matches_sensitive_path(&path)
+        };
+        if dangerous {
+            return Some(path);
         }
-        return Some(path);
     }
     if let Some(cmd) = command_hint_from_args(args)
         && !cmd.is_empty()
-        && (is_dangerous_file_path(cmd) || crate::permission::redact::matches_sensitive_path(cmd))
     {
-        if is_session_tool_result_artifact_reference(cmd)
-            && !command_mutates_session_tool_result_artifact(cmd)
-        {
-            return None;
+        let dangerous = if is_read {
+            // Layer 1: known safe internal artifact? → allow.
+            if is_internal_safe_path(cmd).is_none() {
+                // Layer 2: known dangerous? → block.
+                is_dangerous_file_path(cmd)
+                    || crate::permission::redact::matches_sensitive_path(cmd)
+            } else {
+                false
+            }
+        } else {
+            is_dangerous_file_path(cmd)
+                || crate::permission::redact::matches_sensitive_path(cmd)
+        };
+        if dangerous {
+            return Some(cmd.to_string());
         }
-        return Some(cmd.to_string());
     }
     None
 }

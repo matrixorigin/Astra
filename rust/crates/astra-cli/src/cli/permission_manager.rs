@@ -6,9 +6,8 @@ use crate::cli::workspace_trust::{
     evaluate_workspace_trust, project_permissions_hash,
 };
 use astra_runtime::tool_sandbox::{
-    CommandRisk, GitSafetyViolation, analyze_command_risks,
-    command_mutates_session_tool_result_artifact, is_dangerous_file_path,
-    is_session_tool_result_artifact_reference, validate_git_command,
+    CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
+    is_internal_safe_path, validate_git_command,
 };
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
@@ -571,29 +570,48 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
 }
 
 fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    let is_read = is_read_only_tool_with_args(tool_name, Some(args));
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
-        && (is_dangerous_file_path(&path)
-            || astra_turn_core::permission::redact::matches_sensitive_path(&path))
     {
-        if is_session_tool_result_artifact_reference(&path)
-            && is_read_only_tool_with_args(tool_name, Some(args))
-        {
-            return None;
+        let dangerous = if is_read {
+            // Layer 1: known safe internal artifact? → allow.
+            if is_internal_safe_path(&path).is_none() {
+                // Layer 2: known dangerous? → block.
+                is_dangerous_file_path(&path)
+                    || astra_turn_core::permission::redact::matches_sensitive_path(&path)
+            } else {
+                false
+            }
+        } else {
+            is_dangerous_file_path(&path)
+                || astra_turn_core::permission::redact::matches_sensitive_path(&path)
+        };
+        if dangerous {
+            return Some(path);
         }
-        return Some(path);
     }
     if let Some(cmd) = command_hint_from_args(args)
         && !cmd.is_empty()
-        && (is_dangerous_file_path(cmd)
-            || astra_turn_core::permission::redact::matches_sensitive_path(cmd))
     {
-        if is_session_tool_result_artifact_reference(cmd)
-            && !command_mutates_session_tool_result_artifact(cmd)
-        {
-            return None;
+        // For commands, we can't reliably parse read vs write from a string,
+        // so use the tool-level read/write classification as a conservative proxy.
+        let dangerous = if is_read {
+            // Layer 1: known safe internal artifact? → allow.
+            if is_internal_safe_path(cmd).is_none() {
+                // Layer 2: known dangerous? → block.
+                is_dangerous_file_path(cmd)
+                    || astra_turn_core::permission::redact::matches_sensitive_path(cmd)
+            } else {
+                false
+            }
+        } else {
+            is_dangerous_file_path(cmd)
+                || astra_turn_core::permission::redact::matches_sensitive_path(cmd)
+        };
+        if dangerous {
+            return Some(cmd.to_string());
         }
-        return Some(cmd.to_string());
     }
     None
 }

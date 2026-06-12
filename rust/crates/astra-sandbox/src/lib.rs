@@ -33,8 +33,8 @@ pub use process_isolation::{
     CgroupGuard, IsolatedOutput, IsolationConfig, apply_cgroup, execute_isolated,
 };
 pub use shell_hardening::{
-    DANGEROUS_FILE_PATHS, SENSITIVE_ENV_VARS, ShellHardeningConfig, build_hardened_command,
-    command_mutates_session_tool_result_artifact, is_dangerous_file_path,
+    DANGEROUS_FILE_PATHS, InternalPathKind, SENSITIVE_ENV_VARS, ShellHardeningConfig,
+    build_hardened_command, is_dangerous_file_path, is_dangerous_read_path, is_internal_safe_path,
     is_session_tool_result_artifact_reference, scrub_secrets_from_env,
 };
 pub use tier::{ToolTier, classify_tool, effective_tier};
