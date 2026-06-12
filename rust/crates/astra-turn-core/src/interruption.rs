@@ -774,23 +774,29 @@ pub fn interruption_from_error_kind(
 mod tests {
     use super::*;
 
+    // ── labels ──
+
     #[test]
-    fn interruption_kind_labels_are_snake_case() {
+    fn interruption_kind_labels() {
         let kinds = [
             InterruptionKind::BudgetExhausted,
             InterruptionKind::EmptyCompletion,
             InterruptionKind::TokenBudgetExceeded,
+            InterruptionKind::CumulativeBudgetExceeded,
             InterruptionKind::RateLimited,
+            InterruptionKind::CooldownRejected,
             InterruptionKind::UserCancelled,
             InterruptionKind::ContextOverflow,
             InterruptionKind::AuthFailure,
             InterruptionKind::CriticalVerdict,
+            InterruptionKind::ApprovalRejected,
+            InterruptionKind::ServerOverload,
             InterruptionKind::StreamTransport,
             InterruptionKind::StreamIdle,
         ];
         for kind in kinds {
             let label = kind.label();
-            assert!(!label.is_empty());
+            assert!(!label.is_empty(), "{kind:?} should have a label");
             assert!(
                 label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                 "label should be snake_case: {label}"
@@ -799,23 +805,105 @@ mod tests {
         }
     }
 
+    // ── is_resumable ──
+
     #[test]
-    fn budget_exhausted_is_resumable() {
+    fn interruption_kind_is_resumable() {
+        // resumable kinds
         assert!(InterruptionKind::BudgetExhausted.is_resumable());
         assert!(InterruptionKind::EmptyCompletion.is_resumable());
         assert!(InterruptionKind::RateLimited.is_resumable());
         assert!(InterruptionKind::UserCancelled.is_resumable());
         assert!(InterruptionKind::StreamTransport.is_resumable());
         assert!(InterruptionKind::StreamIdle.is_resumable());
-    }
-
-    #[test]
-    fn auth_failure_is_not_resumable() {
+        assert!(InterruptionKind::CriticalVerdict.is_resumable());
+        assert!(InterruptionKind::ApprovalRejected.is_resumable());
+        assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
+        assert!(InterruptionKind::ServerOverload.is_resumable());
+        assert!(InterruptionKind::CooldownRejected.is_resumable());
+        // non-resumable
         assert!(!InterruptionKind::AuthFailure.is_resumable());
     }
 
+    // ── error_kind → interruption mapping ──
+
     #[test]
-    fn record_serializes_to_json() {
+    fn error_kind_mapping() {
+        // resumable mappings
+        let cases: &[(astra_core::ErrorKind, InterruptionKind)] = &[
+            (astra_core::ErrorKind::Auth, InterruptionKind::AuthFailure),
+            (astra_core::ErrorKind::RateLimit, InterruptionKind::RateLimited),
+            (astra_core::ErrorKind::ContextWindow, InterruptionKind::ContextOverflow),
+            (astra_core::ErrorKind::ServerError, InterruptionKind::ServerOverload),
+            (astra_core::ErrorKind::BudgetExhausted, InterruptionKind::BudgetExhausted),
+            (astra_core::ErrorKind::Cancelled, InterruptionKind::UserCancelled),
+            (astra_core::ErrorKind::StreamIdle, InterruptionKind::StreamIdle),
+            (astra_core::ErrorKind::StreamTransport, InterruptionKind::StreamTransport),
+            (astra_core::ErrorKind::Network, InterruptionKind::StreamTransport),
+        ];
+        for (ek, expected_kind) in cases {
+            let (kind, _action) = interruption_from_error_kind(*ek)
+                .unwrap_or_else(|| panic!("{ek:?} should map to an interruption"));
+            assert_eq!(kind, *expected_kind, "mismatch for {ek:?}");
+        }
+        // specific action shape checks
+        let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::Auth).unwrap();
+        assert!(matches!(action, ResumeAction::RequiresIntervention { .. }));
+        let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::RateLimit).unwrap();
+        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+        let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::ContextWindow).unwrap();
+        assert!(matches!(action, ResumeAction::CompactAndRetry));
+        let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::ServerError).unwrap();
+        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+        // non-interruptions
+        let none_cases = [
+            astra_core::ErrorKind::Unknown,
+            astra_core::ErrorKind::ToolNotFound,
+            astra_core::ErrorKind::ToolTimeout,
+            astra_core::ErrorKind::InvalidRequest,
+            astra_core::ErrorKind::ToolInvalidArgs,
+            astra_core::ErrorKind::ResourceLimit,
+            astra_core::ErrorKind::ToolRoundsExhausted,
+        ];
+        for ek in none_cases {
+            assert!(interruption_from_error_kind(ek).is_none(), "{ek:?} should be None");
+        }
+    }
+
+    // ── from_json_value ──
+
+    #[test]
+    fn from_json_value() {
+        // unknown kind falls back to Settle
+        assert_eq!(
+            ResumeMode::from_json_value(None, "totally_unknown_kind_v9"),
+            ResumeMode::Settle
+        );
+        assert_eq!(
+            ResumeMode::from_json_value(Some(&serde_json::json!("not_a_known_mode")), "another_unknown_kind"),
+            ResumeMode::Settle
+        );
+        // known kinds use calibrated defaults
+        assert_eq!(
+            ResumeMode::from_json_value(None, "empty_completion"),
+            ResumeMode::Settle
+        );
+        assert_eq!(
+            ResumeMode::from_json_value(None, "budget_exhausted"),
+            ResumeMode::Continue
+        );
+        // explicit value wins over kind default
+        assert_eq!(
+            ResumeMode::from_json_value(Some(&serde_json::json!("continue")), "empty_completion"),
+            ResumeMode::Continue
+        );
+    }
+
+    // ── record serialization & user messages ──
+
+    #[test]
+    fn record_serialization_and_user_messages() {
+        // basic record round-trip
         let record = InterruptionRecord::new(
             InterruptionKind::BudgetExhausted,
             ResumeAction::ContinueImmediately,
@@ -836,110 +924,15 @@ mod tests {
         assert_eq!(json["resumable"], true);
         assert_eq!(json["has_checkpoint"], true);
         assert_eq!(json["tool_calls_completed"], 5);
-        assert!(
-            json.get("stall_signal").is_none(),
-            "stall_signal omitted from JSON when None for backwards compat: {json:?}"
-        );
-    }
+        assert!(json.get("stall_signal").is_none());
 
-    /// Regression: `ResumeMode::from_json_value` used to fail OPEN when the
-    /// `kind` was unknown — falling back to `ResumeMode::default()` =
-    /// Continue, which broadens execution. For an unknown interruption
-    /// kind we cannot reason about whether broadening is appropriate, so
-    /// the safe default is Settle. Catch any future refactor that
-    /// regresses this.
-    #[test]
-    fn from_json_value_unknown_kind_falls_back_to_settle() {
-        // No `resume_mode` field, unknown kind → must default to Settle.
-        let mode = ResumeMode::from_json_value(None, "totally_unknown_kind_v9");
-        assert_eq!(
-            mode,
-            ResumeMode::Settle,
-            "unknown interruption kind must fail-safe to Settle, not broaden via Continue"
-        );
-
-        // Also: an unrecognised resume_mode value with an unknown kind →
-        // still Settle (the unrecognised value triggers the fallback,
-        // and the fallback now hits the unknown-kind branch).
-        let mode = ResumeMode::from_json_value(
-            Some(&serde_json::json!("not_a_known_mode")),
-            "another_unknown_kind",
-        );
-        assert_eq!(mode, ResumeMode::Settle);
-    }
-
-    #[test]
-    fn from_json_value_known_kind_uses_calibrated_default() {
-        // Known kinds keep their calibrated defaults — no regression of
-        // existing behaviour.
-        assert_eq!(
-            ResumeMode::from_json_value(None, "empty_completion"),
-            ResumeMode::Settle
-        );
-        assert_eq!(
-            ResumeMode::from_json_value(None, "budget_exhausted"),
-            ResumeMode::Continue
-        );
-    }
-
-    #[test]
-    fn from_json_value_explicit_value_wins_over_kind_default() {
-        // An explicit "continue" must beat the kind default (e.g. an
-        // EmptyCompletion record whose author wants to resume normally).
-        let mode =
-            ResumeMode::from_json_value(Some(&serde_json::json!("continue")), "empty_completion");
-        assert_eq!(mode, ResumeMode::Continue);
-    }
-
-    #[test]
-    fn empty_completion_records_settlement_resume_mode() {
-        let record = InterruptionRecord::new(
-            InterruptionKind::EmptyCompletion,
-            ResumeAction::ContinueImmediately,
-            InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 5,
-                turns_completed: 3,
-                remaining_turns: 4,
-                error_detail: None,
-                stall_signal: None,
-                resume_restricted_tools: vec!["agent".to_string(), "bash".to_string()],
-            },
-        );
-
+        // stall_signal serialization
+        let record = record.with_stall_signal("single_tool_streak=18");
+        assert_eq!(record.stall_signal.as_deref(), Some("single_tool_streak=18"));
         let json = record.to_json();
-        assert_eq!(record.resume_mode, ResumeMode::Settle);
-        assert_eq!(json["resume_mode"], "settle");
-        assert_eq!(
-            json["resume_restricted_tools"],
-            serde_json::json!(["agent", "bash"])
-        );
-    }
+        assert_eq!(json["stall_signal"], "single_tool_streak=18");
 
-    #[test]
-    fn record_with_stall_signal_serializes_the_breadcrumb() {
-        let record = InterruptionRecord::new(
-            InterruptionKind::BudgetExhausted,
-            ResumeAction::ContinueImmediately,
-            InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 18,
-                turns_completed: 18,
-                remaining_turns: 131,
-                error_detail: None,
-                stall_signal: Some("single_tool_streak=18".to_string()),
-                resume_restricted_tools: Vec::new(),
-            },
-        );
-        let json = record.to_json();
-        assert_eq!(
-            json["stall_signal"], "single_tool_streak=18",
-            "the resumed session must see *why* the loop was cut so the LLM can self-correct"
-        );
-    }
-
-    #[test]
-    fn with_stall_signal_builder_attaches_breadcrumb() {
+        // builder convenience
         let record = InterruptionRecord::new(
             InterruptionKind::BudgetExhausted,
             ResumeAction::ContinueImmediately,
@@ -951,7 +944,29 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_with_delay() {
+    fn interruption_record_kind_specific_messages() {
+        // empty completion — settle mode + user message
+        let record = InterruptionRecord::new(
+            InterruptionKind::EmptyCompletion,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 5,
+                turns_completed: 3,
+                remaining_turns: 4,
+                error_detail: Some("agentic loop completed without final text".to_string()),
+                stall_signal: None,
+                resume_restricted_tools: vec!["agent".to_string(), "bash".to_string()],
+            },
+        );
+        assert_eq!(record.resume_mode, ResumeMode::Settle);
+        let json = record.to_json();
+        assert_eq!(json["resume_mode"], "settle");
+        assert_eq!(json["resume_restricted_tools"], serde_json::json!(["agent", "bash"]));
+        assert!(record.user_message.contains("without a final answer"));
+        assert!(record.user_message.contains("continue"));
+
+        // rate limited — delay surfacing
         let record = InterruptionRecord::new(
             InterruptionKind::RateLimited,
             ResumeAction::WaitAndRetry { delay_seconds: 30 },
@@ -968,10 +983,8 @@ mod tests {
         assert!(record.user_message.contains("rate_limited"));
         assert!(record.user_message.contains("30s"));
         assert!(record.error_detail.is_some());
-    }
 
-    #[test]
-    fn context_overflow_suggests_compaction() {
+        // context overflow — compaction suggestion
         let record = InterruptionRecord::new(
             InterruptionKind::ContextOverflow,
             ResumeAction::CompactAndRetry,
@@ -987,29 +1000,8 @@ mod tests {
         );
         assert!(record.kind.is_resumable());
         assert!(record.user_message.contains("compacted"));
-    }
 
-    #[test]
-    fn empty_completion_has_explicit_user_message() {
-        let record = InterruptionRecord::new(
-            InterruptionKind::EmptyCompletion,
-            ResumeAction::ContinueImmediately,
-            InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 4,
-                turns_completed: 3,
-                remaining_turns: 7,
-                error_detail: Some("agentic loop completed without final text".to_string()),
-                stall_signal: None,
-                resume_restricted_tools: Vec::new(),
-            },
-        );
-        assert!(record.user_message.contains("without a final answer"));
-        assert!(record.user_message.contains("continue"));
-    }
-
-    #[test]
-    fn budget_exhausted_user_message_surfaces_stall_cause() {
+        // budget exhausted — stall cause surfacing
         let record = InterruptionRecord::new(
             InterruptionKind::BudgetExhausted,
             ResumeAction::ContinueImmediately,
@@ -1024,16 +1016,10 @@ mod tests {
             },
         );
         assert!(record.user_message.contains("Cause:"));
-        assert!(
-            record
-                .user_message
-                .contains("re-read overlapping file ranges 5 time(s)")
-        );
+        assert!(record.user_message.contains("re-read overlapping file ranges 5 time(s)"));
         assert!(record.user_message.contains("You can continue"));
-    }
 
-    #[test]
-    fn harness_paused_user_message_is_actionable() {
+        // harness paused — actionable message
         let record = InterruptionRecord::new(
             InterruptionKind::HarnessPaused,
             ResumeAction::ContinueImmediately,
@@ -1049,200 +1035,91 @@ mod tests {
         );
         assert!(record.user_message.contains("read-heavy stall"));
         assert!(record.user_message.contains("Cause:"));
-        assert!(
-            record
-                .user_message
-                .contains("re-read overlapping file ranges 6 time(s)")
-        );
+        assert!(record.user_message.contains("re-read overlapping file ranges 6 time(s)"));
         assert!(record.user_message.contains("You can continue"));
     }
 
-    // ── resume guidance tests ──
+    // ── resume guidance ──
 
     #[test]
-    fn resume_guidance_budget_exhausted() {
+    fn resume_guidance_budget_exhausted_variants() {
+        // baseline: no stall_signal
         let irj = serde_json::json!({
-            "kind": "budget_exhausted",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 12,
-            "turns_completed": 15,
-            "remaining_turns": 0,
+            "kind": "budget_exhausted", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 12, "turns_completed": 15, "remaining_turns": 0,
             "user_message": "[budget_exhausted] 12 tool call(s) completed. A checkpoint was saved."
         });
-        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("[RESUME CONTEXT]"));
         assert!(guidance.contains("budget_exhausted"));
         assert!(guidance.contains("15 turn(s)"));
         assert!(guidance.contains("12 tool call(s)"));
         assert!(guidance.contains("Checkpoint: saved"));
         assert!(guidance.contains("Prioritize"));
-        // With no stall_signal, no cause line.
-        assert!(
-            !guidance.contains("Cause:"),
-            "Cause line should be absent when no stall_signal present: {guidance}"
-        );
-    }
+        assert!(!guidance.contains("Cause:"));
 
-    #[test]
-    fn resume_guidance_budget_exhausted_with_stall_signal_surfaces_cause() {
+        // with single_tool_streak stall_signal
         let irj = serde_json::json!({
-            "kind": "budget_exhausted",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 18,
-            "turns_completed": 18,
-            "remaining_turns": 131,
+            "kind": "budget_exhausted", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 18, "turns_completed": 18, "remaining_turns": 131,
             "user_message": "[budget_exhausted] 18 tool call(s) completed.",
             "stall_signal": "single_tool_streak=18"
         });
-        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
-        assert!(
-            guidance.contains("Cause:"),
-            "resumed session must see *why* it was cut so the LLM can self-correct: {guidance}"
-        );
-        assert!(
-            guidance.contains("18 consecutive rounds"),
-            "streak count must be interpolated into the cause line: {guidance}"
-        );
-        assert!(
-            guidance.contains("batch"),
-            "corrective advice must tell the model to batch next: {guidance}"
-        );
-    }
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("Cause:"));
+        assert!(guidance.contains("18 consecutive rounds"));
+        assert!(guidance.contains("batch"));
 
-    #[test]
-    fn resume_guidance_budget_exhausted_with_exploration_family_signal_surfaces_cause() {
+        // with exploration_family stall_signal
         let irj = serde_json::json!({
-            "kind": "budget_exhausted",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 22,
-            "turns_completed": 14,
-            "remaining_turns": 135,
+            "kind": "budget_exhausted", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 22, "turns_completed": 14, "remaining_turns": 135,
             "user_message": "[budget_exhausted] 22 tool call(s) completed.",
             "stall_signal": "exploration_family=read;streak=5"
         });
-        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
-        assert!(
-            guidance.contains("read exploration family"),
-            "guidance should surface the dominant churn family: {guidance}"
-        );
-        assert!(
-            guidance.contains("5 consecutive rounds"),
-            "streak should be preserved in resume guidance: {guidance}"
-        );
-        assert!(
-            guidance.contains("reuse the evidence already gathered"),
-            "guidance should tell the resumed turn to stop re-reading: {guidance}"
-        );
-    }
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("read exploration family"));
+        assert!(guidance.contains("5 consecutive rounds"));
+        assert!(guidance.contains("reuse the evidence already gathered"));
 
-    #[test]
-    fn resume_guidance_budget_exhausted_with_redundant_reads_signal_surfaces_cause() {
+        // with redundant_reads stall_signal
         let irj = serde_json::json!({
-            "kind": "budget_exhausted",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 20,
-            "turns_completed": 14,
-            "remaining_turns": 135,
+            "kind": "budget_exhausted", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 20, "turns_completed": 14, "remaining_turns": 135,
             "user_message": "[budget_exhausted] 20 tool call(s) completed.",
             "stall_signal": "redundant_reads=5"
         });
-        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
-        assert!(
-            guidance.contains("re-read overlapping file ranges 5 time"),
-            "guidance should explain the redundant-read cause: {guidance}"
-        );
-        assert!(
-            guidance.contains("already in context"),
-            "guidance should steer the resumed turn toward reuse: {guidance}"
-        );
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("re-read overlapping file ranges 5 time"));
+        assert!(guidance.contains("already in context"));
     }
 
     #[test]
-    fn resume_guidance_surfaces_resume_guard_tools() {
+    fn resume_guidance_various_kinds() {
+        // rate_limited
         let irj = serde_json::json!({
-            "kind": "budget_exhausted",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 20,
-            "turns_completed": 14,
-            "remaining_turns": 135,
-            "user_message": "[budget_exhausted] 20 tool call(s) completed.",
-            "resume_restricted_tools": ["bash", "read_file"]
-        });
-        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
-        assert!(guidance.contains("Resume guard:"));
-        assert!(guidance.contains("bash, read_file"));
-    }
-
-    #[test]
-    fn resume_guidance_harness_paused_allows_single_missing_fact() {
-        let irj = serde_json::json!({
-            "kind": "harness_paused",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 28,
-            "turns_completed": 16,
-            "remaining_turns": 134,
-            "user_message": "[harness_paused] 28 tool call(s) completed. A checkpoint was saved."
-        });
-        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
-        assert!(guidance.contains("read-heavy stall"), "{guidance}");
-        assert!(guidance.contains("one concrete next action"), "{guidance}");
-        assert!(
-            guidance.contains("one specific fact is still missing"),
-            "{guidance}"
-        );
-        assert!(
-            !guidance.contains("Do NOT continue broad or duplicate reading"),
-            "{guidance}"
-        );
-    }
-
-    #[test]
-    fn resume_guidance_rate_limited() {
-        let irj = serde_json::json!({
-            "kind": "rate_limited",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 5,
-            "turns_completed": 3,
-            "remaining_turns": 7,
+            "kind": "rate_limited", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 5, "turns_completed": 3, "remaining_turns": 7,
             "user_message": ""
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("rate_limited"));
         assert!(guidance.contains("batch tool calls"));
-    }
 
-    #[test]
-    fn resume_guidance_context_overflow() {
+        // context_overflow
         let irj = serde_json::json!({
-            "kind": "context_overflow",
-            "resumable": true,
-            "has_checkpoint": false,
-            "tool_calls_completed": 0,
-            "turns_completed": 1,
-            "remaining_turns": 9,
+            "kind": "context_overflow", "resumable": true, "has_checkpoint": false,
+            "tool_calls_completed": 0, "turns_completed": 1, "remaining_turns": 9,
             "user_message": ""
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("context_overflow"));
         assert!(guidance.contains("compacted"));
-    }
 
-    #[test]
-    fn resume_guidance_empty_completion() {
+        // empty_completion
         let irj = serde_json::json!({
-            "kind": "empty_completion",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 2,
-            "turns_completed": 5,
-            "remaining_turns": 3,
+            "kind": "empty_completion", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 2, "turns_completed": 5, "remaining_turns": 3,
             "user_message": "[empty_completion] The run ended without a final answer."
         });
         let guidance = build_resume_guidance(&irj).unwrap();
@@ -1254,114 +1131,32 @@ mod tests {
     }
 
     #[test]
-    fn resume_guidance_settlement_mode_overrides_kind_specific_advice() {
+    fn resume_guidance_new_kinds() {
+        // critical_verdict
         let irj = serde_json::json!({
-            "kind": "budget_exhausted",
-            "resume_mode": "settle",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 20,
-            "turns_completed": 10,
-            "remaining_turns": 0,
-            "user_message": ""
-        });
-        let guidance = build_resume_guidance(&irj).unwrap();
-        assert!(guidance.contains("Enter settlement"), "{guidance}");
-        assert!(
-            !guidance.contains("Prioritize completing"),
-            "settlement mode should not fall back to execute-mode budget advice: {guidance}"
-        );
-    }
-
-    #[test]
-    fn resume_guidance_non_resumable_returns_none() {
-        let irj = serde_json::json!({
-            "kind": "auth_failure",
-            "resumable": false,
-            "has_checkpoint": false,
-            "tool_calls_completed": 0,
-            "turns_completed": 0,
-            "remaining_turns": 10,
-            "user_message": ""
-        });
-        assert!(build_resume_guidance(&irj).is_none());
-    }
-
-    #[test]
-    fn resume_guidance_missing_fields_returns_none() {
-        let irj = serde_json::json!({});
-        assert!(build_resume_guidance(&irj).is_none());
-    }
-
-    // ── new interruption kind tests ──
-
-    #[test]
-    fn critical_verdict_is_resumable() {
-        assert!(InterruptionKind::CriticalVerdict.is_resumable());
-    }
-
-    #[test]
-    fn approval_rejected_is_resumable() {
-        assert!(InterruptionKind::ApprovalRejected.is_resumable());
-    }
-
-    #[test]
-    fn cumulative_budget_exceeded_is_resumable() {
-        assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
-    }
-
-    #[test]
-    fn server_overload_is_resumable() {
-        assert!(InterruptionKind::ServerOverload.is_resumable());
-    }
-
-    #[test]
-    fn cooldown_rejected_is_resumable() {
-        assert!(InterruptionKind::CooldownRejected.is_resumable());
-    }
-
-    #[test]
-    fn resume_guidance_critical_verdict() {
-        let irj = serde_json::json!({
-            "kind": "critical_verdict",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 8,
-            "turns_completed": 4,
-            "remaining_turns": 0,
+            "kind": "critical_verdict", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 8, "turns_completed": 4, "remaining_turns": 0,
             "user_message": ""
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("critical_verdict"));
         assert!(guidance.contains("TurnGuard"));
         assert!(guidance.contains("different approach"));
-    }
 
-    #[test]
-    fn resume_guidance_approval_rejected() {
+        // approval_rejected
         let irj = serde_json::json!({
-            "kind": "approval_rejected",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 3,
-            "turns_completed": 2,
-            "remaining_turns": 8,
+            "kind": "approval_rejected", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 3, "turns_completed": 2, "remaining_turns": 8,
             "user_message": ""
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("approval_rejected"));
         assert!(guidance.contains("read-only"));
-    }
 
-    #[test]
-    fn resume_guidance_cumulative_budget() {
+        // cumulative_budget_exceeded
         let irj = serde_json::json!({
-            "kind": "cumulative_budget_exceeded",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 20,
-            "turns_completed": 10,
-            "remaining_turns": 0,
+            "kind": "cumulative_budget_exceeded", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 20, "turns_completed": 10, "remaining_turns": 0,
             "user_message": ""
         });
         let guidance = build_resume_guidance(&irj).unwrap();
@@ -1370,40 +1165,11 @@ mod tests {
     }
 
     #[test]
-    fn all_interruption_kinds_have_labels() {
-        let kinds = [
-            InterruptionKind::BudgetExhausted,
-            InterruptionKind::EmptyCompletion,
-            InterruptionKind::TokenBudgetExceeded,
-            InterruptionKind::CumulativeBudgetExceeded,
-            InterruptionKind::RateLimited,
-            InterruptionKind::CooldownRejected,
-            InterruptionKind::UserCancelled,
-            InterruptionKind::ContextOverflow,
-            InterruptionKind::AuthFailure,
-            InterruptionKind::CriticalVerdict,
-            InterruptionKind::ApprovalRejected,
-            InterruptionKind::ServerOverload,
-        ];
-        for kind in kinds {
-            let label = kind.label();
-            assert!(!label.is_empty(), "{kind:?} should have a label");
-            assert!(
-                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "label should be snake_case: {label}"
-            );
-        }
-    }
-
-    #[test]
-    fn resume_guidance_with_compaction_context() {
+    fn resume_guidance_compaction_context() {
+        // insufficient compaction
         let irj = serde_json::json!({
-            "kind": "context_overflow",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 10,
-            "turns_completed": 5,
-            "remaining_turns": 5,
+            "kind": "context_overflow", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 10, "turns_completed": 5, "remaining_turns": 5,
             "user_message": ""
         });
         let ctx = CompactionResumeContext {
@@ -1416,19 +1182,8 @@ mod tests {
         assert!(guidance.contains("15000 tokens freed"));
         assert!(guidance.contains("insufficient"));
         assert!(guidance.contains("concise"));
-    }
 
-    #[test]
-    fn resume_guidance_with_compaction_context_sufficient() {
-        let irj = serde_json::json!({
-            "kind": "context_overflow",
-            "resumable": true,
-            "has_checkpoint": true,
-            "tool_calls_completed": 5,
-            "turns_completed": 3,
-            "remaining_turns": 7,
-            "user_message": ""
-        });
+        // sufficient compaction
         let ctx = CompactionResumeContext {
             compaction_attempts: 1,
             total_tokens_freed: 8000,
@@ -1438,97 +1193,64 @@ mod tests {
         assert!(guidance.contains("1 attempt(s)"));
         assert!(guidance.contains("8000 tokens freed"));
         assert!(!guidance.contains("insufficient"));
-    }
 
-    #[test]
-    fn resume_guidance_without_compaction_context_unchanged() {
-        let irj = serde_json::json!({
-            "kind": "context_overflow",
-            "resumable": true,
-            "has_checkpoint": false,
-            "tool_calls_completed": 0,
-            "turns_completed": 1,
-            "remaining_turns": 9,
-            "user_message": ""
-        });
+        // no compaction context → unchanged
         let with = build_resume_guidance_with_context(&irj, None).unwrap();
         let without = build_resume_guidance(&irj).unwrap();
         assert_eq!(with, without);
     }
 
-    // ── interruption_from_error_kind tests ──
-
     #[test]
-    fn error_kind_auth_maps_to_auth_failure() {
-        let (kind, action) = interruption_from_error_kind(astra_core::ErrorKind::Auth).unwrap();
-        assert_eq!(kind, InterruptionKind::AuthFailure);
-        assert!(matches!(action, ResumeAction::RequiresIntervention { .. }));
+    fn resume_guidance_surfaces_resume_guard_tools() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 20, "turns_completed": 14, "remaining_turns": 135,
+            "user_message": "[budget_exhausted] 20 tool call(s) completed.",
+            "resume_restricted_tools": ["bash", "read_file"]
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("Resume guard:"));
+        assert!(guidance.contains("bash, read_file"));
     }
 
     #[test]
-    fn error_kind_rate_limit_maps_to_rate_limited() {
-        let (kind, action) =
-            interruption_from_error_kind(astra_core::ErrorKind::RateLimit).unwrap();
-        assert_eq!(kind, InterruptionKind::RateLimited);
-        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+    fn resume_guidance_settlement_mode_overrides_kind_specific_advice() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted", "resume_mode": "settle", "resumable": true,
+            "has_checkpoint": true, "tool_calls_completed": 20, "turns_completed": 10,
+            "remaining_turns": 0, "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("Enter settlement"));
+        assert!(!guidance.contains("Prioritize completing"));
     }
 
     #[test]
-    fn error_kind_context_window_maps_to_context_overflow() {
-        let (kind, action) =
-            interruption_from_error_kind(astra_core::ErrorKind::ContextWindow).unwrap();
-        assert_eq!(kind, InterruptionKind::ContextOverflow);
-        assert!(matches!(action, ResumeAction::CompactAndRetry));
+    fn resume_guidance_harness_paused_allows_single_missing_fact() {
+        let irj = serde_json::json!({
+            "kind": "harness_paused", "resumable": true, "has_checkpoint": true,
+            "tool_calls_completed": 28, "turns_completed": 16, "remaining_turns": 134,
+            "user_message": "[harness_paused] 28 tool call(s) completed. A checkpoint was saved."
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("read-heavy stall"));
+        assert!(guidance.contains("one concrete next action"));
+        assert!(guidance.contains("one specific fact is still missing"));
+        assert!(!guidance.contains("Do NOT continue broad or duplicate reading"));
     }
 
     #[test]
-    fn error_kind_server_error_maps_to_server_overload() {
-        let (kind, action) =
-            interruption_from_error_kind(astra_core::ErrorKind::ServerError).unwrap();
-        assert_eq!(kind, InterruptionKind::ServerOverload);
-        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
-    }
+    fn resume_guidance_edge_cases() {
+        // non-resumable returns None
+        let irj = serde_json::json!({
+            "kind": "auth_failure", "resumable": false, "has_checkpoint": false,
+            "tool_calls_completed": 0, "turns_completed": 0, "remaining_turns": 10,
+            "user_message": ""
+        });
+        assert!(build_resume_guidance(&irj).is_none());
 
-    #[test]
-    fn error_kind_budget_exhausted_maps_to_budget_exhausted() {
-        let (kind, _) =
-            interruption_from_error_kind(astra_core::ErrorKind::BudgetExhausted).unwrap();
-        assert_eq!(kind, InterruptionKind::BudgetExhausted);
-    }
-
-    #[test]
-    fn error_kind_cancelled_maps_to_user_cancelled() {
-        let (kind, _) = interruption_from_error_kind(astra_core::ErrorKind::Cancelled).unwrap();
-        assert_eq!(kind, InterruptionKind::UserCancelled);
-    }
-
-    #[test]
-    fn error_kind_unknown_returns_none() {
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::Unknown).is_none());
-    }
-
-    #[test]
-    fn error_kind_tool_errors_return_none() {
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolNotFound).is_none());
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolTimeout).is_none());
-    }
-
-    #[test]
-    fn error_kind_stream_errors_are_resumable_interruptions() {
-        let (idle, _) = interruption_from_error_kind(astra_core::ErrorKind::StreamIdle).unwrap();
-        assert_eq!(idle, InterruptionKind::StreamIdle);
-        let (transport, _) =
-            interruption_from_error_kind(astra_core::ErrorKind::StreamTransport).unwrap();
-        assert_eq!(transport, InterruptionKind::StreamTransport);
-        let (network, _) = interruption_from_error_kind(astra_core::ErrorKind::Network).unwrap();
-        assert_eq!(network, InterruptionKind::StreamTransport);
-    }
-
-    #[test]
-    fn error_kind_non_retryable_non_interruption() {
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::InvalidRequest).is_none());
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolInvalidArgs).is_none());
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::ResourceLimit).is_none());
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolRoundsExhausted).is_none());
+        // missing fields returns None
+        assert!(build_resume_guidance(&serde_json::json!({})).is_none());
     }
 }
+
