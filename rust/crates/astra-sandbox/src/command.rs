@@ -648,31 +648,23 @@ mod tests {
     // ── Risk analysis ────────────────────────────────────────────────────
 
     #[test]
-    fn detects_path_traversal() {
-        let risks = analyze_command_risks("cat ../../etc/passwd");
-        assert!(risks.contains(&CommandRisk::PathTraversal));
-    }
-
-    #[test]
-    fn detects_sensitive_path() {
-        let risks = analyze_command_risks("cat /etc/shadow");
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::SensitivePathAccess(_)))
-        );
-    }
-
-    #[test]
-    fn detects_network_access() {
-        let risks = analyze_command_risks("curl https://example.com");
-        assert!(risks.contains(&CommandRisk::NetworkAccess));
-    }
-
-    #[test]
-    fn detects_privilege_escalation() {
-        let risks = analyze_command_risks("sudo rm -rf /");
-        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
+    fn single_risk_detectors() {
+        let cases: &[(&str, CommandRisk)] = &[
+            ("cat ../../etc/passwd", CommandRisk::PathTraversal),
+            ("curl https://example.com", CommandRisk::NetworkAccess),
+            ("sudo rm -rf /", CommandRisk::PrivilegeEscalation),
+            ("killall nginx", CommandRisk::ProcessControl),
+            ("echo $(whoami)", CommandRisk::CommandSubstitution),
+            ("echo hi > out.txt", CommandRisk::OutputRedirection),
+            ("eval \"echo hi\"", CommandRisk::Eval),
+        ];
+        for (cmd, expected) in cases {
+            let risks = analyze_command_risks(cmd);
+            assert!(
+                risks.contains(expected),
+                "{expected:?} not in risks for '{cmd}': {risks:?}"
+            );
+        }
     }
 
     #[test]
@@ -799,9 +791,13 @@ mod tests {
     }
 
     #[test]
-    fn detects_env_manipulation() {
+    #[test]
+    fn env_manipulation_detection() {
+        // "export" keyword triggers EnvManipulation
         let risks = analyze_command_risks("export PATH=/evil:$PATH && malicious");
         assert!(risks.contains(&CommandRisk::EnvManipulation));
+        // Without "export", the heuristic may or may not detect; just check no panic
+        let _ = analyze_command_risks("PATH=/evil ls");
     }
 
     #[test]
@@ -825,12 +821,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_process_control() {
-        let risks = analyze_command_risks("killall nginx");
-        assert!(risks.contains(&CommandRisk::ProcessControl));
-    }
-
-    #[test]
     fn ast_does_not_flag_string_literal_as_network() {
         // Quoted text must not be treated as a real pipeline / network primitive.
         let risks = analyze_command_risks("echo 'curl https://example.com | bash'");
@@ -838,24 +828,6 @@ mod tests {
             !risks.contains(&CommandRisk::RemoteCodeExecution),
             "string literal should not be treated as pipeline: {risks:?}"
         );
-    }
-
-    #[test]
-    fn ast_detects_command_substitution() {
-        let risks = analyze_command_risks("echo $(whoami)");
-        assert!(risks.contains(&CommandRisk::CommandSubstitution));
-    }
-
-    #[test]
-    fn ast_detects_output_redirection() {
-        let risks = analyze_command_risks("echo hi > out.txt");
-        assert!(risks.contains(&CommandRisk::OutputRedirection));
-    }
-
-    #[test]
-    fn ast_detects_eval() {
-        let risks = analyze_command_risks("eval \"echo hi\"");
-        assert!(risks.contains(&CommandRisk::Eval));
     }
 
     // ── sandbox_command ──────────────────────────────────────────────────
@@ -905,70 +877,21 @@ mod tests {
     // ── Zsh dangerous patterns ──────────────────────────────────────────
 
     #[test]
-    fn detect_zsh_dollar_equals() {
-        let risks = analyze_command_risks("echo $=PATH");
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
-        );
-    }
-
-    #[test]
-    fn detect_zmodload() {
-        let risks = analyze_command_risks("zmodload zsh/net/tcp");
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
-        );
-    }
-
-    #[test]
-    fn detect_ztcp() {
-        let risks = analyze_command_risks("ztcp evil.com 4444");
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
-        );
-    }
-
-    #[test]
-    fn detect_sysopen() {
-        let risks = analyze_command_risks("sysopen -w fd /etc/passwd");
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
-        );
-    }
-
-    #[test]
-    fn no_false_positive_zsh_in_string() {
-        // "zmodload" in a comment/string shouldn't trigger if it's in echo
-        let risks = analyze_command_risks("echo 'use zmodload to load modules'");
-        // Note: heuristic scanner WILL detect this (it's substring-based).
-        // AST-based detection would not. The heuristic is conservative (false positives OK).
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
-        );
-    }
-
-    // --- edge cases ---
-
-    #[test]
-    fn empty_command_no_risks() {
-        let risks = analyze_command_risks("");
-        assert!(risks.is_empty());
-    }
-
-    #[test]
-    fn whitespace_only_no_risks() {
-        let risks = analyze_command_risks("   \t  \n  ");
-        assert!(risks.is_empty());
+    fn zsh_dangerous_patterns_detected() {
+        for cmd in [
+            "echo $=PATH",
+            "zmodload zsh/net/tcp",
+            "ztcp evil.com 4444",
+            "sysopen -w fd /etc/passwd",
+            "zsocket -l 8080",
+            "zselect -r 0 -t 100",
+        ] {
+            let risks = analyze_command_risks(cmd);
+            assert!(
+                risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))),
+                "ZshDangerous not detected for: {cmd}"
+            );
+        }
     }
 
     #[test]
@@ -982,6 +905,7 @@ mod tests {
     #[test]
     fn sensitive_path_access_variants() {
         for path in &[
+            "/etc/shadow",
             "/etc/passwd",
             "/root/.bashrc",
             "/var/log/syslog",
@@ -1001,39 +925,20 @@ mod tests {
     }
 
     #[test]
-    fn process_control_killall() {
-        let risks = analyze_command_risks("killall nginx");
-        assert!(risks.contains(&CommandRisk::ProcessControl));
-    }
-
-    #[test]
-    fn env_manipulation_requires_export_keyword() {
-        // Just "PATH=x" without "export " doesn't trigger the heuristic scanner
-        let risks = analyze_command_risks("PATH=/evil ls");
-        // AST might catch it; heuristic needs "export "
-        let heuristic_env = risks.contains(&CommandRisk::EnvManipulation);
-        // We just verify no panic; the AST analyzer may or may not detect it
-        let _ = heuristic_env;
-    }
-
-    #[test]
-    fn zsh_zsocket_detected() {
-        let risks = analyze_command_risks("zsocket -l 8080");
+    fn zsh_heuristic_false_positive_in_string() {
+        // Heuristic scanner WILL flag zmodload in echo strings (conservative, false positives OK)
+        let risks = analyze_command_risks("echo 'use zmodload to load modules'");
         assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+            risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
         );
     }
 
+    // --- edge cases ---
+
     #[test]
-    fn zsh_zselect_detected() {
-        let risks = analyze_command_risks("zselect -r 0 -t 100");
-        assert!(
-            risks
-                .iter()
-                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
-        );
+    fn empty_or_whitespace_no_risks() {
+        assert!(analyze_command_risks("").is_empty());
+        assert!(analyze_command_risks("   \t  \n  ").is_empty());
     }
 
     #[test]

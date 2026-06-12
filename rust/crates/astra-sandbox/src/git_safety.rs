@@ -322,7 +322,8 @@ mod tests {
     // --- Force push ---
 
     #[test]
-    fn force_push_detection() {
+    fn force_push_behavior() {
+        // Detect force push
         for (cmd, is_protected) in [
             ("git push --force origin main", true),
             ("git push -f origin main", false),
@@ -336,24 +337,35 @@ mod tests {
                 )), "ForcePushProtectedBranch for: {cmd}");
             }
         }
-        // Feature branch should NOT trigger protected branch
+        // Feature branch NOT protected
         let v = validate_git_command("git push --force origin feature/my-feature");
         assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        // Feature branches containing "main"/"develop" are NOT protected (false positive regression)
+        for cmd in ["git push --force origin feature/main-refactor", "git push -f origin feature/develop-ui"] {
+            let v = validate_git_command(cmd);
+            assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)));
+            assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })), "false positive for {cmd}");
+        }
+        // "origin/main" with remote prefix IS protected
+        let v = validate_git_command("git push --force origin origin/main");
+        assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        // Non-force flags are NOT force push
+        for cmd in ["git push --follow-tags origin my-branch", "git push -ff origin my-branch"] {
+            let v = validate_git_command(cmd);
+            assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)), "false positive: {cmd}");
+        }
+        // --force-with-lease IS force push
+        let v = validate_git_command("git push --force-with-lease");
+        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+        // Path-prefixed git
+        let v = validate_git_command("/usr/bin/git push --force");
+        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
     }
 
-    // --- cd + git compound ---
-
     #[test]
-    fn blocks_cd_git_compound() {
+    fn cd_git_compound_behavior() {
         let v = validate_git_command("cd /tmp/evil && git status");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CdGitCompound))
-        );
-    }
-
-    #[test]
-    fn allows_git_without_cd() {
+        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::CdGitCompound)));
         let v = validate_git_command("git status");
         assert!(v.is_empty());
     }
@@ -361,10 +373,11 @@ mod tests {
     // --- git -c config injection ---
 
     #[test]
-    fn git_config_injection_blocked() {
+    fn git_config_flags_blocked() {
         for cmd in [
             "git -c core.fsmonitor=evil status",
             "git --exec-path=/tmp/evil status",
+            "git --config-env=core.editor=EDITOR commit",
         ] {
             let v = validate_git_command(cmd);
             assert!(
@@ -386,38 +399,6 @@ mod tests {
             v.iter()
                 .any(|v| matches!(v, GitSafetyViolation::CommitAmend))
         );
-    }
-
-    // --- Regression: protected branch false positives ---
-
-    #[test]
-    fn force_push_protected_branch_false_positives() {
-        // Feature branches containing "main" or "develop" in name are NOT protected
-        for cmd in [
-            "git push --force origin feature/main-refactor",
-            "git push -f origin feature/develop-ui",
-        ] {
-            let v = validate_git_command(cmd);
-            assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)));
-            assert!(
-                !v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })),
-                "false positive for {cmd}"
-            );
-        }
-        // BUT "origin/main" with remote prefix is still protected
-        let v = validate_git_command("git push --force origin origin/main");
-        assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
-    }
-
-    #[test]
-    fn no_false_positive_on_non_force_flags() {
-        for cmd in [
-            "git push --follow-tags origin my-branch",
-            "git push -ff origin my-branch",
-        ] {
-            let v = validate_git_command(cmd);
-            assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)), "false positive: {cmd}");
-        }
     }
 
     // --- bare repo detection ---
@@ -456,41 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn git_with_path_prefix_detected() {
-        let violations = validate_git_command("/usr/bin/git push --force");
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, GitSafetyViolation::ForcePush))
-        );
-    }
-
-    #[test]
-    fn force_with_lease_is_force_push() {
-        let violations = validate_git_command("git push --force-with-lease");
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, GitSafetyViolation::ForcePush))
-        );
-    }
-
-    #[test]
     fn multiple_violations_in_one_command() {
         let violations = validate_git_command("git commit --amend --no-verify");
         assert!(
             violations.len() >= 2,
             "should detect both amend and no-verify"
-        );
-    }
-
-    #[test]
-    fn git_config_env_flag_blocked() {
-        let violations = validate_git_command("git --config-env=core.editor=EDITOR commit");
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, GitSafetyViolation::GitExecPathFlag))
         );
     }
 

