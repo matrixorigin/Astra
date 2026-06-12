@@ -605,14 +605,168 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
         serialized.contains("child review result: no critical issues"),
         "spawn tool output should include child result: {serialized}"
     );
+    let live_events = find_events(&events, "agent_live_event");
+    let live_output = live_events
+        .iter()
+        .find(|event| {
+            event["event_kind"].as_str() == Some("output_delta")
+                && event["content"].as_str() == Some("child review result: no critical issues")
+        })
+        .unwrap_or_else(|| {
+            panic!("server dynamic spawn should stream child output into agent_live_event: {serialized}")
+        });
     assert!(
-        !find_event_type(&events, "agent_spawned").is_empty(),
+        live_output["workspace"]["kind"].as_str() == Some("server_sandbox")
+            && live_output["executor"]["kind"].as_str() == Some("server_local")
+            && live_output["transport"].as_str() == Some("server_local"),
+        "server dynamic spawn should stream child output into agent_live_event: {serialized}"
+    );
+    assert!(
+        live_events.iter().any(|event| {
+            event["event_kind"].as_str() == Some("agent_terminated")
+                && event["termination"].as_str() == Some("completed")
+        }),
+        "server dynamic spawn should stream child terminal live event: {serialized}"
+    );
+    let spawned = find_event_type(&events, "agent_spawned");
+    assert!(
+        !spawned.is_empty(),
         "server dynamic spawn should emit agent_spawned progress: {serialized}"
     );
+    assert_eq!(spawned[0]["workspace"]["kind"], "server_sandbox");
+    assert_eq!(spawned[0]["executor"]["kind"], "server_local");
+    assert_eq!(spawned[0]["transport"], "server_local");
+    let completed = find_event_type(&events, "agent_completed");
     assert!(
-        !find_event_type(&events, "agent_completed").is_empty(),
+        !completed.is_empty(),
         "server dynamic spawn should emit agent_completed progress: {serialized}"
     );
+    assert_eq!(completed[0]["workspace"]["kind"], "server_sandbox");
+    assert_eq!(completed[0]["executor"]["kind"], "server_local");
+}
+
+#[tokio::test]
+async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
+    init_env();
+    let (app, _ledger) = build_test_app();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Use a child agent to review the edge workspace.",
+            "workspace_binding": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/xupeng/github/astra",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor_binding": {
+                "kind": "edge_agent",
+                "executor_id": "edge-macbook-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call("call-spawn-edge-reviewer", "agent", json!({
+                                "action": "spawn",
+                                "description": "edge child review",
+                                "prompt": "Review src/lib.rs in the inherited edge workspace.",
+                                "agent_type": "code-review",
+                                "run_in_background": false
+                            }))
+                        ]
+                    },
+                    {
+                        "full_text": "parent synthesis after edge child review"
+                    }
+                ],
+                "test_spawn_child_llm_rounds": [
+                    {
+                        "full_text": "edge child review result: no critical issues"
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        find_events(&events, "text_delta").iter().any(|event| {
+            event["content"].as_str() == Some("parent synthesis after edge child review")
+        }),
+        "parent should synthesize after edge-bound child spawn: {serialized}"
+    );
+    assert!(
+        serialized.contains("edge child review result: no critical issues"),
+        "spawn tool output should include edge child result: {serialized}"
+    );
+
+    let workspace = find_event(&events, "workspace_bound")
+        .unwrap_or_else(|| panic!("expected workspace_bound event: {serialized}"));
+    assert_eq!(workspace["workspace"]["kind"], "edge_workspace");
+    assert_eq!(workspace["workspace"]["cwd"], "/Users/xupeng/github/astra");
+    assert_eq!(workspace["executor"]["kind"], "edge_agent");
+    assert_eq!(workspace["transport"], "edge_ws");
+    assert_eq!(workspace["fallback_policy"], "disabled");
+
+    let routing = find_events(&events, "tool_routing_decision")
+        .into_iter()
+        .find(|event| {
+            event["call_id"].as_str() == Some("call-spawn-edge-reviewer")
+                && event["tool"].as_str() == Some("agent")
+        })
+        .unwrap_or_else(|| {
+            panic!("expected server-control-plane route for edge-bound agent spawn: {serialized}")
+        });
+    assert_eq!(routing["route"], "server_control_plane");
+
+    let live_events = find_events(&events, "agent_live_event");
+    let live_output = live_events
+        .iter()
+        .find(|event| {
+            event["event_kind"].as_str() == Some("output_delta")
+                && event["content"].as_str()
+                    == Some("edge child review result: no critical issues")
+        })
+        .unwrap_or_else(|| {
+            panic!("edge-bound dynamic spawn should stream child output into agent_live_event: {serialized}")
+        });
+    assert_eq!(live_output["workspace"]["kind"], "edge_workspace");
+    assert_eq!(
+        live_output["workspace"]["cwd"],
+        "/Users/xupeng/github/astra"
+    );
+    assert_eq!(live_output["executor"]["kind"], "edge_agent");
+    assert_eq!(live_output["executor"]["executor_id"], "edge-macbook-1");
+    assert_eq!(live_output["transport"], "edge_ws");
+    assert_eq!(live_output["fallback_policy"], "disabled");
+
+    let spawned = find_event_type(&events, "agent_spawned");
+    assert!(
+        !spawned.is_empty(),
+        "edge-bound dynamic spawn should emit agent_spawned progress: {serialized}"
+    );
+    assert_eq!(spawned[0]["workspace"]["kind"], "edge_workspace");
+    assert_eq!(spawned[0]["workspace"]["cwd"], "/Users/xupeng/github/astra");
+    assert_eq!(spawned[0]["executor"]["kind"], "edge_agent");
+    assert_eq!(spawned[0]["executor"]["executor_id"], "edge-macbook-1");
+    assert_eq!(spawned[0]["transport"], "edge_ws");
+    assert_eq!(spawned[0]["fallback_policy"], "disabled");
+
+    let completed = find_event_type(&events, "agent_completed");
+    assert!(
+        !completed.is_empty(),
+        "edge-bound dynamic spawn should emit agent_completed progress: {serialized}"
+    );
+    assert_eq!(completed[0]["workspace"]["kind"], "edge_workspace");
+    assert_eq!(completed[0]["executor"]["kind"], "edge_agent");
+    assert_eq!(completed[0]["transport"], "edge_ws");
 }
 
 // ── Event-driven synchronization helpers ─────────────────────────────────────
@@ -967,6 +1121,285 @@ async fn text_only_response_streams_session_info_and_text() {
         "expected at least one text_delta event"
     );
     assert_eq!(text_events[0]["content"], "Hi there!");
+}
+
+#[tokio::test]
+async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Hello",
+            "workspace_binding": {
+                "kind": "server_sandbox",
+                "display_name": "Server sandbox",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor_binding": {
+                "kind": "server_local",
+                "executor_id": "server-local",
+                "display_name": "Server sandbox",
+                "transport": "server_local",
+                "status": "online"
+            },
+            "context": {
+                "test_llm_rounds": [
+                    { "full_text": "Hi there!" }
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let run_id = find_event(&events, "session_info")
+        .and_then(|event| event["run_id"].as_str())
+        .expect("session_info run_id");
+    let workspace = find_event(&events, "workspace_bound")
+        .unwrap_or_else(|| panic!("expected workspace_bound event: {events:?}"));
+    assert_eq!(workspace["run_id"], run_id);
+    assert_eq!(workspace["workspace"]["kind"], "server_sandbox");
+    assert_eq!(workspace["executor"]["kind"], "server_local");
+    assert_eq!(workspace["transport"], "server_local");
+    assert_eq!(workspace["fallback_policy"], "disabled");
+    assert!(
+        workspace["workspace"]["cwd"].as_str().is_some_and(|cwd| {
+            cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
+        }),
+        "workspace cwd should be the provisioned server workspace: {workspace:?}"
+    );
+
+    let executor = find_event(&events, "executor_bound")
+        .unwrap_or_else(|| panic!("expected executor_bound event: {events:?}"));
+    assert_eq!(executor["run_id"], run_id);
+    assert_eq!(executor["executor"]["status"], "online");
+}
+
+#[tokio::test]
+async fn web_agent_tool_call_events_include_execution_binding_metadata() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Run a command in the workspace",
+            "workspace_binding": {
+                "kind": "server_sandbox",
+                "display_name": "Server sandbox",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor_binding": {
+                "kind": "server_local",
+                "executor_id": "server-local",
+                "display_name": "Server sandbox",
+                "transport": "server_local",
+                "status": "online"
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call("call-bash-binding", "bash", json!({"command": "printf ok"}))
+                        ]
+                    },
+                    { "full_text": "Command finished." }
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let tool_call = find_event(&events, "tool_call")
+        .unwrap_or_else(|| panic!("expected tool_call event: {events:?}"));
+    assert_eq!(tool_call["tool_call"]["id"], "call-bash-binding");
+    assert_eq!(tool_call["workspace"]["kind"], "server_sandbox");
+    assert_eq!(tool_call["executor"]["kind"], "server_local");
+    assert_eq!(tool_call["transport"], "server_local");
+    assert_eq!(tool_call["fallback_policy"], "disabled");
+    assert!(
+        tool_call["workspace"]["cwd"].as_str().is_some_and(|cwd| {
+            cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
+        }),
+        "tool_call should carry the actual provisioned workspace: {tool_call:?}"
+    );
+}
+
+#[tokio::test]
+async fn edge_executor_offline_blocks_run_before_next_llm_round() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Run a command in my edge workspace",
+            "workspace_binding": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/xupeng/github/astra",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor_binding": {
+                "kind": "edge_agent",
+                "executor_id": "edge-macbook-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "offline"
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call(
+                                "call-edge-offline-bash",
+                                "bash",
+                                json!({"command": "printf should-not-run"})
+                            )
+                        ]
+                    },
+                    { "full_text": "Should never run." }
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        find_events(&events, "run_blocked_executor_offline")
+            .iter()
+            .any(|event| {
+                event["call_id"].as_str() == Some("call-edge-offline-bash")
+                    && event["reason"].as_str() == Some("executor_offline")
+                    && event["executor"]["status"].as_str() == Some("offline")
+            }),
+        "edge offline tool should emit actionable blocked event: {serialized}"
+    );
+    assert!(
+        find_events(&events, "run_waiting")
+            .iter()
+            .any(|event| event["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("executor_offline"))),
+        "edge offline tool should put the run into waiting state: {serialized}"
+    );
+    assert!(
+        !find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some("Should never run.")),
+        "run must not continue to the next LLM round after executor-offline blocking: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Use a child agent in my edge workspace",
+            "workspace_binding": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/xupeng/github/astra",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor_binding": {
+                "kind": "edge_agent",
+                "executor_id": "edge-macbook-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "offline"
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call("call-spawn-offline-child", "agent", json!({
+                                "action": "spawn",
+                                "description": "edge child command",
+                                "prompt": "Run a command in the inherited edge workspace.",
+                                "agent_type": "code-review",
+                                "run_in_background": false
+                            }))
+                        ]
+                    },
+                    { "full_text": "Should never run after child waiting." }
+                ],
+                "test_spawn_child_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call(
+                                "call-child-edge-offline-bash",
+                                "bash",
+                                json!({"command": "printf child-should-not-run"})
+                            )
+                        ]
+                    },
+                    { "full_text": "Child should never synthesize." }
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        find_event_type(&events, "agent_spawned")
+            .iter()
+            .any(|event| {
+                event["workspace"]["kind"].as_str() == Some("edge_workspace")
+                    && event["executor"]["kind"].as_str() == Some("edge_agent")
+                    && event["executor"]["status"].as_str() == Some("offline")
+            }),
+        "child spawn should inherit edge binding metadata: {serialized}"
+    );
+    assert!(
+        find_events(&events, "tool_transport_failed")
+            .iter()
+            .any(|event| {
+                event["tool"].as_str() == Some("agent")
+                    && event["agent_status"].as_str() == Some("waiting")
+                    && event["agent_id"].as_str().is_some()
+                    && event["reason"].as_str() == Some("executor_offline")
+                    && event["workspace"]["kind"].as_str() == Some("edge_workspace")
+                    && event["executor"]["kind"].as_str() == Some("edge_agent")
+            }),
+        "child waiting state should stream as structured agent tool failure metadata: {serialized}"
+    );
+    assert!(
+        find_events(&events, "run_blocked_executor_offline")
+            .iter()
+            .any(|event| {
+                event["call_id"].as_str() == Some("call-spawn-offline-child")
+                    && event["tool"].as_str() == Some("agent")
+                    && event["reason"].as_str() == Some("executor_offline")
+            }),
+        "parent agent tool should emit an actionable executor-offline blocked event: {serialized}"
+    );
+    assert!(
+        find_events(&events, "run_waiting")
+            .iter()
+            .any(|event| event["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("executor_offline"))),
+        "parent run should enter waiting after child execution-boundary waiting: {serialized}"
+    );
+    assert!(
+        !find_events(&events, "text_delta").iter().any(|event| {
+            event["content"].as_str() == Some("Should never run after child waiting.")
+                || event["content"].as_str() == Some("Child should never synthesize.")
+        }),
+        "parent and child must not continue after executor-offline blocking: {serialized}"
+    );
 }
 
 #[tokio::test]
@@ -3063,6 +3496,10 @@ async fn a1_run_status_all_fields_text_only() {
         events_count > 0,
         "events_count should be > 0, got {events_count}"
     );
+    assert_eq!(body["workspace"]["kind"].as_str(), Some("server_sandbox"));
+    assert_eq!(body["executor"]["kind"].as_str(), Some("server_local"));
+    assert_eq!(body["transport"].as_str(), Some("server_local"));
+    assert_eq!(body["fallback_policy"].as_str(), Some("disabled"));
 }
 
 #[tokio::test]

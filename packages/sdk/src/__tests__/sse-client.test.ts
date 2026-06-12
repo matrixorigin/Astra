@@ -1,5 +1,14 @@
 import { SSEClient, parseSseDataEvents } from '../sse-client';
-import type { StreamEvent, ConnectionState } from '../types';
+import type {
+  AgentWaitingEvent,
+  ConnectionState,
+  RunBlockedTransportDisconnectedEvent,
+  RunBlockedWorkspaceExecutorUnavailableEvent,
+  RunStartedEvent,
+  RunWaitingEvent,
+  StreamEvent,
+  ToolCallEvent,
+} from '../types';
 import { readSseFixture } from './sse-fixture-helpers';
 
 // ─── Mock Fetch + ReadableStream ────────────────────────────────────
@@ -138,7 +147,7 @@ describe('SSEClient — Event Parsing', () => {
 
   test('parses multiple events in one chunk', async () => {
     const chunks = [
-      'data: {"type":"run_started","run_id":"r1"}\n\n' +
+      'data: {"type":"run_started","run_id":"r1","workspace":{"kind":"edge_workspace","cwd":"/repo"},"executor":{"kind":"edge_agent","executor_id":"edge-1"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n' +
         'data: {"type":"text_delta","content":"a"}\n\n' +
         'data: {"type":"text_delta","content":"b"}\n\n',
     ];
@@ -152,7 +161,12 @@ describe('SSEClient — Event Parsing', () => {
     await client.connect();
 
     expect(events).toHaveLength(3);
-    expect(events[0].type).toBe('run_started');
+    const started = events[0] as RunStartedEvent;
+    expect(started.type).toBe('run_started');
+    expect(started.workspace?.kind).toBe('edge_workspace');
+    expect(started.executor?.executor_id).toBe('edge-1');
+    expect(started.transport).toBe('edge_ws');
+    expect(started.fallback_policy).toBe('disabled');
     expect(events[1].type).toBe('text_delta');
     expect(events[2].type).toBe('text_delta');
   });
@@ -376,5 +390,55 @@ describe('parseSseDataEvents', () => {
       'usage',
       'turn_complete',
     ]);
+  });
+
+  test('parses execution-boundary waiting and blocked events', () => {
+    const raw =
+      'data: {"type":"run_waiting","run_id":"r1","reason":"executor offline","waiting_for":"edge","workspace":{"kind":"edge_workspace"},"executor":{"kind":"edge_agent","status":"offline"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n' +
+      'data: {"type":"run_blocked_transport_disconnected","call_id":"c1","tool":"shell","message":"edge disconnected","executor":{"kind":"edge_agent"},"transport":"edge_ws"}\n\n' +
+      'data: {"type":"run_blocked_workspace_executor_unavailable","call_id":"c2","tool":"bash","reason":"workspace_executor_unavailable","message":"workspace is not routed","workspace":{"kind":"git_checkout"},"executor":{"kind":"hosted_runner","status":"degraded"},"transport":"runner_rpc"}\n\n' +
+      'data: {"type":"agent_waiting","agent_id":"a1","run_id":"r2","status":"waiting","reason":"child executor offline"}\n\n';
+
+    const events = parseSseDataEvents(raw);
+    expect(events).toHaveLength(4);
+
+    const runWaiting: RunWaitingEvent = events[0] as RunWaitingEvent;
+    expect(runWaiting.type).toBe('run_waiting');
+    expect(runWaiting.executor?.status).toBe('offline');
+    expect(runWaiting.fallback_policy).toBe('disabled');
+
+    const blocked: RunBlockedTransportDisconnectedEvent =
+      events[1] as RunBlockedTransportDisconnectedEvent;
+    expect(blocked.type).toBe('run_blocked_transport_disconnected');
+    expect(blocked.tool).toBe('shell');
+    expect(blocked.transport).toBe('edge_ws');
+
+    const unsupported: RunBlockedWorkspaceExecutorUnavailableEvent =
+      events[2] as RunBlockedWorkspaceExecutorUnavailableEvent;
+    expect(unsupported.type).toBe('run_blocked_workspace_executor_unavailable');
+    expect(unsupported.reason).toBe('workspace_executor_unavailable');
+    expect(unsupported.workspace?.kind).toBe('git_checkout');
+    expect(unsupported.executor?.status).toBe('degraded');
+
+    const agentWaiting: AgentWaitingEvent = events[3] as AgentWaitingEvent;
+    expect(agentWaiting.type).toBe('agent_waiting');
+    expect(agentWaiting.agent_id).toBe('a1');
+  });
+
+  test('parses execution bindings on tool_call events', () => {
+    const raw =
+      'data: {"type":"tool_call","tool_call":{"id":"call-1","function":{"name":"bash","arguments":"{}"}},"workspace":{"kind":"edge_workspace","cwd":"/repo"},"executor":{"kind":"edge_agent","executor_id":"edge-1","status":"online"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n';
+
+    const events = parseSseDataEvents(raw);
+    expect(events).toHaveLength(1);
+
+    const toolCall = events[0] as ToolCallEvent;
+    expect(toolCall.type).toBe('tool_call');
+    expect(toolCall.tool_call.id).toBe('call-1');
+    expect(toolCall.workspace?.kind).toBe('edge_workspace');
+    expect(toolCall.workspace?.cwd).toBe('/repo');
+    expect(toolCall.executor?.executor_id).toBe('edge-1');
+    expect(toolCall.transport).toBe('edge_ws');
+    expect(toolCall.fallback_policy).toBe('disabled');
   });
 });

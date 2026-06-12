@@ -571,10 +571,6 @@ fn bg_running_only_renders_count() {
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
-        plain.contains(crate::tui::background_shortcut::background_task_open_hint()),
-        "running background tasks must expose the foreground switcher shortcut; got {plain:?}"
-    );
-    assert!(
         !plain.contains("background commands"),
         "chip must use typed task vocabulary; got {plain:?}"
     );
@@ -582,12 +578,6 @@ fn bg_running_only_renders_count() {
         !plain.contains("needs input"),
         "needs-input segment must hide when 0; got {plain:?}"
     );
-    let chip = StatusLine::from_context(&c)
-        .left
-        .into_iter()
-        .find(|seg| seg.text.contains("Background"))
-        .expect("running background chip must render");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
 }
 
 #[test]
@@ -645,11 +635,7 @@ fn bg_stalled_only_chip_uses_yellow_for_attention() {
         .find(|seg| seg.text.contains("need input"))
         .expect("bg chip must render even when only stalled (the model needs to know)");
     assert_eq!(
-        chip.text,
-        format!(
-            "Background · 2 need input · {}",
-            crate::tui::background_shortcut::background_task_open_hint()
-        ),
+        chip.text, "2 need input",
         "stalled-only chip should be an attention state, not a vague background label"
     );
     assert_eq!(
@@ -676,13 +662,7 @@ fn bg_failed_only_chip_uses_red_attention() {
         .iter()
         .find(|seg| seg.text.contains("failed"))
         .expect("failed bg shell must stay visible as an attention state");
-    assert_eq!(
-        chip.text,
-        format!(
-            "Background · 1 shell failed · {}",
-            crate::tui::background_shortcut::background_task_open_hint()
-        )
-    );
+    assert_eq!(chip.text, "1 shell failed");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
 }
 
@@ -738,60 +718,6 @@ fn bg_footer_names_two_task_kinds_explicitly() {
     assert!(
         plain.contains("2 shells · 1 local agent"),
         "two readable kinds should be explicit; got {plain:?}"
-    );
-}
-
-#[test]
-fn bg_footer_stays_discoverable_during_active_foreground_turn() {
-    let c = StatusContext {
-        turn_active: true,
-        current_objective: Some("Waiting for next tool".into()),
-        bg_task_counts: Some(BackgroundTaskCounts {
-            running: 1,
-            ..BackgroundTaskCounts::default()
-        }),
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    let open_hint = crate::tui::background_shortcut::background_task_open_hint();
-    assert!(
-        plain.contains("Background · 1 shell"),
-        "foreground activity must not hide running background tasks; got {plain:?}"
-    );
-    assert!(
-        plain.contains(open_hint),
-        "footer must tell the user how to open/switch to background tasks; got {plain:?}"
-    );
-}
-
-#[test]
-fn bg_footer_survives_standard_width_compaction() {
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    let c = StatusContext {
-        model: Some("deepseek-v4-pro-overlong-thinking-model".into()),
-        permission_mode: PermissionMode::Auto,
-        pending_approvals: 2,
-        task_counts: Some((3, 5)),
-        bg_task_counts: Some(BackgroundTaskCounts {
-            running: 1,
-            ..BackgroundTaskCounts::default()
-        }),
-        cwd: Some("~/github/astra".into()),
-        git_branch: Some("fix-ctrl-b-background-fallback".into()),
-        ..ctx()
-    };
-    let status = StatusLine::from_context(&c);
-    let area = Rect::new(0, 0, 80, 1);
-    let mut buf = Buffer::empty(area);
-    status.render(area, &mut buf);
-    let rendered: String = (0..area.width)
-        .map(|x| buf[(x, 0)].symbol().to_string())
-        .collect();
-    assert!(
-        rendered.contains("Background"),
-        "standard-width footer must keep background tasks discoverable; got {rendered:?}"
     );
 }
 

@@ -784,7 +784,7 @@ textarea {
 
 .astra-dot-nav {
   position: absolute;
-  left: 18px;
+  left: max(18px, calc((100% - 860px) / 2 - 64px));
   top: 50%;
   z-index: 40;
   display: flex;

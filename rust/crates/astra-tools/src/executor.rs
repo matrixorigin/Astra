@@ -297,12 +297,28 @@ impl ToolExecutor for DefaultToolExecutor {
             return cached;
         }
 
-        let result = match tokio::time::timeout(TOOL_TIMEOUT, self.dispatch(name, args)).await {
-            Ok(r) => r,
-            Err(_) => ToolResult::error(format!(
-                "Tool '{name}' timed out after {}s",
-                TOOL_TIMEOUT.as_secs()
-            )),
+        let dispatch = self.dispatch(name, args);
+        let result = if let Some(token) = self.ctx.cancel_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    ToolResult::error(format!("Tool '{name}' cancelled before completion"))
+                }
+                result = tokio::time::timeout(TOOL_TIMEOUT, dispatch) => match result {
+                    Ok(r) => r,
+                    Err(_) => ToolResult::error(format!(
+                        "Tool '{name}' timed out after {}s",
+                        TOOL_TIMEOUT.as_secs()
+                    )),
+                },
+            }
+        } else {
+            match tokio::time::timeout(TOOL_TIMEOUT, dispatch).await {
+                Ok(r) => r,
+                Err(_) => ToolResult::error(format!(
+                    "Tool '{name}' timed out after {}s",
+                    TOOL_TIMEOUT.as_secs()
+                )),
+            }
         };
         // Truncate oversized output to prevent context window overflow.
         let result = if result.output.len() > MAX_TOOL_OUTPUT_BYTES {
@@ -1719,6 +1735,33 @@ mod tests {
         );
         assert!(
             result.output.contains("cancelled"),
+            "error must mention cancellation, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_in_flight_dispatch() {
+        let (_tmp, exec) = test_executor();
+        let token = Arc::new(CancellationToken::new());
+        let trigger = Arc::clone(&token);
+        let exec = exec.with_cancel_token(Some(token));
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            exec.execute("sleep", &serde_json::json!({"seconds": 30})),
+        )
+        .await
+        .expect("in-flight cancellation should not wait for tool timeout");
+
+        assert!(result.is_error, "cancelled tool should be an error");
+        assert!(
+            result.output.contains("cancelled before completion"),
             "error must mention cancellation, got: {}",
             result.output
         );

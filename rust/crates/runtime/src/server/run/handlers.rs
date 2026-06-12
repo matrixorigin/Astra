@@ -20,6 +20,7 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
         let index = event.get("index").cloned();
         let event_type = event
             .get("event_type")
+            .or_else(|| event.get("type"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
@@ -27,6 +28,12 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             .get("data")
             .and_then(serde_json::Value::as_object)
             .and_then(|data| data.get("cancelled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let run_finished_interrupted = event
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|data| data.get("interrupted"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
@@ -84,10 +91,8 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
         if transformed.is_null() {
             continue;
         }
-        if matches!(
-            event_type.as_str(),
-            "run_started" | "run_paused" | "run_resumed" | "run_finished"
-        ) && let Some(obj) = transformed.as_object_mut()
+        if should_inject_run_id(event_type.as_str())
+            && let Some(obj) = transformed.as_object_mut()
             && !obj.contains_key("run_id")
         {
             obj.insert(
@@ -102,6 +107,8 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                 None
             } else if run_finished_cancelled {
                 Some("cancelled")
+            } else if run_finished_interrupted {
+                Some("paused")
             } else if pending_run_error.is_some() {
                 Some("failed")
             } else {
@@ -128,6 +135,19 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
     }
 
     transformed_events
+}
+
+fn should_inject_run_id(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "run_started"
+            | "run_error"
+            | "run_interrupted"
+            | "run_waiting"
+            | "run_paused"
+            | "run_resumed"
+            | "run_finished"
+    ) || event_type.starts_with("run_blocked_")
 }
 
 pub(crate) async fn get_run_status_handler(
@@ -172,6 +192,14 @@ pub(crate) struct RunProjectionResponse {
     pub waiting_for: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_policy: Option<String>,
     pub run_event_high_watermark: i64,
     pub projection_event_idx: i64,
     pub projection_updated_at: String,
@@ -217,6 +245,10 @@ impl RunProjectionResponse {
             status: value.status,
             waiting_for: value.waiting_for,
             error_message: value.error_message,
+            workspace: value.workspace,
+            executor: value.executor,
+            transport: value.transport,
+            fallback_policy: value.fallback_policy,
             run_event_high_watermark: value.run_event_high_watermark,
             projection_event_idx: value.projection_event_idx,
             projection_updated_at: value.projection_updated_at,
@@ -557,7 +589,7 @@ mod tests {
         );
         assert_eq!(
             transformed[1],
-            json!({"type": "error", "message": "boom", "code": "RUN_ERROR", "index": 8})
+            json!({"type": "run_error", "message": "boom", "error": "boom", "code": "RUN_ERROR", "run_id": "run-123", "index": 8})
         );
     }
 
@@ -603,7 +635,7 @@ mod tests {
 
         assert_eq!(
             transformed[0],
-            json!({"type": "error", "message": "boom", "code": "RUN_ERROR", "index": 10})
+            json!({"type": "run_error", "message": "boom", "error": "boom", "code": "RUN_ERROR", "run_id": "run-123", "index": 10})
         );
         assert_eq!(
             transformed[1],
@@ -620,6 +652,64 @@ mod tests {
         assert_eq!(
             transformed[4],
             json!({"type": "run_finished", "run_id": "run-123", "status": "cancelled", "index": 12})
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_emits_interrupted_pause_status() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![
+                json!({
+                    "event_type": "run_interrupted",
+                    "data": {
+                        "kind": "budget_exhausted",
+                        "resumable": true,
+                        "user_message": "You can continue in the next message."
+                    },
+                    "index": 10
+                }),
+                json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "interrupted": true,
+                        "interruption_kind": "budget_exhausted",
+                        "resumable": true,
+                        "prompt_tokens": 7,
+                        "completion_tokens": 3
+                    },
+                    "index": 11
+                }),
+            ],
+        );
+
+        assert_eq!(
+            transformed[0],
+            json!({
+                "type": "run_interrupted",
+                "run_id": "run-123",
+                "kind": "budget_exhausted",
+                "resumable": true,
+                "user_message": "You can continue in the next message.",
+                "message": "You can continue in the next message.",
+                "index": 10
+            })
+        );
+        assert_eq!(
+            transformed[1],
+            json!({"type": "usage", "prompt_tokens": 7, "completion_tokens": 3, "index": 11})
+        );
+        assert_eq!(
+            transformed[2],
+            json!({
+                "type": "run_finished",
+                "run_id": "run-123",
+                "status": "paused",
+                "interrupted": true,
+                "interruption_kind": "budget_exhausted",
+                "resumable": true,
+                "index": 11
+            })
         );
     }
 
@@ -651,9 +741,14 @@ mod tests {
                     "index": 2
                 }),
                 json!({
+                    "event_type": "run_waiting",
+                    "data": {"reason": "waiting: executor_offline"},
+                    "index": 3
+                }),
+                json!({
                     "event_type": "run_resumed",
                     "data": {},
-                    "index": 3
+                    "index": 4
                 }),
             ],
         );
@@ -664,7 +759,78 @@ mod tests {
         );
         assert_eq!(
             transformed[1],
-            json!({"type": "run_resumed", "run_id": "run-123", "index": 3})
+            json!({
+                "type": "run_waiting",
+                "run_id": "run-123",
+                "reason": "waiting: executor_offline",
+                "index": 3
+            })
+        );
+        assert_eq!(
+            transformed[2],
+            json!({"type": "run_resumed", "run_id": "run-123", "index": 4})
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_injects_run_id_into_blocked_events() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![
+                json!({
+                    "event_type": "run_blocked_fallback_disabled",
+                    "data": {
+                        "message": "Server fallback is disabled.",
+                        "reason": "fallback_disabled"
+                    },
+                    "index": 4
+                }),
+                json!({
+                    "type": "run_blocked_transport_disconnected",
+                    "reason": "transport_disconnected",
+                    "index": 5
+                }),
+                json!({
+                    "event_type": "run_blocked_workspace_executor_unavailable",
+                    "data": {
+                        "reason": "workspace_executor_unavailable",
+                        "workspace": {"kind": "git_checkout"},
+                        "executor": {"kind": "hosted_runner", "status": "degraded"}
+                    },
+                    "index": 6
+                }),
+            ],
+        );
+
+        assert_eq!(
+            transformed[0],
+            json!({
+                "type": "run_blocked_fallback_disabled",
+                "run_id": "run-123",
+                "message": "Server fallback is disabled.",
+                "reason": "fallback_disabled",
+                "index": 4
+            })
+        );
+        assert_eq!(
+            transformed[1],
+            json!({
+                "type": "run_blocked_transport_disconnected",
+                "run_id": "run-123",
+                "reason": "transport_disconnected",
+                "index": 5
+            })
+        );
+        assert_eq!(
+            transformed[2],
+            json!({
+                "type": "run_blocked_workspace_executor_unavailable",
+                "run_id": "run-123",
+                "reason": "workspace_executor_unavailable",
+                "workspace": {"kind": "git_checkout"},
+                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "index": 6
+            })
         );
     }
 
@@ -769,6 +935,33 @@ mod tests {
         engine
             .append_event(
                 "run-projection-http",
+                json!({
+                    "event_type": "workspace_bound",
+                    "data": {
+                        "workspace": {
+                            "kind": "edge_workspace",
+                            "display_name": "MacBook Pro",
+                            "cwd": "/Users/xupeng/github/astra",
+                            "authority": "read_write",
+                            "fallback_policy": "disabled"
+                        },
+                        "executor": {
+                            "kind": "edge_agent",
+                            "executor_id": "edge-macbook-1",
+                            "display_name": "MacBook Pro",
+                            "transport": "edge_ws",
+                            "status": "online"
+                        },
+                        "transport": "edge_ws",
+                        "fallback_policy": "disabled"
+                    }
+                }),
+            )
+            .await
+            .expect("persist binding event");
+        engine
+            .append_event(
+                "run-projection-http",
                 json!({"event_type": "injection_freshness", "data": {"fingerprint": "secret"}}),
             )
             .await
@@ -851,7 +1044,22 @@ mod tests {
             serde_json::from_slice(&body).expect("projection response should be valid json");
         assert_eq!(json.get("status"), Some(&json!("failed")));
         assert_eq!(json.get("latest_event_type"), Some(&json!("run_finished")));
-        assert_eq!(json.get("run_event_high_watermark"), Some(&json!(4)));
+        assert_eq!(json.get("run_event_high_watermark"), Some(&json!(5)));
+        assert_eq!(
+            json.pointer("/workspace/kind"),
+            Some(&json!("edge_workspace"))
+        );
+        assert_eq!(
+            json.pointer("/workspace/cwd"),
+            Some(&json!("/Users/xupeng/github/astra"))
+        );
+        assert_eq!(json.pointer("/executor/kind"), Some(&json!("edge_agent")));
+        assert_eq!(
+            json.pointer("/executor/executor_id"),
+            Some(&json!("edge-macbook-1"))
+        );
+        assert_eq!(json.get("transport"), Some(&json!("edge_ws")));
+        assert_eq!(json.get("fallback_policy"), Some(&json!("disabled")));
         assert_eq!(
             json.pointer("/latest_checkpoint/checkpoint_version"),
             Some(&json!("checkpoint_v3"))
@@ -873,6 +1081,12 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .expect("recent_events should be an array");
         assert_eq!(recent_events.len(), 4);
+        assert!(
+            recent_events.iter().all(|event| {
+                event.get("type").and_then(serde_json::Value::as_str) != Some("workspace_bound")
+            }),
+            "projection top-level binding must not depend on the bounded recent event window"
+        );
         assert!(
             recent_events.iter().all(|event| {
                 event.get("type").and_then(serde_json::Value::as_str) != Some("injection_freshness")

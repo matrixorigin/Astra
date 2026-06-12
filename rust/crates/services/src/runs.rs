@@ -199,7 +199,7 @@ impl From<LlmTokenServiceConfig> for LlmTokenServiceRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBudget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_turns: Option<u32>,
@@ -215,6 +215,85 @@ pub enum RequestedTurnInteractionMode {
     Auto,
     Deny,
     Headless,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceBindingRequestKind {
+    ServerSandbox,
+    EdgeWorkspace,
+    UploadedSnapshot,
+    GitCheckout,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAuthorityRequest {
+    ReadOnly,
+    ReadWrite,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackPolicyRequest {
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBindingRequest {
+    pub kind: WorkspaceBindingRequestKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<WorkspaceAuthorityRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_policy: Option<FallbackPolicyRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorBindingRequestKind {
+    ServerLocal,
+    EdgeAgent,
+    ThinClient,
+    Mcp,
+    HostedRunner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTransportKindRequest {
+    ServerLocal,
+    EdgeWs,
+    EdgeLedger,
+    McpHttp,
+    RunnerRpc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorStatusRequest {
+    Online,
+    Offline,
+    Degraded,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorBindingRequest {
+    pub kind: ExecutorBindingRequestKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ToolTransportKindRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ExecutorStatusRequest>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -266,6 +345,8 @@ pub struct ChatRequestData {
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
+    pub workspace_binding: Option<WorkspaceBindingRequest>,
+    pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
     pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
@@ -310,6 +391,8 @@ impl std::fmt::Debug for ChatRequestData {
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
             .field("allow_tools", &self.allow_tools)
+            .field("workspace_binding", &self.workspace_binding)
+            .field("executor_binding", &self.executor_binding)
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
             .field("deprecated_mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
@@ -351,6 +434,10 @@ pub struct RunStatusRecord {
     pub status: String,
     pub waiting_for: Option<String>,
     pub events_count: i64,
+    pub workspace: Option<serde_json::Value>,
+    pub executor: Option<serde_json::Value>,
+    pub transport: Option<String>,
+    pub fallback_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,6 +456,10 @@ pub struct RunProjectionRecord {
     pub status: String,
     pub waiting_for: Option<String>,
     pub error_message: Option<String>,
+    pub workspace: Option<serde_json::Value>,
+    pub executor: Option<serde_json::Value>,
+    pub transport: Option<String>,
+    pub fallback_policy: Option<String>,
     pub run_event_high_watermark: i64,
     pub projection_event_idx: i64,
     pub projection_updated_at: String,
@@ -2678,7 +2769,10 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "approval_batch_required",
     // Run lifecycle + framing.
     "run_started",
+    "run_error",
+    "run_interrupted",
     "run_finished",
+    "run_waiting",
     "run_paused",
     "run_resumed",
     "context_meta",
@@ -2690,9 +2784,14 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "explain",
     "error",
     "ping",
-    "tool_call",
-    "tool_call_start",
-    "tool_call_end",
+    // Work-surface execution binding and transport lifecycle.
+    "workspace_bound",
+    "executor_bound",
+    "executor_status_changed",
+    "tool_routing_decision",
+    "tool_transport_started",
+    "tool_transport_completed",
+    "tool_transport_failed",
     // Plan / delegation surface (public admin features).
     "plan_created",
     "plan_step_start",
@@ -2700,13 +2799,49 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "plan_revised",
     "agent_delegated",
     "agent_spawned",
+    "agent_live_event",
     "agent_progress",
     "agent_completed",
     "agent_failed",
+    "agent_waiting",
     "agent_cancelled",
     "agent_interrupted",
     "task_board_snapshot",
 ];
+
+fn insert_if_present(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    data: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    if let Some(value) = data.get(key).cloned() {
+        out.insert(key.to_string(), value);
+    }
+}
+
+fn copy_execution_boundary_fields(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    data: &serde_json::Map<String, serde_json::Value>,
+) {
+    for key in [
+        "workspace",
+        "executor",
+        "transport",
+        "fallback_policy",
+        "route",
+        "success",
+        "duration_ms",
+        "error_kind",
+        "reason",
+        "blocked",
+    ] {
+        insert_if_present(out, data, key);
+    }
+}
+
+fn is_external_client_event_type(event_type: &str) -> bool {
+    EXTERNAL_CLIENT_ALLOWLIST.contains(&event_type) || event_type.starts_with("run_blocked_")
+}
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
     // Already-client-ready shape (`{"type": ..., ...}`): allowlist the
@@ -2718,7 +2853,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         .is_none()
         && let Some(client_type) = event.get("type").and_then(serde_json::Value::as_str)
     {
-        if EXTERNAL_CLIENT_ALLOWLIST.contains(&client_type) {
+        if is_external_client_event_type(client_type) {
             return event;
         }
         // Unknown / internal event — drop.
@@ -2761,17 +2896,60 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "content": data.get("chunk").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
         "thinking_done" | "reasoning_done" => serde_json::json!({ "type": event_type }),
-        "tool_call_start" => serde_json::json!({
-            "type": "tool_call_start",
-            "tool": data.get("tool").cloned().unwrap_or(serde_json::Value::String(String::new())),
-            "call_id": data.get("call_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
-            "arguments": data.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
-        }),
-        "tool_result" => serde_json::json!({
-            "type": "tool_call_end",
-            "call_id": data.get("call_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
-            "result": data.get("result").cloned().unwrap_or(serde_json::Value::String(String::new())),
-        }),
+        "tool_call_start" => {
+            let mut out = serde_json::Map::from_iter([(
+                "type".to_string(),
+                serde_json::Value::String("tool_call_start".to_string()),
+            )]);
+            out.insert(
+                "tool".to_string(),
+                data.get("tool")
+                    .or_else(|| data.get("name"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::String(String::new())),
+            );
+            out.insert(
+                "call_id".to_string(),
+                data.get("call_id")
+                    .or_else(|| data.get("tool_call_id"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::String(String::new())),
+            );
+            out.insert(
+                "arguments".to_string(),
+                data.get("arguments")
+                    .or_else(|| data.get("args"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            copy_execution_boundary_fields(&mut out, &data);
+            serde_json::Value::Object(out)
+        }
+        "tool_result" => {
+            let mut out = serde_json::Map::from_iter([(
+                "type".to_string(),
+                serde_json::Value::String("tool_call_end".to_string()),
+            )]);
+            out.insert(
+                "call_id".to_string(),
+                data.get("call_id")
+                    .or_else(|| data.get("tool_call_id"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::String(String::new())),
+            );
+            if let Some(tool) = data.get("tool").or_else(|| data.get("name")).cloned() {
+                out.insert("tool".to_string(), tool);
+            }
+            out.insert(
+                "result".to_string(),
+                data.get("result")
+                    .or_else(|| data.get("output"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::String(String::new())),
+            );
+            copy_execution_boundary_fields(&mut out, &data);
+            serde_json::Value::Object(out)
+        }
         "run_started" => {
             let mut out = serde_json::json!({ "type": "run_started" });
             if let Some(obj) = out.as_object_mut() {
@@ -2790,29 +2968,76 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(interactive_client) = data.get("interactive_client").cloned() {
                     obj.insert("interactive_client".to_string(), interactive_client);
                 }
+                if let Some(workspace) = data.get("workspace").cloned() {
+                    obj.insert("workspace".to_string(), workspace);
+                }
+                if let Some(executor) = data.get("executor").cloned() {
+                    obj.insert("executor".to_string(), executor);
+                }
+                if let Some(transport) = data.get("transport").cloned() {
+                    obj.insert("transport".to_string(), transport);
+                }
+                if let Some(fallback_policy) = data.get("fallback_policy").cloned() {
+                    obj.insert("fallback_policy".to_string(), fallback_policy);
+                }
             }
             out
         }
         "run_finished" => {
             let mut out = serde_json::json!({ "type": "run_finished" });
             if let Some(obj) = out.as_object_mut() {
-                if let Some(run_id) = data.get("run_id").cloned() {
-                    obj.insert("run_id".to_string(), run_id);
-                }
-                if let Some(status) = data.get("status").cloned() {
-                    obj.insert("status".to_string(), status);
-                }
-                if let Some(error) = data.get("error").cloned() {
-                    obj.insert("error".to_string(), error);
+                for key in [
+                    "run_id",
+                    "status",
+                    "error",
+                    "error_kind",
+                    "interrupted",
+                    "interruption_kind",
+                    "resumable",
+                ] {
+                    insert_if_present(obj, &data, key);
                 }
             }
             out
         }
-        "run_error" => serde_json::json!({
-            "type": "error",
-            "message": data.get("error").cloned().unwrap_or(serde_json::Value::String("Unknown error".to_string())),
-            "code": "RUN_ERROR",
-        }),
+        "run_error" => {
+            let message = data
+                .get("error")
+                .or_else(|| data.get("message"))
+                .cloned()
+                .unwrap_or(serde_json::Value::String("Unknown error".to_string()));
+            let mut out = serde_json::Map::from_iter([
+                (
+                    "type".to_string(),
+                    serde_json::Value::String("run_error".to_string()),
+                ),
+                ("message".to_string(), message.clone()),
+                ("error".to_string(), message),
+                (
+                    "code".to_string(),
+                    serde_json::Value::String("RUN_ERROR".to_string()),
+                ),
+            ]);
+            for key in ["run_id", "error_kind", "reason", "blocked"] {
+                insert_if_present(&mut out, &data, key);
+            }
+            serde_json::Value::Object(out)
+        }
+        "run_interrupted" => {
+            let mut out = serde_json::Map::from_iter([(
+                "type".to_string(),
+                serde_json::Value::String("run_interrupted".to_string()),
+            )]);
+            for (k, v) in &data {
+                out.insert(k.clone(), v.clone());
+            }
+            if !out.contains_key("message")
+                && let Some(user_message) = data.get("user_message").cloned()
+            {
+                out.insert("message".to_string(), user_message);
+            }
+            serde_json::Value::Object(out)
+        }
         "approval_request" | "approval_required" => {
             let mut out = serde_json::json!({ "type": "approval_required" });
             if let Some(obj) = out.as_object_mut() {
@@ -2867,8 +3092,26 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
+        "run_waiting" => {
+            let mut out = serde_json::json!({ "type": "run_waiting" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "run_resumed" => {
             let mut out = serde_json::json!({ "type": "run_resumed" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        event_type if event_type.starts_with("run_blocked_") => {
+            let mut out = serde_json::json!({ "type": event_type });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
                     obj.insert(k.clone(), v.clone());
@@ -2899,7 +3142,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "task": data.get("task").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
         "agent_spawned" | "agent_progress" | "agent_completed" | "agent_failed"
-        | "agent_cancelled" | "agent_interrupted" => {
+        | "agent_waiting" | "agent_cancelled" | "agent_interrupted" => {
             let mut out = serde_json::json!({ "type": event_type });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
@@ -3238,22 +3481,52 @@ mod tests {
     fn tool_call_start() {
         let out = transform_run_event_for_client(make_event(
             "tool_call_start",
-            json!({"tool": "bash", "call_id": "c1", "arguments": "{\"command\":\"ls\"}"}),
+            json!({
+                "name": "bash",
+                "tool_call_id": "c1",
+                "args": {"command": "ls"},
+                "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
+                "executor": {"kind": "server_local", "transport": "server_local"},
+                "transport": "server_local",
+                "fallback_policy": "disabled"
+            }),
         ));
         assert_eq!(out["type"], "tool_call_start");
         assert_eq!(out["tool"], "bash");
         assert_eq!(out["call_id"], "c1");
-        assert_eq!(out["arguments"], "{\"command\":\"ls\"}");
+        assert_eq!(out["arguments"]["command"], "ls");
+        assert_eq!(out["workspace"]["kind"], "server_sandbox");
+        assert_eq!(out["executor"]["kind"], "server_local");
+        assert_eq!(out["transport"], "server_local");
+        assert_eq!(out["fallback_policy"], "disabled");
     }
 
     #[test]
     fn tool_result() {
         let out = transform_run_event_for_client(make_event(
             "tool_result",
-            json!({"call_id": "c1", "result": "ok"}),
+            json!({
+                "tool_call_id": "c1",
+                "name": "bash",
+                "output": "ok",
+                "success": true,
+                "duration_ms": 42,
+                "workspace": {"kind": "edge_workspace", "cwd": "/Users/xupeng/github/astra"},
+                "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
+                "transport": "edge_ws",
+                "fallback_policy": "disabled"
+            }),
         ));
         assert_eq!(out["type"], "tool_call_end");
         assert_eq!(out["call_id"], "c1");
+        assert_eq!(out["tool"], "bash");
+        assert_eq!(out["result"], "ok");
+        assert_eq!(out["success"], true);
+        assert_eq!(out["duration_ms"], 42);
+        assert_eq!(out["workspace"]["kind"], "edge_workspace");
+        assert_eq!(out["executor"]["executor_id"], "edge-1");
+        assert_eq!(out["transport"], "edge_ws");
+        assert_eq!(out["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -3265,7 +3538,11 @@ mod tests {
                 "session_id": "sess-1",
                 "interaction_mode": "auto",
                 "suppressed_loop_nudges": true,
-                "interactive_client": true
+                "interactive_client": true,
+                "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
+                "executor": {"kind": "server_local", "status": "online"},
+                "transport": "server_local",
+                "fallback_policy": "disabled"
             }),
         ));
         assert_eq!(started["type"], "run_started");
@@ -3274,6 +3551,12 @@ mod tests {
         assert_eq!(started["interaction_mode"], "auto");
         assert_eq!(started["suppressed_loop_nudges"], true);
         assert_eq!(started["interactive_client"], true);
+        assert_eq!(started["workspace"]["kind"], "server_sandbox");
+        assert_eq!(started["workspace"]["cwd"], "/tmp/astra-workspaces/run-1");
+        assert_eq!(started["executor"]["kind"], "server_local");
+        assert_eq!(started["executor"]["status"], "online");
+        assert_eq!(started["transport"], "server_local");
+        assert_eq!(started["fallback_policy"], "disabled");
 
         let finished = transform_run_event_for_client(make_event(
             "run_finished",
@@ -3283,13 +3566,21 @@ mod tests {
         assert_eq!(finished["run_id"], "run-1");
         assert_eq!(finished["status"], "failed");
         assert_eq!(finished["error"], "boom");
+
+        let waiting = transform_run_event_for_client(make_event(
+            "run_waiting",
+            json!({"reason": "waiting: executor_offline"}),
+        ));
+        assert_eq!(waiting["type"], "run_waiting");
+        assert_eq!(waiting["reason"], "waiting: executor_offline");
     }
 
     #[test]
-    fn run_error_maps_to_error_type() {
+    fn run_error_maps_to_run_lifecycle_type() {
         let out = transform_run_event_for_client(make_event("run_error", json!({"error": "boom"})));
-        assert_eq!(out["type"], "error");
+        assert_eq!(out["type"], "run_error");
         assert_eq!(out["message"], "boom");
+        assert_eq!(out["error"], "boom");
         assert_eq!(out["code"], "RUN_ERROR");
     }
 
@@ -3297,6 +3588,22 @@ mod tests {
     fn run_error_default_message() {
         let out = transform_run_event_for_client(make_event("run_error", json!({})));
         assert_eq!(out["message"], "Unknown error");
+    }
+
+    #[test]
+    fn run_interrupted_is_client_visible() {
+        let out = transform_run_event_for_client(make_event(
+            "run_interrupted",
+            json!({
+                "kind": "budget_exhausted",
+                "resumable": true,
+                "user_message": "You can continue in the next message."
+            }),
+        ));
+        assert_eq!(out["type"], "run_interrupted");
+        assert_eq!(out["kind"], "budget_exhausted");
+        assert_eq!(out["resumable"], true);
+        assert_eq!(out["message"], "You can continue in the next message.");
     }
 
     #[test]
@@ -3362,6 +3669,22 @@ mod tests {
             json!({"agent_id": "a1", "error": "boom"}),
         ));
         assert_eq!(failed["type"], "agent_failed");
+        let waiting = transform_run_event_for_client(make_event(
+            "agent_waiting",
+            json!({
+                "agent_id": "a1",
+                "reason": "executor_offline",
+                "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                "executor": {"kind": "edge_agent", "status": "offline"},
+                "transport": "edge_ws",
+            }),
+        ));
+        assert_eq!(waiting["type"], "agent_waiting");
+        assert_eq!(waiting["agent_id"], "a1");
+        assert_eq!(waiting["reason"], "executor_offline");
+        assert_eq!(waiting["workspace"]["kind"], "edge_workspace");
+        assert_eq!(waiting["executor"]["kind"], "edge_agent");
+        assert_eq!(waiting["transport"], "edge_ws");
         let cancelled = transform_run_event_for_client(make_event(
             "agent_cancelled",
             json!({"agent_id": "a1", "reason": "user request"}),
@@ -3422,6 +3745,125 @@ mod tests {
     }
 
     #[test]
+    fn already_shaped_agent_live_events_pass_through() {
+        let event = json!({
+            "type": "agent_live_event",
+            "agent_id": "agent-1",
+            "event_kind": "output_delta",
+            "content": "child output",
+        });
+        assert_eq!(transform_run_event_for_client(event.clone()), event);
+
+        let waiting = json!({
+            "type": "agent_waiting",
+            "agent_id": "agent-1",
+            "reason": "executor_offline",
+            "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+            "executor": {"kind": "edge_agent", "status": "offline"},
+            "transport": "edge_ws",
+        });
+        assert_eq!(transform_run_event_for_client(waiting.clone()), waiting);
+    }
+
+    #[test]
+    fn already_shaped_work_surface_binding_and_transport_events_pass_through() {
+        for event in [
+            json!({
+                "type": "workspace_bound",
+                "workspace": {"kind": "server_sandbox"},
+                "executor": {"kind": "server_local"},
+            }),
+            json!({
+                "type": "executor_bound",
+                "workspace": {"kind": "server_sandbox"},
+                "executor": {"kind": "server_local"},
+            }),
+            json!({
+                "type": "tool_routing_decision",
+                "call_id": "c1",
+                "tool": "bash",
+                "route": "server_sandbox",
+            }),
+            json!({
+                "type": "tool_transport_started",
+                "call_id": "c1",
+                "tool": "bash",
+            }),
+            json!({
+                "type": "tool_transport_completed",
+                "call_id": "c1",
+                "duration_ms": 12,
+            }),
+            json!({
+                "type": "tool_transport_failed",
+                "call_id": "c1",
+                "error": "offline",
+            }),
+            json!({
+                "type": "run_blocked_executor_offline",
+                "call_id": "c1",
+                "tool": "bash",
+                "reason": "executor_offline",
+            }),
+            json!({
+                "type": "run_blocked_transport_disconnected",
+                "call_id": "c1",
+                "tool": "bash",
+                "reason": "transport_disconnected",
+            }),
+            json!({
+                "type": "run_blocked_fallback_disabled",
+                "call_id": "c1",
+                "tool": "bash",
+                "reason": "fallback_disabled",
+            }),
+            json!({
+                "type": "run_blocked_workspace_executor_unavailable",
+                "call_id": "c1",
+                "tool": "bash",
+                "reason": "workspace_executor_unavailable",
+                "workspace": {"kind": "git_checkout"},
+                "executor": {"kind": "hosted_runner", "status": "degraded"},
+            }),
+        ] {
+            assert_eq!(transform_run_event_for_client(event.clone()), event);
+        }
+    }
+
+    #[test]
+    fn durable_run_blocked_namespace_events_transform_for_client() {
+        let out = transform_run_event_for_client(json!({
+            "event_type": "run_blocked_workspace_executor_unavailable",
+            "data": {
+                "call_id": "c1",
+                "tool": "bash",
+                "reason": "workspace_executor_unavailable",
+                "message": "Workspace is not routed to an available executor.",
+                "workspace": {"kind": "git_checkout"},
+                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "transport": "runner_rpc",
+                "fallback_policy": "disabled"
+            },
+            "index": 4
+        }));
+
+        assert_eq!(
+            out,
+            json!({
+                "type": "run_blocked_workspace_executor_unavailable",
+                "call_id": "c1",
+                "tool": "bash",
+                "reason": "workspace_executor_unavailable",
+                "message": "Workspace is not routed to an available executor.",
+                "workspace": {"kind": "git_checkout"},
+                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "transport": "runner_rpc",
+                "fallback_policy": "disabled"
+            })
+        );
+    }
+
+    #[test]
     fn chat_request_data_debug_redacts_forward_header_values() {
         let mut forward_headers = std::collections::HashMap::new();
         forward_headers.insert(
@@ -3441,6 +3883,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
@@ -3510,6 +3954,8 @@ mod tests {
                     allow_skills: None,
                     allow_skill_sources: None,
                     allow_tools: None,
+                    workspace_binding: None,
+                    executor_binding: None,
                     runtime_mcp_bindings: Vec::new(),
                     mcp_binding_ids: None,
                     context: None,

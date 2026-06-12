@@ -1,10 +1,15 @@
 "use client";
 
 import {
+  AlertTriangle,
   Bot,
   ClipboardList,
+  HardDrive,
   Loader2,
+  MessageSquare,
   MoreVertical,
+  Monitor,
+  RefreshCw,
   Terminal,
   type LucideIcon,
 } from "lucide-react";
@@ -32,6 +37,7 @@ import { useChatLifecycleActions } from "@/hooks/use-chat-lifecycle-actions";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
 import {
   getChat,
+  getEdgeStatus,
   getChatWorkSurface,
   getChatWorkSurfaceRun,
   queueChatRunInput,
@@ -40,19 +46,30 @@ import {
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
+  updateChatWorkspaceSelection,
 } from "@/lib/api/chats";
 import {
   WebApiError,
   isAuthRequiredError,
   isNotFoundError,
 } from "@/lib/api/errors";
-import type { ChatDetail, ChatMessage, ComposerOptions } from "@/lib/api/types";
-import { deriveChatRunUiState } from "@/lib/chat-run-state";
+import type {
+  ChatDetail,
+  ChatMessage,
+  ComposerOptions,
+  EdgeStatusResponse,
+  WorkspaceSelection,
+} from "@/lib/api/types";
+import {
+  deriveChatRunUiState,
+  isTerminalChatRunStatus,
+} from "@/lib/chat-run-state";
 import {
   isChatScrolledToBottom,
   shouldAutoScrollChat,
 } from "@/lib/chat-scroll-state";
 import {
+  ACTIVE_AGENT_SURFACE_STATUSES,
   applyWorkSurfaceEvent,
   beginWorkSurfaceLoad,
   createEmptyWorkSurface,
@@ -66,8 +83,10 @@ import { useToast } from "@/components/ui/toast";
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
 const RUN_ATTACH_MAX_RETRIES = 4;
+const WORKSPACE_SELECTION_STORAGE_KEY = "astra.web.workspaceSelection";
 const ATTACHABLE_RUN_STATUSES = new Set([
   "running",
+  "blocked",
   "input-queued",
   "waiting",
   "cancelling",
@@ -75,6 +94,15 @@ const ATTACHABLE_RUN_STATUSES = new Set([
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function isWorkspaceSelectionError(error: unknown): error is WebApiError {
+  return (
+    error instanceof WebApiError &&
+    error.status === 409 &&
+    typeof error.code === "string" &&
+    error.code.startsWith("workspace_")
+  );
 }
 
 function hasCompletedAssistantAfterUser(
@@ -97,12 +125,14 @@ function hasCompletedAssistantAfterUser(
 }
 
 function findStreamingAssistantMessageId(messages: ChatMessage[]) {
-  return [...messages].reverse().find(
-    (message) =>
-      message.role === "assistant" &&
-      (message.status === "streaming" ||
-        message.reasoningStatus === "streaming"),
-  )?.id;
+  return [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === "assistant" &&
+        (message.status === "streaming" ||
+          message.reasoningStatus === "streaming"),
+    )?.id;
 }
 
 function createStreamingAssistantMessage(id: string): ChatMessage {
@@ -146,14 +176,87 @@ function canAttachRunStream(status: string | undefined | null) {
   return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
 }
 
+function defaultWorkspaceSelection(): WorkspaceSelection | null {
+  return null;
+}
+
+type WorkspaceSelectionState = {
+  selection: WorkspaceSelection | null;
+  explicit: boolean;
+};
+
+function workspaceSelectionStorageKey(chatId: string) {
+  return `${WORKSPACE_SELECTION_STORAGE_KEY}.${chatId}`;
+}
+
+function defaultWorkspaceSelectionState(): WorkspaceSelectionState {
+  return { selection: defaultWorkspaceSelection(), explicit: false };
+}
+
+function readStoredWorkspaceSelectionState(
+  chatId: string,
+): WorkspaceSelectionState {
+  if (typeof window === "undefined") {
+    return defaultWorkspaceSelectionState();
+  }
+  const raw = window.localStorage.getItem(workspaceSelectionStorageKey(chatId));
+  if (!raw) {
+    return defaultWorkspaceSelectionState();
+  }
+  try {
+    const value = JSON.parse(raw) as WorkspaceSelection;
+    if (value.kind === "server_sandbox") {
+      return { selection: value, explicit: true };
+    }
+    if (
+      value.kind === "edge_workspace" &&
+      value.edgeAgentId?.trim() &&
+      value.cwd?.trim()
+    ) {
+      return { selection: value, explicit: true };
+    }
+  } catch {
+    // Fall through to the implicit server sandbox display default.
+  }
+  return defaultWorkspaceSelectionState();
+}
+
+function workspaceSelectionStateFromDetail(
+  detail: ChatDetail,
+): WorkspaceSelectionState {
+  if (
+    detail.workspaceSelection &&
+    detail.workspaceSelectionExplicit !== false
+  ) {
+    return { selection: detail.workspaceSelection, explicit: true };
+  }
+  return readStoredWorkspaceSelectionState(detail.chat.id);
+}
+
+function storeWorkspaceSelectionState(
+  chatId: string,
+  state: WorkspaceSelectionState,
+) {
+  if (!state.explicit || !state.selection) {
+    window.localStorage.removeItem(workspaceSelectionStorageKey(chatId));
+    return;
+  }
+  window.localStorage.setItem(
+    workspaceSelectionStorageKey(chatId),
+    JSON.stringify(state.selection),
+  );
+}
+
 function createAssistantPatchController(params: {
   setDetail: Dispatch<SetStateAction<ChatDetail>>;
   getAssistantId: () => string;
 }) {
   let framePatch: Partial<ChatMessage> | null = null;
   let frameRaf: number | null = null;
+  let mounted = true;
 
   const applyPatch = (assistantId: string, patch: Partial<ChatMessage>) => {
+    if (!mounted) return;
     params.setDetail((current) => ({
       ...current,
       messages: current.messages.map((message) =>
@@ -177,6 +280,7 @@ function createAssistantPatchController(params: {
       applyPatch(params.getAssistantId(), patch);
     },
     patchBatched(patch: Partial<ChatMessage>) {
+      if (!mounted) return;
       framePatch = { ...framePatch, ...patch };
       if (frameRaf === null) {
         frameRaf = requestAnimationFrame(flush);
@@ -190,6 +294,7 @@ function createAssistantPatchController(params: {
       flush();
     },
     cancel() {
+      mounted = false;
       if (frameRaf !== null) {
         cancelAnimationFrame(frameRaf);
         frameRaf = null;
@@ -214,13 +319,25 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       initial.activeRun?.runId ?? null,
     ),
   );
-  const [workSurfaceTab, setWorkSurfaceTab] =
-    useState<WorkSurfaceTab>("tasks");
+  const [workSurfaceTab, setWorkSurfaceTab] = useState<WorkSurfaceTab>("tasks");
   const [workSurfaceOpenSignal, setWorkSurfaceOpenSignal] = useState(0);
+  const [workspaceSelectionState, setWorkspaceSelectionState] =
+    useState<WorkspaceSelectionState>(() =>
+      workspaceSelectionStateFromDetail(initial),
+    );
+  const workspaceSelection = workspaceSelectionState.selection;
+  const [edgeWorkspaces, setEdgeWorkspaces] = useState<
+    EdgeStatusResponse["edges"]
+  >([]);
+  const [edgeWorkspacesLoading, setEdgeWorkspacesLoading] = useState(false);
+  const [edgeWorkspacesError, setEdgeWorkspacesError] = useState<string | null>(
+    null,
+  );
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const workspaceSelectionRequestRef = useRef(0);
   const attachedRunRef = useRef<string | null>(null);
   const autoAttachAttemptedRunRef = useRef<string | null>(null);
   const autoAttachRetryTimerRef = useRef<number | undefined>(undefined);
@@ -264,23 +381,34 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     resumingRun,
     stoppingRun,
   });
-  const showRunStatusPanel = Boolean(
-    detail.activeRun?.runId &&
-    canResumeRun,
+  const showRunStatusPanel = Boolean(detail.activeRun?.runId && canResumeRun);
+  const agentActivityCount = runActivityMetricCount(
+    workSurface.agents.filter((agent) =>
+      ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status),
+    ).length,
+    workSurface.agents.length,
   );
-  const runningAgentCount = workSurface.agents.filter((agent) =>
-    ["running", "started", "tool_executing", "metrics_update"].includes(
-      agent.status,
-    ),
+  const toolActivityCount = runActivityMetricCount(
+    workSurface.tools.filter((tool) => tool.status === "running").length,
+    workSurface.tools.length,
+  );
+  const openTaskCount = workSurface.tasks.filter((task) =>
+    ["in_progress", "pending", "paused"].includes(task.status),
   ).length;
-  const runningToolCount = workSurface.tools.filter(
-    (tool) => tool.status === "running",
-  ).length;
-  const workingTaskCount = workSurface.tasks.filter(
-    (task) => task.status === "in_progress",
-  ).length;
+  const taskActivityCount = runActivityMetricCount(
+    openTaskCount,
+    workSurface.tasks.length,
+  );
+  const activeRunIsVisibleActivity = Boolean(
+    detail.activeRun?.runId &&
+    activeRunStatus &&
+    !isTerminalChatRunStatus(activeRunStatus),
+  );
+  const workSurfaceActiveRun = activeRunIsVisibleActivity
+    ? detail.activeRun
+    : undefined;
   const showRunActivityBar = Boolean(
-    !isArchived && !canResumeRun && (startingRun || detail.activeRun?.runId),
+    !isArchived && !canResumeRun && (startingRun || activeRunIsVisibleActivity),
   );
   const runActivityLabel =
     stoppingRun || activeRunStatus === "cancelling"
@@ -288,6 +416,67 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       : startingRun
         ? "Starting run"
         : activeRunLabel;
+  const workspaceSelectorDisabled = Boolean(
+    startingRun ||
+    composerDisabled ||
+    (detail.activeRun?.runId &&
+      activeRunStatus &&
+      !isTerminalChatRunStatus(activeRunStatus)),
+  );
+
+  const setWorkspaceSelection = useCallback(
+    (selection: WorkspaceSelection) => {
+      const previous = workspaceSelectionState;
+      const next = { selection, explicit: true };
+      const requestId = workspaceSelectionRequestRef.current + 1;
+      workspaceSelectionRequestRef.current = requestId;
+      setWorkspaceSelectionState(next);
+      storeWorkspaceSelectionState(detail.chat.id, next);
+      void updateChatWorkspaceSelection(detail.chat.id, selection)
+        .then((updated) => {
+          if (workspaceSelectionRequestRef.current !== requestId) {
+            return;
+          }
+          const updatedState = workspaceSelectionStateFromDetail(updated);
+          setDetail(updated);
+          setWorkspaceSelectionState(updatedState);
+          storeWorkspaceSelectionState(updated.chat.id, updatedState);
+        })
+        .catch((error) => {
+          if (workspaceSelectionRequestRef.current !== requestId) {
+            return;
+          }
+          setWorkspaceSelectionState(previous);
+          storeWorkspaceSelectionState(detail.chat.id, previous);
+          addToast(
+            `Workspace was not updated. ${
+              error instanceof Error
+                ? error.message
+                : "Failed to persist workspace selection."
+            }`,
+            "warning",
+          );
+        });
+    },
+    [addToast, detail.chat.id, workspaceSelectionState],
+  );
+
+  const refreshEdgeWorkspaces = useCallback(async () => {
+    setEdgeWorkspacesLoading(true);
+    setEdgeWorkspacesError(null);
+    try {
+      const status = await getEdgeStatus();
+      setEdgeWorkspaces(status.edges);
+    } catch (error) {
+      setEdgeWorkspacesError(
+        error instanceof Error
+          ? error.message
+          : "Failed to load edge workspaces.",
+      );
+    } finally {
+      setEdgeWorkspacesLoading(false);
+    }
+  }, []);
 
   const nextStreamAbortSignal = useCallback(() => {
     streamAbortRef.current?.abort();
@@ -633,186 +822,184 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           ? [...current.messages, userMessage, assistantMessage]
           : [...current.messages, assistantMessage],
       }));
+      const streamPayload = {
+        content: text,
+        options,
+        pendingMessageId,
+        ...(workspaceSelectionState.explicit && workspaceSelection
+          ? { workspace: workspaceSelection }
+          : {}),
+      };
       try {
-        await streamChatMessage(
-          detail.chat.id,
-          {
-            content: text,
-            options,
-            pendingMessageId,
-          },
-          {
-            signal: nextStreamAbortSignal(),
-            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-            onLocalMessages: ({
-              userMessage: localUserMessage,
-              assistantMessage: localAssistantMessage,
-            }) => {
-              const previousAssistantId = currentAssistantId;
-              const previousUserId = currentUserId;
-              currentAssistantId = localAssistantMessage.id;
-              currentUserId = localUserMessage.id;
-              setDetail((current) => {
-                let sawAssistant = false;
-                let sawUser = false;
-                const messages = current.messages.flatMap((message) => {
-                  if (
-                    message.id === previousUserId ||
-                    message.id === localUserMessage.id
-                  ) {
-                    if (sawUser) {
-                      return [];
-                    }
-                    sawUser = true;
-                    return [localUserMessage];
+        await streamChatMessage(detail.chat.id, streamPayload, {
+          signal: nextStreamAbortSignal(),
+          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onLocalMessages: ({
+            userMessage: localUserMessage,
+            assistantMessage: localAssistantMessage,
+          }) => {
+            const previousAssistantId = currentAssistantId;
+            const previousUserId = currentUserId;
+            currentAssistantId = localAssistantMessage.id;
+            currentUserId = localUserMessage.id;
+            setDetail((current) => {
+              let sawAssistant = false;
+              let sawUser = false;
+              const messages = current.messages.flatMap((message) => {
+                if (
+                  message.id === previousUserId ||
+                  message.id === localUserMessage.id
+                ) {
+                  if (sawUser) {
+                    return [];
                   }
-                  if (
-                    message.id === previousAssistantId ||
-                    message.id === localAssistantMessage.id
-                  ) {
-                    if (sawAssistant) {
-                      return [];
-                    }
-                    sawAssistant = true;
-                    return [localAssistantMessage];
+                  sawUser = true;
+                  return [localUserMessage];
+                }
+                if (
+                  message.id === previousAssistantId ||
+                  message.id === localAssistantMessage.id
+                ) {
+                  if (sawAssistant) {
+                    return [];
                   }
-                  return [message];
-                });
-                if (!sawUser && appendUser) {
-                  messages.push(localUserMessage);
+                  sawAssistant = true;
+                  return [localAssistantMessage];
                 }
-                if (!sawAssistant) {
-                  messages.push(localAssistantMessage);
-                }
-                return {
-                  ...current,
-                  pendingTurn: pendingMessageId
-                    ? undefined
-                    : current.pendingTurn,
-                  messages,
-                };
+                return [message];
               });
-            },
-            onRunStarted: (runId) => {
-              streamRunId = runId;
-              attachedRunRef.current = runId;
-              resetWorkSurfaceRun(runId);
-              setStartingRun(false);
-              setDetail((current) => ({
+              if (!sawUser && appendUser) {
+                messages.push(localUserMessage);
+              }
+              if (!sawAssistant) {
+                messages.push(localAssistantMessage);
+              }
+              return {
                 ...current,
-                activeRun: {
-                  runId,
-                  status: "running",
-                  waitingFor: null,
-                },
-              }));
-            },
-            onSessionBound: ({ sessionId }) => {
-              setWorkSurface((current) => ({
-                ...resetWorkSurfaceForRun(current, {
-                  sessionId,
-                  runId: current.runId,
-                }),
-                error: null,
-              }));
-              setDetail((current) => ({
-                ...current,
-                session: {
-                  chatId: current.session?.chatId ?? current.chat.id,
-                  backendSessionId: sessionId,
-                  persisted: true,
-                  messageCount: current.messages.length,
-                },
-              }));
-            },
-            onRunUpdated: (run) => {
-              setDetail((current) => ({
-                ...current,
-                activeRun: {
-                  runId: run.runId,
-                  status: run.status,
-                  waitingFor: run.waitingFor ?? null,
-                },
-              }));
-            },
-            onRunFinished: () => {
-              setStoppingRun(false);
-              setStartingRun(false);
-              setDetail((current) =>
-                streamRunId && current.activeRun?.runId === streamRunId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-            },
-            onReasoning: (reasoning) => {
-              assistantPatcher.patchBatched({
-                reasoning,
-                reasoningStatus: "streaming",
-                status: "streaming",
-              });
-            },
-            onReasoningDone: (reasoning) => {
-              assistantPatcher.patchBatched({
-                reasoning,
-                reasoningStatus: "complete",
-                status: "streaming",
-              });
-            },
-            onText: (content) => {
-              assistantPatcher.patchBatched({ content, status: "streaming" });
-            },
-            onArtifacts: (artifacts) => {
-              assistantPatcher.patchBatched({ artifacts });
-            },
-            onDone: (content) => {
-              assistantPatcher.flushNow();
-              setStartingRun(false);
-              setDetail((current) =>
-                streamRunId && current.activeRun?.runId === streamRunId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-              assistantPatcher.patchNow({
-                content:
-                  content ||
-                  "Astra completed the run without returning visible text.",
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-            onCancelled: (content) => {
-              assistantPatcher.flushNow();
-              setStoppingRun(false);
-              setStartingRun(false);
-              setDetail((current) =>
-                streamRunId && current.activeRun?.runId === streamRunId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-              assistantPatcher.patchNow({
-                content: content || "Stopped.",
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-            onPaused: (content) => {
-              assistantPatcher.flushNow();
-              assistantPatcher.patchNow({
-                content,
-                status: "streaming",
-              });
-            },
+                pendingTurn: pendingMessageId ? undefined : current.pendingTurn,
+                messages,
+              };
+            });
           },
-        );
+          onRunStarted: (runId) => {
+            streamRunId = runId;
+            attachedRunRef.current = runId;
+            resetWorkSurfaceRun(runId);
+            setStartingRun(false);
+            setDetail((current) => ({
+              ...current,
+              activeRun: {
+                runId,
+                status: "running",
+                waitingFor: null,
+              },
+            }));
+          },
+          onSessionBound: ({ sessionId }) => {
+            setWorkSurface((current) => ({
+              ...resetWorkSurfaceForRun(current, {
+                sessionId,
+                runId: current.runId,
+              }),
+              error: null,
+            }));
+            setDetail((current) => ({
+              ...current,
+              session: {
+                chatId: current.session?.chatId ?? current.chat.id,
+                backendSessionId: sessionId,
+                persisted: true,
+                messageCount: current.messages.length,
+              },
+            }));
+          },
+          onRunUpdated: (run) => {
+            setDetail((current) => ({
+              ...current,
+              activeRun: {
+                runId: run.runId,
+                status: run.status,
+                waitingFor: run.waitingFor ?? null,
+              },
+            }));
+          },
+          onRunFinished: () => {
+            setStoppingRun(false);
+            setStartingRun(false);
+            setDetail((current) =>
+              streamRunId && current.activeRun?.runId === streamRunId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
+          },
+          onReasoning: (reasoning) => {
+            assistantPatcher.patchBatched({
+              reasoning,
+              reasoningStatus: "streaming",
+              status: "streaming",
+            });
+          },
+          onReasoningDone: (reasoning) => {
+            assistantPatcher.patchBatched({
+              reasoning,
+              reasoningStatus: "complete",
+              status: "streaming",
+            });
+          },
+          onText: (content) => {
+            assistantPatcher.patchBatched({ content, status: "streaming" });
+          },
+          onArtifacts: (artifacts) => {
+            assistantPatcher.patchBatched({ artifacts });
+          },
+          onDone: (content) => {
+            assistantPatcher.flushNow();
+            setStartingRun(false);
+            setDetail((current) =>
+              streamRunId && current.activeRun?.runId === streamRunId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
+            assistantPatcher.patchNow({
+              content:
+                content ||
+                "Astra completed the run without returning visible text.",
+              reasoningStatus: "complete",
+              status: "complete",
+            });
+          },
+          onCancelled: (content) => {
+            assistantPatcher.flushNow();
+            setStoppingRun(false);
+            setStartingRun(false);
+            setDetail((current) =>
+              streamRunId && current.activeRun?.runId === streamRunId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
+            assistantPatcher.patchNow({
+              content: content || "Stopped.",
+              reasoningStatus: "complete",
+              status: "complete",
+            });
+          },
+          onPaused: (content) => {
+            assistantPatcher.flushNow();
+            assistantPatcher.patchNow({
+              content,
+              status: "streaming",
+            });
+          },
+        });
       } catch (error) {
         if (isAbortError(error)) {
           return;
@@ -837,6 +1024,16 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           router.replace(chatListHref);
           return;
         }
+        if (isWorkspaceSelectionError(error)) {
+          setStartingRun(false);
+          void refreshEdgeWorkspaces();
+          assistantPatcher.patchNow({
+            content: error.detail,
+            reasoningStatus: "complete",
+            status: "failed",
+          });
+          return;
+        }
         const message =
           error instanceof Error ? error.message : "Astra stream failed.";
         assistantPatcher.patchNow({
@@ -858,8 +1055,11 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       detail.chat.archivedAt,
       detail.chat.id,
       nextStreamAbortSignal,
+      refreshEdgeWorkspaces,
       router,
       resetWorkSurfaceRun,
+      workspaceSelection,
+      workspaceSelectionState.explicit,
     ],
   );
 
@@ -1066,7 +1266,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     ],
   );
 
-  const stopActiveRun = useCallback(async () => {
+  const stopActiveRun = useCallback(() => {
     if (!detail.activeRun?.runId || !canStopRun) {
       return;
     }
@@ -1076,54 +1276,60 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     }
     runControlMutationRef.current = true;
     setStoppingRun(true);
+    streamAbortRef.current?.abort();
+    if (attachedRunRef.current === runId) {
+      attachedRunRef.current = null;
+    }
     setDetail((current) => ({
       ...current,
-      activeRun: current.activeRun?.runId
-        ? {
-            runId: current.activeRun.runId,
-            status: "cancelling",
-            waitingFor: null,
-          }
-        : current.activeRun,
+      activeRun:
+        current.activeRun?.runId === runId
+          ? {
+              ...current.activeRun,
+              status: "cancelling",
+              waitingFor: "cancel_requested",
+            }
+          : current.activeRun,
+      messages: completeLatestStreamingAssistantAsStopped(current.messages),
     }));
-    try {
-      await stopChatRun(detail.chat.id);
-      streamAbortRef.current?.abort();
-      if (attachedRunRef.current === runId) {
-        attachedRunRef.current = null;
-      }
-      setDetail((current) => ({
-        ...current,
-        activeRun:
-          current.activeRun?.runId === runId ? undefined : current.activeRun,
-        messages: completeLatestStreamingAssistantAsStopped(current.messages),
-      }));
-      void hydrateWorkSurfaceForChat({ silent: true });
-    } catch (error) {
-      if (isAuthRequiredError(error)) {
-        router.push(
-          `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
+    void hydrateWorkSurfaceForChat({ silent: true });
+
+    void stopChatRun(detail.chat.id)
+      .then((result) => {
+        setDetail((current) => ({
+          ...current,
+          activeRun: result.activeRun,
+        }));
+        void hydrateWorkSurfaceForChat({ silent: true });
+      })
+      .catch((error: unknown) => {
+        if (isAuthRequiredError(error)) {
+          router.push(
+            `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
+          );
+          return;
+        }
+        if (isNotFoundError(error)) {
+          router.replace(chatListHref);
+          return;
+        }
+        void getChat(detail.chat.id)
+          .then(setDetail)
+          .catch(() => {
+            // The local stop still took effect; the toast below is the durable
+            // signal if both cancellation and refresh fail.
+          });
+        addToast(
+          error instanceof Error
+            ? error.message
+            : "Failed to stop the active run.",
+          "error",
         );
-        return;
-      }
-      if (isNotFoundError(error)) {
-        router.replace(chatListHref);
-        return;
-      }
-      const refreshed = await getChat(detail.chat.id).catch(() => null);
-      if (refreshed) {
-        setDetail(refreshed);
-      }
-      addToast(
-        error instanceof Error
-          ? error.message
-          : "Failed to stop the active run.",
-        "error",
-      );
-    } finally {
-      runControlMutationRef.current = false;
-      setStoppingRun(false);
-    }
+      })
+      .finally(() => {
+        runControlMutationRef.current = false;
+        setStoppingRun(false);
+      });
   }, [
     addToast,
     canStopRun,
@@ -1359,6 +1565,23 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   }, [hydrateWorkSurfaceForChat]);
 
   useEffect(() => {
+    const nextState =
+      detail.workspaceSelection && detail.workspaceSelectionExplicit !== false
+        ? { selection: detail.workspaceSelection, explicit: true }
+        : readStoredWorkspaceSelectionState(detail.chat.id);
+    setWorkspaceSelectionState(nextState);
+    storeWorkspaceSelectionState(detail.chat.id, nextState);
+  }, [
+    detail.chat.id,
+    detail.workspaceSelection,
+    detail.workspaceSelectionExplicit,
+  ]);
+
+  useEffect(() => {
+    void refreshEdgeWorkspaces();
+  }, [refreshEdgeWorkspaces]);
+
+  useEffect(() => {
     const activeRun = detail.activeRun;
     if (!activeRun?.runId) {
       autoAttachAttemptedRunRef.current = null;
@@ -1515,9 +1738,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             </h1>
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
               <span className="size-1.5 rounded-full bg-success" />
-              <span>
-                {detail.chat.model ?? "Default model"}
-              </span>
+              <span>{detail.chat.model ?? "Default model"}</span>
             </div>
           </div>
           <div className="min-w-0 flex-1" />
@@ -1595,14 +1816,24 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                 {showRunActivityBar ? (
                   <RunActivityBar
                     label={runActivityLabel}
-                    agents={runningAgentCount}
-                    tools={runningToolCount}
-                    tasks={workingTaskCount}
+                    agents={agentActivityCount}
+                    tools={toolActivityCount}
+                    tasks={taskActivityCount}
                     onOpenAgents={() => openWorkSurfaceTab("agents")}
                     onOpenTasks={() => openWorkSurfaceTab("tasks")}
                     onOpenTools={() => openWorkSurfaceTab("tools")}
                   />
                 ) : null}
+                <WorkspaceSelector
+                  selection={workspaceSelection}
+                  explicit={workspaceSelectionState.explicit}
+                  edges={edgeWorkspaces}
+                  loading={edgeWorkspacesLoading}
+                  error={edgeWorkspacesError}
+                  disabled={workspaceSelectorDisabled}
+                  onRefresh={refreshEdgeWorkspaces}
+                  onSelect={setWorkspaceSelection}
+                />
                 <Composer
                   disabled={composerDisabled}
                   placeholder={composerPlaceholder}
@@ -1684,7 +1915,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       </div>
       <WorkSurfacePanel
         state={workSurface}
-        activeRun={detail.activeRun}
+        activeRun={workSurfaceActiveRun}
         tab={workSurfaceTab}
         onTabChange={setWorkSurfaceTab}
         openSignal={workSurfaceOpenSignal}
@@ -1693,6 +1924,163 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         }}
         onLoadAgentRun={loadAgentRunProjection}
       />
+    </div>
+  );
+}
+
+function WorkspaceSelector({
+  selection,
+  explicit,
+  edges,
+  loading,
+  error,
+  disabled,
+  onRefresh,
+  onSelect,
+}: {
+  selection: WorkspaceSelection | null;
+  explicit: boolean;
+  edges: EdgeStatusResponse["edges"];
+  loading: boolean;
+  error: string | null;
+  disabled: boolean;
+  onRefresh: () => void | Promise<void>;
+  onSelect: (selection: WorkspaceSelection) => void;
+}) {
+  const edgeOptions = edges
+    .filter((edge) => edge.workspace_dir?.trim())
+    .map((edge) => ({
+      edgeAgentId: edge.edge_agent_id,
+      displayName: edge.hostname ?? edge.edge_agent_id,
+      cwd: edge.workspace_dir!,
+      connectedSecs: edge.connected_secs,
+    }));
+  const selectedEdge =
+    selection?.kind === "edge_workspace"
+      ? edgeOptions.find(
+          (edge) =>
+            edge.edgeAgentId === selection.edgeAgentId &&
+            edge.cwd === selection.cwd,
+        )
+      : null;
+  const selectedEdgeMissing =
+    explicit && selection?.kind === "edge_workspace" && !selectedEdge;
+  const selectedOfflineLabel =
+    selection?.kind === "edge_workspace"
+      ? `${selection.displayName ?? selection.edgeAgentId} · ${selection.cwd}`
+      : "";
+
+  return (
+    <div className="mb-2 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
+      <span className="font-medium text-text">Workspace</span>
+      {!explicit || !selection ? (
+        <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-bg px-2.5 py-1.5 font-medium text-text-secondary">
+          <MessageSquare className="size-3.5 shrink-0 text-text-muted" />
+          <span className="truncate">Chat only</span>
+          <span className="hidden border-l border-border pl-1.5 font-normal text-text-muted sm:inline">
+            No code workspace
+          </span>
+        </span>
+      ) : null}
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => onSelect({ kind: "server_sandbox" })}
+        className={[
+          "inline-flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1.5 font-medium transition focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-50",
+          explicit && selection?.kind === "server_sandbox"
+            ? "bg-text text-white"
+            : "bg-bg text-text-secondary hover:bg-surface-muted hover:text-text",
+        ].join(" ")}
+      >
+        <HardDrive className="size-3.5 shrink-0" />
+        <span className="truncate">Server sandbox</span>
+      </button>
+      {edgeOptions.map((edge) => {
+        const selected =
+          explicit &&
+          selection?.kind === "edge_workspace" &&
+          selection.edgeAgentId === edge.edgeAgentId &&
+          selection.cwd === edge.cwd;
+        return (
+          <button
+            key={`${edge.edgeAgentId}:${edge.cwd}`}
+            type="button"
+            disabled={disabled}
+            title={`${edge.displayName} · ${edge.cwd}`}
+            onClick={() =>
+              onSelect({
+                kind: "edge_workspace",
+                edgeAgentId: edge.edgeAgentId,
+                displayName: edge.displayName,
+                cwd: edge.cwd,
+              })
+            }
+            className={[
+              "inline-flex min-w-0 max-w-[min(30rem,100%)] items-center gap-1.5 rounded-full px-2.5 py-1.5 font-medium transition focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-50",
+              selected
+                ? "bg-text text-white"
+                : "bg-bg text-text-secondary hover:bg-surface-muted hover:text-text",
+            ].join(" ")}
+          >
+            <Monitor className="size-3.5 shrink-0" />
+            <span className="truncate">{edge.displayName}</span>
+            <span
+              className={[
+                "min-w-0 truncate border-l pl-1.5 font-normal",
+                selected
+                  ? "border-white/30 text-white/75"
+                  : "border-border text-text-muted",
+              ].join(" ")}
+            >
+              {edge.cwd}
+            </span>
+            <span className="sr-only">
+              connected for {edge.connectedSecs} seconds
+            </span>
+          </button>
+        );
+      })}
+      <button
+        type="button"
+        disabled={loading}
+        onClick={() => {
+          void onRefresh();
+        }}
+        className="inline-flex size-7 items-center justify-center rounded-full bg-bg text-text-muted transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-wait disabled:opacity-60"
+        aria-label="Refresh edge workspaces"
+        title="Refresh edge workspaces"
+      >
+        <RefreshCw
+          className={["size-3.5", loading ? "animate-spin" : ""].join(" ")}
+        />
+      </button>
+      {edgeOptions.length === 0 && !loading ? (
+        <span className="text-text-muted">No edge workspaces online</span>
+      ) : null}
+      {selectedEdgeMissing ? (
+        <div
+          className="flex min-w-0 max-w-full flex-wrap items-center gap-2 rounded-[10px] border border-warning/30 bg-warning/10 px-2.5 py-1.5 text-warning"
+          role="status"
+          aria-label={`Selected edge workspace is offline: ${selectedOfflineLabel}`}
+        >
+          <AlertTriangle className="size-3.5 shrink-0" />
+          <span className="min-w-0 max-w-[min(28rem,100%)] truncate">
+            Edge offline · {selectedOfflineLabel}
+          </span>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSelect({ kind: "server_sandbox" })}
+            className="rounded-full bg-bg px-2 py-0.5 font-medium text-text transition hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Use server sandbox
+          </button>
+        </div>
+      ) : null}
+      {error ? (
+        <span className="max-w-full truncate text-warning">{error}</span>
+      ) : null}
     </div>
   );
 }
@@ -1707,20 +2095,23 @@ function RunActivityBar({
   onOpenTools,
 }: {
   label: string;
-  agents: number;
-  tools: number;
-  tasks: number;
+  agents: RunActivityMetricCount;
+  tools: RunActivityMetricCount;
+  tasks: RunActivityMetricCount;
   onOpenAgents: () => void;
   onOpenTasks: () => void;
   onOpenTools: () => void;
 }) {
   return (
     <div className="mb-3 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
-      <span className="inline-flex items-center gap-2 font-medium text-text">
+      <span className="inline-flex min-w-0 items-center gap-2 font-medium text-text">
         <Loader2 className="size-3.5 animate-spin text-accent" />
-        {label}
+        <span className="truncate">{label}</span>
       </span>
-      <span className="inline-flex items-center gap-1 pl-0.5" aria-hidden="true">
+      <span
+        className="inline-flex items-center gap-1 pl-0.5"
+        aria-hidden="true"
+      >
         <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
         <span
           className="size-1.5 animate-bounce rounded-full bg-text-muted"
@@ -1731,7 +2122,7 @@ function RunActivityBar({
           style={{ animationDelay: "240ms" }}
         />
       </span>
-      <span className="h-4 w-px bg-border" />
+      <span className="h-4 w-px bg-border" aria-hidden="true" />
       <RunActivityMetric
         icon={Bot}
         label="Agents"
@@ -1762,19 +2153,45 @@ function RunActivityMetric({
 }: {
   icon: LucideIcon;
   label: string;
-  value: number;
+  value: RunActivityMetricCount;
   onClick: () => void;
 }) {
+  const unitLabel = value.mode === "active" ? "active" : "item";
+  const pluralUnit =
+    value.mode === "active" || value.value === 1 ? unitLabel : `${unitLabel}s`;
+  const title =
+    value.mode === "active"
+      ? `Open ${label} (${value.active} active, ${value.total} total)`
+      : `Open ${label} (${value.total} total)`;
   return (
     <button
       type="button"
-      className="inline-flex items-center gap-1 rounded-full bg-bg px-2 py-1 font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30"
+      className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-bg px-2.5 py-1 font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30"
       onClick={onClick}
-      aria-label={`Open ${label.toLowerCase()} work surface`}
-      title={`Open ${label}`}
+      aria-label={`Open ${label.toLowerCase()} work surface, ${value.value} ${pluralUnit}`}
+      title={title}
     >
       <Icon className="size-3.5 text-text-muted" />
-      {value}
+      <span className="tabular-nums text-text">{value.value}</span>
+      <span className="hidden sm:inline">{label}</span>
+      <span className="hidden text-text-muted xl:inline">{pluralUnit}</span>
     </button>
   );
+}
+
+type RunActivityMetricCount = {
+  active: number;
+  total: number;
+  value: number;
+  mode: "active" | "item";
+};
+
+function runActivityMetricCount(
+  active: number,
+  total: number,
+): RunActivityMetricCount {
+  if (active > 0) {
+    return { active, total, value: active, mode: "active" };
+  }
+  return { active, total, value: total, mode: "item" };
 }

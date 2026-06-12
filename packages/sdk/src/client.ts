@@ -117,6 +117,10 @@ type RunStatusWire = {
   status: string;
   waiting_for?: string | null;
   events_count: number;
+  workspace?: RunStatus['workspace'];
+  executor?: RunStatus['executor'];
+  transport?: string | null;
+  fallback_policy?: string | null;
 };
 
 type RunListWire = {
@@ -153,6 +157,10 @@ function normalizeRunStatus(w: RunStatusWire): RunStatus {
     status: w.status as RunStatus['status'],
     eventsCount: Number(w.events_count),
     waitingFor: w.waiting_for ?? undefined,
+    workspace: w.workspace,
+    executor: w.executor,
+    transport: w.transport ?? undefined,
+    fallbackPolicy: w.fallback_policy ?? undefined,
   };
 }
 

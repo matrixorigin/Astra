@@ -10,9 +10,10 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use axum::Json;
@@ -50,7 +51,8 @@ use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, DynamicAgentSpawner, InheritedPermissions,
-    ProgressBroadcaster, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+    ProgressBroadcaster, ProgressEventType, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+    SpawnedAgentState,
 };
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
@@ -62,6 +64,10 @@ use crate::{
     EventCreateRequestData, EventService,
 };
 use astra_pipeline::step_recorder::StepRecorder;
+use astra_turn_core::agent_live_event::{
+    AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
+    AgentLiveTermination, SharedAgentLiveEventSink,
+};
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
@@ -74,11 +80,17 @@ use astra_core::{
     STATUS_RUNNING, STATUS_WAITING,
 };
 
-use crate::orchestration::spawner::project_subrun_status_to_spawn;
+use crate::orchestration::spawner::{
+    agent_status_to_progress_event, project_subrun_status_to_spawn,
+};
 use crate::server::run::engine::{RunEngine, RunStartContext};
 use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
+use crate::server::tool_transport::{
+    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+};
 use crate::server::{server_skill_subrun, server_tool_executor};
 
 const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
@@ -98,6 +110,448 @@ fn wire_executor_into_state(
     let executor = std::sync::Arc::new(executor);
     state.hooks.task_board_monitor = Some(executor.task_manager());
     state.server_tool_executor = Some(executor);
+}
+
+fn resolve_request_execution_bindings(
+    request: &ChatRequestData,
+    server_workspace: &Path,
+) -> (WorkspaceBinding, ExecutorBinding) {
+    let workspace = match request.workspace_binding.as_ref() {
+        Some(binding) => workspace_binding_from_request(binding, server_workspace),
+        None => WorkspaceBinding::server_sandbox(server_workspace),
+    };
+    let executor = executor_binding_from_request(request.executor_binding.as_ref(), &workspace);
+    (workspace, executor)
+}
+
+fn request_uses_server_workspace(request: &ChatRequestData, has_edge_tools: bool) -> bool {
+    match request
+        .workspace_binding
+        .as_ref()
+        .map(|binding| binding.kind)
+    {
+        Some(astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox) => true,
+        Some(_) => false,
+        None => !has_edge_tools,
+    }
+}
+
+fn resolve_request_execution_bindings_without_server_workspace(
+    request: &ChatRequestData,
+    edge_profile: &Map<String, Value>,
+) -> Option<(WorkspaceBinding, ExecutorBinding)> {
+    let Some(binding) = request.workspace_binding.as_ref() else {
+        return Some(execution_bindings_from_edge_profile(edge_profile));
+    };
+    if matches!(
+        binding.kind,
+        astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
+    ) {
+        return None;
+    }
+    let workspace = workspace_binding_from_request(binding, Path::new(""));
+    let executor = executor_binding_from_request(request.executor_binding.as_ref(), &workspace);
+    Some((workspace, executor))
+}
+
+fn execution_bindings_from_edge_profile(
+    edge_profile: &Map<String, Value>,
+) -> (WorkspaceBinding, ExecutorBinding) {
+    let cwd = first_non_empty_profile_string(edge_profile, &["cwd", "git_root"]);
+    let executor_id =
+        first_non_empty_profile_string(edge_profile, &["edge_agent_id", "agent_id", "edge_id"])
+            .unwrap_or_else(|| "edge-profile".to_string());
+    let display_name = first_non_empty_profile_string(
+        edge_profile,
+        &["display_name", "hostname", "edge_agent_id", "agent_id"],
+    )
+    .unwrap_or_else(|| {
+        if cwd.is_some() {
+            "Edge workspace".to_string()
+        } else {
+            "No workspace".to_string()
+        }
+    });
+
+    let workspace = if let Some(cwd) = cwd {
+        WorkspaceBinding {
+            kind: WorkspaceBindingKind::EdgeWorkspace,
+            display_name: display_name.clone(),
+            cwd: Some(cwd),
+            authority: WorkspaceAuthority::ReadWrite,
+            fallback_policy: FallbackPolicy::Disabled,
+        }
+    } else {
+        WorkspaceBinding {
+            kind: WorkspaceBindingKind::None,
+            display_name: "No workspace".to_string(),
+            cwd: None,
+            authority: WorkspaceAuthority::None,
+            fallback_policy: FallbackPolicy::Disabled,
+        }
+    };
+    let executor = match workspace.kind {
+        WorkspaceBindingKind::EdgeWorkspace => ExecutorBinding::edge_agent(
+            executor_id,
+            display_name,
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Unknown,
+        ),
+        _ => ExecutorBinding {
+            kind: ExecutorBindingKind::Unknown,
+            executor_id: "none".to_string(),
+            display_name: "No executor".to_string(),
+            transport: ToolTransportKind::Unknown,
+            status: ExecutorStatus::Unknown,
+        },
+    };
+    (workspace, executor)
+}
+
+fn first_non_empty_profile_string(
+    edge_profile: &Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        edge_profile
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn execution_bindings_from_metadata(
+    metadata: Option<&Value>,
+    server_workspace: &Path,
+) -> Option<(WorkspaceBinding, ExecutorBinding)> {
+    let metadata = metadata?.as_object()?;
+    let mut workspace: WorkspaceBinding =
+        serde_json::from_value(metadata.get("workspace")?.clone()).ok()?;
+    if matches!(workspace.kind, WorkspaceBindingKind::ServerSandbox) {
+        workspace.cwd = Some(server_workspace.display().to_string());
+    }
+    let executor: ExecutorBinding =
+        serde_json::from_value(metadata.get("executor")?.clone()).ok()?;
+    Some((workspace, executor))
+}
+
+#[derive(Default)]
+struct RunExecutionBindingSnapshot {
+    workspace: Option<Value>,
+    executor: Option<Value>,
+    transport: Option<String>,
+    fallback_policy: Option<String>,
+}
+
+fn agent_working_dir_for_bindings(
+    execution_bindings: Option<&(WorkspaceBinding, ExecutorBinding)>,
+    runtime_workspace: &Path,
+) -> PathBuf {
+    let Some((workspace, _)) = execution_bindings else {
+        return runtime_workspace.to_path_buf();
+    };
+    if matches!(workspace.kind, WorkspaceBindingKind::ServerSandbox) {
+        return runtime_workspace.to_path_buf();
+    }
+    workspace
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_workspace.to_path_buf())
+}
+
+fn binding_snapshot_events(
+    run_id: &str,
+    session_id: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+) -> [Value; 2] {
+    let mut workspace_event = Map::new();
+    workspace_event.insert(
+        "type".to_string(),
+        Value::String("workspace_bound".to_string()),
+    );
+    workspace_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    workspace_event.insert(
+        "session_id".to_string(),
+        Value::String(session_id.to_string()),
+    );
+    for (key, value) in binding_event_fields(workspace, executor) {
+        workspace_event.insert(key, value);
+    }
+
+    let mut executor_event = Map::new();
+    executor_event.insert(
+        "type".to_string(),
+        Value::String("executor_bound".to_string()),
+    );
+    executor_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    executor_event.insert(
+        "session_id".to_string(),
+        Value::String(session_id.to_string()),
+    );
+    for (key, value) in binding_event_fields(workspace, executor) {
+        executor_event.insert(key, value);
+    }
+
+    [
+        Value::Object(workspace_event),
+        Value::Object(executor_event),
+    ]
+}
+
+fn run_start_context_from_request(
+    request: &ChatRequestData,
+    execution_bindings: Option<&(WorkspaceBinding, ExecutorBinding)>,
+) -> RunStartContext {
+    RunStartContext {
+        interaction_mode: request.interaction_mode,
+        interactive_client: Some(request.interactive_client),
+        execution_metadata: execution_bindings
+            .map(|(workspace, executor)| binding_event_fields(workspace, executor)),
+    }
+}
+
+fn workspace_binding_from_request(
+    binding: &astra_services::runs::WorkspaceBindingRequest,
+    server_workspace: &Path,
+) -> WorkspaceBinding {
+    match binding.kind {
+        astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox => {
+            let mut workspace = WorkspaceBinding::server_sandbox(server_workspace);
+            if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
+                workspace.display_name = display_name;
+            }
+            if let Some(authority) = binding.authority {
+                workspace.authority = workspace_authority_from_request(authority);
+            }
+            if let Some(fallback_policy) = binding.fallback_policy {
+                workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
+            }
+            workspace
+        }
+        astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace => WorkspaceBinding {
+            kind: WorkspaceBindingKind::EdgeWorkspace,
+            display_name: non_empty_string(binding.display_name.as_deref())
+                .unwrap_or_else(|| "Edge workspace".to_string()),
+            cwd: non_empty_string(binding.cwd.as_deref()),
+            authority: binding
+                .authority
+                .map(workspace_authority_from_request)
+                .unwrap_or(WorkspaceAuthority::ReadWrite),
+            fallback_policy: binding
+                .fallback_policy
+                .map(fallback_policy_from_request)
+                .unwrap_or(FallbackPolicy::Disabled),
+        },
+        astra_services::runs::WorkspaceBindingRequestKind::UploadedSnapshot => WorkspaceBinding {
+            kind: WorkspaceBindingKind::UploadedSnapshot,
+            display_name: non_empty_string(binding.display_name.as_deref())
+                .unwrap_or_else(|| "Uploaded snapshot".to_string()),
+            cwd: non_empty_string(binding.cwd.as_deref()),
+            authority: binding
+                .authority
+                .map(workspace_authority_from_request)
+                .unwrap_or(WorkspaceAuthority::ReadOnly),
+            fallback_policy: binding
+                .fallback_policy
+                .map(fallback_policy_from_request)
+                .unwrap_or(FallbackPolicy::Disabled),
+        },
+        astra_services::runs::WorkspaceBindingRequestKind::GitCheckout => WorkspaceBinding {
+            kind: WorkspaceBindingKind::GitCheckout,
+            display_name: non_empty_string(binding.display_name.as_deref())
+                .unwrap_or_else(|| "Git checkout".to_string()),
+            cwd: non_empty_string(binding.cwd.as_deref()),
+            authority: binding
+                .authority
+                .map(workspace_authority_from_request)
+                .unwrap_or(WorkspaceAuthority::ReadWrite),
+            fallback_policy: binding
+                .fallback_policy
+                .map(fallback_policy_from_request)
+                .unwrap_or(FallbackPolicy::Disabled),
+        },
+        astra_services::runs::WorkspaceBindingRequestKind::None => WorkspaceBinding {
+            kind: WorkspaceBindingKind::None,
+            display_name: non_empty_string(binding.display_name.as_deref())
+                .unwrap_or_else(|| "No workspace".to_string()),
+            cwd: None,
+            authority: WorkspaceAuthority::None,
+            fallback_policy: binding
+                .fallback_policy
+                .map(fallback_policy_from_request)
+                .unwrap_or(FallbackPolicy::Disabled),
+        },
+    }
+}
+
+fn executor_binding_from_request(
+    binding: Option<&astra_services::runs::ExecutorBindingRequest>,
+    workspace: &WorkspaceBinding,
+) -> ExecutorBinding {
+    match workspace.kind {
+        WorkspaceBindingKind::ServerSandbox => {
+            let mut executor = ExecutorBinding::server_local();
+            if let Some(binding) = binding {
+                if let Some(executor_id) = non_empty_string(binding.executor_id.as_deref()) {
+                    executor.executor_id = executor_id;
+                }
+                if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
+                    executor.display_name = display_name;
+                }
+                if let Some(status) = binding.status {
+                    executor.status = executor_status_from_request(status);
+                }
+            }
+            executor
+        }
+        WorkspaceBindingKind::EdgeWorkspace => edge_executor_binding_from_request(binding),
+        WorkspaceBindingKind::UploadedSnapshot | WorkspaceBindingKind::GitCheckout => {
+            hosted_executor_binding_from_request(binding, &workspace.display_name)
+        }
+        WorkspaceBindingKind::None => ExecutorBinding {
+            kind: ExecutorBindingKind::Unknown,
+            executor_id: "none".to_string(),
+            display_name: "No executor".to_string(),
+            transport: ToolTransportKind::Unknown,
+            status: ExecutorStatus::Unknown,
+        },
+        WorkspaceBindingKind::Unknown => ExecutorBinding {
+            kind: ExecutorBindingKind::Unknown,
+            executor_id: "unknown".to_string(),
+            display_name: "Unknown executor".to_string(),
+            transport: ToolTransportKind::Unknown,
+            status: ExecutorStatus::Unknown,
+        },
+    }
+}
+
+fn edge_executor_binding_from_request(
+    binding: Option<&astra_services::runs::ExecutorBindingRequest>,
+) -> ExecutorBinding {
+    let mut executor = ExecutorBinding::edge_agent(
+        "edge-agent",
+        "Edge workspace",
+        ToolTransportKind::EdgeWs,
+        ExecutorStatus::Unknown,
+    );
+    if let Some(binding) = binding {
+        if let Some(executor_id) = non_empty_string(binding.executor_id.as_deref()) {
+            executor.executor_id = executor_id;
+        }
+        if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
+            executor.display_name = display_name;
+        }
+        if let Some(transport) = binding.transport {
+            executor.transport = tool_transport_from_request(transport);
+        }
+        if let Some(status) = binding.status {
+            executor.status = executor_status_from_request(status);
+        }
+    }
+    executor
+}
+
+fn hosted_executor_binding_from_request(
+    binding: Option<&astra_services::runs::ExecutorBindingRequest>,
+    workspace_display_name: &str,
+) -> ExecutorBinding {
+    let mut executor = ExecutorBinding {
+        kind: ExecutorBindingKind::HostedRunner,
+        executor_id: "hosted-runner".to_string(),
+        display_name: workspace_display_name.to_string(),
+        transport: ToolTransportKind::RunnerRpc,
+        status: ExecutorStatus::Unknown,
+    };
+    if let Some(binding) = binding {
+        executor.kind = executor_kind_from_request(binding.kind);
+        if let Some(executor_id) = non_empty_string(binding.executor_id.as_deref()) {
+            executor.executor_id = executor_id;
+        }
+        if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
+            executor.display_name = display_name;
+        }
+        if let Some(transport) = binding.transport {
+            executor.transport = tool_transport_from_request(transport);
+        }
+        if let Some(status) = binding.status {
+            executor.status = executor_status_from_request(status);
+        }
+    }
+    executor
+}
+
+fn workspace_authority_from_request(
+    authority: astra_services::runs::WorkspaceAuthorityRequest,
+) -> WorkspaceAuthority {
+    match authority {
+        astra_services::runs::WorkspaceAuthorityRequest::ReadOnly => WorkspaceAuthority::ReadOnly,
+        astra_services::runs::WorkspaceAuthorityRequest::ReadWrite => WorkspaceAuthority::ReadWrite,
+        astra_services::runs::WorkspaceAuthorityRequest::None => WorkspaceAuthority::None,
+    }
+}
+
+fn fallback_policy_from_request(
+    fallback_policy: astra_services::runs::FallbackPolicyRequest,
+) -> FallbackPolicy {
+    match fallback_policy {
+        astra_services::runs::FallbackPolicyRequest::Disabled => FallbackPolicy::Disabled,
+    }
+}
+
+fn executor_kind_from_request(
+    kind: astra_services::runs::ExecutorBindingRequestKind,
+) -> ExecutorBindingKind {
+    match kind {
+        astra_services::runs::ExecutorBindingRequestKind::ServerLocal => {
+            ExecutorBindingKind::ServerLocal
+        }
+        astra_services::runs::ExecutorBindingRequestKind::EdgeAgent => {
+            ExecutorBindingKind::EdgeAgent
+        }
+        astra_services::runs::ExecutorBindingRequestKind::ThinClient => {
+            ExecutorBindingKind::ThinClient
+        }
+        astra_services::runs::ExecutorBindingRequestKind::Mcp => ExecutorBindingKind::Mcp,
+        astra_services::runs::ExecutorBindingRequestKind::HostedRunner => {
+            ExecutorBindingKind::HostedRunner
+        }
+    }
+}
+
+fn tool_transport_from_request(
+    transport: astra_services::runs::ToolTransportKindRequest,
+) -> ToolTransportKind {
+    match transport {
+        astra_services::runs::ToolTransportKindRequest::ServerLocal => {
+            ToolTransportKind::ServerLocal
+        }
+        astra_services::runs::ToolTransportKindRequest::EdgeWs => ToolTransportKind::EdgeWs,
+        astra_services::runs::ToolTransportKindRequest::EdgeLedger => ToolTransportKind::EdgeLedger,
+        astra_services::runs::ToolTransportKindRequest::McpHttp => ToolTransportKind::McpHttp,
+        astra_services::runs::ToolTransportKindRequest::RunnerRpc => ToolTransportKind::RunnerRpc,
+    }
+}
+
+fn executor_status_from_request(
+    status: astra_services::runs::ExecutorStatusRequest,
+) -> ExecutorStatus {
+    match status {
+        astra_services::runs::ExecutorStatusRequest::Online => ExecutorStatus::Online,
+        astra_services::runs::ExecutorStatusRequest::Offline => ExecutorStatus::Offline,
+        astra_services::runs::ExecutorStatusRequest::Degraded => ExecutorStatus::Degraded,
+        astra_services::runs::ExecutorStatusRequest::Unknown => ExecutorStatus::Unknown,
+    }
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -2447,6 +2901,7 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                     "text_done"
                         | "run_error"
                         | "run_interrupted"
+                        | "run_waiting"
                         | "run_finished"
                         | "reasoning_delta"
                         | "reasoning_message_content"
@@ -2463,7 +2918,7 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
 fn streaming_final_event_for_replay(event: &Value) -> bool {
     matches!(
         durable_event_type(event),
-        Some("text_done" | "run_error" | "run_interrupted" | "run_finished")
+        Some("text_done" | "run_error" | "run_interrupted" | "run_waiting" | "run_finished")
     )
 }
 
@@ -2472,6 +2927,9 @@ fn streaming_event_for_persistence(event: &Value) -> bool {
 }
 
 fn live_delta_event_for_persistence(event: &Value) -> bool {
+    if durable_event_type(event).is_some_and(|event_type| event_type.starts_with("run_blocked_")) {
+        return true;
+    }
     matches!(
         durable_event_type(event),
         Some(
@@ -2481,16 +2939,25 @@ fn live_delta_event_for_persistence(event: &Value) -> bool {
                 | "reasoning_done"
                 | "thinking_delta"
                 | "thinking_done"
+                | "workspace_bound"
+                | "executor_bound"
+                | "executor_status_changed"
                 | "agent_delegated"
                 | "agent_spawned"
+                | "agent_live_event"
                 | "agent_progress"
                 | "agent_completed"
                 | "agent_failed"
+                | "agent_waiting"
                 | "agent_cancelled"
                 | "agent_interrupted"
                 | "task_board_snapshot"
                 | "tool_call"
                 | "tool_call_start"
+                | "tool_routing_decision"
+                | "tool_transport_started"
+                | "tool_transport_completed"
+                | "tool_transport_failed"
                 | "tool_call_end"
         )
     )
@@ -2514,25 +2981,350 @@ struct RunState {
 struct AgentProgressStreamBridge {
     stop_tx: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
+    sent_lifecycle_events: AgentProgressLifecycleLedger,
 }
 
 impl AgentProgressStreamBridge {
-    async fn stop_and_drain(self) {
+    async fn stop_and_drain(self) -> AgentProgressLifecycleLedger {
         let _ = self.stop_tx.send(());
         let _ = self.join.await;
+        self.sent_lifecycle_events
+    }
+}
+
+type AgentProgressLifecycleLedger = Arc<std::sync::Mutex<HashSet<AgentProgressLifecycleEventKey>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentProgressLifecycleEventKey {
+    agent_id: String,
+    kind: AgentProgressLifecycleEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AgentProgressLifecycleEventKind {
+    Spawned { run_id: String },
+    Completed,
+    Interrupted,
+    Failed,
+    Waiting,
+    Cancelled,
+}
+
+fn agent_progress_lifecycle_event_key(
+    event: &AgentProgressEvent,
+) -> Option<AgentProgressLifecycleEventKey> {
+    let kind = match &event.event_type {
+        ProgressEventType::AgentSpawned { run_id, .. } => {
+            AgentProgressLifecycleEventKind::Spawned {
+                run_id: run_id.clone(),
+            }
+        }
+        ProgressEventType::Completed { .. } => AgentProgressLifecycleEventKind::Completed,
+        ProgressEventType::Interrupted { .. } => AgentProgressLifecycleEventKind::Interrupted,
+        ProgressEventType::Failed { .. } => AgentProgressLifecycleEventKind::Failed,
+        ProgressEventType::Waiting { .. } => AgentProgressLifecycleEventKind::Waiting,
+        ProgressEventType::Cancelled { .. } => AgentProgressLifecycleEventKind::Cancelled,
+        _ => return None,
+    };
+    Some(AgentProgressLifecycleEventKey {
+        agent_id: event.agent_id.clone(),
+        kind,
+    })
+}
+
+fn mark_agent_progress_lifecycle_event_sent(
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
+    key: AgentProgressLifecycleEventKey,
+) {
+    sent_lifecycle_events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key);
+}
+
+fn has_agent_progress_lifecycle_event_sent(
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
+    key: &AgentProgressLifecycleEventKey,
+) -> bool {
+    sent_lifecycle_events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(key)
+}
+
+#[derive(Debug, Clone)]
+struct WorkSurfaceAgentLiveEventSink {
+    tx: mpsc::Sender<Value>,
+    execution_metadata: Option<Value>,
+}
+
+impl WorkSurfaceAgentLiveEventSink {
+    fn new(tx: mpsc::Sender<Value>, execution_metadata: Option<Value>) -> Self {
+        Self {
+            tx,
+            execution_metadata,
+        }
+    }
+}
+
+impl AgentLiveEventSink for WorkSurfaceAgentLiveEventSink {
+    fn send(&self, event: AgentLiveEvent) -> Result<(), AgentLiveSendError> {
+        let value = agent_live_event_to_work_surface_sse(&event, self.execution_metadata.as_ref());
+        match self.tx.try_send(value) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Work surface receiver is behind — drop rather than block the
+                // SSE emitter thread. The frontend will catch up on the next
+                // poll / refresh.
+                Err(AgentLiveSendError::Dropped)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(AgentLiveSendError::Closed)
+            }
+        }
+    }
+}
+
+fn agent_live_event_to_work_surface_sse(
+    event: &AgentLiveEvent,
+    execution_metadata: Option<&Value>,
+) -> Value {
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let mut value = match &event.kind {
+        AgentLiveEventKind::OutputDelta(content) => json!({
+            "type": "agent_live_event",
+            "agent_id": event.agent_id.as_str(),
+            "event_kind": "output_delta",
+            "content": content,
+            "timestamp": timestamp,
+        }),
+        AgentLiveEventKind::ThinkingDelta(content) => json!({
+            "type": "agent_live_event",
+            "agent_id": event.agent_id.as_str(),
+            "event_kind": "thinking_delta",
+            "content": content,
+            "timestamp": timestamp,
+        }),
+        AgentLiveEventKind::Status(content) => json!({
+            "type": "agent_live_event",
+            "agent_id": event.agent_id.as_str(),
+            "event_kind": "status",
+            "content": content,
+            "timestamp": timestamp,
+        }),
+        AgentLiveEventKind::ToolStarted {
+            name,
+            description,
+            tool_use_id,
+        } => json!({
+            "type": "agent_live_event",
+            "agent_id": event.agent_id.as_str(),
+            "event_kind": "tool_started",
+            "name": name,
+            "description": description,
+            "tool_use_id": tool_use_id,
+            "timestamp": timestamp,
+        }),
+        AgentLiveEventKind::ToolCompleted {
+            name,
+            description,
+            status,
+            duration_ms,
+            output_summary,
+            output,
+            tool_use_id,
+        } => json!({
+            "type": "agent_live_event",
+            "agent_id": event.agent_id.as_str(),
+            "event_kind": "tool_completed",
+            "name": name,
+            "description": description,
+            "status": status,
+            "duration_ms": duration_ms,
+            "output_summary": output_summary,
+            "output": output,
+            "tool_use_id": tool_use_id,
+            "timestamp": timestamp,
+        }),
+        AgentLiveEventKind::AgentTerminated {
+            termination,
+            duration_ms,
+            reason,
+        } => {
+            let termination = match termination {
+                AgentLiveTermination::Completed => "completed",
+                AgentLiveTermination::Failed => "failed",
+                AgentLiveTermination::Cancelled => "cancelled",
+            };
+            json!({
+                "type": "agent_live_event",
+                "agent_id": event.agent_id.as_str(),
+                "event_kind": "agent_terminated",
+                "termination": termination,
+                "status": termination,
+                "duration_ms": duration_ms,
+                "reason": reason,
+                "timestamp": timestamp,
+            })
+        }
+    };
+    merge_agent_live_execution_metadata(&mut value, execution_metadata);
+    value
+}
+
+fn merge_agent_live_execution_metadata(event: &mut Value, execution_metadata: Option<&Value>) {
+    let Some(event_obj) = event.as_object_mut() else {
+        return;
+    };
+    let Some(metadata_obj) = execution_metadata.and_then(Value::as_object) else {
+        return;
+    };
+    for key in ["workspace", "executor", "transport", "fallback_policy"] {
+        if let Some(value) = metadata_obj.get(key).cloned() {
+            event_obj.entry(key.to_string()).or_insert(value);
+        }
     }
 }
 
 async fn forward_agent_progress_event_to_stream(
     filter: &mut server_loop_host::RunScopedAgentProgressFilter,
     event_tx: &mpsc::Sender<Value>,
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
     evt: AgentProgressEvent,
 ) -> bool {
     for evt in filter.accept(evt) {
+        let lifecycle_key = agent_progress_lifecycle_event_key(&evt);
         let Some(event) = server_loop_host::progress_event_to_sse(&evt) else {
             continue;
         };
         if event_tx.send(event).await.is_err() {
+            return false;
+        }
+        if let Some(key) = lifecycle_key {
+            mark_agent_progress_lifecycle_event_sent(sent_lifecycle_events, key);
+        }
+    }
+    true
+}
+
+async fn drain_ready_agent_progress_events(
+    progress_rx: &mut broadcast::Receiver<AgentProgressEvent>,
+    filter: &mut server_loop_host::RunScopedAgentProgressFilter,
+    event_tx: &mpsc::Sender<Value>,
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
+) -> bool {
+    loop {
+        match progress_rx.try_recv() {
+            Ok(evt) => {
+                if !forward_agent_progress_event_to_stream(
+                    filter,
+                    event_tx,
+                    sent_lifecycle_events,
+                    evt,
+                )
+                .await
+                {
+                    return false;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                tracing::warn!(
+                    target: "astra_runtime::work_surface",
+                    dropped,
+                    "agent progress live stream lagged while draining ready events"
+                );
+                continue;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => return true,
+            Err(broadcast::error::TryRecvError::Closed) => return true,
+        }
+    }
+}
+
+fn system_time_epoch_ms(time: SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn agent_spawned_progress_event_from_state(state: &SpawnedAgentState) -> AgentProgressEvent {
+    AgentProgressEvent {
+        agent_id: state.agent_id.clone(),
+        event_type: ProgressEventType::AgentSpawned {
+            run_id: state.run_id.clone(),
+            parent_run_id: state.parent_run_id.clone(),
+            agent_type: state.agent_type.clone(),
+            description: state.description.clone(),
+            fanout_slot: state.fanout_slot.clone(),
+        },
+        timestamp_epoch_ms: system_time_epoch_ms(state.started_at),
+        metadata: state.execution_metadata.clone(),
+    }
+}
+
+fn agent_lifecycle_progress_event_from_state(
+    state: &SpawnedAgentState,
+) -> Option<AgentProgressEvent> {
+    let event_type =
+        agent_status_to_progress_event(&state.status, &state.metrics, state.started_at)?;
+    if !event_type.is_terminal() && !matches!(event_type, ProgressEventType::Waiting { .. }) {
+        return None;
+    }
+    Some(AgentProgressEvent {
+        agent_id: state.agent_id.clone(),
+        event_type,
+        timestamp_epoch_ms: SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0),
+        metadata: state.execution_metadata.clone(),
+    })
+}
+
+async fn send_missing_agent_lifecycle_event(
+    event_tx: &mpsc::Sender<Value>,
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
+    event: AgentProgressEvent,
+) -> bool {
+    let Some(key) = agent_progress_lifecycle_event_key(&event) else {
+        return true;
+    };
+    if has_agent_progress_lifecycle_event_sent(sent_lifecycle_events, &key) {
+        return true;
+    }
+    let Some(sse) = server_loop_host::progress_event_to_sse(&event) else {
+        return true;
+    };
+    if event_tx.send(sse).await.is_err() {
+        return false;
+    }
+    mark_agent_progress_lifecycle_event_sent(sent_lifecycle_events, key);
+    true
+}
+
+async fn stream_missing_agent_lifecycle_events(
+    spawner: &DynamicAgentSpawner,
+    root_run_id: &str,
+    event_tx: &mpsc::Sender<Value>,
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
+) -> bool {
+    let states = spawner.get_agent_states_for_run_tree(root_run_id).await;
+    for state in states {
+        if !send_missing_agent_lifecycle_event(
+            event_tx,
+            sent_lifecycle_events,
+            agent_spawned_progress_event_from_state(&state),
+        )
+        .await
+        {
+            return false;
+        }
+        if let Some(event) = agent_lifecycle_progress_event_from_state(&state)
+            && !send_missing_agent_lifecycle_event(event_tx, sent_lifecycle_events, event).await
+        {
             return false;
         }
     }
@@ -2554,6 +3346,7 @@ struct ServerSpawnRuntimeContext {
     forward_headers: HashMap<String, String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
     request_constraints: RequestConstraints,
+    execution_metadata: Option<Value>,
     pause_flag: Option<Arc<AtomicBool>>,
     cancel_token: Option<Arc<CancellationToken>>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -2808,11 +3601,23 @@ impl AgenticRunLifecycleService {
     ) -> AgentProgressStreamBridge {
         let mut progress_rx = self.dynamic_agent_progress_broadcaster().subscribe();
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let sent_lifecycle_events_for_bridge = Arc::clone(&sent_lifecycle_events);
         let join = tokio::spawn(async move {
             let mut filter = server_loop_host::RunScopedAgentProgressFilter::new(root_run_id);
             'bridge: loop {
                 tokio::select! {
                     _ = &mut stop_rx => {
+                        if !drain_ready_agent_progress_events(
+                            &mut progress_rx,
+                            &mut filter,
+                            &event_tx,
+                            &sent_lifecycle_events_for_bridge,
+                        )
+                        .await
+                        {
+                            break 'bridge;
+                        }
                         let drain_deadline = tokio::time::sleep(AGENT_PROGRESS_STREAM_DRAIN_GRACE);
                         tokio::pin!(drain_deadline);
                         'drain: loop {
@@ -2824,6 +3629,7 @@ impl AgenticRunLifecycleService {
                                             if !forward_agent_progress_event_to_stream(
                                                 &mut filter,
                                                 &event_tx,
+                                                &sent_lifecycle_events_for_bridge,
                                                 evt,
                                             )
                                             .await
@@ -2852,6 +3658,7 @@ impl AgenticRunLifecycleService {
                                 if !forward_agent_progress_event_to_stream(
                                     &mut filter,
                                     &event_tx,
+                                    &sent_lifecycle_events_for_bridge,
                                     evt,
                                 )
                                 .await
@@ -2873,7 +3680,11 @@ impl AgenticRunLifecycleService {
                 }
             }
         });
-        AgentProgressStreamBridge { stop_tx, join }
+        AgentProgressStreamBridge {
+            stop_tx,
+            join,
+            sent_lifecycle_events,
+        }
     }
 
     async fn server_agent_spawner_for_session(&self, session_id: &str) -> ServerAgentSpawnerEntry {
@@ -2970,6 +3781,7 @@ impl AgenticRunLifecycleService {
         turn_seq: u32,
         request: &ChatRequestData,
         workspace: &std::path::Path,
+        work_surface_event_tx: Option<mpsc::Sender<Value>>,
         pause_flag: Option<Arc<AtomicBool>>,
         cancel_token: Option<Arc<CancellationToken>>,
         #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
@@ -2984,6 +3796,7 @@ impl AgenticRunLifecycleService {
             tracing::error!(error = %err, "request constraints failed late validation in dynamic-agent wiring");
             RequestConstraints::default()
         });
+        let execution_metadata = Some(executor.binding_metadata());
         entry
             .executor
             .set_runtime_context(ServerSpawnRuntimeContext {
@@ -2994,6 +3807,7 @@ impl AgenticRunLifecycleService {
                 forward_headers: request.forward_headers.clone(),
                 llm_token_service: request.llm_token_service.clone(),
                 request_constraints: request_constraints.clone(),
+                execution_metadata: execution_metadata.clone(),
                 pause_flag,
                 cancel_token,
                 #[cfg(feature = "bridge-e2e-hooks")]
@@ -3025,8 +3839,14 @@ impl AgenticRunLifecycleService {
                 &request_constraints,
             ),
             active_skills: Vec::new(),
-            live_event_sink: None,
+            live_event_sink: work_surface_event_tx.map(|tx| {
+                Arc::new(WorkSurfaceAgentLiveEventSink::new(
+                    tx,
+                    execution_metadata.clone(),
+                )) as SharedAgentLiveEventSink
+            }),
             trace_context: Some(server_trace_context(user_id, session_id, run_id, turn_seq)),
+            execution_metadata,
         });
     }
 
@@ -3322,16 +4142,14 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         request: &ChatRequestData,
+        execution_bindings: Option<&(WorkspaceBinding, ExecutorBinding)>,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         self.run_engine
             .start_run_with_context(
                 run_id,
                 user_id,
                 session_id,
-                RunStartContext {
-                    interaction_mode: request.interaction_mode,
-                    interactive_client: Some(request.interactive_client),
-                },
+                run_start_context_from_request(request, execution_bindings),
             )
             .await
             .map_err(|error| {
@@ -4082,13 +4900,58 @@ impl AgenticRunLifecycleService {
             .collect()
     }
 
+    fn durable_event_payload(event: &Value) -> Option<&Map<String, Value>> {
+        if event.get("event_type").is_some() {
+            event.get("data").and_then(Value::as_object)
+        } else {
+            event.as_object()
+        }
+    }
+
+    fn durable_run_execution_binding_snapshot(
+        run: &DurableRunRecord,
+    ) -> RunExecutionBindingSnapshot {
+        let mut snapshot = RunExecutionBindingSnapshot::default();
+        for event in &run.events {
+            let Some(payload) = Self::durable_event_payload(event) else {
+                continue;
+            };
+            if let Some(workspace) = payload
+                .get("workspace")
+                .filter(|value| value.is_object())
+                .cloned()
+            {
+                snapshot.workspace = Some(workspace);
+            }
+            if let Some(executor) = payload
+                .get("executor")
+                .filter(|value| value.is_object())
+                .cloned()
+            {
+                snapshot.executor = Some(executor);
+            }
+            if let Some(transport) = payload.get("transport").and_then(Value::as_str) {
+                snapshot.transport = Some(transport.to_string());
+            }
+            if let Some(fallback_policy) = payload.get("fallback_policy").and_then(Value::as_str) {
+                snapshot.fallback_policy = Some(fallback_policy.to_string());
+            }
+        }
+        snapshot
+    }
+
     fn durable_status_record(run: &DurableRunRecord) -> RunStatusRecord {
+        let binding = Self::durable_run_execution_binding_snapshot(run);
         RunStatusRecord {
             run_id: run.run_id.clone(),
             session_id: run.session_id.clone(),
             status: run.status.clone(),
             waiting_for: run.waiting_for.clone(),
             events_count: run.events.len() as i64,
+            workspace: binding.workspace,
+            executor: binding.executor,
+            transport: binding.transport,
+            fallback_policy: binding.fallback_policy,
         }
     }
 
@@ -4234,6 +5097,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let edge_tools = Self::extract_edge_tools(&request);
+        let server_side_tool_catalog = edge_tools.is_empty();
         let edge_profile = Self::extract_edge_profile(&request);
         let mcp_bundle =
             runtime_mcp::prepare_request_scoped_runtime_bundle(&request.runtime_mcp_bindings)
@@ -4255,8 +5119,35 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runs.insert(run_id.clone(), run_state);
         }
 
+        // Provision workspace early so build_initial_state and durable
+        // run_started metadata use the same execution boundary.
+        let server_workspace = if request_uses_server_workspace(&request, !edge_tools.is_empty()) {
+            Some(self.provision_server_workspace(&session_id))
+        } else {
+            None
+        };
+        let execution_bindings = server_workspace
+            .as_deref()
+            .map(|workspace| resolve_request_execution_bindings(&request, workspace))
+            .or_else(|| {
+                resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+            });
+        let tool_runtime_workspace = server_workspace.clone().or_else(|| {
+            if server_side_tool_catalog && execution_bindings.is_some() {
+                Some(self.provision_server_workspace(&session_id))
+            } else {
+                None
+            }
+        });
+
         if let Err(error) = self
-            .persist_run_start(&run_id, &user_id, &session_id, &request)
+            .persist_run_start(
+                &run_id,
+                &user_id,
+                &session_id,
+                &request,
+                execution_bindings.as_ref(),
+            )
             .await
         {
             self.runs.write().await.remove(&run_id);
@@ -4264,14 +5155,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         // Spawn background agentic loop.
-
-        // Provision workspace early so build_initial_state can load stop hooks
-        // from the provisioned directory when no edge profile supplies cwd.
-        let server_workspace = if edge_tools.is_empty() {
-            Some(self.provision_server_workspace(&session_id))
-        } else {
-            None
-        };
         // Look up the plan-resume hint up-front so the system prompt on every
         // turn reminds the LLM a plan is in flight. Missing pool → None, missing
         // active plan → None, transient errors → None (best-effort).
@@ -4294,6 +5177,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_resume_hint,
             task_board_resume_hint,
         );
+        if let Some((workspace_binding, executor_binding)) = execution_bindings.as_ref() {
+            host.set_execution_metadata(Value::Object(binding_event_fields(
+                workspace_binding,
+                executor_binding,
+            )));
+        }
         if let Some(ref bundle) = mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone());
         }
@@ -4360,9 +5249,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &session_id,
         )
         .await;
-        // When no edge tools are provided (no CLI connected), use the
-        // already-provisioned workspace for the ServerToolExecutor.
-        if let Some(workspace) = server_workspace {
+        // The ServerToolExecutor is the owner for server-side runtime tools
+        // such as `agent`. For edge-bound runs this workspace is only an
+        // internal runtime scratch dir; execution routing still follows the
+        // explicit workspace/executor binding and cannot silently fall back.
+        if let Some(workspace) = tool_runtime_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
@@ -4423,6 +5314,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(writer) = self.auxiliary_event_writer.clone() {
                 executor.set_auxiliary_event_writer(writer);
             }
+            let (workspace_binding, executor_binding) =
+                execution_bindings.clone().unwrap_or_else(|| {
+                    resolve_request_execution_bindings(&request, workspace.as_path())
+                });
+            let agent_working_dir =
+                agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
+            host.set_execution_metadata(Value::Object(binding_event_fields(
+                &workspace_binding,
+                &executor_binding,
+            )));
+            executor.set_execution_bindings(workspace_binding, executor_binding);
 
             self.wire_server_dynamic_agent_tools(
                 &mut executor,
@@ -4431,7 +5333,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &run_id,
                 loop_state.session_turn,
                 &request,
-                workspace.as_path(),
+                agent_working_dir.as_path(),
+                None,
                 Some(pause_flag.clone()),
                 Some(llm_cancel_token.clone()),
                 #[cfg(feature = "harness")]
@@ -4767,6 +5670,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let edge_tools = Self::extract_edge_tools(&request);
+        let server_side_tool_catalog = edge_tools.is_empty();
         let edge_profile = Self::extract_edge_profile(&request);
 
         // ── MCP: request-scoped discovery; schemas and credentials stay in memory.
@@ -4776,11 +5680,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Provision workspace early for web-agent mode (no edge tools) so
         // build_initial_state loads stop hooks from the provisioned directory.
-        let server_workspace = if edge_tools.is_empty() {
+        let server_workspace = if request_uses_server_workspace(&request, !edge_tools.is_empty()) {
             Some(self.provision_server_workspace(&session_id))
         } else {
             None
         };
+        let execution_bindings = server_workspace
+            .as_deref()
+            .map(|workspace| resolve_request_execution_bindings(&request, workspace))
+            .or_else(|| {
+                resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+            });
+        let stream_agent_spawner = self
+            .server_agent_spawner_for_session(&session_id)
+            .await
+            .spawner;
+        let tool_runtime_workspace = server_workspace.clone().or_else(|| {
+            if server_side_tool_catalog && execution_bindings.is_some() {
+                Some(self.provision_server_workspace(&session_id))
+            } else {
+                None
+            }
+        });
 
         // Create the bounded SSE channel. 512 events is generous for any single
         // turn; hitting the limit means the client cannot keep up, so we treat
@@ -4790,6 +5711,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
+        let client_event_tx_for_fanout = client_event_tx.clone();
         let fanout_runs = self.runs_handle();
         let fanout_run_id = run_id.clone();
         tokio::spawn(async move {
@@ -4800,7 +5722,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 let _ = live_tx_for_fanout.send(event.clone());
-                let _ = client_event_tx.send(event).await;
+                let _ = client_event_tx_for_fanout.send(event).await;
             }
         });
         let progress_bridge =
@@ -4876,6 +5798,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         );
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
+        if let Some((workspace_binding, executor_binding)) = execution_bindings.as_ref() {
+            host.set_execution_metadata(Value::Object(binding_event_fields(
+                workspace_binding,
+                executor_binding,
+            )));
+        }
 
         // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = mcp_bundle {
@@ -4895,8 +5823,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             runs.insert(run_id.clone(), run_state);
         }
+        if let Some((workspace_binding, executor_binding)) = execution_bindings.as_ref() {
+            for event in
+                binding_snapshot_events(&run_id, &session_id, workspace_binding, executor_binding)
+            {
+                if event_tx.send(event).await.is_err() {
+                    self.runs.write().await.remove(&run_id);
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to start run event stream".to_string(),
+                    ));
+                }
+            }
+        }
         if let Err(error) = self
-            .persist_run_start(&run_id, &user_id, &session_id, &request)
+            .persist_run_start(
+                &run_id,
+                &user_id,
+                &session_id,
+                &request,
+                execution_bindings.as_ref(),
+            )
             .await
         {
             self.runs.write().await.remove(&run_id);
@@ -4928,8 +5875,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         )
         .await;
 
-        // Wire ServerToolExecutor when no edge agent is connected (web-agent mode).
-        if let Some(workspace) = server_workspace {
+        // Wire the server-side runtime tool owner whenever the host exposes the
+        // server tool catalog. For edge-bound runs this uses an internal
+        // scratch workspace only; the visible binding still routes local-code
+        // tools to edge or blocks when edge is unavailable.
+        if let Some(workspace) = tool_runtime_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
@@ -4985,6 +5935,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(writer) = self.auxiliary_event_writer.clone() {
                 executor.set_auxiliary_event_writer(writer);
             }
+            let (workspace_binding, executor_binding) =
+                execution_bindings.clone().unwrap_or_else(|| {
+                    resolve_request_execution_bindings(&request, workspace.as_path())
+                });
+            let agent_working_dir =
+                agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
+            executor.set_execution_bindings(workspace_binding, executor_binding);
             executor.set_work_surface_event_tx(event_tx.clone());
             self.wire_server_dynamic_agent_tools(
                 &mut executor,
@@ -4993,7 +5950,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &run_id,
                 state.session_turn,
                 &request,
-                workspace.as_path(),
+                agent_working_dir.as_path(),
+                Some(event_tx.clone()),
                 Some(pause_flag.clone()),
                 Some(llm_cancel_token.clone()),
                 #[cfg(feature = "harness")]
@@ -5010,6 +5968,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_session_id = session_id.clone();
         let bg_resource_governor = self.resource_governor.clone();
         let bg_user_id = user_id.clone();
+        let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -5161,12 +6120,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
             }
 
-            for event in streamed_final_events {
-                if event_tx.send(event).await.is_err() {
-                    break;
-                }
-            }
-
             // Persist usage unconditionally — cancelled runs still consumed tokens
             // and must have accurate usage in durable store for billing/audit.
             astra_core::log_persist!(
@@ -5196,8 +6149,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Ensure fast synchronous child-agent progress has reached the SSE
-            // stream before the parent turn terminal marker closes the turn.
-            progress_bridge.stop_and_drain().await;
+            // stream before the parent run/turn terminal markers close the turn.
+            let sent_lifecycle_events = progress_bridge.stop_and_drain().await;
+            let _ = stream_missing_agent_lifecycle_events(
+                missing_lifecycle_spawner.as_ref(),
+                &bg_run_id,
+                &event_tx,
+                &sent_lifecycle_events,
+            )
+            .await;
+
+            for event in streamed_final_events {
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
 
             // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
             let _ = event_tx
@@ -5268,6 +6234,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
             })?;
         let recent_events = Self::durable_recent_events(&run, recent_limit);
+        let binding = Self::durable_run_execution_binding_snapshot(&run);
 
         if let Some(projection) = projection {
             Ok(RunProjectionRecord {
@@ -5276,6 +6243,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 status: projection.status,
                 waiting_for: projection.waiting_for,
                 error_message: projection.error_message,
+                workspace: binding.workspace.clone(),
+                executor: binding.executor.clone(),
+                transport: binding.transport.clone(),
+                fallback_policy: binding.fallback_policy.clone(),
                 run_event_high_watermark: run.last_event_idx,
                 projection_event_idx: projection.projection_event_idx,
                 projection_updated_at: projection.updated_at,
@@ -5303,6 +6274,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 status: run.status.clone(),
                 waiting_for: run.waiting_for.clone(),
                 error_message: run.error_message.clone(),
+                workspace: binding.workspace,
+                executor: binding.executor,
+                transport: binding.transport,
+                fallback_policy: binding.fallback_policy,
                 run_event_high_watermark: run.last_event_idx,
                 projection_event_idx: run.last_event_idx,
                 projection_updated_at: run.updated_at.clone(),
@@ -5979,6 +6954,65 @@ fn spawn_system_prompt(config: &SpawnRunConfig) -> String {
     }
 }
 
+fn emit_server_subrun_agent_terminated(
+    sink: Option<&SharedAgentLiveEventSink>,
+    agent_id: &str,
+    started_at: Instant,
+    termination: AgentLiveTermination,
+    reason: Option<String>,
+) {
+    let Some(sink) = sink else {
+        return;
+    };
+    if let Err(error) = sink.send(AgentLiveEvent {
+        agent_id: agent_id.to_string(),
+        kind: AgentLiveEventKind::AgentTerminated {
+            termination,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            reason,
+        },
+    }) {
+        tracing::warn!(
+            target: "astra_runtime::work_surface",
+            agent_id,
+            error = ?error,
+            "failed to emit server subrun terminal live event"
+        );
+    }
+}
+
+fn server_subrun_live_termination(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    loop_state: &AgenticLoopState,
+) -> AgentLiveTermination {
+    match outcome {
+        Ok(AgenticLoopOutcome::Completed) if loop_state.interruption.is_some() => {
+            AgentLiveTermination::Cancelled
+        }
+        Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
+        Ok(AgenticLoopOutcome::Cancelled | AgenticLoopOutcome::Waiting(_)) => {
+            AgentLiveTermination::Cancelled
+        }
+        Ok(AgenticLoopOutcome::Error(_)) | Err(_) => AgentLiveTermination::Failed,
+    }
+}
+
+fn server_subrun_live_reason(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    loop_state: &AgenticLoopState,
+) -> Option<String> {
+    match outcome {
+        Ok(AgenticLoopOutcome::Completed) if loop_state.interruption.is_some() => {
+            Some("paused".to_string())
+        }
+        Ok(AgenticLoopOutcome::Completed) => None,
+        Ok(AgenticLoopOutcome::Cancelled) => Some("cancelled".to_string()),
+        Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.clone()),
+        Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
@@ -6068,8 +7102,14 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             pause_flag: context.pause_flag.clone(),
             checkpoint_gate: None,
             mailbox: config.mailbox,
+            progress_emitter: config.progress_emitter.clone(),
+            live_event_sink: config.live_event_sink.clone(),
             cancel_token: context.cancel_token.clone(),
             inherited_prefix: config.inherited_prefix,
+            execution_metadata: config
+                .execution_metadata
+                .clone()
+                .or_else(|| context.execution_metadata.clone()),
             #[cfg(feature = "harness")]
             harness_sink: context.harness_sink.clone(),
         };
@@ -6294,6 +7334,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // deeper delegation trees but require threading the store into
         // `ServerSubRunExecutor` separately — scope-cut from G2 v1.
         let mut host = builder.build();
+        if let Some(sink) = config.live_event_sink.clone() {
+            host.set_agent_live_event_sink(config.agent_profile.agent_id.clone(), sink);
+        }
 
         // Build the task prompt, incorporating previous output if pipeline.
         let full_task = if let Some(prev) = &config.previous_output {
@@ -6412,6 +7455,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             },
             messaging: MessagingState {
                 mailbox: config.mailbox,
+                progress_emitter: config.progress_emitter.clone(),
                 ..Default::default()
             },
             deferred_input: Default::default(),
@@ -6498,6 +7542,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // server-side and sub-agents would get edge-protocol errors.
         {
             let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id);
+            let execution_bindings =
+                execution_bindings_from_metadata(config.execution_metadata.as_ref(), &workspace);
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
@@ -6546,6 +7592,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(obs) = loop_state.telemetry.observability_session.clone() {
                 executor.set_observability_session(obs);
             }
+            if let Some((workspace_binding, executor_binding)) = execution_bindings {
+                executor.set_execution_bindings(workspace_binding, executor_binding);
+            }
             wire_executor_into_state(executor, &mut loop_state);
         }
 
@@ -6558,6 +7607,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .await;
 
+        let live_started_at = Instant::now();
+        let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
         // Fire SessionEnd hooks (best-effort).
@@ -6614,6 +7665,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.agent_profile.model_override.as_deref(),
         )
         .await;
+
+        emit_server_subrun_agent_terminated(
+            config.live_event_sink.as_ref(),
+            &live_agent_id,
+            live_started_at,
+            server_subrun_live_termination(&outcome, &loop_state),
+            server_subrun_live_reason(&outcome, &loop_state),
+        );
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
@@ -6741,6 +7800,7 @@ mod tests {
             agent_id: agent_id.to_string(),
             event_type,
             timestamp_epoch_ms,
+            metadata: None,
         }
     }
 
@@ -6882,6 +7942,255 @@ mod tests {
                 .any(|event| event["type"].as_str() == Some("agent_completed")),
             "bridge should drain agent_completed before stopping: {events:?}"
         );
+    }
+
+    struct ImmediateLifecycleExecutor;
+
+    #[async_trait]
+    impl SpawnAgentExecutor for ImmediateLifecycleExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                finish_reason: "normal".to_string(),
+                output: Some("child done".to_string()),
+                error: None,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct WaitingLifecycleExecutor;
+
+    #[async_trait]
+    impl SpawnAgentExecutor for WaitingLifecycleExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "waiting".to_string(),
+                finish_reason: "waiting".to_string(),
+                output: Some("executor_offline".to_string()),
+                error: None,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let spawner =
+            DynamicAgentSpawner::new(router).with_executor(Arc::new(ImmediateLifecycleExecutor));
+        let execution_metadata = json!({
+            "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra"},
+            "executor": {"kind": "server_local"},
+            "transport": "server_local"
+        });
+        let context = crate::orchestration::SpawnContext {
+            parent_run_id: "root-run".to_string(),
+            parent_agent_id: "root-agent".to_string(),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            inherited_permissions: None,
+            inherited_skills: vec![],
+            working_dir: PathBuf::from("/tmp/astra"),
+            live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: Some("call-spawn".to_string()),
+            execution_metadata: Some(execution_metadata),
+        };
+        let input = astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
+            description: "review code".to_string(),
+            prompt: "review".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: false,
+            ..Default::default()
+        };
+        let spawn_output = spawner.spawn(input, &context).await.unwrap();
+        assert!(
+            matches!(
+                spawn_output,
+                astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Completed { .. }
+            ),
+            "test setup must archive a synchronous completed child: {spawn_output:?}"
+        );
+
+        let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let (event_tx, mut event_rx) = mpsc::channel::<Value>(8);
+        assert!(
+            stream_missing_agent_lifecycle_events(
+                &spawner,
+                "root-run",
+                &event_tx,
+                &sent_lifecycle_events
+            )
+            .await
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2, "expected spawned + completed: {events:?}");
+        assert_eq!(events[0]["type"], "agent_spawned");
+        assert_eq!(events[0]["workspace"]["kind"], "server_sandbox");
+        assert_eq!(events[0]["executor"]["kind"], "server_local");
+        assert_eq!(events[0]["transport"], "server_local");
+        assert_eq!(events[1]["type"], "agent_completed");
+        assert_eq!(events[1]["status"], "completed");
+        assert_eq!(events[1]["workspace"]["kind"], "server_sandbox");
+
+        let (second_tx, mut second_rx) = mpsc::channel::<Value>(8);
+        assert!(
+            stream_missing_agent_lifecycle_events(
+                &spawner,
+                "root-run",
+                &second_tx,
+                &sent_lifecycle_events
+            )
+            .await
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "already-sent lifecycle events must not be replayed twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let spawner =
+            DynamicAgentSpawner::new(router).with_executor(Arc::new(WaitingLifecycleExecutor));
+        let context = crate::orchestration::SpawnContext {
+            parent_run_id: "root-run".to_string(),
+            parent_agent_id: "root-agent".to_string(),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            inherited_permissions: None,
+            inherited_skills: vec![],
+            working_dir: PathBuf::from("/tmp/astra"),
+            live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: Some("call-spawn".to_string()),
+            execution_metadata: Some(json!({
+                "workspace": {"kind": "edge_workspace", "cwd": "/Users/test/repo"},
+                "executor": {"kind": "edge_agent", "status": "offline"},
+                "transport": "edge_ws"
+            })),
+        };
+        let input = astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
+            description: "review code".to_string(),
+            prompt: "review".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: false,
+            ..Default::default()
+        };
+        let spawn_output = spawner.spawn(input, &context).await.unwrap();
+        assert!(
+            matches!(
+                spawn_output,
+                astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Waiting { .. }
+            ),
+            "test setup must archive a synchronous waiting child: {spawn_output:?}"
+        );
+
+        let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let (event_tx, mut event_rx) = mpsc::channel::<Value>(8);
+        assert!(
+            stream_missing_agent_lifecycle_events(
+                &spawner,
+                "root-run",
+                &event_tx,
+                &sent_lifecycle_events
+            )
+            .await
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2, "expected spawned + waiting: {events:?}");
+        assert_eq!(events[0]["type"], "agent_spawned");
+        assert_eq!(events[1]["type"], "agent_waiting");
+        assert_eq!(events[1]["reason"], "executor_offline");
+        assert_eq!(events[1]["workspace"]["kind"], "edge_workspace");
+        assert_eq!(events[1]["executor"]["kind"], "edge_agent");
+    }
+
+    #[test]
+    fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
+        let metadata = json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-macbook-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        });
+        let output = super::agent_live_event_to_work_surface_sse(
+            &AgentLiveEvent {
+                agent_id: "agent-1".to_string(),
+                kind: AgentLiveEventKind::OutputDelta("child output".to_string()),
+            },
+            Some(&metadata),
+        );
+        assert_eq!(output["type"], "agent_live_event");
+        assert_eq!(output["agent_id"], "agent-1");
+        assert_eq!(output["event_kind"], "output_delta");
+        assert_eq!(output["content"], "child output");
+        assert_eq!(output["workspace"]["kind"], "edge_workspace");
+        assert_eq!(output["executor"]["kind"], "edge_agent");
+        assert_eq!(output["transport"], "edge_ws");
+        assert_eq!(output["fallback_policy"], "disabled");
+
+        let terminal = super::agent_live_event_to_work_surface_sse(
+            &AgentLiveEvent {
+                agent_id: "agent-1".to_string(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: AgentLiveTermination::Completed,
+                    duration_ms: 12,
+                    reason: None,
+                },
+            },
+            Some(&metadata),
+        );
+        assert_eq!(terminal["event_kind"], "agent_terminated");
+        assert_eq!(terminal["termination"], "completed");
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(terminal["duration_ms"], 12);
+        assert_eq!(terminal["workspace"]["kind"], "edge_workspace");
+        assert_eq!(terminal["executor"]["executor_id"], "edge-macbook-1");
     }
 
     // ── extract_prev_assistant_text + implicit feedback wiring ──
@@ -7136,6 +8445,7 @@ mod tests {
             inherited_skills: Vec::new(),
             live_event_sink: None,
             inherited_prefix: None,
+            execution_metadata: None,
             is_fork_child: false,
         }
     }
@@ -7148,6 +8458,7 @@ mod tests {
             forward_headers: HashMap::new(),
             llm_token_service: None,
             request_constraints: RequestConstraints::default(),
+            execution_metadata: None,
             pause_flag: None,
             cancel_token: None,
             trace_context: server_trace_context(user_id, "session-1", parent_run_id, 1),
@@ -7598,6 +8909,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
@@ -7607,6 +8920,169 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
         }
+    }
+
+    #[test]
+    fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
+        let mut request = test_request("hello");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: Some("Requested server".to_string()),
+            cwd: Some("/client/claimed/path".to_string()),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
+            executor_id: Some("server-local".to_string()),
+            display_name: Some("Requested executor".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let server_workspace = Path::new("/tmp/astra-runtime-workspace");
+        let (workspace, executor) = resolve_request_execution_bindings(&request, server_workspace);
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
+        assert_eq!(workspace.display_name, "Requested server");
+        assert_eq!(
+            workspace.cwd.as_deref(),
+            Some("/tmp/astra-runtime-workspace")
+        );
+        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
+        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
+        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
+        assert_eq!(executor.executor_id, "server-local");
+        assert_eq!(executor.display_name, "Requested executor");
+        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
+        assert_eq!(executor.status, ExecutorStatus::Online);
+    }
+
+    #[test]
+    fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() {
+        let mut request = test_request("hello");
+
+        assert!(request_uses_server_workspace(&request, false));
+        assert!(!request_uses_server_workspace(&request, true));
+
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: None,
+            cwd: None,
+            authority: None,
+            fallback_policy: None,
+        });
+        assert!(request_uses_server_workspace(&request, true));
+
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some("Edge".to_string()),
+            cwd: Some("/repo".to_string()),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        assert!(!request_uses_server_workspace(&request, false));
+        assert!(!request_uses_server_workspace(&request, true));
+    }
+
+    #[test]
+    fn request_execution_bindings_keep_edge_workspace_without_server_fallback() {
+        let mut request = test_request("review this repo");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some("MacBook Pro".to_string()),
+            cwd: Some("/Users/xupeng/github/astra".to_string()),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some("edge-macbook-1".to_string()),
+            display_name: Some("MacBook Pro".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let (workspace, executor) =
+            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.display_name, "MacBook Pro");
+        assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
+        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(executor.executor_id, "edge-macbook-1");
+        assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
+        assert_eq!(executor.status, ExecutorStatus::Online);
+    }
+
+    #[test]
+    fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert("cwd".to_string(), json!("/Users/xupeng/github/astra"));
+        edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
+        edge_profile.insert("hostname".to_string(), json!("MacBook Pro"));
+
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &test_request("review this repo"),
+            &edge_profile,
+        )
+        .expect("legacy edge profile should produce explicit bindings");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.display_name, "MacBook Pro");
+        assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
+        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
+        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(executor.executor_id, "edge-macbook-1");
+        assert_eq!(executor.display_name, "MacBook Pro");
+        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+        assert_eq!(executor.status, ExecutorStatus::Unknown);
+    }
+
+    #[test]
+    fn missing_edge_profile_execution_bindings_emit_no_workspace() {
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &test_request("hello"),
+            &Map::new(),
+        )
+        .expect("missing edge profile should still produce an explicit no-workspace binding");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
+        assert_eq!(workspace.display_name, "No workspace");
+        assert_eq!(workspace.authority, WorkspaceAuthority::None);
+        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
+        assert_eq!(executor.kind, ExecutorBindingKind::Unknown);
+        assert_eq!(executor.transport, ToolTransportKind::Unknown);
+    }
+
+    #[test]
+    fn execution_bindings_from_metadata_rebases_server_sandbox_cwd() {
+        let metadata = json!({
+            "workspace": {
+                "kind": "server_sandbox",
+                "display_name": "Server sandbox",
+                "cwd": "/tmp/parent-workspace",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "server_local",
+                "executor_id": "server-local",
+                "display_name": "Server sandbox",
+                "transport": "server_local",
+                "status": "online"
+            }
+        });
+
+        let (workspace, executor) =
+            execution_bindings_from_metadata(Some(&metadata), Path::new("/tmp/child-workspace"))
+                .expect("metadata bindings");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
+        assert_eq!(workspace.cwd.as_deref(), Some("/tmp/child-workspace"));
+        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
     }
 
     #[tokio::test]
@@ -7970,6 +9446,10 @@ mod tests {
             json!({"type": "tool_call", "tool_call": {"id": "call-1"}}),
             json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok"}),
             json!({"type": "agent_progress", "agent_id": "agent-1", "status": "started"}),
+            json!({"type": "agent_live_event", "agent_id": "agent-1", "event_kind": "output_delta", "content": "child"}),
+            json!({"type": "run_blocked_transport_disconnected", "call_id": "call-1", "reason": "transport_disconnected"}),
+            json!({"type": "run_blocked_fallback_disabled", "call_id": "call-2", "reason": "fallback_disabled"}),
+            json!({"type": "run_blocked_workspace_executor_unavailable", "call_id": "call-3", "reason": "workspace_executor_unavailable"}),
             json!({"event_type": "text_done", "data": {"full_text": "hi"}}),
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];
@@ -7987,6 +9467,10 @@ mod tests {
         assert!(live_delta_event_for_persistence(&events[2]));
         assert!(live_delta_event_for_persistence(&events[3]));
         assert!(live_delta_event_for_persistence(&events[4]));
+        assert!(live_delta_event_for_persistence(&events[5]));
+        assert!(live_delta_event_for_persistence(&events[6]));
+        assert!(live_delta_event_for_persistence(&events[7]));
+        assert!(live_delta_event_for_persistence(&events[8]));
     }
 
     #[test]
@@ -8213,6 +9697,10 @@ mod tests {
         assert_eq!(status.run_id, run.run_id);
         assert_eq!(status.status, "running");
         assert_eq!(status.events_count, 1);
+        assert_eq!(status.workspace.as_ref().unwrap()["kind"], "server_sandbox");
+        assert_eq!(status.executor.as_ref().unwrap()["kind"], "server_local");
+        assert_eq!(status.transport.as_deref(), Some("server_local"));
+        assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
     }
 
     #[tokio::test]
@@ -8233,6 +9721,83 @@ mod tests {
         assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
         assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
         assert_eq!(durable.events[0]["data"]["interactive_client"], true);
+        assert_eq!(
+            durable.events[0]["data"]["workspace"]["kind"],
+            "server_sandbox"
+        );
+        assert!(
+            durable.events[0]["data"]["workspace"]["cwd"]
+                .as_str()
+                .is_some_and(|cwd| cwd.contains("astra-workspaces")),
+            "{:?}",
+            durable.events[0]
+        );
+        assert_eq!(
+            durable.events[0]["data"]["executor"]["kind"],
+            "server_local"
+        );
+        assert_eq!(durable.events[0]["data"]["transport"], "server_local");
+        assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn create_run_persists_edge_binding_into_run_started_event() {
+        let svc = test_service();
+        let mut req = test_request("review this repo");
+        req.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some("MacBook Pro".to_string()),
+            cwd: Some("/Users/xupeng/github/astra".to_string()),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        req.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some("edge-macbook-1".to_string()),
+            display_name: Some("MacBook Pro".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+        let run = ok(svc.create_run("user-1".into(), req).await);
+
+        let durable = svc
+            .run_engine
+            .load_run(&run.run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(durable.events[0]["event_type"], "run_started");
+        assert_eq!(
+            durable.events[0]["data"]["workspace"]["kind"],
+            "edge_workspace"
+        );
+        assert_eq!(
+            durable.events[0]["data"]["workspace"]["cwd"],
+            "/Users/xupeng/github/astra"
+        );
+        assert_eq!(durable.events[0]["data"]["executor"]["kind"], "edge_agent");
+        assert_eq!(
+            durable.events[0]["data"]["executor"]["executor_id"],
+            "edge-macbook-1"
+        );
+        assert_eq!(durable.events[0]["data"]["transport"], "edge_ws");
+        assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
+
+        let status = ok(svc
+            .get_run_status(run.run_id.clone(), "user-1".into())
+            .await);
+        assert_eq!(status.workspace.as_ref().unwrap()["kind"], "edge_workspace");
+        assert_eq!(
+            status.workspace.as_ref().unwrap()["cwd"],
+            "/Users/xupeng/github/astra"
+        );
+        assert_eq!(status.executor.as_ref().unwrap()["kind"], "edge_agent");
+        assert_eq!(
+            status.executor.as_ref().unwrap()["executor_id"],
+            "edge-macbook-1"
+        );
+        assert_eq!(status.transport.as_deref(), Some("edge_ws"));
+        assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
     }
 
     #[tokio::test]
@@ -8363,6 +9928,18 @@ mod tests {
         assert!(ids.contains(u1_a.run_id.as_str()));
         assert!(ids.contains(u1_c.run_id.as_str()));
         assert!(!ids.contains(u2_b.run_id.as_str()));
+        assert!(
+            for_u1
+                .runs
+                .iter()
+                .all(|run| run.workspace.as_ref().unwrap()["kind"] == "server_sandbox")
+        );
+        assert!(
+            for_u1
+                .runs
+                .iter()
+                .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
+        );
 
         let for_u2 = ok(svc.list_runs("user-2".into(), 10, 0).await);
         assert_eq!(for_u2.total, 1);
@@ -8459,6 +10036,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: Some(ctx),
@@ -8609,6 +10188,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: Some(ctx),

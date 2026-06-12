@@ -17,6 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ACTIVE_AGENT_SURFACE_STATUSES } from "@/lib/work-surface";
 import type {
   AgentSurfaceItem,
   SessionTask,
@@ -27,6 +28,7 @@ import type { WorkSurfaceRunResponse } from "@/lib/api/types";
 import { cn } from "@/lib/utils/cn";
 
 export type WorkSurfaceTab = "tasks" | "agents" | "tools";
+type WorkSurfaceViewMode = "all" | "attention";
 
 type WorkSurfacePanelProps = {
   state: WorkSurfaceState;
@@ -44,6 +46,28 @@ type AgentRunProjectionState = {
   projection: WorkSurfaceRunResponse | null;
 };
 
+type WorkspaceBindingLike =
+  | {
+      kind?: string | null;
+      display_name?: string | null;
+      cwd?: string | null;
+      authority?: string | null;
+      fallback_policy?: string | null;
+    }
+  | null
+  | undefined;
+
+type ExecutorBindingLike =
+  | {
+      kind?: string | null;
+      executor_id?: string | null;
+      display_name?: string | null;
+      transport?: string | null;
+      status?: string | null;
+    }
+  | null
+  | undefined;
+
 export function WorkSurfacePanel({
   state,
   activeRun,
@@ -56,20 +80,91 @@ export function WorkSurfacePanel({
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [viewModes, setViewModes] = useState<
+    Record<WorkSurfaceTab, WorkSurfaceViewMode>
+  >({
+    tasks: "all",
+    agents: "all",
+    tools: "all",
+  });
   const [agentRunDetails, setAgentRunDetails] = useState<
     Record<string, AgentRunProjectionState>
   >({});
   const openSignalRef = useRef(openSignal);
   const counts = useMemo(() => taskCounts(state.tasks), [state.tasks]);
-  const runningAgents = state.agents.filter((agent) =>
-    isAgentActive(agent.status),
-  ).length;
-  const runningTools = state.tools.filter(
-    (tool) => tool.status === "running",
-  ).length;
+  const attentionCounts = useMemo(
+    () => ({
+      tasks: state.tasks.filter(taskNeedsAttention).length,
+      agents: state.agents.filter(agentNeedsAttention).length,
+      tools: state.tools.filter(toolNeedsAttention).length,
+    }),
+    [state.agents, state.tasks, state.tools],
+  );
+  const taskViewMode =
+    attentionCounts.tasks > 0 ? (viewModes.tasks ?? "all") : "all";
+  const agentViewMode =
+    attentionCounts.agents > 0 ? (viewModes.agents ?? "all") : "all";
+  const toolViewMode =
+    attentionCounts.tools > 0 ? (viewModes.tools ?? "all") : "all";
+  const viewMode =
+    tab === "tasks"
+      ? taskViewMode
+      : tab === "agents"
+        ? agentViewMode
+        : toolViewMode;
+  const visibleTasks = useMemo(
+    () =>
+      taskViewMode === "attention"
+        ? state.tasks.filter(taskNeedsAttention)
+        : state.tasks,
+    [state.tasks, taskViewMode],
+  );
+  const visibleAgents = useMemo(
+    () =>
+      agentViewMode === "attention"
+        ? state.agents.filter(agentNeedsAttention)
+        : state.agents,
+    [state.agents, agentViewMode],
+  );
+  const visibleTools = useMemo(
+    () =>
+      toolViewMode === "attention"
+        ? state.tools.filter(toolNeedsAttention)
+        : state.tools,
+    [state.tools, toolViewMode],
+  );
+  const visibleTaskCounts = useMemo(
+    () => taskCounts(visibleTasks),
+    [visibleTasks],
+  );
+  const agentActivityCount = state.agents.length;
+  const toolActivityCount = state.tools.length;
+  const visibleRunStatus = activeRun?.status ?? state.runStatus;
   const selectedAgent = selectedAgentId
-    ? state.agents.find((agent) => agent.agentId === selectedAgentId)
+    ? visibleAgents.find((agent) => agent.agentId === selectedAgentId)
     : undefined;
+
+  useEffect(() => {
+    if (tab !== "agents") {
+      return;
+    }
+    if (!visibleAgents.length) {
+      if (selectedAgentId) {
+        setSelectedAgentId(null);
+      }
+      return;
+    }
+    if (
+      selectedAgentId &&
+      visibleAgents.some((agent) => agent.agentId === selectedAgentId)
+    ) {
+      return;
+    }
+    const latest = [...visibleAgents].sort(
+      (left, right) => right.updatedAt - left.updatedAt,
+    )[0];
+    setSelectedAgentId(latest?.agentId ?? null);
+  }, [selectedAgentId, visibleAgents, tab]);
 
   useEffect(() => {
     if (!selectedAgent?.runId) {
@@ -138,7 +233,18 @@ export function WorkSurfacePanel({
     openSignalRef.current = openSignal;
     setCollapsed(false);
     setMobileOpen(true);
-  }, [openSignal]);
+    setViewModes((current) => ({
+      ...current,
+      [tab]: attentionCounts[tab] > 0 ? "attention" : "all",
+    }));
+  }, [attentionCounts, openSignal, tab]);
+
+  useEffect(() => {
+    if (viewModes[tab] !== "attention" || attentionCounts[tab] > 0) {
+      return;
+    }
+    setViewModes((current) => ({ ...current, [tab]: "all" }));
+  }, [attentionCounts, tab, viewModes]);
 
   const body = (
     <>
@@ -147,7 +253,9 @@ export function WorkSurfacePanel({
           type="button"
           className="hidden size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text lg:inline-flex"
           onClick={() => setCollapsed((value) => !value)}
-          aria-label={collapsed ? "Expand work surface" : "Collapse work surface"}
+          aria-label={
+            collapsed ? "Expand work surface" : "Collapse work surface"
+          }
         >
           <ChevronRight
             className={cn("size-4 transition", collapsed ? "rotate-180" : "")}
@@ -161,8 +269,8 @@ export function WorkSurfacePanel({
             </h2>
           </div>
           <p className="mt-0.5 truncate text-xs text-text-muted">
-            {activeRun?.status
-              ? "Live work surface"
+            {visibleRunStatus
+              ? runStatusHeadline(visibleRunStatus)
               : state.hydrated
                 ? "Session projection"
                 : "Waiting for session"}
@@ -186,6 +294,9 @@ export function WorkSurfacePanel({
         </button>
       </div>
 
+      <BindingStrip state={state} />
+      <RunBlockedBanner blocked={state.blocked} />
+
       <div className="flex shrink-0 border-b border-border/70 px-2 py-2">
         <TabButton
           active={tab === "tasks"}
@@ -198,14 +309,14 @@ export function WorkSurfacePanel({
           active={tab === "agents"}
           icon={Bot}
           label="Agents"
-          count={runningAgents}
+          count={agentActivityCount}
           onClick={() => onTabChange("agents")}
         />
         <TabButton
           active={tab === "tools"}
           icon={Terminal}
           label="Tools"
-          count={runningTools}
+          count={toolActivityCount}
           onClick={() => onTabChange("tools")}
         />
       </div>
@@ -220,14 +331,27 @@ export function WorkSurfacePanel({
           {state.warnings.join(" ")}
         </div>
       ) : null}
+      <AttentionViewToggle
+        tab={tab}
+        mode={viewMode}
+        attentionCount={attentionCounts[tab]}
+        totalCount={tabItemCount(tab, state)}
+        onModeChange={(mode) =>
+          setViewModes((current) => ({ ...current, [tab]: mode }))
+        }
+      />
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         {tab === "tasks" ? (
-          <TaskBoard tasks={state.tasks} loading={state.loading} counts={counts} />
+          <TaskBoard
+            tasks={visibleTasks}
+            loading={state.loading}
+            counts={visibleTaskCounts}
+          />
         ) : null}
         {tab === "agents" ? (
           <AgentBoard
-            agents={state.agents}
+            agents={visibleAgents}
             loading={state.loading}
             selectedAgentId={selectedAgentId}
             agentRunDetails={agentRunDetails}
@@ -239,7 +363,7 @@ export function WorkSurfacePanel({
           />
         ) : null}
         {tab === "tools" ? (
-          <ToolTimeline tools={state.tools} loading={state.loading} />
+          <ToolTimeline tools={visibleTools} loading={state.loading} />
         ) : null}
       </div>
     </>
@@ -329,6 +453,60 @@ function TabButton({
   );
 }
 
+function AttentionViewToggle({
+  tab,
+  mode,
+  attentionCount,
+  totalCount,
+  onModeChange,
+}: {
+  tab: WorkSurfaceTab;
+  mode: WorkSurfaceViewMode;
+  attentionCount: number;
+  totalCount: number;
+  onModeChange: (mode: WorkSurfaceViewMode) => void;
+}) {
+  if (!attentionCount) {
+    return null;
+  }
+  const label = tab === "tasks" ? "items" : tab;
+  return (
+    <div className="border-b border-border/70 px-4 py-2">
+      <div className="flex items-center gap-2 rounded-[8px] bg-bg p-1 text-xs">
+        <button
+          type="button"
+          aria-pressed={mode === "attention"}
+          onClick={() => onModeChange("attention")}
+          className={cn(
+            "inline-flex flex-1 items-center justify-center gap-1.5 rounded-[6px] px-2 py-1.5 font-medium transition",
+            mode === "attention"
+              ? "bg-danger/10 text-danger"
+              : "text-text-muted hover:bg-surface-muted hover:text-text",
+          )}
+        >
+          <AlertTriangle className="size-3.5" />
+          <span>Needs attention</span>
+          <span className="tabular-nums">{attentionCount}</span>
+        </button>
+        <button
+          type="button"
+          aria-pressed={mode === "all"}
+          onClick={() => onModeChange("all")}
+          className={cn(
+            "inline-flex flex-1 items-center justify-center gap-1.5 rounded-[6px] px-2 py-1.5 font-medium transition",
+            mode === "all"
+              ? "bg-surface-muted text-text"
+              : "text-text-muted hover:bg-surface-muted hover:text-text",
+          )}
+        >
+          <span>All {label}</span>
+          <span className="tabular-nums">{totalCount}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TaskBoard({
   tasks,
   loading,
@@ -402,7 +580,9 @@ function TaskCard({ task }: { task: SessionTask }) {
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-text-muted">
             {subtasks.length ? (
-              <span>{done}/{subtasks.length} subtasks</span>
+              <span>
+                {done}/{subtasks.length} subtasks
+              </span>
             ) : (
               <span>{progress}%</span>
             )}
@@ -414,7 +594,10 @@ function TaskCard({ task }: { task: SessionTask }) {
           {subtasks.length ? (
             <div className="space-y-1">
               {subtasks.slice(0, 4).map((subtask) => (
-                <div key={subtask.id} className="flex items-center gap-2 text-xs">
+                <div
+                  key={subtask.id}
+                  className="flex items-center gap-2 text-xs"
+                >
                   <StatusIcon status={subtask.status} small />
                   <span
                     className={cn(
@@ -457,7 +640,9 @@ function AgentBoard({
   if (!agents.length) {
     return <EmptySurface loading={loading} label="No subagent activity yet" />;
   }
-  const sorted = [...agents].sort((left, right) => right.updatedAt - left.updatedAt);
+  const sorted = [...agents].sort(
+    (left, right) => right.updatedAt - left.updatedAt,
+  );
   return (
     <div className="space-y-2.5">
       {sorted.map((agent) => (
@@ -549,6 +734,7 @@ function AgentCard({
               {agent.description}
             </p>
           ) : null}
+          <AgentExecutionMeta agent={agent} />
           <div className="h-1.5 overflow-hidden rounded-full bg-surface-muted">
             <div
               className={cn(
@@ -581,13 +767,19 @@ function AgentCard({
                 {agent.toolName}
               </span>
             ) : null}
-            {agent.totalToolCalls ? <span>{agent.totalToolCalls} tools</span> : null}
+            {agent.totalToolCalls ? (
+              <span>{agent.totalToolCalls} tools</span>
+            ) : null}
             {agent.totalPromptTokens || agent.totalCompletionTokens ? (
               <span>
-                {(agent.totalPromptTokens ?? 0) + (agent.totalCompletionTokens ?? 0)} tokens
+                {(agent.totalPromptTokens ?? 0) +
+                  (agent.totalCompletionTokens ?? 0)}{" "}
+                tokens
               </span>
             ) : null}
-            {agent.durationMs ? <span>{formatDuration(agent.durationMs)}</span> : null}
+            {agent.durationMs ? (
+              <span>{formatDuration(agent.durationMs)}</span>
+            ) : null}
           </div>
           {summary ? (
             <p
@@ -629,6 +821,16 @@ function AgentDetails({
     ["Agent", agent.agentId],
     ["Run", agent.runId],
     ["Parent", agent.parentRunId],
+    [
+      "Workspace",
+      agent.workspace
+        ? (agent.workspace.cwd ?? workspaceDisplayName(agent.workspace))
+        : undefined,
+    ],
+    [
+      "Executor",
+      agent.executor ? executorDisplayName(agent.executor) : undefined,
+    ],
   ].filter((entry): entry is [string, string] => Boolean(entry[1]));
   return (
     <div className="border-t border-border/60 px-3 pb-3 pt-2">
@@ -654,7 +856,12 @@ function AgentDetails({
         </div>
       ) : null}
       <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-text-muted">
-        <span>Updated {Number.isNaN(updated.getTime()) ? "now" : updated.toLocaleTimeString()}</span>
+        <span>
+          Updated{" "}
+          {Number.isNaN(updated.getTime())
+            ? "now"
+            : updated.toLocaleTimeString()}
+        </span>
         {agent.reason ? <span>Reason {statusLabel(agent.reason)}</span> : null}
         {agent.toolName ? <span>Tool {agent.toolName}</span> : null}
       </div>
@@ -674,6 +881,29 @@ function AgentDetails({
   );
 }
 
+function AgentExecutionMeta({ agent }: { agent: AgentSurfaceItem }) {
+  const items = [
+    agent.executor ? executorDisplayName(agent.executor) : undefined,
+    agent.workspace?.cwd,
+    agent.transport ? `transport ${statusLabel(agent.transport)}` : undefined,
+    agent.fallbackPolicy
+      ? `fallback ${statusLabel(agent.fallbackPolicy)}`
+      : undefined,
+  ].filter((item): item is string => Boolean(item));
+  if (!items.length) {
+    return null;
+  }
+  return (
+    <div className="flex flex-wrap gap-x-2 gap-y-1 text-[11px] text-text-muted">
+      {items.map((item) => (
+        <span key={item} className="min-w-0 max-w-full truncate">
+          {item}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function AgentLiveEvents({
   events,
   active,
@@ -682,6 +912,7 @@ function AgentLiveEvents({
   active: boolean;
 }) {
   const recent = [...events].slice(-8).reverse();
+  const transcript = agentLiveTranscript(events);
   return (
     <div className="rounded-[8px] border border-border/60 bg-surface/50 p-2.5">
       <div className="mb-2 flex items-center justify-between gap-3">
@@ -691,6 +922,16 @@ function AgentLiveEvents({
         </div>
         {active ? <MiniLiveDots className="shrink-0" /> : null}
       </div>
+      {transcript ? (
+        <div className="mb-2 rounded-[7px] border border-border/60 bg-bg px-2.5 py-2">
+          <div className="mb-1 text-[10px] font-semibold uppercase text-text-muted">
+            {transcript.label}
+          </div>
+          <div className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-text">
+            {transcript.detail}
+          </div>
+        </div>
+      ) : null}
       {recent.length ? (
         <div className="space-y-2">
           {recent.map((event) => (
@@ -705,6 +946,29 @@ function AgentLiveEvents({
       )}
     </div>
   );
+}
+
+function agentLiveTranscript(events: NonNullable<AgentSurfaceItem["events"]>) {
+  const textEvents = events.filter(
+    (event) =>
+      event.detail &&
+      (event.type === "agent_live_event:output_delta" ||
+        event.type === "agent_live_event:thinking_delta"),
+  );
+  if (!textEvents.length) {
+    return null;
+  }
+  const latest = textEvents[textEvents.length - 1];
+  const label =
+    latest.type === "agent_live_event:thinking_delta"
+      ? "Thinking preview"
+      : "Live output";
+  const detail = textEvents
+    .map((event) => event.detail)
+    .filter((detail): detail is string => Boolean(detail))
+    .join("\n")
+    .slice(-4000);
+  return { label, detail };
 }
 
 function AgentRunProjection({
@@ -723,8 +987,11 @@ function AgentRunProjection({
           <Terminal className="size-3.5 text-accent" />
           <span>Child run events</span>
         </div>
-        {details?.loading || active ? <MiniLiveDots className="shrink-0" /> : null}
+        {details?.loading || active ? (
+          <MiniLiveDots className="shrink-0" />
+        ) : null}
       </div>
+      {projection ? <AgentRunBindingSummary projection={projection} /> : null}
       {details?.error ? (
         <div className="rounded-[6px] bg-danger/5 px-2 py-2 text-xs text-danger">
           {details.error}
@@ -737,7 +1004,10 @@ function AgentRunProjection({
       ) : recent.length ? (
         <div className="space-y-2">
           {recent.map((event, index) => (
-            <RunProjectionEventRow key={`${eventType(event)}:${index}`} event={event} />
+            <RunProjectionEventRow
+              key={`${eventType(event)}:${index}`}
+              event={event}
+            />
           ))}
         </div>
       ) : (
@@ -745,6 +1015,71 @@ function AgentRunProjection({
           No child run events yet
         </div>
       )}
+    </div>
+  );
+}
+
+function AgentRunBindingSummary({
+  projection,
+}: {
+  projection: WorkSurfaceRunResponse;
+}) {
+  // Extracting binding information with null guards for every field
+  // so that downstream display fns never crash on unexpected shapes.
+  const rawWs = projection.workspace;
+  const rawEx = projection.executor;
+  const workspace: WorkspaceBindingLike =
+    rawWs && typeof rawWs === "object" && !Array.isArray(rawWs) ? rawWs : null;
+  const executor: ExecutorBindingLike =
+    rawEx && typeof rawEx === "object" && !Array.isArray(rawEx) ? rawEx : null;
+  if (
+    !workspace &&
+    !executor &&
+    !projection.transport &&
+    !projection.fallbackPolicy
+  ) {
+    return null;
+  }
+  const items = [
+    executor
+      ? {
+          label: "Executor",
+          value: executorDisplayName(executor),
+          detail: executorDetail(executor),
+        }
+      : null,
+    workspace
+      ? {
+          label: "Workspace",
+          value: workspaceDisplayName(workspace),
+          detail: workspace.cwd ?? workspace.authority ?? undefined,
+        }
+      : null,
+    projection.transport
+      ? { label: "Transport", value: statusLabel(projection.transport) }
+      : null,
+    projection.fallbackPolicy
+      ? { label: "Fallback", value: statusLabel(projection.fallbackPolicy) }
+      : null,
+  ].filter(Boolean) as Array<{
+    label: string;
+    value: string;
+    detail?: string;
+  }>;
+
+  return (
+    <div className="mb-2 grid gap-1.5 rounded-[6px] bg-surface-muted px-2 py-2 text-[11px] text-text-muted sm:grid-cols-2">
+      {items.map((item) => (
+        <div key={item.label} className="min-w-0">
+          <span className="font-medium text-text-secondary">{item.label}</span>
+          <span className="ml-1 text-text">{item.value}</span>
+          {item.detail ? (
+            <span className="ml-1 break-all text-text-muted">
+              {item.detail}
+            </span>
+          ) : null}
+        </div>
+      ))}
     </div>
   );
 }
@@ -835,6 +1170,98 @@ function MiniLiveDots({ className }: { className?: string }) {
   );
 }
 
+function BindingStrip({ state }: { state: WorkSurfaceState }) {
+  const workspace = state.workspace;
+  const executor = state.executor;
+  if (!workspace && !executor) {
+    return null;
+  }
+  return (
+    <div className="grid shrink-0 gap-2 border-b border-border/70 px-4 py-3 text-xs md:grid-cols-2">
+      <BindingItem
+        label="Workspace"
+        value={workspaceDisplayName(workspace)}
+        detail={workspace?.cwd ?? workspace?.authority}
+      />
+      <BindingItem
+        label="Executor"
+        value={executorDisplayName(executor)}
+        detail={executorDetail(executor)}
+      />
+    </div>
+  );
+}
+
+function RunBlockedBanner({
+  blocked,
+}: {
+  blocked: WorkSurfaceState["blocked"];
+}) {
+  if (!blocked) {
+    return null;
+  }
+  const executor = executorDisplayName(blocked.executor);
+  const workspace =
+    blocked.workspace?.cwd ?? workspaceDisplayName(blocked.workspace);
+  const fallback = blocked.fallbackPolicy
+    ? `Fallback ${statusLabel(blocked.fallbackPolicy)}`
+    : undefined;
+  const details = [
+    executor,
+    workspace,
+    blocked.transport
+      ? `transport ${statusLabel(blocked.transport)}`
+      : undefined,
+    fallback,
+  ].filter((item): item is string => Boolean(item));
+  return (
+    <div className="border-b border-warning/30 bg-warning/10 px-4 py-3">
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-semibold text-text">Run blocked</div>
+          <p className="mt-0.5 line-clamp-3 text-xs leading-5 text-text-secondary">
+            {blocked.message}
+          </p>
+          {details.length ? (
+            <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1 text-[11px] text-text-muted">
+              {details.map((item) => (
+                <span key={item} className="max-w-full truncate">
+                  {item}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BindingItem({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: string;
+  detail?: string | null;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] font-semibold uppercase text-text-muted">
+        {label}
+      </div>
+      <div className="mt-0.5 truncate font-medium text-text">{value}</div>
+      {detail ? (
+        <div className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
+          {detail}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ToolTimeline({
   tools,
   loading,
@@ -845,7 +1272,7 @@ function ToolTimeline({
   if (!tools.length) {
     return <EmptySurface loading={loading} label="No tool calls yet" />;
   }
-  const sorted = [...tools].sort((left, right) => right.startedAt - left.startedAt);
+  const sorted = [...tools].sort(toolActivitySort);
   return (
     <div className="relative space-y-2.5">
       <div className="absolute bottom-3 left-[17px] top-3 w-px bg-border/80" />
@@ -859,6 +1286,8 @@ function ToolTimeline({
 function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
   const running = tool.status === "running";
   const failed = tool.status === "error";
+  const cancelled = tool.status === "cancelled";
+  const finishedAt = tool.finishedAt ?? tool.startedAt;
   return (
     <section className="relative pl-9">
       <div
@@ -866,13 +1295,17 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
           "absolute left-[9px] top-3 z-10 flex size-4 items-center justify-center rounded-full border bg-bg",
           running
             ? "border-accent text-accent"
-            : failed
-              ? "border-danger text-danger"
-              : "border-success text-success",
+            : cancelled
+              ? "border-text-muted text-text-muted"
+              : failed
+                ? "border-danger text-danger"
+                : "border-success text-success",
         )}
       >
         {running ? (
           <span className="size-2 animate-pulse rounded-full bg-accent" />
+        ) : cancelled ? (
+          <Pause className="size-3" />
         ) : failed ? (
           <AlertTriangle className="size-3" />
         ) : (
@@ -884,9 +1317,11 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
           "rounded-card border bg-bg p-3 shadow-sm",
           running
             ? "border-accent/35 bg-accent/5"
-            : failed
-              ? "border-danger/25 bg-danger/5"
-              : "border-border/70",
+            : cancelled
+              ? "border-border/70 bg-surface-muted/35"
+              : failed
+                ? "border-danger/25 bg-danger/5"
+                : "border-border/70",
         )}
       >
         <div className="flex items-start gap-2">
@@ -896,8 +1331,13 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
               <h3 className="min-w-0 flex-1 truncate font-mono text-xs font-semibold text-text">
                 {tool.tool}
               </h3>
+              <time className="shrink-0 text-[10px] text-text-muted">
+                {formatEventTime(finishedAt)}
+              </time>
               <StatusPill status={tool.status} active={running} />
             </div>
+            <ToolExecutionMeta tool={tool} />
+            {failed ? <ToolFailureNotice tool={tool} /> : null}
             {tool.arguments ? (
               <StructuredPayload label="Args" value={tool.arguments} />
             ) : null}
@@ -915,6 +1355,152 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
       </div>
     </section>
   );
+}
+
+function toolActivitySort(left: ToolSurfaceItem, right: ToolSurfaceItem) {
+  const activityDelta = toolActivityAt(right) - toolActivityAt(left);
+  if (activityDelta !== 0) {
+    return activityDelta;
+  }
+  const startedDelta = right.startedAt - left.startedAt;
+  if (startedDelta !== 0) {
+    return startedDelta;
+  }
+  return right.callId.localeCompare(left.callId);
+}
+
+function toolActivityAt(tool: ToolSurfaceItem) {
+  return tool.finishedAt ?? tool.startedAt;
+}
+
+function ToolExecutionMeta({ tool }: { tool: ToolSurfaceItem }) {
+  const items: Array<{
+    label: string;
+    value: string;
+    tone?: "default" | "danger";
+  }> = [];
+  if (tool.executor) {
+    items.push({
+      label: "Executor",
+      value: executorDisplayName(tool.executor),
+      tone: tool.executor.status === "offline" ? "danger" : "default",
+    });
+  }
+  const workspace = tool.workspace?.cwd ?? workspaceDisplayName(tool.workspace);
+  if (tool.workspace) {
+    items.push({ label: "Workspace", value: workspace });
+  }
+  if (tool.transport) {
+    items.push({ label: "Transport", value: statusLabel(tool.transport) });
+  }
+  if (tool.fallbackPolicy) {
+    items.push({ label: "Fallback", value: statusLabel(tool.fallbackPolicy) });
+  }
+  if (tool.route) {
+    items.push({ label: "Route", value: statusLabel(tool.route) });
+  }
+  if (tool.durationMs !== undefined) {
+    items.push({ label: "Duration", value: formatDuration(tool.durationMs) });
+  }
+  if (tool.errorKind) {
+    items.push({
+      label: "Reason",
+      value: statusLabel(tool.errorKind),
+      tone: tool.errorKind === "cancelled" ? "default" : "danger",
+    });
+  }
+  if (!items.length) {
+    return null;
+  }
+  return (
+    <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+      {items.map((item) => (
+        <ToolMetaChip
+          key={`${item.label}:${item.value}`}
+          label={item.label}
+          value={item.value}
+          tone={item.tone}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ToolMetaChip({
+  label,
+  value,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "danger";
+}) {
+  return (
+    <div
+      className={cn(
+        "min-w-0 rounded-[6px] border px-2 py-1.5",
+        tone === "danger"
+          ? "border-danger/20 bg-danger/5"
+          : "border-border/60 bg-surface-muted",
+      )}
+      title={`${label}: ${value}`}
+    >
+      <div
+        className={cn(
+          "text-[10px] font-semibold uppercase leading-3",
+          tone === "danger" ? "text-danger" : "text-text-muted",
+        )}
+      >
+        {label}
+      </div>
+      <div
+        className={cn(
+          "mt-0.5 truncate font-mono text-[11px] leading-4",
+          tone === "danger" ? "text-danger" : "text-text-secondary",
+        )}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function ToolFailureNotice({ tool }: { tool: ToolSurfaceItem }) {
+  const message = toolFailureMessage(tool);
+  if (!message) {
+    return null;
+  }
+  return (
+    <div className="mt-2 flex items-start gap-2 rounded-[6px] border border-danger/20 bg-danger/5 px-2 py-2 text-xs leading-5 text-danger">
+      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+      <span className="min-w-0 flex-1">{message}</span>
+    </div>
+  );
+}
+
+function toolFailureMessage(tool: ToolSurfaceItem) {
+  if (tool.errorKind === "executor_offline") {
+    return "Executor offline. Reconnect the edge executor or choose another workspace.";
+  }
+  if (tool.errorKind === "transport_disconnected") {
+    return "Transport disconnected. Reconnect edge before retrying.";
+  }
+  if (tool.errorKind === "approval_timeout") {
+    return "Approval timed out. Review pending approvals and retry.";
+  }
+  if (tool.errorKind === "tool_timeout" || tool.errorKind === "timeout") {
+    return "Tool timed out. Retry or narrow the command.";
+  }
+  if (tool.errorKind === "fallback_disabled") {
+    return "Fallback disabled. This run will not execute local-code tools on the server.";
+  }
+  if (tool.errorKind === "workspace_executor_unavailable") {
+    return "Workspace executor unavailable. Choose Server sandbox or a connected edge workspace.";
+  }
+  if (tool.blocked) {
+    return "Tool blocked. Resolve the executor or workspace issue before retrying.";
+  }
+  return undefined;
 }
 
 function StructuredPayload({
@@ -967,7 +1553,9 @@ function StructuredValue({
           </span>
         ))}
         {value.length > 8 ? (
-          <span className="text-[11px] text-text-muted">+{value.length - 8}</span>
+          <span className="text-[11px] text-text-muted">
+            +{value.length - 8}
+          </span>
         ) : null}
       </div>
     );
@@ -1021,16 +1609,14 @@ function Metric({ label, value }: { label: string; value: number }) {
   );
 }
 
-function EmptySurface({
-  loading,
-  label,
-}: {
-  loading: boolean;
-  label: string;
-}) {
+function EmptySurface({ loading, label }: { loading: boolean; label: string }) {
   return (
     <div className="flex min-h-48 flex-col items-center justify-center gap-2 text-center text-sm text-text-muted">
-      {loading ? <Loader2 className="size-5 animate-spin" /> : <Pause className="size-5" />}
+      {loading ? (
+        <Loader2 className="size-5 animate-spin" />
+      ) : (
+        <Pause className="size-5" />
+      )}
       <p>{loading ? "Loading work surface" : label}</p>
     </div>
   );
@@ -1044,32 +1630,43 @@ function StatusPill({
   active?: boolean;
 }) {
   const done = isDone(status) || status === "done";
-  const failed =
-    status === "failed" || status === "cancelled" || status === "interrupted";
+  const cancelled = status === "cancelled";
+  const failed = status === "failed" || status === "interrupted";
   return (
     <span
       className={cn(
         "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium",
-        failed
-          ? "bg-danger/10 text-danger"
-          : done
-            ? "bg-success/10 text-success"
-            : active
-              ? "bg-accent/10 text-accent"
-              : "bg-surface-muted text-text-muted",
+        cancelled
+          ? "bg-surface-muted text-text-muted"
+          : failed
+            ? "bg-danger/10 text-danger"
+            : done
+              ? "bg-success/10 text-success"
+              : active
+                ? "bg-accent/10 text-accent"
+                : "bg-surface-muted text-text-muted",
       )}
     >
-      {active ? <span className="size-1.5 animate-pulse rounded-full bg-current" /> : null}
+      {active ? (
+        <span className="size-1.5 animate-pulse rounded-full bg-current" />
+      ) : null}
       {statusLabel(status)}
     </span>
   );
 }
 
-function StatusIcon({ status, small = false }: { status: string; small?: boolean }) {
+function StatusIcon({
+  status,
+  small = false,
+}: {
+  status: string;
+  small?: boolean;
+}) {
   const done = isDone(status);
-  const running = status === "in_progress" || status === "running" || status === "started";
-  const failed =
-    status === "failed" || status === "cancelled" || status === "interrupted";
+  const running =
+    status === "in_progress" || status === "running" || status === "started";
+  const cancelled = status === "cancelled";
+  const failed = status === "failed" || status === "interrupted";
   const className = cn(
     "shrink-0",
     small ? "size-3" : "mt-0.5 size-4",
@@ -1077,11 +1674,14 @@ function StatusIcon({ status, small = false }: { status: string; small?: boolean
       ? "text-success"
       : running
         ? "text-accent"
-        : failed
-          ? "text-danger"
-          : "text-text-muted",
+        : cancelled
+          ? "text-text-muted"
+          : failed
+            ? "text-danger"
+            : "text-text-muted",
   );
   if (done) return <CheckCircle2 className={className} />;
+  if (cancelled) return <Pause className={className} />;
   if (failed) return <AlertTriangle className={className} />;
   if (running) return <Loader2 className={cn(className, "animate-spin")} />;
   return <Circle className={className} />;
@@ -1099,6 +1699,43 @@ function taskCounts(tasks: SessionTask[]) {
   return { working, queued, done, open: working + queued };
 }
 
+function tabItemCount(tab: WorkSurfaceTab, state: WorkSurfaceState) {
+  if (tab === "tasks") return state.tasks.length;
+  if (tab === "agents") return state.agents.length;
+  return state.tools.length;
+}
+
+function taskNeedsAttention(task: SessionTask) {
+  return Boolean(
+    task.status === "blocked" ||
+    task.status === "paused" ||
+    task.status === "failed" ||
+    task.blocked_by?.length,
+  );
+}
+
+function agentNeedsAttention(agent: AgentSurfaceItem) {
+  return (
+    agent.status === "failed" ||
+    agent.status === "waiting" ||
+    agent.status === "interrupted" ||
+    Boolean(agent.error)
+  );
+}
+
+function toolNeedsAttention(tool: ToolSurfaceItem) {
+  return Boolean(
+    tool.blocked ||
+    (tool.status === "error" && tool.errorKind !== "cancelled") ||
+    tool.errorKind === "approval_timeout" ||
+    tool.errorKind === "tool_timeout" ||
+    tool.errorKind === "transport_disconnected" ||
+    tool.errorKind === "executor_offline" ||
+    tool.errorKind === "fallback_disabled" ||
+    tool.errorKind === "workspace_executor_unavailable",
+  );
+}
+
 function taskSort(left: SessionTask, right: SessionTask) {
   const rank = (task: SessionTask) =>
     task.status === "in_progress"
@@ -1110,7 +1747,16 @@ function taskSort(left: SessionTask, right: SessionTask) {
           : isDone(task.status)
             ? 4
             : 3;
-  return rank(left) - rank(right) || left.id.localeCompare(right.id);
+  return (
+    rank(left) - rank(right) ||
+    taskUpdatedAtMs(right) - taskUpdatedAtMs(left) ||
+    left.id.localeCompare(right.id)
+  );
+}
+
+function taskUpdatedAtMs(task: SessionTask) {
+  const timestamp = Date.parse(task.updated_at);
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function isDone(status: string) {
@@ -1118,13 +1764,37 @@ function isDone(status: string) {
 }
 
 function isAgentActive(status: string) {
-  return ["running", "started", "tool_executing", "metrics_update"].includes(
-    status,
-  );
+  return ACTIVE_AGENT_SURFACE_STATUSES.has(status);
 }
 
 function statusLabel(status: string) {
-  return status.replace(/_/g, " ");
+  return status.replace(/[_-]+/g, " ");
+}
+
+function runStatusHeadline(status: string) {
+  const label = statusLabel(status).trim();
+  return label ? label.charAt(0).toUpperCase() + label.slice(1) : "Active";
+}
+
+function workspaceDisplayName(workspace: WorkspaceBindingLike) {
+  return (
+    workspace?.display_name ??
+    (workspace?.kind ? statusLabel(workspace.kind) : "Workspace pending")
+  );
+}
+
+function executorDisplayName(executor: ExecutorBindingLike) {
+  return (
+    executor?.display_name ??
+    (executor?.kind ? statusLabel(executor.kind) : "Executor pending")
+  );
+}
+
+function executorDetail(executor: ExecutorBindingLike) {
+  const parts = [executor?.transport, executor?.status]
+    .filter(Boolean)
+    .map((value) => statusLabel(String(value)));
+  return parts.length ? parts.join(" / ") : undefined;
 }
 
 function formatDuration(ms: number) {
@@ -1143,11 +1813,7 @@ function formatEventTime(timestamp: number) {
 }
 
 function eventType(event: Record<string, unknown>) {
-  return (
-    stringValue(event.type) ??
-    stringValue(event.event_type) ??
-    "event"
-  );
+  return stringValue(event.type) ?? stringValue(event.event_type) ?? "event";
 }
 
 function eventPayload(event: Record<string, unknown>) {

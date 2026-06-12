@@ -69,6 +69,11 @@ pub(crate) fn local_agent_status_projection(
             Some("Agent is waiting for input.".to_string()),
             None,
         ),
+        AgentStatus::Waiting { reason } => (
+            "waiting_for_input",
+            Some(format!("Agent is waiting: {reason}")),
+            None,
+        ),
         AgentStatus::Completed {
             result,
             finish_reason,
@@ -398,6 +403,9 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             "waiting_for_input",
             "Agent is waiting for input.".to_string(),
         ),
+        AgentStatus::Waiting { reason } => {
+            ("waiting_for_input", format!("Agent is waiting: {reason}"))
+        }
         AgentStatus::Completed { result, .. } => ("completed", result.clone()),
         AgentStatus::Failed { error, .. } => ("failed", error.clone()),
         AgentStatus::Cancelled { reason, .. } => ("killed", reason.clone()),

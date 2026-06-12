@@ -270,6 +270,25 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "create typo must be actionable: {create_typo}"
     );
 
+    let create_dependency_field = exe
+        .execute(
+            "task",
+            &json!({
+                "action": "create",
+                "title": "Blocked task",
+                "add_blocked_by": ["task-1"]
+            }),
+        )
+        .await;
+    assert!(
+        create_dependency_field.starts_with("Error:")
+            && create_dependency_field.contains("update-only")
+            && create_dependency_field.contains("task(action='create'")
+            && create_dependency_field.contains("task(action='update'")
+            && create_dependency_field.contains("<created task_id>"),
+        "create dependency-field misuse should explain the two-step repair: {create_dependency_field}"
+    );
+
     let too_many_subtasks = (0..=astra_tools::task_mgmt::MAX_CREATE_SUBTASKS)
         .map(|index| json!({ "id": format!("s{index}"), "title": format!("step {index}") }))
         .collect::<Vec<_>>();

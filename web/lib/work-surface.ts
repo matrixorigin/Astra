@@ -1,3 +1,11 @@
+import {
+  blockedRunMessage,
+  runWaitingStatusMessage,
+  isExecutionBoundaryWait,
+  extractBlockedReason,
+  projectRunWaitingState,
+} from "@/lib/run-status-messages";
+
 export type SessionSubtask = {
   id: string;
   title: string;
@@ -28,9 +36,45 @@ export type ToolSurfaceItem = {
   tool: string;
   arguments?: string;
   result?: string;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
+  errorKind?: string;
+  blocked?: boolean;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string;
+  fallbackPolicy?: string;
+  route?: string;
+  durationMs?: number;
   startedAt: number;
   finishedAt?: number;
+};
+
+export type WorkspaceBinding = {
+  kind: string;
+  display_name?: string;
+  cwd?: string | null;
+  authority?: string;
+  fallback_policy?: string;
+};
+
+export type ExecutorBinding = {
+  kind: string;
+  executor_id?: string;
+  display_name?: string;
+  transport?: string;
+  status?: string;
+};
+
+export type RunBlockedState = {
+  reason: string;
+  message: string;
+  callId?: string;
+  tool?: string;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string;
+  fallbackPolicy?: string;
+  timestamp: number;
 };
 
 export type AgentSurfaceEvent = {
@@ -59,6 +103,10 @@ export type AgentSurfaceItem = {
   error?: string;
   reason?: string;
   durationMs?: number;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string;
+  fallbackPolicy?: string;
   events?: AgentSurfaceEvent[];
   updatedAt: number;
 };
@@ -66,9 +114,13 @@ export type AgentSurfaceItem = {
 export type WorkSurfaceState = {
   sessionId: string | null;
   runId: string | null;
+  runStatus: string | null;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
   tasks: SessionTask[];
   tools: ToolSurfaceItem[];
   agents: AgentSurfaceItem[];
+  blocked: RunBlockedState | null;
   loading: boolean;
   hydrated: boolean;
   error: string | null;
@@ -76,9 +128,27 @@ export type WorkSurfaceState = {
   updatedAt: string | null;
 };
 
+export const ACTIVE_AGENT_SURFACE_STATUSES = new Set([
+  "running",
+  "started",
+  "busy",
+  "idle",
+  "tool_executing",
+  "llm_call_started",
+  "llm_call_completed",
+  "metrics_update",
+  "turn_completed",
+  "permission_denied",
+]);
+
 export type WorkSurfaceResponse = {
   sessionId: string | null;
   runId?: string | null;
+  status?: string | null;
+  workspace?: WorkspaceBinding | null;
+  executor?: ExecutorBinding | null;
+  transport?: string | null;
+  fallbackPolicy?: string | null;
   tasks: SessionTask[];
   events?: Record<string, unknown>[];
   generatedAt?: string;
@@ -92,9 +162,13 @@ export function createEmptyWorkSurface(
   return {
     sessionId,
     runId,
+    runStatus: null,
+    workspace: undefined,
+    executor: undefined,
     tasks: [],
     tools: [],
     agents: [],
+    blocked: null,
     loading: false,
     hydrated: false,
     error: null,
@@ -133,8 +207,12 @@ export function resetWorkSurfaceForRun(
     sessionId:
       params.sessionId === undefined ? state.sessionId : params.sessionId,
     runId: params.runId,
+    runStatus: null,
+    workspace: undefined,
+    executor: undefined,
     tools: [],
     agents: [],
+    blocked: null,
     error: null,
     warnings: [],
     updatedAt: new Date().toISOString(),
@@ -162,9 +240,13 @@ export function hydrateWorkSurface(
     ...current,
     sessionId: response.sessionId,
     runId: response.runId ?? null,
+    runStatus: response.status ?? null,
+    workspace: response.workspace ?? undefined,
+    executor: response.executor ?? undefined,
     tasks: response.tasks,
     tools: [],
     agents: [],
+    blocked: null,
     loading: false,
     hydrated: true,
     error: null,
@@ -174,6 +256,14 @@ export function hydrateWorkSurface(
   for (const event of response.events ?? []) {
     next = applyWorkSurfaceEvent(next, event);
   }
+  if (response.status && isTerminalRunStatus(response.status)) {
+    next = applyRunFinished(next, {
+      type: "run_finished",
+      run_id: response.runId ?? undefined,
+      session_id: response.sessionId,
+      status: response.status,
+    });
+  }
   return next;
 }
 
@@ -182,26 +272,158 @@ export function applyWorkSurfaceEvent(
   event: Record<string, unknown>,
 ): WorkSurfaceState {
   const type = typeof event.type === "string" ? event.type : "";
+  if (type.startsWith("run_blocked_")) {
+    return applyRunBlockedEvent(state, event);
+  }
   switch (type) {
     case "task_board_snapshot":
       return applyTaskBoardSnapshot(state, event);
+    case "run_started":
+      return applyRunStarted(state, event);
+    case "run_paused":
+      return applyRunLifecycleStatus(state, event, "paused");
+    case "run_waiting":
+      return applyRunWaiting(state, event);
+    case "run_resumed":
+      return applyRunLifecycleStatus(state, event, "running");
+    case "run_error":
+      return applyRunError(state, event);
+    case "run_interrupted":
+      return applyRunInterrupted(state, event);
+    case "run_finished":
+      return applyRunFinished(state, event);
+    case "workspace_bound":
+      return applyWorkspaceBinding(state, event);
+    case "executor_bound":
+    case "executor_status_changed":
+      return applyExecutorBinding(state, event);
     case "tool_call":
       return upsertToolFromToolCall(state, event);
     case "tool_call_start":
+    case "tool_transport_started":
       return upsertToolFromStart(state, event);
+    case "tool_routing_decision":
+      return applyToolRoutingDecision(state, event);
+    case "tool_transport_completed":
+    case "tool_transport_failed":
+      return finishToolTransport(state, event);
     case "tool_call_end":
       return finishToolCall(state, event);
     case "agent_delegated":
     case "agent_spawned":
+    case "agent_live_event":
     case "agent_progress":
     case "agent_completed":
     case "agent_failed":
+    case "agent_waiting":
     case "agent_cancelled":
     case "agent_interrupted":
       return upsertAgent(state, event);
     default:
       return state;
   }
+}
+
+function applyRunStarted(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const workspace = workspaceBindingFromEvent(event);
+  const executor = executorBindingFromEvent(event);
+  if (!workspace && !executor) {
+    return {
+      ...state,
+      runId: stringField(event, "run_id") ?? state.runId,
+      sessionId: stringField(event, "session_id") ?? state.sessionId,
+      runStatus: "running",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    ...state,
+    runId: stringField(event, "run_id") ?? state.runId,
+    sessionId: stringField(event, "session_id") ?? state.sessionId,
+    runStatus: "running",
+    workspace: workspace ?? state.workspace,
+    executor: executor ?? state.executor,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyRunLifecycleStatus(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+  status: string,
+): WorkSurfaceState {
+  return {
+    ...state,
+    runId: stringField(event, "run_id") ?? state.runId,
+    sessionId: stringField(event, "session_id") ?? state.sessionId,
+    runStatus: status,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyRunFinished(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const status = stringField(event, "status") ?? "completed";
+  const timestamp = timestampFromEvent(event);
+  const tools = state.tools.map((tool) =>
+    tool.status === "running"
+      ? finalizeRunningToolForRunStatus(tool, status, event, timestamp)
+      : tool,
+  );
+  const agents = state.agents.map((agent) =>
+    isAgentSurfaceActive(agent.status)
+      ? finalizeActiveAgentForRunStatus(agent, status, event, timestamp)
+      : agent,
+  );
+  return {
+    ...state,
+    runId: stringField(event, "run_id") ?? state.runId,
+    sessionId: stringField(event, "session_id") ?? state.sessionId,
+    runStatus: status,
+    tools,
+    agents,
+    blocked:
+      status === "completed" || status === "cancelled" ? null : state.blocked,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyRunError(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const next = applyRunFinished(state, { ...event, status: "failed" });
+  const reason = blockedReasonFromEvent(event);
+  if (!reason) {
+    return next;
+  }
+  const workspace = workspaceBindingFromEvent(event) ?? next.workspace;
+  const executor = executorBindingFromEvent(event) ?? next.executor;
+  return {
+    ...next,
+    workspace,
+    executor,
+    blocked: blockedStateFromEvent(event, next, workspace, executor),
+  };
+}
+
+function applyRunInterrupted(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  return applyRunFinished(state, {
+    ...event,
+    status: "paused",
+    error_kind:
+      stringField(event, "error_kind") ??
+      stringField(event, "kind") ??
+      "interrupted",
+  });
 }
 
 function applyTaskBoardSnapshot(
@@ -211,15 +433,112 @@ function applyTaskBoardSnapshot(
   const tasks = Array.isArray(event.tasks)
     ? (event.tasks.filter(isTaskLike) as SessionTask[])
     : state.tasks;
+  const workspace = workspaceBindingFromEvent(event);
+  const executor = executorBindingFromEvent(event);
   return {
     ...state,
     sessionId:
       typeof event.session_id === "string" ? event.session_id : state.sessionId,
+    runId: stringField(event, "run_id") ?? state.runId,
+    workspace: workspace ?? state.workspace,
+    executor: executor ?? state.executor,
     tasks,
     hydrated: true,
     loading: false,
     error: null,
     updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyWorkspaceBinding(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  return {
+    ...state,
+    sessionId:
+      typeof event.session_id === "string" ? event.session_id : state.sessionId,
+    workspace: workspaceBindingFromEvent(event) ?? state.workspace,
+    executor: executorBindingFromEvent(event) ?? state.executor,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyExecutorBinding(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const executor = executorBindingFromEvent(event);
+  const clearBlocked = shouldClearBlockedForExecutorStatus(
+    state.blocked,
+    executor,
+  );
+  return {
+    ...state,
+    sessionId:
+      typeof event.session_id === "string" ? event.session_id : state.sessionId,
+    workspace: workspaceBindingFromEvent(event) ?? state.workspace,
+    executor: executor ?? state.executor,
+    runStatus:
+      clearBlocked && state.runStatus === "blocked"
+        ? "running"
+        : state.runStatus,
+    blocked: clearBlocked ? null : state.blocked,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyRunBlockedEvent(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const workspace = workspaceBindingFromEvent(event) ?? state.workspace;
+  const executor = executorBindingFromEvent(event) ?? state.executor;
+  return {
+    ...state,
+    runId: stringField(event, "run_id") ?? state.runId,
+    sessionId: stringField(event, "session_id") ?? state.sessionId,
+    runStatus: "blocked",
+    workspace,
+    executor,
+    blocked: blockedStateFromEvent(event, state, workspace, executor),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyRunWaiting(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const projection = projectRunWaitingState(
+    event as {
+      waiting_for?: string;
+      reason?: string;
+      error_kind?: string;
+    },
+  );
+  if (projection.blocked) {
+    const workspace = workspaceBindingFromEvent(event) ?? state.workspace;
+    const executor = executorBindingFromEvent(event) ?? state.executor;
+    return {
+      ...state,
+      runId: stringField(event, "run_id") ?? state.runId,
+      sessionId: stringField(event, "session_id") ?? state.sessionId,
+      runStatus: projection.status,
+      workspace,
+      executor,
+      blocked: blockedStateFromEvent(
+        { ...event, blocked: true, reason: projection.waitingFor },
+        state,
+        workspace,
+        executor,
+      ),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    ...applyRunLifecycleStatus(state, event, projection.status),
+    blocked: null,
   };
 }
 
@@ -251,6 +570,7 @@ function upsertToolFromToolCall(
       fn.arguments ?? toolCall.arguments ?? toolCall.args,
     ),
     status: "running",
+    ...toolBindingFields(event, state),
     startedAt: timestampFromEvent(event),
   });
 }
@@ -267,8 +587,68 @@ function upsertToolFromStart(
     tool,
     arguments: stringifyMaybe(event.arguments),
     status: "running",
+    ...toolBindingFields(event, state),
     startedAt: timestampFromEvent(event),
   });
+}
+
+function applyToolRoutingDecision(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const callId = stringField(event, "call_id");
+  if (!callId) return state;
+  const route = stringField(event, "route");
+  const tool = stringField(event, "tool");
+  return upsertTool(state, {
+    callId,
+    tool: tool ?? "tool",
+    status: "running",
+    route,
+    ...toolBindingFields(event, state),
+    startedAt: timestampFromEvent(event),
+  });
+}
+
+function finishToolTransport(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const callId = stringField(event, "call_id");
+  if (!callId) return state;
+  const isFailure =
+    event.type === "tool_transport_failed" || event.success === false;
+  const cancelled = eventIsCancelled(event);
+  const result = stringifyMaybe(event.error ?? event.result);
+  const durationMs = numberField(event, "duration_ms");
+  const timestamp = timestampFromEvent(event);
+  const status: ToolSurfaceItem["status"] = cancelled
+    ? "cancelled"
+    : isFailure
+      ? "error"
+      : "done";
+  const tools = upsertList(state.tools, callId, "callId", (existing) => ({
+    ...existing,
+    callId,
+    tool: stringField(event, "tool") ?? existing?.tool ?? "tool",
+    result: result ?? existing?.result,
+    status,
+    errorKind: stringField(event, "error_kind") ?? existing?.errorKind,
+    blocked: booleanField(event, "blocked") ?? existing?.blocked,
+    durationMs: durationMs ?? existing?.durationMs,
+    ...toolBindingFields(event, state),
+    startedAt: existing?.startedAt ?? timestamp,
+    finishedAt: timestamp,
+  })).slice(-40);
+  const next = applyMaybeBlockedToolFailure(
+    {
+      ...state,
+      tools,
+      updatedAt: new Date().toISOString(),
+    },
+    event,
+  );
+  return applyAgentWaitingFromToolEvent(next, event);
 }
 
 function finishToolCall(
@@ -278,18 +658,49 @@ function finishToolCall(
   const callId = stringField(event, "call_id");
   if (!callId) return state;
   const result = stringifyMaybe(event.result);
-  const status: ToolSurfaceItem["status"] =
-    event.success === false ? "error" : "done";
+  const status: ToolSurfaceItem["status"] = eventIsCancelled(event)
+    ? "cancelled"
+    : event.success === false
+      ? "error"
+      : "done";
+  const durationMs = numberField(event, "duration_ms");
   const tools = upsertList(state.tools, callId, "callId", (existing) => ({
     callId,
-    tool: existing?.tool ?? "tool",
+    tool: stringField(event, "tool") ?? existing?.tool ?? "tool",
     arguments: existing?.arguments,
     result,
     status,
+    errorKind: stringField(event, "error_kind") ?? existing?.errorKind,
+    blocked: booleanField(event, "blocked") ?? existing?.blocked,
+    workspace:
+      workspaceBindingFromEvent(event) ??
+      existing?.workspace ??
+      state.workspace,
+    executor:
+      executorBindingFromEvent(event) ?? existing?.executor ?? state.executor,
+    transport:
+      stringField(event, "transport") ??
+      existing?.transport ??
+      state.executor?.transport,
+    fallbackPolicy:
+      stringField(event, "fallback_policy") ??
+      workspaceBindingFromEvent(event)?.fallback_policy ??
+      existing?.fallbackPolicy ??
+      state.workspace?.fallback_policy,
+    route: stringField(event, "route") ?? existing?.route,
+    durationMs: durationMs ?? existing?.durationMs,
     startedAt: existing?.startedAt ?? timestampFromEvent(event),
     finishedAt: timestampFromEvent(event),
   })).slice(-40);
-  return { ...state, tools, updatedAt: new Date().toISOString() };
+  const next = applyMaybeBlockedToolFailure(
+    {
+      ...state,
+      tools,
+      updatedAt: new Date().toISOString(),
+    },
+    event,
+  );
+  return applyAgentWaitingFromToolEvent(next, event);
 }
 
 function upsertAgent(
@@ -299,23 +710,28 @@ function upsertAgent(
   const agentId = stringField(event, "agent_id");
   if (!agentId) return state;
   const type = String(event.type ?? "");
+  const liveKind = stringField(event, "event_kind");
   const terminalStatus =
     type === "agent_completed"
       ? "completed"
       : type === "agent_failed"
         ? "failed"
-        : type === "agent_cancelled"
-          ? "cancelled"
-          : type === "agent_interrupted"
-            ? "interrupted"
-            : undefined;
+        : type === "agent_waiting"
+          ? "waiting"
+          : type === "agent_cancelled"
+            ? "cancelled"
+            : type === "agent_interrupted"
+              ? "interrupted"
+              : type === "agent_live_event" && liveKind === "agent_terminated"
+                ? (stringField(event, "termination") ??
+                  stringField(event, "status"))
+                : undefined;
   const timestamp = timestampFromEvent(event);
   const agents = upsertList(state.agents, agentId, "agentId", (existing) => {
     const next: AgentSurfaceItem = {
       agentId,
       runId: stringField(event, "run_id") ?? existing?.runId,
-      parentRunId:
-        stringField(event, "parent_run_id") ?? existing?.parentRunId,
+      parentRunId: stringField(event, "parent_run_id") ?? existing?.parentRunId,
       agentType: stringField(event, "agent_type") ?? existing?.agentType,
       description:
         stringField(event, "description") ??
@@ -323,10 +739,16 @@ function upsertAgent(
         existing?.description,
       status:
         terminalStatus ??
+        liveAgentStatus(event, liveKind, existing?.status) ??
         stringField(event, "status") ??
         existing?.status ??
         "running",
-      toolName: stringField(event, "tool_name") ?? existing?.toolName,
+      toolName:
+        stringField(event, "tool_name") ??
+        (liveKind?.startsWith("tool_")
+          ? stringField(event, "name")
+          : undefined) ??
+        existing?.toolName,
       turn: numberField(event, "turn") ?? existing?.turn,
       maxTurns: numberField(event, "max_turns") ?? existing?.maxTurns,
       totalPromptTokens:
@@ -345,7 +767,25 @@ function upsertAgent(
         existing?.resultSummary,
       error: stringField(event, "error") ?? existing?.error,
       reason: stringField(event, "reason") ?? existing?.reason,
-      durationMs: numberField(event, "duration_ms") ?? existing?.durationMs,
+      durationMs:
+        type === "agent_live_event" && liveKind !== "agent_terminated"
+          ? existing?.durationMs
+          : (numberField(event, "duration_ms") ?? existing?.durationMs),
+      workspace:
+        workspaceBindingFromEvent(event) ??
+        existing?.workspace ??
+        state.workspace,
+      executor:
+        executorBindingFromEvent(event) ?? existing?.executor ?? state.executor,
+      transport:
+        stringField(event, "transport") ??
+        existing?.transport ??
+        state.executor?.transport,
+      fallbackPolicy:
+        stringField(event, "fallback_policy") ??
+        workspaceBindingFromEvent(event)?.fallback_policy ??
+        existing?.fallbackPolicy ??
+        state.workspace?.fallback_policy,
       updatedAt: timestamp,
     };
     return {
@@ -356,7 +796,46 @@ function upsertAgent(
   return { ...state, agents, updatedAt: new Date().toISOString() };
 }
 
+function applyAgentWaitingFromToolEvent(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  if (stringField(event, "agent_status") !== "waiting") {
+    return state;
+  }
+  const agentId = stringField(event, "agent_id");
+  if (!agentId) {
+    return state;
+  }
+  return upsertAgent(state, {
+    ...event,
+    type: "agent_waiting",
+    agent_id: agentId,
+    status: "waiting",
+    reason:
+      stringField(event, "reason") ??
+      stringField(event, "error_kind") ??
+      "waiting",
+  });
+}
+
 const AGENT_EVENT_LIMIT = 32;
+
+function liveAgentStatus(
+  event: Record<string, unknown>,
+  liveKind: string | undefined,
+  existingStatus: string | undefined,
+) {
+  if (!liveKind) return undefined;
+  if (liveKind === "tool_started") return "tool_executing";
+  if (liveKind === "agent_terminated") {
+    return stringField(event, "termination") ?? stringField(event, "status");
+  }
+  if (existingStatus && !ACTIVE_AGENT_SURFACE_STATUSES.has(existingStatus)) {
+    return existingStatus;
+  }
+  return existingStatus ?? "running";
+}
 
 function appendAgentEvent(
   current: AgentSurfaceEvent[] | undefined,
@@ -369,6 +848,20 @@ function appendAgentEvent(
   if (!entry) return events;
 
   const previous = events[events.length - 1];
+  if (
+    previous &&
+    previous.type === entry.type &&
+    previous.label === entry.label &&
+    previous.tone === entry.tone &&
+    (entry.type === "agent_live_event:output_delta" ||
+      entry.type === "agent_live_event:thinking_delta")
+  ) {
+    const detail = `${previous.detail ?? ""}${entry.detail ?? ""}`.slice(-2000);
+    return [
+      ...events.slice(0, -1),
+      { ...entry, id: previous.id, detail, timestamp },
+    ];
+  }
   if (
     previous &&
     previous.type === entry.type &&
@@ -393,6 +886,7 @@ function describeAgentEvent(
   let label = "Updated";
   let detail: string | undefined;
   let tone: AgentSurfaceEvent["tone"] = "neutral";
+  let eventType = type;
 
   if (type === "agent_delegated") {
     label = "Delegated";
@@ -402,6 +896,48 @@ function describeAgentEvent(
     label = "Spawned";
     detail = agent.description;
     tone = "running";
+  } else if (type === "agent_live_event") {
+    const liveKind = stringField(event, "event_kind") ?? "status";
+    eventType = `${type}:${liveKind}`;
+    if (liveKind === "output_delta") {
+      label = "Output";
+      detail = stringField(event, "content");
+      tone = "running";
+    } else if (liveKind === "thinking_delta") {
+      label = "Thinking";
+      detail = stringField(event, "content");
+      tone = "running";
+    } else if (liveKind === "status") {
+      label = "Status";
+      detail = stringField(event, "content");
+      tone = "running";
+    } else if (liveKind === "tool_started") {
+      const name = stringField(event, "name") ?? agent.toolName;
+      label = name ? `Running ${name}` : "Running tool";
+      detail = stringField(event, "description");
+      tone = "running";
+    } else if (liveKind === "tool_completed") {
+      const name = stringField(event, "name") ?? agent.toolName ?? "Tool";
+      const liveStatus = stringField(event, "status") ?? "ok";
+      label = `${name} ${statusLabel(liveStatus)}`;
+      detail =
+        stringField(event, "output_summary") ??
+        stringField(event, "output") ??
+        stringField(event, "description");
+      tone =
+        liveStatus === "error" || liveStatus === "failed"
+          ? "danger"
+          : "success";
+    } else if (liveKind === "agent_terminated") {
+      const termination = stringField(event, "termination") ?? "completed";
+      label = statusLabel(termination);
+      detail = stringField(event, "reason");
+      tone = termination === "completed" ? "success" : "danger";
+    } else {
+      label = statusLabel(liveKind);
+      detail = stringField(event, "content");
+      tone = "running";
+    }
   } else if (type === "agent_progress") {
     tone = "running";
     if (status === "tool_executing") {
@@ -413,6 +949,36 @@ function describeAgentEvent(
     } else if (status === "started") {
       label = "Started";
       detail = agent.description;
+    } else if (status === "busy") {
+      label = "Working";
+      detail = stringField(event, "activity") ?? progress;
+    } else if (status === "idle") {
+      label = "Idle";
+      detail = progress;
+      tone = "neutral";
+    } else if (status === "llm_call_started") {
+      label = "Waiting for model";
+      detail = turnDetail(event) ?? progress;
+    } else if (status === "llm_call_completed") {
+      label = "Model responded";
+      detail = durationDetail(event) ?? turnDetail(event) ?? progress;
+    } else if (status === "turn_completed") {
+      label = "Turn completed";
+      detail =
+        [turnDetail(event), stringField(event, "activity")]
+          .filter((item): item is string => Boolean(item))
+          .join(", ") || progress;
+    } else if (status === "permission_denied") {
+      label = "Permission denied";
+      detail =
+        [
+          stringField(event, "tool_name"),
+          stringField(event, "reason"),
+          turnDetail(event),
+        ]
+          .filter((item): item is string => Boolean(item))
+          .join(", ") || progress;
+      tone = "danger";
     } else {
       label = status ? statusLabel(status) : "Progress";
       detail = progress;
@@ -425,6 +991,10 @@ function describeAgentEvent(
     label = "Failed";
     detail = agent.error ?? agent.reason;
     tone = "danger";
+  } else if (type === "agent_waiting") {
+    label = "Waiting";
+    detail = agent.reason ?? progress;
+    tone = isExecutionBoundaryWait(agent.reason ?? "") ? "danger" : "neutral";
   } else if (type === "agent_cancelled") {
     label = "Cancelled";
     detail = agent.reason ?? agent.resultSummary;
@@ -439,14 +1009,30 @@ function describeAgentEvent(
 
   const id = [
     timestamp,
-    type,
+    eventType,
     status ?? "",
     label,
     detail ?? "",
     agent.turn ?? "",
     agent.toolName ?? "",
   ].join(":");
-  return { id, type, label, detail, tone, timestamp };
+  return { id, type: eventType, label, detail, tone, timestamp };
+}
+
+function turnDetail(event: Record<string, unknown>) {
+  const turn = numberField(event, "turn");
+  return turn === undefined ? undefined : `turn ${turn}`;
+}
+
+function durationDetail(event: Record<string, unknown>) {
+  const duration = numberField(event, "duration_ms");
+  const ttft = numberField(event, "ttft_ms");
+  const parts = [
+    duration === undefined ? undefined : `${duration}ms`,
+    ttft === undefined ? undefined : `ttft ${ttft}ms`,
+    turnDetail(event),
+  ].filter((item): item is string => Boolean(item));
+  return parts.length ? parts.join(", ") : undefined;
 }
 
 function agentProgressDetail(agent: AgentSurfaceItem) {
@@ -467,16 +1053,259 @@ function agentProgressDetail(agent: AgentSurfaceItem) {
   return parts.length ? parts.join(", ") : undefined;
 }
 
+function isAgentSurfaceActive(status: string) {
+  return ACTIVE_AGENT_SURFACE_STATUSES.has(status);
+}
+
+function finalizeRunningToolForRunStatus(
+  tool: ToolSurfaceItem,
+  runStatus: string,
+  event: Record<string, unknown>,
+  timestamp: number,
+): ToolSurfaceItem {
+  if (runStatus === "completed") {
+    return {
+      ...tool,
+      status: "done",
+      result:
+        tool.result ??
+        "Run completed before this tool emitted a final transport result.",
+      finishedAt: tool.finishedAt ?? timestamp,
+    };
+  }
+  if (runStatus === "paused" || runStatus === "interrupted") {
+    return {
+      ...tool,
+      status: "error",
+      errorKind:
+        tool.errorKind ??
+        stringField(event, "error_kind") ??
+        stringField(event, "kind") ??
+        "interrupted",
+      result: tool.result ?? defaultRunFinishedToolMessage(runStatus),
+      finishedAt: tool.finishedAt ?? timestamp,
+    };
+  }
+  const errorKind =
+    runStatus === "cancelled"
+      ? "cancelled"
+      : (stringField(event, "error_kind") ?? runStatus);
+  return {
+    ...tool,
+    status: runStatus === "cancelled" ? "cancelled" : "error",
+    errorKind: tool.errorKind ?? errorKind,
+    result:
+      tool.result ??
+      stringField(event, "error") ??
+      stringField(event, "message") ??
+      defaultRunFinishedToolMessage(runStatus),
+    finishedAt: tool.finishedAt ?? timestamp,
+  };
+}
+
+function finalizeActiveAgentForRunStatus(
+  agent: AgentSurfaceItem,
+  runStatus: string,
+  event: Record<string, unknown>,
+  timestamp: number,
+): AgentSurfaceItem {
+  if (runStatus === "completed") {
+    return {
+      ...agent,
+      status: "completed",
+      resultSummary:
+        agent.resultSummary ??
+        "Parent run completed before a terminal subagent event was observed.",
+      updatedAt: timestamp,
+    };
+  }
+  if (runStatus === "cancelled") {
+    return {
+      ...agent,
+      status: "cancelled",
+      reason: agent.reason ?? "parent_run_cancelled",
+      resultSummary: agent.resultSummary ?? "Stopped with the parent run.",
+      updatedAt: timestamp,
+    };
+  }
+  if (runStatus === "paused" || runStatus === "interrupted") {
+    return {
+      ...agent,
+      status: "interrupted",
+      reason:
+        agent.reason ??
+        stringField(event, "error_kind") ??
+        stringField(event, "kind") ??
+        "parent_run_interrupted",
+      resultSummary:
+        agent.resultSummary ??
+        stringField(event, "message") ??
+        stringField(event, "user_message") ??
+        "Parent run paused before a terminal subagent event was observed.",
+      updatedAt: timestamp,
+    };
+  }
+  return {
+    ...agent,
+    status: "failed",
+    error:
+      agent.error ??
+      stringField(event, "error") ??
+      stringField(event, "message") ??
+      "Parent run failed before a terminal subagent event was observed.",
+    reason: agent.reason ?? stringField(event, "error_kind") ?? runStatus,
+    updatedAt: timestamp,
+  };
+}
+
+function defaultRunFinishedToolMessage(runStatus: string) {
+  if (runStatus === "cancelled") {
+    return "Stopped before this tool emitted a final transport result.";
+  }
+  if (runStatus === "paused" || runStatus === "interrupted") {
+    return "Run paused before this tool emitted a final transport result.";
+  }
+  return "Run failed before this tool emitted a final transport result.";
+}
+
+function eventIsCancelled(event: Record<string, unknown>) {
+  return (
+    booleanField(event, "cancelled") === true ||
+    stringField(event, "error_kind") === "cancelled" ||
+    stringField(event, "reason") === "cancelled"
+  );
+}
+
+function isTerminalRunStatus(status: string) {
+  return (
+    status === "completed" ||
+    status === "cancelled" ||
+    status === "failed" ||
+    status === "interrupted"
+  );
+}
+
 function upsertTool(
   state: WorkSurfaceState,
   item: ToolSurfaceItem,
 ): WorkSurfaceState {
-  const tools = upsertList(state.tools, item.callId, "callId", (existing) => ({
+  const tools = upsertList(state.tools, item.callId, "callId", (existing) =>
+    mergeToolItem(existing, item),
+  ).slice(-40);
+  return { ...state, tools, updatedAt: new Date().toISOString() };
+}
+
+function mergeToolItem(
+  existing: ToolSurfaceItem | undefined,
+  item: ToolSurfaceItem,
+): ToolSurfaceItem {
+  const next: ToolSurfaceItem = {
     ...existing,
     ...item,
     startedAt: existing?.startedAt ?? item.startedAt,
-  })).slice(-40);
-  return { ...state, tools, updatedAt: new Date().toISOString() };
+  };
+  if (item.workspace === undefined) next.workspace = existing?.workspace;
+  if (item.executor === undefined) next.executor = existing?.executor;
+  if (item.transport === undefined) next.transport = existing?.transport;
+  if (item.fallbackPolicy === undefined) {
+    next.fallbackPolicy = existing?.fallbackPolicy;
+  }
+  if (item.route === undefined) next.route = existing?.route;
+  if (item.durationMs === undefined) next.durationMs = existing?.durationMs;
+  return next;
+}
+
+function applyMaybeBlockedToolFailure(
+  state: WorkSurfaceState,
+  event: Record<string, unknown>,
+): WorkSurfaceState {
+  const reason = blockedReasonFromEvent(event);
+  if (!reason) {
+    return state;
+  }
+  const workspace = workspaceBindingFromEvent(event) ?? state.workspace;
+  const executor = executorBindingFromEvent(event) ?? state.executor;
+  return {
+    ...state,
+    runStatus: "blocked",
+    workspace,
+    executor,
+    blocked: blockedStateFromEvent(event, state, workspace, executor),
+  };
+}
+
+const ACTIONABLE_BLOCKING_ERROR_KINDS = new Set([
+  "executor_offline",
+  "transport_disconnected",
+  "fallback_disabled",
+  "workspace_executor_unavailable",
+  "approval_timeout",
+  "workspace_path_mismatch",
+]);
+
+function blockedReasonFromEvent(event: Record<string, unknown>) {
+  const reason = extractBlockedReason(
+    event as {
+      type?: string;
+      reason?: string;
+      error_kind?: string;
+      blocked?: boolean;
+    },
+  );
+  if (reason) return reason;
+
+  const errorKind = stringField(event, "error_kind");
+  if (errorKind && ACTIONABLE_BLOCKING_ERROR_KINDS.has(errorKind)) {
+    return errorKind;
+  }
+  return null;
+}
+
+function blockedStateFromEvent(
+  event: Record<string, unknown>,
+  state: WorkSurfaceState,
+  workspace?: WorkspaceBinding,
+  executor?: ExecutorBinding,
+): RunBlockedState {
+  const reason = blockedReasonFromEvent(event) ?? "blocked";
+  const message =
+    stringField(event, "message") ??
+    stringField(event, "error") ??
+    stringifyMaybe(event.result) ??
+    blockedRunMessage(reason);
+  return {
+    reason,
+    message,
+    callId: stringField(event, "call_id"),
+    tool: stringField(event, "tool"),
+    workspace,
+    executor,
+    transport: stringField(event, "transport") ?? executor?.transport,
+    fallbackPolicy:
+      stringField(event, "fallback_policy") ??
+      workspace?.fallback_policy ??
+      state.workspace?.fallback_policy,
+    timestamp: timestampFromEvent(event),
+  };
+}
+
+function executorIsAvailable(executor: ExecutorBinding | undefined) {
+  return Boolean(
+    executor?.status &&
+    !["offline", "degraded", "unknown"].includes(executor.status),
+  );
+}
+
+function shouldClearBlockedForExecutorStatus(
+  blocked: RunBlockedState | null,
+  executor: ExecutorBinding | undefined,
+) {
+  return Boolean(
+    blocked &&
+    executorIsAvailable(executor) &&
+    (blocked.reason === "executor_offline" ||
+      blocked.reason === "transport_disconnected"),
+  );
 }
 
 function upsertList<T, K extends keyof T>(
@@ -499,7 +1328,14 @@ function stringField(obj: Record<string, unknown>, key: string) {
 
 function numberField(obj: Record<string, unknown>, key: string) {
   const value = obj[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function booleanField(obj: Record<string, unknown>, key: string) {
+  const value = obj[key];
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function nestedNumberField(
@@ -510,6 +1346,61 @@ function nestedNumberField(
   const value = obj[key];
   if (!value || typeof value !== "object") return undefined;
   return numberField(value as Record<string, unknown>, nestedKey);
+}
+
+function workspaceBindingFromEvent(
+  event: Record<string, unknown>,
+): WorkspaceBinding | undefined {
+  const workspace = event.workspace;
+  if (!workspace || typeof workspace !== "object") return undefined;
+  const raw = workspace as Record<string, unknown>;
+  const kind = stringField(raw, "kind");
+  if (!kind) return undefined;
+  return {
+    kind,
+    display_name: stringField(raw, "display_name"),
+    cwd: typeof raw.cwd === "string" || raw.cwd === null ? raw.cwd : undefined,
+    authority: stringField(raw, "authority"),
+    fallback_policy: stringField(raw, "fallback_policy"),
+  };
+}
+
+function executorBindingFromEvent(
+  event: Record<string, unknown>,
+): ExecutorBinding | undefined {
+  const executor = event.executor;
+  if (!executor || typeof executor !== "object") return undefined;
+  const raw = executor as Record<string, unknown>;
+  const kind = stringField(raw, "kind");
+  if (!kind) return undefined;
+  return {
+    kind,
+    executor_id: stringField(raw, "executor_id"),
+    display_name: stringField(raw, "display_name"),
+    transport: stringField(raw, "transport"),
+    status: stringField(raw, "status"),
+  };
+}
+
+function toolBindingFields(
+  event: Record<string, unknown>,
+  state: WorkSurfaceState,
+): Partial<ToolSurfaceItem> {
+  const workspace = workspaceBindingFromEvent(event) ?? state.workspace;
+  const executor = executorBindingFromEvent(event) ?? state.executor;
+  const fields: Partial<ToolSurfaceItem> = {};
+  if (workspace) fields.workspace = workspace;
+  if (executor) fields.executor = executor;
+  const transport = stringField(event, "transport") ?? executor?.transport;
+  if (transport) fields.transport = transport;
+  const fallbackPolicy =
+    stringField(event, "fallback_policy") ?? workspace?.fallback_policy;
+  if (fallbackPolicy) fields.fallbackPolicy = fallbackPolicy;
+  const route = stringField(event, "route");
+  if (route) fields.route = route;
+  const durationMs = numberField(event, "duration_ms");
+  if (durationMs !== undefined) fields.durationMs = durationMs;
+  return fields;
 }
 
 function timestampFromEvent(event: Record<string, unknown>) {

@@ -152,42 +152,6 @@ pub(crate) enum WireEvent {
     Compaction(CompactionEvent),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundTaskOutputInfoKind {
-    Other,
-    RunningSnapshot,
-    Snapshot,
-}
-
-fn background_task_output_info_kind(msg: &str) -> BackgroundTaskOutputInfoKind {
-    let first_line = msg.lines().next().unwrap_or_default().trim_start();
-    let is_background_output = [
-        "Read shell output ",
-        "Read local agent output ",
-        "Read cloud session output ",
-        "Read main session output ",
-        "Read monitor output ",
-    ]
-    .iter()
-    .any(|prefix| first_line.starts_with(prefix));
-    if !is_background_output {
-        return BackgroundTaskOutputInfoKind::Other;
-    }
-
-    let metadata = msg.split("\nOutput chunk:").next().unwrap_or(msg);
-    if metadata.contains("still running")
-        || metadata.contains("Pending ·")
-        || metadata.contains(" · pending")
-        || metadata.contains("needs input")
-        || metadata.contains("Waiting for input")
-        || metadata.contains("No result yet")
-    {
-        BackgroundTaskOutputInfoKind::RunningSnapshot
-    } else {
-        BackgroundTaskOutputInfoKind::Snapshot
-    }
-}
-
 /// Per-turn metrics the outer loop collects and hands to
 /// `TurnComplete` for the summary band. Boxed in the event enum
 /// so the enum stays small (clippy::large_enum_variant guard).
@@ -456,7 +420,6 @@ pub(crate) struct ChatWidget {
     session_id: String,
     history: Vec<Arc<dyn HistoryCell>>,
     active_cell: Option<Box<dyn HistoryCell>>,
-    active_tool_use_id: Option<String>,
     /// Live parallel TaskCells, keyed by their `tool_use_id`.
     /// Mutating directly (no `Arc`) so child events can attach.
     live_tasks: std::collections::HashMap<String, Box<TaskCell>>,
@@ -502,11 +465,6 @@ pub(crate) struct ChatWidget {
     /// Control tool ids cleared at a turn boundary. Used to detect
     /// late `AgentControlCompleted` arrivals after the row was dropped.
     cleared_agent_tool_use_ids: std::collections::HashSet<String>,
-    /// Top-level Bash tool ids already rendered as "running in the
-    /// background" after a Ctrl+B handoff. If their server-side
-    /// ToolCompleted arrives after TurnError has committed the active
-    /// cell, drop it instead of synthesizing a duplicate ToolCell.
-    backgrounded_bash_tool_use_ids: std::collections::HashSet<String>,
     /// Current-turn UI capability for foreground bash promotion.
     /// Enabled by the interactive event loop only after it installs a
     /// detach handle that Ctrl+B can signal.
@@ -519,7 +477,6 @@ impl ChatWidget {
             session_id: session_id.into(),
             history: Vec::new(),
             active_cell: None,
-            active_tool_use_id: None,
             live_tasks: std::collections::HashMap::new(),
             live_task_order: Vec::new(),
             agent_runs: AgentRunRegistry::default(),
@@ -530,53 +487,12 @@ impl ChatWidget {
             cancelled_task_ids: std::collections::HashSet::new(),
             cleared_agent_run_ids: std::collections::HashSet::new(),
             cleared_agent_tool_use_ids: std::collections::HashSet::new(),
-            backgrounded_bash_tool_use_ids: std::collections::HashSet::new(),
             bash_background_hint_enabled: false,
         }
     }
 
     pub fn set_bash_background_hint_enabled(&mut self, enabled: bool) {
         self.bash_background_hint_enabled = enabled;
-        if let Some(cell) = self.active_cell.as_mut()
-            && let Some(tool) = cell.as_any_mut().downcast_mut::<ToolCell>()
-            && tool.name == "bash"
-        {
-            tool.set_ctrl_b_background_hint(enabled);
-        }
-    }
-
-    pub fn mark_active_bash_backgrounded(
-        &mut self,
-        tool_use_id: Option<&str>,
-        task_id: &str,
-    ) -> bool {
-        if let (Some(active_id), Some(tool_use_id)) =
-            (self.active_tool_use_id.as_deref(), tool_use_id)
-            && active_id != tool_use_id
-        {
-            return false;
-        }
-
-        let Some(cell) = self.active_cell.as_mut() else {
-            return false;
-        };
-        {
-            let Some(tool) = cell.as_any_mut().downcast_mut::<ToolCell>() else {
-                return false;
-            };
-            if tool.name != "bash" {
-                return false;
-            }
-            tool.complete_bash_backgrounded(task_id);
-        }
-        let suppress_tool_use_id = tool_use_id
-            .map(str::to_string)
-            .or_else(|| self.active_tool_use_id.clone());
-        if let Some(tool_use_id) = suppress_tool_use_id {
-            self.backgrounded_bash_tool_use_ids.insert(tool_use_id);
-        }
-        self.commit_active();
-        true
     }
 
     /// IDs of currently-live parallel TaskCells in spawn order.
@@ -1281,7 +1197,6 @@ impl ChatWidget {
             if cell.name == "bash" && self.bash_background_hint_enabled {
                 cell.set_ctrl_b_background_hint(true);
             }
-            self.active_tool_use_id = Some(tool_use_id);
             self.active_cell = Some(Box::new(cell));
         }
     }
@@ -1714,16 +1629,6 @@ impl ChatWidget {
         // synthesize a new completed cell (happens when the model
         // emits a ToolCompleted without a paired ToolStarted —
         // e.g. replayed from journal mid-turn).
-        if self.backgrounded_bash_tool_use_ids.contains(&tool_use_id) {
-            if self.active_tool_use_id.as_deref() == Some(tool_use_id.as_str()) {
-                self.backgrounded_bash_tool_use_ids.remove(&tool_use_id);
-                self.commit_active();
-                return;
-            }
-            self.backgrounded_bash_tool_use_ids.remove(&tool_use_id);
-            return;
-        }
-
         if let Some(cell) = self.active_cell.as_mut()
             && let Some(tc) = cell.as_any_mut().downcast_mut::<ToolCell>()
         {
@@ -1826,15 +1731,7 @@ impl ChatWidget {
     }
 
     fn on_turn_info(&mut self, msg: String) {
-        match background_task_output_info_kind(&msg) {
-            BackgroundTaskOutputInfoKind::RunningSnapshot => {}
-            BackgroundTaskOutputInfoKind::Snapshot => {
-                self.commit_cell(Box::new(SystemCell::background_task(msg)));
-            }
-            BackgroundTaskOutputInfoKind::Other => {
-                self.commit_cell(Box::new(SystemCell::info(msg)));
-            }
-        }
+        self.commit_cell(Box::new(SystemCell::info(msg)));
     }
 
     fn on_explain_report(&mut self, items: Vec<serde_json::Value>) {
@@ -1915,10 +1812,8 @@ impl ChatWidget {
     /// history, and persist. No-op when `active_cell` is None.
     fn commit_active(&mut self) {
         let Some(mut cell) = self.active_cell.take() else {
-            self.active_tool_use_id = None;
             return;
         };
-        self.active_tool_use_id = None;
         cell.finalize();
         // Box → Arc: the scrollback index shares cells with
         // long-lived render paths (e.g. Ctrl+O overlay) without
@@ -2336,28 +2231,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_ctrl_b_hint_updates_existing_active_cell() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
-
-        w.set_bash_background_hint_enabled(true);
-        let cell = w
-            .active_cell
-            .as_deref()
-            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
-            .unwrap();
-        assert!(cell.ctrl_b_background_hint);
-
-        w.set_bash_background_hint_enabled(false);
-        let cell = w
-            .active_cell
-            .as_deref()
-            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
-            .unwrap();
-        assert!(!cell.ctrl_b_background_hint);
-    }
-
-    #[test]
     fn non_bash_tool_started_ignores_ctrl_b_hint_capability() {
         let mut w = fresh();
         w.set_bash_background_hint_enabled(true);
@@ -2391,65 +2264,6 @@ mod tests {
             .live_task_cell("tu_test")
             .expect("agent get_result should render as a live TaskCell");
         assert!(!get_result_cell.ctrl_b_background_hint);
-    }
-
-    #[test]
-    fn turn_info_suppresses_running_background_output_snapshot() {
-        let mut w = fresh();
-
-        w.handle_event(AppEvent::Wire(WireEvent::TurnInfo(
-            "Read shell output bg-shell-1 · \"make check\"\n\
-             9 new lines · offset 0 -> 178 · total 178 bytes · 5 total lines · still running\n\
-             Output chunk:\n\
-             Running clippy..."
-                .into(),
-        )));
-
-        assert!(
-            w.history().is_empty(),
-            "running background output snapshots belong in the background detail view, not scrollback"
-        );
-    }
-
-    #[test]
-    fn turn_info_keeps_terminal_background_output_as_background_cell() {
-        let mut w = fresh();
-
-        w.handle_event(AppEvent::Wire(WireEvent::TurnInfo(
-            "Read shell output bg-shell-1 · \"make check\"\n\
-             1 new line · offset 178 -> 210 · total 210 bytes · 6 total lines · completed\n\
-             Output chunk:\n\
-             All checks passed"
-                .into(),
-        )));
-
-        assert_eq!(w.history().len(), 1);
-        let cell = w
-            .history()
-            .last()
-            .and_then(|cell| {
-                cell.as_any_ref()
-                    .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
-            })
-            .expect("terminal background output should render as a system cell");
-        let first = cell
-            .display_lines(100)
-            .first()
-            .map(|line| line.to_string())
-            .unwrap_or_default();
-        assert!(first.starts_with("↳ Background · "), "{first}");
-        assert!(!first.contains("Note ·"), "{first}");
-    }
-
-    #[test]
-    fn turn_info_keeps_non_background_info() {
-        let mut w = fresh();
-
-        w.handle_event(AppEvent::Wire(WireEvent::TurnInfo(
-            "token refreshed".into(),
-        )));
-
-        assert_eq!(w.history().len(), 1);
     }
 
     #[test]
@@ -2983,129 +2797,6 @@ mod tests {
             .expect("last cell should be SystemCell");
         // Humanisation strips the tag.
         assert_eq!(err.message(), "rate limited");
-    }
-
-    #[test]
-    fn backgrounded_bash_survives_turn_error_and_drops_late_completion() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
-        assert!(w.mark_active_bash_backgrounded(Some("tu_test"), "bg-shell-1"));
-
-        w.handle_event(AppEvent::Wire(WireEvent::TurnError("TUI cancel".into())));
-        assert_eq!(w.history.len(), 2);
-        let tool = w.history[0]
-            .as_any_ref()
-            .downcast_ref::<ToolCell>()
-            .expect("first cell should be the backgrounded bash tool");
-        assert_eq!(tool.status, ToolStatus::Success);
-        let expected = format!(
-            "Running in the background as bg-shell-1 · {}",
-            crate::tui::background_shortcut::background_task_open_hint()
-        );
-        assert_eq!(tool.output_summary.as_deref(), Some(expected.as_str()));
-
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
-            name: "read_file".into(),
-            description: "Reading: Cargo.toml".into(),
-            tool_use_id: "tu_next".into(),
-            parent_tool_use_id: None,
-        }));
-        w.handle_event(AppEvent::Wire(tool_completed(
-            "bash",
-            "$ make check",
-            "ok",
-            1200,
-            Some("<bash_detached>The bash command was promoted.</bash_detached>"),
-        )));
-        assert_eq!(
-            w.history.len(),
-            2,
-            "late bash ToolCompleted must not synthesize a duplicate ToolCell or commit the next active tool"
-        );
-        let active = w
-            .active_cell
-            .as_deref()
-            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
-            .expect("next active tool should remain live");
-        assert_eq!(active.name, "read_file");
-    }
-
-    #[test]
-    fn backgrounded_bash_normal_completion_commits_once_with_task_id() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
-        assert!(w.mark_active_bash_backgrounded(Some("tu_test"), "bg-shell-1"));
-
-        w.handle_event(AppEvent::Wire(tool_completed(
-            "bash",
-            "$ make check",
-            "success",
-            1200,
-            Some(
-                "<bash_detached>The bash command was promoted to background task bg-shell-1.</bash_detached>",
-            ),
-        )));
-
-        assert!(
-            w.active_cell.is_none(),
-            "normal detached ToolCompleted should finish the foreground Bash cell"
-        );
-        assert_eq!(
-            w.history.len(),
-            1,
-            "detached ToolCompleted must not synthesize a duplicate Bash cell"
-        );
-        assert!(
-            w.backgrounded_bash_tool_use_ids.is_empty(),
-            "detached ToolCompleted should retire the suppression marker"
-        );
-        let tool = w.history[0]
-            .as_any_ref()
-            .downcast_ref::<ToolCell>()
-            .expect("history should contain the backgrounded Bash tool");
-        assert_eq!(tool.status, ToolStatus::Success);
-        let expected = format!(
-            "Running in the background as bg-shell-1 · {}",
-            crate::tui::background_shortcut::background_task_open_hint()
-        );
-        assert_eq!(tool.output_summary.as_deref(), Some(expected.as_str()));
-    }
-
-    #[test]
-    fn backgrounded_bash_without_explicit_tool_use_id_suppresses_late_completion() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "$ make check")));
-        assert!(w.mark_active_bash_backgrounded(None, "bg-shell-1"));
-
-        w.handle_event(AppEvent::Wire(tool_completed(
-            "bash",
-            "$ make check",
-            "success",
-            1200,
-            Some(
-                "<bash_detached>The bash command was promoted to background task bg-shell-1.</bash_detached>",
-            ),
-        )));
-
-        assert_eq!(
-            w.history.len(),
-            1,
-            "late detached ToolCompleted must not synthesize a duplicate Bash cell"
-        );
-        assert!(
-            w.backgrounded_bash_tool_use_ids.is_empty(),
-            "late detached ToolCompleted should retire the inferred suppression marker"
-        );
-        let tool = w.history[0]
-            .as_any_ref()
-            .downcast_ref::<ToolCell>()
-            .expect("history should contain the backgrounded Bash tool");
-        assert_eq!(tool.status, ToolStatus::Success);
-        let expected = format!(
-            "Running in the background as bg-shell-1 · {}",
-            crate::tui::background_shortcut::background_task_open_hint()
-        );
-        assert_eq!(tool.output_summary.as_deref(), Some(expected.as_str()));
     }
 
     // ── Invariant: at most one live cell ─────────────────────────

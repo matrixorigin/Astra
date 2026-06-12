@@ -138,10 +138,6 @@ pub(crate) struct BackgroundTaskHandle {
     last_output_size: u64,
     last_activity: Instant,
     last_tail_probe_at: Option<Instant>,
-    /// Set after `prune_terminated` deletes this task's output files.
-    /// The handle stays in the map so callers get "output expired"
-    /// instead of "not found".
-    pub(crate) output_files_deleted: bool,
 }
 
 impl BackgroundTaskHandle {
@@ -210,13 +206,6 @@ const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 /// beyond this limit are soft-rejected (return an empty id) to prevent
 /// unbounded resource consumption.  The LLM can retry or re-plan.
 const MAX_CONCURRENT_TASKS: usize = 32;
-/// Maximum number of *terminal* (completed/failed/killed) tasks retained
-/// in-memory after they finish. Terminal tasks must remain queryable so
-/// the model can answer "how did make check go?" in the next user turn —
-/// CC's TaskList keeps completed tasks visible until the user dismisses
-/// them; this cap is the equivalent for our HashMap-backed registry. When
-/// the cap is exceeded, the oldest-ended terminal entries are LRU-evicted.
-const MAX_TERMINAL_TASKS_RETAINED: usize = 64;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const PROMPT_PATTERNS: &[&str] = &[
@@ -250,31 +239,11 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    /// Rebind the directory used for future background shell output files.
-    /// Existing handles keep their original stdout/stderr paths because live
-    /// runners may still be appending to those files.
-    ///
-    /// Returns an error if the directory cannot be created. Callers must
-    /// surface the failure — a silently-failed mkdir would surface much
-    /// later as `try_spawn_shell` "No such file or directory" with no link
-    /// back to this rebind, defeating traceability.
-    pub fn rebind_output_dir(&mut self, output_dir: PathBuf) -> Result<(), String> {
-        std::fs::create_dir_all(&output_dir).map_err(|e| {
-            format!(
-                "background task output directory could not be created at {}: {e}",
-                output_dir.display()
-            )
-        })?;
-        self.output_dir = output_dir;
-        Ok(())
-    }
-
     /// Spawn a shell command in the background. Returns the task ID.
     pub fn try_spawn_shell(&mut self, command: &str, description: &str) -> Result<String, String> {
-        // Use active_count (includes stalled) to prevent capacity bypass
-        if self.active_count() >= MAX_CONCURRENT_TASKS {
+        if self.running_count() >= MAX_CONCURRENT_TASKS {
             return Err(format!(
-                "background shell task limit reached ({MAX_CONCURRENT_TASKS} active)"
+                "background shell task limit reached ({MAX_CONCURRENT_TASKS} running)"
             ));
         }
         let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
@@ -299,7 +268,6 @@ impl BackgroundTaskRegistry {
             last_output_size: 0,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
-            output_files_deleted: false,
         };
         self.tasks.insert(id.clone(), handle);
 
@@ -352,7 +320,7 @@ impl BackgroundTaskRegistry {
     /// `command_label` is rendered as the task description. Cancel
     /// behaviour matches `spawn_shell`: `kill(id)` will SIGKILL the
     /// process group via the existing kill_on_drop guard.
-    pub async fn adopt_detached_shell(
+    pub fn adopt_detached_shell(
         &mut self,
         child: tokio::process::Child,
         stdout: tokio::process::ChildStdout,
@@ -361,6 +329,11 @@ impl BackgroundTaskRegistry {
         partial_stdout: String,
         partial_stderr: String,
     ) -> Result<String, String> {
+        if self.running_count() >= MAX_CONCURRENT_TASKS {
+            return Err(format!(
+                "background shell task limit reached ({MAX_CONCURRENT_TASKS} running)"
+            ));
+        }
         let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
         let cancel = CancellationToken::new();
         let stdout_path = self.output_dir.join(format!("{id}.stdout"));
@@ -369,39 +342,19 @@ impl BackgroundTaskRegistry {
 
         // Seed output files with partial bytes the foreground runner
         // already showed. The LLM and user must see one continuous
-        // stream, not a jump-cut at the detach point.
-        // CRITICAL FIX: File creation errors block spawn to prevent orphan processes
+        // stream, not a jump-cut at the detach point. Errors are
+        // non-fatal: the streamer will append regardless.
         if !partial_stdout.is_empty() {
-            if let Err(e) = tokio::fs::write(&stdout_path, &partial_stdout).await {
-                return Err(format!(
-                    "adopted shell: cannot seed stdout file {}: {e}",
-                    stdout_path.display()
-                ));
-            }
+            let _ = std::fs::write(&stdout_path, &partial_stdout);
         } else {
             // Touch the file so get_output() on a not-yet-flushed
             // adopted task doesn't return ENOENT.
-            if let Err(e) = tokio::fs::File::create(&stdout_path).await {
-                return Err(format!(
-                    "adopted shell: cannot create stdout file {}: {e}",
-                    stdout_path.display()
-                ));
-            }
+            let _ = std::fs::File::create(&stdout_path);
         }
         if !partial_stderr.is_empty() {
-            if let Err(e) = tokio::fs::write(&stderr_path, &partial_stderr).await {
-                return Err(format!(
-                    "adopted shell: cannot seed stderr file {}: {e}",
-                    stderr_path.display()
-                ));
-            }
+            let _ = std::fs::write(&stderr_path, &partial_stderr);
         } else {
-            if let Err(e) = tokio::fs::File::create(&stderr_path).await {
-                return Err(format!(
-                    "adopted shell: cannot create stderr file {}: {e}",
-                    stderr_path.display()
-                ));
-            }
+            let _ = std::fs::File::create(&stderr_path);
         }
 
         let handle = BackgroundTaskHandle {
@@ -420,7 +373,6 @@ impl BackgroundTaskRegistry {
             last_output_size: partial_stdout.len() as u64 + partial_stderr.len() as u64,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
-            output_files_deleted: false,
         };
         self.tasks.insert(id.clone(), handle);
 
@@ -492,7 +444,6 @@ impl BackgroundTaskRegistry {
             last_output_size,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
-            output_files_deleted: false,
         };
         self.tasks.insert(id.to_string(), handle);
         Ok(())
@@ -525,17 +476,12 @@ impl BackgroundTaskRegistry {
         if handle.status().is_terminal() {
             return Err(format!("background shell '{id}' already terminated"));
         }
-        // Signal cancellation. The runner observes this via
+        // Only signal cancellation. The runner observes this via
         // `cancel.cancelled()`, kills the child, and emits its own
         // terminal `TaskCompletion`. `poll_completions` then translates
         // that to a single `Killed` event. No premature status-set,
         // no duplicate event.
-        // Note: kill() is best-effort and returns before the child
-        // process actually terminates. The process will be killed
-        // shortly and the completion will be processed in the next
-        // drain_join_set() or poll_completions() call.
         handle.cancel_token.cancel();
-        self.drain_join_set();
         Ok(())
     }
 
@@ -606,49 +552,10 @@ impl BackgroundTaskRegistry {
 
     /// Prune terminated tasks from the registry to prevent unbounded
     /// memory growth in long-running sessions.  Tasks that have reached a
-    /// LRU-evict terminal tasks once the retained set exceeds
-    /// [`MAX_TERMINAL_TASKS_RETAINED`]. Running tasks are never touched.
-    /// Called from `poll_completions` so the cap is enforced exactly once
-    /// per tick rather than from every read path.
-    ///
-    /// Pre-fix this method dropped *every* terminal task on each tick,
-    /// which made `task_output("bg-shell-1")` start replying "not found"
-    /// the moment a make-check completed — even within the same session,
-    /// even seconds after the task notification fired. Models couldn't
-    /// answer "how did it go?" in the next turn without re-running the
-    /// command. The CC equivalent (`BackgroundTasksDialog`) keeps
-    /// completed entries visible until the user dismisses them; this cap
-    /// gives us the same semantics with a fixed memory ceiling.
+    /// terminal state (completed / failed / killed) are removed from the
+    /// in-memory map; their output files remain on disk.
     pub fn prune_terminated(&mut self) {
-        let mut terminal: Vec<(&str, u64)> = self
-            .tasks
-            .iter()
-            .filter(|(_, h)| h.status().is_terminal())
-            .map(|(id, h)| (id.as_str(), h.ended_at_ms.unwrap_or(h.started_at_ms)))
-            .collect();
-        if terminal.len() <= MAX_TERMINAL_TASKS_RETAINED {
-            return;
-        }
-        // Oldest-ended first; evict from the front of the sorted list.
-        terminal.sort_by_key(|(_, ended)| *ended);
-        let to_evict = terminal.len() - MAX_TERMINAL_TASKS_RETAINED;
-        let victims: Vec<String> = terminal
-            .into_iter()
-            .take(to_evict)
-            .map(|(id, _)| id.to_string())
-            .collect();
-        for id in victims {
-            if let Some(handle) = self.tasks.get_mut(&id) {
-                // Clean up output files on disk to prevent unbounded
-                // disk usage. Each task can produce up to MAX_OUTPUT_BYTES
-                // per stream; without cleanup, N tasks = N*2*cap bytes.
-                // Keep the handle in the map so get_output returns
-                // "output expired" instead of "not found".
-                let _ = std::fs::remove_file(&handle.stdout_path);
-                let _ = std::fs::remove_file(&handle.stderr_path);
-                handle.output_files_deleted = true;
-            }
-        }
+        self.tasks.retain(|_, h| !h.status().is_terminal());
     }
 
     /// Kill all running tasks. Returns IDs of killed tasks.
@@ -672,11 +579,6 @@ impl BackgroundTaskRegistry {
             .tasks
             .get(id)
             .ok_or_else(|| format!("no background shell with id '{id}'"))?;
-        if handle.output_files_deleted {
-            return Err(format!(
-                "output for '{id}' was evicted (too many completed tasks); rerun if needed"
-            ));
-        }
         if handle.status().is_terminal() && !handle.stdout_path.exists() {
             return Err(missing_output_artifact_error(&handle.stdout_path));
         }
@@ -695,11 +597,6 @@ impl BackgroundTaskRegistry {
             .tasks
             .get(id)
             .ok_or_else(|| format!("no background shell with id '{id}'"))?;
-        if handle.output_files_deleted {
-            return Err(format!(
-                "output for '{id}' was evicted (too many completed tasks); rerun if needed"
-            ));
-        }
         if handle.status().is_terminal() && !handle.stdout_path.exists() {
             return Err(missing_output_artifact_error(&handle.stdout_path));
         }
@@ -718,11 +615,6 @@ impl BackgroundTaskRegistry {
             .tasks
             .get(id)
             .ok_or_else(|| format!("no background shell with id '{id}'"))?;
-        if handle.output_files_deleted {
-            return Err(format!(
-                "output for '{id}' was evicted (too many completed tasks); rerun if needed"
-            ));
-        }
         let stdout_missing = !handle.stdout_path.exists();
         let stderr_has_output = file_len(&handle.stderr_path) > 0;
         if handle.status().is_terminal() && stdout_missing && !stderr_has_output {
@@ -737,11 +629,6 @@ impl BackgroundTaskRegistry {
             .tasks
             .get(id)
             .ok_or_else(|| format!("no background shell with id '{id}'"))?;
-        if handle.output_files_deleted {
-            return Err(format!(
-                "output for '{id}' was evicted (too many completed tasks); rerun if needed"
-            ));
-        }
         read_tail_str(&handle.stderr_path, tail_bytes)
     }
 
@@ -788,10 +675,8 @@ impl BackgroundTaskRegistry {
 
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
-    /// Also LRU-trims the terminal-task pool when it exceeds
-    /// [`MAX_TERMINAL_TASKS_RETAINED`]; recently-finished entries
-    /// remain queryable across user turns so `task_output(id)` can
-    /// answer "how did it go?" instead of "not found".
+    /// Also prunes tasks that were terminal on entry, ensuring one
+    /// full tick of display + persist before removal.
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
         self.prune_terminated();
         self.drain_join_set();
@@ -799,7 +684,7 @@ impl BackgroundTaskRegistry {
     }
 
     /// Check all running shell tasks for stalls (no output growth for STALL_THRESHOLD).
-    pub async fn stall_check(&mut self) {
+    pub fn stall_check(&mut self) {
         self.drain_join_set();
         let mut stall_events = Vec::new();
         for handle in self.tasks.values_mut() {
@@ -812,12 +697,10 @@ impl BackgroundTaskRegistry {
             if handle.status() == BgTaskStatus::Stalled {
                 continue; // already reported
             }
-            let stdout_size = tokio::fs::metadata(&handle.stdout_path)
-                .await
+            let stdout_size = std::fs::metadata(&handle.stdout_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let stderr_size = tokio::fs::metadata(&handle.stderr_path)
-                .await
+            let stderr_size = std::fs::metadata(&handle.stderr_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
             let current_size = stdout_size.saturating_add(stderr_size);
@@ -891,21 +774,8 @@ impl BackgroundTaskRegistry {
             .count()
     }
 
-    /// Number of active tasks consuming resources (including stalled).
-    /// Used for capacity checks to prevent bypassing MAX_CONCURRENT_TASKS
-    /// when stalled tasks accumulate.
-    pub fn active_count(&self) -> usize {
-        self.tasks
-            .values()
-            .filter(|h| {
-                let s = h.status();
-                h.live_control.is_available() && !s.is_terminal()
-            })
-            .count()
-    }
-
     pub fn can_spawn_shell_task(&self) -> bool {
-        self.active_count() < MAX_CONCURRENT_TASKS
+        self.running_count() < MAX_CONCURRENT_TASKS
     }
 
     /// Number of stalled tasks — surfaced separately on the status
@@ -1035,15 +905,7 @@ async fn run_shell_task(
         exit = child.wait() => {
             match exit {
                 Ok(exit_status) => {
-                    // CRITICAL FIX: On unix, read signal() for SIGKILL/OOM detection
-                    #[cfg(unix)]
-                    let code = exit_status.code().or_else(|| {
-                        use std::os::unix::process::ExitStatusExt;
-                        exit_status.signal().map(|sig| 128 + sig)
-                    });
-                    #[cfg(not(unix))]
                     let code = exit_status.code();
-
                     let success = exit_status.success()
                         || code
                             .map(|code| {
@@ -1107,16 +969,12 @@ async fn run_shell_task(
 /// Reader for an adopted detached shell. Streams remaining bytes
 /// from a live `ChildStdout` (or stderr) into the registry's per-task
 /// file, appending after any partial-output prefix that
-/// `adopt_detached_shell` already wrote. Stops on stream EOF,
-/// channel error, or when total written exceeds MAX_OUTPUT_BYTES.
-/// The latter prevents unbounded disk writes from fast-outputting
-/// processes between stall_check polling intervals.
-async fn drain_stream_to_file<R>(
-    mut reader: R,
-    path: std::path::PathBuf,
-    initial_bytes: u64,
-    cancel: CancellationToken,
-) -> Result<u64, String>
+/// `adopt_detached_shell` already wrote. Stops on stream EOF or
+/// channel error. Cap-handling: the file may pass `MAX_OUTPUT_BYTES`
+/// here; `stall_check` is the enforcement point for size cap because
+/// the streamer can't synchronously kill the child without racing
+/// with `wait()`.
+async fn drain_stream_to_file<R>(mut reader: R, path: std::path::PathBuf)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1130,54 +988,30 @@ where
     {
         Ok(f) => f,
         Err(e) => {
-            let msg = format!("failed to open {}: {e}", path.display());
-            tracing::warn!("adopted shell stream: {msg}");
-            return Err(msg);
+            tracing::warn!(
+                "adopted shell stream: failed to open {}: {e}",
+                path.display()
+            );
+            return;
         }
     };
     let mut file = BufWriter::new(file);
     let mut buf = [0u8; 8192];
-    let mut written = initial_bytes;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                written += n as u64;
-                if written > MAX_OUTPUT_BYTES {
-                    tracing::warn!(
-                        "adopted shell stream: output exceeded {} bytes, stopping write",
-                        MAX_OUTPUT_BYTES
-                    );
-                    break;
-                }
                 if let Err(e) = file.write_all(&buf[..n]).await {
-                    let msg = format!("write error on {}: {e}", path.display());
-                    tracing::warn!("adopted shell stream: {msg}");
-                    // Cancel the task to kill the child process.
-                    // Without this, the child blocks on its stdout/stderr
-                    // pipe buffer (typically 64KB) waiting for a reader
-                    // that will never come — a silent deadlock.
-                    cancel.cancel();
-                    // Flush whatever made it into BufWriter before returning.
-                    let _ = file.flush().await;
-                    return Err(msg);
+                    tracing::warn!("adopted shell stream: write error: {e}");
+                    return;
                 }
             }
-            Err(e) => {
-                let msg = format!("read error on {}: {e}", path.display());
-                tracing::warn!("adopted shell stream: {msg}");
-                cancel.cancel();
-                let _ = file.flush().await;
-                return Err(msg);
-            }
+            Err(_) => return,
         }
     }
     if let Err(e) = file.flush().await {
-        let msg = format!("flush error on {}: {e}", path.display());
-        tracing::warn!("adopted shell stream: {msg}");
-        return Err(msg);
+        tracing::warn!("adopted shell stream: flush error: {e}");
     }
-    Ok(written)
 }
 
 /// Adopted-shell runner: drains both streams concurrently and waits
@@ -1208,46 +1042,17 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
         command_label,
     } = run;
 
-    let stdout_initial = std::fs::metadata(&stdout_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let stderr_initial = std::fs::metadata(&stderr_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let stdout_drain = tokio::spawn(drain_stream_to_file(
-        stdout,
-        stdout_path.clone(),
-        stdout_initial,
-        cancel.clone(),
-    ));
-    let stderr_drain = tokio::spawn(drain_stream_to_file(
-        stderr,
-        stderr_path.clone(),
-        stderr_initial,
-        cancel.clone(),
-    ));
+    let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.clone()));
+    let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.clone()));
 
     let result = tokio::select! {
         exit = child.wait() => {
             // Drain remaining buffered output before reporting status.
-            let stdout_err = stdout_drain.await.ok().and_then(|r| r.err());
-            let stderr_err = stderr_drain.await.ok().and_then(|r| r.err());
-            // Collect drain errors — if output capture failed, the
-            // stall_check would otherwise misdiagnose it as "waiting
-            // for input" instead of reporting the real failure.
-            let drain_error = stdout_err.as_ref()
-                .or(stderr_err.as_ref());
+            let _ = stdout_drain.await;
+            let _ = stderr_drain.await;
             match exit {
                 Ok(exit_status) => {
-                    // CRITICAL FIX: On unix, read signal() for SIGKILL/OOM detection
-                    #[cfg(unix)]
-                    let code = exit_status.code().or_else(|| {
-                        use std::os::unix::process::ExitStatusExt;
-                        exit_status.signal().map(|sig| 128 + sig)
-                    });
-                    #[cfg(not(unix))]
                     let code = exit_status.code();
-
                     let success = exit_status.success()
                         || code
                             .map(|code| {
@@ -1256,18 +1061,7 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
                             })
                             .unwrap_or(false);
                     let summary = make_summary(&stdout_path, code);
-                    if let Some(err) = drain_error {
-                        // Output capture failed — report as error
-                        // regardless of exit code so the LLM knows
-                        // the output file may be incomplete.
-                        TaskCompletion {
-                            id: task_id.clone(),
-                            status: BgTaskStatus::Failed,
-                            exit_code: code,
-                            summary: String::new(),
-                            error: Some(format!("output capture failed: {err}")),
-                        }
-                    } else if success {
+                    if success {
                         TaskCompletion {
                             id: task_id.clone(),
                             status: BgTaskStatus::Completed,
@@ -1714,59 +1508,8 @@ mod tests {
             last_output_size: 0,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
-            output_files_deleted: false,
         };
         (handle, dir)
-    }
-
-    #[tokio::test]
-    async fn rebind_output_dir_keeps_existing_handles_and_routes_future_spawns() {
-        let tmp = TempDir::new().unwrap();
-        let old_dir = tmp.path().join("default");
-        let new_dir = tmp.path().join("session");
-        let mut reg = BackgroundTaskRegistry::new(old_dir.clone());
-
-        let old_id = reg.spawn_shell("true", "first turn task");
-        let old_stdout_path = reg.get(&old_id).unwrap().stdout_path.clone();
-        assert_eq!(old_stdout_path.parent(), Some(old_dir.as_path()));
-
-        reg.rebind_output_dir(new_dir.clone()).expect("rebind ok");
-
-        assert_eq!(
-            reg.get(&old_id).unwrap().stdout_path,
-            old_stdout_path,
-            "live tasks must keep the paths their runner is still writing"
-        );
-        let new_id = reg.spawn_shell("true", "next turn task");
-        assert_eq!(
-            reg.get(&new_id).unwrap().stdout_path.parent(),
-            Some(new_dir.as_path()),
-            "future tasks should use the rebound session output directory"
-        );
-    }
-
-    /// `rebind_output_dir` must surface mkdir errors instead of swallowing
-    /// them — callers depend on the error to render a system message; a
-    /// silent failure would surface much later as cryptic "No such file or
-    /// directory" errors from `try_spawn_shell`.
-    #[tokio::test]
-    async fn rebind_output_dir_reports_mkdir_error_when_path_unwritable() {
-        let tmp = TempDir::new().unwrap();
-        let blocker = tmp.path().join("blocker");
-        std::fs::write(&blocker, b"").unwrap();
-        let unwritable = blocker.join("nested");
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-
-        let result = reg.rebind_output_dir(unwritable);
-        assert!(
-            result.is_err(),
-            "rebind must fail when the target path cannot be created"
-        );
-        let error = result.unwrap_err();
-        assert!(
-            error.contains("background task output directory could not be created"),
-            "error must name the failed operation: {error}"
-        );
     }
 
     async fn wait_for_task_status(
@@ -1851,7 +1594,7 @@ mod tests {
         let source = include_str!("background_tasks.rs");
         // Find the body of stall_check.
         let start = source
-            .find("pub async fn stall_check(&mut self) {")
+            .find("pub fn stall_check(&mut self) {")
             .expect("stall_check must exist");
         // Body ends at the closing brace of the for-loop completion;
         // a sentinel from the function tail keeps us from over-reading.
@@ -2456,7 +2199,7 @@ mod tests {
         })
         .await
         .expect("background shell should exceed output cap");
-        reg.stall_check().await;
+        reg.stall_check();
 
         let events = reg.poll_completions();
         assert!(
@@ -2469,8 +2212,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stall_check_throttles_same_size_tail_rechecks() {
+    #[test]
+    fn stall_check_throttles_same_size_tail_rechecks() {
         let tmp = TempDir::new().unwrap();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Running);
@@ -2482,14 +2225,14 @@ mod tests {
         handle.last_activity = Instant::now() - STALL_THRESHOLD - Duration::from_secs(1);
         reg.tasks.insert(handle.id.clone(), handle);
 
-        reg.stall_check().await;
+        reg.stall_check();
         assert!(
             reg.poll_completions().is_empty(),
             "first non-prompt tail probe should not emit a stall event"
         );
 
         std::fs::write(tmp.path().join("stdout.log"), "Continue? [y/N]\n").unwrap();
-        reg.stall_check().await;
+        reg.stall_check();
         assert!(
             reg.poll_completions().is_empty(),
             "immediate same-size reread must be throttled to avoid repeated tail I/O"
@@ -2497,7 +2240,7 @@ mod tests {
 
         let handle = reg.tasks.get_mut("bg-throttle").unwrap();
         handle.last_tail_probe_at = Some(Instant::now() - STALL_TAIL_RECHECK_COOLDOWN);
-        reg.stall_check().await;
+        reg.stall_check();
         assert!(reg.poll_completions().iter().any(|event| matches!(
             event,
             BgTaskEvent::Stalled { id, last_output_tail, .. }
@@ -2660,101 +2403,6 @@ mod tests {
         );
     }
 
-    /// Regression for the trace where `task_output("bg-shell-1")` returned
-    /// "Background task not found" right after a successful completion
-    /// in the *previous* user turn. Pre-fix `prune_terminated` removed
-    /// every terminal entry on every `poll_completions`, so the next user
-    /// turn (a few hundred ms later) lost the ability to read the task's
-    /// final output. The fix retains terminal tasks up to a fixed cap.
-    #[tokio::test]
-    async fn terminal_tasks_remain_queryable_across_polls() {
-        let tmp = TempDir::new().unwrap();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let id = reg.spawn_shell("true", "completed task");
-
-        // Wait for completion + drive the poll cycle a few times,
-        // mirroring the outer-tick loop that runs many times per second.
-        wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
-            let _ = reg.poll_completions();
-            reg.get(&id).is_some_and(|h| h.status().is_terminal())
-        })
-        .await
-        .expect("task should complete and stay queryable");
-
-        // Three more ticks: pre-fix this would prune the task. Now it must
-        // remain queryable so the next user turn can `task_output(id)`.
-        for _ in 0..3 {
-            let _ = reg.poll_completions();
-        }
-        let handle = reg
-            .get(&id)
-            .expect("terminal task must remain queryable after multiple poll_completions ticks");
-        assert!(
-            handle.status().is_terminal(),
-            "retained handle must report terminal status, got {:?}",
-            handle.status()
-        );
-    }
-
-    /// Past `MAX_TERMINAL_TASKS_RETAINED` terminal entries the registry
-    /// LRU-evicts the oldest-ended ones so the in-memory map can't grow
-    /// without bound during a long session. Spawn one at a time and wait
-    /// for terminal — `MAX_CONCURRENT_TASKS` caps in-flight runners, but
-    /// retained terminals (after they finish) are bounded by a separate
-    /// cap which this test exercises.
-    #[tokio::test]
-    async fn terminal_tasks_lru_evict_when_over_cap() {
-        let tmp = TempDir::new().unwrap();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let mut ids = Vec::new();
-        let total = MAX_TERMINAL_TASKS_RETAINED + 5;
-        for _ in 0..total {
-            let id = reg.spawn_shell("true", "tiny");
-            wait_until(Duration::from_secs(2), Duration::from_millis(10), || {
-                let _ = reg.poll_completions();
-                reg.get(&id).is_some_and(|h| h.status().is_terminal())
-            })
-            .await
-            .expect("each spawned task must reach terminal before the next spawn");
-            ids.push(id);
-        }
-        // One final poll to enforce the cap once we know everyone is terminal.
-        let _ = reg.poll_completions();
-
-        // All tasks remain in the map (metadata preserved), but the
-        // oldest ones have their output files deleted.
-        let retained = ids.iter().filter(|id| reg.get(id).is_some()).count();
-        assert_eq!(
-            retained, total,
-            "all tasks must remain in the map after LRU eviction (metadata preserved)"
-        );
-
-        let evicted = ids
-            .iter()
-            .filter(|id| reg.get(id).is_some_and(|h| h.output_files_deleted))
-            .count();
-        assert_eq!(
-            evicted,
-            total - MAX_TERMINAL_TASKS_RETAINED,
-            "oldest tasks must have output files marked as deleted"
-        );
-
-        // Newest entries are kept with output files intact. The most
-        // recent task id we spawned must still be reachable — LRU
-        // eviction targets oldest-ended first.
-        let last = ids.last().unwrap();
-        assert!(
-            reg.get(last).is_some_and(|h| !h.output_files_deleted),
-            "newest terminal task must survive LRU eviction with output intact"
-        );
-        // Oldest must have output files deleted.
-        let first = ids.first().unwrap();
-        assert!(
-            reg.get(first).is_some_and(|h| h.output_files_deleted),
-            "oldest terminal task must have output files evicted under LRU policy"
-        );
-    }
-
     /// C3 regression: drain_join_set should populate handle status
     /// for tasks that completed with no output, so callers polling
     /// `is_terminal` see them as terminal even before
@@ -2827,7 +2475,6 @@ mod tests {
                 partial_stdout,
                 partial_stderr,
             )
-            .await
             .expect("adopt detached shell");
         assert!(
             id.starts_with("bg-shell-"),
@@ -2867,20 +2514,13 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("adopted.stdout");
-        let seed = "before-detach\n";
-        std::fs::write(&path, seed).expect("seed output");
+        std::fs::write(&path, "before-detach\n").expect("seed output");
 
         let (mut tx, rx) = tokio::io::duplex(64);
-        let drain = tokio::spawn(drain_stream_to_file(
-            rx,
-            path.clone(),
-            seed.len() as u64,
-            CancellationToken::new(),
-        ));
+        let drain = tokio::spawn(drain_stream_to_file(rx, path.clone()));
         tx.write_all(b"after-detach\n").await.expect("write stream");
         drop(tx);
-        let written = drain.await.expect("drain join").expect("drain ok");
-        assert_eq!(written, seed.len() as u64 + b"after-detach\n".len() as u64);
+        drain.await.expect("drain join");
 
         let output = std::fs::read_to_string(&path).expect("read appended output");
         assert_eq!(output, "before-detach\nafter-detach\n");

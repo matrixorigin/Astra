@@ -7,6 +7,11 @@ import {
 } from "@/lib/api/web-store";
 import type { SendMessageRequest } from "@/lib/api/types";
 import { RuntimeClientError } from "@/lib/runtime-client";
+import {
+  normalizeWorkspaceSelection,
+  sameWorkspaceSelection,
+  validateWorkspaceAuthority,
+} from "@/lib/workspace-authority";
 
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 
@@ -44,6 +49,48 @@ export async function POST(
   if (!chat.activeRun?.runId) {
     return NextResponse.json(
       { error: "no active run is available for deferred input" },
+      { status: 409 },
+    );
+  }
+  const storedWorkspaceSelection = normalizeWorkspaceSelection(
+    chat.workspaceSelection,
+  );
+  const hasRequestedWorkspace = Object.prototype.hasOwnProperty.call(
+    body,
+    "workspace",
+  );
+  const requestedWorkspaceSelection = normalizeWorkspaceSelection(
+    body.workspace,
+  );
+  if (hasRequestedWorkspace && !requestedWorkspaceSelection) {
+    return NextResponse.json(
+      {
+        error: "workspace must be a server sandbox or edge workspace selection",
+        code: "invalid_workspace_selection",
+      },
+      { status: 400 },
+    );
+  }
+  if (
+    requestedWorkspaceSelection &&
+    !sameWorkspaceSelection(requestedWorkspaceSelection, storedWorkspaceSelection)
+  ) {
+    return NextResponse.json(
+      {
+        error:
+          "An active run's workspace cannot be changed with deferred input. Stop the run, select the workspace, and start again.",
+        code: "workspace_active_run_immutable",
+      },
+      { status: 409 },
+    );
+  }
+  const workspaceError = validateWorkspaceAuthority(
+    body.content,
+    storedWorkspaceSelection,
+  );
+  if (workspaceError) {
+    return NextResponse.json(
+      { error: workspaceError.message, code: workspaceError.code },
       { status: 409 },
     );
   }

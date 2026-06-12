@@ -12,11 +12,35 @@ type RuntimeTodosResponse = {
 };
 
 type RuntimeRunProjectionResponse = {
+  run_id?: string;
   session_id?: string;
+  status?: string | null;
+  workspace?: Record<string, unknown> | null;
+  executor?: Record<string, unknown> | null;
+  transport?: string | null;
+  fallback_policy?: string | null;
   recent_events?: Array<Record<string, unknown>>;
 };
 
 const WORK_SURFACE_RECENT_EVENT_LIMIT = 400;
+
+function projectionBindingSeedEvent(
+  projection: RuntimeRunProjectionResponse | null,
+) {
+  if (!projection?.workspace && !projection?.executor) {
+    return null;
+  }
+  return {
+    type: "run_started",
+    run_id: projection.run_id,
+    session_id: projection.session_id,
+    status: projection.status,
+    workspace: projection.workspace ?? undefined,
+    executor: projection.executor ?? undefined,
+    transport: projection.transport ?? undefined,
+    fallback_policy: projection.fallback_policy ?? undefined,
+  };
+}
 
 export async function GET(
   _request: Request,
@@ -89,11 +113,20 @@ export async function GET(
             return { tasks: [] };
           })
       : { tasks: [] };
-    const events = projection?.recent_events ?? [];
+    const bindingSeed = projectionBindingSeedEvent(projection);
+    const events = [
+      ...(bindingSeed ? [bindingSeed] : []),
+      ...(projection?.recent_events ?? []),
+    ];
 
     return NextResponse.json({
       sessionId: resolvedSessionId,
       runId,
+      status: projection?.status ?? null,
+      workspace: projection?.workspace ?? null,
+      executor: projection?.executor ?? null,
+      transport: projection?.transport ?? null,
+      fallbackPolicy: projection?.fallback_policy ?? null,
       tasks: Array.isArray(todos.tasks) ? todos.tasks : [],
       events,
       warnings,

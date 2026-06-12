@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
@@ -42,6 +42,13 @@ use astra_tools::{
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
+use crate::server::tool_transport::{
+    ExecutorBinding, ExecutorStatus, ServerLocalToolTransport, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
+    TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE,
+    ToolExecutionRequest, ToolExecutionRouteKind, ToolExecutionService, ToolPolicySnapshot,
+    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    binding_event_fields, route_binding_event_fields,
+};
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
     execute_isolated, filter_environment, wrap_command_with_limits,
@@ -49,6 +56,13 @@ use crate::tool_sandbox::{
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
 use astra_tools::plan_task_mirror;
+
+const TOOL_ERROR_KIND_APPROVAL_TIMEOUT: &str = "approval_timeout";
+const TOOL_ERROR_KIND_TOOL_TIMEOUT: &str = "tool_timeout";
+const TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH: &str = "workspace_path_mismatch";
+const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
+const TOOL_ERROR_KIND_AGENT_WAITING: &str = "agent_waiting";
+const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
@@ -72,6 +86,207 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         variants.push(canonical);
     }
     variants
+}
+
+fn shell_path_token_delimiter(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\'' | '"' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '[' | ']'
+        )
+}
+
+fn shell_path_start_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '\'' | '"' | '`' | '=' | ':' | '(' | '{' | '[' | ',' | '<' | '>'
+            )
+    })
+}
+
+fn windows_drive_path_at(input: &str, index: usize) -> bool {
+    let bytes = input.as_bytes();
+    bytes.get(index).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(index + 1) == Some(&b':')
+        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
+}
+
+fn collect_shell_path_token(input: &str, start: usize) -> String {
+    input[start..]
+        .chars()
+        .take_while(|ch| !shell_path_token_delimiter(*ch))
+        .collect::<String>()
+        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ':'))
+        .to_string()
+}
+
+fn shell_home_path_at(input: &str, index: usize) -> bool {
+    input[index..].starts_with("~/")
+        || input[index..].starts_with("$HOME/")
+        || input[index..].starts_with("${HOME}/")
+}
+
+fn collect_local_workspace_path_token(input: &str, start: usize) -> String {
+    const BRACED_HOME: &str = "${HOME}/";
+    if input[start..].starts_with(BRACED_HOME) {
+        let suffix_start = start + BRACED_HOME.len();
+        let suffix = input[suffix_start..]
+            .chars()
+            .take_while(|ch| !shell_path_token_delimiter(*ch))
+            .collect::<String>()
+            .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ':'))
+            .to_string();
+        return format!("{BRACED_HOME}{suffix}");
+    }
+    collect_shell_path_token(input, start)
+}
+
+fn extract_local_workspace_path_mentions(command: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut previous = None;
+    for (index, ch) in command.char_indices() {
+        let at_boundary = shell_path_start_boundary(previous);
+        let rest = &command[index..];
+        let is_local_path = at_boundary
+            && (shell_home_path_at(command, index)
+                || rest.starts_with("/Users/")
+                || rest.starts_with("/home/")
+                || rest.starts_with("/Volumes/")
+                || windows_drive_path_at(command, index));
+        if is_local_path {
+            let token = collect_local_workspace_path_token(command, index);
+            if !token.is_empty() && !mentions.iter().any(|existing| existing == &token) {
+                mentions.push(token);
+            }
+        }
+        previous = Some(ch);
+    }
+    mentions
+}
+
+fn workspace_owns_absolute_path(workspace_root: &Path, raw_path: &str) -> bool {
+    let candidate = Path::new(raw_path);
+    if !candidate.is_absolute() {
+        return false;
+    }
+    let candidate_variants = unique_path_variants(candidate);
+    let workspace_variants = unique_path_variants(workspace_root);
+    candidate_variants.iter().any(|candidate| {
+        workspace_variants
+            .iter()
+            .any(|workspace| candidate == workspace || candidate.starts_with(workspace))
+    })
+}
+
+fn server_sandbox_local_path_mismatch(
+    command: &str,
+    workspace_root: &Path,
+    workspace_binding: &WorkspaceBinding,
+) -> Option<String> {
+    server_sandbox_local_path_mismatch_in_text(
+        "command",
+        command,
+        workspace_root,
+        workspace_binding,
+    )
+}
+
+fn server_sandbox_local_path_mismatch_in_text(
+    subject: &str,
+    text: &str,
+    workspace_root: &Path,
+    workspace_binding: &WorkspaceBinding,
+) -> Option<String> {
+    if workspace_binding.kind != WorkspaceBindingKind::ServerSandbox {
+        return None;
+    }
+
+    extract_local_workspace_path_mentions(text)
+        .into_iter()
+        .find(|path| {
+            shell_home_path_at(path, 0)
+                || windows_drive_path_at(path, 0)
+                || !workspace_owns_absolute_path(workspace_root, path)
+        })
+        .map(|path| {
+            let cwd = workspace_binding
+                .cwd
+                .as_deref()
+                .unwrap_or_else(|| workspace_root.to_str().unwrap_or("server sandbox"));
+            format!(
+                "Error: {subject} references local path '{path}', but this run is bound to Server sandbox at {cwd}. Select a connected edge workspace that owns that path, then retry."
+            )
+        })
+}
+
+fn server_sandbox_path_argument_mismatch(
+    subject: &str,
+    raw_path: &str,
+    workspace_root: &Path,
+    workspace_binding: &WorkspaceBinding,
+) -> Option<String> {
+    if workspace_binding.kind != WorkspaceBindingKind::ServerSandbox {
+        return None;
+    }
+
+    let path = raw_path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(path);
+    let mismatched = shell_home_path_at(path, 0)
+        || windows_drive_path_at(path, 0)
+        || (candidate.is_absolute() && !workspace_owns_absolute_path(workspace_root, path));
+    if !mismatched {
+        return None;
+    }
+
+    let cwd = workspace_binding
+        .cwd
+        .as_deref()
+        .unwrap_or_else(|| workspace_root.to_str().unwrap_or("server sandbox"));
+    Some(format!(
+        "Error: {subject} references local path '{path}', but this run is bound to Server sandbox at {cwd}. Select a connected edge workspace that owns that path, then retry."
+    ))
+}
+
+fn path_arg<'a>(args: &'a Value, field: &str) -> Option<&'a str> {
+    args.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn server_sandbox_tool_path_mismatch(
+    tool_name: &str,
+    args: &Value,
+    workspace_root: &Path,
+    workspace_binding: &WorkspaceBinding,
+) -> Option<String> {
+    if tool_name == "bash" {
+        return path_arg(args, "command").and_then(|command| {
+            server_sandbox_local_path_mismatch(command, workspace_root, workspace_binding)
+        });
+    }
+
+    let fields: &[&str] = match tool_name {
+        "publish_artifact" | "read_file" | "write_file" | "str_replace" | "list_dir"
+        | "symbols" => &["path"],
+        "grep" => &["path"],
+        "glob" => &["path", "pattern"],
+        "git" => &["path", "file"],
+        "git_diff" | "git_contributors" => &["path"],
+        "git_blame" | "git_file_history" => &["file"],
+        _ => &[],
+    };
+
+    fields.iter().find_map(|field| {
+        let value = path_arg(args, field)?;
+        let subject = format!("tool '{tool_name}' argument '{field}'");
+        server_sandbox_path_argument_mismatch(&subject, value, workspace_root, workspace_binding)
+    })
 }
 
 const MAX_PUBLISH_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
@@ -390,12 +605,12 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     }
 }
 
-fn bounded_drift(old: f64, new: f64, min: f64, max: f64) -> Option<f64> {
-    let span = max - min;
-    if span <= f64::EPSILON {
+fn normalized_drift(old: f64, new: f64) -> Option<f64> {
+    let denom = old.abs();
+    if denom < f64::EPSILON {
         return None;
     }
-    Some((new - old).abs() / span)
+    Some((new - old).abs() / denom)
 }
 
 fn extract_tool_name(args: &Value) -> Option<String> {
@@ -900,12 +1115,8 @@ pub struct ServerToolExecutor {
     /// Optional resource governor for usage tracking (Phase 5).
     resource_governor:
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
-    /// Optional edge connection pool for routing to remote edge agents.
-    edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
-    /// Optional cross-pod edge dispatch relay (DB-backed).
-    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
-    /// Optional edge registry for cross-pod edge agent discovery.
-    edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
+    /// Transport-agnostic tool execution router for server-local, edge, and relay paths.
+    tool_execution_service: ToolExecutionService,
     /// Optional observability session for self-mod and rollback-backed session state.
     observability_session:
         Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
@@ -922,6 +1133,8 @@ pub struct ServerToolExecutor {
         Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Shared default executor for delegating common tool logic.
     default_executor: DefaultToolExecutor,
+    /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
+    cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Optional remote workspace artifact store for publishing workspace metadata.
     workspace_artifact_store: Option<astra_services::DatabaseSessionArtifactStore>,
     /// Optional shared pool for context-manifest side events.
@@ -952,6 +1165,11 @@ pub struct ServerToolExecutor {
     agent_tool_context: Option<AgentToolContext>,
     /// Optional live event channel used by the web-agent work surface.
     work_surface_event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
+    /// Explicit workspace authority for this executor. Tool events include
+    /// this snapshot so Web never has to infer where a command ran.
+    workspace_binding: WorkspaceBinding,
+    /// Explicit executor/transport binding for this executor.
+    executor_binding: ExecutorBinding,
     capabilities: astra_turn_core::capability::CapabilitySet,
     server_tool_names: HashSet<String>,
     /// Exactly-once executor for crash recovery deduplication.
@@ -1014,7 +1232,7 @@ impl ServerToolExecutor {
         let server_tool_names = resolved_server_tool_names(&capabilities);
 
         Self {
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             user_id,
             session_id,
             sandbox_policy,
@@ -1033,14 +1251,13 @@ impl ServerToolExecutor {
             progress_callback: None,
             auxiliary_event_writer: None,
             resource_governor: None,
-            edge_connection_pool: None,
-            edge_dispatch_service: None,
-            edge_registry_service: None,
+            tool_execution_service: ToolExecutionService::new(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             self_mod_pinned_tools: Mutex::new(pinned_tools),
             self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
             self_mod_mutation_counter: Mutex::new((0, 0)),
+            cancel_token: None,
             workspace_artifact_store: None,
             context_manifest_pool: None,
             plan_repo: None,
@@ -1050,6 +1267,8 @@ impl ServerToolExecutor {
             mcp_manager: None,
             agent_tool_context: None,
             work_surface_event_tx: None,
+            workspace_binding: WorkspaceBinding::server_sandbox(&workspace_root),
+            executor_binding: ExecutorBinding::server_local(),
             capabilities,
             server_tool_names,
             exactly_once_executor: None,
@@ -1267,7 +1486,8 @@ impl ServerToolExecutor {
         mut self,
         token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Self {
-        self.default_executor = self.default_executor.with_cancel_token(token);
+        self.default_executor = self.default_executor.with_cancel_token(token.clone());
+        self.cancel_token = token;
         self
     }
 
@@ -1291,6 +1511,377 @@ impl ServerToolExecutor {
     /// Attach the live web-agent work-surface event channel.
     pub fn set_work_surface_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
         self.work_surface_event_tx = Some(tx);
+    }
+
+    pub fn set_execution_bindings(
+        &mut self,
+        workspace: WorkspaceBinding,
+        executor: ExecutorBinding,
+    ) {
+        self.workspace_binding = workspace;
+        self.executor_binding = executor;
+        self.emit_binding_snapshot();
+    }
+
+    pub fn set_edge_workspace_binding(
+        &mut self,
+        executor_id: impl Into<String>,
+        display_name: impl Into<String>,
+        cwd: impl Into<String>,
+        authority: WorkspaceAuthority,
+    ) {
+        let executor_id = executor_id.into();
+        let display_name = display_name.into();
+        self.workspace_binding =
+            WorkspaceBinding::edge_workspace(display_name.clone(), cwd, authority);
+        self.executor_binding = ExecutorBinding::edge_agent(
+            executor_id,
+            display_name,
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Unknown,
+        );
+        self.emit_binding_snapshot();
+    }
+
+    fn binding_event_fields(&self) -> Map<String, Value> {
+        binding_event_fields(&self.workspace_binding, &self.executor_binding)
+    }
+
+    pub fn binding_metadata(&self) -> Value {
+        Value::Object(self.binding_event_fields())
+    }
+
+    fn tool_call_id(args: &Value) -> Option<&str> {
+        args.get("_tool_call_id").and_then(Value::as_str)
+    }
+
+    fn run_id(args: &Value) -> Option<&str> {
+        string_arg(args, "_run_id")
+    }
+
+    fn insert_run_id(event: &mut Map<String, Value>, args: &Value) {
+        if let Some(run_id) = Self::run_id(args) {
+            event.insert("run_id".to_string(), Value::String(run_id.to_string()));
+        }
+    }
+
+    fn public_tool_arguments(args: &Value) -> Value {
+        let Some(map) = args.as_object() else {
+            return args.clone();
+        };
+        Value::Object(
+            map.iter()
+                .filter(|(key, _)| !key.starts_with('_'))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn emit_work_surface_event(&self, mut event: Map<String, Value>, unavailable_label: &str) {
+        let Some(tx) = &self.work_surface_event_tx else {
+            return;
+        };
+        for (key, value) in self.binding_event_fields() {
+            event.entry(key).or_insert(value);
+        }
+        if let Err(error) = tx.try_send(Value::Object(event)) {
+            tracing::debug!(
+                target: "astra_runtime::work_surface",
+                session_id = %self.session_id,
+                error = %error,
+                "{unavailable_label}"
+            );
+        }
+    }
+
+    pub fn emit_binding_snapshot(&self) {
+        let mut workspace_event = Map::new();
+        workspace_event.insert(
+            "type".to_string(),
+            Value::String("workspace_bound".to_string()),
+        );
+        workspace_event.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        self.emit_work_surface_event(
+            workspace_event,
+            "work-surface workspace binding event channel unavailable",
+        );
+
+        let mut executor_event = Map::new();
+        executor_event.insert(
+            "type".to_string(),
+            Value::String("executor_bound".to_string()),
+        );
+        executor_event.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        self.emit_work_surface_event(
+            executor_event,
+            "work-surface executor binding event channel unavailable",
+        );
+    }
+
+    fn insert_event_binding_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
+        for (key, value) in fields {
+            event.insert(key.clone(), value.clone());
+        }
+    }
+
+    fn emit_tool_routing_decision(
+        &self,
+        name: &str,
+        args: &Value,
+        route: ToolExecutionRouteKind,
+        route_fields: Option<&Map<String, Value>>,
+    ) {
+        let Some(call_id) = Self::tool_call_id(args) else {
+            return;
+        };
+        let mut event = Map::new();
+        event.insert(
+            "type".to_string(),
+            Value::String("tool_routing_decision".to_string()),
+        );
+        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        Self::insert_run_id(&mut event, args);
+        event.insert("tool".to_string(), Value::String(name.to_string()));
+        event.insert(
+            "route".to_string(),
+            Value::String(route.as_str().to_string()),
+        );
+        if let Some(route_fields) = route_fields {
+            Self::insert_event_binding_fields(&mut event, route_fields);
+        }
+        self.emit_work_surface_event(event, "work-surface tool routing event channel unavailable");
+    }
+
+    fn emit_tool_transport_started(
+        &self,
+        name: &str,
+        args: &Value,
+        route_fields: Option<&Map<String, Value>>,
+    ) {
+        let Some(call_id) = Self::tool_call_id(args) else {
+            return;
+        };
+        let mut event = Map::new();
+        event.insert(
+            "type".to_string(),
+            Value::String("tool_transport_started".to_string()),
+        );
+        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        Self::insert_run_id(&mut event, args);
+        event.insert("tool".to_string(), Value::String(name.to_string()));
+        event.insert("arguments".to_string(), Self::public_tool_arguments(args));
+        if let Some(route_fields) = route_fields {
+            Self::insert_event_binding_fields(&mut event, route_fields);
+        }
+        self.emit_work_surface_event(event, "work-surface tool start event channel unavailable");
+    }
+
+    fn emit_tool_transport_finished(
+        &self,
+        name: &str,
+        args: &Value,
+        result: &astra_tools::ToolResult,
+        duration_ms: u64,
+    ) {
+        let Some(call_id) = Self::tool_call_id(args) else {
+            return;
+        };
+        let mut event = Map::new();
+        event.insert(
+            "type".to_string(),
+            Value::String(
+                if result.is_error {
+                    "tool_transport_failed"
+                } else {
+                    "tool_transport_completed"
+                }
+                .to_string(),
+            ),
+        );
+        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        Self::insert_run_id(&mut event, args);
+        event.insert("tool".to_string(), Value::String(name.to_string()));
+        event.insert("success".to_string(), Value::Bool(!result.is_error));
+        event.insert(
+            "duration_ms".to_string(),
+            Value::Number(serde_json::Number::from(duration_ms)),
+        );
+        if result.is_error {
+            event.insert("error".to_string(), Value::String(result.output.clone()));
+        }
+        copy_result_routing_metadata(&mut event, result);
+        self.emit_work_surface_event(
+            event,
+            "work-surface tool transport completion event channel unavailable",
+        );
+        self.emit_executor_blocked_if_needed(name, args, result);
+        self.emit_agent_waiting_if_needed(name, args, result);
+    }
+
+    fn emit_agent_waiting_if_needed(
+        &self,
+        name: &str,
+        args: &Value,
+        result: &astra_tools::ToolResult,
+    ) {
+        if name != "agent" {
+            return;
+        }
+        let parsed = serde_json::from_str::<Value>(&result.output).ok();
+        let is_waiting = result_metadata_str(result, "agent_status") == Some("waiting")
+            || parsed
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                == Some("waiting");
+        if !is_waiting {
+            return;
+        }
+        let Some(agent_id) = result_metadata_str(result, "agent_id").or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("agent_id"))
+                .and_then(Value::as_str)
+        }) else {
+            return;
+        };
+        let reason = result_metadata_str(result, "reason")
+            .or_else(|| {
+                parsed
+                    .as_ref()
+                    .and_then(|value| value.get("reason"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("waiting");
+        let mut event = Map::new();
+        event.insert(
+            "type".to_string(),
+            Value::String("agent_waiting".to_string()),
+        );
+        event.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
+        event.insert("status".to_string(), Value::String("waiting".to_string()));
+        event.insert("reason".to_string(), Value::String(reason.to_string()));
+        if let Some(call_id) = Self::tool_call_id(args) {
+            event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        }
+        copy_result_routing_metadata(&mut event, result);
+        self.emit_work_surface_event(
+            event,
+            "work-surface agent waiting event channel unavailable",
+        );
+    }
+
+    fn emit_executor_blocked_if_needed(
+        &self,
+        name: &str,
+        args: &Value,
+        result: &astra_tools::ToolResult,
+    ) {
+        let Some(error_kind) = result_metadata_str(result, "error_kind") else {
+            return;
+        };
+        let (executor_status, blocked_event_type) = match error_kind {
+            TOOL_ERROR_KIND_EXECUTOR_OFFLINE => ("offline", "run_blocked_executor_offline"),
+            TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED => {
+                ("degraded", "run_blocked_transport_disconnected")
+            }
+            TOOL_ERROR_KIND_FALLBACK_DISABLED => ("degraded", "run_blocked_fallback_disabled"),
+            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE => {
+                ("degraded", "run_blocked_workspace_executor_unavailable")
+            }
+            _ => return,
+        };
+        let Some(call_id) = Self::tool_call_id(args) else {
+            return;
+        };
+        let run_id = Self::run_id(args);
+
+        let reason = result_metadata_str(result, "reason").unwrap_or(error_kind);
+        let mut executor_event = Map::new();
+        executor_event.insert(
+            "type".to_string(),
+            Value::String("executor_status_changed".to_string()),
+        );
+        executor_event.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        executor_event.insert(
+            "status".to_string(),
+            Value::String(executor_status.to_string()),
+        );
+        executor_event.insert("reason".to_string(), Value::String(reason.to_string()));
+        executor_event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        if let Some(run_id) = run_id {
+            executor_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
+        }
+        executor_event.insert("tool".to_string(), Value::String(name.to_string()));
+        executor_event.insert("message".to_string(), Value::String(result.output.clone()));
+        copy_result_routing_metadata(&mut executor_event, result);
+        self.emit_work_surface_event(
+            executor_event,
+            "work-surface executor status event channel unavailable",
+        );
+
+        let mut blocked_event = Map::new();
+        blocked_event.insert(
+            "type".to_string(),
+            Value::String(blocked_event_type.to_string()),
+        );
+        blocked_event.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        blocked_event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        if let Some(run_id) = run_id {
+            blocked_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
+        }
+        blocked_event.insert("tool".to_string(), Value::String(name.to_string()));
+        blocked_event.insert("reason".to_string(), Value::String(reason.to_string()));
+        blocked_event.insert("message".to_string(), Value::String(result.output.clone()));
+        copy_result_routing_metadata(&mut blocked_event, result);
+        self.emit_work_surface_event(
+            blocked_event,
+            "work-surface run blocked event channel unavailable",
+        );
+    }
+
+    fn attach_binding_metadata(&self, result: &mut astra_tools::ToolResult) {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        for (key, value) in self.binding_event_fields() {
+            metadata.entry(key).or_insert(value);
+        }
+    }
+
+    fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            user_id: self.user_id.clone(),
+            run_id: string_arg(args, "_run_id").unwrap_or_default().to_string(),
+            session_id: self.session_id.clone(),
+            tool_call_id: Self::tool_call_id(args).unwrap_or_default().to_string(),
+            tool_name: name.to_string(),
+            args: args.clone(),
+            workspace: self.workspace_binding.clone(),
+            executor: self.executor_binding.clone(),
+            policy: ToolPolicySnapshot::default(),
+        }
+    }
+
+    fn record_resource_tool_call(&self) {
+        let Some(ref gov) = self.resource_governor else {
+            return;
+        };
+        let gov = gov.clone();
+        let uid = self.user_id.clone();
+        tokio::spawn(async move {
+            gov.record_tool_calls(&uid, 1).await;
+        });
     }
 
     async fn server_run_script(&self, args: &Value) -> astra_tools::ToolResult {
@@ -1847,21 +2438,21 @@ impl ServerToolExecutor {
         &mut self,
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) {
-        self.edge_connection_pool = Some(pool);
+        self.tool_execution_service.set_edge_connection_pool(pool);
     }
 
     pub fn set_edge_dispatch_service(
         &mut self,
         svc: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
     ) {
-        self.edge_dispatch_service = Some(svc);
+        self.tool_execution_service.set_edge_dispatch_service(svc);
     }
 
     pub fn set_edge_registry_service(
         &mut self,
         svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
     ) {
-        self.edge_registry_service = Some(svc);
+        self.tool_execution_service.set_edge_registry_service(svc);
     }
 
     pub fn set_observability_session(
@@ -1874,114 +2465,47 @@ impl ServerToolExecutor {
     /// Execute a tool call and return the result string.
     ///
     /// Routing order:
-    /// 1. Try remote edge agent (if connected via WebSocket)
-    /// 2. Fall back to local server-side execution
+    /// 1. Route from the explicit workspace/executor binding.
+    /// 2. Server-sandbox runs execute server-local tools.
+    /// 3. Edge-bound runs execute on edge only; server fallback is disabled.
     pub async fn execute(&self, name: &str, args: &Value) -> String {
         self.execute_with_metadata(name, args).await.output
     }
 
     /// Execute a tool call and preserve structured metadata for server-side fallback paths.
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
-        // Runtime MCP tools are request-scoped server-side tools. Execute them
-        // locally so short-lived credentials never route through edge dispatch.
-        if name.starts_with("mcp__") {
-            return self.execute_mcp_tool(name, args).await;
-        }
+        let started_at = std::time::Instant::now();
 
-        // ── Try remote edge agent first ──────────────────────────────
-        if let Some(pool) = &self.edge_connection_pool {
-            if let Some(result) = pool.execute_tool_any_edge(&self.user_id, name, args).await {
-                return astra_tools::ToolResult {
-                    output: result.output,
-                    metadata: None,
-                    is_error: result.is_error,
-                    exit_semantics: None,
-                };
+        // Early cancel check before any routing/transport work
+        if let Some(token) = self.cancel_token.as_ref() {
+            if token.is_cancelled() {
+                return cancelled_tool_result(name);
             }
         }
-        // ── Cross-pod edge dispatch fallback ─────────────────────────
-        // Local pool had no matching edge connection; try routing via the
-        // DB-backed dispatch relay so a different pod can deliver the tool
-        // call to the edge client.
-        if let (Some(dispatch), Some(registry)) =
-            (&self.edge_dispatch_service, &self.edge_registry_service)
-        {
-            if let Ok(agents) = registry.list_by_user(&self.user_id).await {
-                // Use the first available edge agent for cross-pod dispatch
-                if let Some(agent) = agents.first() {
-                    let request_id = format!(
-                        "xp-{}-{}",
-                        self.session_id,
-                        uuid::Uuid::new_v4()
-                            .to_string()
-                            .split('-')
-                            .next()
-                            .unwrap_or("0")
-                    );
-                    let timeout_secs = 300u64;
-                    let msg =
-                        astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
-                            request_id: request_id.clone(),
-                            tool: name.to_string(),
-                            args: args.clone(),
-                            timeout_secs,
-                        };
-                    let payload_json = match serde_json::to_string(&msg) {
-                        Ok(json) => json,
-                        Err(e) => {
-                            return astra_tools::ToolResult::error(format!(
-                                "dispatch payload serialization failed: {e}"
-                            ));
-                        }
-                    };
 
-                    if dispatch
-                        .insert_dispatch(
-                            &self.user_id,
-                            &agent.edge_agent_id,
-                            &request_id,
-                            &payload_json,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        match dispatch
-                            .wait_result(
-                                &request_id,
-                                std::time::Duration::from_secs(timeout_secs + 10),
-                            )
-                            .await
-                        {
-                            Ok(Some(result_json)) => {
-                                let (output, is_error) =
-                                    astra_thin_client::ToolResultRequest::parse_output_and_error(
-                                        &result_json,
-                                    );
-                                return astra_tools::ToolResult {
-                                    output,
-                                    metadata: None,
-                                    is_error,
-                                    exit_semantics: None,
-                                };
-                            }
-                            _ => {
-                                // Timeout or error — fall through to local execution
-                            }
-                        }
-                    }
-                }
+        let request = self.tool_execution_request(name, args);
+        let route = self.tool_execution_service.routing_decision(&request);
+        let route_fields = route_binding_event_fields(route, &request);
+        self.emit_tool_routing_decision(name, args, route, route_fields.as_ref());
+        self.emit_tool_transport_started(name, args, route_fields.as_ref());
+
+        let execution = self.tool_execution_service.execute(request, self);
+        let mut result = if let Some(token) = self.cancel_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => cancelled_tool_result(name),
+                result = execution => result,
             }
-        }
-        // ── Fire-and-forget resource usage recording (Phase 5) ────────
-        if let Some(ref gov) = self.resource_governor {
-            let gov = gov.clone();
-            let uid = self.user_id.clone();
-            tokio::spawn(async move {
-                gov.record_tool_calls(&uid, 1).await;
-            });
-        }
+        } else {
+            execution.await
+        };
+        annotate_default_executor_cancel_if_needed(name, &mut result);
 
-        self.execute_local_with_metadata(name, args).await
+        self.attach_binding_metadata(&mut result);
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        self.emit_tool_transport_finished(name, args, &result, duration_ms);
+        self.emit_tool_call_end(name, args, &result, duration_ms);
+
+        result
     }
 
     /// Execute a tool locally on the server (no edge routing).
@@ -2006,6 +2530,15 @@ impl ServerToolExecutor {
             ));
         }
 
+        if let Some(reason) = server_sandbox_tool_path_mismatch(
+            name,
+            args,
+            &self.workspace_root,
+            &self.workspace_binding,
+        ) {
+            return workspace_path_mismatch_tool_result(reason);
+        }
+
         // ── Approval gate check ──────────────────────────────────────
         if let Some(gate) = &self.approval_gate {
             if gate.requires_approval(name) {
@@ -2020,9 +2553,7 @@ impl ServerToolExecutor {
                         ));
                     }
                     astra_tools::ApprovalDecision::Timeout => {
-                        return astra_tools::ToolResult::error(
-                            "Tool execution denied: approval request timed out".into(),
-                        );
+                        return approval_timeout_tool_result();
                     }
                 }
             }
@@ -2304,7 +2835,7 @@ impl ServerToolExecutor {
                          the engine.".to_string(),
                     ),
                     "run_chain" => self.default_executor.execute("run_chain", args).await,
-                    "spawn" | "get_result" | "send_message" => tool_result_from_output(
+                    "spawn" | "get_result" | "send_message" => agent_tool_result_from_output(
                         crate::orchestration::handle_agent_tool(
                             args,
                             self.agent_tool_context.as_ref(),
@@ -2312,7 +2843,7 @@ impl ServerToolExecutor {
                         .await,
                     ),
                     other if other.is_empty() && args.get("spawn").is_some() => {
-                        tool_result_from_output(
+                        agent_tool_result_from_output(
                             crate::orchestration::handle_agent_tool(
                                 args,
                                 self.agent_tool_context.as_ref(),
@@ -2321,7 +2852,7 @@ impl ServerToolExecutor {
                         )
                     }
                     other if other.is_empty() && args.get("agents").is_some() => {
-                        tool_result_from_output(
+                        agent_tool_result_from_output(
                             crate::orchestration::handle_agent_tool(
                                 args,
                                 self.agent_tool_context.as_ref(),
@@ -3388,7 +3919,16 @@ impl ServerToolExecutor {
             return Err(format!("task.{action} arguments must be an object"));
         };
         for key in obj.keys() {
+            if key.starts_with('_') {
+                continue;
+            }
             if !allowed.contains(&key.as_str()) {
+                if action == "create" && Self::is_task_dependency_edge_field(key) {
+                    return Err(format!(
+                        "unknown field '{key}' for task.create. Dependency edge fields (`add_blocks`, `add_blocked_by`, `remove_blocks`, `remove_blocked_by`) are update-only: first call task(action='create', title=...), then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
+                        allowed.join(", ")
+                    ));
+                }
                 return Err(format!(
                     "unknown field '{key}' for task.{action} (valid: {})",
                     allowed.join(", ")
@@ -3396,6 +3936,13 @@ impl ServerToolExecutor {
             }
         }
         Ok(())
+    }
+
+    fn is_task_dependency_edge_field(key: &str) -> bool {
+        matches!(
+            key,
+            "add_blocks" | "add_blocked_by" | "remove_blocks" | "remove_blocked_by"
+        )
     }
 
     fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
@@ -3440,7 +3987,8 @@ impl ServerToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.create(args).await;
+        let task_args = Self::public_tool_arguments(args);
+        let output = self.task_manager.create(&task_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3453,20 +4001,25 @@ impl ServerToolExecutor {
                 snapshot,
                 format!(
                     "task:create:{}",
-                    args.get("title").and_then(Value::as_str).unwrap_or("task")
+                    task_args
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
                 ),
             );
-            self.emit_task_board_snapshot("task_create").await;
+            self.emit_task_board_snapshot("task_create", args).await;
         }
         output
     }
 
     async fn task_list(&self, args: &Value) -> String {
-        self.task_manager.list(args).await
+        let task_args = Self::public_tool_arguments(args);
+        self.task_manager.list(&task_args).await
     }
 
     async fn task_get(&self, args: &Value) -> String {
-        self.task_manager.get(args).await
+        let task_args = Self::public_tool_arguments(args);
+        self.task_manager.get(&task_args).await
     }
 
     async fn task_action_update(&self, args: &Value) -> String {
@@ -3476,7 +4029,8 @@ impl ServerToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.update(args).await;
+        let task_args = Self::public_tool_arguments(args);
+        let output = self.task_manager.update(&task_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3489,12 +4043,13 @@ impl ServerToolExecutor {
                 snapshot,
                 format!(
                     "task:update:{}",
-                    args.get("task_id")
+                    task_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
                 ),
             );
-            self.emit_task_board_snapshot("task_update").await;
+            self.emit_task_board_snapshot("task_update", args).await;
         }
         output
     }
@@ -3506,7 +4061,8 @@ impl ServerToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.stop(args).await;
+        let task_args = Self::public_tool_arguments(args);
+        let output = self.task_manager.stop(&task_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3519,12 +4075,13 @@ impl ServerToolExecutor {
                 snapshot,
                 format!(
                     "task:stop:{}",
-                    args.get("task_id")
+                    task_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
                 ),
             );
-            self.emit_task_board_snapshot("task_stop").await;
+            self.emit_task_board_snapshot("task_stop", args).await;
         }
         output
     }
@@ -3582,7 +4139,8 @@ impl ServerToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.archive(args).await;
+        let task_args = Self::public_tool_arguments(args);
+        let output = self.task_manager.archive(&task_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3595,20 +4153,21 @@ impl ServerToolExecutor {
                 snapshot,
                 format!(
                     "task:archive:{}",
-                    args.get("task_id")
+                    task_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("bulk")
                 ),
             );
-            self.emit_task_board_snapshot("task_archive").await;
+            self.emit_task_board_snapshot("task_archive", args).await;
         }
         output
     }
 
-    async fn emit_task_board_snapshot(&self, reason: &str) {
-        let Some(tx) = &self.work_surface_event_tx else {
+    async fn emit_task_board_snapshot(&self, reason: &str, args: &Value) {
+        if self.work_surface_event_tx.is_none() {
             return;
-        };
+        }
         let tasks = match self.task_manager.store().load(&self.session_id).await {
             Ok(tasks) => tasks,
             Err(error) => {
@@ -3621,43 +4180,50 @@ impl ServerToolExecutor {
                 return;
             }
         };
-        let event = json!({
-            "type": "task_board_snapshot",
-            "session_id": self.session_id.clone(),
-            "reason": reason,
-            "tasks": tasks,
-        });
-        if let Err(error) = tx.try_send(event) {
-            tracing::debug!(
-                target: "astra_runtime::work_surface",
-                session_id = %self.session_id,
-                error = %error,
-                "work-surface event channel unavailable"
-            );
-        }
+        let mut event = Map::new();
+        event.insert(
+            "type".to_string(),
+            Value::String("task_board_snapshot".to_string()),
+        );
+        event.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        Self::insert_run_id(&mut event, args);
+        event.insert("reason".to_string(), Value::String(reason.to_string()));
+        event.insert("tasks".to_string(), json!(tasks));
+        self.emit_work_surface_event(event, "work-surface task board event channel unavailable");
     }
 
-    fn emit_tool_call_end(&self, args: &Value, result: &astra_tools::ToolResult) {
-        let Some(tx) = &self.work_surface_event_tx else {
+    fn emit_tool_call_end(
+        &self,
+        name: &str,
+        args: &Value,
+        result: &astra_tools::ToolResult,
+        duration_ms: u64,
+    ) {
+        let Some(call_id) = Self::tool_call_id(args) else {
             return;
         };
-        let Some(call_id) = args.get("_tool_call_id").and_then(Value::as_str) else {
-            return;
-        };
-        let event = json!({
-            "type": "tool_call_end",
-            "call_id": call_id,
-            "result": result.output.clone(),
-            "success": !result.is_error,
-        });
-        if let Err(error) = tx.try_send(event) {
-            tracing::debug!(
-                target: "astra_runtime::work_surface",
-                session_id = %self.session_id,
-                error = %error,
-                "work-surface tool completion event channel unavailable"
-            );
-        }
+        let mut event = Map::new();
+        event.insert(
+            "type".to_string(),
+            Value::String("tool_call_end".to_string()),
+        );
+        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
+        Self::insert_run_id(&mut event, args);
+        event.insert("tool".to_string(), Value::String(name.to_string()));
+        event.insert("result".to_string(), Value::String(result.output.clone()));
+        event.insert("success".to_string(), Value::Bool(!result.is_error));
+        event.insert(
+            "duration_ms".to_string(),
+            Value::Number(serde_json::Number::from(duration_ms)),
+        );
+        copy_result_routing_metadata(&mut event, result);
+        self.emit_work_surface_event(
+            event,
+            "work-surface tool completion event channel unavailable",
+        );
     }
 
     #[allow(dead_code)]
@@ -3801,7 +4367,7 @@ impl ServerToolExecutor {
                     return json!({"error": "compression.compression_threshold must be within [0.5, 0.98]"}).to_string();
                 }
                 let old = session.config.compression.compression_threshold;
-                let drift = bounded_drift(old, new, 0.5, 0.98);
+                let drift = normalized_drift(old, new);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3828,7 +4394,7 @@ impl ServerToolExecutor {
                         .to_string();
                 }
                 let old = session.config.memory.retrieval_top_k;
-                let drift = bounded_drift(old as f64, new as f64, 1.0, 20.0);
+                let drift = normalized_drift(old as f64, new as f64);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3855,7 +4421,7 @@ impl ServerToolExecutor {
                         .to_string();
                 }
                 let old = session.config.tool_selection.max_tools;
-                let drift = bounded_drift(old as f64, new as f64, 5.0, 80.0);
+                let drift = normalized_drift(old as f64, new as f64);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3881,7 +4447,7 @@ impl ServerToolExecutor {
                     return json!({"error": "tool_selection.tool_budget_tokens must be within [0, 40000]"}).to_string();
                 }
                 let old = session.config.tool_selection.tool_budget_tokens;
-                let drift = bounded_drift(old as f64, new as f64, 0.0, 40_000.0);
+                let drift = normalized_drift(old as f64, new as f64);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3907,7 +4473,7 @@ impl ServerToolExecutor {
                     return json!({"error": "token_budget.max_turn_input_tokens must be within [8000, 200000]"}).to_string();
                 }
                 let old = session.config.token_budget.max_turn_input_tokens;
-                let drift = bounded_drift(old as f64, new as f64, 8_000.0, 200_000.0);
+                let drift = normalized_drift(old as f64, new as f64);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3933,7 +4499,7 @@ impl ServerToolExecutor {
                     return json!({"error": "token_budget.tools_reserve must be within [1000, 40000]"}).to_string();
                 }
                 let old = session.config.token_budget.tools_reserve;
-                let drift = bounded_drift(old as f64, new as f64, 1_000.0, 40_000.0);
+                let drift = normalized_drift(old as f64, new as f64);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3960,7 +4526,7 @@ impl ServerToolExecutor {
                         .to_string();
                 }
                 let old = session.config.verification.strictness;
-                let drift = bounded_drift(old, new, 0.2, 0.95);
+                let drift = normalized_drift(old, new);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -5029,6 +5595,13 @@ impl ServerToolExecutor {
         if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command(command) {
             return astra_tools::ToolResult::error(reason);
         }
+        if let Some(reason) = server_sandbox_local_path_mismatch(
+            command,
+            &self.workspace_root,
+            &self.workspace_binding,
+        ) {
+            return workspace_path_mismatch_tool_result(reason);
+        }
         let timeout_secs = args
             .get("timeout")
             .and_then(|v| v.as_f64())
@@ -5065,7 +5638,7 @@ fn tool_result_from_server_bash_output(
 ) -> astra_tools::ToolResult {
     let body = format_server_bash_output(&output, timeout_secs);
     if output.timed_out {
-        return astra_tools::ToolResult::error(format!("Error: {body}"));
+        return tool_timeout_tool_result(format!("Error: {body}"));
     }
     let semantics = output.exit_code.map(|code| classify_exit(command, code));
     let result_class =
@@ -5212,12 +5785,226 @@ fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     }
 }
 
+fn normalized_wait_reason(reason: &str) -> String {
+    reason
+        .trim()
+        .strip_prefix("waiting:")
+        .unwrap_or_else(|| reason.trim())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
+    let normalized = normalized_wait_reason(reason);
+    if normalized == TOOL_ERROR_KIND_EXECUTOR_OFFLINE
+        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_EXECUTOR_OFFLINE}:"))
+    {
+        Some(TOOL_ERROR_KIND_EXECUTOR_OFFLINE)
+    } else if normalized == TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED}:"))
+    {
+        Some(TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED)
+    } else if normalized == TOOL_ERROR_KIND_FALLBACK_DISABLED
+        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_FALLBACK_DISABLED}:"))
+    {
+        Some(TOOL_ERROR_KIND_FALLBACK_DISABLED)
+    } else {
+        None
+    }
+}
+
+fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
+    let parsed = serde_json::from_str::<Value>(&output).ok();
+    let waiting_reason = parsed.as_ref().and_then(|value| {
+        let status = value.get("status").and_then(Value::as_str)?;
+        if status != "waiting" {
+            return None;
+        }
+        Some(
+            value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("waiting"),
+        )
+    });
+
+    let Some(reason) = waiting_reason else {
+        return tool_result_from_output(output);
+    };
+
+    let normalized_reason = normalized_wait_reason(reason);
+    let error_kind =
+        execution_boundary_wait_error_kind(reason).unwrap_or(TOOL_ERROR_KIND_AGENT_WAITING);
+    let mut result = astra_tools::ToolResult::error(output);
+    let mut metadata = Map::new();
+    metadata.insert(
+        "error_kind".to_string(),
+        Value::String(error_kind.to_string()),
+    );
+    metadata.insert("reason".to_string(), Value::String(normalized_reason));
+    metadata.insert("blocked".to_string(), Value::Bool(true));
+    metadata.insert(
+        "agent_status".to_string(),
+        Value::String("waiting".to_string()),
+    );
+    if let Some(agent_id) = parsed
+        .as_ref()
+        .and_then(|value| value.get("agent_id"))
+        .and_then(Value::as_str)
+    {
+        metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
+    }
+    result.metadata = Some(metadata);
+    result
+}
+
+fn approval_timeout_tool_result() -> astra_tools::ToolResult {
+    let mut result =
+        astra_tools::ToolResult::error("Tool execution denied: approval request timed out".into());
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_APPROVAL_TIMEOUT.to_string()),
+        ),
+        (
+            "reason".to_string(),
+            Value::String(TOOL_ERROR_KIND_APPROVAL_TIMEOUT.to_string()),
+        ),
+        ("blocked".to_string(), Value::Bool(true)),
+    ]));
+    result
+}
+
+fn tool_timeout_tool_result(message: String) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(message);
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_TOOL_TIMEOUT.to_string()),
+        ),
+        (
+            "reason".to_string(),
+            Value::String(TOOL_ERROR_KIND_TOOL_TIMEOUT.to_string()),
+        ),
+    ]));
+    result
+}
+
+fn cancelled_tool_result(tool_name: &str) -> astra_tools::ToolResult {
+    let mut result =
+        astra_tools::ToolResult::error(format!("Tool '{tool_name}' cancelled before completion"));
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+        ),
+        (
+            "reason".to_string(),
+            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+        ),
+        ("cancelled".to_string(), Value::Bool(true)),
+    ]));
+    result
+}
+
+fn annotate_default_executor_cancel_if_needed(
+    tool_name: &str,
+    result: &mut astra_tools::ToolResult,
+) {
+    if !result.is_error || result_metadata_str(result, "error_kind").is_some() {
+        return;
+    }
+    let cancelled_before = format!("Tool '{tool_name}' cancelled before completion");
+    let not_executed = format!("Tool '{tool_name}' not executed: run was cancelled");
+    if result.output != cancelled_before && result.output != not_executed {
+        return;
+    }
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+        ),
+        (
+            "reason".to_string(),
+            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+        ),
+        ("cancelled".to_string(), Value::Bool(true)),
+    ]));
+}
+
+fn workspace_path_mismatch_tool_result(message: String) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(message);
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
+        ),
+        (
+            "reason".to_string(),
+            Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
+        ),
+        ("blocked".to_string(), Value::Bool(true)),
+    ]));
+    result
+}
+
+const RESULT_ROUTING_METADATA_FIELDS: &[&str] = &[
+    "workspace",
+    "executor",
+    "transport",
+    "fallback_policy",
+    "error_kind",
+    "reason",
+    "blocked",
+    "cancelled",
+    "agent_id",
+    "agent_status",
+];
+
+fn copy_result_routing_metadata(event: &mut Map<String, Value>, result: &astra_tools::ToolResult) {
+    let Some(metadata) = result.metadata.as_ref() else {
+        return;
+    };
+    for key in RESULT_ROUTING_METADATA_FIELDS {
+        if let Some(value) = metadata.get(*key) {
+            event
+                .entry((*key).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
+fn result_metadata_str<'a>(result: &'a astra_tools::ToolResult, key: &str) -> Option<&'a str> {
+    result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_str)
+}
+
 // ─── ToolExecutor trait implementation ────────────────────────────────────────
 //
 // This allows ServerToolExecutor to be used polymorphically wherever
 // `dyn ToolExecutor` (or `impl ToolExecutor`) is required, e.g. in
 // shared pipeline code that doesn't know whether it runs on the server
 // or on an edge/CLI client.
+
+#[async_trait]
+impl ServerLocalToolTransport for ServerToolExecutor {
+    async fn execute_server_local_tool(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> astra_tools::ToolResult {
+        if request.tool_name.starts_with("mcp__") {
+            return self
+                .execute_mcp_tool(&request.tool_name, &request.args)
+                .await;
+        }
+        self.record_resource_tool_call();
+        self.execute_local_with_metadata(&request.tool_name, &request.args)
+            .await
+    }
+}
 
 #[async_trait]
 impl ToolExecutor for ServerToolExecutor {
@@ -5253,6 +6040,80 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn agent_waiting_output_becomes_execution_boundary_blocked_result() {
+        let result = agent_tool_result_from_output(
+            json!({
+                "status": "waiting",
+                "agent_id": "reviewer-1",
+                "reason": "executor_offline"
+            })
+            .to_string(),
+        );
+
+        assert!(result.is_error);
+        let metadata = result.metadata.expect("blocked metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
+        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["agent_status"], "waiting");
+        assert_eq!(metadata["agent_id"], "reviewer-1");
+    }
+
+    #[test]
+    fn generic_agent_waiting_output_stays_structured_but_not_execution_boundary() {
+        let result = agent_tool_result_from_output(
+            json!({
+                "status": "waiting",
+                "agent_id": "reviewer-1",
+                "reason": "tool_approval"
+            })
+            .to_string(),
+        );
+
+        assert!(result.is_error);
+        let metadata = result.metadata.expect("waiting metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_AGENT_WAITING);
+        assert_eq!(metadata["reason"], "tool_approval");
+        assert_eq!(metadata["blocked"], true);
+    }
+
+    #[tokio::test]
+    async fn agent_waiting_tool_result_emits_agent_waiting_work_surface_event() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        exec.set_work_surface_event_tx(tx);
+        let mut result = agent_tool_result_from_output(
+            json!({
+                "status": "waiting",
+                "agent_id": "reviewer-1",
+                "reason": "executor_offline"
+            })
+            .to_string(),
+        );
+        exec.attach_binding_metadata(&mut result);
+
+        exec.emit_tool_transport_finished(
+            "agent",
+            &json!({"_tool_call_id": "call-agent"}),
+            &result,
+            12,
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| {
+                event["type"] == "agent_waiting"
+                    && event["agent_id"] == "reviewer-1"
+                    && event["reason"] == "executor_offline"
+            }),
+            "expected agent_waiting event, got {events:?}"
+        );
+    }
 
     fn env_guard() -> MutexGuard<'static, ()> {
         static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -5521,6 +6382,25 @@ esac
             "server list_user should reject unknown fields before returning a filtered list: {list_user_typo}"
         );
 
+        let create_dependency_field = exec
+            .execute(
+                "task",
+                &json!({
+                    "action": "create",
+                    "title": "Blocked task",
+                    "add_blocked_by": ["task-1"]
+                }),
+            )
+            .await;
+        assert!(
+            create_dependency_field.starts_with("Error:")
+                && create_dependency_field.contains("update-only")
+                && create_dependency_field.contains("task(action='create'")
+                && create_dependency_field.contains("task(action='update'")
+                && create_dependency_field.contains("<created task_id>"),
+            "server create dependency-field misuse should explain the two-step repair: {create_dependency_field}"
+        );
+
         let update_status_field = exec
             .execute(
                 "task",
@@ -5758,6 +6638,10 @@ esac
             Err("MCP tools must not deliver edge dispatch results".to_string())
         }
 
+        async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+            Err("MCP tools must not fail edge dispatch results".to_string())
+        }
+
         async fn wait_result(
             &self,
             _request_id: &str,
@@ -5808,6 +6692,163 @@ esac
         }
     }
 
+    struct NoResultEdgeDispatch;
+
+    #[async_trait]
+    impl astra_services::multi_agent::EdgeDispatchService for NoResultEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<i64, String> {
+            Ok(1)
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn deliver_result(
+            &self,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn wait_result(
+            &self,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    struct PendingEdgeDispatch {
+        wait_started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<i64, String> {
+            Ok(1)
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn deliver_result(
+            &self,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn wait_result(
+            &self,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            if let Some(sender) = self.wait_started.lock().expect("wait started lock").take() {
+                let _ = sender.send(());
+            }
+            std::future::pending::<Result<Option<String>, String>>().await
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    struct OneEdgeRegistry {
+        edge_agent_id: String,
+    }
+
+    #[async_trait]
+    impl astra_services::multi_agent::EdgeRegistryService for OneEdgeRegistry {
+        async fn register_or_update(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+            _hostname: Option<&str>,
+            _worktree_path: Option<&str>,
+            _capabilities: Option<serde_json::Value>,
+        ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+            Err("not needed for this test".to_string())
+        }
+
+        async fn heartbeat(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn list_by_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            Ok(vec![astra_services::multi_agent::EdgeAgentRecord {
+                registry_id: format!("registry-{}", self.edge_agent_id),
+                user_id: user_id.to_string(),
+                edge_agent_id: self.edge_agent_id.clone(),
+                edge_id: format!("edge-id-{}", self.edge_agent_id),
+                hostname: Some("MacBook Pro".to_string()),
+                worktree_path: Some("/Users/test/project".to_string()),
+                registered_at: "2026-06-11T00:00:00Z".to_string(),
+                last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
+            }])
+        }
+
+        async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn mcp_tools_bypass_edge_dispatch() {
         let (mut exec, _dir) = test_executor();
@@ -5823,6 +6864,645 @@ esac
             result.output.contains("no MCP manager configured"),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_bound_mcp_tool_events_show_mcp_transport_not_edge() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+        exec.set_edge_dispatch_service(Arc::new(PanicEdgeDispatch));
+        exec.set_edge_registry_service(Arc::new(PanicEdgeRegistry));
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "mcp__demo__search",
+                &json!({
+                    "query": "hello",
+                    "_tool_call_id": "call-mcp",
+                    "_run_id": "run-mcp",
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("no MCP manager configured"),
+            "{}",
+            result.output
+        );
+        let metadata = result.metadata.as_ref().expect("mcp metadata");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "mcp");
+        assert_eq!(metadata["executor"]["display_name"], "MCP server");
+        assert_eq!(metadata["transport"], "mcp_http");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let routing = events
+            .iter()
+            .find(|event| event["type"] == "tool_routing_decision")
+            .expect("tool_routing_decision");
+        assert_eq!(routing["route"], "request_scoped_mcp");
+        assert_eq!(routing["run_id"], "run-mcp");
+        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(routing["executor"]["kind"], "mcp");
+        assert_eq!(routing["transport"], "mcp_http");
+
+        let started = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_started")
+            .expect("tool_transport_started");
+        assert_eq!(started["call_id"], "call-mcp");
+        assert_eq!(started["executor"]["kind"], "mcp");
+        assert_eq!(started["transport"], "mcp_http");
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-mcp");
+        assert_eq!(failed["executor"]["kind"], "mcp");
+        assert_eq!(failed["transport"], "mcp_http");
+
+        let ended = events
+            .iter()
+            .find(|event| event["type"] == "tool_call_end")
+            .expect("tool_call_end");
+        assert_eq!(ended["call_id"], "call-mcp");
+        assert_eq!(ended["executor"]["kind"], "mcp");
+        assert_eq!(ended["transport"], "mcp_http");
+    }
+
+    #[tokio::test]
+    async fn server_sandbox_binding_executes_server_local_tools() {
+        let (exec, dir) = test_executor();
+
+        let result = exec
+            .execute_with_metadata("bash", &json!({"command": "pwd"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(
+            result.output.contains(&dir.path().display().to_string()),
+            "{}",
+            result.output
+        );
+        let metadata = result.metadata.expect("binding metadata");
+        assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+        assert_eq!(metadata["executor"]["kind"], "server_local");
+        assert_eq!(metadata["transport"], "server_local");
+    }
+
+    #[tokio::test]
+    async fn unsupported_workspace_binding_emits_blocked_work_surface_events() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::GitCheckout,
+                display_name: "Hosted checkout".to_string(),
+                cwd: Some("/checkout/repo".to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding {
+                kind: crate::server::tool_transport::ExecutorBindingKind::HostedRunner,
+                executor_id: "runner-1".to_string(),
+                display_name: "Hosted runner".to_string(),
+                transport: ToolTransportKind::RunnerRpc,
+                status: ExecutorStatus::Online,
+            },
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf should-not-run",
+                    "_tool_call_id": "call-unsupported-workspace",
+                    "_run_id": "run-unsupported-workspace",
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("No server fallback was attempted"),
+            "{}",
+            result.output
+        );
+        let metadata = result.metadata.as_ref().expect("blocked metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE
+        );
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["workspace"]["kind"], "git_checkout");
+        assert_eq!(metadata["executor"]["status"], "degraded");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let routing = events
+            .iter()
+            .find(|event| event["type"] == "tool_routing_decision")
+            .expect("tool_routing_decision");
+        assert_eq!(routing["route"], "unsupported");
+        assert_eq!(routing["call_id"], "call-unsupported-workspace");
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-unsupported-workspace");
+        assert_eq!(
+            failed["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE
+        );
+        assert_eq!(failed["workspace"]["kind"], "git_checkout");
+        assert_eq!(failed["executor"]["status"], "degraded");
+
+        let blocked = events
+            .iter()
+            .find(|event| event["type"] == "run_blocked_workspace_executor_unavailable")
+            .expect("run_blocked_workspace_executor_unavailable");
+        assert_eq!(blocked["run_id"], "run-unsupported-workspace");
+        assert_eq!(blocked["call_id"], "call-unsupported-workspace");
+        assert_eq!(
+            blocked["reason"],
+            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE
+        );
+        assert!(
+            blocked["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("No server fallback was attempted")),
+            "{blocked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_bound_binding_does_not_fallback_to_server_local_when_offline() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let result = exec
+            .execute_with_metadata("bash", &json!({"command": "printf should-not-run"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("fallback is disabled"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("should-not-run"),
+            "edge-bound offline tool must not execute locally: {}",
+            result.output
+        );
+        let metadata = result.metadata.expect("binding metadata");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "edge_agent");
+        assert_eq!(metadata["fallback_policy"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn edge_bound_web_search_runs_on_server_runtime_with_explicit_metadata() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "web_search",
+                &json!({
+                    "query": "astra runtime",
+                    "_tool_call_id": "call-web-search",
+                    "_run_id": "run-web-search",
+                }),
+            )
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("search_url"), "{result:?}");
+        let metadata = result.metadata.as_ref().expect("server runtime metadata");
+        assert_eq!(metadata["workspace"]["kind"], "none");
+        assert_eq!(metadata["executor"]["kind"], "server_local");
+        assert_eq!(metadata["executor"]["display_name"], "Server runtime");
+        assert_eq!(metadata["transport"], "server_local");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let routing = events
+            .iter()
+            .find(|event| event["type"] == "tool_routing_decision")
+            .expect("tool_routing_decision");
+        assert_eq!(routing["route"], "server_runtime");
+        assert_eq!(routing["run_id"], "run-web-search");
+        assert_eq!(routing["workspace"]["kind"], "none");
+        assert_eq!(routing["executor"]["display_name"], "Server runtime");
+        assert_eq!(routing["transport"], "server_local");
+
+        let started = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_started")
+            .expect("tool_transport_started");
+        assert_eq!(started["call_id"], "call-web-search");
+        assert_eq!(started["run_id"], "run-web-search");
+        assert_eq!(started["workspace"]["kind"], "none");
+        assert_eq!(started["executor"]["display_name"], "Server runtime");
+        assert_eq!(started["transport"], "server_local");
+
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_completed")
+            .expect("tool_transport_completed");
+        assert_eq!(completed["call_id"], "call-web-search");
+        assert_eq!(completed["run_id"], "run-web-search");
+        assert_eq!(completed["workspace"]["kind"], "none");
+        assert_eq!(completed["executor"]["display_name"], "Server runtime");
+        assert_eq!(completed["transport"], "server_local");
+    }
+
+    #[tokio::test]
+    async fn edge_bound_offline_emits_actionable_blocked_work_surface_events() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf should-not-run",
+                    "_tool_call_id": "call-offline",
+                    "_run_id": "run-offline",
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let routing = events
+            .iter()
+            .find(|event| event["type"] == "tool_routing_decision")
+            .expect("tool_routing_decision");
+        assert_eq!(routing["call_id"], "call-offline");
+        assert_eq!(routing["run_id"], "run-offline");
+        assert_eq!(routing["tool"], "bash");
+        assert_eq!(routing["route"], "edge_bound");
+        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(routing["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(routing["executor"]["kind"], "edge_agent");
+        assert_eq!(routing["executor"]["executor_id"], "edge-macbook-1");
+        assert_eq!(routing["executor"]["transport"], "edge_ws");
+        assert_eq!(routing["transport"], "edge_ws");
+        assert_eq!(routing["fallback_policy"], "disabled");
+
+        let started = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_started")
+            .expect("tool_transport_started");
+        assert_eq!(started["call_id"], "call-offline");
+        assert_eq!(started["run_id"], "run-offline");
+        assert_eq!(started["tool"], "bash");
+        assert_eq!(started["workspace"]["kind"], "edge_workspace");
+        assert_eq!(started["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(started["executor"]["kind"], "edge_agent");
+        assert_eq!(started["executor"]["executor_id"], "edge-macbook-1");
+        assert_eq!(started["transport"], "edge_ws");
+        assert_eq!(started["fallback_policy"], "disabled");
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-offline");
+        assert_eq!(failed["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
+        assert_eq!(failed["executor"]["status"], "offline");
+        assert_eq!(failed["workspace"]["kind"], "edge_workspace");
+
+        let status = events
+            .iter()
+            .find(|event| event["type"] == "executor_status_changed")
+            .expect("executor_status_changed");
+        assert_eq!(status["status"], "offline");
+        assert_eq!(status["executor"]["status"], "offline");
+        assert_eq!(status["reason"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
+        assert_eq!(status["run_id"], "run-offline");
+
+        let blocked = events
+            .iter()
+            .find(|event| event["type"] == "run_blocked_executor_offline")
+            .expect("run_blocked_executor_offline");
+        assert_eq!(blocked["call_id"], "call-offline");
+        assert_eq!(blocked["run_id"], "run-offline");
+        assert_eq!(blocked["tool"], "bash");
+        assert!(
+            blocked["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Server fallback is disabled")),
+            "{blocked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_transport_disconnect_emits_degraded_blocked_work_surface_events() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        exec.set_work_surface_event_tx(tx);
+        exec.set_edge_dispatch_service(Arc::new(NoResultEdgeDispatch));
+        exec.set_edge_registry_service(Arc::new(OneEdgeRegistry {
+            edge_agent_id: "edge-macbook-1".to_string(),
+        }));
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf edge",
+                    "_tool_call_id": "call-transport-disconnected",
+                    "_run_id": "run-transport-disconnected",
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-transport-disconnected");
+        assert_eq!(failed["error_kind"], TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED);
+        assert_eq!(failed["reason"], TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED);
+        assert_eq!(failed["executor"]["status"], "degraded");
+        assert_eq!(failed["workspace"]["kind"], "edge_workspace");
+
+        let status = events
+            .iter()
+            .find(|event| {
+                event["type"] == "executor_status_changed"
+                    && event["reason"] == TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+            })
+            .expect("executor_status_changed");
+        assert_eq!(status["status"], "degraded");
+        assert_eq!(status["executor"]["status"], "degraded");
+        assert_eq!(status["run_id"], "run-transport-disconnected");
+
+        let blocked = events
+            .iter()
+            .find(|event| event["type"] == "run_blocked_transport_disconnected")
+            .expect("run_blocked_transport_disconnected");
+        assert_eq!(blocked["call_id"], "call-transport-disconnected");
+        assert_eq!(blocked["run_id"], "run-transport-disconnected");
+        assert_eq!(blocked["tool"], "bash");
+        assert_eq!(blocked["reason"], TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED);
+        assert!(
+            blocked["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("transport 'edge_ws' disconnected")),
+            "{blocked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_token_interrupts_pending_edge_transport_with_structured_events() {
+        let (mut exec, _dir) = test_executor();
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        exec = exec.with_cancel_token(Some(cancel_token.clone()));
+        let (wait_started_tx, wait_started_rx) = tokio::sync::oneshot::channel();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        exec.set_work_surface_event_tx(event_tx);
+        exec.set_edge_dispatch_service(Arc::new(PendingEdgeDispatch {
+            wait_started: StdMutex::new(Some(wait_started_tx)),
+        }));
+        exec.set_edge_registry_service(Arc::new(OneEdgeRegistry {
+            edge_agent_id: "edge-macbook-1".to_string(),
+        }));
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let handle = tokio::spawn(async move {
+            exec.execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf edge",
+                    "_tool_call_id": "call-cancelled",
+                    "_run_id": "run-cancelled",
+                }),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), wait_started_rx)
+            .await
+            .expect("timed out waiting for edge ledger wait to start")
+            .expect("wait started sender dropped");
+        cancel_token.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled edge transport should return promptly")
+            .expect("tool task should not panic");
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("cancelled"), "{result:?}");
+        let metadata = result.metadata.as_ref().expect("cancelled metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(metadata["cancelled"], true);
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "edge_agent");
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-cancelled");
+        assert_eq!(failed["run_id"], "run-cancelled");
+        assert_eq!(failed["error_kind"], TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(failed["reason"], TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(failed["cancelled"], true);
+        assert_eq!(failed["workspace"]["kind"], "edge_workspace");
+        assert_eq!(failed["executor"]["kind"], "edge_agent");
+
+        let ended = events
+            .iter()
+            .find(|event| event["type"] == "tool_call_end")
+            .expect("tool_call_end");
+        assert_eq!(ended["call_id"], "call-cancelled");
+        assert_eq!(ended["run_id"], "run-cancelled");
+        assert_eq!(ended["error_kind"], TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(ended["cancelled"], true);
+    }
+
+    #[tokio::test]
+    async fn work_surface_events_include_binding_metadata_and_public_arguments() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+        exec.emit_binding_snapshot();
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf ok",
+                    "_tool_call_id": "call-1",
+                    "_run_id": "run-1",
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "workspace_bound"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| event["type"] == "executor_bound"),
+            "{events:?}"
+        );
+        let routing = events
+            .iter()
+            .find(|event| event["type"] == "tool_routing_decision")
+            .expect("tool_routing_decision");
+        assert_eq!(routing["call_id"], "call-1");
+        assert_eq!(routing["run_id"], "run-1");
+        let started = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_started")
+            .expect("tool_transport_started");
+        assert_eq!(started["run_id"], "run-1");
+        assert_eq!(started["workspace"]["kind"], "server_sandbox");
+        assert_eq!(started["executor"]["kind"], "server_local");
+        assert_eq!(started["arguments"]["command"], "printf ok");
+        assert!(
+            started["arguments"].get("_tool_call_id").is_none(),
+            "{started:?}"
+        );
+        assert!(started["arguments"].get("_run_id").is_none(), "{started:?}");
+        let transport_completed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_completed")
+            .expect("tool_transport_completed");
+        assert_eq!(transport_completed["run_id"], "run-1");
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "tool_call_end")
+            .expect("tool_call_end");
+        assert_eq!(completed["call_id"], "call-1");
+        assert_eq!(completed["run_id"], "run-1");
+        assert_eq!(completed["workspace"]["kind"], "server_sandbox");
+        assert_eq!(completed["transport"], "server_local");
+    }
+
+    #[tokio::test]
+    async fn task_board_snapshot_events_include_run_and_binding_metadata() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+
+        let result = exec
+            .execute_with_metadata(
+                "task",
+                &json!({
+                    "action": "create",
+                    "title": "live task board",
+                    "_tool_call_id": "call-task-create",
+                    "_run_id": "run-task",
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let snapshot = events
+            .iter()
+            .find(|event| event["type"] == "task_board_snapshot")
+            .expect("task_board_snapshot");
+        assert_eq!(snapshot["session_id"], "test-session");
+        assert_eq!(snapshot["run_id"], "run-task");
+        assert_eq!(snapshot["reason"], "task_create");
+        assert_eq!(snapshot["workspace"]["kind"], "server_sandbox");
+        assert_eq!(snapshot["executor"]["kind"], "server_local");
+        assert_eq!(snapshot["transport"], "server_local");
+        assert_eq!(snapshot["tasks"][0]["title"], "live task board");
+        assert!(
+            snapshot["tasks"][0].get("_run_id").is_none(),
+            "{snapshot:?}"
+        );
+        assert!(
+            snapshot["tasks"][0].get("_tool_call_id").is_none(),
+            "{snapshot:?}"
         );
     }
 
@@ -6731,11 +8411,63 @@ esac
     async fn approval_timeout_returns_denied_error_string() {
         let (mut exec, _dir) = test_executor();
         exec.set_approval_gate(std::sync::Arc::new(AlwaysTimeoutGate));
-        let out = exec.execute("bash", &json!({"command": "echo hi"})).await;
+        let result = exec
+            .execute_with_metadata("bash", &json!({"command": "echo hi"}))
+            .await;
         assert!(
-            out.contains("approval request timed out"),
-            "unexpected output: {out}"
+            result.output.contains("approval request timed out"),
+            "unexpected output: {}",
+            result.output
         );
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.expect("approval timeout metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_APPROVAL_TIMEOUT);
+        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_APPROVAL_TIMEOUT);
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+        assert_eq!(metadata["executor"]["kind"], "server_local");
+        assert_eq!(metadata["transport"], "server_local");
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_emits_blocked_work_surface_metadata() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+        exec.set_approval_gate(std::sync::Arc::new(AlwaysTimeoutGate));
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({"command": "echo hi", "_tool_call_id": "call-approval-timeout"}),
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-approval-timeout");
+        assert_eq!(failed["error_kind"], TOOL_ERROR_KIND_APPROVAL_TIMEOUT);
+        assert_eq!(failed["reason"], TOOL_ERROR_KIND_APPROVAL_TIMEOUT);
+        assert_eq!(failed["blocked"], true);
+        assert_eq!(failed["workspace"]["kind"], "server_sandbox");
+        assert_eq!(failed["executor"]["kind"], "server_local");
+
+        let ended = events
+            .iter()
+            .find(|event| event["type"] == "tool_call_end")
+            .expect("tool_call_end");
+        assert_eq!(ended["call_id"], "call-approval-timeout");
+        assert_eq!(ended["error_kind"], TOOL_ERROR_KIND_APPROVAL_TIMEOUT);
+        assert_eq!(ended["reason"], TOOL_ERROR_KIND_APPROVAL_TIMEOUT);
+        assert_eq!(ended["blocked"], true);
     }
 
     // ── Bash execution ─────────────────────────────────────────────────
@@ -6796,6 +8528,273 @@ esac
             .await;
         assert!(!result.is_error, "{result:?}");
         assert_eq!(result.output.trim(), "found");
+    }
+
+    #[test]
+    fn server_sandbox_path_guard_rejects_unowned_local_paths_only() {
+        let workspace_root = Path::new("/Users/server/astra-workspaces/session-1");
+        let workspace = WorkspaceBinding::server_sandbox(workspace_root);
+
+        assert!(
+            server_sandbox_local_path_mismatch("cd subdir && pwd", workspace_root, &workspace)
+                .is_none()
+        );
+        assert!(
+            server_sandbox_local_path_mismatch(
+                "cat /Users/server/astra-workspaces/session-1/marker.txt",
+                workspace_root,
+                &workspace,
+            )
+            .is_none()
+        );
+        assert!(
+            server_sandbox_local_path_mismatch(
+                "cd ~/github/astra && git status",
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_local_path_mismatch(
+                "cd $HOME/github/astra && git status",
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_local_path_mismatch(
+                "cd ${HOME}/github/astra && git status",
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_local_path_mismatch(
+                "cd /Users/xupeng/github/astra && git status",
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn server_sandbox_tool_path_guard_checks_path_arguments_only() {
+        let workspace_root = Path::new("/Users/server/astra-workspaces/session-1");
+        let workspace = WorkspaceBinding::server_sandbox(workspace_root);
+
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "read_file",
+                &json!({"path": "/Users/server/astra-workspaces/session-1/marker.txt"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_none()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "read_file",
+                &json!({"path": "/Users/xupeng/github/astra/src/lib.rs"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "read_file",
+                &json!({"path": "$HOME/github/astra/src/lib.rs"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "read_file",
+                &json!({"path": "${HOME}/github/astra/src/lib.rs"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "list_dir",
+                &json!({"path": "/tmp/user-local-repo"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some(),
+            "absolute path arguments outside the server sandbox must not depend on /Users-style prefix detection"
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "grep",
+                &json!({"pattern": "/Users/xupeng/github/astra"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_none(),
+            "grep pattern is content, not a filesystem target"
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "grep",
+                &json!({"pattern": "needle", "path": "/Users/xupeng/github/astra"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "glob",
+                &json!({"pattern": "/Users/xupeng/github/astra/**/*.rs"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "glob",
+                &json!({"pattern": "/Users/server/astra-workspaces/session-1/**/*.rs"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_none()
+        );
+        assert!(
+            server_sandbox_tool_path_mismatch(
+                "git_file_history",
+                &json!({"file": "/Users/xupeng/github/astra/src/lib.rs"}),
+                workspace_root,
+                &workspace,
+            )
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_blocks_user_home_path_in_server_sandbox() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "cd ~/github/astra && git status",
+                    "_tool_call_id": "call-workspace-path"
+                }),
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Server sandbox"), "{result:?}");
+        assert!(result.output.contains("edge workspace"), "{result:?}");
+        let metadata = result.metadata.as_ref().expect("path mismatch metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH
+        );
+        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH);
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-workspace-path");
+        assert_eq!(
+            failed["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH
+        );
+        assert_eq!(failed["blocked"], true);
+        assert_eq!(failed["workspace"]["kind"], "server_sandbox");
+
+        let ended = events
+            .iter()
+            .find(|event| event["type"] == "tool_call_end")
+            .expect("tool_call_end");
+        assert_eq!(ended["call_id"], "call-workspace-path");
+        assert_eq!(ended["error_kind"], TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH);
+        assert_eq!(ended["blocked"], true);
+    }
+
+    #[tokio::test]
+    async fn read_file_blocks_user_home_path_in_server_sandbox() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+
+        let result = exec
+            .execute_with_metadata(
+                "read_file",
+                &json!({
+                    "path": "/Users/xupeng/github/astra/src/lib.rs",
+                    "_tool_call_id": "call-read-local-path"
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Server sandbox"), "{result:?}");
+        assert!(result.output.contains("edge workspace"), "{result:?}");
+        let metadata = result.metadata.as_ref().expect("path mismatch metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH
+        );
+        assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-read-local-path");
+        assert_eq!(
+            failed["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH
+        );
+        assert_eq!(failed["blocked"], true);
+        assert_eq!(failed["workspace"]["kind"], "server_sandbox");
+    }
+
+    #[tokio::test]
+    async fn list_dir_blocks_unowned_absolute_path_in_server_sandbox() {
+        let (exec, _dir) = test_executor();
+
+        let result = exec
+            .execute_with_metadata("list_dir", &json!({"path": "/tmp/user-local-repo"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Server sandbox"), "{result:?}");
+        assert!(result.output.contains("/tmp/user-local-repo"), "{result:?}");
+        let metadata = result.metadata.as_ref().expect("path mismatch metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH
+        );
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
     }
 
     #[tokio::test]
@@ -6861,6 +8860,56 @@ esac
         assert!(result.is_error, "got: {}", result.output);
         assert!(result.output.contains("start"), "got: {}", result.output);
         assert!(result.output.contains("timed out after 0.2s"));
+        let metadata = result.metadata.expect("tool timeout metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert!(metadata.get("blocked").is_none(), "{metadata:?}");
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_emits_tool_timeout_work_surface_metadata() {
+        let (mut exec, _dir) = test_executor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        exec.set_work_surface_event_tx(tx);
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf start; sleep 1",
+                    "timeout": 0.1,
+                    "_tool_call_id": "call-tool-timeout"
+                }),
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.as_ref().expect("tool timeout metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_transport_failed")
+            .expect("tool_transport_failed");
+        assert_eq!(failed["call_id"], "call-tool-timeout");
+        assert_eq!(failed["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(failed["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(failed["workspace"]["kind"], "server_sandbox");
+        assert!(failed.get("blocked").is_none(), "{failed:?}");
+
+        let ended = events
+            .iter()
+            .find(|event| event["type"] == "tool_call_end")
+            .expect("tool_call_end");
+        assert_eq!(ended["call_id"], "call-tool-timeout");
+        assert_eq!(ended["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(ended["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
     }
 
     #[tokio::test]

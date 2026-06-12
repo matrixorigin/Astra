@@ -1752,6 +1752,7 @@ fn sync_conn_state_from_stream_event(
             "session_info"
                 | "run_started"
                 | "run_paused"
+                | "run_waiting"
                 | "run_resumed"
                 | "run_cancelled"
                 | "run_finished"
@@ -2803,15 +2804,20 @@ mod tests {
             "data": {},
             "index": 2
         });
+        let run_waiting = serde_json::json!({
+            "event_type": "run_waiting",
+            "data": {"reason": "waiting: executor_offline"},
+            "index": 3
+        });
         let run_resumed = serde_json::json!({
             "event_type": "run_resumed",
             "data": {},
-            "index": 3
+            "index": 4
         });
 
         let payloads = lifecycle_events_to_ws_payloads(
             "run-123",
-            vec![run_paused, run_resumed],
+            vec![run_paused, run_waiting, run_resumed],
             &mut pending_run_error,
         );
 
@@ -2824,9 +2830,15 @@ mod tests {
                     "index": 2
                 }),
                 serde_json::json!({
+                    "type": "run_waiting",
+                    "run_id": "run-123",
+                    "reason": "waiting: executor_offline",
+                    "index": 3
+                }),
+                serde_json::json!({
                     "type": "run_resumed",
                     "run_id": "run-123",
-                    "index": 3
+                    "index": 4
                 })
             ]
         );

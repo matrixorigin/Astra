@@ -281,12 +281,73 @@ describe('AstraClient — Runs', () => {
       status: 'completed',
       waiting_for: null,
       events_count: 5,
+      workspace: {
+        kind: 'edge_workspace',
+        display_name: 'MacBook Pro',
+        cwd: '/Users/test/project',
+        authority: 'read_write',
+        fallback_policy: 'disabled',
+      },
+      executor: {
+        kind: 'edge_agent',
+        executor_id: 'edge-1',
+        display_name: 'MacBook Pro',
+        transport: 'edge_ws',
+        status: 'online',
+      },
+      transport: 'edge_ws',
+      fallback_policy: 'disabled',
     };
     globalThis.fetch = mockFetch(200, raw);
 
     const result = await createClient().getRunStatus('r1');
     expect(result.status).toBe('completed');
     expect(result.eventsCount).toBe(5);
+    expect(result.workspace).toMatchObject({
+      kind: 'edge_workspace',
+      cwd: '/Users/test/project',
+    });
+    expect(result.executor).toMatchObject({
+      kind: 'edge_agent',
+      executor_id: 'edge-1',
+      transport: 'edge_ws',
+    });
+    expect(result.transport).toBe('edge_ws');
+    expect(result.fallbackPolicy).toBe('disabled');
+  });
+
+  test('getRunStatus normalizes blocked execution-boundary state', async () => {
+    globalThis.fetch = mockFetch(200, {
+      run_id: 'r-blocked',
+      session_id: 's1',
+      status: 'blocked',
+      waiting_for: 'workspace_executor_unavailable',
+      events_count: 7,
+      workspace: {
+        kind: 'git_checkout',
+        display_name: 'Hosted checkout',
+        cwd: '/checkout/repo',
+        authority: 'read_only',
+        fallback_policy: 'disabled',
+      },
+      executor: {
+        kind: 'hosted_runner',
+        executor_id: 'runner-1',
+        display_name: 'Hosted runner',
+        transport: 'runner_rpc',
+        status: 'degraded',
+      },
+      transport: 'runner_rpc',
+      fallback_policy: 'disabled',
+    });
+
+    const result = await createClient().getRunStatus('r-blocked');
+    expect(result.status).toBe('blocked');
+    expect(result.waitingFor).toBe('workspace_executor_unavailable');
+    expect(result.workspace?.kind).toBe('git_checkout');
+    expect(result.executor?.status).toBe('degraded');
+    expect(result.transport).toBe('runner_rpc');
+    expect(result.fallbackPolicy).toBe('disabled');
   });
 
   test('cancelRun', async () => {
@@ -324,6 +385,22 @@ describe('AstraClient — Runs', () => {
       run_id: 'r1',
       session_id: 's1',
       status: 'running',
+      workspace: {
+        kind: 'edge_workspace',
+        display_name: 'MacBook Pro',
+        cwd: '/Users/xupeng/github/astra',
+        authority: 'read_write',
+        fallback_policy: 'disabled',
+      },
+      executor: {
+        kind: 'edge_agent',
+        executor_id: 'edge-1',
+        display_name: 'MacBook Pro',
+        transport: 'edge_ws',
+        status: 'online',
+      },
+      transport: 'edge_ws',
+      fallback_policy: 'disabled',
       run_event_high_watermark: 7,
       projection_event_idx: 6,
       projection_updated_at: '2026-06-10T00:00:00.000Z',
@@ -344,6 +421,11 @@ describe('AstraClient — Runs', () => {
       recentLimit: 25,
     });
     expect(projection.recent_events).toHaveLength(1);
+    expect(projection.workspace?.kind).toBe('edge_workspace');
+    expect(projection.workspace?.cwd).toBe('/Users/xupeng/github/astra');
+    expect(projection.executor?.executor_id).toBe('edge-1');
+    expect(projection.transport).toBe('edge_ws');
+    expect(projection.fallback_policy).toBe('disabled');
     const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
     expect(url).toContain('/chat/runs/r1/projection');
     expect(url).toContain('recent_limit=25');
@@ -358,6 +440,22 @@ describe('AstraClient — Runs', () => {
           status: 'running',
           waiting_for: null,
           events_count: 3,
+          workspace: {
+            kind: 'server_sandbox',
+            display_name: 'Server sandbox',
+            cwd: '/tmp/astra-workspaces/s1',
+            authority: 'read_write',
+            fallback_policy: 'disabled',
+          },
+          executor: {
+            kind: 'server_local',
+            executor_id: 'server-local',
+            display_name: 'Server sandbox',
+            transport: 'server_local',
+            status: 'online',
+          },
+          transport: 'server_local',
+          fallback_policy: 'disabled',
         },
       ],
       total: 1,
@@ -367,6 +465,10 @@ describe('AstraClient — Runs', () => {
     const r = await createClient().listRuns();
     expect(r.runs[0].runId).toBe('r1');
     expect(r.runs[0].eventsCount).toBe(3);
+    expect(r.runs[0].workspace?.kind).toBe('server_sandbox');
+    expect(r.runs[0].executor?.kind).toBe('server_local');
+    expect(r.runs[0].transport).toBe('server_local');
+    expect(r.runs[0].fallbackPolicy).toBe('disabled');
     const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
     expect(url).toContain('/runs');
   });

@@ -63,6 +63,8 @@ pub struct AgentToolContext {
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// DB trace identity shared with the current Web turn.
     pub trace_context: Option<TraceContext>,
+    /// UI/runtime execution binding metadata inherited by child agents.
+    pub execution_metadata: Option<Value>,
 }
 
 /// Handle the consolidated `agent` tool for shared dynamic-agent actions.
@@ -649,6 +651,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         inherited_skills: ctx.active_skills.clone(),
         live_event_sink: ctx.live_event_sink.clone(),
         trace_context: ctx.trace_context.clone(),
+        execution_metadata: ctx.execution_metadata.clone(),
         spawn_tool_call_id: args
             .get("_tool_call_id")
             .and_then(Value::as_str)
@@ -1017,17 +1020,23 @@ mod tests {
 
     struct CapturingModelExecutor {
         captured_model: Mutex<Option<String>>,
+        captured_execution_metadata: Mutex<Option<Value>>,
     }
 
     impl CapturingModelExecutor {
         fn new() -> Self {
             Self {
                 captured_model: Mutex::new(None),
+                captured_execution_metadata: Mutex::new(None),
             }
         }
 
         fn take_captured_model(&self) -> Option<String> {
             self.captured_model.lock().unwrap().take()
+        }
+
+        fn take_captured_execution_metadata(&self) -> Option<Value> {
+            self.captured_execution_metadata.lock().unwrap().take()
         }
     }
 
@@ -1035,6 +1044,7 @@ mod tests {
     impl SpawnAgentExecutor for CapturingModelExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             *self.captured_model.lock().unwrap() = config.model.clone();
+            *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
@@ -1154,6 +1164,7 @@ mod tests {
             active_skills: Vec::new(),
             live_event_sink: None,
             trace_context: None,
+            execution_metadata: None,
         }
     }
 
@@ -1175,6 +1186,46 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
         );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_inherits_execution_metadata() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        ctx.execution_metadata = Some(json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/xupeng/github/astra",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-macbook-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        }));
+        let args = json!({
+            "description": "Code quality review",
+            "prompt": "Review the latest commit",
+            "agent_type": "general-purpose"
+        });
+
+        let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        let metadata = executor
+            .take_captured_execution_metadata()
+            .expect("execution metadata");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "edge_agent");
+        assert_eq!(metadata["transport"], "edge_ws");
     }
 
     #[tokio::test]

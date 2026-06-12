@@ -47,6 +47,8 @@ pub enum ProgressEventType {
     },
     /// Agent failed.
     Failed { error: String },
+    /// Agent is waiting for external input or an execution boundary to recover.
+    Waiting { reason: String },
     /// Agent cancelled.
     Cancelled { reason: String },
     /// Tool blocked by permission policy (emitted so parent/UI can surface warnings).
@@ -98,6 +100,7 @@ impl ProgressEventType {
             Self::Interrupted { .. } => Some(AgentProgressTerminalKind::Interrupted),
             Self::Failed { .. } => Some(AgentProgressTerminalKind::Failed),
             Self::Cancelled { .. } => Some(AgentProgressTerminalKind::Cancelled),
+            Self::Waiting { .. } => None, // Waiting is recoverable, not terminal
             _ => None,
         }
     }

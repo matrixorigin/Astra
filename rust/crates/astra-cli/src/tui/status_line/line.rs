@@ -352,26 +352,6 @@ fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
     parts
 }
 
-fn background_task_chip_text(counts: BackgroundTaskCounts) -> String {
-    format!(
-        "Background · {} · {}",
-        background_task_count_parts(counts).join(" · "),
-        crate::tui::background_shortcut::background_task_open_hint()
-    )
-}
-
-fn background_task_chip_style(counts: BackgroundTaskCounts) -> Style {
-    if counts.failed_total() > 0 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if counts.waiting > 0 || counts.unavailable_total() > 0 {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Cyan)
-    }
-}
-
 /// Threshold below which the budget chip is dim, above which it warns.
 const BUDGET_WARN_PERCENT: f32 = 75.0;
 const BUDGET_ERROR_PERCENT: f32 = 90.0;
@@ -446,31 +426,6 @@ impl StatusLine {
             }
         }
 
-        // Background tasks are active work the user may need to revisit while
-        // the foreground turn continues. Keep this before lower-priority
-        // per-turn chips so standard-width terminals do not hide it first.
-        if let Some(counts) = ctx.bg_task_counts
-            && !counts.is_empty()
-        {
-            out.left.push(Segment::styled(
-                background_task_chip_text(counts),
-                background_task_chip_style(counts),
-            ));
-        }
-
-        for summary in &ctx.bg_fanout_summaries {
-            out.left.push(Segment::styled(
-                summary.text(),
-                Style::default().fg(if summary.failed > 0 {
-                    Color::Red
-                } else if summary.unavailable > 0 {
-                    Color::Yellow
-                } else {
-                    Color::Magenta
-                }),
-            ));
-        }
-
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {
                 "⏸ 1 pending".to_string()
@@ -501,6 +456,36 @@ impl StatusLine {
                 };
                 out.left.push(Segment::styled(text, style));
             }
+        }
+
+        for summary in &ctx.bg_fanout_summaries {
+            out.left.push(Segment::styled(
+                summary.text(),
+                Style::default().fg(if summary.failed > 0 {
+                    Color::Red
+                } else if summary.unavailable > 0 {
+                    Color::Yellow
+                } else {
+                    Color::Magenta
+                }),
+            ));
+        }
+
+        // BackgroundTaskRegistry chip. Running tasks are informational;
+        // needs-input/failed tasks are attention states and stay visible
+        // even after no shell is making forward progress.
+        if let Some(counts) = ctx.bg_task_counts
+            && !counts.is_empty()
+        {
+            let parts = background_task_count_parts(counts);
+            let style = if counts.failed_total() > 0 {
+                Style::default().fg(Color::Red)
+            } else if counts.waiting > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                muted
+            };
+            out.left.push(Segment::styled(parts.join(" · "), style));
         }
 
         // ── Right: cwd · budget · branch · cost ────────────────────

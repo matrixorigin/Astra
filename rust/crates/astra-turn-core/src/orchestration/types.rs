@@ -31,6 +31,9 @@ pub enum AgentStatus {
         #[allow(dead_code)]
         finish_reason: Option<String>,
     },
+    Waiting {
+        reason: String,
+    },
     Cancelled {
         /// Whether the cancellation was triggered by the user (Ctrl+C
         /// / Ctrl+G x) as opposed to a system condition (parent

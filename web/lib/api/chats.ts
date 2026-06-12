@@ -1,6 +1,11 @@
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError } from "@/lib/api/errors";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
+import {
+  blockedRunMessage,
+  extractBlockedReason,
+  projectRunWaitingState,
+} from "@/lib/run-status-messages";
 import type {
   ChatDetail,
   ChatMessage,
@@ -13,6 +18,8 @@ import type {
   ActiveRunMutationResponse,
   WorkSurfaceResponse,
   WorkSurfaceRunResponse,
+  EdgeStatusResponse,
+  WorkspaceSelection,
 } from "@/lib/api/types";
 
 export function listChats(params: {
@@ -50,6 +57,10 @@ export function getChatWorkSurfaceRun(chatId: string, runId: string) {
   );
 }
 
+export function getEdgeStatus() {
+  return requestJson<EdgeStatusResponse>("/api/edges/status");
+}
+
 export function archiveChat(chatId: string, archived: boolean) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
@@ -61,6 +72,16 @@ export function updateChatModel(chatId: string, model: string) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
     body: JSON.stringify({ model }),
+  });
+}
+
+export function updateChatWorkspaceSelection(
+  chatId: string,
+  workspaceSelection: WorkspaceSelection,
+) {
+  return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ workspaceSelection }),
   });
 }
 
@@ -146,6 +167,7 @@ export type ChatStreamHandlers = {
 };
 
 type ChatStreamState = {
+  runId?: string;
   rawText: string;
   text: string;
   reasoning: string;
@@ -173,6 +195,71 @@ function parseSseFrame(frame: string) {
   } catch {
     return null;
   }
+}
+
+const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
+  "task_board_snapshot",
+  "workspace_bound",
+  "executor_bound",
+  "executor_status_changed",
+  "tool_call",
+  "tool_call_start",
+  "tool_routing_decision",
+  "tool_transport_started",
+  "tool_transport_completed",
+  "tool_transport_failed",
+  "tool_call_end",
+  "agent_delegated",
+  "agent_spawned",
+  "agent_live_event",
+  "agent_progress",
+  "agent_completed",
+  "agent_failed",
+  "agent_waiting",
+  "agent_cancelled",
+  "agent_interrupted",
+  "run_waiting",
+]);
+
+function isRunBlockedEvent(type: string) {
+  return type.startsWith("run_blocked_");
+}
+
+function isWorkSurfaceStreamEvent(type: string) {
+  return WORK_SURFACE_STREAM_EVENT_TYPES.has(type) || isRunBlockedEvent(type);
+}
+
+function streamEventMessage(event: Record<string, unknown>, fallback: string) {
+  for (const key of ["message", "error", "user_message", "reason"]) {
+    const value = event[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return fallback;
+}
+
+function explicitStreamEventMessage(event: Record<string, unknown>) {
+  for (const key of ["message", "error", "user_message"]) {
+    const value = event[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function blockedWaitingFor(event: Record<string, unknown>) {
+  return (
+    extractBlockedReason(
+      event as {
+        type?: string;
+        reason?: string;
+        error_kind?: string;
+        blocked?: boolean;
+      },
+    ) ?? "blocked"
+  );
 }
 
 function applyAssistantText(
@@ -205,23 +292,6 @@ function applyStreamEvent(
   const type = typeof event.type === "string" ? event.type : "";
 
   if (
-    type === "task_board_snapshot" ||
-    type === "tool_call" ||
-    type === "tool_call_start" ||
-    type === "tool_call_end" ||
-    type === "agent_delegated" ||
-    type === "agent_spawned" ||
-    type === "agent_progress" ||
-    type === "agent_completed" ||
-    type === "agent_failed" ||
-    type === "agent_cancelled" ||
-    type === "agent_interrupted"
-  ) {
-    handlers.onWorkSurfaceEvent?.(event);
-    return;
-  }
-
-  if (
     type === "local_messages" &&
     event.user_message &&
     event.assistant_message
@@ -234,6 +304,7 @@ function applyStreamEvent(
   }
 
   if (type === "session_info" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
     if (typeof event.session_id === "string") {
       handlers.onSessionBound?.({ sessionId: event.session_id });
     }
@@ -261,6 +332,8 @@ function applyStreamEvent(
   }
 
   if (type === "run_started" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
     handlers.onRunStarted?.(event.run_id);
     handlers.onRunUpdated?.({
       runId: event.run_id,
@@ -270,7 +343,63 @@ function applyStreamEvent(
     return;
   }
 
+  if (isRunBlockedEvent(type)) {
+    handlers.onWorkSurfaceEvent?.(event);
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    const message = streamEventMessage(event, "");
+    state.paused = true;
+    if (!state.rawText.trim() && message) {
+      state.rawText = message;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (runId) {
+      state.runId = runId;
+      handlers.onRunUpdated?.({
+        runId,
+        status: "blocked",
+        waitingFor: blockedWaitingFor(event),
+      });
+    }
+    return;
+  }
+
+  if (type === "run_waiting") {
+    handlers.onWorkSurfaceEvent?.(event);
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    const projection = projectRunWaitingState(
+      event as { waiting_for?: string; reason?: string; error_kind?: string },
+    );
+    const message = explicitStreamEventMessage(event);
+    state.paused = true;
+    if (!state.rawText.trim() && message) {
+      state.rawText = message;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (runId) {
+      state.runId = runId;
+      handlers.onRunUpdated?.({
+        runId,
+        status: projection.status,
+        waitingFor: projection.waitingFor,
+      });
+    }
+    return;
+  }
+
+  if (isWorkSurfaceStreamEvent(type)) {
+    handlers.onWorkSurfaceEvent?.(event);
+    return;
+  }
+
   if (type === "run_paused" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
     state.paused = true;
     handlers.onRunUpdated?.({
       runId: event.run_id,
@@ -281,12 +410,51 @@ function applyStreamEvent(
   }
 
   if (type === "run_resumed" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
     state.paused = false;
     handlers.onRunUpdated?.({
       runId: event.run_id,
       status: "running",
       waitingFor: null,
     });
+    return;
+  }
+
+  if (type === "run_error") {
+    handlers.onWorkSurfaceEvent?.(event);
+    const message = streamEventMessage(event, "Astra run failed.");
+    state.error = message;
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+      handlers.onRunUpdated?.({
+        runId: event.run_id,
+        status: "failed",
+        waitingFor: null,
+      });
+    }
+    return;
+  }
+
+  if (type === "run_interrupted") {
+    handlers.onWorkSurfaceEvent?.(event);
+    state.paused = true;
+    const message = streamEventMessage(event, "");
+    if (!state.rawText.trim() && message) {
+      state.rawText = message;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+      handlers.onRunUpdated?.({
+        runId: event.run_id,
+        status: "paused",
+        waitingFor:
+          typeof event.waiting_for === "string"
+            ? event.waiting_for
+            : "user_resume",
+      });
+    }
     return;
   }
 
@@ -334,8 +502,26 @@ function applyStreamEvent(
   }
 
   if (type === "run_finished") {
+    handlers.onWorkSurfaceEvent?.(event);
     const status =
       typeof event.status === "string" ? event.status : "completed";
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+    }
+    if (status === "paused" || status === "interrupted") {
+      state.paused = true;
+      if (typeof event.run_id === "string") {
+        handlers.onRunUpdated?.({
+          runId: event.run_id,
+          status: "paused",
+          waitingFor:
+            typeof event.waiting_for === "string"
+              ? event.waiting_for
+              : "user_resume",
+        });
+      }
+      return;
+    }
     handlers.onRunFinished?.({
       runId: typeof event.run_id === "string" ? event.run_id : undefined,
       status,
@@ -361,16 +547,19 @@ async function consumeChatStream(
 ) {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
+    let code: string | undefined;
     try {
       const body = (await response.json()) as {
         error?: string;
         detail?: string;
+        code?: string;
       };
       detail = body.error ?? body.detail ?? detail;
+      code = typeof body.code === "string" ? body.code : undefined;
     } catch {
       // Preserve the HTTP status.
     }
-    throw new WebApiError(response.status, detail);
+    throw new WebApiError(response.status, detail, code);
   }
 
   if (!response.body) {

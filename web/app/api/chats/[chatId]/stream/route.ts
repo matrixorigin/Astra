@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PATH_CHAT_STREAM, chatRunStreamPath } from "@astra/sdk";
+import {
+  PATH_CHAT_STREAM,
+  PATH_EDGES_STATUS,
+  chatRunStreamPath,
+} from "@astra/sdk";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   beginStreamingMessage,
@@ -7,6 +11,7 @@ import {
   getChat,
   resolveBackendModelName,
   setChatActiveRun,
+  updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 import { fetchSessionArtifacts } from "@/lib/api/stream-artifacts";
@@ -16,11 +21,23 @@ import {
   type StreamEventState,
 } from "@/lib/api/stream-event-handler";
 import {
+  RuntimeClientError,
   WebRuntimeClient,
   readRuntimeErrorDetail,
   requireRuntimeClient,
 } from "@/lib/runtime-client";
-import type { SendMessageRequest } from "@/lib/api/types";
+import type {
+  EdgeStatusResponse,
+  SendMessageRequest,
+  WorkspaceSelection,
+} from "@/lib/api/types";
+import {
+  normalizeSlashPath,
+  normalizeWorkspaceSelection,
+  resolveWorkspaceBindings,
+  sameWorkspaceSelection,
+  validateWorkspaceAuthority,
+} from "@/lib/workspace-authority";
 
 const encoder = new TextEncoder();
 
@@ -55,6 +72,71 @@ function normalizedActiveSkills(skills?: string[]) {
   );
 }
 
+async function verifyLiveWorkspaceSelection(
+  selection: WorkspaceSelection | null,
+  runtime: WebRuntimeClient,
+): Promise<
+  | {
+      selection: WorkspaceSelection | null;
+      error: null;
+    }
+  | {
+      selection: null;
+      error: {
+        code: string;
+        message: string;
+      };
+    }
+> {
+  if (selection?.kind !== "edge_workspace") {
+    return { selection, error: null };
+  }
+
+  const status = await runtime.get<EdgeStatusResponse>(PATH_EDGES_STATUS, {
+    auth: "required",
+    operation: "verify edge workspace binding",
+  });
+  const edge = status.edges.find(
+    (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
+  );
+  if (!edge) {
+    return {
+      selection: null,
+      error: {
+        code: "workspace_edge_offline",
+        message: `Edge executor ${selection.displayName ?? selection.edgeAgentId} is offline. Reconnect edge or choose a connected workspace. Server fallback is disabled for this workspace.`,
+      },
+    };
+  }
+
+  const liveCwd = edge.workspace_dir?.trim() ?? "";
+  if (
+    !liveCwd ||
+    normalizeSlashPath(liveCwd) !== normalizeSlashPath(selection.cwd)
+  ) {
+    const current = liveCwd
+      ? `currently reports ${liveCwd}`
+      : "does not report a workspace";
+    return {
+      selection: null,
+      error: {
+        code: "workspace_edge_path_unavailable",
+        message: `Edge executor ${edge.hostname ?? selection.displayName ?? selection.edgeAgentId} ${current}, not ${selection.cwd}. Choose the current edge workspace, then retry. Server fallback is disabled for this workspace.`,
+      },
+    };
+  }
+
+  return {
+    selection: {
+      ...selection,
+      displayName:
+        edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
+      cwd: liveCwd,
+    },
+    error: null,
+  };
+}
+
 async function readSendMessageRequest(
   request: NextRequest,
   chat: ReturnType<typeof getChat>,
@@ -70,11 +152,15 @@ async function readSendMessageRequest(
   if (!chat?.pendingTurn) {
     return null;
   }
-  return {
+  const recovered: SendMessageRequest = {
     content: chat.pendingTurn.content,
     options: chat.pendingTurn.options,
     pendingMessageId: chat.pendingTurn.messageId,
-  } satisfies SendMessageRequest;
+  };
+  if (chat.workspaceSelection) {
+    recovered.workspace = chat.workspaceSelection;
+  }
+  return recovered;
 }
 
 async function readErrorDetail(response: Response) {
@@ -273,7 +359,10 @@ function proxyRunStream(params: {
           }
 
           if (state.lastStatus === "streaming") {
-            if (state.runLifecycle === "paused") {
+            if (
+              state.runLifecycle === "paused" ||
+              state.runLifecycle === "blocked"
+            ) {
               updateStreamingAssistantMessage(
                 ownerUserId,
                 chatId,
@@ -399,15 +488,6 @@ export async function POST(
   }
 
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
-  let runtimeSessionId = chatId;
-  const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
-
-  const started = beginStreamingMessage(ownerUserId, chatId, body);
-  if (!started) {
-    return NextResponse.json({ error: "chat not found" }, { status: 404 });
-  }
-  const backendAbortController = new AbortController();
-  const knownArtifactIds = new Set<string>();
   let runtimePromise: Promise<WebRuntimeClient> | undefined;
   const getStreamRuntime = () => {
     runtimePromise ??= requireRuntimeClient({
@@ -416,6 +496,105 @@ export async function POST(
     });
     return runtimePromise;
   };
+  const hasRequestedWorkspace = Object.prototype.hasOwnProperty.call(
+    body,
+    "workspace",
+  );
+  const storedWorkspaceSelection = normalizeWorkspaceSelection(
+    chat.workspaceSelection,
+  );
+  const requestedWorkspaceSelection = normalizeWorkspaceSelection(
+    body.workspace,
+  );
+  if (hasRequestedWorkspace && !requestedWorkspaceSelection) {
+    return NextResponse.json(
+      {
+        error: "workspace must be a server sandbox or edge workspace selection",
+        code: "invalid_workspace_selection",
+      },
+      { status: 400 },
+    );
+  }
+  const workspaceSelection =
+    requestedWorkspaceSelection ?? storedWorkspaceSelection;
+  const workspaceError = validateWorkspaceAuthority(
+    body.content,
+    workspaceSelection,
+  );
+  if (workspaceError) {
+    return NextResponse.json(
+      { error: workspaceError.message, code: workspaceError.code },
+      { status: 409 },
+    );
+  }
+  let liveWorkspaceSelection = workspaceSelection;
+  if (workspaceSelection?.kind === "edge_workspace") {
+    try {
+      const verified = await verifyLiveWorkspaceSelection(
+        workspaceSelection,
+        await getStreamRuntime(),
+      );
+      if (verified.error) {
+        return NextResponse.json(
+          { error: verified.error.message, code: verified.error.code },
+          { status: 409 },
+        );
+      }
+      liveWorkspaceSelection = verified.selection ?? undefined;
+    } catch (error) {
+      const status =
+        error instanceof RuntimeClientError ? (error.status ?? 502) : 502;
+      const message =
+        error instanceof RuntimeClientError
+          ? error.detail
+          : error instanceof Error
+            ? error.message
+            : "Failed to verify edge workspace status.";
+      return NextResponse.json(
+        { error: message, code: "workspace_edge_status_unavailable" },
+        { status },
+      );
+    }
+  }
+  if (
+    liveWorkspaceSelection &&
+    requestedWorkspaceSelection &&
+    !sameWorkspaceSelection(liveWorkspaceSelection, storedWorkspaceSelection)
+  ) {
+    try {
+      const updated = await updateChatWorkspaceSelection(
+        ownerUserId,
+        chatId,
+        liveWorkspaceSelection,
+      );
+      if (!updated) {
+        return NextResponse.json({ error: "chat not found" }, { status: 404 });
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "failed to persist workspace selection";
+      return NextResponse.json({ error: message }, { status: 502 });
+    }
+  }
+  const effectiveWorkspaceSelection =
+    liveWorkspaceSelection ?? ({ kind: "server_sandbox" } as const);
+  const workspaceBindings = resolveWorkspaceBindings(
+    effectiveWorkspaceSelection,
+  );
+  let runtimeSessionId = chatId;
+  const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
+
+  const started = beginStreamingMessage(ownerUserId, chatId, {
+    ...body,
+    workspaceSelection: liveWorkspaceSelection ?? undefined,
+  });
+  if (!started) {
+    return NextResponse.json({ error: "chat not found" }, { status: 404 });
+  }
+  const backendAbortController = new AbortController();
+  const knownArtifactIds = new Set<string>();
 
   return proxyRunStream({
     backendResponse: async (emit) => {
@@ -452,12 +631,20 @@ export async function POST(
           session_id: runtimeSessionId,
           model,
           allow_skills: activeSkills.length ? activeSkills : undefined,
+          workspace_binding: workspaceBindings.workspaceBinding,
+          executor_binding: workspaceBindings.executorBinding,
           context: {
             source: "web_v1",
             transport: "next_sse_proxy",
-            edge_profile: activeSkills.length
-              ? { active_skills: activeSkills }
-              : undefined,
+            edge_profile:
+              activeSkills.length || workspaceBindings.edgeProfile
+                ? {
+                    ...workspaceBindings.edgeProfile,
+                    ...(activeSkills.length
+                      ? { active_skills: activeSkills }
+                      : {}),
+                  }
+                : undefined,
             thinking: body.options?.thinking
               ? { mode: "adaptive", effort: "high" }
               : { mode: "off" },

@@ -839,6 +839,9 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
             )
         }
         ProgressEventType::Failed { error } => format!("{} {}", "✗ Failed:".red(), error),
+        ProgressEventType::Waiting { reason } => {
+            format!("{} {}", "⏸ Waiting:".yellow(), reason)
+        }
         ProgressEventType::Cancelled { reason } => {
             format!("{} {}", "⊘ Cancelled:".yellow(), reason)
         }
@@ -971,6 +974,7 @@ fn status_icon(status: &AgentStatus) -> &'static str {
         AgentStatus::Idle => "💤",
         AgentStatus::Completed { .. } => "✅",
         AgentStatus::Failed { .. } => "❌",
+        AgentStatus::Waiting { .. } => "⏸",
         AgentStatus::Cancelled { .. } => "🛑",
     }
 }
@@ -989,6 +993,7 @@ fn format_status(status: &AgentStatus) -> String {
             format!("completed: {preview}")
         }
         AgentStatus::Failed { error, .. } => format!("failed: {error}"),
+        AgentStatus::Waiting { reason } => format!("waiting: {reason}"),
         AgentStatus::Cancelled { by_user, reason } => {
             if reason.is_empty() {
                 if *by_user {
@@ -2554,6 +2559,7 @@ mod tests {
             live_event_sink: None,
             trace_context: None,
             spawn_tool_call_id: None,
+            execution_metadata: None,
         };
         let input = SpawnAgentInput {
             description: "watch test agent".to_string(),

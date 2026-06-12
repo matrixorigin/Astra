@@ -24,6 +24,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::server::tool_transport::{
+    projected_tool_end_event_fields, projected_tool_start_event_fields,
+};
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode, TurnInteractionPolicy,
@@ -43,6 +46,9 @@ use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::RequestedTurnInteractionMode;
+use astra_turn_core::agent_live_event::{
+    AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
+};
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
 };
@@ -864,6 +870,13 @@ pub struct ServerAgenticLoopHost {
     /// Tracks which plan hint was baked into the latched lifecycle summary so
     /// mid-turn plan enter/exit can refresh only the plan line.
     turn_start_plan_resume_hint: Option<String>,
+    /// Workspace/executor binding metadata attached to live tool-call events
+    /// before transport execution begins.
+    execution_metadata: Option<Value>,
+    /// Optional mirror used by server-side spawned sub-runs. The child host
+    /// still owns normal SSE/event buffering, but these mirrored events go to
+    /// the parent Work Surface agent card instead of the parent chat transcript.
+    agent_live_mirror: Option<AgentLiveMirror>,
 
     // ── Test hooks ──
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -908,6 +921,12 @@ pub struct ServerAgenticLoopHost {
     /// outage never blocks the session. When unset (the default), the host
     /// uses the keyword classifier exclusively — same as the trait default.
     turn_intent_judge: Option<Arc<dyn astra_services::TurnIntentJudge>>,
+}
+
+#[derive(Clone)]
+struct AgentLiveMirror {
+    agent_id: String,
+    sink: SharedAgentLiveEventSink,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -1196,6 +1215,8 @@ impl ServerAgenticLoopHostBuilder {
             progress_filter,
             turn_start_lifecycle_summary: None,
             turn_start_plan_resume_hint: None,
+            execution_metadata: None,
+            agent_live_mirror: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             task_board_resume_hint: self.task_board_resume_hint,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1433,7 +1454,9 @@ impl ServerAgenticLoopHost {
     /// Push an SSE event to both the internal buffer and the streaming channel.
     /// If the streaming channel is closed (client disconnected), triggers
     /// cancellation so the agentic loop stops at the next turn boundary.
-    fn emit_event(&mut self, event: Value) {
+    fn emit_event(&mut self, mut event: Value) {
+        self.attach_execution_metadata_to_tool_event(&mut event);
+        self.mirror_agent_live_event(&event);
         if let Some(ref tx) = self.event_tx {
             match tx.try_send(event.clone()) {
                 Ok(()) => {}
@@ -1461,6 +1484,69 @@ impl ServerAgenticLoopHost {
             }
         }
         self.emitted_events.push(event);
+    }
+
+    fn attach_execution_metadata_to_tool_event(&self, event: &mut Value) {
+        let Some(event_obj) = event.as_object_mut() else {
+            return;
+        };
+        let event_type = event_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if !matches!(
+            event_type.as_deref(),
+            Some("tool_call" | "tool_call_start" | "tool_call_end")
+        ) {
+            return;
+        }
+        let Some(metadata_obj) = self.execution_metadata.as_ref().and_then(Value::as_object) else {
+            return;
+        };
+        for (key, value) in metadata_obj {
+            event_obj
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        let projected_fields = match event_type.as_deref() {
+            Some("tool_call" | "tool_call_start") => {
+                let Some(tool_name) = tool_name_from_tool_start_event(event_obj) else {
+                    return;
+                };
+                projected_tool_start_event_fields(tool_name, metadata_obj)
+            }
+            Some("tool_call_end") => projected_tool_end_event_fields(
+                tool_name_from_tool_end_event(event_obj),
+                metadata_obj,
+            ),
+            _ => None,
+        };
+        let Some(projected_fields) = projected_fields else {
+            return;
+        };
+        for (key, value) in projected_fields {
+            event_obj.insert(key, value);
+        }
+    }
+
+    fn mirror_agent_live_event(&self, event: &Value) {
+        let Some(mirror) = self.agent_live_mirror.as_ref() else {
+            return;
+        };
+        let Some(kind) = agent_live_event_kind_from_server_sse(event) else {
+            return;
+        };
+        if let Err(err) = mirror.sink.send(AgentLiveEvent {
+            agent_id: mirror.agent_id.clone(),
+            kind,
+        }) {
+            tracing::warn!(
+                target: "astra_runtime::work_surface",
+                agent_id = %mirror.agent_id,
+                error = ?err,
+                "failed to mirror child agent live event"
+            );
+        }
     }
 
     fn push_reasoning_events(&mut self, reasoning: &str) {
@@ -1529,6 +1615,14 @@ impl ServerAgenticLoopHost {
         self.progress_rx = None;
         self.progress_filter = None;
         self.event_tx = Some(tx);
+    }
+
+    pub fn set_execution_metadata(&mut self, metadata: Value) {
+        self.execution_metadata = Some(metadata);
+    }
+
+    pub fn set_agent_live_event_sink(&mut self, agent_id: String, sink: SharedAgentLiveEventSink) {
+        self.agent_live_mirror = Some(AgentLiveMirror { agent_id, sink });
     }
 
     /// Set the cancellation handles used when client disconnects.
@@ -3615,6 +3709,189 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 }
 
+fn tool_name_from_tool_start_event(event_obj: &Map<String, Value>) -> Option<&str> {
+    event_obj
+        .get("tool_name")
+        .or_else(|| event_obj.get("tool"))
+        .or_else(|| event_obj.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            let tool_call = event_obj.get("tool_call").and_then(Value::as_object)?;
+            let function = tool_call.get("function").and_then(Value::as_object);
+            function
+                .and_then(|function| function.get("name"))
+                .or_else(|| tool_call.get("name"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn tool_name_from_tool_end_event(event_obj: &Map<String, Value>) -> Option<&str> {
+    event_obj
+        .get("tool_name")
+        .or_else(|| event_obj.get("tool"))
+        .or_else(|| event_obj.get("name"))
+        .and_then(Value::as_str)
+}
+
+pub(crate) fn agent_live_event_kind_from_server_sse(event: &Value) -> Option<AgentLiveEventKind> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    match event_type {
+        "text_delta" => event
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| AgentLiveEventKind::OutputDelta(text.to_string())),
+        "reasoning_delta" | "thinking_delta" => event
+            .get("content")
+            .or_else(|| event.get("text"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| AgentLiveEventKind::ThinkingDelta(text.to_string())),
+        "tool_call" | "tool_call_start" => {
+            let (name, description, tool_use_id) = live_tool_started_fields(event)?;
+            Some(AgentLiveEventKind::ToolStarted {
+                name,
+                description,
+                tool_use_id,
+            })
+        }
+        "tool_call_end" | "tool_transport_completed" | "tool_transport_failed" => {
+            let (name, description, status, duration_ms, output_summary, output, tool_use_id) =
+                live_tool_completed_fields(event)?;
+            Some(AgentLiveEventKind::ToolCompleted {
+                name,
+                description,
+                status,
+                duration_ms,
+                output_summary,
+                output,
+                tool_use_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn live_tool_started_fields(event: &Value) -> Option<(String, String, String)> {
+    if let Some(tool_call) = event.get("tool_call").and_then(Value::as_object) {
+        let function = tool_call.get("function").and_then(Value::as_object);
+        let name = function
+            .and_then(|function| function.get("name"))
+            .or_else(|| tool_call.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        let description = function
+            .and_then(|function| function.get("arguments"))
+            .or_else(|| tool_call.get("arguments"))
+            .map(live_value_to_string)
+            .unwrap_or_default();
+        let tool_use_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return Some((name, description, tool_use_id));
+    }
+
+    let name = event
+        .get("tool_name")
+        .or_else(|| event.get("tool"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let description = event
+        .get("arguments")
+        .or_else(|| event.get("args"))
+        .map(live_value_to_string)
+        .unwrap_or_default();
+    let tool_use_id = event
+        .get("call_id")
+        .or_else(|| event.get("tool_call_id"))
+        .or_else(|| event.get("tool_use_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((name, description, tool_use_id))
+}
+
+#[allow(clippy::type_complexity)]
+fn live_tool_completed_fields(
+    event: &Value,
+) -> Option<(
+    String,
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    String,
+)> {
+    let failed = event
+        .get("success")
+        .and_then(Value::as_bool)
+        .map(|success| !success)
+        .unwrap_or(false)
+        || event.get("type").and_then(Value::as_str) == Some("tool_transport_failed");
+    let status = event
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(if failed { "error" } else { "ok" })
+        .to_string();
+    let name = event
+        .get("tool_name")
+        .or_else(|| event.get("tool"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let description = event
+        .get("description")
+        .or_else(|| event.get("arguments"))
+        .or_else(|| event.get("args"))
+        .map(live_value_to_string)
+        .unwrap_or_default();
+    let duration_ms = event
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_summary = event
+        .get("output_summary")
+        .or_else(|| event.get("summary"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let output = event
+        .get("result")
+        .or_else(|| event.get("output"))
+        .or_else(|| event.get("error"))
+        .map(live_value_to_string)
+        .filter(|value| !value.is_empty());
+    let tool_use_id = event
+        .get("call_id")
+        .or_else(|| event.get("tool_call_id"))
+        .or_else(|| event.get("tool_use_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((
+        name,
+        description,
+        status,
+        duration_ms,
+        output_summary,
+        output,
+        tool_use_id,
+    ))
+}
+
+fn live_value_to_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
 // ─── Progress event → SSE value conversion ──────────────────────────────────
 
 /// Convert an `AgentProgressEvent` into an SSE-compatible JSON value.
@@ -3626,14 +3903,14 @@ pub(crate) fn progress_event_to_sse(
     let agent_id = &evt.agent_id;
     let ts = evt.timestamp_epoch_ms;
 
-    match &evt.event_type {
+    let event = match &evt.event_type {
         ProgressEventType::AgentSpawned {
             run_id,
             parent_run_id,
             agent_type,
             description,
             fanout_slot,
-        } => Some(json!({
+        } => json!({
             "type": "agent_spawned",
             "agent_id": agent_id,
             "run_id": run_id,
@@ -3642,20 +3919,46 @@ pub(crate) fn progress_event_to_sse(
             "description": description,
             "fanout_slot": fanout_slot,
             "timestamp": ts,
-        })),
-        ProgressEventType::Started { description } => Some(json!({
+        }),
+        ProgressEventType::Started { description } => json!({
             "type": "agent_progress",
             "agent_id": agent_id,
             "status": "started",
             "description": description,
             "timestamp": ts,
-        })),
+        }),
+        ProgressEventType::TurnCompleted {
+            turn,
+            tool_calls_this_turn,
+            activity,
+        } => json!({
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "turn_completed",
+            "turn": turn,
+            "tool_calls_this_turn": tool_calls_this_turn,
+            "activity": activity,
+            "timestamp": ts,
+        }),
+        ProgressEventType::Idle => json!({
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "idle",
+            "timestamp": ts,
+        }),
+        ProgressEventType::Busy { activity } => json!({
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "busy",
+            "activity": activity,
+            "timestamp": ts,
+        }),
         ProgressEventType::Completed {
             result_summary,
             total_tool_calls,
             total_tokens,
             duration_ms,
-        } => Some(json!({
+        } => json!({
             "type": "agent_completed",
             "agent_id": agent_id,
             "status": "completed",
@@ -3664,14 +3967,14 @@ pub(crate) fn progress_event_to_sse(
             "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
             "duration_ms": duration_ms,
             "timestamp": ts,
-        })),
+        }),
         ProgressEventType::Interrupted {
             reason,
             partial_summary,
             total_tool_calls,
             total_tokens,
             duration_ms,
-        } => Some(json!({
+        } => json!({
             "type": "agent_interrupted",
             "agent_id": agent_id,
             "status": "interrupted",
@@ -3681,36 +3984,63 @@ pub(crate) fn progress_event_to_sse(
             "total_tokens": { "prompt": total_tokens.0, "completion": total_tokens.1 },
             "duration_ms": duration_ms,
             "timestamp": ts,
-        })),
-        ProgressEventType::Failed { error } => Some(json!({
+        }),
+        ProgressEventType::Failed { error } => json!({
             "type": "agent_failed",
             "agent_id": agent_id,
             "status": "failed",
             "error": error,
             "timestamp": ts,
-        })),
-        ProgressEventType::Cancelled { reason } => Some(json!({
+        }),
+        ProgressEventType::Waiting { reason } => json!({
+            "type": "agent_waiting",
+            "agent_id": agent_id,
+            "status": "waiting",
+            "reason": reason,
+            "timestamp": ts,
+        }),
+        ProgressEventType::Cancelled { reason } => json!({
             "type": "agent_cancelled",
             "agent_id": agent_id,
             "status": "cancelled",
             "reason": reason,
             "timestamp": ts,
-        })),
-        ProgressEventType::ToolExecuting { tool_name, turn } => Some(json!({
+        }),
+        ProgressEventType::ToolExecuting { tool_name, turn } => json!({
             "type": "agent_progress",
             "agent_id": agent_id,
             "status": "tool_executing",
             "tool_name": tool_name,
             "turn": turn,
             "timestamp": ts,
-        })),
+        }),
+        ProgressEventType::LlmCallStarted { turn } => json!({
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "llm_call_started",
+            "turn": turn,
+            "timestamp": ts,
+        }),
+        ProgressEventType::LlmCallCompleted {
+            turn,
+            ttft_ms,
+            duration_ms,
+        } => json!({
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "llm_call_completed",
+            "turn": turn,
+            "ttft_ms": ttft_ms,
+            "duration_ms": duration_ms,
+            "timestamp": ts,
+        }),
         ProgressEventType::MetricsUpdate {
             turn,
             max_turns,
             total_prompt_tokens,
             total_completion_tokens,
             total_tool_calls,
-        } => Some(json!({
+        } => json!({
             "type": "agent_progress",
             "agent_id": agent_id,
             "status": "metrics_update",
@@ -3720,11 +4050,36 @@ pub(crate) fn progress_event_to_sse(
             "total_completion_tokens": total_completion_tokens,
             "total_tool_calls": total_tool_calls,
             "timestamp": ts,
-        })),
-        // Other event types (Idle, Busy, LlmCallStarted, LlmCallCompleted,
-        // TurnCompleted, PermissionDenied) are too granular for web SSE
-        _ => None,
+        }),
+        ProgressEventType::PermissionDenied {
+            tool_name,
+            reason,
+            turn,
+        } => json!({
+            "type": "agent_progress",
+            "agent_id": agent_id,
+            "status": "permission_denied",
+            "tool_name": tool_name,
+            "reason": reason,
+            "turn": turn,
+            "timestamp": ts,
+        }),
+    };
+    Some(merge_progress_metadata(event, evt.metadata.as_ref()))
+}
+
+fn merge_progress_metadata(mut event: Value, metadata: Option<&Value>) -> Value {
+    let (Some(event_obj), Some(metadata_obj)) =
+        (event.as_object_mut(), metadata.and_then(Value::as_object))
+    else {
+        return event;
+    };
+    for (key, value) in metadata_obj {
+        event_obj
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
     }
+    event
 }
 
 fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
@@ -5072,6 +5427,63 @@ mod tests {
         assert_eq!(results[1].request_id, "w2");
         assert_eq!(results[0].status, "ok");
         assert_eq!(results[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn deliver_edge_tools_tool_call_end_includes_edge_ledger_metadata() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-meta".to_string(),
+            "s-edge-meta".to_string(),
+        )
+        .build();
+        host.set_execution_metadata(json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        }));
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key("u-edge-meta", "r1"),
+            json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
+        );
+        let tool_calls = vec![json!({
+            "id": "r1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+        })];
+
+        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "ok");
+        let end = host
+            .emitted_events
+            .iter()
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("tool_call_end"))
+            .expect("tool_call_end");
+        assert_eq!(end["call_id"], "r1");
+        assert_eq!(end["workspace"]["kind"], "edge_workspace");
+        assert_eq!(end["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(end["executor"]["kind"], "edge_agent");
+        assert_eq!(end["executor"]["executor_id"], "edge-1");
+        assert_eq!(end["executor"]["transport"], "edge_ledger");
+        assert_eq!(end["executor"]["status"], "online");
+        assert_eq!(end["transport"], "edge_ledger");
+        assert_eq!(end["fallback_policy"], "disabled");
     }
 
     #[tokio::test]
@@ -6537,6 +6949,276 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_start_events_preserve_execution_metadata() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.set_execution_metadata(json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        host.set_event_tx(tx);
+
+        host.emit_event(json!({
+            "type": "tool_call_start",
+            "call_id": "call-1",
+            "tool": "bash"
+        }));
+
+        let event = rx.try_recv().expect("tool_call_start event");
+        assert_eq!(event["type"], "tool_call_start");
+        assert_eq!(event["workspace"]["kind"], "edge_workspace");
+        assert_eq!(event["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(event["executor"]["kind"], "edge_agent");
+        assert_eq!(event["transport"], "edge_ws");
+        assert_eq!(event["fallback_policy"], "disabled");
+    }
+
+    #[test]
+    fn tool_call_events_preserve_execution_metadata() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.set_execution_metadata(json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        host.set_event_tx(tx);
+
+        host.emit_event(json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "call-1",
+                "function": {
+                    "name": "edge_shell",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }
+            }
+        }));
+
+        let event = rx.try_recv().expect("tool_call event");
+        assert_eq!(event["type"], "tool_call");
+        assert_eq!(event["workspace"]["kind"], "edge_workspace");
+        assert_eq!(event["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(event["executor"]["kind"], "edge_agent");
+        assert_eq!(event["executor"]["executor_id"], "edge-1");
+        assert_eq!(event["transport"], "edge_ws");
+        assert_eq!(event["fallback_policy"], "disabled");
+    }
+
+    #[test]
+    fn tool_call_start_projects_server_runtime_metadata_for_runtime_tools() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.set_execution_metadata(json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        host.set_event_tx(tx);
+
+        host.emit_event(json!({
+            "type": "tool_call_start",
+            "call_id": "call-web-search",
+            "tool": "web_search"
+        }));
+
+        let event = rx.try_recv().expect("tool_call_start event");
+        assert_eq!(event["type"], "tool_call_start");
+        assert_eq!(event["workspace"]["kind"], "none");
+        assert_eq!(event["executor"]["kind"], "server_local");
+        assert_eq!(event["executor"]["executor_id"], "server-runtime");
+        assert_eq!(event["executor"]["display_name"], "Server runtime");
+        assert_eq!(event["transport"], "server_local");
+    }
+
+    #[test]
+    fn tool_call_start_projects_request_scoped_mcp_metadata() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.set_execution_metadata(json!({
+            "workspace": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "edge_agent",
+                "executor_id": "edge-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            },
+            "transport": "edge_ws",
+            "fallback_policy": "disabled"
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        host.set_event_tx(tx);
+
+        host.emit_event(json!({
+            "type": "tool_call_start",
+            "tool_call": {
+                "id": "call-mcp",
+                "function": {
+                    "name": "mcp__demo__search",
+                    "arguments": "{\"query\":\"hello\"}"
+                }
+            }
+        }));
+
+        let event = rx.try_recv().expect("tool_call_start event");
+        assert_eq!(event["type"], "tool_call_start");
+        assert_eq!(event["workspace"]["kind"], "edge_workspace");
+        assert_eq!(event["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(event["executor"]["kind"], "mcp");
+        assert_eq!(event["executor"]["executor_id"], "request-scoped-mcp");
+        assert_eq!(event["executor"]["display_name"], "MCP server");
+        assert_eq!(event["transport"], "mcp_http");
+        assert_eq!(event["fallback_policy"], "disabled");
+    }
+
+    #[test]
+    fn server_sse_text_delta_maps_to_agent_live_output() {
+        let kind = super::agent_live_event_kind_from_server_sse(&json!({
+            "type": "text_delta",
+            "content": "child output"
+        }))
+        .expect("text delta should mirror");
+
+        assert!(matches!(
+            kind,
+            AgentLiveEventKind::OutputDelta(text) if text == "child output"
+        ));
+    }
+
+    #[test]
+    fn server_sse_tool_events_map_to_agent_live_tool_lifecycle() {
+        let started = super::agent_live_event_kind_from_server_sse(&json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "call-1",
+                "function": {"name": "bash", "arguments": "{\"cmd\":\"cargo test\"}"}
+            }
+        }))
+        .expect("tool call should mirror");
+        assert!(matches!(
+            started,
+            AgentLiveEventKind::ToolStarted { name, tool_use_id, .. }
+                if name == "bash" && tool_use_id == "call-1"
+        ));
+
+        let completed = super::agent_live_event_kind_from_server_sse(&json!({
+            "type": "tool_call_end",
+            "call_id": "call-1",
+            "tool": "bash",
+            "success": true,
+            "result": "ok"
+        }))
+        .expect("tool result should mirror");
+        assert!(matches!(
+            completed,
+            AgentLiveEventKind::ToolCompleted { name, status, output, tool_use_id, .. }
+                if name == "bash"
+                    && status == "ok"
+                    && output.as_deref() == Some("ok")
+                    && tool_use_id == "call-1"
+        ));
+    }
+
+    #[test]
+    fn server_sse_tool_transport_failed_maps_error_to_agent_live_output() {
+        let failed = super::agent_live_event_kind_from_server_sse(&json!({
+            "type": "tool_transport_failed",
+            "call_id": "call-2",
+            "tool": "bash",
+            "success": false,
+            "duration_ms": 42,
+            "error": "edge transport disconnected"
+        }))
+        .expect("transport failure should mirror");
+
+        assert!(matches!(
+            failed,
+            AgentLiveEventKind::ToolCompleted {
+                name,
+                status,
+                duration_ms,
+                output,
+                tool_use_id,
+                ..
+            } if name == "bash"
+                && status == "error"
+                && duration_ms == 42
+                && output.as_deref() == Some("edge transport disconnected")
+                && tool_use_id == "call-2"
+        ));
+    }
+
+    #[test]
     fn progress_event_agent_spawned_to_sse() {
         use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 
@@ -6550,12 +7232,44 @@ mod tests {
                 fanout_slot: None,
             },
             timestamp_epoch_ms: 1000,
+            metadata: None,
         };
         let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
         assert_eq!(sse["type"], "agent_spawned");
         assert_eq!(sse["agent_id"], "agent-1");
         assert_eq!(sse["run_id"], "run-123");
         assert_eq!(sse["agent_type"], "explore");
+    }
+
+    #[test]
+    fn progress_event_agent_spawned_preserves_execution_metadata() {
+        use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+
+        let evt = AgentProgressEvent {
+            agent_id: "agent-1".to_string(),
+            event_type: ProgressEventType::AgentSpawned {
+                run_id: "run-123".to_string(),
+                parent_run_id: "run-000".to_string(),
+                agent_type: "explore".to_string(),
+                description: "Search codebase".to_string(),
+                fanout_slot: None,
+            },
+            timestamp_epoch_ms: 1000,
+            metadata: Some(json!({
+                "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                "executor": {"kind": "edge_agent", "display_name": "MacBook Pro"},
+                "transport": "edge_ws",
+                "fallback_policy": "disabled",
+                "agent_id": "must-not-overwrite",
+            })),
+        };
+
+        let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
+        assert_eq!(sse["agent_id"], "agent-1");
+        assert_eq!(sse["workspace"]["kind"], "edge_workspace");
+        assert_eq!(sse["executor"]["kind"], "edge_agent");
+        assert_eq!(sse["transport"], "edge_ws");
+        assert_eq!(sse["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -6571,11 +7285,76 @@ mod tests {
                 duration_ms: 3000,
             },
             timestamp_epoch_ms: 2000,
+            metadata: None,
         };
         let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
         assert_eq!(sse["type"], "agent_completed");
         assert_eq!(sse["status"], "completed");
         assert_eq!(sse["total_tool_calls"], 5);
+    }
+
+    #[test]
+    fn progress_event_live_statuses_to_sse_agent_progress() {
+        use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+
+        let cases = vec![
+            (
+                ProgressEventType::Busy {
+                    activity: "executing".to_string(),
+                },
+                "busy",
+                json!({"activity": "executing"}),
+            ),
+            (
+                ProgressEventType::LlmCallStarted { turn: 2 },
+                "llm_call_started",
+                json!({"turn": 2}),
+            ),
+            (
+                ProgressEventType::LlmCallCompleted {
+                    turn: 2,
+                    ttft_ms: Some(17),
+                    duration_ms: 91,
+                },
+                "llm_call_completed",
+                json!({"turn": 2, "ttft_ms": 17, "duration_ms": 91}),
+            ),
+            (
+                ProgressEventType::TurnCompleted {
+                    turn: 3,
+                    tool_calls_this_turn: 1,
+                    activity: "summarized".to_string(),
+                },
+                "turn_completed",
+                json!({"turn": 3, "tool_calls_this_turn": 1, "activity": "summarized"}),
+            ),
+            (
+                ProgressEventType::PermissionDenied {
+                    tool_name: "bash".to_string(),
+                    reason: "approval required".to_string(),
+                    turn: 4,
+                },
+                "permission_denied",
+                json!({"tool_name": "bash", "reason": "approval required", "turn": 4}),
+            ),
+        ];
+
+        for (event_type, status, expected_fields) in cases {
+            let evt = AgentProgressEvent {
+                agent_id: "agent-live".to_string(),
+                event_type,
+                timestamp_epoch_ms: 1234,
+                metadata: None,
+            };
+            let sse = super::progress_event_to_sse(&evt).expect("progress SSE");
+            assert_eq!(sse["type"], "agent_progress");
+            assert_eq!(sse["agent_id"], "agent-live");
+            assert_eq!(sse["status"], status);
+            assert_eq!(sse["timestamp"], 1234);
+            for (key, value) in expected_fields.as_object().unwrap() {
+                assert_eq!(&sse[key], value, "field {key} for status {status}");
+            }
+        }
     }
 
     #[test]
@@ -6592,6 +7371,7 @@ mod tests {
                 duration_ms: 3000,
             },
             timestamp_epoch_ms: 2000,
+            metadata: None,
         };
         let sse = super::progress_event_to_sse(&evt).expect("should produce SSE");
         assert_eq!(sse["type"], "agent_interrupted");
@@ -6609,6 +7389,7 @@ mod tests {
                 error: "boom".to_string(),
             },
             timestamp_epoch_ms: 1,
+            metadata: None,
         };
         let cancelled = AgentProgressEvent {
             agent_id: "agent-c".to_string(),
@@ -6616,6 +7397,7 @@ mod tests {
                 reason: "user request".to_string(),
             },
             timestamp_epoch_ms: 2,
+            metadata: None,
         };
 
         let failed_sse = super::progress_event_to_sse(&failed).expect("failed SSE");
@@ -6628,15 +7410,19 @@ mod tests {
     }
 
     #[test]
-    fn progress_event_idle_returns_none() {
+    fn progress_event_idle_to_sse_agent_progress() {
         use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 
         let evt = AgentProgressEvent {
             agent_id: "agent-3".to_string(),
             event_type: ProgressEventType::Idle,
             timestamp_epoch_ms: 3000,
+            metadata: None,
         };
-        assert!(super::progress_event_to_sse(&evt).is_none());
+        let sse = super::progress_event_to_sse(&evt).expect("idle progress SSE");
+        assert_eq!(sse["type"], "agent_progress");
+        assert_eq!(sse["agent_id"], "agent-3");
+        assert_eq!(sse["status"], "idle");
     }
 
     // ── Mock-LLM prompt-cache verification framework tests ──────────────────

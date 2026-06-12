@@ -3,6 +3,11 @@ import {
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
+import {
+  runWaitingStatusMessage,
+  extractBlockedReason,
+  projectRunWaitingState,
+} from "@/lib/run-status-messages";
 
 export interface StreamEventContext {
   ownerUserId: string;
@@ -12,13 +17,51 @@ export interface StreamEventContext {
 }
 
 export interface StreamEventState {
+  runId?: string;
   assistantText: string;
   assistantRawText: string;
   reasoningText: string;
   reasoningFromThinkingTags?: boolean;
   lastStatus: "streaming" | "complete" | "failed";
   protocolError: boolean;
-  runLifecycle: "running" | "paused" | "finished";
+  runLifecycle: "running" | "paused" | "waiting" | "blocked" | "finished";
+}
+
+function blockedWaitingFor(event: Record<string, unknown>) {
+  return (
+    extractBlockedReason(
+      event as {
+        type?: string;
+        reason?: string;
+        error_kind?: string;
+        blocked?: boolean;
+      },
+    ) ?? "blocked"
+  );
+}
+
+function eventMessage(event: Record<string, unknown>, fallback: string) {
+  for (const key of ["message", "error", "user_message", "reason"]) {
+    const value = event[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return fallback;
+}
+
+function explicitEventMessage(event: Record<string, unknown>) {
+  for (const key of ["message", "error", "user_message"]) {
+    const value = event[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function isRunBlockedEvent(type: string) {
+  return type.startsWith("run_blocked_");
 }
 
 export function applyStreamEvent(
@@ -87,6 +130,7 @@ export function applyStreamEvent(
       throw new Error(message);
     }
     if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
       setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
         runId: event.run_id,
         status: "running",
@@ -98,6 +142,7 @@ export function applyStreamEvent(
 
   if (type === "run_started" && typeof event.run_id === "string") {
     state.runLifecycle = "running";
+    state.runId = event.run_id;
     setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
       runId: event.run_id,
       status: "running",
@@ -106,8 +151,66 @@ export function applyStreamEvent(
     return;
   }
 
+  if (isRunBlockedEvent(type)) {
+    state.runLifecycle = "blocked";
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    const waitingFor = blockedWaitingFor(event);
+    const message =
+      explicitEventMessage(event) || runWaitingStatusMessage(waitingFor, true);
+    if (
+      !state.assistantRawText.trim() &&
+      !state.assistantText.trim() &&
+      message
+    ) {
+      applyAssistantText(message, "streaming");
+    }
+    if (runId) {
+      state.runId = runId;
+      setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+        runId,
+        status: "blocked",
+        waitingFor,
+      });
+    }
+    return;
+  }
+
+  if (type === "run_waiting") {
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    const projection = projectRunWaitingState(
+      event as { waiting_for?: string; reason?: string; error_kind?: string },
+    );
+    state.runLifecycle = projection.status;
+    const message =
+      explicitEventMessage(event) ||
+      runWaitingStatusMessage(projection.waitingFor, projection.blocked);
+    if (
+      !state.assistantRawText.trim() &&
+      !state.assistantText.trim() &&
+      message
+    ) {
+      applyAssistantText(message, "streaming");
+    }
+    if (runId) {
+      state.runId = runId;
+      setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+        runId,
+        status: projection.status,
+        waitingFor: projection.waitingFor,
+      });
+    }
+    return;
+  }
+
   if (type === "run_paused" && typeof event.run_id === "string") {
     state.runLifecycle = "paused";
+    state.runId = event.run_id;
     setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
       runId: event.run_id,
       status: "paused",
@@ -118,10 +221,53 @@ export function applyStreamEvent(
 
   if (type === "run_resumed" && typeof event.run_id === "string") {
     state.runLifecycle = "running";
+    state.runId = event.run_id;
     setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
       runId: event.run_id,
       status: "running",
       waitingFor: null,
+    });
+    return;
+  }
+
+  if (type === "run_error") {
+    const message = eventMessage(event, "Astra run failed.");
+    state.assistantText = state.assistantText || message;
+    state.lastStatus = "failed";
+    state.runLifecycle = "finished";
+    setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
+    updateStreamingAssistantMessage(
+      ctx.ownerUserId,
+      ctx.chatId,
+      ctx.assistantMessageId,
+      {
+        content: state.assistantText,
+        reasoning: state.reasoningText || undefined,
+        reasoningStatus: undefined,
+        status: "failed",
+      },
+    );
+    return;
+  }
+
+  if (type === "run_interrupted" && typeof event.run_id === "string") {
+    const message = eventMessage(event, "");
+    state.runLifecycle = "paused";
+    state.runId = event.run_id;
+    if (
+      !state.assistantRawText.trim() &&
+      !state.assistantText.trim() &&
+      message
+    ) {
+      applyAssistantText(message, "streaming");
+    }
+    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+      runId: event.run_id,
+      status: "paused",
+      waitingFor:
+        typeof event.waiting_for === "string"
+          ? event.waiting_for
+          : "user_resume",
     });
     return;
   }
@@ -206,6 +352,34 @@ export function applyStreamEvent(
   if (type === "run_finished") {
     const status =
       typeof event.status === "string" ? event.status : "completed";
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+    }
+    if (status === "paused" || status === "interrupted") {
+      state.runLifecycle = "paused";
+      if (typeof event.run_id === "string") {
+        setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+          runId: event.run_id,
+          status: "paused",
+          waitingFor:
+            typeof event.waiting_for === "string"
+              ? event.waiting_for
+              : "user_resume",
+        });
+      }
+      updateStreamingAssistantMessage(
+        ctx.ownerUserId,
+        ctx.chatId,
+        ctx.assistantMessageId,
+        {
+          content: state.assistantText,
+          reasoning: state.reasoningText || undefined,
+          reasoningStatus: state.reasoningText ? "streaming" : undefined,
+          status: "streaming",
+        },
+      );
+      return;
+    }
     state.runLifecycle = "finished";
     setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
     if (status === "cancelled") {

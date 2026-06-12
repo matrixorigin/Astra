@@ -448,6 +448,137 @@ describe('queueDeferredRunInput', () => {
     });
   });
 
+  it('keeps a cancelling active run before runtime cancellation resolves', async () => {
+    const cancelRun = jest.fn(
+      () => new Promise<void>(() => {
+        // Keep the runtime request pending to model a slow network/tool cancel.
+      }),
+    );
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-stop',
+        status: 'running',
+        waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    const result = await stopActiveRun('user-a', 'chat-stop', {
+      skipSync: true,
+      cancelTimeoutMs: 1,
+    });
+
+    expect(cancelRun).toHaveBeenCalledWith('run-stop');
+    expect(result).toEqual({
+      activeRun: {
+        runId: 'run-stop',
+        status: 'cancelling',
+        waitingFor: 'cancel_requested',
+      },
+      cancelPending: true,
+    });
+    expect(store.chats[0].activeRun).toMatchObject({
+      runId: 'run-stop',
+      status: 'cancelling',
+      waitingFor: 'cancel_requested',
+    });
+  });
+
+  it('does not resurrect a cancelling run as running while backend polling still reports it running', async () => {
+    const cancelRun = jest.fn(
+      () => new Promise<void>(() => {
+        // Keep cancellation pending so the next backend sync still sees running.
+      }),
+    );
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+    const listRuntimeSessions = jest.fn().mockResolvedValue({
+      sessions: [
+        {
+          session_id: 'chat-stop',
+          user_id: 'user-a',
+          title: 'Stop test',
+          metadata: { source: 'web_v1' },
+          status: 'active',
+          created_at: '2026-06-07T00:00:00.000Z',
+          updated_at: '2026-06-07T00:00:00.000Z',
+        },
+      ],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const listRuns = jest.fn().mockResolvedValue({
+      runs: [
+        {
+          runId: 'run-stop',
+          sessionId: 'chat-stop',
+          status: 'running',
+          waitingFor: null,
+        },
+      ],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const getSessionTranscript = jest.fn().mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 200,
+      offset: 0,
+    });
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: { listRuntimeSessions, listRuns, getSessionTranscript },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-stop',
+        status: 'running',
+        waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    await stopActiveRun('user-a', 'chat-stop', {
+      skipSync: true,
+      cancelTimeoutMs: 1,
+    });
+
+    const detail = await getChatHydrated('user-a', 'chat-stop');
+    expect(detail?.activeRun).toEqual({
+      runId: 'run-stop',
+      status: 'cancelling',
+      waitingFor: 'cancel_requested',
+    });
+    expect(listRuns).toHaveBeenCalled();
+  });
+
   it('hydrates a lost paused run before resuming it', async () => {
     const listRuntimeSessions = jest.fn().mockResolvedValue({
       sessions: [

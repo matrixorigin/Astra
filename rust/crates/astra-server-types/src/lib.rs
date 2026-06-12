@@ -638,6 +638,14 @@ pub enum WsServerMessage {
     #[serde(rename = "run_paused")]
     RunPaused { run_id: String },
 
+    /// Run is waiting for an external event before it can continue.
+    #[serde(rename = "run_waiting")]
+    RunWaiting {
+        run_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Run was resumed.
     #[serde(rename = "run_resumed")]
     RunResumed { run_id: String },

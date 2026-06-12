@@ -8,6 +8,9 @@ export type StreamEventType =
   | 'run_resumed'
   | 'run_finished'
   | 'run_cancelled'
+  | 'run_waiting'
+  | 'run_error'
+  | 'run_interrupted'
   | 'text_delta'
   | 'text_done'
   | 'reasoning_delta'
@@ -24,8 +27,20 @@ export type StreamEventType =
   | 'plan_revised'
   | 'plan_step_start'
   | 'plan_step_done'
+  | 'workspace_bound'
+  | 'executor_bound'
+  | 'executor_status_changed'
+  | 'tool_routing_decision'
+  | 'tool_transport_started'
+  | 'tool_transport_completed'
+  | 'tool_transport_failed'
+  | 'run_blocked_executor_offline'
+  | 'run_blocked_transport_disconnected'
+  | 'run_blocked_fallback_disabled'
+  | 'run_blocked_workspace_executor_unavailable'
   | 'agent_delegated'
   | 'agent_spawned'
+  | 'agent_waiting'
   | 'agent_progress'
   | 'agent_completed'
   | 'agent_failed'
@@ -50,29 +65,55 @@ export type RunStartedEvent = {
   type: 'run_started';
   run_id?: string;
   session_id?: string;
-};
+} & ExecutionBindingFields;
 
 export type RunPausedEvent = {
   type: 'run_paused';
   run_id?: string;
-};
+  waiting_for?: string | null;
+} & ExecutionBindingFields;
 
 export type RunResumedEvent = {
   type: 'run_resumed';
   run_id?: string;
-};
+} & ExecutionBindingFields;
 
 export type RunFinishedEvent = {
   type: 'run_finished';
   run_id?: string;
   status?: string;
   error?: string | null;
-};
+} & ExecutionBindingFields;
 
 export type RunCancelledEvent = {
   type: 'run_cancelled';
   run_id: string;
-};
+} & ExecutionBindingFields;
+
+export type RunWaitingEvent = {
+  type: 'run_waiting';
+  run_id?: string;
+  reason?: string;
+  waiting_for?: string | null;
+  timestamp?: number;
+} & ExecutionBindingFields;
+
+export type RunErrorEvent = {
+  type: 'run_error';
+  run_id?: string;
+  message?: string;
+  error?: string;
+  code?: string;
+} & ExecutionBindingFields;
+
+export type RunInterruptedEvent = {
+  type: 'run_interrupted';
+  run_id?: string;
+  kind?: string;
+  message?: string;
+  waiting_for?: string | null;
+  resumable?: boolean;
+} & ExecutionBindingFields;
 
 export type TextDeltaEvent = {
   type: 'text_delta';
@@ -93,12 +134,57 @@ export type ThinkingDoneEvent = {
   type: 'reasoning_done';
 };
 
+export type WorkspaceBinding = {
+  kind:
+    | 'server_sandbox'
+    | 'edge_workspace'
+    | 'uploaded_snapshot'
+    | 'git_checkout'
+    | 'none'
+    | 'unknown'
+    | string;
+  display_name?: string;
+  cwd?: string | null;
+  authority?: 'read_only' | 'read_write' | string;
+  fallback_policy?: 'disabled' | 'server_read_only' | 'ask_user' | string;
+};
+
+export type ExecutorBinding = {
+  kind:
+    | 'server_local'
+    | 'edge_agent'
+    | 'thin_client'
+    | 'mcp'
+    | 'hosted_runner'
+    | 'unknown'
+    | string;
+  executor_id?: string;
+  display_name?: string;
+  transport?:
+    | 'server_local'
+    | 'edge_ws'
+    | 'edge_ledger'
+    | 'mcp_http'
+    | 'runner_rpc'
+    | 'unknown'
+    | string;
+  status?: 'online' | 'offline' | 'degraded' | 'unknown' | string;
+};
+
+export type ExecutionBindingFields = {
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string;
+  fallback_policy?: string;
+  route?: string;
+};
+
 export type ToolCallStartEvent = {
   type: 'tool_call_start';
   tool: string;
   call_id: string;
   arguments?: string;
-};
+} & ExecutionBindingFields;
 
 export type ToolCallEvent = {
   type: 'tool_call';
@@ -116,13 +202,17 @@ export type ToolCallEvent = {
       call_id?: string;
     };
   };
-};
+} & ExecutionBindingFields;
 
 export type ToolCallEndEvent = {
   type: 'tool_call_end';
   call_id: string;
   result?: string;
-};
+  success?: boolean;
+  duration_ms?: number;
+  error_kind?: string;
+  blocked?: boolean;
+} & ExecutionBindingFields;
 
 export type UsageEvent = {
   type: 'usage';
@@ -196,7 +286,7 @@ export type AgentDelegatedEvent = {
   type: 'agent_delegated';
   agent_id: string;
   task: string;
-};
+} & ExecutionBindingFields;
 
 export type AgentSpawnedEvent = {
   type: 'agent_spawned';
@@ -206,7 +296,18 @@ export type AgentSpawnedEvent = {
   agent_type: string;
   description: string;
   timestamp?: number;
-};
+} & ExecutionBindingFields;
+
+export type AgentWaitingEvent = {
+  type: 'agent_waiting';
+  agent_id: string;
+  run_id?: string;
+  parent_run_id?: string;
+  status?: 'waiting' | string;
+  reason?: string;
+  waiting_for?: string | null;
+  timestamp?: number;
+} & ExecutionBindingFields;
 
 export type AgentProgressEvent = {
   type: 'agent_progress';
@@ -220,7 +321,7 @@ export type AgentProgressEvent = {
   total_completion_tokens?: number;
   total_tool_calls?: number;
   timestamp?: number;
-};
+} & ExecutionBindingFields;
 
 export type AgentCompletedEvent = {
   type: 'agent_completed';
@@ -233,7 +334,7 @@ export type AgentCompletedEvent = {
   total_tokens?: { prompt: number; completion: number };
   duration_ms?: number;
   timestamp?: number;
-};
+} & ExecutionBindingFields;
 
 export type AgentFailedEvent = {
   type: 'agent_failed';
@@ -241,7 +342,7 @@ export type AgentFailedEvent = {
   status?: 'failed';
   error?: string;
   timestamp?: number;
-};
+} & ExecutionBindingFields;
 
 export type AgentCancelledEvent = {
   type: 'agent_cancelled';
@@ -249,7 +350,7 @@ export type AgentCancelledEvent = {
   status?: 'cancelled';
   reason?: string;
   timestamp?: number;
-};
+} & ExecutionBindingFields;
 
 export type AgentInterruptedEvent = {
   type: 'agent_interrupted';
@@ -261,7 +362,7 @@ export type AgentInterruptedEvent = {
   total_tokens?: { prompt: number; completion: number };
   duration_ms?: number;
   timestamp?: number;
-};
+} & ExecutionBindingFields;
 
 export type SessionSubtask = {
   id: string;
@@ -294,6 +395,83 @@ export type TaskBoardSnapshotEvent = {
   reason?: string;
   tasks: SessionTask[];
 };
+
+export type WorkspaceBoundEvent = {
+  type: 'workspace_bound';
+  session_id?: string;
+  workspace: WorkspaceBinding;
+  executor?: ExecutorBinding;
+} & ExecutionBindingFields;
+
+export type ExecutorBoundEvent = {
+  type: 'executor_bound' | 'executor_status_changed';
+  session_id?: string;
+  executor: ExecutorBinding;
+  workspace?: WorkspaceBinding;
+} & ExecutionBindingFields;
+
+export type ToolRoutingDecisionEvent = {
+  type: 'tool_routing_decision';
+  call_id: string;
+  tool?: string;
+} & ExecutionBindingFields;
+
+export type ToolTransportStartedEvent = {
+  type: 'tool_transport_started';
+  call_id: string;
+  tool: string;
+  arguments?: unknown;
+} & ExecutionBindingFields;
+
+export type ToolTransportCompletedEvent = {
+  type: 'tool_transport_completed';
+  call_id: string;
+  tool?: string;
+  result?: unknown;
+  success?: boolean;
+  duration_ms?: number;
+} & ExecutionBindingFields;
+
+export type ToolTransportFailedEvent = {
+  type: 'tool_transport_failed';
+  call_id: string;
+  tool?: string;
+  error?: string;
+  error_kind?: string;
+  blocked?: boolean;
+  success?: false;
+  duration_ms?: number;
+} & ExecutionBindingFields;
+
+type RunBlockedBaseEvent = {
+  reason?: string;
+  message?: string;
+  call_id?: string;
+  tool?: string;
+  timestamp?: number;
+} & ExecutionBindingFields;
+
+export type RunBlockedExecutorOfflineEvent = RunBlockedBaseEvent & {
+  type: 'run_blocked_executor_offline';
+};
+
+export type RunBlockedTransportDisconnectedEvent = RunBlockedBaseEvent & {
+  type: 'run_blocked_transport_disconnected';
+};
+
+export type RunBlockedFallbackDisabledEvent = RunBlockedBaseEvent & {
+  type: 'run_blocked_fallback_disabled';
+};
+
+export type RunBlockedWorkspaceExecutorUnavailableEvent = RunBlockedBaseEvent & {
+  type: 'run_blocked_workspace_executor_unavailable';
+};
+
+export type RunBlockedEvent =
+  | RunBlockedExecutorOfflineEvent
+  | RunBlockedTransportDisconnectedEvent
+  | RunBlockedFallbackDisabledEvent
+  | RunBlockedWorkspaceExecutorUnavailableEvent;
 
 export type ToolApprovalRequestEvent = {
   type: 'tool_approval_request';
@@ -343,6 +521,9 @@ export type StreamEvent = (
   | RunResumedEvent
   | RunFinishedEvent
   | RunCancelledEvent
+  | RunWaitingEvent
+  | RunErrorEvent
+  | RunInterruptedEvent
   | TextDeltaEvent
   | TextDoneEvent
   | ThinkingDeltaEvent
@@ -361,12 +542,20 @@ export type StreamEvent = (
   | PlanStepDoneEvent
   | AgentDelegatedEvent
   | AgentSpawnedEvent
+  | AgentWaitingEvent
   | AgentProgressEvent
   | AgentCompletedEvent
   | AgentFailedEvent
   | AgentCancelledEvent
   | AgentInterruptedEvent
   | TaskBoardSnapshotEvent
+  | WorkspaceBoundEvent
+  | ExecutorBoundEvent
+  | ToolRoutingDecisionEvent
+  | ToolTransportStartedEvent
+  | ToolTransportCompletedEvent
+  | ToolTransportFailedEvent
+  | RunBlockedEvent
   | ToolApprovalRequestEvent
   | PingEvent
   | DeviceLeaseEndedEvent
@@ -386,6 +575,14 @@ export type ToolCall = {
   arguments?: string;
   result?: string;
   status: 'running' | 'done' | 'error';
+  errorKind?: string;
+  blocked?: boolean;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string;
+  fallbackPolicy?: string;
+  route?: string;
+  durationMs?: number;
   startedAt: number;
   finishedAt?: number;
 };
@@ -430,6 +627,12 @@ export type ChatMessage = {
 export type WorkspaceState = {
   sessionId: string | null;
   runId: string | null;
+  runStatus: string | null;
+  waitingFor: string | null;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport: string | null;
+  fallbackPolicy: string | null;
   messages: ChatMessage[];
   toolCalls: ToolCall[];
   followupSuggestion: string | null;
@@ -518,6 +721,8 @@ export type ChatRequest = {
   /** When set and non-empty, sent as `allow_tools`. */
   allowTools?: string[];
   skillSearch?: SkillSearchSettings;
+  workspaceBinding?: WorkspaceBinding;
+  executorBinding?: ExecutorBinding;
 };
 
 export type RunStatus = {
@@ -530,9 +735,15 @@ export type RunStatus = {
     | 'failed'
     | 'cancelled'
     | 'paused'
+    | 'waiting'
+    | 'blocked'
     | string;
   eventsCount: number;
   waitingFor?: string | null;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string | null;
+  fallbackPolicy?: string | null;
 };
 
 export type RunProjectionResponse = {
@@ -541,6 +752,10 @@ export type RunProjectionResponse = {
   status: string;
   waiting_for?: string | null;
   error_message?: string | null;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string | null;
+  fallback_policy?: string | null;
   run_event_high_watermark: number;
   projection_event_idx: number;
   projection_updated_at: string;

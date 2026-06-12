@@ -1521,6 +1521,12 @@ impl ToolExecutor {
         };
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
+                if action == "create" && Self::is_task_dependency_edge_field(key) {
+                    return Err(format!(
+                        "unknown field '{key}' for task.create. Dependency edge fields (`add_blocks`, `add_blocked_by`, `remove_blocks`, `remove_blocked_by`) are update-only: first call task(action='create', title=...), then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
+                        allowed.join(", ")
+                    ));
+                }
                 return Err(format!(
                     "unknown field '{key}' for task.{action} (valid: {})",
                     allowed.join(", ")
@@ -1528,6 +1534,13 @@ impl ToolExecutor {
             }
         }
         Ok(())
+    }
+
+    fn is_task_dependency_edge_field(key: &str) -> bool {
+        matches!(
+            key,
+            "add_blocks" | "add_blocked_by" | "remove_blocks" | "remove_blocked_by"
+        )
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -2287,15 +2300,7 @@ impl ToolExecutor {
             Err(error) => return error.to_string(),
             Ok(None) => return "Task id is required".to_string(),
         };
-        // Default to snapshot-now. The block-until-terminal mode is opt-in
-        // because polling-with-output-coalescing actively misleads the model:
-        // a long-running cargo build emits new bytes every few hundred ms, so
-        // a "wait for new output" loop returns immediately every iteration
-        // with status=running, training the model to keep polling instead
-        // of ending the turn and trusting the <task_notification>. block=true
-        // here means "wait for the task to TERMINATE", not "wait for the
-        // next chunk".
-        let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
+        let block = args.get("block").and_then(Value::as_bool).unwrap_or(true);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let max_bytes = args
             .get("max_bytes")
@@ -2324,14 +2329,9 @@ impl ToolExecutor {
                 }
                 match rx.await {
                     Ok(Ok(snapshot)) => {
-                        // Only exit on true terminal status (completed/failed/
-                        // killed/unavailable) or waiting_for_input. Non-shell
-                        // tasks (local agents) still return immediately because
-                        // they don't have streaming output. New-bytes-arrived
-                        // is NOT an exit condition any more — that was the
-                        // old reverse-incentive trap.
                         if snapshot.kind != "shell"
                             || background_task_status_should_return_immediately(&snapshot.status)
+                            || !snapshot.output.is_empty()
                             || tokio::time::Instant::now() >= deadline
                         {
                             return format_background_task_output(&task_id, offset, &snapshot);

@@ -13,6 +13,8 @@ export type {
   ConnectionState,
   ChatMessage,
   ToolCall,
+  WorkspaceBinding,
+  ExecutorBinding,
   PlanState,
   TokenUsage,
   ChatConfig,

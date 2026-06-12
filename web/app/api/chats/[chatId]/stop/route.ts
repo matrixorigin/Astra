@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
-import { getChatHydrated, stopActiveRun } from "@/lib/api/web-store";
+import { getChat, stopActiveRun } from "@/lib/api/web-store";
 import { RuntimeClientError } from "@/lib/runtime-client";
+
+const STOP_CANCEL_ACK_TIMEOUT_MS = 1_500;
 
 export async function POST(
   _request: Request,
@@ -13,7 +15,7 @@ export async function POST(
   }
 
   const { chatId } = await context.params;
-  const chat = await getChatHydrated(auth.user.user_id, chatId);
+  const chat = getChat(auth.user.user_id, chatId);
   if (!chat) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
@@ -33,6 +35,7 @@ export async function POST(
   try {
     const result = await stopActiveRun(auth.user.user_id, chatId, {
       skipSync: true,
+      cancelTimeoutMs: STOP_CANCEL_ACK_TIMEOUT_MS,
     });
     if (!result) {
       return NextResponse.json({ error: "chat not found" }, { status: 404 });

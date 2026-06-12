@@ -342,11 +342,27 @@ pub enum StreamEvent {
     RunPaused {
         run_id: Option<String>,
     },
+    RunWaiting {
+        run_id: Option<String>,
+        reason: Option<String>,
+    },
     RunResumed {
         run_id: Option<String>,
     },
     RunCancelled {
         run_id: Option<String>,
+    },
+    RunError {
+        message: String,
+        error_kind: Option<String>,
+        raw: Value,
+    },
+    RunInterrupted {
+        run_id: Option<String>,
+        kind: Option<String>,
+        resumable: Option<bool>,
+        message: Option<String>,
+        raw: Value,
     },
     RunFinished {
         run_id: Option<String>,
@@ -510,11 +526,32 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "run_paused" => StreamEvent::RunPaused {
             run_id: optional_str(&obj, "run_id"),
         },
+        "run_waiting" => StreamEvent::RunWaiting {
+            run_id: optional_str(&obj, "run_id"),
+            reason: optional_str(&obj, "reason"),
+        },
         "run_resumed" => StreamEvent::RunResumed {
             run_id: optional_str(&obj, "run_id"),
         },
         "run_cancelled" => StreamEvent::RunCancelled {
             run_id: optional_str(&obj, "run_id"),
+        },
+        "run_error" => StreamEvent::RunError {
+            message: obj
+                .get("message")
+                .or_else(|| obj.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            error_kind: optional_str(&obj, "error_kind"),
+            raw,
+        },
+        "run_interrupted" => StreamEvent::RunInterrupted {
+            run_id: optional_str(&obj, "run_id"),
+            kind: optional_str(&obj, "kind").or_else(|| optional_str(&obj, "interruption_kind")),
+            resumable: obj.get("resumable").and_then(|v| v.as_bool()),
+            message: optional_str(&obj, "message").or_else(|| optional_str(&obj, "user_message")),
+            raw,
         },
         "run_finished" => StreamEvent::RunFinished {
             run_id: optional_str(&obj, "run_id"),
@@ -1042,6 +1079,62 @@ mod tests {
                 assert_eq!(run_id.as_deref(), Some("run-1"));
                 assert_eq!(status.as_deref(), Some("failed"));
                 assert_eq!(error.as_deref(), Some("boom"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let run_error = serde_json::json!({
+            "type": "run_error",
+            "message": "boom",
+            "error_kind": "tool_failure"
+        });
+        match classify_stream_event(run_error).unwrap() {
+            StreamEvent::RunError {
+                message,
+                error_kind,
+                ..
+            } => {
+                assert_eq!(message, "boom");
+                assert_eq!(error_kind.as_deref(), Some("tool_failure"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let waiting = serde_json::json!({
+            "type": "run_waiting",
+            "run_id": "run-1",
+            "reason": "waiting: executor_offline"
+        });
+        match classify_stream_event(waiting).unwrap() {
+            StreamEvent::RunWaiting { run_id, reason } => {
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+                assert_eq!(reason.as_deref(), Some("waiting: executor_offline"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let interrupted = serde_json::json!({
+            "type": "run_interrupted",
+            "run_id": "run-1",
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "message": "You can continue in the next message."
+        });
+        match classify_stream_event(interrupted).unwrap() {
+            StreamEvent::RunInterrupted {
+                run_id,
+                kind,
+                resumable,
+                message,
+                ..
+            } => {
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+                assert_eq!(kind.as_deref(), Some("budget_exhausted"));
+                assert_eq!(resumable, Some(true));
+                assert_eq!(
+                    message.as_deref(),
+                    Some("You can continue in the next message.")
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

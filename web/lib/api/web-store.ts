@@ -9,7 +9,6 @@ import {
   type RuntimeSessionResponse,
   type RuntimeTranscriptItemResponse,
   type RuntimeTranscriptResponse,
-  type StreamEvent,
 } from "@astra/sdk";
 import {
   activeRunPriority,
@@ -24,6 +23,10 @@ import {
   requireRuntimeClient,
   runtimeErrorDetail,
 } from "@/lib/runtime-client";
+import {
+  normalizeWorkspaceSelection,
+  sameWorkspaceSelection,
+} from "@/lib/workspace-authority";
 import type {
   ChatDetail,
   ChatListResponse,
@@ -39,6 +42,7 @@ import type {
   SearchResponse,
   SidebarData,
   UserSummary,
+  WorkspaceSelection,
 } from "@/lib/api/types";
 import { modelCache } from "@/lib/api/model-cache";
 
@@ -54,7 +58,9 @@ type ChatRecord = ChatSummary & {
   archivedAt?: string | null;
   backendSessionId?: string | null;
   messages: ChatMessage[];
+  workspaceSelection?: WorkspaceSelection;
   activeRun?: ChatActiveRunRecord;
+  locallyStoppedRuns?: Record<string, string>;
   pendingTurn?: {
     messageId: string;
     content: string;
@@ -69,6 +75,10 @@ export class StaleDeferredRunError extends Error {
   }
 }
 
+type RuntimeCancelSettlement =
+  | { status: "completed" }
+  | { status: "failed"; error: unknown };
+
 type ProjectRecord = ProjectDetail["project"];
 
 type Store = {
@@ -80,10 +90,12 @@ type Store = {
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
+const LOCAL_STOPPED_RUN_GRACE_MS = 5 * 60_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(["chat-web-agent-notes"]);
+const WORKSPACE_SELECTION_METADATA_KEY = "workspace_selection";
 
 type StreamResult = {
   assistantText: string;
@@ -94,6 +106,46 @@ type StreamResult = {
 
 function runtimeOperationError(operation: string, error: unknown) {
   return new Error(`${operation}: ${runtimeErrorDetail(error)}`);
+}
+
+async function settleRuntimeCancel(
+  cancelPromise: Promise<unknown>,
+  timeoutMs?: number,
+  onLateSettled?: (settled: RuntimeCancelSettlement) => void,
+) {
+  if (!timeoutMs || timeoutMs <= 0) {
+    await cancelPromise;
+    return false;
+  }
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const handledCancel = cancelPromise.then(
+    () => ({ status: "completed" as const }),
+    (error: unknown) => ({ status: "failed" as const, error }),
+  );
+  const timeout = new Promise<{ status: "pending" }>((resolve) => {
+    timeoutId = setTimeout(() => resolve({ status: "pending" }), timeoutMs);
+  });
+  const result = await Promise.race([handledCancel, timeout]);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+  }
+  if (result.status === "failed") {
+    throw result.error;
+  }
+  if (result.status === "pending") {
+    void handledCancel.then((settled) => {
+      if (settled.status === "failed") {
+        console.warn(
+          "Runtime cancel failed after Web stop response:",
+          runtimeErrorDetail(settled.error),
+        );
+      }
+      onLateSettled?.(settled);
+    });
+    return true;
+  }
+  return false;
 }
 
 declare global {
@@ -146,8 +198,64 @@ function isFreshLocalActiveRun(
     return false;
   }
   const observedAt = Date.parse(activeRun.observedAt);
+  const maxAge =
+    activeRun.status.trim().toLowerCase() === "cancelling"
+      ? LOCAL_STOPPED_RUN_GRACE_MS
+      : LOCAL_ACTIVE_RUN_GRACE_MS;
   return (
-    Number.isFinite(observedAt) && now - observedAt <= LOCAL_ACTIVE_RUN_GRACE_MS
+    Number.isFinite(observedAt) && now - observedAt <= maxAge
+  );
+}
+
+function pruneLocallyStoppedRuns(chat: ChatRecord, now = Date.now()) {
+  const stoppedRuns = chat.locallyStoppedRuns;
+  if (!stoppedRuns) {
+    return;
+  }
+  for (const [runId, observedAt] of Object.entries(stoppedRuns)) {
+    const stoppedAt = Date.parse(observedAt);
+    if (
+      !Number.isFinite(stoppedAt) ||
+      now - stoppedAt > LOCAL_STOPPED_RUN_GRACE_MS
+    ) {
+      delete stoppedRuns[runId];
+    }
+  }
+  if (Object.keys(stoppedRuns).length === 0) {
+    chat.locallyStoppedRuns = undefined;
+  }
+}
+
+function rememberLocallyStoppedRun(chat: ChatRecord, runId: string) {
+  pruneLocallyStoppedRuns(chat);
+  chat.locallyStoppedRuns = {
+    ...(chat.locallyStoppedRuns ?? {}),
+    [runId]: nowIso(),
+  };
+}
+
+function forgetLocallyStoppedRun(chat: ChatRecord, runId: string) {
+  if (!chat.locallyStoppedRuns) {
+    return;
+  }
+  delete chat.locallyStoppedRuns[runId];
+  if (Object.keys(chat.locallyStoppedRuns).length === 0) {
+    chat.locallyStoppedRuns = undefined;
+  }
+}
+
+function isLocallyStoppedRun(
+  chat: ChatRecord | undefined,
+  runId: string,
+  now = Date.now(),
+) {
+  const observedAt = chat?.locallyStoppedRuns?.[runId];
+  if (!observedAt) {
+    return false;
+  }
+  const stoppedAt = Date.parse(observedAt);
+  return (
+    Number.isFinite(stoppedAt) && now - stoppedAt <= LOCAL_STOPPED_RUN_GRACE_MS
   );
 }
 
@@ -211,6 +319,18 @@ function publicActiveRun(
     runId: activeRun.runId,
     status: activeRun.status,
     waitingFor: activeRun.waitingFor ?? null,
+  };
+}
+
+function workspaceSelectionMetadata(selection: WorkspaceSelection) {
+  if (selection.kind === "server_sandbox") {
+    return { kind: "server_sandbox" };
+  }
+  return {
+    kind: "edge_workspace",
+    edgeAgentId: selection.edgeAgentId,
+    displayName: selection.displayName ?? null,
+    cwd: selection.cwd,
   };
 }
 
@@ -528,6 +648,8 @@ export function getChat(
     project: project ? { id: project.id, name: project.name } : undefined,
     activeRun: publicActiveRun(chat.activeRun),
     pendingTurn: chat.pendingTurn,
+    workspaceSelection: chat.workspaceSelection,
+    workspaceSelectionExplicit: Boolean(chat.workspaceSelection),
   };
 }
 
@@ -653,6 +775,7 @@ export function beginStreamingMessage(
     content: string;
     options?: ComposerOptions;
     pendingMessageId?: string;
+    workspaceSelection?: WorkspaceSelection;
   },
 ) {
   const store = getStore(ownerUserId);
@@ -706,6 +829,9 @@ export function beginStreamingMessage(
   if (payload.options?.model) {
     chat.model = payload.options.model;
   }
+  if (payload.workspaceSelection) {
+    chat.workspaceSelection = payload.workspaceSelection;
+  }
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
   }
@@ -734,6 +860,9 @@ export function setChatActiveRun(
         "observedAt" in activeRun ? activeRun.observedAt : nowIso(),
       )
     : undefined;
+  if (activeRun?.runId) {
+    forgetLocallyStoppedRun(chat, activeRun.runId);
+  }
   return chat.activeRun;
 }
 
@@ -749,8 +878,13 @@ export async function queueDeferredRunInput(
     throw new Error("Deferred input is too large.");
   }
   await syncBackendSessions(ownerUserId);
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
+
+  // Re-read chat after every async boundary to avoid TOCTOU races.
+  function findChat(): typeof chat | undefined {
+    return getStore(ownerUserId).chats.find((item) => item.id === chatId);
+  }
+
+  let chat = findChat();
   if (!chat) {
     return null;
   }
@@ -763,6 +897,15 @@ export async function queueDeferredRunInput(
     operation: `submit deferred run input for ${chat.activeRun.runId}`,
   });
   const activeRunId = chat.activeRun.runId;
+
+  // Verify chat hasn't changed after obtaining the client.
+  chat = findChat();
+  if (!chat?.activeRun || chat.activeRun.runId !== activeRunId) {
+    throw new StaleDeferredRunError(
+      "The run changed before input could be submitted.",
+    );
+  }
+
   let runStatus: RunStatus;
   try {
     runStatus = await client.sdk.getRunStatus(activeRunId);
@@ -777,12 +920,26 @@ export async function queueDeferredRunInput(
     }
     throw error;
   }
+
+  // Verify chat hasn't changed after getRunStatus.
+  chat = findChat();
+  if (!chat?.activeRun || chat.activeRun.runId !== activeRunId) {
+    throw new StaleDeferredRunError("The run changed during status check.");
+  }
+
   if (
     runStatus.sessionId !== backendSessionIdForChat(chat) ||
     !runBlocksChatTurn(runStatus.status)
   ) {
     chat.activeRun = undefined;
     throw new StaleDeferredRunError("The previous run is no longer active.");
+  }
+  // Final guard: another concurrent operation (e.g. stop) may have cleared
+  // or replaced chat.activeRun between findChat() and this mutation point.
+  if (chat.activeRun?.runId !== activeRunId) {
+    throw new StaleDeferredRunError(
+      "The run was superseded before input could be submitted.",
+    );
   }
   chat.activeRun = makeActiveRunRecord(
     {
@@ -812,6 +969,12 @@ export async function queueDeferredRunInput(
       throw new StaleDeferredRunError("The previous run is no longer active.");
     }
     throw error;
+  }
+
+  // Final verification after submitRunInput.
+  chat = findChat();
+  if (!chat?.activeRun || chat.activeRun.runId !== activeRunId) {
+    throw new StaleDeferredRunError("The run changed after input submission.");
   }
 
   const timestamp = nowIso();
@@ -848,7 +1011,7 @@ export async function queueDeferredRunInput(
 export async function stopActiveRun(
   ownerUserId: string,
   chatId: string,
-  options?: { skipSync?: boolean },
+  options?: { skipSync?: boolean; cancelTimeoutMs?: number },
 ) {
   if (!options?.skipSync) {
     await syncBackendSessions(ownerUserId);
@@ -862,24 +1025,59 @@ export async function stopActiveRun(
     throw new Error("No active run is available to stop.");
   }
 
+  const previousActiveRun = chat.activeRun;
+  const runId = previousActiveRun.runId;
+  rememberLocallyStoppedRun(chat, runId);
+
   const client = await requireRuntimeClient({
     auth: "required",
-    operation: `cancel active run ${chat.activeRun.runId}`,
+    operation: `cancel active run ${runId}`,
   });
 
-  const runId = chat.activeRun.runId;
-  await client.sdk.cancelRun(runId);
-  chat.activeRun = makeActiveRunRecord(
-    {
-      runId,
-      status: "cancelling",
-      waitingFor: null,
+  const cancelPending = await settleRuntimeCancel(
+    client.sdk.cancelRun(runId),
+    options?.cancelTimeoutMs,
+    (settled) => {
+      const currentChat = getStore(ownerUserId).chats.find(
+        (item) => item.id === chatId,
+      );
+      if (currentChat?.activeRun?.runId !== runId) {
+        return;
+      }
+      if (settled.status === "completed") {
+        currentChat.activeRun = undefined;
+        return;
+      }
+      forgetLocallyStoppedRun(currentChat, runId);
+      currentChat.activeRun = makeActiveRunRecord(
+        {
+          runId,
+          status: previousActiveRun.status,
+          waitingFor: previousActiveRun.waitingFor ?? null,
+        },
+        "local_mutation",
+      );
     },
-    "local_mutation",
   );
+
+  if (cancelPending) {
+    if (chat.activeRun?.runId === runId) {
+      chat.activeRun = makeActiveRunRecord(
+        {
+          runId,
+          status: "cancelling",
+          waitingFor: "cancel_requested",
+        },
+        "local_mutation",
+      );
+    }
+  } else {
+    chat.activeRun = undefined;
+  }
 
   return {
     activeRun: publicActiveRun(chat.activeRun),
+    cancelPending,
   };
 }
 
@@ -979,6 +1177,34 @@ export async function updateChatModel(
   }
   await updateBackendSessionModel(chat, normalized);
   chat.model = normalized;
+  return getChat(ownerUserId, chatId);
+}
+
+export async function updateChatWorkspaceSelection(
+  ownerUserId: string,
+  chatId: string,
+  selection: WorkspaceSelection,
+) {
+  const normalized = normalizeWorkspaceSelection(selection);
+  if (!normalized) {
+    return null;
+  }
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+
+  const previous = chat.workspaceSelection;
+  chat.workspaceSelection = normalized;
+  try {
+    if (chat.backendSessionId) {
+      await updateBackendSessionWorkspaceSelection(chat, normalized);
+    }
+  } catch (error) {
+    chat.workspaceSelection = previous;
+    throw error;
+  }
   return getChat(ownerUserId, chatId);
 }
 
@@ -1192,6 +1418,7 @@ export async function ensureChatBackendSession(
     title: chat.title,
     projectId: chat.projectId,
     model,
+    workspaceSelection: chat.workspaceSelection,
     runtime: params.runtime,
   });
   chat.backendSessionId = session.sessionId;
@@ -1285,6 +1512,10 @@ function chatRecordFromBackendSession(
     null;
   const title = session.title ?? existing?.title ?? null;
   const archivedAt = session.status === "archived" ? updatedAt : null;
+  const workspaceSelection =
+    normalizeWorkspaceSelection(
+      session.metadata?.[WORKSPACE_SELECTION_METADATA_KEY],
+    ) ?? existing?.workspaceSelection;
 
   return {
     id: existing?.id ?? session.session_id,
@@ -1297,7 +1528,9 @@ function chatRecordFromBackendSession(
     model,
     backendSessionId: session.session_id,
     messages: existing?.messages ?? [],
+    workspaceSelection,
     activeRun: existing?.activeRun,
+    locallyStoppedRuns: existing?.locallyStoppedRuns,
     pendingTurn: existing?.pendingTurn,
   };
 }
@@ -1418,9 +1651,18 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   const backendChatIds = new Set<string>();
   const activeRunBySession = new Map<string, ChatActiveRunRecord>();
   const backendRunStatuses = new Map<string, string>();
+  const syncNow = Date.now();
 
   for (const run of runs) {
     backendRunStatuses.set(run.runId, run.status);
+    const existingForRun =
+      byBackendSessionId.get(run.sessionId) ?? byId.get(run.sessionId);
+    if (existingForRun && isTerminalChatRunStatus(run.status)) {
+      forgetLocallyStoppedRun(existingForRun, run.runId);
+    }
+    if (isLocallyStoppedRun(existingForRun, run.runId, syncNow)) {
+      continue;
+    }
     if (!runBlocksChatTurn(run.status)) {
       continue;
     }
@@ -1566,6 +1808,7 @@ async function createBackendSession(params: {
   title: string | null;
   projectId: string | null;
   model: string;
+  workspaceSelection?: WorkspaceSelection;
   runtime?: WebRuntimeClient;
 }): Promise<{ sessionId: string }> {
   const client =
@@ -1584,6 +1827,13 @@ async function createBackendSession(params: {
         project_id: params.projectId,
         initial_model: params.model,
         current_model: params.model,
+        ...(params.workspaceSelection
+          ? {
+              [WORKSPACE_SELECTION_METADATA_KEY]: workspaceSelectionMetadata(
+                params.workspaceSelection,
+              ),
+            }
+          : {}),
       },
     });
   } catch (error) {
@@ -1664,6 +1914,40 @@ async function updateBackendSessionModel(
   } catch (error) {
     throw runtimeOperationError(
       `Cannot update persisted session ${sessionId} model`,
+      error,
+    );
+  }
+}
+
+async function updateBackendSessionWorkspaceSelection(
+  chat: ChatRecord,
+  selection: WorkspaceSelection,
+): Promise<void> {
+  const sessionId = backendSessionIdForChat(chat);
+  const client = await requireRuntimeClient({
+    auth: "required",
+    operation: `update persisted session ${sessionId} workspace selection`,
+  });
+  let parsed: RuntimeSessionResponse;
+  try {
+    parsed = await client.sdk.getRuntimeSession(sessionId);
+  } catch (error) {
+    throw runtimeOperationError(
+      `Cannot read persisted session ${sessionId} before workspace selection update`,
+      error,
+    );
+  }
+
+  const metadata = {
+    ...(parsed.metadata ?? {}),
+    [WORKSPACE_SELECTION_METADATA_KEY]: workspaceSelectionMetadata(selection),
+  };
+
+  try {
+    await client.sdk.updateRuntimeSession(sessionId, { metadata });
+  } catch (error) {
+    throw runtimeOperationError(
+      `Cannot update persisted session ${sessionId} workspace selection`,
       error,
     );
   }
@@ -1893,7 +2177,7 @@ function parseRunSseText(text: string): StreamResult {
   let nextOffset = 0;
 
   for (const event of parseSseDataEvents(text.replace(/\r\n/g, "\n"))) {
-    const record = event as StreamEvent & Record<string, unknown>;
+    const record = event as Record<string, unknown>;
     const type = typeof record.type === "string" ? record.type : "";
     if (typeof record.index === "number" && Number.isFinite(record.index)) {
       nextOffset = Math.max(nextOffset, Math.trunc(record.index) + 1);
@@ -1908,6 +2192,21 @@ function parseRunSseText(text: string): StreamResult {
       typeof record.assistant_text === "string"
     ) {
       finalText = record.assistant_text;
+    } else if (
+      type === "run_interrupted" &&
+      typeof record.message === "string"
+    ) {
+      finalText = finalText || record.message;
+    } else if (type === "run_error") {
+      const runError =
+        typeof record.message === "string"
+          ? record.message
+          : typeof record.error === "string"
+            ? record.error
+            : undefined;
+      if (runError) {
+        error = runError;
+      }
     } else if (type === "error" && typeof record.message === "string") {
       error = record.message;
     } else if (
@@ -1916,6 +2215,11 @@ function parseRunSseText(text: string): StreamResult {
       typeof record.error === "string"
     ) {
       error = record.error;
+      finished = true;
+    } else if (
+      type === "run_finished" &&
+      (record.status === "paused" || record.status === "interrupted")
+    ) {
       finished = true;
     } else if (type === "run_finished") {
       finished = true;

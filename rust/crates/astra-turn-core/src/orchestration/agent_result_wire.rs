@@ -17,6 +17,7 @@ pub enum AgentToolResultStatusKind {
     TimedOut,
     Cancelled,
     Interrupted,
+    Waiting,
     StillRunning,
     Launched,
     /// Catch-all for unknown wire statuses.
@@ -33,6 +34,7 @@ impl AgentToolResultStatusKind {
             Self::TimedOut => "timeout",
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
+            Self::Waiting => "waiting",
             Self::StillRunning => "still_running",
             Self::Launched => "launched",
             Self::Other => "other",
@@ -65,6 +67,7 @@ impl FromStr for AgentToolResultStatusKind {
             "timeout" => Ok(Self::TimedOut),
             "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
+            "waiting" => Ok(Self::Waiting),
             "still_running" => Ok(Self::StillRunning),
             "launched" => Ok(Self::Launched),
             "other" => Ok(Self::Other),
@@ -119,9 +122,11 @@ pub fn project_agent_tool_wire<'a>(
         Some(AgentToolResultStatusKind::TimedOut) => AgentToolWireOutcomeKind::TimedOut,
         Some(AgentToolResultStatusKind::Cancelled) => AgentToolWireOutcomeKind::Cancelled,
         Some(AgentToolResultStatusKind::Interrupted) => AgentToolWireOutcomeKind::Interrupted,
-        Some(AgentToolResultStatusKind::StillRunning | AgentToolResultStatusKind::Launched) => {
-            AgentToolWireOutcomeKind::Running
-        }
+        Some(
+            AgentToolResultStatusKind::Waiting
+            | AgentToolResultStatusKind::StillRunning
+            | AgentToolResultStatusKind::Launched,
+        ) => AgentToolWireOutcomeKind::Running,
         Some(AgentToolResultStatusKind::Other) => AgentToolWireOutcomeKind::Failed,
         _ if outer_tool_success && has_result => AgentToolWireOutcomeKind::Completed,
         _ if !outer_tool_success => AgentToolWireOutcomeKind::Failed,
@@ -225,6 +230,13 @@ pub fn agent_tool_incomplete_reason(parsed: &Value) -> Option<String> {
                 .unwrap_or("child result retrieval failed")
                 .to_string(),
         ),
+        Some(AgentToolResultStatusKind::Waiting) => Some(format!(
+            "child agent is waiting ({})",
+            parsed
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("waiting")
+        )),
         Some(AgentToolResultStatusKind::Cancelled) => Some(
             parsed
                 .get("reason")
@@ -364,6 +376,17 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             })
             .to_string()
         }
+        AgentStatus::Waiting { reason } => json!({
+            "status": AgentToolResultStatusKind::Waiting.as_str(),
+            "agent_id": agent_id,
+            "reason": if reason.trim().is_empty() {
+                "waiting".to_string()
+            } else {
+                reason.clone()
+            },
+            "hint": "The child agent is waiting for external input or executor recovery. Do not fabricate its result.",
+        })
+        .to_string(),
         AgentStatus::Cancelled { by_user, reason } => {
             let mut payload = json!({
                 "status": AgentToolResultStatusKind::Cancelled.as_str(),
@@ -498,6 +521,46 @@ mod tests {
 
         let tool_failed = project_agent_tool_wire("spawn", false, None);
         assert_eq!(tool_failed.outcome, AgentToolWireOutcomeKind::Failed);
+    }
+
+    #[test]
+    fn waiting_status_projects_as_incomplete_running_wire() {
+        let waiting = json!({
+            "status": AgentToolResultStatusKind::Waiting.as_str(),
+            "agent_id": "a1",
+            "reason": "executor_offline"
+        });
+
+        let projection = project_agent_tool_wire("get_result", true, Some(&waiting));
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Running);
+        assert_eq!(projection.agent_id, Some("a1"));
+        assert_eq!(
+            agent_tool_incomplete_reason(&waiting).as_deref(),
+            Some("child agent is waiting (executor_offline)")
+        );
+    }
+
+    #[test]
+    fn render_wait_for_agent_status_preserves_waiting_reason_and_hint() {
+        let rendered = render_wait_for_agent_status(
+            "a1",
+            &AgentStatus::Waiting {
+                reason: "executor_offline".to_string(),
+            },
+        );
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            parsed["status"],
+            AgentToolResultStatusKind::Waiting.as_str()
+        );
+        assert_eq!(parsed["agent_id"], "a1");
+        assert_eq!(parsed["reason"], "executor_offline");
+        assert!(
+            parsed["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("Do not fabricate"))
+        );
     }
 
     #[test]

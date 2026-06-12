@@ -45,9 +45,12 @@ function pendingSseBody() {
     return Promise.resolve();
   });
   const releaseLock = jest.fn();
-  const read = jest.fn(() => new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
-    releasePendingRead = () => resolve({ value: undefined, done: true });
-  }));
+  const read = jest.fn(
+    () =>
+      new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
+        releasePendingRead = () => resolve({ value: undefined, done: true });
+      }),
+  );
 
   return {
     cancel,
@@ -71,6 +74,7 @@ describe('streamChatMessage cancellation semantics', () => {
   it('treats a cancelled run as a clean stop instead of a failed stream', async () => {
     const onCancelled = jest.fn();
     const onDone = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
 
     (globalThis.fetch as jest.Mock).mockResolvedValue({
       ok: true,
@@ -80,19 +84,32 @@ describe('streamChatMessage cancellation semantics', () => {
       ]),
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      onCancelled,
-      onDone,
-    })).resolves.toBe('');
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onCancelled,
+        onDone,
+        onWorkSurfaceEvent,
+      }),
+    ).resolves.toBe('');
 
     expect(onCancelled).toHaveBeenCalledWith('');
     expect(onDone).not.toHaveBeenCalled();
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
+      type: 'run_started',
+      run_id: 'run-123',
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
+      type: 'run_finished',
+      run_id: 'run-123',
+      status: 'cancelled',
+    });
   });
 
   it('treats a paused run as paused and does not complete the assistant message', async () => {
     const onPaused = jest.fn();
     const onDone = jest.fn();
     const onRunUpdated = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
 
     (globalThis.fetch as jest.Mock).mockResolvedValue({
       ok: true,
@@ -103,14 +120,204 @@ describe('streamChatMessage cancellation semantics', () => {
       ]),
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      onPaused,
-      onDone,
-      onRunUpdated,
-    })).resolves.toBe('partial');
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onPaused,
+        onDone,
+        onRunUpdated,
+        onWorkSurfaceEvent,
+      }),
+    ).resolves.toBe('partial');
 
-    expect(onRunUpdated).toHaveBeenCalledWith({ runId: 'run-123', status: 'paused', waitingFor: null });
+    expect(onRunUpdated).toHaveBeenCalledWith({
+      runId: 'run-123',
+      status: 'paused',
+      waitingFor: null,
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
+      type: 'run_paused',
+      run_id: 'run-123',
+    });
     expect(onPaused).toHaveBeenCalledWith('partial');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('treats an interrupted run as paused and keeps the work surface current', async () => {
+    const onPaused = jest.fn();
+    const onDone = jest.fn();
+    const onRunUpdated = jest.fn();
+    const onRunFinished = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
+    const onText = jest.fn();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"run-123"}\n\n',
+        'data: {"type":"run_interrupted","run_id":"run-123","kind":"budget_exhausted","resumable":true,"message":"Budget exhausted. You can continue."}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"paused","interrupted":true,"resumable":true}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onPaused,
+        onDone,
+        onRunUpdated,
+        onRunFinished,
+        onWorkSurfaceEvent,
+        onText,
+      }),
+    ).resolves.toBe('Budget exhausted. You can continue.');
+
+    expect(onText).toHaveBeenLastCalledWith(
+      'Budget exhausted. You can continue.',
+    );
+    expect(onRunUpdated).toHaveBeenLastCalledWith({
+      runId: 'run-123',
+      status: 'paused',
+      waitingFor: 'user_resume',
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'run_interrupted', run_id: 'run-123' }),
+    );
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'run_finished',
+        run_id: 'run-123',
+        status: 'paused',
+      }),
+    );
+    expect(onPaused).toHaveBeenCalledWith(
+      'Budget exhausted. You can continue.',
+    );
+    expect(onRunFinished).not.toHaveBeenCalled();
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('projects blocked run events into the main active-run state', async () => {
+    const onPaused = jest.fn();
+    const onDone = jest.fn();
+    const onRunUpdated = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
+    const onText = jest.fn();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"run-123"}\n\n',
+        'data: {"type":"run_blocked_executor_offline","session_id":"session-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
+        'data: {"type":"run_waiting","run_id":"run-123","reason":"waiting: executor_offline"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onPaused,
+        onDone,
+        onRunUpdated,
+        onWorkSurfaceEvent,
+        onText,
+      }),
+    ).resolves.toBe('Edge executor MacBook Pro is offline.');
+
+    expect(onText).toHaveBeenLastCalledWith(
+      'Edge executor MacBook Pro is offline.',
+    );
+    expect(onRunUpdated).toHaveBeenLastCalledWith({
+      runId: 'run-123',
+      status: 'blocked',
+      waitingFor: 'executor_offline',
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'run_blocked_executor_offline' }),
+    );
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'run_waiting' }),
+    );
+    expect(onPaused).toHaveBeenCalledWith(
+      'Edge executor MacBook Pro is offline.',
+    );
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('projects generic run_waiting events into waiting active-run state', async () => {
+    const onPaused = jest.fn();
+    const onDone = jest.fn();
+    const onRunUpdated = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
+    const onText = jest.fn();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"run-123"}\n\n',
+        'data: {"type":"run_waiting","run_id":"run-123","reason":"waiting: tool_approval"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onPaused,
+        onDone,
+        onRunUpdated,
+        onWorkSurfaceEvent,
+        onText,
+      }),
+    ).resolves.toBe('');
+
+    expect(onRunUpdated).toHaveBeenLastCalledWith({
+      runId: 'run-123',
+      status: 'waiting',
+      waitingFor: 'tool_approval',
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'run_waiting' }),
+    );
+    expect(onText).not.toHaveBeenCalled();
+    expect(onPaused).toHaveBeenCalledWith('');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('projects future blocked run event names into active-run state', async () => {
+    const onPaused = jest.fn();
+    const onDone = jest.fn();
+    const onRunUpdated = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
+    const onText = jest.fn();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"run-123"}\n\n',
+        'data: {"type":"run_blocked_fallback_disabled","session_id":"session-1","message":"Server fallback is disabled for this workspace."}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onPaused,
+        onDone,
+        onRunUpdated,
+        onWorkSurfaceEvent,
+        onText,
+      }),
+    ).resolves.toBe('Server fallback is disabled for this workspace.');
+
+    expect(onText).toHaveBeenLastCalledWith(
+      'Server fallback is disabled for this workspace.',
+    );
+    expect(onRunUpdated).toHaveBeenLastCalledWith({
+      runId: 'run-123',
+      status: 'blocked',
+      waitingFor: 'fallback_disabled',
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'run_blocked_fallback_disabled' }),
+    );
+    expect(onPaused).toHaveBeenCalledWith(
+      'Server fallback is disabled for this workspace.',
+    );
     expect(onDone).not.toHaveBeenCalled();
   });
 
@@ -158,31 +365,125 @@ describe('streamChatMessage cancellation semantics', () => {
       ]),
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      onLocalMessages,
-      onRunStarted,
-      onRunUpdated,
-      onArtifacts,
-      onReasoning,
-      onReasoningDone,
-      onText,
-      onDone,
-      onRunFinished,
-    })).resolves.toBe('visible');
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onLocalMessages,
+        onRunStarted,
+        onRunUpdated,
+        onArtifacts,
+        onReasoning,
+        onReasoningDone,
+        onText,
+        onDone,
+        onRunFinished,
+      }),
+    ).resolves.toBe('visible');
 
     expect(onRunStarted).toHaveBeenCalledWith('run-session');
-    expect(onRunUpdated).toHaveBeenCalledWith({ runId: 'run-session', status: 'running', waitingFor: null });
+    expect(onRunUpdated).toHaveBeenCalledWith({
+      runId: 'run-session',
+      status: 'running',
+      waitingFor: null,
+    });
     expect(onLocalMessages).toHaveBeenCalledWith({
-      userMessage: expect.objectContaining({ id: 'u1', role: 'user', content: 'hi' }),
-      assistantMessage: expect.objectContaining({ id: 'a1', role: 'assistant' }),
+      userMessage: expect.objectContaining({
+        id: 'u1',
+        role: 'user',
+        content: 'hi',
+      }),
+      assistantMessage: expect.objectContaining({
+        id: 'a1',
+        role: 'assistant',
+      }),
     });
     expect(onReasoning).toHaveBeenLastCalledWith('thinking');
     expect(onReasoningDone).toHaveBeenCalledWith('thinking');
     expect(onReasoningDone).toHaveBeenLastCalledWith('hidden');
-    expect(onArtifacts).toHaveBeenCalledWith([expect.objectContaining({ id: 'artifact-1' })]);
+    expect(onArtifacts).toHaveBeenCalledWith([
+      expect.objectContaining({ id: 'artifact-1' }),
+    ]);
     expect(onText).toHaveBeenLastCalledWith('visible');
-    expect(onRunFinished).toHaveBeenCalledWith({ runId: 'run-session', status: 'completed', error: null });
+    expect(onRunFinished).toHaveBeenCalledWith({
+      runId: 'run-session',
+      status: 'completed',
+      error: null,
+    });
     expect(onDone).toHaveBeenCalledWith('visible');
+  });
+
+  it('forwards workspace, executor, and transport events to the work surface while streaming', async () => {
+    const onWorkSurfaceEvent = jest.fn();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"workspace_bound","workspace":{"kind":"server_sandbox","display_name":"Server sandbox","cwd":"/tmp/astra-workspaces/run-1","authority":"read_write","fallback_policy":"disabled"}}\n\n',
+        'data: {"type":"executor_bound","executor":{"kind":"server_local","executor_id":"server-local","display_name":"Server sandbox","transport":"server_local","status":"online"}}\n\n',
+        'data: {"type":"tool_routing_decision","call_id":"call-1","tool":"bash","route":"server_local","transport":"server_local"}\n\n',
+        'data: {"type":"tool_transport_started","call_id":"call-1","tool":"bash","transport":"server_local"}\n\n',
+        'data: {"type":"tool_transport_completed","call_id":"call-1","tool":"bash","transport":"server_local","duration_ms":12}\n\n',
+        'data: {"type":"tool_call_end","call_id":"call-1","tool":"bash","success":true,"result":"ok"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onWorkSurfaceEvent,
+      }),
+    ).resolves.toBe('');
+
+    expect(onWorkSurfaceEvent).toHaveBeenCalledTimes(6);
+    expect(onWorkSurfaceEvent).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        type: 'workspace_bound',
+        workspace: expect.objectContaining({ kind: 'server_sandbox' }),
+      }),
+    );
+    expect(onWorkSurfaceEvent).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({
+        type: 'tool_routing_decision',
+        call_id: 'call-1',
+        route: 'server_local',
+      }),
+    );
+  });
+
+  it('forwards run_started bindings to the work surface without dropping run state updates', async () => {
+    const onWorkSurfaceEvent = jest.fn();
+    const onRunStarted = jest.fn();
+    const onRunUpdated = jest.fn();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"run-123","session_id":"session-123","workspace":{"kind":"edge_workspace","display_name":"MacBook Pro","cwd":"/Users/xupeng/github/astra","authority":"read_write","fallback_policy":"disabled"},"executor":{"kind":"edge_agent","executor_id":"edge-macbook-1","display_name":"MacBook Pro","transport":"edge_ws","status":"online"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onWorkSurfaceEvent,
+        onRunStarted,
+        onRunUpdated,
+      }),
+    ).resolves.toBe('');
+
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'run_started',
+        workspace: expect.objectContaining({ kind: 'edge_workspace' }),
+        executor: expect.objectContaining({ kind: 'edge_agent' }),
+      }),
+    );
+    expect(onRunStarted).toHaveBeenCalledWith('run-123');
+    expect(onRunUpdated).toHaveBeenCalledWith({
+      runId: 'run-123',
+      status: 'running',
+      waitingFor: null,
+    });
   });
 
   it('uses turn_complete text as the final assistant text', async () => {
@@ -197,10 +498,12 @@ describe('streamChatMessage cancellation semantics', () => {
       ]),
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      onText,
-      onDone,
-    })).resolves.toBe('final answer');
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onText,
+        onDone,
+      }),
+    ).resolves.toBe('final answer');
 
     expect(onText).toHaveBeenLastCalledWith('final answer');
     expect(onDone).toHaveBeenCalledWith('final answer');
@@ -209,6 +512,8 @@ describe('streamChatMessage cancellation semantics', () => {
   it('throws stream error events and failed run_finished errors instead of calling done', async () => {
     const onDone = jest.fn();
     const onRunFinished = jest.fn();
+    const onRunUpdated = jest.fn();
+    const onWorkSurfaceEvent = jest.fn();
 
     (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
       ok: true,
@@ -217,9 +522,11 @@ describe('streamChatMessage cancellation semantics', () => {
       ]),
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      onDone,
-    })).rejects.toThrow('runtime disconnected');
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onDone,
+      }),
+    ).rejects.toThrow('runtime disconnected');
     expect(onDone).not.toHaveBeenCalled();
 
     (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
@@ -229,11 +536,42 @@ describe('streamChatMessage cancellation semantics', () => {
       ]),
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      onDone,
-      onRunFinished,
-    })).rejects.toThrow('tool crashed');
-    expect(onRunFinished).toHaveBeenCalledWith({ runId: 'run-123', status: 'failed', error: 'tool crashed' });
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onDone,
+        onRunFinished,
+      }),
+    ).rejects.toThrow('tool crashed');
+    expect(onRunFinished).toHaveBeenCalledWith({
+      runId: 'run-123',
+      status: 'failed',
+      error: 'tool crashed',
+    });
+    expect(onDone).not.toHaveBeenCalled();
+
+    (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_error","run_id":"run-456","message":"loop crashed","error_kind":"runtime"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-456","status":"failed","error":"loop crashed"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        onDone,
+        onRunUpdated,
+        onWorkSurfaceEvent,
+      }),
+    ).rejects.toThrow('loop crashed');
+    expect(onRunUpdated).toHaveBeenCalledWith({
+      runId: 'run-456',
+      status: 'failed',
+      waitingFor: null,
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'run_error', run_id: 'run-456' }),
+    );
     expect(onDone).not.toHaveBeenCalled();
   });
 
@@ -248,9 +586,11 @@ describe('streamChatMessage cancellation semantics', () => {
       body,
     });
 
-    await expect(streamChatMessage('chat-123', defaultPayload, {
-      signal: controller.signal,
-    })).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
 
     expect(body.cancel).toHaveBeenCalled();
     expect(body.releaseLock).toHaveBeenCalled();
@@ -281,12 +621,12 @@ describe('streamChatMessage cancellation semantics', () => {
   it('streams an existing run with an encoded GET URL', async () => {
     (globalThis.fetch as jest.Mock).mockResolvedValue({
       ok: true,
-      body: sseBody([
-        'data: {"type":"text_done","full_text":"resumed"}\n\n',
-      ]),
+      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
     });
 
-    await expect(streamExistingChatRun('chat 123', 'run/123', {})).resolves.toBe('resumed');
+    await expect(
+      streamExistingChatRun('chat 123', 'run/123', {}),
+    ).resolves.toBe('resumed');
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       '/api/chats/chat%20123/stream?runId=run%2F123',

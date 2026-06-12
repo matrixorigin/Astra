@@ -55,6 +55,9 @@ pub trait EdgeDispatchService: Send + Sync {
         result_json: &str,
     ) -> Result<bool, String>;
 
+    /// Move an in-flight dispatch to a failed terminal state.
+    async fn fail_dispatch(&self, request_id: &str, reason: &str) -> Result<bool, String>;
+
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
     async fn wait_result(
         &self,
@@ -288,6 +291,33 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(affected)
     }
 
+    #[tracing::instrument(skip(self), fields(request_id = %request_id, reason = %reason))]
+    async fn fail_dispatch(&self, request_id: &str, reason: &str) -> Result<bool, String> {
+        let output = format!("edge dispatch {reason}");
+        let result_json = serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "output": output,
+            "duration_ms": 0,
+        })
+        .to_string();
+        let n = sqlx::query(
+            "UPDATE edge_pending_dispatch \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             WHERE request_id = ? AND status IN ('pending', 'dispatched')",
+        )
+        .bind(result_json)
+        .bind(request_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_dispatch fail_dispatch: {e}"))?;
+        let affected = n.rows_affected() > 0;
+        if affected && let Some(ref m) = self.metrics {
+            saturating_decrement(&m.dispatch_queue_depth);
+        }
+        Ok(affected)
+    }
+
     #[tracing::instrument(skip(self), fields(request_id = %request_id, timeout_ms = timeout.as_millis()))]
     async fn wait_result(
         &self,
@@ -313,7 +343,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                             let result: Option<String> = r.try_get("result_json").ok();
                             return Ok(result);
                         }
-                        "failed" => return Ok(None),
+                        "failed" => {
+                            let result: Option<String> = r.try_get("result_json").ok();
+                            return Ok(result);
+                        }
                         _ => {} // still pending or dispatched
                     }
                 }
@@ -339,17 +372,43 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
 
     async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
         let secs = older_than.as_secs() as i64;
-        let n = sqlx::query(
-            "DELETE FROM edge_pending_dispatch \
-             WHERE (status = 'completed' AND completed_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND)) \
-                OR (status = 'failed' AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND))",
+        let expired_result_json = serde_json::json!({
+            "request_id": null,
+            "status": "error",
+            "output": "edge dispatch expired",
+            "duration_ms": 0,
+        })
+        .to_string();
+        let expired = sqlx::query(
+            "UPDATE edge_pending_dispatch \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             WHERE status IN ('pending', 'dispatched') \
+               AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND)",
         )
+        .bind(expired_result_json)
         .bind(secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_dispatch expire stale: {e}"))?
+        .rows_affected();
+        if expired > 0
+            && let Some(ref m) = self.metrics
+        {
+            for _ in 0..expired {
+                saturating_decrement(&m.dispatch_queue_depth);
+            }
+        }
+
+        let deleted = sqlx::query(
+            "DELETE FROM edge_pending_dispatch \
+             WHERE status IN ('completed', 'failed') \
+               AND COALESCE(completed_at, created_at) <= DATE_SUB(NOW(6), INTERVAL ? SECOND)",
+        )
         .bind(secs)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_dispatch cleanup: {e}"))?;
-        Ok(n.rows_affected())
+        Ok(expired + deleted.rows_affected())
     }
 }
 
@@ -382,6 +441,9 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
         _edge_agent_id: &str,
         _result_json: &str,
     ) -> Result<bool, String> {
+        Err("edge dispatch service not configured".to_string())
+    }
+    async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
         Err("edge dispatch service not configured".to_string())
     }
     async fn wait_result(

@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::server::tool_transport::{
+    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
+    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE,
+};
 use astra_services::EvaluationService;
 use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::runs::ToolOutputBatchItem;
@@ -40,15 +44,32 @@ pub(crate) enum TurnToolPhaseControl {
     Return(AgenticLoopOutcome),
 }
 
-fn edge_round_contains_detached_bash(turn_result: &super::host::HostTurnResult) -> bool {
-    turn_result.edge_tool_round.iter().any(|edge_result| {
-        edge_result.tool == "bash"
-            && edge_result
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("bash_detached"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
+
+fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<String> {
+    tool_results.iter().find_map(|result| {
+        let result = result.as_object()?;
+        let error_kind = result.get("error_kind").and_then(Value::as_str);
+        let reason = result
+            .get("reason")
+            .and_then(Value::as_str)
+            .or(error_kind)?;
+        let blocked = result
+            .get("blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !blocked {
+            return None;
+        }
+        match error_kind.or(Some(reason)) {
+            Some(
+                TOOL_ERROR_KIND_EXECUTOR_OFFLINE
+                | TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+                | TOOL_ERROR_KIND_FALLBACK_DISABLED
+                | TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE,
+            ) => Some(reason.to_string()),
+            _ => None,
+        }
     })
 }
 
@@ -1208,6 +1229,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await;
     }
 
+    if let Some(reason) = execution_boundary_blocked_wait_reason(&new_tool_results) {
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
+            reason,
+        )));
+    }
+
     let _ = evo_records_before;
 
     if state.step_signal_collector.is_some() || state.tactical_adapter.is_some() {
@@ -1284,17 +1314,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     record_edge_tool_observability(state, &turn_result.edge_tool_round);
-
-    if edge_round_contains_detached_bash(&turn_result) {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        state.telemetry.completed_turns_for_tuning += 1;
-        maybe_run_tuning_cycle(state);
-        let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
-        apply_per_turn_adaptation(state, turn_tokens);
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
-    }
 
     if let Some(ref registry) = state.skills.registry_for_activation {
         let mut any_newly_activated = false;
@@ -1775,6 +1794,68 @@ mod tests {
             None,
         );
         assert!(tool_record_was_rejected(&rec));
+    }
+
+    #[test]
+    fn execution_boundary_blocked_result_waits_the_loop() {
+        let results = vec![json!({
+            "tool_call_id": "call-edge-offline",
+            "name": "bash",
+            "result": "edge offline",
+            "blocked": true,
+            "error_kind": "executor_offline",
+            "reason": "executor_offline"
+        })];
+
+        assert_eq!(
+            execution_boundary_blocked_wait_reason(&results).as_deref(),
+            Some("executor_offline")
+        );
+    }
+
+    #[test]
+    fn approval_blocked_result_does_not_wait_the_loop() {
+        let results = vec![json!({
+            "tool_call_id": "call-approval-timeout",
+            "name": "bash",
+            "result": "approval timed out",
+            "blocked": true,
+            "error_kind": "approval_timeout",
+            "reason": "approval_timeout"
+        })];
+
+        assert!(execution_boundary_blocked_wait_reason(&results).is_none());
+    }
+
+    #[test]
+    fn unavailable_workspace_executor_waits_the_loop() {
+        let results = vec![json!({
+            "tool_call_id": "call-workspace-unavailable",
+            "name": "bash",
+            "result": "workspace executor unavailable",
+            "blocked": true,
+            "error_kind": "workspace_executor_unavailable",
+            "reason": "workspace_executor_unavailable"
+        })];
+
+        assert_eq!(
+            execution_boundary_blocked_wait_reason(&results).as_deref(),
+            Some("workspace_executor_unavailable")
+        );
+    }
+
+    #[test]
+    fn non_blocked_transport_error_does_not_wait_the_loop() {
+        let results = vec![json!({
+            "tool_call_id": "call-transport-warning",
+            "name": "bash",
+            "result": "transport warning",
+            "blocked": false,
+            "error_kind": "transport_disconnected",
+            "reason": "transport_disconnected"
+        })];
+
+        assert!(execution_boundary_blocked_wait_reason(&results).is_none());
     }
 
     #[test]
