@@ -184,40 +184,49 @@ mod tests {
     }
 
     #[test]
-    fn select_mode_finds_exact_tool() {
+    fn select_mode_behavior() {
         let schemas = sample_schemas();
+
+        // Exact match — finds tool, no missing
         let result = tool_search(&schemas, &json!({"query": "select:bash"}));
         assert!(result.contains("bash"));
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["missing"].as_array().unwrap().is_empty());
-    }
 
-    #[test]
-    fn select_mode_reports_missing() {
-        let schemas = sample_schemas();
+        // Missing tool
         let result = tool_search(&schemas, &json!({"query": "select:nonexistent"}));
         assert!(result.contains("nonexistent"));
+
+        // Missing reported verbatim
+        let schemas: Vec<Value> = vec![json!({
+            "function": {"name": "read_file", "description": "rf"}
+        })];
+        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let missing = parsed["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].as_str(), Some("spawn_agent"));
+
+        // Legacy alias not resolved
+        let schemas = vec![json!({
+            "function": {"name": "agent", "description": "spawn/list agents", "parameters": {"type":"object"}}
+        })];
+        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["matches"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["missing"][0].as_str(), Some("spawn_agent"));
     }
 
     #[test]
-    fn empty_query_returns_error() {
+    fn error_queries_return_error() {
+        // Empty or whitespace-only queries must error — the contract is
+        // "missing query = error".
         let schemas = sample_schemas();
-        let result = tool_search(&schemas, &json!({"query": ""}));
-        assert!(result.contains("Error"));
-    }
-
-    #[test]
-    fn whitespace_only_query_returns_error() {
-        // Previously: `!q.is_empty()` passed for "   ", then q.trim() handed
-        // an empty string to the keyword scorer, which returned an empty
-        // matches array — not an error. The contract is "missing query =
-        // error", so whitespace-only must take the same error path.
-        let schemas = sample_schemas();
-        for q in ["   ", "\t", "\n\n", " \t \n "] {
+        for q in &["", "   ", "\t", "\n\n", " \t \n "] {
             let result = tool_search(&schemas, &json!({"query": q}));
             assert!(
                 result.contains("Error"),
-                "whitespace-only query {q:?} must error, got: {result}"
+                "query {q:?} must error, got: {result}"
             );
         }
     }
@@ -247,22 +256,27 @@ mod tests {
     }
 
     #[test]
-    fn select_mode_returns_full_parameters_schema() {
+    fn select_vs_keyword_params() {
+        // select: mode returns full parameters so the LLM can call the tool;
+        // keyword mode omits parameters to stay compact.
         let schemas = schemas_with_params();
+
         let result = tool_search(&schemas, &json!({"query": "select:read_file"}));
         let parsed: Value = serde_json::from_str(&result).expect("valid json");
         let first = &parsed["matches"][0];
-        // Full parameters object must be present so the LLM can call the tool.
-        assert!(
-            first.get("parameters").is_some(),
-            "select mode must return full parameters, got: {result}"
-        );
+        assert!(first.get("parameters").is_some());
         let params = &first["parameters"];
         assert!(params["properties"]["path"]["type"].as_str() == Some("string"));
+
+        let result = tool_search(&schemas, &json!({"query": "file"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["matches"][0].get("parameters").is_none());
     }
 
     #[test]
-    fn select_mode_returns_full_description_not_truncated() {
+    fn select_vs_keyword_description() {
+        // select: returns full description (LLM invoked it explicitly);
+        // keyword search truncates for compact browsing.
         let long_desc = "x".repeat(500);
         let schemas = vec![json!({
             "type": "function",
@@ -272,80 +286,17 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })];
+
         let result = tool_search(&schemas, &json!({"query": "select:big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
-        // Full description for select: mode (LLM just invoked it explicitly,
-        // we owe it the whole thing — no ellipsis truncation).
-        assert_eq!(desc.len(), 500, "select mode must not truncate description");
+        assert_eq!(desc.len(), 500);
         assert!(!desc.contains('…'));
-    }
 
-    #[test]
-    fn keyword_search_still_truncates_description() {
-        // Keyword search is a browsing mode — many results, must stay
-        // compact. Truncation is OK here; user/LLM can then select: to
-        // unlock full schema.
-        let long_desc = "x".repeat(500);
-        let schemas = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "big",
-                "description": long_desc,
-                "parameters": {"type": "object", "properties": {}}
-            }
-        })];
         let result = tool_search(&schemas, &json!({"query": "big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
-        assert!(desc.len() <= 200, "keyword search should stay compact");
+        assert!(desc.len() <= 200);
     }
 
-    #[test]
-    fn select_mode_reports_missing_requested_name_verbatim() {
-        let schemas: Vec<Value> = vec![json!({
-            "function": {"name": "read_file", "description": "rf"}
-        })];
-        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let missing = parsed["missing"].as_array().unwrap();
-        assert_eq!(missing.len(), 1, "exactly one missing entry, got: {result}");
-        assert_eq!(
-            missing[0].as_str(),
-            Some("spawn_agent"),
-            "missing names should stay literal once legacy aliasing is removed: {result}"
-        );
-    }
-
-    #[test]
-    fn select_mode_does_not_resolve_removed_legacy_aliases() {
-        let schemas = vec![json!({
-            "function": {"name": "agent", "description": "spawn/list agents", "parameters": {"type":"object"}}
-        })];
-        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["matches"].as_array().unwrap().is_empty(),
-            "removed legacy alias must not silently resolve: {result}"
-        );
-        assert_eq!(
-            parsed["missing"][0].as_str(),
-            Some("spawn_agent"),
-            "the missing list should point at the exact stale name the caller used"
-        );
-    }
-
-    #[test]
-    fn keyword_search_does_not_return_parameters() {
-        // Keyword mode: just name + short desc, no parameters — encourages
-        // the caller to narrow down with select: before committing to the
-        // full schema.
-        let schemas = schemas_with_params();
-        let result = tool_search(&schemas, &json!({"query": "file"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["matches"][0].get("parameters").is_none(),
-            "keyword search should not include full parameters"
-        );
-    }
 }

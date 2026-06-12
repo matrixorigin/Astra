@@ -801,12 +801,14 @@ mod tests {
     #[test]
     fn has_line_number_prefix_cases() {
         // recognizes supported prefixes
-        assert!(has_line_number_prefix("1  let x = 5;"));
-        assert!(has_line_number_prefix("42  let x = 5;"));
+        assert!(has_line_number_prefix("1. hello"));
+        assert!(has_line_number_prefix("42: world"));
+        assert!(has_line_number_prefix("  7| test"));
+        assert!(has_line_number_prefix("15."));
         // rejects non-prefixes
-        assert!(!has_line_number_prefix("  1  let x = 5;"));
-        assert!(!has_line_number_prefix("let x = 5;"));
-        assert!(!has_line_number_prefix(""));
+        assert!(!has_line_number_prefix("hello"));
+        assert!(!has_line_number_prefix("v1.2.3"));
+        assert!(!has_line_number_prefix("  abc: test"));
     }
 
     #[test]

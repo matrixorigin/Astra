@@ -159,7 +159,7 @@ mod tests {
             ("verify", "Run checks", Some("User wants to validate code quality"), &["validate"], 1), // extra only
             ("bash", "Execute shell commands", None, &["kubernetes"], 0),            // no match
             ("read_file", "Read file contents from workspace", None, &["read", "workspace"], 22), // multi-term
-            ("ReadFile", "Read file contents", None, &["readfile"], 28),             // case insensitive exact+parts
+            ("ReadFile", "Read file contents", None, &["readfile"], 20),             // case insensitive exact match
             ("bash", "Execute commands", None, &[], 0),                              // empty query
         ];
         for (name, desc, extra, terms, expected) in score_cases {

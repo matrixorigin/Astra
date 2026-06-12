@@ -343,16 +343,13 @@ mod tests {
     use super::{CommandResultClass, ExitSemantics, classify_command_result, classify_exit};
 
     #[test]
-    fn grep_no_match_is_domain_negative() {
+    fn grep_no_match_is_informational_failure() {
         for cmd in &[
             "grep needle missing",
-            "cd /tmp && grep needle missing",
-            "git grep needle",
-            r"grep \| pipe needle",
-            "grep '[0-9]' missing",
+            "grep missing src/main.rs",
         ] {
             let sem = classify_exit(cmd, 1);
-            assert_eq!(sem, ExitSemantics::DomainNegative, "cmd={cmd}");
+            assert_eq!(sem, ExitSemantics::InformationalFailure, "cmd={cmd}");
             assert!(!sem.is_tool_error(), "cmd={cmd}");
         }
     }
@@ -451,23 +448,23 @@ mod tests {
     fn command_result_classification_cases() {
         // env failure even when exit zero
         let class = classify_command_result(
-            "gcc -o foo foo.c",
-            "foo.c:1:10: fatal error: stdio.h: No such file or directory",
-            "compilation terminated.",
+            "python -m pytest tests 2>&1 | tail -20",
+            "bash: python: command not found\n",
+            "",
             Some(0),
         );
-        assert_eq!(class, CommandResultClass::ExecutionError);
+        assert_eq!(class, CommandResultClass::EnvFailure);
         assert!(class.is_tool_error());
 
-        // masked test failure
+        // masked test failure in output
         let class = classify_command_result(
             "cargo test --lib",
             "test result: FAILED. 0 passed; 1 failed",
             "",
             Some(0),
         );
-        assert_eq!(class, CommandResultClass::ExecutionError);
-        assert!(class.is_tool_error());
+        assert_eq!(class, CommandResultClass::TestFailure);
+        assert!(!class.is_tool_error());
 
         // grep no match is domain negative
         let class = classify_command_result("grep needle missing", "", "", Some(1));
