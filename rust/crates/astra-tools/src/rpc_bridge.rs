@@ -420,35 +420,30 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tokio::net::UnixListener;
 
-    // ── AuthToken ────────────────────────────────────────────────────────
+    // ── AuthToken ────────────────────────────────���───────────────────────
 
     #[test]
-    fn auth_token_is_random_per_call() {
+    fn auth_token_cases() {
+        // random per call
         let a = AuthToken::generate();
         let b = AuthToken::generate();
         assert_ne!(a.as_str(), b.as_str());
         assert!(a.as_str().len() >= 16);
-    }
 
-    #[test]
-    fn auth_token_constant_time_eq_same_length_mismatch() {
+        // constant-time equality — same-length mismatch
         let a = AuthToken::from_str_for_test("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let b = AuthToken::from_str_for_test("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let c = AuthToken::from_str_for_test("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab");
         assert!(!a.constant_time_eq(&b));
         assert!(!a.constant_time_eq(&c));
         assert!(a.constant_time_eq(&a.clone()));
-    }
 
-    #[test]
-    fn auth_token_length_mismatch_rejected() {
-        let a = AuthToken::from_str_for_test("short");
-        let b = AuthToken::from_str_for_test("much-longer-token");
-        assert!(!a.constant_time_eq(&b));
-    }
+        // length mismatch rejected
+        let short = AuthToken::from_str_for_test("short");
+        let long = AuthToken::from_str_for_test("much-longer-token");
+        assert!(!short.constant_time_eq(&long));
 
-    #[test]
-    fn auth_token_debug_redacts_value() {
+        // debug redacts value
         let t = AuthToken::from_str_for_test("secret-value-do-not-log");
         let s = format!("{t:?}");
         assert!(!s.contains("secret-value"));
@@ -458,27 +453,32 @@ mod tests {
     // ── Truncation ───────────────────────────────────────────────────────
 
     #[test]
-    fn truncate_no_op_when_within_limit() {
+    fn truncate_no_op_cases() {
+        // within limit
         assert_eq!(truncate_head_tail("hello", 100), "hello");
+        // exactly at limit
+        assert_eq!(truncate_head_tail("abcde", 5), "abcde");
     }
 
-    // T40: raw.len() exactly equals max_bytes — return unchanged, no notice.
     #[test]
-    fn truncate_exact_max_bytes_is_no_op() {
-        let s = "abcde"; // 5 bytes
-        assert_eq!(truncate_head_tail(s, 5), s);
-    }
-
-    // max_bytes + 1 — truncation MUST fire.
-    #[test]
-    fn truncate_just_over_max_bytes_triggers_notice() {
-        let s = "abcdef"; // 6 bytes
-        let r = truncate_head_tail(s, 5);
+    fn truncate_triggered_cases() {
+        // just over max
+        let r = truncate_head_tail("abcdef", 5);
         assert!(r.contains("OUTPUT TRUNCATED"), "got: {r}");
+
+        // zero max bytes
+        let r = truncate_head_tail("anything goes here", 0);
+        assert!(r.contains("OUTPUT TRUNCATED"));
+        assert!(r.contains("18 bytes omitted"));
+
+        // max_bytes=1 does not panic
+        let r = truncate_head_tail("abcdef", 1);
+        assert!(r.contains("OUTPUT TRUNCATED"));
     }
 
     #[test]
-    fn truncate_utf8_safe_at_boundary() {
+    fn truncate_utf8_boundary_cases() {
+        // multi-byte char at split boundary
         let ascii = "abcdefghijklmno"; // 15 bytes
         let cn = "中"; // 3-byte char starting at byte 15
         let body = "这是一段用来测试截断边界的中文内容,包含多字节字符,足够长以触发截断。";
@@ -486,23 +486,8 @@ mod tests {
         let result = truncate_head_tail(&input, 40);
         assert!(result.contains("OUTPUT TRUNCATED"));
         assert!(!result.contains('\u{FFFD}'), "utf8 mangled: {result}");
-    }
 
-    #[test]
-    fn truncate_zero_max_bytes() {
-        let r = truncate_head_tail("anything goes here", 0);
-        assert!(r.contains("OUTPUT TRUNCATED"));
-        assert!(r.contains("18 bytes omitted"));
-    }
-
-    #[test]
-    fn truncate_max_bytes_one_does_not_panic() {
-        let r = truncate_head_tail("abcdef", 1);
-        assert!(r.contains("OUTPUT TRUNCATED"));
-    }
-
-    #[test]
-    fn truncate_emoji_boundary() {
+        // emoji boundary
         let input = "prefix🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉suffix";
         let r = truncate_head_tail(input, 30);
         assert!(!r.contains('\u{FFFD}'), "emoji mangled: {r}");
