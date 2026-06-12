@@ -288,10 +288,21 @@ mod tests {
     // ─── Mutation classification (regressions from prior code) ───────────
 
     #[test]
-    fn redirect_is_mutating() {
+    fn mutation_classification() {
+        // Redirects
         assert!(intent("echo hi > foo.txt").mutating);
         assert!(intent("echo hi >>foo.txt").mutating);
         assert!(!intent("rg --files | head -n 50").mutating);
+        // Sed
+        assert!(intent("sed -i 's/a/b/' foo.rs").mutating);
+        assert!(!intent("sed -n '1,20p' foo.rs").mutating);
+        // Compound / sudo
+        assert!(intent("cd /tmp && mv x y").mutating);
+        assert!(intent("sudo rm -rf /tmp/foo").mutating);
+        assert!(!intent("cd rust && cat src/lib.rs").mutating);
+        // Package managers
+        assert!(intent("npm install react").mutating);
+        assert!(intent("pnpm install").mutating);
     }
 
     /// Regression: benign fd redirects must NOT be classified as mutating.
@@ -328,8 +339,6 @@ mod tests {
         assert!(!intent("cargo check &>> /tmp/rm_me.log && echo done").mutating);
         // Malformed tail (no target after `2>`): conservative contract —
         // the dangling `>` is left in place so it trips the mutation scan.
-        // Twin of `cloud_approval_policy::…::benign_fd_redirect_target_filenames_are_inert`;
-        // if you change this, change both sides.
         assert!(intent("cargo check 2>").mutating);
         // Non-ASCII filename: UTF-8 sequence must survive the byte-level
         // scan intact (no mojibake that could hit a write-verb substring).
@@ -349,8 +358,7 @@ mod tests {
         assert!(intent("cargo check >").mutating);
         assert!(intent("cargo check 2>>").mutating);
         // Bash combined redirect variants must also fall back to mutating
-        // when dangling. Previously `.replace("&>", " ")` silently ate the
-        // operator and made `cargo check &>` look read-only.
+        // when dangling.
         assert!(intent("cargo check &>").mutating);
         assert!(intent("cargo check &>>").mutating);
     }
@@ -372,29 +380,11 @@ mod tests {
         assert!(!intent("true | 2>/tmp/log cargo check").mutating);
     }
 
-    #[test]
-    fn sed_in_place_is_mutating_sed_n_is_not() {
-        assert!(intent("sed -i 's/a/b/' foo.rs").mutating);
-        assert!(!intent("sed -n '1,20p' foo.rs").mutating);
-    }
-
-    #[test]
-    fn compound_and_sudo_prefixes_handled() {
-        assert!(intent("cd /tmp && mv x y").mutating);
-        assert!(intent("sudo rm -rf /tmp/foo").mutating);
-        assert!(!intent("cd rust && cat src/lib.rs").mutating);
-    }
-
-    #[test]
-    fn install_commands_are_mutating() {
-        assert!(intent("npm install react").mutating);
-        assert!(intent("pnpm install").mutating);
-    }
-
     // ─── Read-target extraction (data-driven) ───────────────────────────
 
     #[test]
-    fn test_read_verbs_extract_targets() {
+    fn read_target_extraction() {
+        // Data-driven: single-segment read verbs
         let cases: &[(&str, &[&str], bool)] = &[
             (
                 "cat rust/crates/astra-sandbox/src/policy.rs",
@@ -413,11 +403,8 @@ mod tests {
             assert_eq!(r.mutating, *is_mutating, "mutating mismatch for: {cmd}");
             assert_eq!(r.read_targets, *expected, "targets mismatch for: {cmd}");
         }
-    }
 
-    #[test]
-    fn test_compound_read_targets() {
-        // &&, pipe, mixed mutating — read targets harvested correctly.
+        // Compound: &&, pipe, mixed mutating
         let r = intent("cat a.rs && cat b.rs");
         assert!(!r.mutating);
         assert_eq!(r.read_targets, vec!["a.rs", "b.rs"]);

