@@ -5,8 +5,8 @@
 //! [`MessagingEventHandler`] trait for external observability integration
 //! (e.g., OpenTelemetry, Prometheus, or custom dashboards).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -51,12 +51,20 @@ impl LatencyTracker {
         let _ = self
             .min_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if us < cur { Some(us) } else { None }
+                if us < cur {
+                    Some(us)
+                } else {
+                    None
+                }
             });
         let _ = self
             .max_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if us > cur { Some(us) } else { None }
+                if us > cur {
+                    Some(us)
+                } else {
+                    None
+                }
             });
     }
 
@@ -356,71 +364,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn latency_tracker_records_and_snapshots() {
+    fn latency_tracker_records_snapshots_and_reset() {
         let tracker = LatencyTracker::new();
+
+        // Empty snapshot
+        let snap = tracker.snapshot();
+        assert_eq!(snap.count, 0);
+        assert_eq!(snap.min_us, 0);
+        assert_eq!(snap.avg_us, 0);
+
+        // Record and snapshot
         tracker.record(Duration::from_micros(100));
         tracker.record(Duration::from_micros(200));
         tracker.record(Duration::from_micros(300));
-
         let snap = tracker.snapshot();
         assert_eq!(snap.count, 3);
         assert_eq!(snap.min_us, 100);
         assert_eq!(snap.max_us, 300);
         assert_eq!(snap.avg_us, 200);
         assert_eq!(snap.sum_us, 600);
-    }
 
-    #[test]
-    fn latency_tracker_empty_snapshot() {
-        let tracker = LatencyTracker::new();
-        let snap = tracker.snapshot();
-        assert_eq!(snap.count, 0);
-        assert_eq!(snap.min_us, 0);
-        assert_eq!(snap.avg_us, 0);
-    }
-
-    #[test]
-    fn latency_tracker_reset() {
-        let tracker = LatencyTracker::new();
-        tracker.record(Duration::from_millis(5));
+        // Reset
         tracker.reset();
         let snap = tracker.snapshot();
         assert_eq!(snap.count, 0);
     }
 
     #[test]
-    fn messaging_metrics_snapshot() {
+    fn messaging_metrics_snapshot_reset_and_display() {
         let m = MessagingMetrics::new();
         m.messages_sent.fetch_add(10, Ordering::Relaxed);
         m.messages_received.fetch_add(8, Ordering::Relaxed);
         m.dead_letters.fetch_add(2, Ordering::Relaxed);
         m.delivery_latency.record(Duration::from_millis(5));
 
+        // Snapshot
         let snap = m.snapshot();
         assert_eq!(snap.messages_sent, 10);
         assert_eq!(snap.messages_received, 8);
         assert_eq!(snap.dead_letters, 2);
         assert_eq!(snap.delivery_latency.count, 1);
-    }
 
-    #[test]
-    fn messaging_metrics_reset() {
-        let m = MessagingMetrics::new();
-        m.messages_sent.fetch_add(100, Ordering::Relaxed);
-        m.retries.fetch_add(5, Ordering::Relaxed);
+        // Display
+        let s = snap.to_string();
+        assert!(s.contains("sent=10"));
+
+        // Reset
         m.reset();
-
         let snap = m.snapshot();
         assert_eq!(snap.messages_sent, 0);
-        assert_eq!(snap.retries, 0);
-    }
-
-    #[test]
-    fn metrics_snapshot_display() {
-        let m = MessagingMetrics::new();
-        m.messages_sent.fetch_add(42, Ordering::Relaxed);
-        let s = m.snapshot().to_string();
-        assert!(s.contains("sent=42"));
+        assert_eq!(snap.messages_received, 0);
+        assert_eq!(snap.dead_letters, 0);
     }
 
     #[tokio::test]

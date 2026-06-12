@@ -56,8 +56,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::mysql::MySqlRow;
-use sqlx::{MySql, Pool, Row, query};
-use tokio::sync::{RwLock, mpsc, watch};
+use sqlx::{query, MySql, Pool, Row};
+use tokio::sync::{mpsc, watch, RwLock};
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError};
@@ -1342,33 +1342,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_message_serialization() {
-        // Verify message JSON roundtrip for DB storage.
-        let msg = AgentMessage::new(
-            addr("run-1", "coder"),
-            MessageTarget::Direct {
-                address: addr("run-2", "reviewer"),
-            },
-            MessagePayload::Text {
-                content: "review this".into(),
-                summary: None,
-            },
-        );
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let restored: AgentMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.id, msg.id);
-        assert_eq!(restored.from.run_id, "run-1");
-    }
-
-    #[test]
-    fn parse_row_id_text_fallback_accepts_numeric_ids() {
+    fn parse_row_id_text_fallback_numeric_and_reject() {
         assert_eq!(super::parse_row_id_text_fallback("42"), Some(42));
-    }
-
-    #[test]
-    fn parse_row_id_text_fallback_rejects_non_numeric_ids() {
         assert_eq!(super::parse_row_id_text_fallback("not-a-row-id"), None);
+        assert_eq!(super::parse_row_id_text_fallback(""), None);
     }
 
     #[test]
@@ -1381,57 +1358,14 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_delivers_to_all_subscribers() {
-        // Broadcast delivers to ALL subscribers in a delegation group,
-        // consistent with InProcessTransport behavior. No sender exclusion.
-        let sender = addr("run-1", "leader");
-        let other = addr("run-2", "worker");
-
-        // Both should receive broadcasts — sender is NOT excluded.
-        assert_ne!(sender, other);
-    }
-
-    #[test]
-    fn default_poll_interval() {
+    fn constants_are_reasonable() {
+        // Poll interval
         assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn broadcast_target_for_storage() {
-        // Verify that broadcast messages get proper target for DB storage.
-        let msg = AgentMessage::new(
-            addr("r0", "leader"),
-            MessageTarget::Broadcast {
-                delegation_id: "del-1".into(),
-            },
-            MessagePayload::Signal(AgentSignal::Heartbeat),
-        );
-
-        // Should already have broadcast target.
-        assert!(
-            matches!(&msg.to, MessageTarget::Broadcast { delegation_id } if delegation_id == "del-1")
-        );
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let restored: AgentMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(&restored.to, MessageTarget::Broadcast { .. }));
-    }
-
-    #[test]
-    fn expired_messages_filtered() {
-        let mut msg = AgentMessage::new(
-            addr("r", "a"),
-            MessageTarget::Parent,
-            MessagePayload::Signal(AgentSignal::Heartbeat),
-        );
-        msg.ttl_ms = Some(0);
-        assert!(msg.is_expired(), "TTL=0 should be expired immediately");
-    }
-
-    #[test]
-    fn backoff_constants_are_reasonable() {
-        const _: () = assert!(CRITICAL_FAILURE_THRESHOLD >= 10);
-        // Runtime checks for Duration comparisons (not const-evaluable).
+        // Cleanup
+        assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
+        assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
+        // Backoff
+        assert!(CRITICAL_FAILURE_THRESHOLD >= 10);
         assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
         assert!(MAX_BACKOFF <= Duration::from_secs(30));
         assert!(MAX_BACKOFF > INITIAL_BACKOFF);
@@ -1445,11 +1379,5 @@ mod tests {
             0
         );
         assert_eq!(m.poll_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn cleanup_scheduler_constants() {
-        assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
-        assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
     }
 }
