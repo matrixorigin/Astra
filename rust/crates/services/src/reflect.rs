@@ -1208,14 +1208,26 @@ mod tests {
     }
 
     #[test]
-    fn insight_high_error_rate() {
-        let overview = make_overview(100, 40, vec![], 5, None);
-        let insights = generate_insights(&overview, &[], &[]);
-        assert!(
-            insights
-                .iter()
-                .any(|i| i.severity == "critical" && i.category == "error_pattern")
-        );
+    fn insight_error_rate_thresholds() {
+        // high (critical, >=40%)
+        let ov = make_overview(100, 40, vec![], 5, None);
+        let ins = generate_insights(&ov, &[], &[]);
+        assert!(ins.iter().any(|i| i.severity == "critical" && i.category == "error_pattern"));
+
+        // elevated (warning, 20%)
+        let ov = make_overview(100, 20, vec![], 5, None);
+        let ins = generate_insights(&ov, &[], &[]);
+        assert!(ins.iter().any(|i| i.severity == "warning" && i.category == "error_pattern"));
+
+        // low (no warning)
+        let ov = make_overview(100, 5, vec![], 5, None);
+        let ins = generate_insights(&ov, &[], &[]);
+        assert!(!ins.iter().any(|i| i.category == "error_pattern"));
+
+        // 100% (critical)
+        let ov = make_overview(10, 10, vec![], 0, None);
+        let ins = generate_insights(&ov, &[], &[]);
+        assert!(ins.iter().any(|i| i.severity == "critical" && i.category == "error_pattern"));
     }
 
     #[test]
@@ -1238,56 +1250,39 @@ mod tests {
 
     #[test]
     fn insight_repeated_tool_failure() {
-        let overview = make_overview(50, 5, vec![], 5, None);
+        // high count triggers insight
+        let ov = make_overview(50, 5, vec![], 5, None);
         let patterns = vec![ErrorPattern {
             skill_name: "bash".into(),
             event_type: "tool_error".into(),
             fail_count: 5,
             sample_error: "permission denied".into(),
         }];
-        let insights = generate_insights(&overview, &patterns, &[]);
-        assert!(
-            insights
-                .iter()
-                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
-        );
-    }
+        let ins = generate_insights(&ov, &patterns, &[]);
+        assert!(ins.iter().any(|i| i.category == "tool_usage" && i.message.contains("bash")));
 
-    #[test]
-    fn insight_no_failure_warning_for_low_count() {
-        let overview = make_overview(50, 2, vec![], 5, None);
+        // low count does not trigger
         let patterns = vec![ErrorPattern {
             skill_name: "bash".into(),
             event_type: "tool_error".into(),
             fail_count: 2,
             sample_error: "not found".into(),
         }];
-        let insights = generate_insights(&overview, &patterns, &[]);
-        assert!(
-            !insights
-                .iter()
-                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
-        );
+        let ins = generate_insights(&ov, &patterns, &[]);
+        assert!(!ins.iter().any(|i| i.category == "tool_usage" && i.message.contains("bash")));
     }
 
     #[test]
     fn insight_over_reliance() {
-        let overview = make_overview(100, 0, vec![("bash".into(), 75)], 5, None);
-        let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.message.contains("Over-reliance")));
-    }
+        // over-reliance detected
+        let ov = make_overview(100, 0, vec![("bash".into(), 75)], 5, None);
+        let ins = generate_insights(&ov, &[], &[]);
+        assert!(ins.iter().any(|i| i.message.contains("Over-reliance")));
 
-    #[test]
-    fn insight_no_over_reliance_when_balanced() {
-        let overview = make_overview(
-            100,
-            0,
-            vec![("bash".into(), 30), ("grep".into(), 25)],
-            5,
-            None,
-        );
-        let insights = generate_insights(&overview, &[], &[]);
-        assert!(!insights.iter().any(|i| i.message.contains("Over-reliance")));
+        // balanced usage — no warning
+        let ov = make_overview(100, 0, vec![("bash".into(), 30), ("grep".into(), 25)], 5, None);
+        let ins = generate_insights(&ov, &[], &[]);
+        assert!(!ins.iter().any(|i| i.message.contains("Over-reliance")));
     }
 
     #[test]
@@ -1378,20 +1373,15 @@ mod tests {
     }
 
     #[test]
-    fn compute_duration_basic() {
+    fn test_compute_duration_minutes() {
+        // basic
         let d = compute_duration_minutes(Some("2026-03-25 08:00:00"), Some("2026-03-25 08:18:30"));
         assert!((d.unwrap() - 18.5).abs() < 0.01);
-    }
 
-    #[test]
-    fn compute_duration_none_on_missing() {
+        // missing / empty
         assert!(compute_duration_minutes(None, Some("2026-03-25 08:00:00")).is_none());
         assert!(compute_duration_minutes(Some("2026-03-25 08:00:00"), None).is_none());
         assert!(compute_duration_minutes(None, None).is_none());
-    }
-
-    #[test]
-    fn compute_duration_none_on_empty() {
         assert!(compute_duration_minutes(Some(""), Some("")).is_none());
     }
 

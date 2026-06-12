@@ -889,37 +889,17 @@ mod tests {
     }
 
     #[test]
-    fn from_journal_event_with_redact_off_keeps_raw_content() {
+    fn from_journal_event_redact_behavior() {
         let event = crate::session_journal::JournalEvent::turn(
-            Some("sess-r"),
-            1,
-            Some("gpt-4"),
-            "hello world",
-            "ok",
-            0,
-            10,
-            5,
-            100,
+            Some("sess-r"), 1, Some("gpt-4"), "hello world", "ok", 0, 10, 5, 100,
         );
-        let ingestion = IngestionEvent::from_journal_event_with_redact(&event, "u1", false);
-        assert_eq!(ingestion.content.as_deref(), Some("hello world"));
-    }
+        // Redact off
+        let off = IngestionEvent::from_journal_event_with_redact(&event, "u1", false);
+        assert_eq!(off.content.as_deref(), Some("hello world"));
 
-    #[test]
-    fn from_journal_event_with_redact_on_replaces_content_with_marker() {
-        let event = crate::session_journal::JournalEvent::turn(
-            Some("sess-r"),
-            1,
-            Some("gpt-4"),
-            "hello world",
-            "ok",
-            0,
-            10,
-            5,
-            100,
-        );
-        let ingestion = IngestionEvent::from_journal_event_with_redact(&event, "u1", true);
-        let content = ingestion.content.expect("content present");
+        // Redact on
+        let on = IngestionEvent::from_journal_event_with_redact(&event, "u1", true);
+        let content = on.content.expect("content present");
         assert!(!content.contains("hello world"));
         assert!(content.starts_with("<redacted: len=11 sha="));
     }
@@ -963,34 +943,16 @@ mod tests {
     }
 
     #[test]
-    fn iso8601_to_mysql_datetime_rfc3339() {
-        assert_eq!(
-            iso8601_to_mysql_datetime("2025-01-15T10:30:00+00:00"),
-            "2025-01-15 10:30:00.000000"
-        );
-    }
-
-    #[test]
-    fn iso8601_to_mysql_datetime_with_micros() {
-        assert_eq!(
-            iso8601_to_mysql_datetime("2025-01-15T10:30:00.123456+00:00"),
-            "2025-01-15 10:30:00.123456"
-        );
-    }
-
-    #[test]
-    fn iso8601_to_mysql_datetime_zulu() {
-        // chrono parses Z suffix as UTC
-        assert_eq!(
-            iso8601_to_mysql_datetime("2025-01-15T10:30:00Z"),
-            "2025-01-15 10:30:00.000000"
-        );
-    }
-
-    #[test]
-    fn iso8601_to_mysql_datetime_fallback() {
-        // Invalid input returns original string
-        assert_eq!(iso8601_to_mysql_datetime("not-a-date"), "not-a-date");
+    fn test_iso8601_to_mysql_datetime() {
+        let cases = vec![
+            ("2025-01-15T10:30:00+00:00", "2025-01-15 10:30:00.000000"),
+            ("2025-01-15T10:30:00.123456+00:00", "2025-01-15 10:30:00.123456"),
+            ("2025-01-15T10:30:00Z", "2025-01-15 10:30:00.000000"),
+            ("not-a-date", "not-a-date"),
+        ];
+        for (input, expect) in cases {
+            assert_eq!(iso8601_to_mysql_datetime(input), expect);
+        }
     }
 
     #[test]

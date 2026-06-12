@@ -505,7 +505,8 @@ mod tests {
     // ─── Project detection tests ────────────────────────────────────────────
 
     #[test]
-    fn detect_build_cmd_rust() {
+    fn detect_build_commands_by_language() {
+        // Rust
         let det = rust_detection();
         assert_eq!(detect_build_command(&det), Some("cargo build".into()));
         assert_eq!(
@@ -516,18 +517,32 @@ mod tests {
             detect_lint_command(&det),
             Some("cargo clippy --workspace -- -D warnings".into())
         );
-    }
 
-    #[test]
-    fn detect_build_cmd_node() {
+        // Node
         let det = node_detection();
         assert_eq!(detect_build_command(&det), Some("npm run build".into()));
         assert_eq!(detect_test_command(&det), Some("npx jest".into()));
         assert_eq!(detect_lint_command(&det), Some("npm run lint".into()));
-    }
 
-    #[test]
-    fn detect_build_cmd_override() {
+        // Go
+        let det = ProjectDetection {
+            has_go_mod: true,
+            ..Default::default()
+        };
+        assert_eq!(detect_build_command(&det), Some("go build ./...".into()));
+        assert_eq!(detect_test_command(&det), Some("go test ./...".into()));
+        assert_eq!(detect_lint_command(&det), Some("golangci-lint run".into()));
+
+        // Python
+        let det = ProjectDetection {
+            has_pyproject_toml: true,
+            ..Default::default()
+        };
+        assert_eq!(detect_build_command(&det), None);
+        assert_eq!(detect_test_command(&det), Some("pytest".into()));
+        assert_eq!(detect_lint_command(&det), Some("ruff check .".into()));
+
+        // Override
         let det = ProjectDetection {
             has_cargo_toml: true,
             build_cmd_override: Some("make build".into()),
@@ -536,27 +551,6 @@ mod tests {
         };
         assert_eq!(detect_build_command(&det), Some("make build".into()));
         assert_eq!(detect_test_command(&det), Some("make test".into()));
-    }
-
-    #[test]
-    fn detect_build_cmd_python() {
-        let det = ProjectDetection {
-            has_pyproject_toml: true,
-            ..Default::default()
-        };
-        assert_eq!(detect_build_command(&det), None);
-        assert_eq!(detect_test_command(&det), Some("pytest".into()));
-        assert_eq!(detect_lint_command(&det), Some("ruff check .".into()));
-    }
-
-    #[test]
-    fn detect_test_cmd_bare_python() {
-        let det = ProjectDetection {
-            has_test_py: true,
-            ..Default::default()
-        };
-        assert_eq!(detect_build_command(&det), None);
-        assert_eq!(detect_test_command(&det), Some("pytest".into()));
     }
 
     #[test]
@@ -569,17 +563,6 @@ mod tests {
         assert!(det.has_test_py, "should detect test_*.py files");
         assert_eq!(detect_test_command(&det), Some("pytest".into()));
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn detect_build_cmd_go() {
-        let det = ProjectDetection {
-            has_go_mod: true,
-            ..Default::default()
-        };
-        assert_eq!(detect_build_command(&det), Some("go build ./...".into()));
-        assert_eq!(detect_test_command(&det), Some("go test ./...".into()));
-        assert_eq!(detect_lint_command(&det), Some("golangci-lint run".into()));
     }
 
     // ─── Contract generation tests ──────────────────────────────────────────
@@ -762,18 +745,14 @@ mod tests {
         }];
         let scope = cg.infer_scope("add a feature", &subtasks);
         assert!(scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
-        assert!(
-            scope
-                .out_of_scope
-                .iter()
-                .any(|s| s.contains("Documentation"))
-        );
-        assert!(
-            scope
-                .assumptions
-                .iter()
-                .any(|s| s.contains("Rust toolchain"))
-        );
+        assert!(scope
+            .out_of_scope
+            .iter()
+            .any(|s| s.contains("Documentation")));
+        assert!(scope
+            .assumptions
+            .iter()
+            .any(|s| s.contains("Rust toolchain")));
     }
 
     #[test]

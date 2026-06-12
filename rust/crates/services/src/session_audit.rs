@@ -6,13 +6,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_trait::async_trait;
-use axum::{Json, http::StatusCode};
+use axum::{http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::{query, Row};
 
 use crate::cost_ledger::{CostLedger, CostLedgerEntry};
 use crate::models::PricingData;
-use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
+use astra_core::{error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool};
 
 fn normalize_tool_name(name: String) -> String {
     let trimmed = name.trim_matches('"').trim();
@@ -2543,77 +2543,44 @@ mod tests {
     // ── Unhappy path / edge-case tests ──
 
     #[test]
-    fn normalize_tool_name_empty() {
-        assert_eq!(normalize_tool_name("".into()), "unknown");
+    fn test_normalize_tool_name() {
+        let cases = vec![
+            ("", "unknown"),
+            ("   ", "unknown"),
+            ("\"bash\"", "bash"),
+            ("\"\"", "unknown"),
+            ("write_file", "write_file"),
+        ];
+        for (input, expect) in cases {
+            assert_eq!(normalize_tool_name(input.into()), expect);
+        }
     }
 
     #[test]
-    fn normalize_tool_name_whitespace() {
-        assert_eq!(normalize_tool_name("   ".into()), "unknown");
-    }
-
-    #[test]
-    fn normalize_tool_name_quoted() {
-        assert_eq!(normalize_tool_name("\"bash\"".into()), "bash");
-    }
-
-    #[test]
-    fn normalize_tool_name_double_quoted_empty() {
-        assert_eq!(normalize_tool_name("\"\"".into()), "unknown");
-    }
-
-    #[test]
-    fn normalize_tool_name_normal() {
-        assert_eq!(normalize_tool_name("write_file".into()), "write_file");
-    }
-
-    #[test]
-    fn truncate_str_empty() {
+    fn test_truncate_str() {
+        // empty
         assert_eq!(truncate_str("", 10), "");
-    }
-
-    #[test]
-    fn truncate_str_zero_max_len() {
-        let result = truncate_str("hello", 0);
-        assert_eq!(result, "…");
-    }
-
-    #[test]
-    fn truncate_str_exact_boundary() {
+        // zero max_len
+        assert_eq!(truncate_str("hello", 0), "…");
+        // exact boundary
         assert_eq!(truncate_str("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_str_multibyte_no_panic() {
-        // 4 CJK chars = 12 bytes, truncate at 7 bytes → must find char boundary
+        // multibyte: 4 CJK chars = 12 bytes, truncate at 7 bytes → "你好…"
         let result = truncate_str("你好世界", 7);
         assert!(result.ends_with('…'));
-        // Should be "你好…" (6 bytes for 2 CJK + 3 bytes for …)
     }
 
     #[test]
-    fn extract_tool_calls_null_metadata() {
-        let meta = serde_json::json!(null);
-        let calls = extract_tool_calls_from_metadata(&meta);
-        assert!(calls.is_empty());
-    }
+    fn test_extract_tool_calls_from_metadata() {
+        // null / non-array / empty
+        for json_val in [
+            serde_json::json!(null),
+            serde_json::json!({"tool_calls": "not_an_array"}),
+            serde_json::json!({"tool_calls": []}),
+        ] {
+            assert!(extract_tool_calls_from_metadata(&json_val).is_empty());
+        }
 
-    #[test]
-    fn extract_tool_calls_non_array_tool_calls() {
-        let meta = serde_json::json!({"tool_calls": "not_an_array"});
-        let calls = extract_tool_calls_from_metadata(&meta);
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn extract_tool_calls_empty_array() {
-        let meta = serde_json::json!({"tool_calls": []});
-        let calls = extract_tool_calls_from_metadata(&meta);
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn extract_tool_calls_missing_fields_default() {
+        // missing fields default
         let meta = serde_json::json!({"tool_calls": [{}]});
         let calls = extract_tool_calls_from_metadata(&meta);
         assert_eq!(calls.len(), 1);

@@ -3186,61 +3186,39 @@ mod tests {
     }
 
     #[test]
-    fn text_delta() {
+    fn sse_text_events() {
+        // text_delta
         let out = transform_run_event_for_client(make_event("text_delta", json!({"chunk": "hi"})));
         assert_eq!(out["type"], "text_delta");
         assert_eq!(out["content"], "hi");
-    }
-
-    #[test]
-    fn text_delta_missing_chunk() {
+        // text_delta missing chunk
         let out = transform_run_event_for_client(make_event("text_delta", json!({})));
         assert_eq!(out["content"], "");
-    }
-
-    #[test]
-    fn assistant_delta_maps_to_text_delta() {
-        let out =
-            transform_run_event_for_client(make_event("assistant_delta", json!({"text": "hi"})));
+        // assistant_delta maps to text_delta
+        let out = transform_run_event_for_client(make_event("assistant_delta", json!({"text": "hi"})));
         assert_eq!(out["type"], "text_delta");
         assert_eq!(out["content"], "hi");
-    }
-
-    #[test]
-    fn text_done() {
-        let out =
-            transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
+        // text_done
+        let out = transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
         assert_eq!(out["type"], "text_done");
         assert_eq!(out["full_text"], "all");
     }
 
     #[test]
-    fn reasoning_message_content() {
-        let out = transform_run_event_for_client(make_event(
-            "reasoning_message_content",
-            json!({"content": "think"}),
-        ));
+    fn sse_thinking_events() {
+        // reasoning_message_content
+        let out = transform_run_event_for_client(make_event("reasoning_message_content", json!({"content": "think"})));
         assert_eq!(out["type"], "reasoning_message_content");
         assert_eq!(out["content"], "think");
-    }
-
-    #[test]
-    fn thinking_delta() {
-        let out =
-            transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
+        // thinking_delta
+        let out = transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
         assert_eq!(out["type"], "thinking_delta");
         assert_eq!(out["content"], "t");
-    }
-
-    #[test]
-    fn thinking_done() {
-        let out = transform_run_event_for_client(make_event("thinking_done", json!({})));
+        // thinking_done
+        let out = transform_run_event_for_client(make_event("thinking_done", json!({"full_text": "all think"})));
         assert_eq!(out["type"], "thinking_done");
-    }
-
-    #[test]
-    fn reasoning_done() {
-        let out = transform_run_event_for_client(make_event("reasoning_done", json!({})));
+        // reasoning_done
+        let out = transform_run_event_for_client(make_event("reasoning_done", json!({"full_text": "reason"})));
         assert_eq!(out["type"], "reasoning_done");
     }
 
@@ -3391,80 +3369,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_type_dropped_by_allowlist() {
-        // wip-7: the transform is an allowlist, not a passthrough —
-        // unknown `event_type` values return `Value::Null` so the
-        // caller in `run_handlers` can skip them entirely. This
-        // blocks future internal events from accidentally leaking to
-        // external API clients.
-        let out = transform_run_event_for_client(make_event("custom_event", json!({})));
-        assert!(
-            out.is_null(),
-            "unknown event_type must be dropped by the allowlist, got: {out}"
-        );
-    }
+    fn unknown_and_missing_events_are_dropped() {
+        // unknown event_type (with and without data)
+        assert!(transform_run_event_for_client(make_event("custom_event", json!({}))).is_null());
+        assert!(transform_run_event_for_client(make_event("team_prepare", json!({"delegation_id":"d1","phase":"prepare"}))).is_null());
 
-    #[test]
-    fn unknown_event_type_with_data_also_dropped() {
-        // Even when an unknown event carries structured data we'd
-        // want on a passthrough, the allowlist still drops it — the
-        // point is that internal events must be explicitly opted in.
-        let out = transform_run_event_for_client(make_event(
-            "team_prepare",
-            json!({"delegation_id": "d1", "phase": "prepare"}),
-        ));
-        assert!(out.is_null(), "unknown event_type must be dropped");
-    }
+        // missing event_type AND type
+        assert!(transform_run_event_for_client(json!({"data": {}})).is_null());
 
-    #[test]
-    fn missing_event_type_and_no_type_is_dropped() {
-        // No `event_type` AND no `type` on the wire: treat as malformed
-        // / future schema and drop. Pre-wip-7 this returned an empty
-        // `type:""` synthetic event; wip-7 drops it per allowlist.
-        let out = transform_run_event_for_client(json!({"data": {}}));
-        assert!(out.is_null(), "malformed event must be dropped");
-    }
-
-    #[test]
-    fn missing_data_object() {
+        // missing data object but event_type present
         let out = transform_run_event_for_client(json!({"event_type": "text_delta"}));
         assert_eq!(out["type"], "text_delta");
         assert_eq!(out["content"], "");
     }
 
     #[test]
-    fn already_shaped_client_event_not_in_allowlist_is_dropped() {
-        // wip-7: already-shaped `{"type": ...}` events go through the
-        // external-client allowlist. `injection_freshness` is the
-        // motivating case — it's the internal-diagnostic side-channel
-        // the bridge emits for the CLI's observability hooks. External
-        // API callers should NEVER see it, even when the bridge emits
-        // the fingerprint-only wire shape.
-        let event = json!({
-            "type": "injection_freshness",
-            "channels": [
-                { "tag": "self_awareness", "hash": 0u64, "bytes": 0u64, "is_empty": true }
-            ]
-        });
-        let out = transform_run_event_for_client(event);
-        assert!(
-            out.is_null(),
-            "client-shaped internal event must be dropped by allowlist, got: {out}"
-        );
-    }
+    fn already_shaped_client_events_allowlist() {
+        // not in allowlist → dropped
+        let event = json!({"type": "injection_freshness", "channels": [{"tag":"self_awareness","hash":0u64,"bytes":0u64,"is_empty":true}]});
+        assert!(transform_run_event_for_client(event).is_null(), "client-shaped internal event must be dropped");
 
-    #[test]
-    fn already_shaped_client_event_in_allowlist_passes_through() {
-        // Allowlisted types pass through unchanged so indexing /
-        // downstream decoration (e.g. `run_id` injection in
-        // `run_handlers`) still works.
+        // in allowlist → pass through
         let event = json!({"type": "text_delta", "content": "hello", "index": 3});
-        let out = transform_run_event_for_client(event.clone());
-        assert_eq!(out, event);
-    }
+        assert_eq!(transform_run_event_for_client(event.clone()), event);
 
-    #[test]
-    fn already_shaped_work_surface_tool_events_pass_through() {
+        // work surface tool events → pass through
         let start = json!({"type": "tool_call", "tool_call": {"id": "c1"}});
         let end = json!({"type": "tool_call_end", "call_id": "c1", "result": "ok"});
         assert_eq!(transform_run_event_for_client(start.clone()), start);

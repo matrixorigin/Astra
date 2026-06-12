@@ -1,15 +1,14 @@
 use async_trait::async_trait;
-use axum::{Json, http::StatusCode};
+use axum::{http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::{query, Row};
 use std::collections::{HashMap, HashSet};
 
 use crate::SessionArtifactStore;
 
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool,
     composite_snapshot::{CompositeSnapshot, CompositeSnapshotIndex, StateDiff},
-    error_response, internal_error,
+    error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
 };
 
 const MAX_CHECKPOINT_LIST_ROWS: i32 = 200;
@@ -736,83 +735,69 @@ pub struct SandboxCheckpointRequest {
 mod tests {
     use super::*;
 
-    // ── validate_checkpoint_name ──
+    // ── validate_checkpoint_name (5→1 data-driven) ──
 
     #[test]
-    fn validate_checkpoint_name_valid_names() {
-        assert!(validate_checkpoint_name("my-checkpoint").is_ok());
-        assert!(validate_checkpoint_name("cp_123").is_ok());
-        assert!(validate_checkpoint_name("a").is_ok());
-        assert!(validate_checkpoint_name(&"x".repeat(128)).is_ok());
+    fn test_validate_checkpoint_name() {
+        let name_128 = "x".repeat(128);
+        let name_129 = "x".repeat(129);
+        let cases: Vec<(&str, bool)> = vec![
+            ("my-checkpoint", true),
+            ("cp_123", true),
+            ("a", true),
+            (&name_128, true),
+            ("", false),
+            (&name_129, false),
+            ("my checkpoint", false),
+            ("cp/bad", false),
+            ("cp.dot", false),
+            ("检查点", false),
+        ];
+        for (name, expect_ok) in cases {
+            assert_eq!(
+                validate_checkpoint_name(name).is_ok(),
+                expect_ok,
+                "name={:?} expect_ok={}",
+                name,
+                expect_ok
+            );
+        }
     }
 
+    // ── truncate_content (4→1 data-driven) ──
+
     #[test]
-    fn validate_checkpoint_name_empty() {
-        let err = validate_checkpoint_name("");
-        assert!(err.is_err());
+    fn truncate_content() {
+        let cases = vec![
+            ("hello", 10, "hello"),
+            ("hello", 5, "hello"),
+            ("hello world", 5, "hello..."),
+            ("", 0, ""),
+            ("", 100, ""),
+        ];
+        for (input, max_len, expect) in cases {
+            assert_eq!(super::truncate_content(input, max_len), expect);
+        }
     }
 
-    #[test]
-    fn validate_checkpoint_name_too_long() {
-        assert!(validate_checkpoint_name(&"x".repeat(129)).is_err());
-    }
+    // ── Serialization (2→1 data-driven) ──
 
     #[test]
-    fn validate_checkpoint_name_special_chars() {
-        assert!(validate_checkpoint_name("my checkpoint").is_err());
-        assert!(validate_checkpoint_name("cp/bad").is_err());
-        assert!(validate_checkpoint_name("cp.dot").is_err());
-    }
-
-    #[test]
-    fn validate_checkpoint_name_unicode() {
-        assert!(validate_checkpoint_name("检查点").is_err());
-    }
-
-    // ── truncate_content ──
-
-    #[test]
-    fn truncate_content_short_unchanged() {
-        assert_eq!(truncate_content("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_content_exact_length() {
-        assert_eq!(truncate_content("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_content_long_adds_ellipsis() {
-        assert_eq!(truncate_content("hello world", 5), "hello...");
-    }
-
-    #[test]
-    fn truncate_content_empty() {
-        assert_eq!(truncate_content("", 0), "");
-        assert_eq!(truncate_content("", 100), "");
-    }
-
-    // ── Serialization ──
-
-    #[test]
-    fn checkpoint_response_skip_serializing_none_description() {
-        let r = CheckpointResponse {
+    fn checkpoint_response_serialization() {
+        let none_desc = CheckpointResponse {
             checkpoint_name: "cp1".into(),
             timestamp: "2024-01-01T00:00:00".into(),
             description: None,
         };
-        let json = serde_json::to_string(&r).unwrap();
+        let json = serde_json::to_string(&none_desc).unwrap();
         assert!(!json.contains("description"));
-    }
 
-    #[test]
-    fn checkpoint_response_includes_description() {
-        let r = CheckpointResponse {
+        let with_desc = CheckpointResponse {
             checkpoint_name: "cp1".into(),
             timestamp: "2024-01-01T00:00:00".into(),
             description: Some("test".into()),
         };
-        let json = serde_json::to_string(&r).unwrap();
+        let json = serde_json::to_string(&with_desc).unwrap();
         assert!(json.contains("\"description\":\"test\""));
     }
 
@@ -938,8 +923,8 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_service_returns_errors() {
         let svc = UnconfiguredDataVersioningService;
-        assert!(
-            svc.create_checkpoint(
+        assert!(svc
+            .create_checkpoint(
                 "u1".into(),
                 CreateCheckpointData {
                     name: "cp".into(),
@@ -947,22 +932,19 @@ mod tests {
                 }
             )
             .await
-            .is_err()
-        );
+            .is_err());
         assert!(svc.list_checkpoints("u1".into()).await.is_err());
-        assert!(
-            svc.get_events_at_checkpoint("u1".into(), "cp".into())
-                .await
-                .is_err()
-        );
-        assert!(
-            svc.get_causal_chain("u1".into(), "e1".into())
-                .await
-                .is_err()
-        );
+        assert!(svc
+            .get_events_at_checkpoint("u1".into(), "cp".into())
+            .await
+            .is_err());
+        assert!(svc
+            .get_causal_chain("u1".into(), "e1".into())
+            .await
+            .is_err());
         assert!(svc.trace_upstream("u1".into(), "e1".into()).await.is_err());
-        assert!(
-            svc.sandbox_checkpoint(
+        assert!(svc
+            .sandbox_checkpoint(
                 "u1".into(),
                 "sb".into(),
                 SandboxCheckpointData {
@@ -970,10 +952,9 @@ mod tests {
                 }
             )
             .await
-            .is_err()
-        );
-        assert!(
-            svc.sandbox_restore(
+            .is_err());
+        assert!(svc
+            .sandbox_restore(
                 "u1".into(),
                 "sb".into(),
                 SandboxCheckpointData {
@@ -981,14 +962,13 @@ mod tests {
                 }
             )
             .await
-            .is_err()
-        );
+            .is_err());
     }
 
-    // ── Data type equality ──
+    // ── Data type equality (2→1) ──
 
     #[test]
-    fn create_checkpoint_data_equality() {
+    fn checkpoint_data_equality() {
         let a = CreateCheckpointData {
             name: "cp1".into(),
             description: Some("d".into()),
@@ -998,14 +978,11 @@ mod tests {
             description: Some("d".into()),
         };
         assert_eq!(a, b);
-    }
 
-    #[test]
-    fn sandbox_checkpoint_data_equality() {
-        let a = SandboxCheckpointData {
+        let sandbox_a = SandboxCheckpointData {
             checkpoint_name: "snap1".into(),
         };
-        let b = a.clone();
-        assert_eq!(a, b);
+        let sandbox_b = sandbox_a.clone();
+        assert_eq!(sandbox_a, sandbox_b);
     }
 }
