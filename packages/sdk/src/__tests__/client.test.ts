@@ -1140,16 +1140,18 @@ describe("chatRequestToWire", () => {
       edgeExecutorId: "ex1",
       capabilities: ["a", "b"],
       workspaceBinding: {
-        kind: "Local",
-        authority: "user",
+        kind: "edge_workspace",
+        display_name: "Edge workspace",
         cwd: "/tmp",
-        status: "active",
+        authority: "read_write",
+        fallback_policy: "disabled",
       },
       executorBinding: {
-        kind: "EdgeAgent",
-        edgeAgentId: "edge-1",
-        status: "active",
-        transport: "edge",
+        kind: "edge_agent",
+        executor_id: "edge-1",
+        display_name: "Edge executor",
+        status: "online",
+        transport: "edge_ws",
       },
     });
     expect(body).toMatchObject({
@@ -1168,16 +1170,18 @@ describe("chatRequestToWire", () => {
       edge_executor_id: "ex1",
       capabilities: ["a", "b"],
       workspace_binding: {
-        kind: "Local",
-        authority: "user",
+        kind: "edge_workspace",
+        display_name: "Edge workspace",
         cwd: "/tmp",
-        status: "active",
+        authority: "read_write",
+        fallback_policy: "disabled",
       },
       executor_binding: {
-        kind: "EdgeAgent",
-        edgeAgentId: "edge-1",
-        status: "active",
-        transport: "edge",
+        kind: "edge_agent",
+        executor_id: "edge-1",
+        display_name: "Edge executor",
+        status: "online",
+        transport: "edge_ws",
       },
     });
   });

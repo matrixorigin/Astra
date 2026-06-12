@@ -1,4 +1,5 @@
 import type { ChatDetail } from '@/lib/api/types';
+import { isExecutionBoundaryWait } from '@/lib/run-status-messages';
 
 const QUEUEABLE_RUN_STATUSES = new Set(['running', 'input-queued', 'waiting']);
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
@@ -34,6 +35,51 @@ export function activeRunPriority(run: { status: string; waitingFor?: string | n
     return RUN_STATUS_PRIORITY['input-queued'];
   }
   return RUN_STATUS_PRIORITY[normalized] ?? 0;
+}
+
+function statusLabel(status: string): string {
+  return status
+    .trim()
+    .replace(/^waiting:\s*/i, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function activeRunDisplayLabel(run: ChatDetail['activeRun'], archived: boolean): string {
+  const status = normalizeChatRunStatus(run?.status);
+  const waitingFor = run?.waitingFor?.trim();
+  if (!run?.runId || !status) {
+    return archived ? 'Archived' : 'Active';
+  }
+  if (status === 'cancelling') {
+    return 'Stopping';
+  }
+  if (status === 'input-queued') {
+    return 'Input Queued';
+  }
+  if (status === 'blocked') {
+    return waitingFor ? `Blocked: ${statusLabel(waitingFor)}` : 'Blocked';
+  }
+  if (waitingFor) {
+    const label = statusLabel(waitingFor);
+    return isExecutionBoundaryWait(waitingFor)
+      ? `Blocked: ${label}`
+      : `Waiting: ${label}`;
+  }
+  if (status === 'waiting') {
+    return 'Waiting';
+  }
+  if (status === 'running') {
+    return 'Running';
+  }
+  if (status === 'paused') {
+    return 'Paused';
+  }
+  if (isTerminalChatRunStatus(status)) {
+    return statusLabel(status);
+  }
+  return statusLabel(run.status);
 }
 
 export type ChatRunUiState = {
@@ -86,17 +132,7 @@ export function deriveChatRunUiState(params: {
         : canQueueDeferredInput
           ? 'Queue a follow-up for the next tool call...'
           : 'Reply to Astra...';
-  const activeRunLabel = activeRunStatus === 'cancelling'
-    ? 'Stopping current run'
-    : activeRunStatus === 'input-queued'
-      ? 'Input queued for next tool call'
-      : params.activeRun?.waitingFor
-        ? `Waiting for ${params.activeRun.waitingFor}`
-        : params.activeRun?.runId
-          ? `Run ${params.activeRun.status}`
-          : params.archived
-            ? 'Archived'
-            : 'Active';
+  const activeRunLabel = activeRunDisplayLabel(params.activeRun, params.archived);
 
   return {
     activeRunStatus,

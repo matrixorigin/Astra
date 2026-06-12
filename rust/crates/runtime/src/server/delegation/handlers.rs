@@ -386,7 +386,8 @@ mod tests {
             user_id: "delegation-owner".into(),
             depth: 0,
             context: HashMap::new(),
-            execution_metadata: None,        }
+            execution_metadata: None,
+        }
     }
 
     /// P0-A: All delegation handlers must verify run ownership via get_run_status

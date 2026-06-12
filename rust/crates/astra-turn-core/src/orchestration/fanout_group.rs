@@ -6,6 +6,7 @@
 //! cancellations, and budget cancellations do not inflate or blur the group.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -55,6 +56,8 @@ pub struct AgentFanoutGroupProjection {
     /// Monotonic timestamp of last mutation or access.  Used for
     /// LRU eviction when the fanout-groups map exceeds its cap.
     pub last_touched: SystemTime,
+    summary_cache: AgentFanoutSummary,
+    agent_slot_index: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +131,12 @@ impl AgentFanoutGroupProjection {
             slots,
             status: AgentFanoutStatus::Planned,
             last_touched: SystemTime::now(),
+            summary_cache: AgentFanoutSummary {
+                target_count,
+                planned: target_count,
+                ..AgentFanoutSummary::default()
+            },
+            agent_slot_index: HashMap::new(),
         }
     }
 
@@ -164,15 +173,25 @@ impl AgentFanoutGroupProjection {
         slot_index: usize,
         reason: impl Into<String>,
     ) -> Result<(), String> {
-        let slot = self.slot_mut(slot_index)?;
-        if slot.agent_id.is_some() {
-            return Err(format!(
-                "fanout slot {slot_index} already has an accepted agent; reject cannot replace it"
-            ));
-        }
-        slot.status = AgentFanoutSlotStatus::SpawnRejected;
-        slot.terminal_reason = Some(reason.into());
-        self.recompute_status();
+        let old_status = {
+            let slot = self.slot_mut(slot_index)?;
+            if slot.agent_id.is_some() {
+                return Err(format!(
+                    "fanout slot {slot_index} already has an accepted agent; reject cannot replace it"
+                ));
+            }
+            let old_status = slot.status;
+            slot.status = AgentFanoutSlotStatus::SpawnRejected;
+            slot.terminal_reason = Some(reason.into());
+            old_status
+        };
+        self.apply_slot_status_transition(
+            old_status,
+            AgentFanoutSlotStatus::SpawnRejected,
+            false,
+            false,
+        );
+        self.recompute_status_from_cache();
         Ok(())
     }
 
@@ -182,31 +201,42 @@ impl AgentFanoutGroupProjection {
         agent_id: impl Into<String>,
     ) -> Result<(), String> {
         let agent_id = agent_id.into();
-        let slot = self.slot_mut(slot_index)?;
-        if let Some(existing) = slot.agent_id.as_ref() {
-            return Err(format!(
-                "fanout slot {slot_index} already accepted agent {existing}; explicit replacement is required"
-            ));
-        }
-        slot.agent_id = Some(agent_id);
-        slot.status = AgentFanoutSlotStatus::Running;
-        slot.terminal_reason = None;
-        self.recompute_status();
+        let old_status = {
+            let slot = self.slot_mut(slot_index)?;
+            if let Some(existing) = slot.agent_id.as_ref() {
+                return Err(format!(
+                    "fanout slot {slot_index} already accepted agent {existing}; explicit replacement is required"
+                ));
+            }
+            let old_status = slot.status;
+            slot.agent_id = Some(agent_id.clone());
+            slot.status = AgentFanoutSlotStatus::Running;
+            slot.terminal_reason = None;
+            old_status
+        };
+        self.summary_cache.accepted += 1;
+        self.apply_slot_status_transition(old_status, AgentFanoutSlotStatus::Running, true, false);
+        self.agent_slot_index.insert(agent_id, slot_index);
+        self.recompute_status_from_cache();
         Ok(())
     }
 
     pub fn mark_result_collected(&mut self, agent_id: &str) -> bool {
-        let Some(slot) = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.agent_id.as_deref() == Some(agent_id))
-        else {
+        let Some(slot_index) = self.agent_slot_index.get(agent_id).copied() else {
+            return false;
+        };
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            self.agent_slot_index.remove(agent_id);
             return false;
         };
         if !slot.status.is_terminal() {
             return false;
         }
-        slot.result_collected = true;
+        if !slot.result_collected {
+            slot.result_collected = true;
+            self.summary_cache.collected += 1;
+            self.summary_cache.uncollected = self.summary_cache.uncollected.saturating_sub(1);
+        }
         true
     }
 
@@ -219,11 +249,11 @@ impl AgentFanoutGroupProjection {
         if !status.is_terminal() {
             return Err("fanout terminal update requires a terminal slot status".to_string());
         }
-        let Some(slot) = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.agent_id.as_deref() == Some(agent_id))
-        else {
+        let Some(slot_index) = self.agent_slot_index.get(agent_id).copied() else {
+            return Err(format!("fanout agent {agent_id} is not assigned to a slot"));
+        };
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            self.agent_slot_index.remove(agent_id);
             return Err(format!("fanout agent {agent_id} is not assigned to a slot"));
         };
         if slot.status.is_terminal() {
@@ -232,52 +262,19 @@ impl AgentFanoutGroupProjection {
                 slot.status
             ));
         }
-        slot.status = status;
-        slot.terminal_reason = reason;
-        self.recompute_status();
+        let (old_status, result_collected) = {
+            let old_status = slot.status;
+            slot.status = status;
+            slot.terminal_reason = reason;
+            (old_status, slot.result_collected)
+        };
+        self.apply_slot_status_transition(old_status, status, true, result_collected);
+        self.recompute_status_from_cache();
         Ok(())
     }
 
     pub fn summary(&self) -> AgentFanoutSummary {
-        let mut summary = AgentFanoutSummary {
-            target_count: self.target_count,
-            planned: self.slots.len(),
-            ..AgentFanoutSummary::default()
-        };
-        for slot in &self.slots {
-            if slot.agent_id.is_some() {
-                summary.accepted += 1;
-            }
-            if matches!(
-                slot.status,
-                AgentFanoutSlotStatus::Running | AgentFanoutSlotStatus::SpawnAccepted
-            ) {
-                summary.active += 1;
-            }
-            if slot.status.is_terminal() {
-                summary.terminal += 1;
-                if slot.agent_id.is_some() && !slot.result_collected {
-                    summary.uncollected += 1;
-                }
-            }
-            if slot.result_collected {
-                summary.collected += 1;
-            }
-            match slot.status {
-                AgentFanoutSlotStatus::Completed => summary.completed += 1,
-                AgentFanoutSlotStatus::Failed => summary.failed += 1,
-                AgentFanoutSlotStatus::CancelledByUser => summary.cancelled_by_user += 1,
-                AgentFanoutSlotStatus::CancelledByParentBudget => {
-                    summary.cancelled_by_parent_budget += 1;
-                }
-                AgentFanoutSlotStatus::TimedOut => summary.timed_out += 1,
-                AgentFanoutSlotStatus::SpawnRejected => summary.spawn_rejected += 1,
-                AgentFanoutSlotStatus::Planned
-                | AgentFanoutSlotStatus::SpawnAccepted
-                | AgentFanoutSlotStatus::Running => {}
-            }
-        }
-        summary
+        self.summary_cache
     }
 
     pub fn summary_sentence(&self) -> String {
@@ -314,8 +311,31 @@ impl AgentFanoutGroupProjection {
         })
     }
 
-    fn recompute_status(&mut self) {
-        let summary = self.summary();
+    fn apply_slot_status_transition(
+        &mut self,
+        old_status: AgentFanoutSlotStatus,
+        new_status: AgentFanoutSlotStatus,
+        has_agent: bool,
+        result_collected: bool,
+    ) {
+        adjust_summary_for_status(
+            &mut self.summary_cache,
+            old_status,
+            has_agent,
+            result_collected,
+            -1,
+        );
+        adjust_summary_for_status(
+            &mut self.summary_cache,
+            new_status,
+            has_agent,
+            result_collected,
+            1,
+        );
+    }
+
+    fn recompute_status_from_cache(&mut self) {
+        let summary = self.summary_cache;
         self.status = if summary.terminal == self.target_count {
             AgentFanoutStatus::Finished
         } else if summary.active > 0 {
@@ -325,6 +345,52 @@ impl AgentFanoutGroupProjection {
         } else {
             AgentFanoutStatus::Planned
         };
+    }
+}
+
+fn adjust_summary_value(value: &mut usize, delta: i8) {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => *value += delta as usize,
+        std::cmp::Ordering::Less => *value = value.saturating_sub((-delta) as usize),
+        std::cmp::Ordering::Equal => {}
+    }
+}
+
+fn adjust_summary_for_status(
+    summary: &mut AgentFanoutSummary,
+    status: AgentFanoutSlotStatus,
+    has_agent: bool,
+    result_collected: bool,
+    delta: i8,
+) {
+    if matches!(
+        status,
+        AgentFanoutSlotStatus::Running | AgentFanoutSlotStatus::SpawnAccepted
+    ) {
+        adjust_summary_value(&mut summary.active, delta);
+    }
+    if status.is_terminal() {
+        adjust_summary_value(&mut summary.terminal, delta);
+        if has_agent && !result_collected {
+            adjust_summary_value(&mut summary.uncollected, delta);
+        }
+    }
+    match status {
+        AgentFanoutSlotStatus::Completed => adjust_summary_value(&mut summary.completed, delta),
+        AgentFanoutSlotStatus::Failed => adjust_summary_value(&mut summary.failed, delta),
+        AgentFanoutSlotStatus::CancelledByUser => {
+            adjust_summary_value(&mut summary.cancelled_by_user, delta);
+        }
+        AgentFanoutSlotStatus::CancelledByParentBudget => {
+            adjust_summary_value(&mut summary.cancelled_by_parent_budget, delta);
+        }
+        AgentFanoutSlotStatus::TimedOut => adjust_summary_value(&mut summary.timed_out, delta),
+        AgentFanoutSlotStatus::SpawnRejected => {
+            adjust_summary_value(&mut summary.spawn_rejected, delta);
+        }
+        AgentFanoutSlotStatus::Planned
+        | AgentFanoutSlotStatus::SpawnAccepted
+        | AgentFanoutSlotStatus::Running => {}
     }
 }
 
@@ -643,5 +709,31 @@ mod tests {
         assert_eq!(summary.terminal, 2);
         assert_eq!(summary.spawn_rejected, 1);
         assert_eq!(summary.uncollected, 1);
+    }
+
+    #[test]
+    fn repeated_terminal_or_collection_updates_do_not_double_count_summary() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
+        group.record_spawn_accepted(0, "auth@aaa").unwrap();
+        group.record_spawn_accepted(1, "api@bbb").unwrap();
+        group
+            .record_terminal_by_agent("auth@aaa", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        assert!(
+            group
+                .record_terminal_by_agent("auth@aaa", AgentFanoutSlotStatus::Failed, None)
+                .is_err()
+        );
+        assert!(group.mark_result_collected("auth@aaa"));
+        assert!(group.mark_result_collected("auth@aaa"));
+
+        let summary = group.summary();
+        assert_eq!(summary.accepted, 2);
+        assert_eq!(summary.active, 1);
+        assert_eq!(summary.terminal, 1);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.collected, 1);
+        assert_eq!(summary.uncollected, 0);
     }
 }

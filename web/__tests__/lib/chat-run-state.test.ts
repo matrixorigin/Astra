@@ -17,6 +17,17 @@ function run(status: string): NonNullable<ChatDetail['activeRun']> {
   };
 }
 
+function waitingRun(
+  status: string,
+  waitingFor: string,
+): NonNullable<ChatDetail['activeRun']> {
+  return {
+    runId: `run-${status}`,
+    status,
+    waitingFor,
+  };
+}
+
 describe('deriveChatRunUiState', () => {
   it('allows queued follow-up input for active queueable statuses', () => {
     for (const status of ['running', 'input-queued', 'waiting']) {
@@ -48,6 +59,25 @@ describe('deriveChatRunUiState', () => {
     expect(ui.composerPlaceholder).toBe(
       'Run status is initializing-provider. Stop it or refresh before sending.',
     );
+    expect(ui.activeRunLabel).toBe('Initializing Provider');
+  });
+
+  it('labels execution-boundary waits as blocked instead of leaking raw reasons', () => {
+    const ui = deriveChatRunUiState({
+      ...base,
+      activeRun: waitingRun('blocked', 'executor_offline'),
+    });
+
+    expect(ui.activeRunLabel).toBe('Blocked: Executor Offline');
+  });
+
+  it('labels ordinary waits separately from blocked executor states', () => {
+    const ui = deriveChatRunUiState({
+      ...base,
+      activeRun: waitingRun('waiting', 'tool_approval'),
+    });
+
+    expect(ui.activeRunLabel).toBe('Waiting: Tool Approval');
   });
 
   it('disables composer consistently while any run-control mutation is in flight', () => {

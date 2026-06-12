@@ -16,10 +16,12 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::manifest::{ExecutionContext, LoadedSkill};
 use crate::traits::{SkillError, SkillExecutionContext, SkillExecutionResult, SkillExecutor};
+
+#[cfg(feature = "crash-recovery")]
+use tokio::sync::Mutex;
 
 #[cfg(feature = "crash-recovery")]
 use astra_pipeline::skill_checkpoint::{

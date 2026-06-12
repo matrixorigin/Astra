@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,7 +30,13 @@ pub enum WorkspaceAuthority {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackPolicy {
+    /// Never route a tool call away from the selected executor.
     Disabled,
+    /// If the selected edge workspace is unavailable, permit server-side
+    /// read-only inspection but no workspace mutation.
+    ServerReadOnly,
+    /// Ask the user before switching executor/workspace authority.
+    AskUser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +182,7 @@ pub trait ToolTransport: Send + Sync {
 pub const TOOL_ERROR_KIND_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
+const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
 pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
 pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE: &str = "workspace_executor_unavailable";
@@ -253,6 +261,43 @@ pub trait ServerLocalToolTransport: Send + Sync {
     ) -> astra_tools::ToolResult;
 }
 
+async fn execute_local_transport<L>(
+    request: &ToolExecutionRequest,
+    local_transport: &L,
+    cancel_token: Option<&Arc<CancellationToken>>,
+) -> astra_tools::ToolResult
+where
+    L: ServerLocalToolTransport + ?Sized,
+{
+    let tool_name = request.tool_name.clone();
+    let execution = local_transport.execute_server_local_tool(request);
+    if let Some(token) = cancel_token {
+        tokio::select! {
+            _ = token.cancelled() => cancelled_tool_result(&tool_name),
+            result = execution => result,
+        }
+    } else {
+        execution.await
+    }
+}
+
+fn cancelled_tool_result(tool_name: &str) -> astra_tools::ToolResult {
+    let mut result =
+        astra_tools::ToolResult::error(format!("Tool '{tool_name}' cancelled before completion"));
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+        ),
+        (
+            "reason".to_string(),
+            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+        ),
+        ("cancelled".to_string(), Value::Bool(true)),
+    ]));
+    result
+}
+
 #[derive(Clone, Default)]
 pub struct ToolExecutionService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
@@ -317,12 +362,26 @@ impl ToolExecutionService {
     where
         L: ServerLocalToolTransport + ?Sized,
     {
+        self.execute_with_cancel(request, local_transport, None)
+            .await
+    }
+
+    pub async fn execute_with_cancel<L>(
+        &self,
+        request: ToolExecutionRequest,
+        local_transport: &L,
+        cancel_token: Option<Arc<CancellationToken>>,
+    ) -> astra_tools::ToolResult
+    where
+        L: ServerLocalToolTransport + ?Sized,
+    {
         match self.routing_decision(&request) {
             ToolExecutionRouteKind::ServerLocal | ToolExecutionRouteKind::ServerControlPlane => {
-                local_transport.execute_server_local_tool(&request).await
+                execute_local_transport(&request, local_transport, cancel_token.as_ref()).await
             }
             ToolExecutionRouteKind::ServerRuntime => {
-                let mut result = local_transport.execute_server_local_tool(&request).await;
+                let mut result =
+                    execute_local_transport(&request, local_transport, cancel_token.as_ref()).await;
                 let metadata = result.metadata.get_or_insert_with(Map::new);
                 for (key, value) in server_runtime_event_fields() {
                     metadata.entry(key).or_insert(value);
@@ -330,25 +389,41 @@ impl ToolExecutionService {
                 result
             }
             ToolExecutionRouteKind::RequestScopedMcp => {
-                let mut result = local_transport.execute_server_local_tool(&request).await;
+                let mut result =
+                    execute_local_transport(&request, local_transport, cancel_token.as_ref()).await;
                 let metadata = result.metadata.get_or_insert_with(Map::new);
                 for (key, value) in request_scoped_mcp_event_fields(&request.workspace) {
                     metadata.entry(key).or_insert(value);
                 }
                 result
             }
-            ToolExecutionRouteKind::EdgeBound => self.execute_edge_bound(request).await,
+            ToolExecutionRouteKind::EdgeBound => {
+                self.execute_edge_bound(request, cancel_token).await
+            }
             ToolExecutionRouteKind::Unsupported => unsupported_workspace_executor_result(&request),
         }
     }
 
-    async fn execute_edge_bound(&self, request: ToolExecutionRequest) -> astra_tools::ToolResult {
+    async fn execute_edge_bound(
+        &self,
+        request: ToolExecutionRequest,
+        cancel_token: Option<Arc<CancellationToken>>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return cancelled_tool_result(&request.tool_name);
+        }
         if matches!(request.executor.status, ExecutorStatus::Offline) {
             return edge_unavailable_result(&request);
         }
 
         let mut diagnostics = Vec::new();
-        match self.try_edge_websocket(&request).await {
+        match self
+            .try_edge_websocket(&request, cancel_token.as_deref())
+            .await
+        {
             EdgeTransportAttempt::Delivered(result) => return result,
             EdgeTransportAttempt::TransportDisconnected => {
                 diagnostics.push("edge-websocket: transport disconnected or timed out".to_string());
@@ -357,7 +432,7 @@ impl ToolExecutionService {
                 diagnostics.push("edge-websocket: no connected edge agent available".to_string());
             }
         }
-        match self.try_edge_dispatch(&request).await {
+        match self.try_edge_dispatch(&request, cancel_token).await {
             EdgeTransportAttempt::Delivered(result) => return result,
             EdgeTransportAttempt::TransportDisconnected => {
                 diagnostics.push("edge-dispatch: store/delivery channel unavailable".to_string());
@@ -374,7 +449,14 @@ impl ToolExecutionService {
         edge_transport_disconnected_result(&request, diagnostics)
     }
 
-    async fn try_edge_websocket(&self, request: &ToolExecutionRequest) -> EdgeTransportAttempt {
+    async fn try_edge_websocket(
+        &self,
+        request: &ToolExecutionRequest,
+        cancel_token: Option<&CancellationToken>,
+    ) -> EdgeTransportAttempt {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
+        }
         let Some(pool) = self.edge_connection_pool.as_ref() else {
             return EdgeTransportAttempt::Unavailable;
         };
@@ -389,17 +471,26 @@ impl ToolExecutionService {
             return EdgeTransportAttempt::Unavailable;
         }
         let edge_result = if edge_executor_id(request).is_some() {
-            pool.execute_tool(
+            pool.execute_tool_with_cancel(
                 &request.user_id,
                 edge_executor_id(request).unwrap_or_default(),
                 &request.tool_name,
                 &request.args,
+                cancel_token,
             )
             .await
         } else {
-            pool.execute_tool_any_edge(&request.user_id, &request.tool_name, &request.args)
-                .await
+            pool.execute_tool_any_edge_with_cancel(
+                &request.user_id,
+                &request.tool_name,
+                &request.args,
+                cancel_token,
+            )
+            .await
         };
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
+        }
         let Some(edge_result) = edge_result else {
             return EdgeTransportAttempt::TransportDisconnected;
         };
@@ -415,19 +506,46 @@ impl ToolExecutionService {
         })
     }
 
-    async fn try_edge_dispatch(&self, request: &ToolExecutionRequest) -> EdgeTransportAttempt {
+    async fn try_edge_dispatch(
+        &self,
+        request: &ToolExecutionRequest,
+        cancel_token: Option<Arc<CancellationToken>>,
+    ) -> EdgeTransportAttempt {
         let (Some(dispatch), Some(registry)) = (
             self.edge_dispatch_service.clone(),
             self.edge_registry_service.as_ref(),
         ) else {
             return EdgeTransportAttempt::Unavailable;
         };
-        let Ok(agents) = registry.list_by_user(&request.user_id).await else {
+        if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
+        }
+        let list_agents = registry.list_by_user(&request.user_id);
+        let agents_result = if let Some(token) = cancel_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
+                }
+                result = list_agents => result,
+            }
+        } else {
+            list_agents.await
+        };
+        let Ok(agents) = agents_result else {
             return EdgeTransportAttempt::Unavailable;
         };
         let Some(agent) = select_edge_agent(&agents, edge_executor_id(request)) else {
             return EdgeTransportAttempt::Unavailable;
         };
+        if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
+        }
         let request_id = format!(
             "xp-{}-{}",
             request.session_id,
@@ -460,14 +578,27 @@ impl ToolExecutionService {
         {
             return EdgeTransportAttempt::TransportDisconnected;
         }
-        let result_json = dispatch
-            .wait_result(
-                &request_id,
-                std::time::Duration::from_secs(timeout_secs + 10),
-            )
-            .await
-            .ok()
-            .flatten();
+        let wait_dispatch = dispatch.clone();
+        let wait_request_id = request_id.clone();
+        let wait_result = async move {
+            wait_dispatch
+                .wait_result(
+                    &wait_request_id,
+                    std::time::Duration::from_secs(timeout_secs + 10),
+                )
+                .await
+        };
+        let result_json = if let Some(token) = cancel_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    let _ = dispatch.fail_dispatch(&request_id, TOOL_ERROR_KIND_CANCELLED).await;
+                    return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
+                }
+                result = wait_result => result.ok().flatten(),
+            }
+        } else {
+            wait_result.await.ok().flatten()
+        };
         let Some(result_json) = result_json else {
             let _ = dispatch.fail_dispatch(&request_id, "expired").await;
             return EdgeTransportAttempt::TransportDisconnected;

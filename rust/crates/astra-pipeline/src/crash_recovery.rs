@@ -77,9 +77,14 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
     // Extract turn number from checkpoint
     let checkpoint_turn = extract_turn_from_step_id(&heavy.light.step_id);
 
-    // Load events from journal
-    let store = FileBackedEventStore::new(session_id);
-    let events = store.all_events().to_vec();
+    // Stream only the recovery window after the checkpoint. Long sessions may
+    // have very large journals; recovery should not materialize historical
+    // events that cannot affect the current replay.
+    let events =
+        FileBackedEventStore::load_events_created_after(session_id, heavy.light.created_at)
+            .map_err(|e| {
+                RecoveryError::JournalRead(format!("Failed to read event journal: {e}"))
+            })?;
 
     // Serialize checkpoint for scan_journal
     let checkpoint_json = serde_json::to_string(&heavy.light).map_err(|e| {
@@ -113,7 +118,7 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
 
         Ok(Some(RecoveryOutcome::AutoRecovered {
             restored,
-            manager,
+            manager: Box::new(manager),
             scan_result,
         }))
     } else {
@@ -125,7 +130,7 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
 
         Ok(Some(RecoveryOutcome::RequiresUserInput {
             pending_decisions: pending.into_iter().map(|(name, _)| name.clone()).collect(),
-            manager,
+            manager: Box::new(manager),
             scan_result,
         }))
     }
@@ -188,18 +193,17 @@ fn build_restored_from_scan(
 
 /// Outcome of crash recovery attempt
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum RecoveryOutcome {
     /// Session automatically recovered, ready to continue
     AutoRecovered {
         restored: RestoredSession,
-        manager: CrashRecoveryManager,
+        manager: Box<CrashRecoveryManager>,
         scan_result: JournalScanResult,
     },
     /// Recovery requires user decisions before proceeding
     RequiresUserInput {
         pending_decisions: Vec<String>,
-        manager: CrashRecoveryManager,
+        manager: Box<CrashRecoveryManager>,
         scan_result: JournalScanResult,
     },
 }
@@ -218,6 +222,8 @@ pub enum RecoveryError {
     VersionMismatch { expected: u32, found: u32 },
     /// Gap detected in journal events (timestamps out of order or large gap).
     JournalGap { expected_after: u64, found_at: u64 },
+    /// Journal could not be read for recovery replay.
+    JournalRead(String),
     /// Crypto hash mismatch — data was tampered with or corrupted.
     HashMismatch { expected: String, actual: String },
     /// Recovery was attempted on an already-recovering session.
@@ -246,6 +252,7 @@ impl fmt::Display for RecoveryError {
                 f,
                 "Journal gap: expected event after {expected_after}, found at {found_at}"
             ),
+            Self::JournalRead(msg) => write!(f, "Journal read failed: {msg}"),
             Self::HashMismatch { expected, actual } => {
                 write!(f, "Hash mismatch: expected {expected}, got {actual}")
             }
@@ -973,7 +980,6 @@ impl CrashRecoveryManager {
         self.scan_result = None;
         self.error = None;
         self.recovery_hash = None;
-        self.attempt_count = 0;
         Ok(())
     }
 }
@@ -1667,7 +1673,27 @@ mod tests {
         assert_eq!(mgr.state(), RecoveryState::Failed);
         mgr.reset_after_failure().unwrap();
         assert_eq!(mgr.state(), RecoveryState::Idle);
-        assert_eq!(mgr.attempt_count(), 0); // Reset clears attempts
+        assert_eq!(
+            mgr.attempt_count(),
+            1,
+            "failure reset must preserve lifetime recovery attempts"
+        );
+    }
+
+    #[test]
+    fn reset_after_failure_does_not_allow_infinite_retry_loop() {
+        let mut mgr = CrashRecoveryManager::new();
+        for _ in 0..3 {
+            mgr.begin_recovery().unwrap();
+            mgr.scan_journal("sess-1", 5, None, 0, vec![]).unwrap_err();
+            mgr.reset_after_failure().unwrap();
+        }
+
+        let result = mgr.begin_recovery();
+        assert!(
+            matches!(result, Err(RecoveryError::RecursiveCrash)),
+            "attempt_count must accumulate across failure resets"
+        );
     }
 
     #[test]

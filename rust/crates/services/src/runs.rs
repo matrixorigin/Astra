@@ -238,7 +238,12 @@ pub enum WorkspaceAuthorityRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackPolicyRequest {
+    /// Never route a tool call away from the selected executor.
     Disabled,
+    /// Permit server-side read-only fallback when the selected executor is unavailable.
+    ServerReadOnly,
+    /// Require explicit user approval before falling back to another executor.
+    AskUser,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

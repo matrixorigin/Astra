@@ -674,6 +674,10 @@ pub struct DynamicAgentSpawner {
     /// Capped at [`MAX_FANOUT_GROUPS`] to prevent unbounded memory
     /// growth from long-running sessions.
     fanout_groups: Arc<RwLock<HashMap<String, AgentFanoutGroupProjection>>>,
+    /// Reverse index for fanout lookup by child agent id. Kept separate from
+    /// the pure fanout projection so runtime queries avoid scanning every
+    /// group and slot.
+    fanout_agent_index: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl DynamicAgentSpawner {
@@ -699,6 +703,7 @@ impl DynamicAgentSpawner {
             trace_writer: None,
             max_concurrent_agents: None,
             fanout_groups: Arc::new(RwLock::new(HashMap::new())),
+            fanout_agent_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -801,17 +806,13 @@ impl DynamicAgentSpawner {
         &self,
         agent_id: &str,
     ) -> Option<AgentFanoutGroupProjection> {
-        self.fanout_groups
+        let group_id = self
+            .fanout_agent_index
             .read()
             .await
-            .values()
-            .find(|group| {
-                group
-                    .slots
-                    .iter()
-                    .any(|slot| slot.agent_id.as_deref() == Some(agent_id))
-            })
-            .cloned()
+            .get(agent_id)
+            .cloned()?;
+        self.fanout_groups.read().await.get(&group_id).cloned()
     }
 
     fn remember_background_agent_id(&self, agent_id: &str) {
@@ -899,33 +900,43 @@ impl DynamicAgentSpawner {
         description: &str,
         created_by_tool_use_id: Option<&str>,
     ) -> Result<(), SpawnError> {
-        let mut groups = self.fanout_groups.write().await;
-        let is_new = !groups.contains_key(&identity.group_id);
-        if is_new {
-            self.evict_terminal_fanout_group_if_full(&mut groups);
-        }
-        let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
-            let mut group = AgentFanoutGroupProjection::new(
-                identity.group_id.clone(),
-                fanout_group_title(identity, group_title),
-                identity.target_count,
-            );
-            group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+        let evicted_agent_ids = {
+            let mut groups = self.fanout_groups.write().await;
+            let is_new = !groups.contains_key(&identity.group_id);
+            let evicted_agent_ids = if is_new {
+                self.evict_terminal_fanout_group_if_full(&mut groups)
+            } else {
+                Vec::new()
+            };
+            let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
+                let mut group = AgentFanoutGroupProjection::new(
+                    identity.group_id.clone(),
+                    fanout_group_title(identity, group_title),
+                    identity.target_count,
+                );
+                group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+                group
+            });
+            if group.target_count != identity.target_count {
+                return Err(SpawnError::InvalidInput(format!(
+                    "fanout group '{}' target_count changed from {} to {}",
+                    identity.group_id, group.target_count, identity.target_count
+                )));
+            }
             group
-        });
-        if group.target_count != identity.target_count {
-            return Err(SpawnError::InvalidInput(format!(
-                "fanout group '{}' target_count changed from {} to {}",
-                identity.group_id, group.target_count, identity.target_count
-            )));
+                .set_slot_request(identity.slot_index, agent_type, description)
+                .map_err(SpawnError::InvalidInput)?;
+            group
+                .record_spawn_accepted(identity.slot_index, agent_id)
+                .map_err(SpawnError::InvalidInput)?;
+            group.touch();
+            evicted_agent_ids
+        };
+        let mut index = self.fanout_agent_index.write().await;
+        for evicted_agent_id in evicted_agent_ids {
+            index.remove(&evicted_agent_id);
         }
-        group
-            .set_slot_request(identity.slot_index, agent_type, description)
-            .map_err(SpawnError::InvalidInput)?;
-        group
-            .record_spawn_accepted(identity.slot_index, agent_id)
-            .map_err(SpawnError::InvalidInput)?;
-        group.touch();
+        index.insert(agent_id.to_string(), identity.group_id.clone());
         Ok(())
     }
 
@@ -938,33 +949,44 @@ impl DynamicAgentSpawner {
         reason: impl Into<String>,
         created_by_tool_use_id: Option<&str>,
     ) -> Result<(), SpawnError> {
-        let mut groups = self.fanout_groups.write().await;
-        let is_new = !groups.contains_key(&identity.group_id);
-        if is_new {
-            self.evict_terminal_fanout_group_if_full(&mut groups);
-        }
-        let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
-            let mut group = AgentFanoutGroupProjection::new(
-                identity.group_id.clone(),
-                fanout_group_title(identity, group_title),
-                identity.target_count,
-            );
-            group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+        let evicted_agent_ids = {
+            let mut groups = self.fanout_groups.write().await;
+            let is_new = !groups.contains_key(&identity.group_id);
+            let evicted_agent_ids = if is_new {
+                self.evict_terminal_fanout_group_if_full(&mut groups)
+            } else {
+                Vec::new()
+            };
+            let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
+                let mut group = AgentFanoutGroupProjection::new(
+                    identity.group_id.clone(),
+                    fanout_group_title(identity, group_title),
+                    identity.target_count,
+                );
+                group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+                group
+            });
+            if group.target_count != identity.target_count {
+                return Err(SpawnError::InvalidInput(format!(
+                    "fanout group '{}' target_count changed from {} to {}",
+                    identity.group_id, group.target_count, identity.target_count
+                )));
+            }
             group
-        });
-        if group.target_count != identity.target_count {
-            return Err(SpawnError::InvalidInput(format!(
-                "fanout group '{}' target_count changed from {} to {}",
-                identity.group_id, group.target_count, identity.target_count
-            )));
+                .set_slot_request(identity.slot_index, agent_type, description)
+                .map_err(SpawnError::InvalidInput)?;
+            group
+                .record_spawn_rejected(identity.slot_index, reason)
+                .map_err(SpawnError::InvalidInput)?;
+            group.touch();
+            evicted_agent_ids
+        };
+        if !evicted_agent_ids.is_empty() {
+            let mut index = self.fanout_agent_index.write().await;
+            for evicted_agent_id in evicted_agent_ids {
+                index.remove(&evicted_agent_id);
+            }
         }
-        group
-            .set_slot_request(identity.slot_index, agent_type, description)
-            .map_err(SpawnError::InvalidInput)?;
-        group
-            .record_spawn_rejected(identity.slot_index, reason)
-            .map_err(SpawnError::InvalidInput)?;
-        group.touch();
         Ok(())
     }
 
@@ -1010,9 +1032,9 @@ impl DynamicAgentSpawner {
     fn evict_terminal_fanout_group_if_full(
         &self,
         groups: &mut HashMap<String, AgentFanoutGroupProjection>,
-    ) {
+    ) -> Vec<String> {
         if groups.len() < MAX_FANOUT_GROUPS {
-            return;
+            return Vec::new();
         }
         // Find the terminal group with the oldest last_touched.
         let Some((evict_id, _)) = groups
@@ -1020,10 +1042,19 @@ impl DynamicAgentSpawner {
             .filter(|(_, g)| g.is_terminal())
             .min_by_key(|(_, g)| g.last_touched)
         else {
-            return;
+            return Vec::new();
         };
         let evict_id = evict_id.clone();
-        groups.remove(&evict_id);
+        groups
+            .remove(&evict_id)
+            .map(|group| {
+                group
+                    .slots
+                    .into_iter()
+                    .filter_map(|slot| slot.agent_id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     async fn mark_fanout_result_collected(&self, state: &SpawnedAgentState) {
@@ -1593,16 +1624,7 @@ impl DynamicAgentSpawner {
         let spawner = self.clone_for_task();
         let agent_id_for_task = agent_id.clone();
         let agent_id_for_output = agent_id.clone();
-        let notify_guard = Arc::clone(&notify);
-        let notify_after_completion = Arc::clone(&notify);
         let spawn_future = async move {
-            struct NotifyOnDrop(Arc<tokio::sync::Notify>);
-            impl Drop for NotifyOnDrop {
-                fn drop(&mut self) {
-                    self.0.notify_waiters();
-                }
-            }
-            let guard = NotifyOnDrop(notify_guard);
             let result = AssertUnwindSafe(executor.execute(run_config))
                 .catch_unwind()
                 .await;
@@ -1672,8 +1694,6 @@ impl DynamicAgentSpawner {
                 }
             };
             let _ = terminal_tx.send(output);
-            notify_after_completion.notify_waiters();
-            std::mem::forget(guard);
         };
         let abort_handle = self
             .background_tasks
@@ -2096,6 +2116,7 @@ impl DynamicAgentSpawner {
             trace_writer: self.trace_writer.clone(),
             max_concurrent_agents: self.max_concurrent_agents,
             fanout_groups: Arc::clone(&self.fanout_groups),
+            fanout_agent_index: Arc::clone(&self.fanout_agent_index),
         }
     }
 
@@ -2543,6 +2564,16 @@ mod tests {
         let transport = Arc::new(InProcessTransport::new());
         let dt = Arc::new(DelegationTracker::new());
         Arc::new(AgentMailboxRouter::new(transport, dt))
+    }
+
+    #[test]
+    fn sync_spawn_wait_path_does_not_depend_on_drop_notifications() {
+        let source = include_str!("spawner.rs");
+        let forbidden = concat!("struct ", "NotifyOnDrop");
+        assert!(
+            !source.contains(forbidden),
+            "sync spawn wait must be driven by terminal result or explicit promotion, not drop-time empty notifications"
+        );
     }
 
     #[tokio::test]
@@ -3809,6 +3840,40 @@ mod tests {
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.active, 1);
         assert_eq!(groups[0].slots[1].requested_description, "bg test");
+
+        factory.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fanout_group_lookup_by_agent_uses_spawn_index() {
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("review-lookup".to_string());
+        input.fanout_group_title = Some("review lookup".to_string());
+        input.fanout_target_count = Some(2);
+        input.fanout_slot_index = Some(0);
+
+        let agent_id = match spawner.spawn(input, &make_bg_context()).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+        let group = spawner
+            .fanout_group_for_agent(&agent_id)
+            .await
+            .expect("spawned fanout child should have indexed group");
+        assert_eq!(group.group_id, "review-lookup");
+        assert_eq!(group.slots[0].agent_id.as_deref(), Some(agent_id.as_str()));
+        assert!(
+            spawner
+                .fanout_group_for_agent("missing-agent")
+                .await
+                .is_none()
+        );
 
         factory.unblock();
         spawner

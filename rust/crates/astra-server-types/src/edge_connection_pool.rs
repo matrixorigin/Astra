@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
@@ -176,6 +177,23 @@ impl EdgeConnectionPool {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<EdgeToolResult> {
+        self.execute_tool_with_cancel(user_id, edge_agent_id, tool, args, None)
+            .await
+    }
+
+    /// Send a tool execution request to an edge agent and await the result.
+    /// Cleans up the pending request on timeout, disconnect, or cancellation.
+    pub async fn execute_tool_with_cancel(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<EdgeToolResult> {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         let key = pool_key(user_id, edge_agent_id);
         let (pending_results, sender) = {
             let entry = self.connections.get(&key)?;
@@ -215,7 +233,19 @@ impl EdgeConnectionPool {
         }
 
         let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
-        match tokio::time::timeout(timeout_dur, rx).await {
+        let result = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    pending_results.remove(&request_id);
+                    self.remove_pending_request(&request_id);
+                    return None;
+                }
+                result = tokio::time::timeout(timeout_dur, rx) => result,
+            }
+        } else {
+            tokio::time::timeout(timeout_dur, rx).await
+        };
+        match result {
             Ok(Ok(result)) => {
                 self.remove_pending_request(&request_id);
                 Some(result)
@@ -235,6 +265,19 @@ impl EdgeConnectionPool {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<EdgeToolResult> {
+        self.execute_tool_any_edge_with_cancel(user_id, tool, args, None)
+            .await
+    }
+
+    /// Send a tool execution request to the first available edge for a user.
+    /// Cleans up the selected edge request if the caller cancels.
+    pub async fn execute_tool_any_edge_with_cancel(
+        &self,
+        user_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<EdgeToolResult> {
         // Find the first connected edge for this user
         let edge_agent_id = self
             .connections
@@ -242,7 +285,8 @@ impl EdgeConnectionPool {
             .find(|entry| entry.value().user_id == user_id && !entry.value().sender.is_closed())
             .map(|entry| entry.value().edge_agent_id.clone())?;
 
-        self.execute_tool(user_id, &edge_agent_id, tool, args).await
+        self.execute_tool_with_cancel(user_id, &edge_agent_id, tool, args, cancel_token)
+            .await
     }
 
     /// Deliver a tool result from an edge agent (called from the edge WS read loop).

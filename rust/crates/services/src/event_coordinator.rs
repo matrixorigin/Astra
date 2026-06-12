@@ -23,7 +23,8 @@
 //! MatrixOne. This is enforced by awaiting DB confirmation before broadcast.
 
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, warn};
 
@@ -121,6 +122,126 @@ pub struct EventCoordinator {
     persist_timeout: std::time::Duration,
     ingestion_send_timeout: std::time::Duration,
     orphan_tx: Option<mpsc::Sender<OrphanedEvent>>,
+    broadcast_order: Arc<Mutex<BroadcastOrderState>>,
+    broadcast_order_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Default)]
+struct BroadcastOrderState {
+    next_sequence: u64,
+    next_to_broadcast: u64,
+    skipped: BTreeSet<u64>,
+}
+
+impl BroadcastOrderState {
+    fn reserve(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
+    }
+
+    fn skip(&mut self, sequence: u64) -> bool {
+        if sequence < self.next_to_broadcast {
+            return false;
+        }
+        if self.next_to_broadcast == sequence {
+            self.next_to_broadcast += 1;
+            self.advance_past_skipped();
+            true
+        } else {
+            self.skipped.insert(sequence);
+            false
+        }
+    }
+
+    fn mark_broadcasted(&mut self, sequence: u64) -> bool {
+        if self.next_to_broadcast != sequence {
+            return false;
+        }
+        self.next_to_broadcast += 1;
+        self.advance_past_skipped();
+        true
+    }
+
+    fn advance_past_skipped(&mut self) {
+        loop {
+            let next = self.next_to_broadcast;
+            if !self.skipped.remove(&next) {
+                break;
+            }
+            self.next_to_broadcast += 1;
+        }
+    }
+}
+
+struct BroadcastSequenceGuard {
+    sequence: u64,
+    state: Arc<Mutex<BroadcastOrderState>>,
+    notify: Arc<tokio::sync::Notify>,
+    active: bool,
+}
+
+impl BroadcastSequenceGuard {
+    fn new(
+        sequence: u64,
+        state: Arc<Mutex<BroadcastOrderState>>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            sequence,
+            state,
+            notify,
+            active: true,
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn skip(&mut self) {
+        if !self.active {
+            return;
+        }
+        skip_broadcast_sequence(&self.state, &self.notify, self.sequence);
+        self.active = false;
+    }
+
+    fn complete(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for BroadcastSequenceGuard {
+    fn drop(&mut self) {
+        if self.active {
+            skip_broadcast_sequence(&self.state, &self.notify, self.sequence);
+        }
+    }
+}
+
+fn lock_broadcast_order(state: &Mutex<BroadcastOrderState>) -> MutexGuard<'_, BroadcastOrderState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("broadcast order state mutex was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn skip_broadcast_sequence(
+    state: &Mutex<BroadcastOrderState>,
+    notify: &tokio::sync::Notify,
+    sequence: u64,
+) {
+    let advanced = {
+        let mut state = lock_broadcast_order(state);
+        state.skip(sequence)
+    };
+    if advanced {
+        notify.notify_waiters();
+    }
 }
 
 /// Trait for journal write operations (allows mocking in tests).
@@ -149,6 +270,8 @@ impl EventCoordinator {
             persist_timeout,
             ingestion_send_timeout: DEFAULT_INGESTION_SEND_TIMEOUT,
             orphan_tx: None,
+            broadcast_order: Arc::new(Mutex::new(BroadcastOrderState::default())),
+            broadcast_order_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -183,6 +306,37 @@ impl EventCoordinator {
         }
     }
 
+    fn reserve_broadcast_sequence(&self) -> BroadcastSequenceGuard {
+        let sequence = {
+            let mut state = lock_broadcast_order(&self.broadcast_order);
+            state.reserve()
+        };
+        BroadcastSequenceGuard::new(
+            sequence,
+            Arc::clone(&self.broadcast_order),
+            Arc::clone(&self.broadcast_order_notify),
+        )
+    }
+
+    async fn broadcast_in_order(&self, guard: &mut BroadcastSequenceGuard, event: &JournalEvent) {
+        loop {
+            let notified = self.broadcast_order_notify.notified();
+            {
+                let mut state = lock_broadcast_order(&self.broadcast_order);
+                if state.next_to_broadcast == guard.sequence() {
+                    let _ = self
+                        .broadcast_tx
+                        .send(serde_json::to_value(event).unwrap_or_default());
+                    state.mark_broadcasted(guard.sequence());
+                    guard.complete();
+                    self.broadcast_order_notify.notify_waiters();
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Persist event to journal + DB, then broadcast to clients.
     ///
     /// Blocks until DB confirmation received. If DB fails, event is marked
@@ -199,10 +353,13 @@ impl EventCoordinator {
     /// * `Err(EventError::Timeout)` - DB flush exceeded timeout
     /// * `Err(EventError::JournalWrite)` - Local journal write failed
     pub async fn emit_event(&self, event: JournalEvent) -> Result<(), EventError> {
+        let mut broadcast_sequence = self.reserve_broadcast_sequence();
+
         // 1. Write to journal (sync, always succeeds unless disk full)
-        self.journal_writer
-            .write(&event)
-            .map_err(EventError::JournalWrite)?;
+        if let Err(e) = self.journal_writer.write(&event) {
+            broadcast_sequence.skip();
+            return Err(EventError::JournalWrite(e));
+        }
 
         // 2. Flush journal to ensure durability before DB ingestion
         if let Err(e) = self.journal_writer.flush() {
@@ -222,6 +379,7 @@ impl EventCoordinator {
             Ok(Ok(())) => { /* send succeeded */ }
             Ok(Err(_)) => {
                 self.queue_orphan(event.clone(), OrphanReason::ChannelClosed);
+                broadcast_sequence.skip();
                 return Err(EventError::ChannelClosed);
             }
             Err(_) => {
@@ -229,6 +387,7 @@ impl EventCoordinator {
                     event.clone(),
                     OrphanReason::IngestionSendTimeout(self.ingestion_send_timeout),
                 );
+                broadcast_sequence.skip();
                 return Err(EventError::IngestionSendTimeout(
                     self.ingestion_send_timeout,
                 ));
@@ -239,9 +398,8 @@ impl EventCoordinator {
         match tokio::time::timeout(self.persist_timeout, confirm_rx).await {
             Ok(Ok(Ok(()))) => {
                 // 5. Broadcast to clients (only now!)
-                let _ = self
-                    .broadcast_tx
-                    .send(serde_json::to_value(&event).unwrap_or_default());
+                self.broadcast_in_order(&mut broadcast_sequence, &event)
+                    .await;
                 debug!(event_type = ?event.event_type, "event persisted and broadcast");
                 Ok(())
             }
@@ -250,12 +408,14 @@ impl EventCoordinator {
                 let reason = format!("{}", e);
                 warn!(event_type = ?event.event_type, error = %e, "event orphaned: DB flush failed");
                 self.queue_orphan(event.clone(), OrphanReason::DbFailed(reason));
+                broadcast_sequence.skip();
                 Err(EventError::Orphaned(format!("{:?}", event.event_type)))
             }
             Ok(Err(_)) => {
                 // Confirmation channel dropped (ingestion worker died)
                 error!(event_type = ?event.event_type, "ingestion worker dropped confirmation channel");
                 self.queue_orphan(event.clone(), OrphanReason::ChannelClosed);
+                broadcast_sequence.skip();
                 Err(EventError::ChannelClosed)
             }
             Err(_) => {
@@ -266,6 +426,7 @@ impl EventCoordinator {
                     "event orphaned: DB flush timeout"
                 );
                 self.queue_orphan(event.clone(), OrphanReason::DbTimeout(self.persist_timeout));
+                broadcast_sequence.skip();
                 Err(EventError::Timeout(
                     format!("{:?}", event.event_type),
                     self.persist_timeout,
@@ -356,7 +517,7 @@ mod tests {
             budget_used: None,
             budget_pressure: None,
             stall_type: None,
-            metadata: Some(serde_json::json!({"key": "value"})),
+            metadata: Some(serde_json::json!({"key": "value", "label": event_type})),
             plan_subtask_id: None,
             ttft_ms: None,
             context_ms: None,
@@ -507,6 +668,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_events_preserve_ordering() {
         let (coord, _journal, mut ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let coord = Arc::new(coord);
 
         let events = vec![
             make_event("test-1"),
@@ -517,12 +679,7 @@ mod tests {
         let handles: Vec<_> = events
             .into_iter()
             .map(|e| {
-                let coord = EventCoordinator::new(
-                    Arc::clone(&coord.journal_writer),
-                    coord.ingestion_tx.clone(),
-                    coord.broadcast_tx.clone(),
-                    Duration::from_secs(5),
-                );
+                let coord = Arc::clone(&coord);
                 tokio::spawn(async move { coord.emit_event(e).await })
             })
             .collect();
@@ -551,6 +708,85 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_event_does_not_block_later_broadcast() {
+        let (coord, _journal, mut ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let coord = Arc::new(coord);
+
+        let first = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("first")).await })
+        };
+        let first_request = ingestion_rx.recv().await.expect("first ingestion request");
+
+        let second = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("second")).await })
+        };
+        let second_request = ingestion_rx.recv().await.expect("second ingestion request");
+
+        first.abort();
+        drop(first_request);
+
+        second_request.confirm_tx.send(Ok(())).unwrap();
+        let second_broadcast =
+            tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv())
+                .await
+                .expect("later broadcast must not be blocked by a cancelled earlier emit")
+                .expect("broadcast channel closed");
+        assert_eq!(second_broadcast["metadata"]["label"], "second");
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_events_do_not_broadcast_later_confirm_before_earlier_event() {
+        let (coord, _journal, mut ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let coord = Arc::new(coord);
+
+        let first = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("first")).await })
+        };
+        let second = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("second")).await })
+        };
+
+        let first_request = ingestion_rx.recv().await.expect("first ingestion request");
+        let second_request = ingestion_rx.recv().await.expect("second ingestion request");
+        assert_eq!(
+            first_request.event.metadata.as_ref().unwrap()["label"],
+            "first"
+        );
+        assert_eq!(
+            second_request.event.metadata.as_ref().unwrap()["label"],
+            "second"
+        );
+
+        second_request.confirm_tx.send(Ok(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "later event must not broadcast while an earlier event is still unpersisted"
+        );
+
+        first_request.confirm_tx.send(Ok(())).unwrap();
+        let first_broadcast = tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv())
+            .await
+            .expect("first broadcast timeout")
+            .expect("broadcast channel closed");
+        let second_broadcast =
+            tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv())
+                .await
+                .expect("second broadcast timeout")
+                .expect("broadcast channel closed");
+        assert_eq!(first_broadcast["metadata"]["label"], "first");
+        assert_eq!(second_broadcast["metadata"]["label"], "second");
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -173,10 +173,9 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
       ? {
           ...message,
           status: "complete" as const,
-          content:
-            message.content +
-            (message.content && !message.content.endsWith("\n") ? "\n" : "") +
-            "\nRun was stopped.",
+          content: message.content.trim()
+            ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
+            : "Stopped.",
           reasoningStatus: "complete" as const,
         }
       : message,

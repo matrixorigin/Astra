@@ -407,6 +407,10 @@ fn fallback_policy_from_request(
 ) -> FallbackPolicy {
     match fallback_policy {
         astra_services::runs::FallbackPolicyRequest::Disabled => FallbackPolicy::Disabled,
+        astra_services::runs::FallbackPolicyRequest::ServerReadOnly => {
+            FallbackPolicy::ServerReadOnly
+        }
+        astra_services::runs::FallbackPolicyRequest::AskUser => FallbackPolicy::AskUser,
     }
 }
 
@@ -458,4 +462,27 @@ fn executor_status_from_request(
 fn non_empty_string(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_policy_request_maps_all_runtime_variants() {
+        assert_eq!(
+            fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::Disabled),
+            FallbackPolicy::Disabled
+        );
+        assert_eq!(
+            fallback_policy_from_request(
+                astra_services::runs::FallbackPolicyRequest::ServerReadOnly
+            ),
+            FallbackPolicy::ServerReadOnly
+        );
+        assert_eq!(
+            fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::AskUser),
+            FallbackPolicy::AskUser
+        );
+    }
 }

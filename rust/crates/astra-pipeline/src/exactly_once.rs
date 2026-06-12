@@ -11,12 +11,12 @@
 //!    - PureRead: optionally re-execute (safe) or return cached
 //!    - IdempotentWrite: return cached (overwrite is safe but unnecessary)
 //!    - NonIdempotent: **always** return cached (never re-execute blindly)
-//! 3. **Cache miss**: Execute tool, record result (success or error), return
+//! 3. **Cache miss**: Execute tool, record successful result, return
 //!
 //! # Unhappy Paths
 //!
-//! - Tool execution panics: caught, recorded as error, cache updated
-//! - Tool returns error: cached (prevents retry storms on transient failures)
+//! - Tool execution panics: surfaced to the caller; failed attempts are not cached
+//! - Tool returns error: not cached; failures are not proof that a side effect applied
 //! - Concurrent execution: cache is per-session, no cross-session dedup (future: MatrixOne)
 //! - Workspace mutation: caller must evict stale PureRead results (see `evict_tool()`)
 
@@ -26,6 +26,19 @@ use serde_json::Value;
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+fn unix_timestamp_secs() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "system clock predates UNIX_EPOCH; using zero cache timestamp"
+            );
+            0
+        }
+    }
+}
 
 /// Result of exactly-once execution
 #[derive(Debug, Clone, PartialEq)]
@@ -254,17 +267,16 @@ impl ExactlyOnceExecutor {
 
         let result = executor(tool_name.to_string(), args.clone()).await;
 
-        // Phase 3: Record result (success or error) and return
+        // Phase 3: Record successful result and return. Failed attempts are
+        // deliberately not cached: exactly-once protects confirmed side
+        // effects, while an error is often retryable transport/runtime state.
         match result {
             Ok(output) => {
                 let cached_result = CachedToolResult {
                     tool_name: tool_name.to_string(),
                     output: output.clone(),
                     is_error: false,
-                    cached_at: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                    cached_at: unix_timestamp_secs(),
                     context_signature: key.context_signature.clone(),
                 };
                 self.cache.record(&key, cached_result);
@@ -274,47 +286,25 @@ impl ExactlyOnceExecutor {
                     from_cache: false,
                 })
             }
-            Err(error_msg) => {
-                // Cache errors to prevent retry storms on transient failures
-                let cached_result = CachedToolResult {
-                    tool_name: tool_name.to_string(),
-                    output: error_msg.clone(),
-                    is_error: true,
-                    cached_at: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    context_signature: key.context_signature.clone(),
-                };
-                self.cache.record(&key, cached_result);
-                Err(ExactlyOnceError::ToolExecutionError(error_msg))
-            }
+            Err(error_msg) => Err(ExactlyOnceError::ToolExecutionError(error_msg)),
         }
     }
 
     /// Record an error result (for tools that failed during original execution).
     ///
-    /// This prevents retry storms on transient failures by caching the error.
+    /// Errors are intentionally not written to the exactly-once cache. A
+    /// failure is not proof that a side effect was applied, and caching it
+    /// would convert transient network/runtime failures into permanent replay
+    /// failures. The method remains as a semantic no-op for callers that
+    /// report failed original executions.
     pub fn record_error(
         &mut self,
-        step_id: &str,
-        tool_index: u32,
-        tool_name: &str,
-        args: &Value,
-        error: String,
+        _step_id: &str,
+        _tool_index: u32,
+        _tool_name: &str,
+        _args: &Value,
+        _error: String,
     ) {
-        let key = IdempotencyKey::new(step_id, tool_index, tool_name, args);
-        let cached_result = CachedToolResult {
-            tool_name: tool_name.to_string(),
-            output: error,
-            is_error: true,
-            cached_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            context_signature: key.context_signature.clone(),
-        };
-        self.cache.record(&key, cached_result);
     }
 
     /// Evict all cache entries for a step (after step completes successfully).
@@ -347,6 +337,20 @@ impl ExactlyOnceExecutor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exactly_once_production_has_no_direct_panic_unwraps() {
+        let source = include_str!("exactly_once.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains(".expect("),
+            "exactly-once production path must not panic on unhappy paths"
+        );
+        assert!(
+            !production.contains(".unwrap("),
+            "exactly-once production path must not unwrap fallible runtime state"
+        );
+    }
 
     #[tokio::test]
     async fn test_cache_miss_executes_tool() {
@@ -388,6 +392,56 @@ mod tests {
             .unwrap();
         assert!(result2.from_cache);
         assert_eq!(result2.output, "hello\n"); // Original result
+    }
+
+    #[tokio::test]
+    async fn transient_tool_errors_are_not_cached_permanently() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let args = json!({"command": "curl https://example.invalid"});
+
+        let first = executor
+            .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                Err("network timeout while connecting".to_string())
+            })
+            .await;
+        assert!(matches!(
+            first,
+            Err(ExactlyOnceError::ToolExecutionError(ref error))
+                if error.contains("network timeout")
+        ));
+        assert_eq!(
+            executor.cache_size(),
+            0,
+            "transient execution errors must not become permanent exactly-once cache entries"
+        );
+
+        let second = executor
+            .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                Ok("retried successfully".to_string())
+            })
+            .await
+            .expect("retry after transient error should execute");
+        assert!(!second.from_cache);
+        assert_eq!(second.output, "retried successfully");
+    }
+
+    #[test]
+    fn record_error_skips_transient_failures() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let args = json!({"command": "curl https://example.invalid"});
+        executor.record_error(
+            "step-1",
+            0,
+            "bash",
+            &args,
+            "transport disconnected: timed out".to_string(),
+        );
+
+        assert_eq!(
+            executor.cache_size(),
+            0,
+            "record_error must not freeze retryable transport failures"
+        );
     }
 
     #[tokio::test]
@@ -441,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_is_cached() {
+    async fn test_error_is_not_cached() {
         let mut executor = ExactlyOnceExecutor::new();
         let args = json!({"command": "exit 1"});
 
@@ -455,19 +509,20 @@ mod tests {
         // Error should be propagated
         assert!(result1.is_err());
 
-        // Manually record the error
+        // Manually recording the error must still leave the cache empty.
         executor.record_error("step-1", 0, "bash", &args, "command failed".to_string());
+        assert_eq!(executor.cache_size(), 0);
 
-        // Second call: returns cached error (prevents retry storm)
+        // Second call: executes again, because failed attempts are retryable.
         let result2 = executor
             .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
-                Ok("success".to_string()) // Should NOT execute this
+                Ok("success".to_string())
             })
             .await
             .unwrap();
-        assert!(result2.from_cache);
-        assert!(result2.is_error);
-        assert_eq!(result2.output, "command failed");
+        assert!(!result2.from_cache);
+        assert!(!result2.is_error);
+        assert_eq!(result2.output, "success");
     }
 
     #[tokio::test]

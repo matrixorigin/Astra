@@ -648,7 +648,9 @@ fn replace_json_path(root: &mut Value, path: &str, new_value: Value) -> Result<V
             .ok_or_else(|| format!("unknown config path segment '{segment}'"))?;
     }
 
-    let last = segments.last().expect("checked non-empty");
+    let Some(last) = segments.last() else {
+        return Err("mutation path cannot be empty".to_string());
+    };
     let object = current
         .as_object_mut()
         .ok_or_else(|| format!("config path '{path}' does not point to an object parent"))?;
@@ -1300,21 +1302,35 @@ impl ServerToolExecutor {
 
     /// Check exactly-once cache and return cached result if available.
     /// Returns None if cache miss or exactly-once is disabled.
+    fn reserve_exactly_once_tool_index(&self) -> Option<u32> {
+        self.exactly_once_executor.as_ref()?;
+        Some(self.tool_call_counter.fetch_add(1, Ordering::SeqCst))
+    }
+
     fn check_exactly_once_cache(
         &self,
         name: &str,
         args: &Value,
+        tool_index: Option<u32>,
     ) -> Option<astra_tools::ToolResult> {
-        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+        use astra_pipeline::step_protocol::IdempotencyKey;
         use astra_turn_types::classify_tool_idempotency;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
+        let tool_index = tool_index?;
         let executor_mutex = self.exactly_once_executor.as_ref()?;
         let step_id = self.session_id.clone();
-        let tool_index = self.tool_call_counter.load(Ordering::SeqCst);
         let key = IdempotencyKey::new(&step_id, tool_index, name, args);
 
-        let executor = executor_mutex.lock().unwrap();
+        let executor = match executor_mutex.lock() {
+            Ok(executor) => executor,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "exactly-once cache lock poisoned; skipping cache lookup"
+                );
+                return None;
+            }
+        };
         let cached = executor.cache().check(&key)?;
         let idempotency = classify_tool_idempotency(name, Some(args));
 
@@ -1357,27 +1373,54 @@ impl ServerToolExecutor {
         name: &str,
         args: &Value,
         result: &astra_tools::ToolResult,
+        tool_index: Option<u32>,
     ) {
         use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        if result.is_error {
+            tracing::debug!(
+                tool_name = %name,
+                "Exactly-once: skipping failed tool result because failures are retryable"
+            );
+            return;
+        }
+
+        let Some(tool_index) = tool_index else {
+            return;
+        };
         let Some(executor_mutex) = self.exactly_once_executor.as_ref() else {
             return;
         };
 
         let step_id = self.session_id.clone();
-        let tool_index = self.tool_call_counter.fetch_add(1, Ordering::SeqCst);
         let key = IdempotencyKey::new(&step_id, tool_index, name, args);
 
-        let mut executor = executor_mutex.lock().unwrap();
+        let mut executor = match executor_mutex.lock() {
+            Ok(executor) => executor,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "exactly-once cache lock poisoned; skipping result record"
+                );
+                return;
+            }
+        };
+        let cached_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "system clock predates UNIX_EPOCH; using zero exactly-once cache timestamp"
+                );
+                0
+            }
+        };
         let cached_result = CachedToolResult {
             tool_name: name.to_string(),
             output: result.output.clone(),
-            is_error: result.is_error,
-            cached_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            is_error: false,
+            cached_at,
             context_signature: None,
         };
         executor.cache_mut().record(&key, cached_result);
@@ -1386,8 +1429,7 @@ impl ServerToolExecutor {
             tool_name = %name,
             step_id = %step_id,
             tool_index = tool_index,
-            is_error = result.is_error,
-            "Exactly-once: recorded tool result in cache"
+            "Exactly-once: recorded successful tool result in cache"
         );
     }
 
@@ -2530,15 +2572,10 @@ impl ServerToolExecutor {
         self.emit_tool_transport_started(name, args, route_fields.as_ref())
             .await;
 
-        let execution = self.tool_execution_service.execute(request, self);
-        let mut result = if let Some(token) = self.cancel_token.as_ref() {
-            tokio::select! {
-                _ = token.cancelled() => cancelled_tool_result(name),
-                result = execution => result,
-            }
-        } else {
-            execution.await
-        };
+        let mut result = self
+            .tool_execution_service
+            .execute_with_cancel(request, self, self.cancel_token.clone())
+            .await;
         annotate_default_executor_cancel_if_needed(name, &mut result);
 
         self.attach_binding_metadata(&mut result);
@@ -2603,7 +2640,8 @@ impl ServerToolExecutor {
         }
 
         // ── Exactly-once: check cache before execution ──────────────
-        if let Some(cached) = self.check_exactly_once_cache(name, args) {
+        let exactly_once_tool_index = self.reserve_exactly_once_tool_index();
+        if let Some(cached) = self.check_exactly_once_cache(name, args, exactly_once_tool_index) {
             return cached;
         }
 
@@ -2990,10 +3028,8 @@ impl ServerToolExecutor {
             cb.tool_completed(&call_id, &result.output, !result.is_error)
                 .await;
         }
-        self.emit_tool_call_end(args, &result);
-
         // ── Exactly-once: record result in cache ────────────────────
-        self.record_exactly_once_result(name, args, &result);
+        self.record_exactly_once_result(name, args, &result, exactly_once_tool_index);
 
         result
     }
@@ -6091,6 +6127,20 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn production_server_tool_executor_has_no_direct_panic_unwraps() {
+        let source = include_str!("server_tool_executor.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains(".expect("),
+            "server tool executor production path must return structured errors instead of panicking"
+        );
+        assert!(
+            !production.contains(".unwrap("),
+            "server tool executor production path must handle unhappy paths instead of panicking"
+        );
+    }
+
+    #[test]
     fn agent_waiting_output_becomes_execution_boundary_blocked_result() {
         let result = agent_tool_result_from_output(
             json!({
@@ -6303,6 +6353,103 @@ esac
             None,
         );
         (exec, dir)
+    }
+
+    #[tokio::test]
+    async fn exactly_once_cache_hit_consumes_tool_index_before_next_record() {
+        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+
+        let (mut exec, _dir) = test_executor();
+        exec.enable_exactly_once();
+
+        let first_args = json!({"action": "create", "title": "cached first"});
+        let second_args = json!({"action": "create", "title": "live second"});
+        let first_key = IdempotencyKey::new("test-session", 0, "task", &first_args);
+        {
+            let executor = exec
+                .exactly_once_executor
+                .as_ref()
+                .expect("exactly-once executor")
+                .lock()
+                .expect("exactly-once lock");
+            assert!(
+                executor.cache().check(&first_key).is_none(),
+                "precondition: first key should start empty"
+            );
+        }
+        {
+            let mut executor = exec
+                .exactly_once_executor
+                .as_ref()
+                .expect("exactly-once executor")
+                .lock()
+                .expect("exactly-once lock");
+            executor.cache_mut().record(
+                &first_key,
+                CachedToolResult {
+                    tool_name: "task".to_string(),
+                    output: "cached-first".to_string(),
+                    is_error: false,
+                    cached_at: 1,
+                    context_signature: None,
+                },
+            );
+        }
+
+        let first = exec.execute_local_with_metadata("task", &first_args).await;
+        assert_eq!(first.output, "cached-first");
+
+        let second = exec.execute_local_with_metadata("task", &second_args).await;
+        assert!(
+            second.output.contains("\"success\":true"),
+            "second tool should execute normally: {second:?}"
+        );
+
+        let second_key = IdempotencyKey::new("test-session", 1, "task", &second_args);
+        let stale_second_key = IdempotencyKey::new("test-session", 0, "task", &second_args);
+        let executor = exec
+            .exactly_once_executor
+            .as_ref()
+            .expect("exactly-once executor")
+            .lock()
+            .expect("exactly-once lock");
+        assert!(
+            executor.cache().check(&second_key).is_some(),
+            "cache hit for the first tool must advance the index before the second record"
+        );
+        assert!(
+            executor.cache().check(&stale_second_key).is_none(),
+            "second tool must not be recorded under the already-consumed index 0"
+        );
+    }
+
+    #[test]
+    fn exactly_once_record_skips_failed_tool_results() {
+        use astra_pipeline::step_protocol::IdempotencyKey;
+
+        let (mut exec, _dir) = test_executor();
+        exec.enable_exactly_once();
+
+        let args = json!({"command": "curl https://example.invalid"});
+        let result = astra_tools::ToolResult {
+            output: "network timeout".to_string(),
+            is_error: true,
+            metadata: None,
+            exit_semantics: None,
+        };
+        exec.record_exactly_once_result("bash", &args, &result, Some(0));
+
+        let key = IdempotencyKey::new("test-session", 0, "bash", &args);
+        let executor = exec
+            .exactly_once_executor
+            .as_ref()
+            .expect("exactly-once executor")
+            .lock()
+            .expect("exactly-once lock");
+        assert!(
+            executor.cache().check(&key).is_none(),
+            "server executor must not cache failed exactly-once results"
+        );
     }
 
     #[tokio::test]
@@ -6796,6 +6943,7 @@ esac
 
     struct PendingEdgeDispatch {
         wait_started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        failed_reasons: Arc<StdMutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -6831,7 +6979,11 @@ esac
             Ok(true)
         }
 
-        async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+        async fn fail_dispatch(&self, _request_id: &str, reason: &str) -> Result<bool, String> {
+            self.failed_reasons
+                .lock()
+                .expect("failed reasons lock")
+                .push(reason.to_string());
             Ok(true)
         }
 
@@ -7389,10 +7541,12 @@ esac
         let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
         exec = exec.with_cancel_token(Some(cancel_token.clone()));
         let (wait_started_tx, wait_started_rx) = tokio::sync::oneshot::channel();
+        let failed_reasons = Arc::new(StdMutex::new(Vec::new()));
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         exec.set_work_surface_event_tx(event_tx);
         exec.set_edge_dispatch_service(Arc::new(PendingEdgeDispatch {
             wait_started: StdMutex::new(Some(wait_started_tx)),
+            failed_reasons: failed_reasons.clone(),
         }));
         exec.set_edge_registry_service(Arc::new(OneEdgeRegistry {
             edge_agent_id: "edge-macbook-1".to_string(),
@@ -7434,6 +7588,11 @@ esac
         assert_eq!(metadata["cancelled"], true);
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "edge_agent");
+        assert_eq!(
+            *failed_reasons.lock().expect("failed reasons lock"),
+            vec![TOOL_ERROR_KIND_CANCELLED.to_string()],
+            "cancelling a ledger-dispatched edge tool must release the pending dispatch"
+        );
 
         let mut events = Vec::new();
         while let Ok(event) = event_rx.try_recv() {

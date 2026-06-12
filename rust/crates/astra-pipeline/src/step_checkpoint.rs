@@ -428,31 +428,54 @@ impl FileBackedEventStore {
         }
     }
 
-    /// Load events from JSONL file.
-    fn load_events(session_id: &str) -> std::io::Result<Vec<StepEvent>> {
+    fn parse_event_line(line: &str) -> std::io::Result<Option<StepEvent>> {
+        if line.trim().is_empty() {
+            return Ok(None);
+        }
+        let json = decrypt_checkpoint(line).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "failed to decrypt checkpoint",
+            )
+        })?;
+        Ok(serde_json::from_str::<StepEvent>(&json).ok())
+    }
+
+    fn load_events_matching(
+        session_id: &str,
+        mut keep: impl FnMut(&StepEvent) -> bool,
+    ) -> std::io::Result<Vec<StepEvent>> {
         let path = events_path_for(session_id);
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let content = std::fs::read_to_string(&path)?;
+        use std::io::BufRead;
+        let file = std::fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(file);
         let mut events = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            // Decrypt checkpoint event
-            let json = decrypt_checkpoint(line).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "failed to decrypt checkpoint",
-                )
-            })?;
-            if let Ok(event) = serde_json::from_str::<StepEvent>(&json) {
+        for line in reader.lines() {
+            let line = line?;
+            if let Some(event) = Self::parse_event_line(&line)?
+                && keep(&event)
+            {
                 events.push(event);
             }
-            // Skip malformed lines (best-effort)
         }
         Ok(events)
+    }
+
+    /// Load events from JSONL file.
+    fn load_events(session_id: &str) -> std::io::Result<Vec<StepEvent>> {
+        Self::load_events_matching(session_id, |_| true)
+    }
+
+    /// Stream only events written after a checkpoint timestamp. Recovery uses
+    /// this instead of materializing the entire long-session journal.
+    pub fn load_events_created_after(
+        session_id: &str,
+        checkpoint_created_at: u64,
+    ) -> std::io::Result<Vec<StepEvent>> {
+        Self::load_events_matching(session_id, |event| event.created_at > checkpoint_created_at)
     }
 
     /// Append a single event to the JSONL file.
@@ -969,6 +992,31 @@ mod tests {
         assert_eq!(store2.all_events()[1].event_id, "e2");
 
         // Clean up
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+    }
+
+    #[test]
+    fn file_event_store_loads_recovery_window_without_full_store_materialization() {
+        let session_id = format!("test-recovery-window-{}", std::process::id());
+        let path = events_path_for(&session_id);
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            for idx in 0..10 {
+                let mut event =
+                    make_event(&format!("e{idx}"), "s1", StepEventType::ToolCallCompleted);
+                event.created_at = idx * 100;
+                store.append(event);
+            }
+        }
+
+        let events = FileBackedEventStore::load_events_created_after(&session_id, 450)
+            .expect("load recovery window");
+        let ids: Vec<_> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["e5", "e6", "e7", "e8", "e9"]);
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(session_dir_for(&session_id));
     }
