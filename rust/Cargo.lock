@@ -558,6 +558,7 @@ name = "astra-skills"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-pipeline",
  "astra-services",
  "async-trait",
  "axum 0.8.9",

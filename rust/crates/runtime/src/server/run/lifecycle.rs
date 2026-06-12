@@ -553,7 +553,26 @@ fn build_server_skill_executor(
         subrun_executor = subrun_executor.with_harness_sink(Some(sink.clone()));
     }
 
+    // Wire skill checkpoint manager for crash recovery resume.
+    // This allows skills to resume from their last checkpoint instead of starting over.
+    #[cfg(feature = "crash-recovery")]
+    {
+        let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("skill_checkpoints");
+        let checkpoint_manager = Arc::new(std::sync::Mutex::new(
+            astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
+        ));
+        let isolated = IsolatedSkillExecutor::with_checkpoint_manager(
+            Arc::new(subrun_executor),
+            checkpoint_manager,
+        );
+        let isolated = Arc::new(isolated);
+    }
+    #[cfg(not(feature = "crash-recovery"))]
     let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
+
     let router = SkillExecutionRouter::new(Some(isolated));
     Some(Arc::new(router))
 }
@@ -4363,6 +4382,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_cancel_token(loop_state.cancellation.token.clone())
             .with_task_store(task_store);
 
+            // Enable exactly-once tool execution for crash recovery dedup.
+            // This prevents side-effect tools (github_create_issue, task create, etc.)
+            // from re-executing when a session resumes after a crash.
+            executor.enable_exactly_once();
+
             if let Some(ref bundle) = mcp_bundle {
                 executor.set_mcp_manager(bundle.manager.clone());
                 executor.set_plugin_schemas(bundle.schemas.clone());
@@ -4924,6 +4948,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ))
             .with_cancel_token(state.cancellation.token.clone())
             .with_task_store(task_store);
+
+            // Enable exactly-once tool execution for crash recovery dedup.
+            // This prevents side-effect tools (github_create_issue, task create, etc.)
+            // from re-executing when a session resumes after a crash.
+            executor.enable_exactly_once();
 
             // ── MCP: inject manager + plugin schemas into executor ────
             if let Some(ref bundle) = mcp_bundle {
@@ -6486,6 +6515,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             ))
             .with_cancel_token(config.cancel_token.clone())
             .with_task_store(task_store);
+
+            // Enable exactly-once tool execution for crash recovery dedup.
+            // This prevents side-effect tools (github_create_issue, task create, etc.)
+            // from re-executing when a session resumes after a crash.
+            executor.enable_exactly_once();
+
             if let Some(pool) = self.shared_pool.as_ref() {
                 executor.set_context_manifest_pool(pool.clone());
                 executor = executor.with_workspace_artifact_store(

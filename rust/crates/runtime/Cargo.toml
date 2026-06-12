@@ -48,7 +48,7 @@ astra-prompts.workspace = true
 astra-sandbox.workspace = true
 astra-server-types = { workspace = true, features = ["server"] }
 astra-mcp.workspace = true
-astra-skills.workspace = true
+astra-skills = { workspace = true, features = ["crash-recovery"] }
 astra-turn-core = { workspace = true, features = ["db-store"] }
 astra-turn-types.workspace = true
 astra-services.workspace = true
