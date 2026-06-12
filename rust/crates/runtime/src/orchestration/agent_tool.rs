@@ -6,10 +6,10 @@
 //! result rendering here so Web/server cannot drift from CLI behavior.
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -198,6 +198,15 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
     };
     if input.target_count == 0 {
         return render_agent_tool_error(None, "Invalid input: target_count must be >= 1");
+    }
+    if input.target_count > 50 {
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Invalid input: target_count {} exceeds maximum of 50",
+                input.target_count
+            ),
+        );
     }
     if input.slots.len() != input.target_count {
         return render_agent_tool_error(
