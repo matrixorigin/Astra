@@ -1337,134 +1337,106 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_tools_succeed_high_quality() {
-        let calls = vec![ok_call("bash"), ok_call("grep"), ok_call("read_file")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
-        assert!(eval.success);
-        assert!(eval.quality > 0.7, "quality={}", eval.quality);
-        assert!(eval.signals.contains(&EvalSignal::AllToolsHealthy));
-    }
+    // ── evaluate_turn quality levels ──
 
     #[test]
-    fn all_tools_fail_low_quality() {
-        let calls = vec![err_call("bash"), err_call("grep")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
-        assert!(!eval.success);
-        assert!(eval.quality < 0.4, "quality={}", eval.quality);
-        assert!(
-            eval.signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9))
-        );
-    }
-
-    #[test]
-    fn mixed_success_moderate_quality() {
-        let calls = vec![ok_call("bash"), err_call("grep"), ok_call("read_file")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
-        assert!(eval.success); // error rate < 0.5
-        let rate_signal = eval
-            .signals
-            .iter()
-            .find(|s| matches!(s, EvalSignal::ToolErrorRate(_)));
-        assert!(rate_signal.is_some());
-    }
-
-    #[test]
-    fn no_tools_conversational_ok() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, false);
-        assert!(eval.success);
-        assert_eq!(eval.quality, 0.5);
-        assert!(eval.confidence < 0.5); // low confidence for text-only
-    }
-
-    #[test]
-    fn no_tools_factual_query_bad() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, true);
-        assert!(!eval.success);
-        assert!(eval.quality < 0.3);
-        assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
-    }
-
-    #[test]
-    fn stalls_reduce_quality() {
-        let calls = vec![ok_call("bash")];
-        let no_stall = evaluate_turn(&calls, 0, false, 0.3, false);
-        let with_stall = evaluate_turn(&calls, 2, false, 0.3, false);
-        assert!(with_stall.quality < no_stall.quality);
-        assert!(with_stall.signals.contains(&EvalSignal::StallDetected));
-    }
-
-    #[test]
-    fn verdict_warning_reduces_quality() {
-        let calls = vec![ok_call("bash")];
-        let no_verdict = evaluate_turn(&calls, 0, false, 0.3, false);
-        let with_verdict = evaluate_turn(&calls, 0, true, 0.3, false);
-        assert!(with_verdict.quality < no_verdict.quality);
-        assert!(with_verdict.signals.contains(&EvalSignal::VerdictWarning));
-    }
-
-    #[test]
-    fn high_budget_pressure_penalizes() {
-        let calls = vec![ok_call("bash")];
-        let low_pressure = evaluate_turn(&calls, 0, false, 0.3, false);
-        let high_pressure = evaluate_turn(&calls, 0, false, 0.85, false);
-        assert!(high_pressure.quality < low_pressure.quality);
-        assert!(
-            high_pressure
-                .signals
-                .contains(&EvalSignal::HighBudgetPressure)
-        );
-    }
-
-    #[test]
-    fn repeat_tool_calls_penalize() {
-        let calls = vec![
-            ok_call("bash"),
-            ok_call("bash"),
-            ok_call("bash"),
-            ok_call("grep"),
-        ];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
-        assert!(
-            eval.signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::RepeatToolCall(n) if n == "bash"))
-        );
-    }
-
-    #[test]
-    fn empty_output_penalizes() {
-        let calls = vec![empty_call("read_file"), ok_call("bash")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
-        assert!(eval.signals.contains(&EvalSignal::EmptyToolOutput));
+    fn evaluate_turn_success_and_failure_quality() {
+        // all tools succeed → high quality
         let all_ok = evaluate_turn(
-            &[ok_call("read_file"), ok_call("bash")],
-            0,
-            false,
-            0.3,
-            false,
+            &[ok_call("bash"), ok_call("grep"), ok_call("read_file")],
+            0, false, 0.3, false,
         );
-        assert!(eval.quality < all_ok.quality);
+        assert!(all_ok.success);
+        assert!(all_ok.quality > 0.7);
+        assert!(all_ok.signals.contains(&EvalSignal::AllToolsHealthy));
+
+        // all tools fail → low quality
+        let all_err = evaluate_turn(
+            &[err_call("bash"), err_call("grep")],
+            0, false, 0.3, false,
+        );
+        assert!(!all_err.success);
+        assert!(all_err.quality < 0.4);
+        assert!(all_err.signals.iter().any(
+            |s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9)
+        ));
+
+        // mixed success → moderate
+        let mixed = evaluate_turn(
+            &[ok_call("bash"), err_call("grep"), ok_call("read_file")],
+            0, false, 0.3, false,
+        );
+        assert!(mixed.success);
+        assert!(mixed.signals.iter().any(
+            |s| matches!(s, EvalSignal::ToolErrorRate(_))
+        ));
     }
 
     #[test]
-    fn quality_clamped_to_bounds() {
-        // Worst case: all errors + stalls + verdict + pressure
-        let calls = vec![err_call("a"), err_call("b"), err_call("c")];
-        let eval = evaluate_turn(&calls, 5, true, 0.9, true);
-        assert!(eval.quality >= 0.0);
-        assert!(eval.quality <= 1.0);
-        assert!(eval.confidence >= 0.0);
-        assert!(eval.confidence <= 1.0);
+    fn no_tools_conversational_vs_factual() {
+        // conversational: no tools needed, moderate quality, low confidence
+        let conv = evaluate_turn(&[], 0, false, 0.3, false);
+        assert!(conv.success);
+        assert_eq!(conv.quality, 0.5);
+        assert!(conv.confidence < 0.5);
+
+        // factual query with no tools: flagged as bad
+        let factual = evaluate_turn(&[], 0, false, 0.3, true);
+        assert!(!factual.success);
+        assert!(factual.quality < 0.3);
+        assert!(factual.signals.contains(&EvalSignal::NoToolsNeeded));
     }
 
     #[test]
-    fn confidence_increases_with_more_signals() {
-        let simple = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false);
-        let complex = evaluate_turn(&[err_call("bash"), err_call("grep")], 2, true, 0.9, false);
-        assert!(complex.confidence > simple.confidence);
+    fn signal_detection_and_penalties() {
+        let base = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false);
+
+        // stalls reduce quality
+        let stall = evaluate_turn(&[ok_call("bash")], 2, false, 0.3, false);
+        assert!(stall.quality < base.quality);
+        assert!(stall.signals.contains(&EvalSignal::StallDetected));
+
+        // verdict warning reduces quality
+        let verdict = evaluate_turn(&[ok_call("bash")], 0, true, 0.3, false);
+        assert!(verdict.quality < base.quality);
+        assert!(verdict.signals.contains(&EvalSignal::VerdictWarning));
+
+        // high budget pressure penalizes
+        let pressure = evaluate_turn(&[ok_call("bash")], 0, false, 0.85, false);
+        assert!(pressure.quality < base.quality);
+        assert!(pressure.signals.contains(&EvalSignal::HighBudgetPressure));
+
+        // repeat tool calls detected
+        let repeat = evaluate_turn(
+            &[ok_call("bash"), ok_call("bash"), ok_call("bash"), ok_call("grep")],
+            0, false, 0.3, false,
+        );
+        assert!(repeat.signals.iter().any(
+            |s| matches!(s, EvalSignal::RepeatToolCall(n) if n == "bash")
+        ));
+
+        // empty output penalizes more than all-ok
+        let empty = evaluate_turn(
+            &[empty_call("read_file"), ok_call("bash")],
+            0, false, 0.3, false,
+        );
+        assert!(empty.signals.contains(&EvalSignal::EmptyToolOutput));
+        assert!(empty.quality < base.quality);
+
+        // quality clamped to [0, 1]
+        let worst = evaluate_turn(
+            &[err_call("a"), err_call("b"), err_call("c")],
+            5, true, 0.9, true,
+        );
+        assert!(worst.quality >= 0.0 && worst.quality <= 1.0);
+        assert!(worst.confidence >= 0.0 && worst.confidence <= 1.0);
+
+        // confidence increases with more signals
+        let complex = evaluate_turn(
+            &[err_call("bash"), err_call("grep")],
+            2, true, 0.9, false,
+        );
+        assert!(complex.confidence > base.confidence);
     }
 
     #[test]

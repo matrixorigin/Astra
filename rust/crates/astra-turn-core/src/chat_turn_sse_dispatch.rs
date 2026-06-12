@@ -829,7 +829,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_sets_has_tool_calls() {
+    fn turn_complete_tool_calls_flag() {
+        // has_tool_calls: true
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
             &sse("turn_complete", ",\"has_tool_calls\":true"),
@@ -837,6 +838,15 @@ mod tests {
             &mut vec![],
         );
         assert!(a.has_tool_calls);
+
+        // has_tool_calls: false — stays default
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("turn_complete", ",\"has_tool_calls\":false"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(!a.has_tool_calls);
     }
 
     #[test]
@@ -1040,53 +1050,25 @@ mod tests {
     }
 
     #[test]
-    fn framer_ttft_on_text_delta_block() {
-        let block = sse("text_delta", ",\"content\":\"x\"");
-        let mut f = ChatTurnSseFramer::new();
-        let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(f.ttft_ms.is_some());
-    }
-
-    #[test]
-    fn framer_ttft_on_reasoning_delta_block() {
-        let block = sse("reasoning_delta", ",\"content\":\"thinking...\"");
-        let mut f = ChatTurnSseFramer::new();
-        let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(f.ttft_ms.is_some());
-    }
-
-    #[test]
-    fn framer_ttft_on_reasoning_message_content_block() {
-        let block = sse("reasoning_message_content", ",\"content\":\"thinking...\"");
-        let mut f = ChatTurnSseFramer::new();
-        let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(f.ttft_ms.is_some());
-    }
-
-    #[test]
-    fn framer_ttft_on_tool_call_start_block() {
-        // LLM responds with only tool calls (no text) — ttft must still be recorded.
-        let block = sse("tool_call_start", ",\"id\":\"call-1\",\"name\":\"bash\"");
-        let mut f = ChatTurnSseFramer::new();
-        let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(
-            f.ttft_ms.is_some(),
-            "ttft must be set when first SSE event is tool_call_start"
-        );
-    }
-
-    #[test]
-    fn framer_ttft_on_tool_call_block() {
-        let block = sse(
-            "tool_call",
-            ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"}",
-        );
-        let mut f = ChatTurnSseFramer::new();
-        let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(
-            f.ttft_ms.is_some(),
-            "ttft must be set when first SSE event is tool_call"
-        );
+    fn framer_ttft_on_first_content_block() {
+        // TTFT must be recorded for text_delta, reasoning_delta,
+        // reasoning_message_content, tool_call_start, and tool_call
+        // — whichever arrives first.
+        let cases: &[(&str, &str)] = &[
+            ("text_delta", ",\"content\":\"x\""),
+            ("reasoning_delta", ",\"content\":\"thinking...\""),
+            ("reasoning_message_content", ",\"content\":\"thinking...\""),
+            ("tool_call_start", ",\"id\":\"call-1\",\"name\":\"bash\""),
+            ("tool_call", ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\""),
+        ];
+        for (event_type, extra) in cases {
+            let mut f = ChatTurnSseFramer::new();
+            let _ = f.push_lossy_bytes(sse(event_type, extra).as_bytes());
+            assert!(
+                f.ttft_ms.is_some(),
+                "ttft must be set when first SSE event is {event_type}"
+            );
+        }
     }
 
     #[test]
@@ -1559,35 +1541,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_block_produces_no_effects() {
-        let mut a = ChatTurnSseAccum::default();
-        let efx = dispatch_chat_turn_sse_event_block("", &mut a, &mut vec![]);
-        assert!(efx.is_empty());
-        assert!(a.full_text.is_empty());
-    }
-
-    #[test]
-    fn whitespace_only_block_produces_no_effects() {
-        let mut a = ChatTurnSseAccum::default();
-        let efx = dispatch_chat_turn_sse_event_block("   \n\n  \n", &mut a, &mut vec![]);
-        assert!(efx.is_empty());
-    }
-
-    #[test]
-    fn done_marker_only_produces_no_effects() {
-        let mut a = ChatTurnSseAccum::default();
-        let efx = dispatch_chat_turn_sse_event_block("data: [DONE]\n\n", &mut a, &mut vec![]);
-        assert!(efx.is_empty());
-    }
-
-    #[test]
-    fn invalid_json_in_data_line_sets_error() {
-        let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block("data: {not valid json}\n\n", &mut a, &mut vec![]);
-        assert!(a.error_message.is_some());
-    }
-
-    #[test]
     fn session_info_captures_id() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
@@ -1596,28 +1549,6 @@ mod tests {
             &mut vec![],
         );
         assert_eq!(a.session_id.as_deref(), Some("sess-abc"));
-    }
-
-    #[test]
-    fn turn_complete_with_tool_calls_true() {
-        let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            &sse("turn_complete", ",\"has_tool_calls\":true"),
-            &mut a,
-            &mut vec![],
-        );
-        assert!(a.has_tool_calls);
-    }
-
-    #[test]
-    fn turn_complete_without_tool_calls_stays_false() {
-        let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            &sse("turn_complete", ",\"has_tool_calls\":false"),
-            &mut a,
-            &mut vec![],
-        );
-        assert!(!a.has_tool_calls);
     }
 
     #[test]
