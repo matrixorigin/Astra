@@ -5456,19 +5456,74 @@ async fn apply_restored_session(
     let last_turn_event = local_journal.last_turn_event;
 
     let mut step_restore_error = None;
-    let step_restored = match astra_pipeline::step_restore::restore_session(&restored.session_id) {
-        Ok(restored) => restored,
-        Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
-            return Err(format!(
-                "Failed to read local step checkpoint for {}: {}",
-                restored.session_id, error
-            ));
-        }
-        Err(error) => {
-            step_restore_error = Some(error.to_string());
-            None
-        }
-    };
+    // Try new crash recovery state machine first; fall back to legacy restore
+    let step_restored =
+        match astra_pipeline::crash_recovery::recover_from_crash(&restored.session_id) {
+            Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::AutoRecovered {
+                restored: cr_restored,
+                ..
+            })) => {
+                tracing::info!("crash recovery: auto-recovered via state machine");
+                Some(cr_restored)
+            }
+            Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::RequiresUserInput {
+                pending_decisions,
+                ..
+            })) => {
+                tracing::warn!(
+                    pending = ?pending_decisions,
+                    "crash recovery: requires user input, falling back to legacy restore"
+                );
+                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                    Ok(r) => r,
+                    Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
+                        return Err(format!(
+                            "Failed to read local step checkpoint for {}: {}",
+                            restored.session_id, error
+                        ));
+                    }
+                    Err(error) => {
+                        step_restore_error = Some(error.to_string());
+                        None
+                    }
+                }
+            }
+            Ok(None) => {
+                // No crash detected — use legacy restore
+                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                    Ok(r) => r,
+                    Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
+                        return Err(format!(
+                            "Failed to read local step checkpoint for {}: {}",
+                            restored.session_id, error
+                        ));
+                    }
+                    Err(error) => {
+                        step_restore_error = Some(error.to_string());
+                        None
+                    }
+                }
+            }
+            Err(cr_err) => {
+                tracing::warn!(
+                    error = %cr_err,
+                    "crash recovery state machine failed, falling back to legacy restore"
+                );
+                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                    Ok(r) => r,
+                    Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
+                        return Err(format!(
+                            "Failed to read local step checkpoint for {}: {}",
+                            restored.session_id, error
+                        ));
+                    }
+                    Err(error) => {
+                        step_restore_error = Some(error.to_string());
+                        None
+                    }
+                }
+            }
+        };
     let has_cloud_heavy_fallback = !restored.conversation_messages.is_empty()
         || !restored.blocked_tools.is_empty()
         || restored.approval_overrides.is_some()
