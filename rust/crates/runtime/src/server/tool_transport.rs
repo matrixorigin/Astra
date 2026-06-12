@@ -1286,7 +1286,8 @@ mod tests {
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("fallback is disabled"),
+            result.output.contains("transport 'edge_ws' disconnected")
+                || result.output.contains("transport disconnected"),
             "{}",
             result.output
         );
@@ -1621,5 +1622,102 @@ mod tests {
         assert_eq!(metadata["executor"]["display_name"], "MCP server");
         assert_eq!(metadata["executor"]["transport"], "mcp_http");
         assert_eq!(metadata["transport"], "mcp_http");
+    }
+
+    // ── Cancel token propagation ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_already_triggered_skips_all_transports() {
+        let mut service = ToolExecutionService::new();
+        let dispatch = Arc::new(StaticEdgeDispatch::default());
+        service.set_edge_dispatch_service(dispatch.clone());
+        service.set_edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-online")],
+        }));
+        let local = CountingLocalTransport::new();
+        let cancel = Arc::new(CancellationToken::new());
+        cancel.cancel();
+
+        let result = service
+            .execute_with_cancel(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-online",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        ExecutorStatus::Online,
+                    ),
+                ),
+                &local,
+                Some(cancel),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("cancelled"), "{}", result.output);
+        assert_eq!(local.calls(), 0);
+        assert!(
+            dispatch
+                .inserted_edge_agent_ids
+                .lock()
+                .expect("lock")
+                .is_empty(),
+            "cancel must block dispatch insertion"
+        );
+    }
+
+    // ── Both transports unavailable with Online executor ──────────────────
+
+    #[tokio::test]
+    async fn online_executor_with_no_transports_reports_disconnected_with_diagnostics() {
+        let mut service = ToolExecutionService::new();
+        let dispatch = Arc::new(StaticEdgeDispatch::no_result());
+        service.set_edge_dispatch_service(dispatch.clone());
+        service.set_edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-online")],
+        }));
+        let local = CountingLocalTransport::new();
+
+        let result = service
+            .execute(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-selected",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        ExecutorStatus::Online,
+                    ),
+                ),
+                &local,
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("transport 'edge_ws' disconnected")
+                || result.output.contains("transport disconnected"),
+            "{}",
+            result.output
+        );
+        let metadata = result.metadata.expect("diagnostics metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+        );
+        assert_eq!(metadata["executor"]["status"], "degraded");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(local.calls(), 0);
     }
 }

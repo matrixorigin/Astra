@@ -2766,10 +2766,12 @@ mod tests {
         assert_eq!(
             error_payloads,
             vec![serde_json::json!({
-                "type": "error",
+                "type": "run_error",
                 "message": "boom",
+                "error": "boom",
                 "code": "RUN_ERROR",
-                "index": 2
+                "index": 2,
+                "run_id": "run-123"
             })]
         );
         assert_eq!(pending_run_error.as_deref(), Some("boom"));
