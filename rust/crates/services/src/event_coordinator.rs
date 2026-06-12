@@ -131,7 +131,7 @@ impl EventCoordinator {
         // 1. Write to journal (sync, always succeeds unless disk full)
         self.journal_writer
             .write(&event)
-            .map_err(|e| EventError::JournalWrite(e))?;
+            .map_err(EventError::JournalWrite)?;
 
         // 2. Send to DB with confirmation channel
         let (confirm_tx, confirm_rx) = oneshot::channel();
