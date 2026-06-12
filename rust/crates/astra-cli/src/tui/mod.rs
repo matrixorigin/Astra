@@ -10,7 +10,7 @@ pub(crate) mod approval;
 mod background_shortcut;
 pub(crate) mod background_tasks;
 mod bg_task_proxy;
-mod bg_task_rendering;
+pub(crate) mod bg_task_rendering;
 mod board_pin;
 mod bottom_pane;
 mod cancel_fanout;

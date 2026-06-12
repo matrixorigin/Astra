@@ -535,6 +535,14 @@ pub(crate) struct SessionState {
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    /// Shared background task registry slot.
+    /// The event loop writes the live [`BackgroundTaskRegistry`] here so
+    /// [`ToolExecutor::task_list_bg`] can read it directly without
+    /// serializing through the BG command queue, avoiding event-loop
+    /// tick latency.
+    pub bg_registry: std::sync::Arc<
+        std::sync::Mutex<Option<crate::tui::background_tasks::BackgroundTaskRegistry>>,
+    >,
     /// Shared detach slot for bash Ctrl+B promotion. Always present
     /// (cheap to construct); when the TUI is attached it's wired
     /// into the executor's ToolContext so each bash invocation can
@@ -709,6 +717,7 @@ impl Default for SessionState {
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,
             bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            bg_registry: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),

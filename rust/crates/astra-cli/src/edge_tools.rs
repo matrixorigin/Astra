@@ -730,6 +730,12 @@ pub struct ToolExecutor {
     /// task actions fail fast with a clear error rather than pushing
     /// to a queue nobody drains (which would hang the LLM turn forever).
     pub(crate) bg_task_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>>,
+    /// Shared background task registry slot for direct reads.
+    /// When the TUI event loop is active, the live
+    /// [`crate::tui::background_tasks::BackgroundTaskRegistry`] is placed
+    /// here so [`Self::task_list_bg`] can bypass the BG command queue.
+    pub(crate) bg_registry:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::tui::background_tasks::BackgroundTaskRegistry>>>>,
     /// Detach slot for the bash tool. Renewed before each tool call
     /// by the TUI event loop so a fresh one-shot reply channel is
     /// available for every bash invocation. `None` outside the TUI
@@ -888,6 +894,7 @@ impl ToolExecutor {
             task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
             task_notify_tx: None,
             bg_task_commands: None,
+            bg_registry: None,
             bash_detach_slot: None,
             spawn_context: None,
             context_cache: None,
@@ -1362,6 +1369,16 @@ impl ToolExecutor {
         commands: std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
     ) -> Self {
         self.bg_task_commands = Some(commands);
+        self
+    }
+
+    pub(crate) fn with_bg_registry(
+        mut self,
+        registry: std::sync::Arc<
+            std::sync::Mutex<Option<crate::tui::background_tasks::BackgroundTaskRegistry>>,
+        >,
+    ) -> Self {
+        self.bg_registry = Some(registry);
         self
     }
 
@@ -2288,6 +2305,16 @@ impl ToolExecutor {
     }
 
     async fn task_list_bg(&self) -> String {
+        // Fast path: read directly from the shared registry slot,
+        // bypassing the BG command queue and event-loop tick latency.
+        if let Some(ref slot) = self.bg_registry {
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref mut registry) = *guard {
+                let rows = crate::tui::bg_task_rendering::background_task_rows(registry);
+                return crate::tui::bg_task_rendering::render_background_task_rows_xml(&rows);
+            }
+        }
+        // Fallback: queue path for when no registry is available
         let Some(ref bg_commands) = self.bg_task_commands else {
             return format_background_task_unavailable(self.cloud_base.is_some());
         };
