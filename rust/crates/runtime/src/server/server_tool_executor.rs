@@ -954,6 +954,11 @@ pub struct ServerToolExecutor {
     work_surface_event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     server_tool_names: HashSet<String>,
+    /// Exactly-once executor for crash recovery deduplication.
+    /// When active (Some), checks idempotency cache before executing tools.
+    exactly_once_executor: Option<Mutex<astra_pipeline::exactly_once::ExactlyOnceExecutor>>,
+    /// Monotonic tool-call counter within the session, used for dedup key generation.
+    tool_call_counter: AtomicU32,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -1047,11 +1052,108 @@ impl ServerToolExecutor {
             work_surface_event_tx: None,
             capabilities,
             server_tool_names,
+            exactly_once_executor: None,
+            tool_call_counter: AtomicU32::new(0),
         }
     }
 
     pub fn task_manager(&self) -> Arc<TaskManager> {
         Arc::clone(&self.task_manager)
+    }
+
+    /// Enable exactly-once execution for crash recovery deduplication.
+    /// When enabled, tools are checked against an idempotency cache before execution.
+    pub fn enable_exactly_once(&mut self) {
+        self.exactly_once_executor = Some(Mutex::new(
+            astra_pipeline::exactly_once::ExactlyOnceExecutor::new(),
+        ));
+    }
+
+    /// Check exactly-once cache and return cached result if available.
+    /// Returns None if cache miss or exactly-once is disabled.
+    fn check_exactly_once_cache(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<astra_tools::ToolResult> {
+        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+        use astra_turn_types::classify_tool_idempotency;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let executor_mutex = self.exactly_once_executor.as_ref()?;
+        let step_id = self.session_id.clone();
+        let tool_index = self.tool_call_counter.load(Ordering::SeqCst);
+        let key = IdempotencyKey::new(&step_id, tool_index, name, args);
+
+        let executor = executor_mutex.lock().unwrap();
+        let cached = executor.cache().check(&key)?;
+        let idempotency = classify_tool_idempotency(name, Some(args));
+
+        match idempotency {
+            astra_turn_types::ToolIdempotency::NonIdempotent
+            | astra_turn_types::ToolIdempotency::IdempotentWrite => {
+                tracing::debug!(
+                    tool_name = %name,
+                    step_id = %step_id,
+                    tool_index = tool_index,
+                    "Exactly-once: cache hit, returning cached result"
+                );
+                Some(astra_tools::ToolResult {
+                    output: cached.output.clone(),
+                    is_error: cached.is_error,
+                    metadata: None,
+                    exit_semantics: None,
+                })
+            }
+            astra_turn_types::ToolIdempotency::PureRead => {
+                tracing::debug!(
+                    tool_name = %name,
+                    step_id = %step_id,
+                    tool_index = tool_index,
+                    "Exactly-once: cache hit for PureRead (AlwaysCache policy)"
+                );
+                Some(astra_tools::ToolResult {
+                    output: cached.output.clone(),
+                    is_error: cached.is_error,
+                    metadata: None,
+                    exit_semantics: None,
+                })
+            }
+        }
+    }
+
+    /// Record tool result in exactly-once cache after execution.
+    fn record_exactly_once_result(&self, name: &str, args: &Value, result: &astra_tools::ToolResult) {
+        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let Some(executor_mutex) = self.exactly_once_executor.as_ref() else {
+            return;
+        };
+
+        let step_id = self.session_id.clone();
+        let tool_index = self.tool_call_counter.fetch_add(1, Ordering::SeqCst);
+        let key = IdempotencyKey::new(&step_id, tool_index, name, args);
+
+        let mut executor = executor_mutex.lock().unwrap();
+        let cached_result = CachedToolResult {
+            tool_name: name.to_string(),
+            output: result.output.clone(),
+            is_error: result.is_error,
+            cached_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        executor.cache_mut().record(&key, cached_result);
+
+        tracing::debug!(
+            tool_name = %name,
+            step_id = %step_id,
+            tool_index = tool_index,
+            is_error = result.is_error,
+            "Exactly-once: recorded tool result in cache"
+        );
     }
 
     pub async fn close_pending_memory_feedback_at_turn_end(
@@ -1920,6 +2022,11 @@ impl ServerToolExecutor {
             }
         }
 
+        // ── Exactly-once: check cache before execution ──────────────
+        if let Some(cached) = self.check_exactly_once_cache(name, args) {
+            return cached;
+        }
+
         // ── Progress: tool started ───────────────────────────────────
         let call_id = format!("{name}-{}", Uuid::new_v4());
         if let Some(cb) = &self.progress_callback {
@@ -2300,6 +2407,9 @@ impl ServerToolExecutor {
                 .await;
         }
         self.emit_tool_call_end(args, &result);
+
+        // ── Exactly-once: record result in cache ────────────────────
+        self.record_exactly_once_result(name, args, &result);
 
         result
     }
