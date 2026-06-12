@@ -8,6 +8,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod crash_recovery;
 pub mod engine;
 pub mod event;
 pub mod exactly_once;
