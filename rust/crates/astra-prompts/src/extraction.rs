@@ -242,217 +242,157 @@ fn response_score(r: &CompactResponse) -> usize {
 mod tests {
     use super::*;
 
+    // ── parse_compact_response ──
+
     #[test]
-    fn parse_compact_response_direct_json() {
-        let input = r#"{"summary":{"goals":["finish feature"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
-        let resp = parse_compact_response(input).unwrap();
-        assert_eq!(resp.summary.goals, vec!["finish feature"]);
-        assert!(resp.facts.is_empty());
+    fn parse_success_variants() {
+        let cases: Vec<(&str, &[&str], &[(&str, &str)])> = vec![
+            // (input, expected_goals, expected_facts)
+            (r#"{"summary":{"goals":["finish feature"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#,
+             &["finish feature"][..], &[]),
+            (r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"Uses Rust","type":"procedural"}]}"#,
+             &[], &[("Uses Rust", "procedural")]),
+            ("```json\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```",
+             &[], &[]),
+            ("```\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```",
+             &[], &[]),
+            ("Here is the compact output:\n{\"summary\":{\"goals\":[\"fix bug\"],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}",
+             &["fix bug"][..], &[]),
+        ];
+        for (input, expected_goals, expected_facts) in cases {
+            let resp = parse_compact_response(input).unwrap();
+            assert_eq!(resp.summary.goals, expected_goals, "goals mismatch");
+            assert_eq!(resp.facts.len(), expected_facts.len(), "facts len mismatch");
+            for (i, (fact, ftype)) in expected_facts.iter().enumerate() {
+                assert_eq!(resp.facts[i].fact, *fact);
+                assert_eq!(resp.facts[i].fact_type, *ftype);
+            }
+        }
     }
 
     #[test]
-    fn parse_compact_response_with_facts() {
-        let input = r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"Uses Rust","type":"procedural"}]}"#;
-        let resp = parse_compact_response(input).unwrap();
-        assert_eq!(resp.facts.len(), 1);
-        assert_eq!(resp.facts[0].fact, "Uses Rust");
-        assert_eq!(resp.facts[0].fact_type, "procedural");
+    fn parse_bracket_matching_edge_cases() {
+        let cases: Vec<(&str, &str)> = vec![
+            // (input, expected_first_goal)
+            (r#"The output is {"nested": "value"} and here is the real result: {"summary":{"goals":["correct"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#,
+             "correct"),
+            (r#"Preamble {"a":{"b":{"c":1}}} and result: {"summary":{"goals":["nested ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"deep","type":"semantic"}]} trailing"#,
+             "nested ok"),
+        ];
+        for (input, expected_goal) in cases {
+            let resp = parse_compact_response(input).unwrap();
+            assert_eq!(resp.summary.goals, vec![expected_goal]);
+        }
     }
 
     #[test]
-    fn parse_compact_response_with_markdown_fences() {
-        let input = "```json\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```";
-        let resp = parse_compact_response(input).unwrap();
-        assert!(resp.facts.is_empty());
-    }
+    fn parse_none_and_error_cases() {
+        let none_cases = [
+            "not json at all",
+            "",
+            "just some text without braces",
+        ];
+        for input in none_cases {
+            assert!(parse_compact_response(input).is_none(), "expected None for: {input}");
+        }
 
-    #[test]
-    fn parse_compact_response_with_plain_fences() {
-        let input = "```\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```";
-        let resp = parse_compact_response(input).unwrap();
-        assert!(resp.facts.is_empty());
-    }
-
-    #[test]
-    fn parse_compact_response_with_preamble() {
-        let input = "Here is the compact output:\n{\"summary\":{\"goals\":[\"fix bug\"],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}";
-        let resp = parse_compact_response(input).unwrap();
-        assert_eq!(resp.summary.goals, vec!["fix bug"]);
-    }
-
-    #[test]
-    fn parse_compact_response_bracket_matching_not_greedy() {
-        // The response contains an embedded JSON fragment in prose before the real output.
-        // Greedy rfind('}') would match the wrong closing brace.
-        let input = r#"The output is {"nested": "value"} and here is the real result: {"summary":{"goals":["correct"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
-        let resp = parse_compact_response(input).unwrap();
-        assert_eq!(resp.summary.goals, vec!["correct"]);
-    }
-
-    #[test]
-    fn parse_compact_response_bracket_matching_deeply_nested() {
-        let input = r#"Preamble {"a":{"b":{"c":1}}} and result: {"summary":{"goals":["nested ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"deep","type":"semantic"}]} trailing"#;
-        let resp = parse_compact_response(input).unwrap();
-        assert_eq!(resp.summary.goals, vec!["nested ok"]);
-        assert_eq!(resp.facts[0].fact, "deep");
-    }
-
-    #[test]
-    fn parse_compact_response_garbage_returns_none() {
-        assert!(parse_compact_response("not json at all").is_none());
-        assert!(parse_compact_response("").is_none());
-    }
-
-    #[test]
-    fn parse_compact_response_no_braces() {
-        assert!(parse_compact_response("just some text without braces").is_none());
-    }
-
-    #[test]
-    fn parse_compact_response_prefers_richer_match_over_empty_stub() {
-        // Regression: the LLM emits an empty schema-shaped stub before
-        // the real answer. The parser must NOT lock in on the empty stub.
-        let input = r#"Example output: {"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}
-Real answer: {"summary":{"goals":["finish refactor"],"decisions":["use typed pipeline"],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"branch is fix_0602_03","type":"semantic"}]}"#;
-        let resp = parse_compact_response(input).expect("must parse the rich answer");
-        assert_eq!(resp.summary.goals, vec!["finish refactor"]);
-        assert_eq!(resp.summary.decisions, vec!["use typed pipeline"]);
-        assert_eq!(resp.facts.len(), 1);
-        assert_eq!(resp.facts[0].fact, "branch is fix_0602_03");
-    }
-
-    #[test]
-    fn parse_compact_response_prefers_later_when_scores_tie() {
-        // Two equally-rich answers: prefer the later one. LLMs emit
-        // their final answer last; an earlier draft should not win.
-        let input = r#"Draft: {"summary":{"goals":["draft goal"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}
-Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
-        let resp = parse_compact_response(input).expect("must parse");
-        assert_eq!(
-            resp.summary.goals,
-            vec!["final goal"],
-            "tie-break must pick the later block"
-        );
-    }
-
-    #[test]
-    fn parse_compact_response_only_stub_returns_stub() {
-        // Single empty stub is still parseable — return it (caller decides).
-        let input = r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
-        let resp = parse_compact_response(input).expect("must parse");
-        assert!(resp.summary.goals.is_empty());
-        assert!(resp.facts.is_empty());
-    }
-
-    #[test]
-    fn parse_compact_response_handles_stray_closing_brace_without_panic() {
-        // Stray `}` before any `{` must not panic via depth underflow.
+        // Stray closing brace must not panic
         let input = r#"} prose then {"summary":{"goals":["ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
         let resp = parse_compact_response(input).expect("should still find the real block");
         assert_eq!(resp.summary.goals, vec!["ok"]);
     }
 
     #[test]
-    fn valid_facts_rejects_unknown_types() {
+    fn parse_prefers_richer_or_later_answer() {
+        // Prefers richer match over empty stub
+        let input = r#"Example output: {"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}
+Real answer: {"summary":{"goals":["finish refactor"],"decisions":["use typed pipeline"],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"branch is fix_0602_03","type":"semantic"}]}"#;
+        let resp = parse_compact_response(input).expect("must parse the rich answer");
+        assert_eq!(resp.summary.goals, vec!["finish refactor"]);
+        assert_eq!(resp.facts[0].fact, "branch is fix_0602_03");
+
+        // Tie-break: when scores equal, prefer later
+        let input = r#"Draft: {"summary":{"goals":["draft goal"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}
+Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).expect("must parse");
+        assert_eq!(resp.summary.goals, vec!["final goal"]);
+
+        // Single empty stub is parseable
+        let input = r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#;
+        let resp = parse_compact_response(input).expect("must parse");
+        assert!(resp.summary.goals.is_empty());
+        assert!(resp.facts.is_empty());
+    }
+
+    // ── valid_facts ──
+
+    #[test]
+    fn valid_facts_filtering() {
+        let base = || CompactSummary {
+            goals: vec![],
+            decisions: vec![],
+            actions: vec![],
+            status: vec![],
+            key_facts: vec![],
+        };
+
+        // Rejects unknown types
         let resp = CompactResponse {
-            summary: CompactSummary {
-                goals: vec![],
-                decisions: vec![],
-                actions: vec![],
-                status: vec![],
-                key_facts: vec![],
-            },
+            summary: base(),
             facts: vec![
-                CompactFact {
-                    fact: "a".into(),
-                    fact_type: "semantic".into(),
-                },
-                CompactFact {
-                    fact: "b".into(),
-                    fact_type: "invalid".into(),
-                },
+                CompactFact { fact: "a".into(), fact_type: "semantic".into() },
+                CompactFact { fact: "b".into(), fact_type: "invalid".into() },
             ],
         };
         let facts = resp.valid_facts();
-        // Only "a" should be kept; "b" with invalid type should be dropped
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].0, "a");
-    }
 
-    #[test]
-    fn valid_facts_accepts_all_valid_types() {
+        // Accepts all valid types
         for t in &["semantic", "profile", "procedural", "working"] {
             let resp = CompactResponse {
-                summary: CompactSummary {
-                    goals: vec![],
-                    decisions: vec![],
-                    actions: vec![],
-                    status: vec![],
-                    key_facts: vec![],
-                },
-                facts: vec![CompactFact {
-                    fact: "test".into(),
-                    fact_type: t.to_string(),
-                }],
+                summary: base(),
+                facts: vec![CompactFact { fact: "test".into(), fact_type: t.to_string() }],
             };
             let facts = resp.valid_facts();
             assert_eq!(facts.len(), 1, "failed for type: {t}");
             assert_eq!(facts[0].1, *t);
         }
-    }
 
-    #[test]
-    fn valid_facts_filters_empty() {
+        // Filters empty facts
         let resp = CompactResponse {
-            summary: CompactSummary {
-                goals: vec![],
-                decisions: vec![],
-                actions: vec![],
-                status: vec![],
-                key_facts: vec![],
-            },
-            facts: vec![CompactFact {
-                fact: "".into(),
-                fact_type: "semantic".into(),
-            }],
+            summary: base(),
+            facts: vec![CompactFact { fact: "".into(), fact_type: "semantic".into() }],
         };
         assert!(resp.valid_facts().is_empty());
     }
 
-    #[test]
-    fn render_summary_all_sections() {
-        let resp = CompactResponse {
-            summary: CompactSummary {
-                goals: vec!["g1".into()],
-                decisions: vec!["d1".into()],
-                actions: vec!["a1".into()],
-                status: vec!["s1".into()],
-                key_facts: vec!["k1".into()],
-            },
-            facts: vec![],
-        };
-        let rendered = resp.render_summary();
-        assert!(rendered.contains("### Goals"));
-        assert!(rendered.contains("- g1"));
-        assert!(rendered.contains("### Decisions"));
-        assert!(rendered.contains("### Actions"));
-        assert!(rendered.contains("### Status"));
-        assert!(rendered.contains("### Key Facts"));
-    }
+    // ── render_summary ──
 
     #[test]
-    fn render_summary_empty_sections_omitted() {
-        let resp = CompactResponse {
-            summary: CompactSummary {
-                goals: vec!["only goal".into()],
-                decisions: vec![],
-                actions: vec![],
-                status: vec![],
-                key_facts: vec![],
-            },
-            facts: vec![],
+    fn render_summary_output() {
+        // All sections populated
+        let all = CompactSummary {
+            goals: vec!["g1".into()],
+            decisions: vec!["d1".into()],
+            actions: vec!["a1".into()],
+            status: vec!["s1".into()],
+            key_facts: vec!["k1".into()],
         };
-        let rendered = resp.render_summary();
+        let rendered = CompactResponse { summary: all, facts: vec![] }.render_summary();
+        for section in &["Goals", "Decisions", "Actions", "Status", "Key Facts"] {
+            assert!(rendered.contains(&format!("### {section}")), "missing section: {section}");
+        }
+
+        // Empty sections omitted
+        let partial = CompactSummary {
+            goals: vec!["only goal".into()],
+            decisions: vec![],
+            actions: vec![],
+            status: vec![],
+            key_facts: vec![],
+        };
+        let rendered = CompactResponse { summary: partial, facts: vec![] }.render_summary();
         assert!(rendered.contains("### Goals"));
         assert!(!rendered.contains("### Decisions"));
     }

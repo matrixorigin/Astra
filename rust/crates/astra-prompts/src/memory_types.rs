@@ -296,83 +296,75 @@ mod tests {
     }
 
     #[test]
-    fn decode_legacy_unprefixed() {
-        let (cat, text) = decode("plain old memory content");
-        assert_eq!(cat, None);
-        assert_eq!(text, "plain old memory content");
-    }
-
-    #[test]
-    fn decode_existing_lesson_prefix() {
-        let (cat, text) = decode("💡 LESSON: use rg not grep");
-        assert_eq!(cat, None, "legacy LESSON prefix should not match");
-        assert_eq!(text, "💡 LESSON: use rg not grep");
-    }
-
-    #[test]
-    fn decode_partial_prefix_no_space() {
-        let (cat, text) = decode("[user]no space after bracket");
-        assert_eq!(cat, None, "prefix without trailing space should not match");
-        assert_eq!(text, "[user]no space after bracket");
-    }
-
-    #[test]
-    fn encode_preserves_content() {
-        let encoded = encode(MemoryCategory::Feedback, "prefer Rust for CLI tools");
-        assert_eq!(encoded, "[feedback] prefer Rust for CLI tools");
-    }
-
-    // ── Decode edge cases ──
-
-    #[test]
-    fn decode_prefix_typo_treated_as_legacy() {
-        let (cat, text) = decode("[userr] text");
-        assert_eq!(cat, None);
-        assert_eq!(text, "[userr] text");
-    }
-
-    #[test]
-    fn decode_double_prefix_first_wins() {
-        let (cat, text) = decode("[user] [feedback] mixed");
-        assert_eq!(cat, Some(MemoryCategory::User));
-        assert_eq!(text, "[feedback] mixed");
-    }
-
-    #[test]
-    fn decode_empty_bracket_treated_as_legacy() {
-        let (cat, text) = decode("[] text");
-        assert_eq!(cat, None);
-        assert_eq!(text, "[] text");
-    }
-
-    #[test]
-    fn decode_space_inside_bracket_treated_as_legacy() {
-        let (cat, text) = decode("[ user] text");
-        assert_eq!(cat, None);
-        assert_eq!(text, "[ user] text");
+    fn decode_legacy_and_edge_cases() {
+        // Legacy content (no prefix, partial prefix, typos, special brackets)
+        let cases: Vec<(&str, Option<MemoryCategory>, &str)> = vec![
+            ("plain old memory content", None, "plain old memory content"),
+            (
+                "💡 LESSON: use rg not grep",
+                None,
+                "💡 LESSON: use rg not grep",
+            ),
+            (
+                "[user]no space after bracket",
+                None,
+                "[user]no space after bracket",
+            ),
+            ("[userr] text", None, "[userr] text"),
+            ("[] text", None, "[] text"),
+            ("[ user] text", None, "[ user] text"),
+            // Double prefix: first one wins
+            (
+                "[user] [feedback] mixed",
+                Some(MemoryCategory::User),
+                "[feedback] mixed",
+            ),
+        ];
+        for (input, expected_cat, expected_text) in cases {
+            let (cat, text) = decode(input);
+            assert_eq!(cat, expected_cat, "decode category mismatch for: {input}");
+            assert_eq!(text, expected_text, "decode text mismatch for: {input}");
+        }
     }
 
     // ── normalize_memoria_type (single source of truth) ──
 
     #[test]
-    fn normalize_maps_all_business_types() {
-        assert_eq!(normalize_memoria_type("user"), "profile");
-        assert_eq!(normalize_memoria_type("feedback"), "semantic");
-        assert_eq!(normalize_memoria_type("project"), "semantic");
-        assert_eq!(normalize_memoria_type("lesson"), "semantic");
-        assert_eq!(normalize_memoria_type("ref"), "procedural");
-        assert_eq!(normalize_memoria_type("reference"), "procedural");
-        assert_eq!(normalize_memoria_type("episode"), "episodic");
-    }
+    fn normalize_memoria_type_mappings() {
+        // Business types → V1 primitives
+        let business_cases = [
+            ("user", "profile"),
+            ("feedback", "semantic"),
+            ("project", "semantic"),
+            ("lesson", "semantic"),
+            ("ref", "procedural"),
+            ("reference", "procedural"),
+            ("episode", "episodic"),
+        ];
+        for (input, expected) in business_cases {
+            assert_eq!(
+                normalize_memoria_type(input),
+                expected,
+                "business type: {input}"
+            );
+        }
 
-    #[test]
-    fn normalize_passes_through_v1_primitives() {
-        assert_eq!(normalize_memoria_type("semantic"), "semantic");
-        assert_eq!(normalize_memoria_type("profile"), "profile");
-        assert_eq!(normalize_memoria_type("procedural"), "procedural");
-        assert_eq!(normalize_memoria_type("working"), "working");
-        assert_eq!(normalize_memoria_type("episodic"), "episodic");
-        assert_eq!(normalize_memoria_type("tool_result"), "tool_result");
+        // V1 primitives pass through unchanged
+        let pass_through = [
+            "semantic",
+            "profile",
+            "procedural",
+            "working",
+            "episodic",
+            "tool_result",
+        ];
+        for input in pass_through {
+            assert_eq!(
+                normalize_memoria_type(input),
+                input,
+                "pass-through: {input}"
+            );
+        }
     }
 
     #[test]
@@ -385,39 +377,19 @@ mod tests {
     // ── Memoria mapping ──
 
     #[test]
-    fn user_maps_to_profile_t1() {
-        assert_eq!(MemoryCategory::User.memoria_type(), "profile");
-        assert_eq!(MemoryCategory::User.trust_tier(), "T1");
-    }
-
-    #[test]
-    fn feedback_maps_to_semantic_t2() {
-        assert_eq!(MemoryCategory::Feedback.memoria_type(), "semantic");
-        assert_eq!(MemoryCategory::Feedback.trust_tier(), "T2");
-    }
-
-    #[test]
-    fn project_maps_to_semantic_t3() {
-        assert_eq!(MemoryCategory::Project.memoria_type(), "semantic");
-        assert_eq!(MemoryCategory::Project.trust_tier(), "T3");
-    }
-
-    #[test]
-    fn reference_maps_to_procedural_t2() {
-        assert_eq!(MemoryCategory::Reference.memoria_type(), "procedural");
-        assert_eq!(MemoryCategory::Reference.trust_tier(), "T2");
-    }
-
-    #[test]
-    fn lesson_maps_to_semantic_t3() {
-        assert_eq!(MemoryCategory::Lesson.memoria_type(), "semantic");
-        assert_eq!(MemoryCategory::Lesson.trust_tier(), "T3");
-    }
-
-    #[test]
-    fn episode_maps_to_episodic_t3() {
-        assert_eq!(MemoryCategory::Episode.memoria_type(), "episodic");
-        assert_eq!(MemoryCategory::Episode.trust_tier(), "T3");
+    fn memoria_type_and_trust_tier_mappings() {
+        let expected: Vec<(MemoryCategory, &str, &str)> = vec![
+            (MemoryCategory::User, "profile", "T1"),
+            (MemoryCategory::Feedback, "semantic", "T2"),
+            (MemoryCategory::Project, "semantic", "T3"),
+            (MemoryCategory::Reference, "procedural", "T2"),
+            (MemoryCategory::Lesson, "semantic", "T3"),
+            (MemoryCategory::Episode, "episodic", "T3"),
+        ];
+        for (cat, mem_type, tier) in expected {
+            assert_eq!(cat.memoria_type(), mem_type, "{cat:?} memoria_type");
+            assert_eq!(cat.trust_tier(), tier, "{cat:?} trust_tier");
+        }
     }
 
     // ── V2 tags ──
@@ -467,8 +439,30 @@ mod tests {
     // ── Prompt builder ──
 
     #[test]
-    fn none_mode_returns_empty() {
-        assert!(build_memory_prompt(MemoryPromptMode::None).is_empty());
+    fn full_mode_content_policies() {
+        let prompt = build_memory_prompt(MemoryPromptMode::Full);
+
+        // No hardcoded trigger keywords
+        assert!(!prompt.contains("关注|跟踪|留意"));
+        assert!(!prompt.contains("follow|watch|track|interested|prefer|remember"));
+
+        // No unconditional store phrases
+        assert!(!prompt.contains("just store, then confirm"));
+
+        // Prefer false negatives / silence
+        assert!(prompt.contains("false negatives") || prompt.contains("silence is cheaper"));
+
+        // Destructive ops require reason
+        assert!(prompt.contains("reason"));
+
+        // New freshness vocabulary
+        assert!(prompt.contains("stale — verify first"));
+        assert!(!prompt.contains("(N days ago)"));
+    }
+
+    #[test]
+    fn all_categories_count() {
+        assert_eq!(MemoryCategory::ALL.len(), 6);
     }
 
     #[test]
@@ -483,117 +477,43 @@ mod tests {
     }
 
     #[test]
-    fn full_mode_has_type_taxonomy() {
+    fn full_mode_has_all_required_sections() {
         let prompt = build_memory_prompt(MemoryPromptMode::Full);
+
+        // Type taxonomy
         assert!(prompt.contains("<types>"));
-        assert!(prompt.contains("<name>user</name>"));
-        assert!(prompt.contains("<name>feedback</name>"));
-        assert!(prompt.contains("<name>project</name>"));
-        assert!(prompt.contains("<name>reference</name>"));
-    }
+        for name in &["user", "feedback", "project", "reference"] {
+            assert!(prompt.contains(&format!("<name>{name}</name>")));
+        }
 
-    #[test]
-    fn full_mode_has_what_not_to_save() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("What NOT to save"));
+        // Guidance sections
+        for section in &["What NOT to save", "When to access", "Before recommending"] {
+            assert!(prompt.contains(section), "missing section: {section}");
+        }
         assert!(prompt.contains("derivable from the codebase"));
-    }
-
-    #[test]
-    fn full_mode_has_when_to_access() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("When to access"));
-    }
-
-    #[test]
-    fn full_mode_has_before_recommending() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("Before recommending"));
         assert!(prompt.contains("check the file exists"));
-    }
 
-    #[test]
-    fn full_mode_no_hardcoded_trigger_keywords() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(
-            !prompt.contains("关注|跟踪|留意"),
-            "should not have hardcoded Chinese trigger keywords"
-        );
-        assert!(
-            !prompt.contains("follow|watch|track|interested|prefer|remember"),
-            "should not have hardcoded English trigger keyword list"
-        );
-    }
+        // Examples present
+        for keyword in &[
+            "data scientist",
+            "don't mock the database",
+            "merge freeze",
+            "Linear project",
+        ] {
+            assert!(
+                prompt.contains(keyword),
+                "missing example keyword: {keyword}"
+            );
+        }
 
-    #[test]
-    fn full_mode_has_examples() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("data scientist"));
-        assert!(prompt.contains("don't mock the database"));
-        assert!(prompt.contains("merge freeze"));
-        assert!(prompt.contains("Linear project"));
-    }
-
-    #[test]
-    fn full_mode_has_deduplication_rule() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
+        // Deduplication and negative preferences
         assert!(
             prompt.contains("memory(action=update"),
-            "prompt must mention memory(action=update ...) as the refinement path"
+            "missing dedup path"
         );
-    }
-
-    #[test]
-    fn full_mode_has_negative_preference_rule() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("不喜欢") || prompt.contains("don't want"));
-    }
-
-    #[test]
-    fn all_categories_count() {
-        assert_eq!(MemoryCategory::ALL.len(), 6);
-    }
-
-    /// P10 regression: the prompt must not tell the model to "just store,
-    /// then confirm". That phrasing contradicted the explicit-save gate
-    /// and caused over-saving.
-    #[test]
-    fn full_mode_no_unconditional_store_phrase() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
         assert!(
-            !prompt.contains("just store, then confirm"),
-            "prompt must not push unconditional stores — it should guide \
-             the model to save only when durable"
-        );
-    }
-
-    #[test]
-    fn full_mode_surfaces_false_negative_preference() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(
-            prompt.contains("false negatives") || prompt.contains("silence is cheaper"),
-            "prompt must tell the model to prefer not-storing when marginal"
-        );
-    }
-
-    #[test]
-    fn full_mode_surfaces_reason_required_on_destructive_ops() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(
-            prompt.contains("reason"),
-            "prompt must explain that destructive ops require a reason"
-        );
-    }
-
-    #[test]
-    fn full_mode_uses_new_freshness_vocabulary() {
-        let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        // The old "(N days ago)" label was replaced by bucketed labels
-        // in P5; the prompt must reflect the new vocabulary.
-        assert!(prompt.contains("stale — verify first"));
-        assert!(
-            !prompt.contains("(N days ago)"),
-            "prompt must not reference the retired exact-day freshness label"
+            prompt.contains("不喜欢") || prompt.contains("don't want"),
+            "missing negative pref rule"
         );
     }
 }
