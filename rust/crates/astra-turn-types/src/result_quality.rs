@@ -235,7 +235,7 @@ mod tests {
             ("git_log", ResultQuality::Truncated, Some("truncated")),
         ];
         for (tool_name, quality, expected_substr) in cases {
-            let msg = quality_feedback(tool_name, quality);
+            let msg = quality_feedback(tool_name, *quality);
             match expected_substr {
                 Some(substr) => assert!(
                     msg.unwrap().contains(substr),

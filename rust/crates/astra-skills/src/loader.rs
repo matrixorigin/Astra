@@ -1043,16 +1043,18 @@ Hooked body."#;
     // ── Path traversal protection ──
 
     #[test]
-    fn reject_path_traversal_blocks_dotdot() {
-        let path = Path::new("/tmp/skills/../../../etc/passwd");
-        let result = reject_path_traversal(path);
-        assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
-    }
-
-    #[test]
-    fn reject_path_traversal_allows_normal_paths() {
-        let path = Path::new("/tmp/skills/review/SKILL.md");
-        assert!(reject_path_traversal(path).is_ok());
+    fn reject_path_traversal_blocks_dangerous_paths() {
+        for (path, expect_err) in [
+            ("/tmp/skills/../../../etc/passwd", true),
+            ("/tmp/skills/review/SKILL.md", false),
+        ] {
+            let result = reject_path_traversal(Path::new(path));
+            if expect_err {
+                assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
     }
 
     #[test]
@@ -1149,22 +1151,21 @@ Hooked body."#;
     }
 
     #[test]
-    fn verify_confinement_rejects_outside_root() {
+    fn verify_confinement_enforces_boundary() {
         let root = tempfile::TempDir::new().unwrap();
         let outside = tempfile::TempDir::new().unwrap();
+
+        // Rejects outside root
         let file = outside.path().join("test.txt");
         std::fs::write(&file, "hello").unwrap();
+        assert!(matches!(
+            verify_confinement(&file, root.path()),
+            Err(SkillError::PermissionDenied(_))
+        ));
 
-        let result = verify_confinement(&file, root.path());
-        assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
-    }
-
-    #[test]
-    fn verify_confinement_allows_inside_root() {
-        let root = tempfile::TempDir::new().unwrap();
+        // Allows inside root
         let file = root.path().join("inside.txt");
         std::fs::write(&file, "hello").unwrap();
-
         assert!(verify_confinement(&file, root.path()).is_ok());
     }
 
@@ -1298,162 +1299,87 @@ Hooked body."#;
     // ── Skill name validation ──
 
     #[test]
-    fn validate_skill_name_rejects_slash() {
-        let content = "---\nname: evil/skill\ndescription: test\n---\nBody";
-        let result = parse_skill_md(content);
-        assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
-    }
-
-    #[test]
-    fn validate_skill_name_rejects_dotdot() {
-        let content = "---\nname: ..escape\ndescription: test\n---\nBody";
-        let result = parse_skill_md(content);
-        assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
-    }
-
-    #[test]
-    fn validate_skill_name_rejects_backslash() {
-        let content = "---\nname: \"evil\\\\skill\"\ndescription: test\n---\nBody";
-        let result = parse_skill_md(content);
-        assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
-    }
-
-    #[test]
-    fn validate_skill_name_rejects_null() {
-        let content = "---\nname: \"evil\\0skill\"\ndescription: test\n---\nBody";
-        let result = parse_skill_md(content);
-        assert!(matches!(result, Err(SkillError::PermissionDenied(_))));
-    }
-
-    #[test]
-    fn validate_skill_name_allows_normal() {
-        let content = "---\nname: my-cool-skill_v2\ndescription: test\n---\nBody";
-        let (manifest, _) = parse_skill_md(content).unwrap();
-        assert_eq!(manifest.name, "my-cool-skill_v2");
-    }
-
-    #[test]
-    fn validate_skill_name_rejects_empty() {
-        let content = "---\nname: \"\"\ndescription: test\n---\nBody";
-        let result = parse_skill_md(content);
-        assert!(result.is_err());
+    fn validate_skill_name() {
+        // Reject dangerous names
+        for (name, expect_reject) in [
+            ("evil/skill", true),
+            ("..escape", true),
+            ("evil\\\\skill", true),
+            ("evil\\0skill", true),
+            ("", true),
+            ("my-cool-skill_v2", false),
+        ] {
+            let content = format!("---\nname: {name}\ndescription: test\n---\nBody");
+            let result = parse_skill_md(&content);
+            if expect_reject {
+                assert!(result.is_err(), "should reject name: {name}");
+            } else {
+                let (manifest, _) = result.unwrap();
+                assert_eq!(manifest.name, name);
+            }
+        }
     }
 
     // ── sanitize_for_path ──
 
     #[test]
-    fn sanitize_path_replaces_slash_and_dotdot() {
-        assert_eq!(sanitize_for_path("evil/skill"), "evil-skill");
-        assert_eq!(sanitize_for_path("..escape"), "--escape");
-        assert_eq!(sanitize_for_path("a\\b"), "a-b");
-    }
-
-    #[test]
-    fn sanitize_path_preserves_safe_names() {
-        assert_eq!(sanitize_for_path("my-skill-v2"), "my-skill-v2");
-        assert_eq!(sanitize_for_path("debug"), "debug");
+    fn sanitize_for_path_normalizes_dangerous_chars() {
+        for (input, expected) in [
+            ("evil/skill", "evil-skill"),
+            ("..escape", "--escape"),
+            ("a\\b", "a-b"),
+            ("my-skill-v2", "my-skill-v2"),
+            ("debug", "debug"),
+        ] {
+            assert_eq!(sanitize_for_path(input), expected);
+        }
     }
 
     // ── Aliases / effort / agent_type frontmatter tests ─────────────────
 
     #[test]
-    fn parse_aliases_from_frontmatter() {
-        let content = r#"---
-name: code-review
-description: "Review code"
-aliases:
-  - cr
-  - review
----
-Do the review.
-"#;
-        let (manifest, _) = parse_skill_md(content).unwrap();
-        assert_eq!(manifest.aliases, vec!["cr", "review"]);
+    fn parse_cc_fields() {
+        // Parse individual & combined CC-compatible fields
+        let cases: Vec<(&str, fn(&SkillManifest))> = vec![
+            // aliases
+            ("name: cc-1\ndescription: \"x\"\naliases:\n  - cr\n  - review\n",
+             |m: &SkillManifest| { assert_eq!(m.aliases, vec!["cr", "review"]); }),
+            // effort named
+            ("name: cc-2\ndescription: \"x\"\neffort: high\n",
+             |m: &SkillManifest| { assert!(matches!(m.effort, Some(EffortLevel::High))); }),
+            // effort numeric
+            ("name: cc-3\ndescription: \"x\"\neffort: \"200\"\n",
+             |m: &SkillManifest| { assert!(matches!(m.effort, Some(EffortLevel::Custom(200)))); }),
+            // agent_type
+            ("name: cc-4\ndescription: \"x\"\nagent_type: researcher\n",
+             |m: &SkillManifest| { assert_eq!(m.agent_type.as_deref(), Some("researcher")); }),
+            // all CC fields together
+            ("name: cc-5\ndescription: \"x\"\naliases: [fc, full]\neffort: max\nagent_type: coder\nmodel: \"claude-sonnet-4-20250514\"\n",
+             |m: &SkillManifest| {
+                assert_eq!(m.aliases, vec!["fc", "full"]);
+                assert!(matches!(m.effort, Some(EffortLevel::Max)));
+                assert_eq!(m.agent_type.as_deref(), Some("coder"));
+                assert_eq!(m.model.as_deref(), Some("claude-sonnet-4-20250514"));
+            }),
+        ];
+        for (content, check) in cases {
+            let full = format!("---\n{content}---\nInstructions.");
+            let (manifest, _) = parse_skill_md(&full).unwrap();
+            check(&manifest);
+        }
     }
 
     #[test]
-    fn parse_effort_named_from_frontmatter() {
-        let content = r#"---
-name: deep-think
-description: "Think hard"
-effort: high
----
-Think carefully.
-"#;
-        let (manifest, _) = parse_skill_md(content).unwrap();
-        assert!(matches!(manifest.effort, Some(EffortLevel::High)));
-    }
-
-    #[test]
-    fn parse_effort_numeric_from_frontmatter() {
-        let content = r#"---
-name: custom-effort
-description: "Custom"
-effort: "200"
----
-Instructions.
-"#;
-        let (manifest, _) = parse_skill_md(content).unwrap();
-        assert!(matches!(manifest.effort, Some(EffortLevel::Custom(200))));
-    }
-
-    #[test]
-    fn parse_agent_type_from_frontmatter() {
-        let content = r#"---
-name: researcher
-description: "Research skill"
-agent_type: researcher
----
-Do research.
-"#;
-        let (manifest, _) = parse_skill_md(content).unwrap();
-        assert_eq!(manifest.agent_type.as_deref(), Some("researcher"));
-    }
-
-    #[test]
-    fn parse_all_cc_fields_together() {
-        let content = r#"---
-name: full-cc
-description: "Full CC-compatible"
-aliases:
-  - fc
-  - full
-effort: max
-agent_type: coder
-model: "claude-sonnet-4-20250514"
----
-Full instructions.
-"#;
-        let (manifest, _) = parse_skill_md(content).unwrap();
-        assert_eq!(manifest.aliases, vec!["fc", "full"]);
-        assert!(matches!(manifest.effort, Some(EffortLevel::Max)));
-        assert_eq!(manifest.agent_type.as_deref(), Some("coder"));
-        assert_eq!(manifest.model.as_deref(), Some("claude-sonnet-4-20250514"));
-    }
-
-    #[test]
-    fn missing_cc_fields_default_to_none() {
-        let content = r#"---
-name: minimal
-description: "Minimal skill"
----
-Just instructions.
-"#;
+    fn parse_cc_fields_defaults_and_errors() {
+        // Missing CC fields default to None
+        let content = "---\nname: minimal\ndescription: \"Minimal skill\"\n---\nJust instructions.";
         let (manifest, _) = parse_skill_md(content).unwrap();
         assert!(manifest.aliases.is_empty());
         assert!(manifest.effort.is_none());
         assert!(manifest.agent_type.is_none());
-    }
 
-    #[test]
-    fn invalid_effort_ignored_in_frontmatter() {
-        let content = r#"---
-name: bad-effort
-description: "Bad effort"
-effort: "not-a-level"
----
-Instructions.
-"#;
+        // Invalid effort is ignored
+        let content = "---\nname: bad-effort\ndescription: \"Bad effort\"\neffort: \"not-a-level\"\n---\nInstructions.";
         let (manifest, _) = parse_skill_md(content).unwrap();
         assert!(manifest.effort.is_none());
     }

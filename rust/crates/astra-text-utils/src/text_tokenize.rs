@@ -240,9 +240,11 @@ mod tests {
         assert!(t.contains(&"prefer".to_string()));
 
         // Cross-form: prefer ↔ preferences share tokens
-        let shared: Vec<_> = tokenize("prefer")
+        let prefer_tokens = tokenize("prefer");
+        let prefs_tokens = tokenize("preferences");
+        let shared: Vec<_> = prefer_tokens
             .iter()
-            .filter(|x| tokenize("preferences").contains(x))
+            .filter(|x| prefs_tokens.contains(x))
             .collect();
         assert!(
             !shared.is_empty(),
@@ -250,9 +252,11 @@ mod tests {
         );
 
         // commit ↔ committed
-        let shared: Vec<_> = tokenize("commit")
+        let commit_tokens = tokenize("commit");
+        let committed_tokens = tokenize("committed");
+        let shared: Vec<_> = commit_tokens
             .iter()
-            .filter(|x| tokenize("committed").contains(x))
+            .filter(|x| committed_tokens.contains(x))
             .collect();
         assert!(
             !shared.is_empty(),
