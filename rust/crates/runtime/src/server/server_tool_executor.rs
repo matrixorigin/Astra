@@ -1144,6 +1144,7 @@ impl ServerToolExecutor {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            context_signature: None,
         };
         executor.cache_mut().record(&key, cached_result);
 

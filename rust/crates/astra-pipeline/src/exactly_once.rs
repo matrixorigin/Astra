@@ -114,11 +114,14 @@ impl Default for ExactlyOnceExecutor {
 }
 
 impl ExactlyOnceExecutor {
-    /// Create a new executor with empty cache
+    /// Create a new executor with empty cache.
+    ///
+    /// Default policy: `ReexecuteOnWorkspaceChange` — PureRead tools are re-executed
+    /// if workspace_version changed, preventing stale reads after file mutations.
     pub fn new() -> Self {
         Self {
             cache: InMemoryIdempotencyCache::new(),
-            pure_read_policy: PureReadPolicy::AlwaysCache,
+            pure_read_policy: PureReadPolicy::ReexecuteOnWorkspaceChange,
         }
     }
 
@@ -202,17 +205,40 @@ impl ExactlyOnceExecutor {
                             });
                         }
                         PureReadPolicy::ReexecuteOnWorkspaceChange => {
-                            // For now, treat as AlwaysCache (workspace version check is future work)
-                            tracing::debug!(
-                                tool_name = %tool_name,
-                                step_id = %step_id,
-                                "Exactly-once: cache hit for PureRead tool (ReexecuteOnWorkspaceChange policy, but no workspace version check yet)"
-                            );
-                            return Ok(ExecutionResult {
-                                output: cached.output.clone(),
-                                is_error: cached.is_error,
-                                from_cache: true,
-                            });
+                            // Check if workspace_version changed
+                            let should_reexecute = if let Some(current_ctx) = &key.context_signature
+                            {
+                                if let Some(cached_ctx) = &cached.context_signature {
+                                    // Compare workspace versions
+                                    current_ctx.workspace_version != cached_ctx.workspace_version
+                                } else {
+                                    // No cached context, assume workspace may have changed
+                                    true
+                                }
+                            } else {
+                                // No current context, use cache (can't verify workspace)
+                                false
+                            };
+
+                            if should_reexecute {
+                                tracing::debug!(
+                                    tool_name = %tool_name,
+                                    step_id = %step_id,
+                                    "Exactly-once: cache hit for PureRead tool, but workspace changed, re-executing"
+                                );
+                                // Fall through to execute
+                            } else {
+                                tracing::debug!(
+                                    tool_name = %tool_name,
+                                    step_id = %step_id,
+                                    "Exactly-once: cache hit for PureRead tool (workspace unchanged)"
+                                );
+                                return Ok(ExecutionResult {
+                                    output: cached.output.clone(),
+                                    is_error: cached.is_error,
+                                    from_cache: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -239,6 +265,7 @@ impl ExactlyOnceExecutor {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
+                    context_signature: key.context_signature.clone(),
                 };
                 self.cache.record(&key, cached_result);
                 Ok(ExecutionResult {
@@ -257,6 +284,7 @@ impl ExactlyOnceExecutor {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
+                    context_signature: key.context_signature.clone(),
                 };
                 self.cache.record(&key, cached_result);
                 Err(ExactlyOnceError::ToolExecutionError(error_msg))
@@ -284,6 +312,7 @@ impl ExactlyOnceExecutor {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            context_signature: key.context_signature.clone(),
         };
         self.cache.record(&key, cached_result);
     }

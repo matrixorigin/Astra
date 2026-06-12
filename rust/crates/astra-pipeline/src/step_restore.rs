@@ -232,6 +232,7 @@ pub fn warm_cache_from_events(
                         output: output.to_string(),
                         is_error,
                         cached_at: event.created_at,
+                        context_signature: None,
                     },
                 );
             }

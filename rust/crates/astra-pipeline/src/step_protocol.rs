@@ -1227,6 +1227,8 @@ pub struct CachedToolResult {
     pub output: String,
     pub is_error: bool,
     pub cached_at: u64,
+    /// Optional context signature captured at cache time (for workspace version comparison).
+    pub context_signature: Option<ContextSignature>,
 }
 
 pub use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
@@ -1872,6 +1874,7 @@ mod tests {
                 output: "3 matches".into(),
                 is_error: false,
                 cached_at: 1000,
+                context_signature: None,
             }),
             retry_count: 0,
         };
@@ -1989,6 +1992,7 @@ mod tests {
                 output: "3 matches".into(),
                 is_error: false,
                 cached_at: epoch_ms(),
+                context_signature: None,
             },
         );
         assert_eq!(cache.len(), 1);
@@ -2010,6 +2014,7 @@ mod tests {
                     output: "r".into(),
                     is_error: false,
                     cached_at: 0,
+                    context_signature: None,
                 },
             );
         }
@@ -2190,6 +2195,7 @@ mod tests {
                 output: "old file".into(),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
         cache.record(
@@ -2199,6 +2205,7 @@ mod tests {
                 output: "old grep".into(),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
 
@@ -2224,6 +2231,7 @@ mod tests {
                 output: "3 matches".into(),
                 is_error: false,
                 cached_at: 1000,
+                context_signature: None,
             }),
             retry_count: 0,
         };
@@ -2591,6 +2599,7 @@ mod tests {
                 output: "found".into(),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
         assert!(cache.check(&key).is_some());
@@ -2903,6 +2912,7 @@ mod tests {
             output: "ok".into(),
             is_error: false,
             cached_at: 0,
+            context_signature: None,
         };
         cache.record(&key_s1, result.clone());
         cache.record(&key_s10, result);

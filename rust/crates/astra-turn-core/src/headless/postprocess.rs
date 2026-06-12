@@ -177,6 +177,7 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
         output: ctx.result_str.clone(),
         is_error: false,
         cached_at: epoch_ms(),
+        context_signature: None,
     };
     ctx.step_recorder
         .attach_cached_result(cached_result.clone());

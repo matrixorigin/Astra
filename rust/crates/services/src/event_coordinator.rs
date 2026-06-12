@@ -29,6 +29,12 @@ use tracing::{debug, error, warn};
 
 use crate::session_journal::JournalEvent;
 
+/// Default timeout for sending an ingestion request to the DB worker.
+const DEFAULT_INGESTION_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Maximum number of orphaned events to buffer before dropping.
+const DEFAULT_ORPHAN_QUEUE_CAPACITY: usize = 256;
+
 /// Error type for event coordination.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EventError {
@@ -43,6 +49,9 @@ pub enum EventError {
 
     #[error("ingestion channel closed")]
     ChannelClosed,
+
+    #[error("ingestion send timed out after {0:?}")]
+    IngestionSendTimeout(std::time::Duration),
 }
 
 /// Status of an event in the coordination pipeline.
@@ -62,6 +71,27 @@ pub enum EventStatus {
 pub struct IngestionRequest {
     pub event: JournalEvent,
     pub confirm_tx: oneshot::Sender<Result<(), IngestionError>>,
+}
+
+/// An event that was written to journal but failed to persist to DB.
+/// Can be retried by a reaper/recovery process.
+#[derive(Debug, Clone)]
+pub struct OrphanedEvent {
+    pub event: JournalEvent,
+    pub reason: OrphanReason,
+}
+
+/// Why an event became orphaned.
+#[derive(Debug, Clone)]
+pub enum OrphanReason {
+    /// DB flush returned an error.
+    DbFailed(String),
+    /// DB flush exceeded timeout.
+    DbTimeout(std::time::Duration),
+    /// Ingestion channel send timed out.
+    IngestionSendTimeout(std::time::Duration),
+    /// Ingestion channel was closed.
+    ChannelClosed,
 }
 
 /// Error during DB ingestion.
@@ -89,11 +119,19 @@ pub struct EventCoordinator {
     ingestion_tx: mpsc::Sender<IngestionRequest>,
     broadcast_tx: broadcast::Sender<Value>,
     persist_timeout: std::time::Duration,
+    ingestion_send_timeout: std::time::Duration,
+    orphan_tx: Option<mpsc::Sender<OrphanedEvent>>,
 }
 
 /// Trait for journal write operations (allows mocking in tests).
 pub trait JournalWriter: Send + Sync {
     fn write(&self, event: &JournalEvent) -> Result<(), String>;
+
+    /// Flush buffered data to OS buffers (fsync equivalent).
+    /// Default implementation is a no-op for writers that don't buffer.
+    fn flush(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl EventCoordinator {
@@ -109,6 +147,39 @@ impl EventCoordinator {
             ingestion_tx,
             broadcast_tx,
             persist_timeout,
+            ingestion_send_timeout: DEFAULT_INGESTION_SEND_TIMEOUT,
+            orphan_tx: None,
+        }
+    }
+
+    /// Set the timeout for sending ingestion requests to the DB worker.
+    pub fn with_ingestion_send_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ingestion_send_timeout = timeout;
+        self
+    }
+
+    /// Enable orphan event queuing. Orphaned events (journal-written but DB-failed)
+    /// will be sent to the returned receiver for dead-letter processing.
+    pub fn with_orphan_queue(mut self) -> (Self, mpsc::Receiver<OrphanedEvent>) {
+        let (tx, rx) = mpsc::channel(DEFAULT_ORPHAN_QUEUE_CAPACITY);
+        self.orphan_tx = Some(tx);
+        (self, rx)
+    }
+
+    /// Queue an orphaned event for dead-letter processing.
+    /// Non-blocking: if the queue is full, the event is logged and dropped.
+    fn queue_orphan(&self, event: JournalEvent, reason: OrphanReason) {
+        if let Some(ref orphan_tx) = self.orphan_tx {
+            let orphaned = OrphanedEvent { event, reason };
+            match orphan_tx.try_send(orphaned) {
+                Ok(()) => debug!("orphaned event queued for dead-letter processing"),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("orphan queue full, dropping orphaned event");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("orphan queue closed, dropping orphaned event");
+                }
+            }
         }
     }
 
@@ -133,22 +204,41 @@ impl EventCoordinator {
             .write(&event)
             .map_err(EventError::JournalWrite)?;
 
-        // 2. Send to DB with confirmation channel
+        // 2. Flush journal to ensure durability before DB ingestion
+        if let Err(e) = self.journal_writer.flush() {
+            warn!(error = %e, "journal flush failed, proceeding with best-effort");
+        }
+
+        // 3. Send to DB with confirmation channel (with timeout)
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let request = IngestionRequest {
             event: event.clone(),
             confirm_tx,
         };
 
-        self.ingestion_tx
-            .send(request)
+        match tokio::time::timeout(self.ingestion_send_timeout, self.ingestion_tx.send(request))
             .await
-            .map_err(|_| EventError::ChannelClosed)?;
+        {
+            Ok(Ok(())) => { /* send succeeded */ }
+            Ok(Err(_)) => {
+                self.queue_orphan(event.clone(), OrphanReason::ChannelClosed);
+                return Err(EventError::ChannelClosed);
+            }
+            Err(_) => {
+                self.queue_orphan(
+                    event.clone(),
+                    OrphanReason::IngestionSendTimeout(self.ingestion_send_timeout),
+                );
+                return Err(EventError::IngestionSendTimeout(
+                    self.ingestion_send_timeout,
+                ));
+            }
+        }
 
-        // 3. Await DB confirmation with timeout (this is the barrier)
+        // 4. Await DB confirmation with timeout (this is the barrier)
         match tokio::time::timeout(self.persist_timeout, confirm_rx).await {
             Ok(Ok(Ok(()))) => {
-                // 4. Broadcast to clients (only now!)
+                // 5. Broadcast to clients (only now!)
                 let _ = self
                     .broadcast_tx
                     .send(serde_json::to_value(&event).unwrap_or_default());
@@ -157,12 +247,15 @@ impl EventCoordinator {
             }
             Ok(Ok(Err(e))) => {
                 // DB failed — event is orphaned, do NOT broadcast
+                let reason = format!("{}", e);
                 warn!(event_type = ?event.event_type, error = %e, "event orphaned: DB flush failed");
+                self.queue_orphan(event.clone(), OrphanReason::DbFailed(reason));
                 Err(EventError::Orphaned(format!("{:?}", event.event_type)))
             }
             Ok(Err(_)) => {
                 // Confirmation channel dropped (ingestion worker died)
                 error!(event_type = ?event.event_type, "ingestion worker dropped confirmation channel");
+                self.queue_orphan(event.clone(), OrphanReason::ChannelClosed);
                 Err(EventError::ChannelClosed)
             }
             Err(_) => {
@@ -172,6 +265,7 @@ impl EventCoordinator {
                     timeout = ?self.persist_timeout,
                     "event orphaned: DB flush timeout"
                 );
+                self.queue_orphan(event.clone(), OrphanReason::DbTimeout(self.persist_timeout));
                 Err(EventError::Timeout(
                     format!("{:?}", event.event_type),
                     self.persist_timeout,
@@ -211,6 +305,13 @@ pub mod mock_journal_writer {
                 return Err("simulated journal failure".to_string());
             }
             self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<(), String> {
+            if *self.should_fail.lock().unwrap() {
+                return Err("simulated flush failure".to_string());
+            }
             Ok(())
         }
     }

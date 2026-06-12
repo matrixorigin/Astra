@@ -788,6 +788,7 @@ impl CrashRecoveryManager {
                                     output: result_str.to_string(),
                                     is_error: false,
                                     cached_at: event.created_at,
+                                    context_signature: None,
                                 });
                             }
                             completed.push(record);
@@ -1452,6 +1453,7 @@ mod tests {
             output: "cached output".to_string(),
             is_error: false,
             cached_at: 1000,
+            context_signature: None,
         };
         let record = ToolCallRecord {
             step_id: "s1".to_string(),
@@ -1505,6 +1507,7 @@ mod tests {
             output: "cached".to_string(),
             is_error: false,
             cached_at: 1000,
+            context_signature: None,
         };
         let record = ToolCallRecord {
             step_id: "s1".to_string(),

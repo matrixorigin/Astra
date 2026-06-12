@@ -1949,6 +1949,7 @@ mod tests {
                 output: "cached output".to_string(),
                 is_error: false,
                 cached_at: 42,
+                context_signature: None,
             },
             "cached_cross_turn",
         );
