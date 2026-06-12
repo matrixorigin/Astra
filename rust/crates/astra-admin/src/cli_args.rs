@@ -260,21 +260,26 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn parse_login_command() {
-        let cli = Cli::try_parse_from(["astra-admin", "login"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Login(_))));
-    }
-
-    #[test]
-    fn parse_init_command() {
-        let cli = Cli::try_parse_from(["astra-admin", "init"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Init)));
-    }
-
-    #[test]
-    fn parse_model_list() {
-        let cli = Cli::try_parse_from(["astra-admin", "model", "list"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Model(ModelCmd::List))));
+    fn parse_simple_commands() {
+        // Basic command parsing
+        assert!(matches!(
+            Cli::try_parse_from(["astra-admin", "login"])
+                .unwrap()
+                .command,
+            Some(Command::Login(_))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["astra-admin", "init"])
+                .unwrap()
+                .command,
+            Some(Command::Init)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["astra-admin", "model", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Model(ModelCmd::List))
+        ));
     }
 
     #[test]
@@ -288,22 +293,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_profile_flag() {
-        let cli = Cli::try_parse_from(["astra-admin", "--profile", "staging", "init"]).unwrap();
-        assert_eq!(cli.profile.as_deref(), Some("staging"));
-    }
-
-    #[test]
-    fn parse_api_url_flag() {
-        let cli =
+    fn parse_flag_options() {
+        // --profile flag
+        assert_eq!(
+            Cli::try_parse_from(["astra-admin", "--profile", "staging", "init"])
+                .unwrap()
+                .profile
+                .as_deref(),
+            Some("staging")
+        );
+        // --api-url flag
+        assert_eq!(
             Cli::try_parse_from(["astra-admin", "--api-url", "http://localhost:9000", "init"])
-                .unwrap();
-        assert_eq!(cli.api_url.as_deref(), Some("http://localhost:9000"));
-    }
-
-    #[test]
-    fn default_api_url() {
-        let cli = Cli::try_parse_from(["astra-admin", "init"]).unwrap();
-        assert_eq!(cli.api_url, None);
+                .unwrap()
+                .api_url
+                .as_deref(),
+            Some("http://localhost:9000")
+        );
+        // Default api_url is None
+        assert_eq!(
+            Cli::try_parse_from(["astra-admin", "init"])
+                .unwrap()
+                .api_url,
+            None
+        );
     }
 }

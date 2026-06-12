@@ -81,47 +81,46 @@ mod tests {
     }
 
     #[test]
-    fn flag_wins_over_env_and_config() {
-        let url = resolve_api_url_with(
-            Some("http://flag:8000"),
-            env_val("http://env:8000"),
-            config_val("http://config:8000"),
+    fn resolve_api_url_priority_chain() {
+        // flag > env > config > default
+        assert_eq!(
+            resolve_api_url_with(
+                Some("http://flag:8000"),
+                env_val("http://env:8000"),
+                config_val("http://config:8000"),
+            ),
+            "http://flag:8000"
         );
-        assert_eq!(url, "http://flag:8000");
-    }
-
-    #[test]
-    fn env_wins_over_config() {
-        let url = resolve_api_url_with(
-            None,
-            env_val("http://env:8000"),
-            config_val("http://config:8000"),
+        assert_eq!(
+            resolve_api_url_with(
+                None,
+                env_val("http://env:8000"),
+                config_val("http://config:8000")
+            ),
+            "http://env:8000"
         );
-        assert_eq!(url, "http://env:8000");
+        assert_eq!(
+            resolve_api_url_with(None, no_env, config_val("http://config:8000")),
+            "http://config:8000"
+        );
+        assert_eq!(
+            resolve_api_url_with(None, no_env, no_config),
+            DEFAULT_API_URL
+        );
     }
 
     #[test]
-    fn config_wins_over_default() {
-        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000"));
-        assert_eq!(url, "http://config:8000");
-    }
-
-    #[test]
-    fn falls_back_to_default() {
-        let url = resolve_api_url_with(None, no_env, no_config);
-        assert_eq!(url, DEFAULT_API_URL);
-    }
-
-    #[test]
-    fn trailing_slash_stripped_from_flag() {
-        let url = resolve_api_url_with(Some("http://flag:8000/"), no_env, no_config);
-        assert_eq!(url, "http://flag:8000");
-    }
-
-    #[test]
-    fn trailing_slash_stripped_from_env() {
-        let url = resolve_api_url_with(None, env_val("http://env:8000/"), no_config);
-        assert_eq!(url, "http://env:8000");
+    fn trailing_slash_stripped_from_sources() {
+        // From flag
+        assert_eq!(
+            resolve_api_url_with(Some("http://flag:8000/"), no_env, no_config),
+            "http://flag:8000"
+        );
+        // From env
+        assert_eq!(
+            resolve_api_url_with(None, env_val("http://env:8000/"), no_config),
+            "http://env:8000"
+        );
     }
 
     #[test]
@@ -151,24 +150,19 @@ mod tests {
     }
 
     #[test]
-    fn read_config_api_url_returns_none_when_missing() {
+    fn read_config_api_url_returns_none_when_missing_or_no_file() {
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
         std::fs::create_dir_all(&astra_dir).unwrap();
         let settings = astra_dir.join("settings.json");
+
+        // File exists but no api_url key
         std::fs::write(&settings, r#"{}"#).unwrap();
+        assert_eq!(read_config_api_url_from(Some(&settings)).unwrap(), None);
 
-        let result = read_config_api_url_from(Some(&settings));
-        assert_eq!(result.unwrap(), None);
-    }
-
-    #[test]
-    fn read_config_api_url_returns_none_when_no_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let settings = tmp.path().join("settings.json");
-
-        let result = read_config_api_url_from(Some(&settings));
-        assert_eq!(result.unwrap(), None);
+        // File doesn't exist at all
+        let nonexistent = tmp.path().join("nonexistent.json");
+        assert_eq!(read_config_api_url_from(Some(&nonexistent)).unwrap(), None);
     }
 
     #[test]

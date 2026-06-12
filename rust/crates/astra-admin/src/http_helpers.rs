@@ -1,4 +1,4 @@
-use super::credentials::{CredentialsFile, Profile, load_credentials, profile_name};
+use super::credentials::{load_credentials, profile_name, CredentialsFile, Profile};
 
 pub(crate) fn read_api_error(status: u16, body: &str) -> String {
     format!("request failed ({status}): {}", compact_or_raw(body))
@@ -65,13 +65,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_or_raw_valid_json() {
-        let result = compact_or_raw("{\"a\": 1}");
-        assert!(result.contains("\"a\""));
-    }
-
-    #[test]
-    fn compact_or_raw_invalid_json() {
+    fn compact_or_raw_valid_and_invalid() {
+        assert!(compact_or_raw("{\"a\": 1}").contains("\"a\""));
         assert_eq!(compact_or_raw("not json"), "not json");
     }
 
