@@ -12,10 +12,8 @@ import type {
 } from "./types";
 import { AstraClient } from "./client";
 import {
-  EXECUTION_BOUNDARY_WAIT_REASONS,
-  isExecutionBoundaryWait,
-  extractWaitingReason,
   extractBlockedReason,
+  projectRunWaitingState,
 } from "./lifecycle-utils";
 
 // ─── useAstraChat ──────────────────────────────────────────────────
@@ -391,11 +389,11 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       case "run_waiting": {
         applyRunExecutionBoundary();
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-        const reason = extractWaitingReason(event);
+        const projection = projectRunWaitingState(event);
         dispatch({
           type: "SET_RUN_STATUS",
-          status: "waiting",
-          waitingFor: reason,
+          status: projection.status,
+          waitingFor: projection.waitingFor,
         });
         break;
       }

@@ -1,7 +1,7 @@
-"use client";
+'use client';
 
-import { useRouter } from "next/navigation";
-import { useCallback, useRef, type Dispatch, type SetStateAction } from "react";
+import { useRouter } from 'next/navigation';
+import { useCallback, useRef, type Dispatch, type SetStateAction } from 'react';
 import {
   getChat,
   getEdgeStatus,
@@ -13,19 +13,19 @@ import {
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
-} from "@/lib/api/chats";
+} from '@/lib/api/chats';
 import {
   WebApiError,
   isAuthRequiredError,
   isNotFoundError,
-} from "@/lib/api/errors";
+} from '@/lib/api/errors';
 import type {
   ChatDetail,
   ChatMessage,
   ComposerOptions,
   WorkSurfaceRunResponse,
   WorkspaceSelection,
-} from "@/lib/api/types";
+} from '@/lib/api/types';
 import {
   applyWorkSurfaceEvent,
   beginWorkSurfaceLoad,
@@ -34,33 +34,36 @@ import {
   hydrateWorkSurface,
   resetWorkSurfaceForRun,
   type WorkSurfaceResponse as WorkSurfaceProjection,
-} from "@/lib/work-surface";
-import { useToast } from "@/components/ui/toast";
+} from '@/lib/work-surface';
+import { useToast } from '@/components/ui/toast';
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
+const STOP_RECONCILE_INITIAL_DELAY_MS = 500;
+const STOP_RECONCILE_INTERVAL_MS = 1_000;
+const STOP_RECONCILE_MAX_MS = 15_000;
 const RUN_ATTACH_MAX_RETRIES = 4;
 const ATTACHABLE_RUN_STATUSES = new Set([
-  "running",
-  "blocked",
-  "input-queued",
-  "waiting",
-  "cancelling",
+  'running',
+  'blocked',
+  'input-queued',
+  'waiting',
+  'cancelling',
 ]);
 
 // Re-exported helpers
 export { ATTACHABLE_RUN_STATUSES };
 
 function isAbortError(error: unknown) {
-  return error instanceof DOMException && error.name === "AbortError";
+  return error instanceof DOMException && error.name === 'AbortError';
 }
 
 function isWorkspaceSelectionError(error: unknown): error is WebApiError {
   return (
     error instanceof WebApiError &&
     error.status === 409 &&
-    typeof error.code === "string" &&
-    error.code.startsWith("workspace_")
+    typeof error.code === 'string' &&
+    error.code.startsWith('workspace_')
   );
 }
 
@@ -73,8 +76,8 @@ function hasCompletedAssistantAfterUser(
   for (let i = userIndex + 1; i < detail.messages.length; i++) {
     const message = detail.messages[i];
     if (
-      message.role === "assistant" &&
-      message.status !== "streaming" &&
+      message.role === 'assistant' &&
+      message.status !== 'streaming' &&
       message.content.trim()
     ) {
       return true;
@@ -149,9 +152,9 @@ function findStreamingAssistantMessageId(messages: ChatMessage[]) {
     .reverse()
     .find(
       (message) =>
-        message.role === "assistant" &&
-        (message.status === "streaming" ||
-          message.reasoningStatus === "streaming"),
+        message.role === 'assistant' &&
+        (message.status === 'streaming' ||
+          message.reasoningStatus === 'streaming'),
     )?.id;
 }
 
@@ -160,9 +163,9 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
     .reverse()
     .findIndex(
       (message) =>
-        message.role === "assistant" &&
-        (message.status === "streaming" ||
-          message.reasoningStatus === "streaming"),
+        message.role === 'assistant' &&
+        (message.status === 'streaming' ||
+          message.reasoningStatus === 'streaming'),
     );
   if (index < 0) {
     return messages;
@@ -172,11 +175,11 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
     i === actualIndex
       ? {
           ...message,
-          status: "complete" as const,
+          status: 'complete' as const,
           content: message.content.trim()
-            ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
-            : "Stopped.",
-          reasoningStatus: "complete" as const,
+            ? `${message.content}${message.content.endsWith('\n') ? '' : '\n'}\nStopped.`
+            : 'Stopped.',
+          reasoningStatus: 'complete' as const,
         }
       : message,
   );
@@ -275,6 +278,7 @@ export function useStreamLifecycle(
   // Refs
   const streamAbortRef = useRef<AbortController | null>(null);
   const attachedRunRef = useRef<string | null>(null);
+  const attachedRunLeaseRef = useRef(0);
   const autoAttachAttemptedRunRef = useRef<string | null>(null);
   const autoAttachRetryTimerRef = useRef<number | undefined>(undefined);
   const autoAttachRetryCountsRef = useRef<Map<string, number>>(new Map());
@@ -298,6 +302,29 @@ export function useStreamLifecycle(
     const controller = new AbortController();
     streamAbortRef.current = controller;
     return controller.signal;
+  }, []);
+
+  const claimAttachedRun = useCallback((runId: string) => {
+    attachedRunLeaseRef.current += 1;
+    const lease = attachedRunLeaseRef.current;
+    attachedRunRef.current = runId;
+    return lease;
+  }, []);
+
+  const clearAttachedRun = useCallback((runId: string, lease?: number) => {
+    if (lease === undefined) {
+      attachedRunLeaseRef.current += 1;
+      if (attachedRunRef.current === runId) {
+        attachedRunRef.current = null;
+      }
+      return;
+    }
+    if (
+      attachedRunLeaseRef.current === lease &&
+      attachedRunRef.current === runId
+    ) {
+      attachedRunRef.current = null;
+    }
   }, []);
 
   const applyWorkSurfaceStreamEvent = useCallback(
@@ -339,12 +366,12 @@ export function useStreamLifecycle(
               ...current.messages,
               {
                 id: assistantMessageId,
-                role: "assistant" as const,
-                content: "",
+                role: 'assistant' as const,
+                content: '',
                 createdAt: new Date().toISOString(),
-                status: "streaming" as const,
-                reasoning: "",
-                reasoningStatus: "streaming" as const,
+                status: 'streaming' as const,
+                reasoning: '',
+                reasoningStatus: 'streaming' as const,
               },
             ],
           },
@@ -399,7 +426,7 @@ export function useStreamLifecycle(
             current,
             error instanceof Error
               ? error.message
-              : "Failed to load work surface.",
+              : 'Failed to load work surface.',
           ),
         );
       }
@@ -424,7 +451,7 @@ export function useStreamLifecycle(
         return;
       }
 
-      attachedRunRef.current = runId;
+      const attachLease = claimAttachedRun(runId);
       resetWorkSurfaceRun(runId);
       const assistantPatcher = createAssistantPatchController({
         setDetail,
@@ -461,19 +488,19 @@ export function useStreamLifecycle(
         onReasoning: (reasoning) => {
           assistantPatcher.patchBatched({
             reasoning,
-            reasoningStatus: "streaming",
-            status: "streaming",
+            reasoningStatus: 'streaming',
+            status: 'streaming',
           });
         },
         onReasoningDone: (reasoning) => {
           assistantPatcher.patchBatched({
             reasoning,
-            reasoningStatus: "complete",
-            status: "streaming",
+            reasoningStatus: 'complete',
+            status: 'streaming',
           });
         },
         onText: (content) => {
-          assistantPatcher.patchBatched({ content, status: "streaming" });
+          assistantPatcher.patchBatched({ content, status: 'streaming' });
         },
         onArtifacts: (artifacts) => {
           assistantPatcher.patchBatched({ artifacts });
@@ -484,25 +511,25 @@ export function useStreamLifecycle(
           assistantPatcher.patchNow({
             content:
               content ||
-              "Astra completed the run without returning visible text.",
-            reasoningStatus: "complete",
-            status: "complete",
+              'Astra completed the run without returning visible text.',
+            reasoningStatus: 'complete',
+            status: 'complete',
           });
         },
         onCancelled: (content) => {
           assistantPatcher.flushNow();
           clearActiveRun();
           assistantPatcher.patchNow({
-            content: content || "Stopped.",
-            reasoningStatus: "complete",
-            status: "complete",
+            content: content || 'Stopped.',
+            reasoningStatus: 'complete',
+            status: 'complete',
           });
         },
         onPaused: (content) => {
           assistantPatcher.flushNow();
           assistantPatcher.patchNow({
             content,
-            status: "streaming",
+            status: 'streaming',
           });
         },
       })
@@ -522,8 +549,8 @@ export function useStreamLifecycle(
           }
           if (options?.scheduleRetry?.()) {
             assistantPatcher.patchNow({
-              status: "streaming",
-              reasoningStatus: "streaming",
+              status: 'streaming',
+              reasoningStatus: 'streaming',
             });
             return;
           }
@@ -532,20 +559,20 @@ export function useStreamLifecycle(
               streamError instanceof Error
                 ? `${failureMessage} (${streamError.message})`
                 : failureMessage,
-            reasoningStatus: "complete",
-            status: "failed",
+            reasoningStatus: 'complete',
+            status: 'failed',
           });
         })
         .finally(() => {
-          if (attachedRunRef.current === runId) {
-            attachedRunRef.current = null;
-          }
+          clearAttachedRun(runId, attachLease);
           assistantPatcher.cancel();
         });
     },
     [
       applyWorkSurfaceStreamEvent,
       chatListHref,
+      claimAttachedRun,
+      clearAttachedRun,
       detail.chat.id,
       nextStreamAbortSignal,
       resetWorkSurfaceRun,
@@ -578,20 +605,20 @@ export function useStreamLifecycle(
       let currentUserId = pendingMessageId ?? crypto.randomUUID();
       const userMessage: ChatMessage = {
         id: currentUserId,
-        role: "user",
+        role: 'user',
         content: text,
         activeSkills: options.activeSkills,
         createdAt: timestamp,
-        status: "complete",
+        status: 'complete',
       };
       const assistantMessage: ChatMessage = {
         id: assistantId,
-        role: "assistant",
-        content: "",
+        role: 'assistant',
+        content: '',
         createdAt: timestamp,
-        status: "streaming",
-        reasoning: "",
-        reasoningStatus: "streaming",
+        status: 'streaming',
+        reasoning: '',
+        reasoningStatus: 'streaming',
       };
 
       const assistantPatcher = createAssistantPatchController({
@@ -600,11 +627,12 @@ export function useStreamLifecycle(
       });
       let recoveredFromHydration = false;
       let streamRunId: string | null = null;
+      let streamRunLease: number | null = null;
       const canReconcilePersistedTranscript = Boolean(pendingMessageId);
       const stopReconcile = () => {
+        stopReconcileRef.current();
         reconcileTimerRef.current = undefined;
         reconcileIntervalRef.current = undefined;
-        stopReconcileRef.current();
       };
       const reconcilePersistedTranscript = async () => {
         if (!canReconcilePersistedTranscript || recoveredFromHydration) {
@@ -706,14 +734,14 @@ export function useStreamLifecycle(
           },
           onRunStarted: (runId) => {
             streamRunId = runId;
-            attachedRunRef.current = runId;
+            streamRunLease = claimAttachedRun(runId);
             resetWorkSurfaceRun(runId);
             setStartingRun(false);
             setDetail((current) => ({
               ...current,
               activeRun: {
                 runId,
-                status: "running",
+                status: 'running',
                 waitingFor: null,
               },
             }));
@@ -761,19 +789,19 @@ export function useStreamLifecycle(
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: "streaming",
-              status: "streaming",
+              reasoningStatus: 'streaming',
+              status: 'streaming',
             });
           },
           onReasoningDone: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: "complete",
-              status: "streaming",
+              reasoningStatus: 'complete',
+              status: 'streaming',
             });
           },
           onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: "streaming" });
+            assistantPatcher.patchBatched({ content, status: 'streaming' });
           },
           onArtifacts: (artifacts) => {
             assistantPatcher.patchBatched({ artifacts });
@@ -792,9 +820,9 @@ export function useStreamLifecycle(
             assistantPatcher.patchNow({
               content:
                 content ||
-                "Astra completed the run without returning visible text.",
-              reasoningStatus: "complete",
-              status: "complete",
+                'Astra completed the run without returning visible text.',
+              reasoningStatus: 'complete',
+              status: 'complete',
             });
           },
           onCancelled: (content) => {
@@ -810,16 +838,16 @@ export function useStreamLifecycle(
                 : current,
             );
             assistantPatcher.patchNow({
-              content: content || "Stopped.",
-              reasoningStatus: "complete",
-              status: "complete",
+              content: content || 'Stopped.',
+              reasoningStatus: 'complete',
+              status: 'complete',
             });
           },
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
               content,
-              status: "streaming",
+              status: 'streaming',
             });
           },
         });
@@ -852,20 +880,20 @@ export function useStreamLifecycle(
           void refreshEdgeWorkspaces();
           assistantPatcher.patchNow({
             content: error.detail,
-            reasoningStatus: "complete",
-            status: "failed",
+            reasoningStatus: 'complete',
+            status: 'failed',
           });
           return;
         }
         const message =
-          error instanceof Error ? error.message : "Astra stream failed.";
+          error instanceof Error ? error.message : 'Astra stream failed.';
         assistantPatcher.patchNow({
           content: `I could not reach the Astra runtime from the web UI. (${message})`,
-          status: "failed",
+          status: 'failed',
         });
       } finally {
-        if (streamRunId && attachedRunRef.current === streamRunId) {
-          attachedRunRef.current = null;
+        if (streamRunId && streamRunLease !== null) {
+          clearAttachedRun(streamRunId, streamRunLease);
         }
         assistantPatcher.cancel();
         stopReconcile();
@@ -875,6 +903,8 @@ export function useStreamLifecycle(
     [
       applyWorkSurfaceStreamEvent,
       chatListHref,
+      claimAttachedRun,
+      clearAttachedRun,
       detail.chat.archivedAt,
       detail.chat.id,
       nextStreamAbortSignal,
@@ -909,7 +939,7 @@ export function useStreamLifecycle(
         });
         const assistantMessageId = crypto.randomUUID();
         const runId = result.activeRun.runId;
-        attachedRunRef.current = runId;
+        const attachLease = claimAttachedRun(runId);
         resetWorkSurfaceRun(runId);
         setDetail((current) => ({
           ...current,
@@ -919,12 +949,12 @@ export function useStreamLifecycle(
             result.userMessage,
             {
               id: assistantMessageId,
-              role: "assistant" as const,
-              content: "",
+              role: 'assistant' as const,
+              content: '',
               createdAt: new Date().toISOString(),
-              status: "streaming" as const,
-              reasoning: "",
-              reasoningStatus: "streaming" as const,
+              status: 'streaming' as const,
+              reasoning: '',
+              reasoningStatus: 'streaming' as const,
             },
           ].sort(
             (a, b) =>
@@ -962,19 +992,19 @@ export function useStreamLifecycle(
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: "streaming",
-              status: "streaming",
+              reasoningStatus: 'streaming',
+              status: 'streaming',
             });
           },
           onReasoningDone: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: "complete",
-              status: "streaming",
+              reasoningStatus: 'complete',
+              status: 'streaming',
             });
           },
           onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: "streaming" });
+            assistantPatcher.patchBatched({ content, status: 'streaming' });
           },
           onArtifacts: (artifacts) => {
             assistantPatcher.patchBatched({ artifacts });
@@ -992,9 +1022,9 @@ export function useStreamLifecycle(
             assistantPatcher.patchNow({
               content:
                 content ||
-                "Astra completed the run without returning visible text.",
-              reasoningStatus: "complete",
-              status: "complete",
+                'Astra completed the run without returning visible text.',
+              reasoningStatus: 'complete',
+              status: 'complete',
             });
           },
           onCancelled: (content) => {
@@ -1008,16 +1038,16 @@ export function useStreamLifecycle(
                 : current,
             );
             assistantPatcher.patchNow({
-              content: content || "Stopped.",
-              reasoningStatus: "complete",
-              status: "complete",
+              content: content || 'Stopped.',
+              reasoningStatus: 'complete',
+              status: 'complete',
             });
           },
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
               content,
-              status: "streaming",
+              status: 'streaming',
             });
           },
         })
@@ -1039,14 +1069,12 @@ export function useStreamLifecycle(
               content:
                 streamError instanceof Error
                   ? `The input was queued, but the web UI could not reconnect to the run stream. (${streamError.message})`
-                  : "The input was queued, but the web UI could not reconnect to the run stream.",
-              status: "failed",
+                  : 'The input was queued, but the web UI could not reconnect to the run stream.',
+              status: 'failed',
             });
           })
           .finally(() => {
-            if (attachedRunRef.current === runId) {
-              attachedRunRef.current = null;
-            }
+            clearAttachedRun(runId, attachLease);
             assistantPatcher.cancel();
           });
       } catch (error) {
@@ -1073,8 +1101,8 @@ export function useStreamLifecycle(
         addToast(
           error instanceof Error
             ? error.message
-            : "Failed to queue input for the active run.",
-          "error",
+            : 'Failed to queue input for the active run.',
+          'error',
         );
       } finally {
         runControlMutationRef.current = false;
@@ -1085,6 +1113,8 @@ export function useStreamLifecycle(
       addToast,
       applyWorkSurfaceStreamEvent,
       chatListHref,
+      claimAttachedRun,
+      clearAttachedRun,
       detail.chat.archivedAt,
       detail.chat.id,
       nextStreamAbortSignal,
@@ -1110,17 +1140,15 @@ export function useStreamLifecycle(
     runControlMutationRef.current = true;
     setStoppingRun(true);
     streamAbortRef.current?.abort();
-    if (attachedRunRef.current === runId) {
-      attachedRunRef.current = null;
-    }
+    clearAttachedRun(runId);
     setDetail((current) => ({
       ...current,
       activeRun:
         current.activeRun?.runId === runId
           ? {
               ...current.activeRun,
-              status: "cancelling",
-              waitingFor: "cancel_requested",
+              status: 'cancelling',
+              waitingFor: 'cancel_requested',
             }
           : current.activeRun,
       messages: completeLatestStreamingAssistantAsStopped(current.messages),
@@ -1133,6 +1161,39 @@ export function useStreamLifecycle(
           activeRun: result.activeRun,
         }));
         void hydrateWorkSurfaceForChat({ silent: true });
+        if (result.cancelPending) {
+          const startedAt = Date.now();
+          const reconcileStop = async () => {
+            const refreshed = await getChat(detail.chat.id).catch(() => null);
+            if (!refreshed) {
+              return;
+            }
+            setDetail(refreshed);
+            void hydrateWorkSurfaceForChat({ silent: true });
+            const activeRun = refreshed.activeRun;
+            const stillCancelling =
+              activeRun?.runId === runId && activeRun.status === 'cancelling';
+            if (
+              !stillCancelling ||
+              Date.now() - startedAt >= STOP_RECONCILE_MAX_MS
+            ) {
+              stopReconcileRef.current();
+              if (stillCancelling) {
+                addToast(
+                  'Stop request is still being processed by the runtime.',
+                  'info',
+                );
+              }
+            }
+          };
+          stopReconcileRef.current();
+          reconcileTimerRef.current = window.setTimeout(() => {
+            void reconcileStop();
+            reconcileIntervalRef.current = window.setInterval(() => {
+              void reconcileStop();
+            }, STOP_RECONCILE_INTERVAL_MS);
+          }, STOP_RECONCILE_INITIAL_DELAY_MS);
+        }
       })
       .catch((error: unknown) => {
         if (isAuthRequiredError(error)) {
@@ -1154,8 +1215,8 @@ export function useStreamLifecycle(
         addToast(
           error instanceof Error
             ? error.message
-            : "Failed to stop the active run.",
-          "error",
+            : 'Failed to stop the active run.',
+          'error',
         );
       })
       .finally(() => {
@@ -1166,11 +1227,15 @@ export function useStreamLifecycle(
     addToast,
     canStopRun,
     chatListHref,
+    clearAttachedRun,
     detail.activeRun?.runId,
     detail.chat.id,
     hydrateWorkSurfaceForChat,
+    reconcileIntervalRef,
+    reconcileTimerRef,
     setDetail,
     setStoppingRun,
+    stopReconcileRef,
     router,
   ]);
 
@@ -1187,9 +1252,9 @@ export function useStreamLifecycle(
       .reverse()
       .find(
         (message) =>
-          message.role === "assistant" &&
-          (message.status === "streaming" ||
-            message.reasoningStatus === "streaming"),
+          message.role === 'assistant' &&
+          (message.status === 'streaming' ||
+            message.reasoningStatus === 'streaming'),
       )?.id;
     const assistantMessageId =
       existingAssistantMessageId ?? crypto.randomUUID();
@@ -1198,10 +1263,10 @@ export function useStreamLifecycle(
     try {
       const result = await resumeChatRun(detail.chat.id);
       if (!result.activeRun?.runId) {
-        throw new Error("Resume response did not include an active run.");
+        throw new Error('Resume response did not include an active run.');
       }
       const runId = result.activeRun.runId;
-      attachedRunRef.current = runId;
+      const attachLease = claimAttachedRun(runId);
       resetWorkSurfaceRun(runId);
       const appendedOptimistic =
         !existingAssistantMessageId &&
@@ -1220,12 +1285,12 @@ export function useStreamLifecycle(
                 ...current.messages,
                 {
                   id: assistantMessageId,
-                  role: "assistant",
-                  content: "",
+                  role: 'assistant',
+                  content: '',
                   createdAt: new Date().toISOString(),
-                  status: "streaming",
-                  reasoning: "",
-                  reasoningStatus: "streaming",
+                  status: 'streaming',
+                  reasoning: '',
+                  reasoningStatus: 'streaming',
                 },
               ],
       }));
@@ -1261,19 +1326,19 @@ export function useStreamLifecycle(
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: "streaming",
-              status: "streaming",
+              reasoningStatus: 'streaming',
+              status: 'streaming',
             });
           },
           onReasoningDone: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: "complete",
-              status: "streaming",
+              reasoningStatus: 'complete',
+              status: 'streaming',
             });
           },
           onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: "streaming" });
+            assistantPatcher.patchBatched({ content, status: 'streaming' });
           },
           onArtifacts: (artifacts) => {
             assistantPatcher.patchBatched({ artifacts });
@@ -1291,9 +1356,9 @@ export function useStreamLifecycle(
             assistantPatcher.patchNow({
               content:
                 content ||
-                "Astra completed the run without returning visible text.",
-              reasoningStatus: "complete",
-              status: "complete",
+                'Astra completed the run without returning visible text.',
+              reasoningStatus: 'complete',
+              status: 'complete',
             });
           },
           onCancelled: (content) => {
@@ -1307,16 +1372,16 @@ export function useStreamLifecycle(
                 : current,
             );
             assistantPatcher.patchNow({
-              content: content || "Stopped.",
-              reasoningStatus: "complete",
-              status: "complete",
+              content: content || 'Stopped.',
+              reasoningStatus: 'complete',
+              status: 'complete',
             });
           },
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
               content,
-              status: "streaming",
+              status: 'streaming',
             });
           },
         });
@@ -1353,13 +1418,11 @@ export function useStreamLifecycle(
         addToast(
           streamError instanceof Error
             ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
-            : "The run resumed, but the web UI could not reconnect to its stream.",
-          "warning",
+            : 'The run resumed, but the web UI could not reconnect to its stream.',
+          'warning',
         );
       } finally {
-        if (attachedRunRef.current === runId) {
-          attachedRunRef.current = null;
-        }
+        clearAttachedRun(runId, attachLease);
         assistantPatcher.cancel();
       }
     } catch (error) {
@@ -1388,8 +1451,8 @@ export function useStreamLifecycle(
       addToast(
         error instanceof Error
           ? error.message
-          : "Failed to resume the paused run.",
-        "error",
+          : 'Failed to resume the paused run.',
+        'error',
       );
     } finally {
       runControlMutationRef.current = false;
@@ -1400,6 +1463,8 @@ export function useStreamLifecycle(
     applyWorkSurfaceStreamEvent,
     canResumeRun,
     chatListHref,
+    claimAttachedRun,
+    clearAttachedRun,
     detail.activeRun?.runId,
     detail.chat.id,
     detail.messages,

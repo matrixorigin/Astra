@@ -134,6 +134,8 @@ export {
   isExecutionBoundaryWait,
   extractWaitingReason,
   extractBlockedReason,
+  projectRunWaitingState,
+  type RunWaitingProjection,
 } from "./lifecycle-utils";
 export {
   ASTRA_EDGE_ID_HEADER,

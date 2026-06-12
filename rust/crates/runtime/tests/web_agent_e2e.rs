@@ -600,6 +600,11 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
             .any(|event| event["content"].as_str() == Some("parent synthesis after child review")),
         "parent should synthesize after dynamic child spawn: {events:?}"
     );
+    let run_id = events[0]
+        .get("run_id")
+        .and_then(Value::as_str)
+        .expect("session_info should include run_id")
+        .to_string();
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(
         serialized.contains("child review result: no critical issues"),
@@ -643,6 +648,18 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
     );
     assert_eq!(completed[0]["workspace"]["kind"], "server_sandbox");
     assert_eq!(completed[0]["executor"]["kind"], "server_local");
+
+    let (replay_status, replay_events) = get_run_stream(&app, &run_id, 0).await;
+    assert_eq!(replay_status, StatusCode::OK);
+    let replay_serialized = serde_json::to_string(&replay_events).unwrap();
+    assert!(
+        !find_event_type(&replay_events, "agent_spawned").is_empty(),
+        "completed run replay should include durable agent_spawned: {replay_serialized}"
+    );
+    assert!(
+        !find_event_type(&replay_events, "agent_completed").is_empty(),
+        "completed run replay should include durable agent_completed: {replay_serialized}"
+    );
 }
 
 #[tokio::test]

@@ -17,15 +17,20 @@
 //!
 //! - Tool execution panics: surfaced to the caller; failed attempts are not cached
 //! - Tool returns error: not cached; failures are not proof that a side effect applied
+//! - Repeated failures: temporarily suppressed with a retry lease, never stored as
+//!   a successful dedupe result
 //! - Concurrent execution: cache is per-session, no cross-session dedup (future: MatrixOne)
 //! - Workspace mutation: caller must evict stale PureRead results (see `evict_tool()`)
 
 use crate::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache};
 use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+const DEFAULT_RETRY_SUPPRESSION_SECS: u64 = 30;
 
 fn unix_timestamp_secs() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -62,6 +67,15 @@ pub enum ExactlyOnceError {
 
     #[error("Tool execution error: {0}")]
     ToolExecutionError(String),
+
+    #[error(
+        "Tool retry suppressed after {retry_count} consecutive failures; retry after {retry_after_secs}s: {last_error}"
+    )]
+    RetrySuppressed {
+        retry_count: u32,
+        retry_after_secs: u64,
+        last_error: String,
+    },
 }
 
 /// Exactly-once executor wrapping an idempotency cache.
@@ -109,11 +123,27 @@ pub struct ExactlyOnceExecutor {
     cache: InMemoryIdempotencyCache,
     /// Policy: whether to re-execute PureRead tools on cache hit
     pure_read_policy: PureReadPolicy,
-    /// Max consecutive failures for same key before caching the error to
-    /// prevent retry storms during crash recovery.
+    /// Max consecutive failures for same key before applying retry suppression.
     max_retries: u32,
     /// Consecutive failure counts per key. Reset on first success.
-    retry_counts: std::collections::HashMap<IdempotencyKey, u32>,
+    retry_counts: HashMap<IdempotencyKey, u32>,
+    /// Short-lived failure leases used to prevent crash-recovery retry storms
+    /// without poisoning the exactly-once result cache.
+    retry_suppressions: HashMap<IdempotencyKey, RetrySuppression>,
+    retry_suppression_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RetrySuppression {
+    retry_count: u32,
+    retry_after_epoch_secs: u64,
+    last_error: String,
+}
+
+impl RetrySuppression {
+    fn remaining_secs(&self, now: u64) -> u64 {
+        self.retry_after_epoch_secs.saturating_sub(now)
+    }
 }
 
 /// Policy for PureRead tools on cache hit
@@ -141,15 +171,23 @@ impl ExactlyOnceExecutor {
             cache: InMemoryIdempotencyCache::new(),
             pure_read_policy: PureReadPolicy::ReexecuteOnWorkspaceChange,
             max_retries: 5,
-            retry_counts: std::collections::HashMap::new(),
+            retry_counts: HashMap::new(),
+            retry_suppressions: HashMap::new(),
+            retry_suppression_secs: DEFAULT_RETRY_SUPPRESSION_SECS,
         }
     }
 
     /// Set max_retries for retry-storm protection. After `max_retries`
-    /// consecutive failures for the same tool+args, even the error result
-    /// is cached to prevent infinite re-execution on crash recovery.
+    /// consecutive failures for the same tool+args, retries are temporarily
+    /// suppressed without caching the failed result.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Set the retry suppression lease duration.
+    pub fn with_retry_suppression_secs(mut self, retry_suppression_secs: u64) -> Self {
+        self.retry_suppression_secs = retry_suppression_secs;
         self
     }
 
@@ -273,6 +311,27 @@ impl ExactlyOnceExecutor {
             }
         }
 
+        let now_secs = unix_timestamp_secs();
+        if let Some(suppression) = self.retry_suppressions.get(&key) {
+            let remaining = suppression.remaining_secs(now_secs);
+            if remaining > 0 {
+                tracing::warn!(
+                    tool_name = %tool_name,
+                    step_id = %step_id,
+                    retry_count = suppression.retry_count,
+                    retry_after_secs = remaining,
+                    "Exactly-once: retry suppressed by short-lived failure lease"
+                );
+                return Err(ExactlyOnceError::RetrySuppressed {
+                    retry_count: suppression.retry_count,
+                    retry_after_secs: remaining,
+                    last_error: suppression.last_error.clone(),
+                });
+            }
+            self.retry_suppressions.remove(&key);
+            self.retry_counts.remove(&key);
+        }
+
         // Phase 2: Cache miss — execute tool
         tracing::debug!(
             tool_name = %tool_name,
@@ -289,6 +348,7 @@ impl ExactlyOnceExecutor {
             Ok(output) => {
                 // Success clears the retry counter for this key.
                 self.retry_counts.remove(&key);
+                self.retry_suppressions.remove(&key);
                 let cached_result = CachedToolResult {
                     tool_name: tool_name.to_string(),
                     output: output.clone(),
@@ -305,8 +365,9 @@ impl ExactlyOnceExecutor {
             }
             Err(error_msg) => {
                 // Retry-storm protection: after max_retries consecutive
-                // failures for the same tool+args, cache the error result
-                // to prevent infinite re-execution on crash recovery.
+                // failures for the same tool+args, install a short-lived
+                // suppression lease. Do not cache the error: a failed attempt
+                // is not proof that a side effect completed.
                 let count = self.retry_counts.entry(key.clone()).or_insert(0);
                 *count += 1;
                 if *count >= self.max_retries {
@@ -315,16 +376,19 @@ impl ExactlyOnceExecutor {
                         step_id = %step_id,
                         retry_count = *count,
                         max_retries = self.max_retries,
-                        "Exactly-once: retry-storm guard engaged, caching error to break loop"
+                        retry_suppression_secs = self.retry_suppression_secs,
+                        "Exactly-once: retry-storm guard engaged with short-lived suppression lease"
                     );
-                    let cached_result = CachedToolResult {
-                        tool_name: tool_name.to_string(),
-                        output: error_msg.clone(),
-                        is_error: true,
-                        cached_at: unix_timestamp_secs(),
-                        context_signature: key.context_signature.clone(),
-                    };
-                    self.cache.record(&key, cached_result);
+                    let retry_after_epoch_secs =
+                        unix_timestamp_secs().saturating_add(self.retry_suppression_secs);
+                    self.retry_suppressions.insert(
+                        key,
+                        RetrySuppression {
+                            retry_count: *count,
+                            retry_after_epoch_secs,
+                            last_error: error_msg.clone(),
+                        },
+                    );
                 }
                 Err(ExactlyOnceError::ToolExecutionError(error_msg))
             }
@@ -532,11 +596,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_storm_guard_engages() {
-        let mut executor = ExactlyOnceExecutor::new().with_max_retries(3);
+    async fn test_retry_storm_guard_engages_without_poisoning_cache() {
+        let mut executor = ExactlyOnceExecutor::new()
+            .with_max_retries(3)
+            .with_retry_suppression_secs(60);
         let args = json!({"command": "curl https://down.example"});
 
-        // Fail 3 times — hits max_retries, error gets cached
+        // Fail 3 times — hits max_retries, but the error is not cached as an
+        // exactly-once result.
         for _i in 0..3 {
             let result = executor
                 .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
@@ -547,21 +614,52 @@ mod tests {
         }
         assert_eq!(
             executor.cache_size(),
-            1,
-            "error should be cached after hitting max_retries"
+            0,
+            "retry suppression must not poison the exactly-once result cache"
         );
 
-        // 4th attempt: returns cached error, no re-execution
-        let result4 = executor
+        // 4th attempt: no tool execution while the suppression lease is fresh.
+        let mut executed = false;
+        let suppressed = executor
             .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                executed = true;
                 Ok("should not execute".to_string())
             })
-            .await
-            .unwrap();
+            .await;
         assert!(
-            result4.from_cache && result4.is_error,
-            "4th attempt should return cached error"
+            matches!(suppressed, Err(ExactlyOnceError::RetrySuppressed { .. })),
+            "4th attempt should be suppressed by a failure lease"
         );
+        assert!(!executed, "suppressed retry must not call the tool");
+        assert_eq!(executor.cache_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_suppression_expiry_allows_successful_recovery() {
+        let mut executor = ExactlyOnceExecutor::new()
+            .with_max_retries(2)
+            .with_retry_suppression_secs(0);
+        let args = json!({"command": "curl https://temporarily-down.example"});
+
+        for _ in 0..2 {
+            let result = executor
+                .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                    Err("network timeout".to_string())
+                })
+                .await;
+            assert!(result.is_err());
+        }
+
+        assert_eq!(executor.cache_size(), 0);
+        let recovered = executor
+            .execute_with_dedup("step-1", 0, "bash", &args, |_, _| async {
+                Ok("network recovered".to_string())
+            })
+            .await
+            .expect("expired suppression should execute the retry");
+        assert!(!recovered.from_cache);
+        assert_eq!(recovered.output, "network recovered");
+        assert_eq!(executor.cache_size(), 1);
     }
 
     #[tokio::test]

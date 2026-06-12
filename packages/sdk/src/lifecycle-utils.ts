@@ -60,3 +60,23 @@ export function extractBlockedReason(event: {
   }
   return null;
 }
+
+export type RunWaitingProjection = {
+  status: "waiting" | "blocked";
+  waitingFor: string;
+  blocked: boolean;
+};
+
+export function projectRunWaitingState(event: {
+  waiting_for?: string | null;
+  reason?: string;
+  error_kind?: string;
+}): RunWaitingProjection {
+  const waitingFor = extractWaitingReason(event);
+  const blocked = isExecutionBoundaryWait(waitingFor);
+  return {
+    status: blocked ? "blocked" : "waiting",
+    waitingFor,
+    blocked,
+  };
+}

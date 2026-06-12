@@ -352,7 +352,7 @@ describe("useAstraChat", () => {
     });
 
     expect(result.current.runId).toBe("run-edge-1");
-    expect(result.current.runStatus).toBe("waiting");
+    expect(result.current.runStatus).toBe("blocked");
     expect(result.current.waitingFor).toBe("executor_offline");
     expect(result.current.workspace).toMatchObject({
       kind: "edge_workspace",

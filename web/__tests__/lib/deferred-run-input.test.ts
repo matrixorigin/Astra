@@ -4,14 +4,27 @@ jest.mock('@/lib/runtime-client', () => ({
   requireRuntimeClient: jest.fn(),
   getRuntimeClient: jest.fn(),
   readRuntimeErrorDetail: jest.fn(),
-  runtimeErrorDetail: jest.fn((error: unknown) => (error instanceof Error ? error.message : String(error))),
+  runtimeErrorDetail: jest.fn((error: unknown) =>
+    error instanceof Error ? error.message : String(error),
+  ),
 }));
 
-import { StaleDeferredRunError, getChatHydrated, getStore, queueDeferredRunInput, resumeActiveRun, stopActiveRun } from '@/lib/api/web-store';
+import {
+  StaleDeferredRunError,
+  getChatHydrated,
+  getStore,
+  queueDeferredRunInput,
+  resumeActiveRun,
+  stopActiveRun,
+} from '@/lib/api/web-store';
 import { getRuntimeClient, requireRuntimeClient } from '@/lib/runtime-client';
 
-const mockGetRuntimeClient = getRuntimeClient as jest.MockedFunction<typeof getRuntimeClient>;
-const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<typeof requireRuntimeClient>;
+const mockGetRuntimeClient = getRuntimeClient as jest.MockedFunction<
+  typeof getRuntimeClient
+>;
+const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<
+  typeof requireRuntimeClient
+>;
 
 describe('queueDeferredRunInput', () => {
   beforeEach(() => {
@@ -84,7 +97,9 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('does not orphan a local queued message when submitRunInput fails', async () => {
-    const submitRunInput = jest.fn().mockRejectedValue(new Error('runtime unavailable'));
+    const submitRunInput = jest
+      .fn()
+      .mockRejectedValue(new Error('runtime unavailable'));
     const getRunStatus = jest.fn().mockResolvedValue({
       runId: 'run-1',
       sessionId: 'chat-1',
@@ -377,7 +392,9 @@ describe('queueDeferredRunInput', () => {
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200, offset: 0 });
     expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
-    expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', { limit: 200 });
+    expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', {
+      limit: 200,
+    });
     expect(result?.chat.id).toBe('chat-open');
     expect(result?.chat.model).toBe('sonnet-4.6-adaptive');
     expect(result?.activeRun).toEqual({
@@ -450,9 +467,10 @@ describe('queueDeferredRunInput', () => {
 
   it('keeps a cancelling active run before runtime cancellation resolves', async () => {
     const cancelRun = jest.fn(
-      () => new Promise<void>(() => {
-        // Keep the runtime request pending to model a slow network/tool cancel.
-      }),
+      () =>
+        new Promise<void>(() => {
+          // Keep the runtime request pending to model a slow network/tool cancel.
+        }),
     );
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: { cancelRun },
@@ -498,11 +516,74 @@ describe('queueDeferredRunInput', () => {
     });
   });
 
+  it('clears cancelling state when a late runtime cancellation reaches terminal status', async () => {
+    let resolveCancel!: () => void;
+    const cancelRun = jest.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCancel = resolve;
+        }),
+    );
+    const getRunStatus = jest.fn().mockResolvedValue({
+      runId: 'run-stop',
+      sessionId: 'chat-stop',
+      status: 'cancelled',
+      eventsCount: 3,
+      waitingFor: null,
+    });
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: { getRunStatus },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-stop',
+        status: 'running',
+        waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    const result = await stopActiveRun('user-a', 'chat-stop', {
+      skipSync: true,
+      cancelTimeoutMs: 1,
+    });
+    expect(result).toMatchObject({
+      activeRun: {
+        runId: 'run-stop',
+        status: 'cancelling',
+        waitingFor: 'cancel_requested',
+      },
+      cancelPending: true,
+    });
+
+    resolveCancel();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(getRunStatus).toHaveBeenCalledWith('run-stop');
+    expect(store.chats[0].activeRun).toBeUndefined();
+  });
+
   it('does not resurrect a cancelling run as running while backend polling still reports it running', async () => {
     const cancelRun = jest.fn(
-      () => new Promise<void>(() => {
-        // Keep cancellation pending so the next backend sync still sees running.
-      }),
+      () =>
+        new Promise<void>(() => {
+          // Keep cancellation pending so the next backend sync still sees running.
+        }),
     );
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: { cancelRun },

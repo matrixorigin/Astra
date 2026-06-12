@@ -2853,47 +2853,130 @@ fn agent_lifecycle_progress_event_from_state(
     })
 }
 
-async fn send_missing_agent_lifecycle_event(
-    event_tx: &mpsc::Sender<Value>,
+fn missing_agent_lifecycle_sse_event(
     sent_lifecycle_events: &AgentProgressLifecycleLedger,
     event: AgentProgressEvent,
-) -> bool {
-    let Some(key) = agent_progress_lifecycle_event_key(&event) else {
-        return true;
-    };
+) -> Option<Value> {
+    let key = agent_progress_lifecycle_event_key(&event)?;
     if has_agent_progress_lifecycle_event_sent(sent_lifecycle_events, &key) {
-        return true;
+        return None;
     }
-    let Some(sse) = server_loop_host::progress_event_to_sse(&event) else {
-        return true;
-    };
-    if event_tx.send(sse).await.is_err() {
-        return false;
-    }
+    let sse = server_loop_host::progress_event_to_sse(&event)?;
     mark_agent_progress_lifecycle_event_sent(sent_lifecycle_events, key);
-    true
+    Some(sse)
 }
 
+async fn collect_missing_agent_lifecycle_events(
+    spawner: &DynamicAgentSpawner,
+    root_run_id: &str,
+    sent_lifecycle_events: &AgentProgressLifecycleLedger,
+) -> Vec<Value> {
+    let states = spawner.get_agent_states_for_run_tree(root_run_id).await;
+    let mut events = Vec::new();
+    for state in states {
+        if let Some(event) = missing_agent_lifecycle_sse_event(
+            sent_lifecycle_events,
+            agent_spawned_progress_event_from_state(&state),
+        ) {
+            events.push(event);
+        }
+        if let Some(event) = agent_lifecycle_progress_event_from_state(&state)
+            .and_then(|event| missing_agent_lifecycle_sse_event(sent_lifecycle_events, event))
+        {
+            events.push(event);
+        }
+    }
+    events
+}
+
+async fn collect_agent_lifecycle_events_for_persistence(
+    spawner: &DynamicAgentSpawner,
+    root_run_id: &str,
+) -> Vec<Value> {
+    let states = spawner.get_agent_states_for_run_tree(root_run_id).await;
+    let mut events = Vec::new();
+    for state in states {
+        if let Some(event) = server_loop_host::progress_event_to_sse(
+            &agent_spawned_progress_event_from_state(&state),
+        ) {
+            events.push(event);
+        }
+        if let Some(event) = agent_lifecycle_progress_event_from_state(&state)
+            .and_then(|event| server_loop_host::progress_event_to_sse(&event))
+        {
+            events.push(event);
+        }
+    }
+    events
+}
+
+fn agent_lifecycle_dedupe_key(event: &Value) -> Option<String> {
+    let event_type = durable_event_type(event)?;
+    if !matches!(
+        event_type,
+        "agent_spawned"
+            | "agent_completed"
+            | "agent_failed"
+            | "agent_waiting"
+            | "agent_cancelled"
+            | "agent_interrupted"
+    ) {
+        return None;
+    }
+    let agent_id = event.get("agent_id").and_then(Value::as_str)?;
+    let status = event
+        .get("status")
+        .or_else(|| event.get("reason"))
+        .or_else(|| event.get("termination"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(format!("{event_type}:{agent_id}:{status}"))
+}
+
+fn merge_agent_lifecycle_before_terminal_events(
+    final_events: &[Value],
+    agent_lifecycle_events: &[Value],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let existing_lifecycle_keys: HashSet<String> = final_events
+        .iter()
+        .filter_map(agent_lifecycle_dedupe_key)
+        .collect();
+    let agent_lifecycle_events: Vec<Value> = agent_lifecycle_events
+        .iter()
+        .filter(|event| match agent_lifecycle_dedupe_key(event) {
+            Some(key) => !existing_lifecycle_keys.contains(&key),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    let mut inserted_lifecycle = false;
+    for event in final_events {
+        if streaming_final_event_for_replay(event) && !inserted_lifecycle {
+            out.extend(agent_lifecycle_events.iter().cloned());
+            inserted_lifecycle = true;
+        }
+        if streaming_event_for_persistence(event) {
+            out.push(event.clone());
+        }
+    }
+    if !inserted_lifecycle {
+        out.extend(agent_lifecycle_events);
+    }
+    out
+}
+
+#[cfg(test)]
 async fn stream_missing_agent_lifecycle_events(
     spawner: &DynamicAgentSpawner,
     root_run_id: &str,
     event_tx: &mpsc::Sender<Value>,
     sent_lifecycle_events: &AgentProgressLifecycleLedger,
 ) -> bool {
-    let states = spawner.get_agent_states_for_run_tree(root_run_id).await;
-    for state in states {
-        if !send_missing_agent_lifecycle_event(
-            event_tx,
-            sent_lifecycle_events,
-            agent_spawned_progress_event_from_state(&state),
-        )
-        .await
-        {
-            return false;
-        }
-        if let Some(event) = agent_lifecycle_progress_event_from_state(&state)
-            && !send_missing_agent_lifecycle_event(event_tx, sent_lifecycle_events, event).await
-        {
+    let events =
+        collect_missing_agent_lifecycle_events(spawner, root_run_id, sent_lifecycle_events).await;
+    for event in events {
+        if event_tx.send(event).await.is_err() {
             return false;
         }
     }
@@ -5596,6 +5679,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let (final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+            // Ensure fast synchronous child-agent progress has reached both
+            // durable replay and the live SSE stream before parent terminal
+            // markers close the turn.
+            let sent_lifecycle_events = progress_bridge.stop_and_drain().await;
+            let missing_lifecycle_events = collect_missing_agent_lifecycle_events(
+                missing_lifecycle_spawner.as_ref(),
+                &bg_run_id,
+                &sent_lifecycle_events,
+            )
+            .await;
+            let archived_lifecycle_events = collect_agent_lifecycle_events_for_persistence(
+                missing_lifecycle_spawner.as_ref(),
+                &bg_run_id,
+            )
+            .await;
             // In streaming mode, host-emitted `type` events have already gone
             // through event_tx and the fanout persistence path. Replay only the
             // synthesized terminal events appended by finalize_run_events.
@@ -5608,11 +5706,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &bg_run_id,
                 streaming_final_events.clone(),
             );
-            let streaming_events_for_durable: Vec<Value> = final_events
-                .iter()
-                .filter(|event| streaming_event_for_persistence(event))
-                .cloned()
-                .collect();
+            let streaming_events_for_durable = merge_agent_lifecycle_before_terminal_events(
+                &final_events,
+                &archived_lifecycle_events,
+            );
             persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
             let mut terminal_state_events = streaming_final_events;
 
@@ -5720,16 +5817,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
             }
 
-            // Ensure fast synchronous child-agent progress has reached the SSE
-            // stream before the parent run/turn terminal markers close the turn.
-            let sent_lifecycle_events = progress_bridge.stop_and_drain().await;
-            let _ = stream_missing_agent_lifecycle_events(
-                missing_lifecycle_spawner.as_ref(),
-                &bg_run_id,
-                &event_tx,
-                &sent_lifecycle_events,
-            )
-            .await;
+            for event in missing_lifecycle_events {
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
 
             for event in streamed_final_events {
                 if event_tx.send(event).await.is_err() {
