@@ -222,6 +222,17 @@ export function applyStreamEvent(
     return;
   }
 
+  if (type === "run_input_queued" && typeof event.run_id === "string") {
+    state.runLifecycle = "running";
+    state.runId = event.run_id;
+    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+      runId: event.run_id,
+      status: "input-queued",
+      waitingFor: "user_input",
+    });
+    return;
+  }
+
   if (type === "run_resumed" && typeof event.run_id === "string") {
     state.runLifecycle = "running";
     state.runId = event.run_id;

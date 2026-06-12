@@ -283,6 +283,8 @@ export function applyWorkSurfaceEvent(
       return applyTaskBoardSnapshot(state, event);
     case 'run_started':
       return applyRunStarted(state, event);
+    case 'run_input_queued':
+      return applyRunLifecycleStatus(state, event, 'input-queued');
     case 'run_paused':
       return applyRunLifecycleStatus(state, event, 'paused');
     case 'run_waiting':

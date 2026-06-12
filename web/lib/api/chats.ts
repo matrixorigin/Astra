@@ -309,6 +309,17 @@ function applyStreamEvent(
     return;
   }
 
+  if (type === "run_input_queued" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
+    handlers.onRunUpdated?.({
+      runId: event.run_id,
+      status: "input-queued",
+      waitingFor: "user_input",
+    });
+    return;
+  }
+
   if (isRunBlockedEvent(type)) {
     handlers.onWorkSurfaceEvent?.(event);
     const runId =

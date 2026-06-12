@@ -134,7 +134,7 @@ async fn submit_deferred_tui_input(
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
         .ok_or_else(|| {
-            "Current turn is not ready to accept deferred input yet. Press Ctrl+C to interrupt immediately."
+            "Current turn is not ready to accept deferred input yet. Press Ctrl+C to cancel this run if you need to stop it now."
                 .to_string()
         })?;
     provider.enqueue_text(text)

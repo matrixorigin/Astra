@@ -192,6 +192,27 @@ describe("applyStreamEvent", () => {
     expect(state.runLifecycle).toBe("blocked");
   });
 
+  it("projects run_input_queued events into active run state", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      { type: "run_input_queued", run_id: "run-1" },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      {
+        runId: "run-1",
+        status: "input-queued",
+        waitingFor: "user_input",
+      },
+    );
+    expect(state.runLifecycle).toBe("running");
+  });
+
   it("keeps execution-boundary run_waiting events blocked", () => {
     const state = makeState();
 

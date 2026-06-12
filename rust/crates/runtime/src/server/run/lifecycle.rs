@@ -6194,9 +6194,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &durable_after_conflict.status,
             ));
         }
-
+        let input_queued_event = json!({
+            "event_type": "run_input_queued",
+            "data": { "waiting_for": "user_input" },
+        });
+        self.run_engine
+            .append_event(&run_id, input_queued_event.clone())
+            .await
+            .map_err(|error| Self::durable_persist_error("input queued event", error))?;
         if let Some(run) = self.runs.write().await.get_mut(&run_id) {
             run.events.push(event);
+            run.events.push(input_queued_event);
             run.status = RunStatus::InputQueued;
             run.waiting_for = Some("user_input".to_string());
         }
