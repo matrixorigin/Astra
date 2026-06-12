@@ -225,23 +225,20 @@ pub fn is_dangerous_read_path(path: &str) -> bool {
 pub fn is_internal_safe_path(path: &str) -> Option<InternalPathKind> {
     use std::path::Path;
     let p = Path::new(path);
-
-    // Normalize to handle both Unix and Windows paths.
     let components: Vec<_> = p.components().collect();
 
-    // Look for pattern: .astra/sessions/<session_id>/tool-results/<file>
-    for (idx, window) in components.windows(4).enumerate() {
-        if window.len() == 4 {
-            let c0 = window[0].as_os_str().to_string_lossy();
-            let c1 = window[1].as_os_str().to_string_lossy();
-            let c2 = window[2].as_os_str().to_string_lossy();
-            let c3 = window[3].as_os_str().to_string_lossy();
+    // Look for pattern: .astra/sessions/<session_id>/tool-results/<file>.
+    // Must match exactly these 4 components in sequence, with at least one more after.
+    for i in 0..components.len().saturating_sub(4) {
+        let c0 = components[i].as_os_str().to_string_lossy();
+        let c1 = components.get(i + 1)?.as_os_str().to_string_lossy();
+        let c2 = components.get(i + 2)?.as_os_str().to_string_lossy();
+        let c3 = components.get(i + 3)?.as_os_str().to_string_lossy();
 
-            if c0 == ".astra" && c1 == "sessions" && !c2.is_empty() && c3 == "tool-results" {
-                // Must have at least one more component (the file itself).
-                if idx + window.len() < components.len() {
-                    return Some(InternalPathKind::SessionToolResult);
-                }
+        if c0 == ".astra" && c1 == "sessions" && !c2.is_empty() && c3 == "tool-results" {
+            // Must have at least one more component (the file itself).
+            if components.len() > i + 4 {
+                return Some(InternalPathKind::SessionToolResult);
             }
         }
     }
