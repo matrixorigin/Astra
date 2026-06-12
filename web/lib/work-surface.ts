@@ -1178,10 +1178,7 @@ function eventIsCancelled(event: Record<string, unknown>) {
 
 function isTerminalRunStatus(status: string) {
   return (
-    status === "completed" ||
-    status === "cancelled" ||
-    status === "failed" ||
-    status === "interrupted"
+    status === "completed" || status === "cancelled" || status === "failed"
   );
 }
 

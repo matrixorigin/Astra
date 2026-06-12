@@ -126,6 +126,14 @@ export function localCodeIntent(message: string) {
     return true;
   }
 
+  // "review" alongside code-related terms (branch, changes, diff, PR, commit, code)
+  if (
+    /\breview\b/i.test(text) &&
+    /\b(?:branch(?:es)?|changes?|diff|PR|commit|code|repo)s?\b/i.test(text)
+  ) {
+    return true;
+  }
+
   // "this/current" workspace context — unambiguously local
   if (
     /\b(?:this|current)\s+(?:repo|repository|project|workspace|directory|folder)\b/i.test(
@@ -159,10 +167,13 @@ export function extractLocalPathMentions(message: string) {
 }
 
 function pathStartBoundary(previous: string | undefined) {
-  return (
-    previous === undefined ||
-    /\s/u.test(previous) ||
-    ["'", '"', "`", "=", ":", "(", "{", "[", ",", "<", ">"].includes(previous)
+  if (previous === undefined) return true;
+  if (/\s/u.test(previous)) return true;
+  // Non-Latin code points (CJK, symbols, emoji, etc.) are natural boundaries
+  const cp = previous.codePointAt(0);
+  if (cp !== undefined && cp > 127) return true;
+  return ["'", '"', "`", "=", ":", "(", "{", "[", ",", "<", ">"].includes(
+    previous,
   );
 }
 

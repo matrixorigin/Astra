@@ -1,11 +1,7 @@
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError } from "@/lib/api/errors";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
-import {
-  blockedRunMessage,
-  extractBlockedReason,
-  projectRunWaitingState,
-} from "@/lib/run-status-messages";
+import { projectRunWaitingState } from "@/lib/run-status-messages";
 import {
   blockedWaitingFor,
   eventMessage,

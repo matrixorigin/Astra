@@ -175,16 +175,12 @@ export const MessageBubble = memo(function MessageBubble({
     isLikelyOrphanStreamingReasoning(rawContent);
   const content = orphanStreamingReasoning ? "" : rawContent;
   const reasoning = orphanStreamingReasoning ? rawContent : rawReasoning;
+  const hasReasoning = Boolean(reasoning.trim());
   const reasoningStreaming =
-    message.reasoningStatus === "streaming" ||
+    (message.reasoningStatus === "streaming" && hasReasoning) ||
     splitContent.reasoningOpen ||
     orphanStreamingReasoning;
-  const hasReasoning = Boolean(reasoning.trim());
-  const showReasoning =
-    !isUser &&
-    (hasReasoning ||
-      message.reasoningStatus === "streaming" ||
-      (message.status === "streaming" && reasoningStreaming));
+  const showReasoning = !isUser && (hasReasoning || reasoningStreaming);
   const isStreamingEmpty =
     message.status === "streaming" && !content.trim() && !hasReasoning;
   if (isUser) {

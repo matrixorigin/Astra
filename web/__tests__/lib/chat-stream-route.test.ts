@@ -947,7 +947,10 @@ describe("chat stream route proxy cancellation", () => {
     expect(
       mockUpdateChatWorkspaceSelection.mock.invocationCallOrder[0],
     ).toBeLessThan(mockBeginStreamingMessage.mock.invocationCallOrder[0]);
-    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(runtime.get).toHaveBeenCalledWith(
+      PATH_EDGES_STATUS,
+      expect.objectContaining({ operation: "verify edge workspace binding" }),
+    );
   });
 
   it("inherits chat workspace selection when recovering an empty pending turn request", async () => {

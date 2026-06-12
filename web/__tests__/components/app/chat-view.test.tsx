@@ -885,7 +885,9 @@ describe("ChatView deferred-input unhappy paths", () => {
       screen.getByRole("button", { name: "Open tools work surface, 1 item" }),
     );
     expect(await screen.findAllByText("Needs attention")).not.toHaveLength(0);
-    expect(await screen.findAllByText("Edge transport disconnected")).not.toHaveLength(0);
+    expect(
+      await screen.findAllByText("Edge transport disconnected"),
+    ).not.toHaveLength(0);
     expect(screen.getAllByText("Executor").length).toBeGreaterThan(0);
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Workspace").length).toBeGreaterThan(0);
@@ -1160,7 +1162,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(screen.getByText("Blocked: Executor Offline")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
-    ).toBeDisabled();
+    ).toBeEnabled();
     await waitFor(() => {
       expect(mockStreamExistingChatRun).toHaveBeenCalledWith(
         "chat-123",

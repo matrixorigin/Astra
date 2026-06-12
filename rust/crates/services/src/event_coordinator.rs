@@ -224,13 +224,15 @@ fn lock_broadcast_order(state: &Mutex<BroadcastOrderState>) -> MutexGuard<'_, Br
     match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            // Do NOT recover from poisoned state — the internal counter / skip
-            // set is unreliable. Panic to surface the original failure rather
-            // than silently corrupting broadcast ordering.
-            panic!(
-                "broadcast order state mutex was poisoned; refusing to continue \
-                 with corrupted ordering state. Original error: {poisoned}"
+            // Recover the inner state from a poisoned mutex. A counter
+            // inconsistency in broadcast ordering is less damaging than
+            // a cascading crash of the entire event system.
+            warn!(
+                "broadcast order state mutex was poisoned (previous task panic); \
+                 recovering with potentially stale ordering state. \
+                 Original error: {poisoned}"
             );
+            poisoned.into_inner()
         }
     }
 }
@@ -329,9 +331,27 @@ impl EventCoordinator {
             {
                 let mut state = lock_broadcast_order(&self.broadcast_order);
                 if state.next_to_broadcast == guard.sequence() {
-                    let _ = self
-                        .broadcast_tx
-                        .send(serde_json::to_value(event).unwrap_or_default());
+                    let event_value = match serde_json::to_value(event) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                "failed to serialize journal event for broadcast: {e}; \
+                                 dropping event (run_id={})",
+                                event.run_id.as_deref().unwrap_or("unknown")
+                            );
+                            state.mark_broadcasted(guard.sequence());
+                            guard.complete();
+                            self.broadcast_order_notify.notify_waiters();
+                            return;
+                        }
+                    };
+                    if let Err(e) = self.broadcast_tx.send(event_value) {
+                        warn!(
+                            "broadcast channel closed or full (run_id={}): {e}; \
+                             dropping event",
+                            event.run_id.as_deref().unwrap_or("unknown")
+                        );
+                    }
                     state.mark_broadcasted(guard.sequence());
                     guard.complete();
                     self.broadcast_order_notify.notify_waiters();
