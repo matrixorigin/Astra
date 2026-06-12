@@ -390,12 +390,12 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     }
 }
 
-fn normalized_drift(old: f64, new: f64) -> Option<f64> {
-    let denom = old.abs();
-    if denom < f64::EPSILON {
+fn bounded_drift(old: f64, new: f64, min: f64, max: f64) -> Option<f64> {
+    let span = max - min;
+    if span <= f64::EPSILON {
         return None;
     }
-    Some((new - old).abs() / denom)
+    Some((new - old).abs() / span)
 }
 
 fn extract_tool_name(args: &Value) -> Option<String> {
@@ -3685,7 +3685,7 @@ impl ServerToolExecutor {
                     return json!({"error": "compression.compression_threshold must be within [0.5, 0.98]"}).to_string();
                 }
                 let old = session.config.compression.compression_threshold;
-                let drift = normalized_drift(old, new);
+                let drift = bounded_drift(old, new, 0.5, 0.98);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3712,7 +3712,7 @@ impl ServerToolExecutor {
                         .to_string();
                 }
                 let old = session.config.memory.retrieval_top_k;
-                let drift = normalized_drift(old as f64, new as f64);
+                let drift = bounded_drift(old as f64, new as f64, 1.0, 20.0);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3739,7 +3739,7 @@ impl ServerToolExecutor {
                         .to_string();
                 }
                 let old = session.config.tool_selection.max_tools;
-                let drift = normalized_drift(old as f64, new as f64);
+                let drift = bounded_drift(old as f64, new as f64, 5.0, 80.0);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3765,7 +3765,7 @@ impl ServerToolExecutor {
                     return json!({"error": "tool_selection.tool_budget_tokens must be within [0, 40000]"}).to_string();
                 }
                 let old = session.config.tool_selection.tool_budget_tokens;
-                let drift = normalized_drift(old as f64, new as f64);
+                let drift = bounded_drift(old as f64, new as f64, 0.0, 40_000.0);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3791,7 +3791,7 @@ impl ServerToolExecutor {
                     return json!({"error": "token_budget.max_turn_input_tokens must be within [8000, 200000]"}).to_string();
                 }
                 let old = session.config.token_budget.max_turn_input_tokens;
-                let drift = normalized_drift(old as f64, new as f64);
+                let drift = bounded_drift(old as f64, new as f64, 8_000.0, 200_000.0);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3817,7 +3817,7 @@ impl ServerToolExecutor {
                     return json!({"error": "token_budget.tools_reserve must be within [1000, 40000]"}).to_string();
                 }
                 let old = session.config.token_budget.tools_reserve;
-                let drift = normalized_drift(old as f64, new as f64);
+                let drift = bounded_drift(old as f64, new as f64, 1_000.0, 40_000.0);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling
@@ -3844,7 +3844,7 @@ impl ServerToolExecutor {
                         .to_string();
                 }
                 let old = session.config.verification.strictness;
-                let drift = normalized_drift(old, new);
+                let drift = bounded_drift(old, new, 0.2, 0.95);
                 if let Some(drift_value) = drift
                     && !force
                     && drift_value > ceiling

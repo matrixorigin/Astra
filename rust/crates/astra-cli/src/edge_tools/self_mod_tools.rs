@@ -63,7 +63,7 @@ impl ToolExecutor {
                     return json!({"error": "compression.compression_threshold must be within [0.5, 0.98]"}).to_string();
                 }
                 let old = session.config.compression.compression_threshold;
-                if let Some(d) = normalized_drift(old, new) {
+                if let Some(d) = bounded_drift(old, new, 0.5, 0.98) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -90,7 +90,7 @@ impl ToolExecutor {
                         .to_string();
                 }
                 let old = session.config.memory.retrieval_top_k;
-                if let Some(d) = normalized_drift(old as f64, new as f64) {
+                if let Some(d) = bounded_drift(old as f64, new as f64, 1.0, 20.0) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -117,7 +117,7 @@ impl ToolExecutor {
                         .to_string();
                 }
                 let old = session.config.tool_selection.max_tools;
-                if let Some(d) = normalized_drift(old as f64, new as f64) {
+                if let Some(d) = bounded_drift(old as f64, new as f64, 5.0, 80.0) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -143,7 +143,7 @@ impl ToolExecutor {
                     return json!({"error": "tool_selection.tool_budget_tokens must be within [0, 40000]"}).to_string();
                 }
                 let old = session.config.tool_selection.tool_budget_tokens;
-                if let Some(d) = normalized_drift(old as f64, new as f64) {
+                if let Some(d) = bounded_drift(old as f64, new as f64, 0.0, 40_000.0) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -169,7 +169,7 @@ impl ToolExecutor {
                     return json!({"error": "token_budget.max_turn_input_tokens must be within [8000, 200000]"}).to_string();
                 }
                 let old = session.config.token_budget.max_turn_input_tokens;
-                if let Some(d) = normalized_drift(old as f64, new as f64) {
+                if let Some(d) = bounded_drift(old as f64, new as f64, 8_000.0, 200_000.0) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -195,7 +195,7 @@ impl ToolExecutor {
                     return json!({"error": "token_budget.tools_reserve must be within [1000, 40000]"}).to_string();
                 }
                 let old = session.config.token_budget.tools_reserve;
-                if let Some(d) = normalized_drift(old as f64, new as f64) {
+                if let Some(d) = bounded_drift(old as f64, new as f64, 1_000.0, 40_000.0) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -222,7 +222,7 @@ impl ToolExecutor {
                         .to_string();
                 }
                 let old = session.config.verification.strictness;
-                if let Some(d) = normalized_drift(old, new) {
+                if let Some(d) = bounded_drift(old, new, 0.2, 0.95) {
                     if !force && d > ceiling {
                         return json!({
                             "error": "config_drift_ceiling_exceeded",
@@ -468,12 +468,12 @@ impl ToolExecutor {
     }
 }
 
-fn normalized_drift(old: f64, new: f64) -> Option<f64> {
-    let denom = old.abs();
-    if denom < f64::EPSILON {
+fn bounded_drift(old: f64, new: f64, min: f64, max: f64) -> Option<f64> {
+    let span = max - min;
+    if span <= f64::EPSILON {
         return None;
     }
-    Some((new - old).abs() / denom)
+    Some((new - old).abs() / span)
 }
 
 fn extract_tool_name(args: &Value) -> Option<String> {
