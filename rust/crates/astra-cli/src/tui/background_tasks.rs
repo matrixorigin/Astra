@@ -6,7 +6,7 @@
 //! - File-backed output capture (stdout/stderr → disk)
 //! - Single-channel `pending_completions` queue drained by
 //!   `poll_completions`; the TUI tick consumes lifecycle events
-//!   (Started / Completed / Failed / Killed / Stalled) exactly once
+//!   (Started / Completed / Failed / Killed / WaitingForInput) exactly once
 //!   per occurrence
 //! - Stall detection for shell tasks stuck on interactive input
 
@@ -34,12 +34,12 @@ pub(crate) enum BgTaskStatus {
     Completed = 1,
     Failed = 2,
     Killed = 3,
-    Stalled = 4,
+    WaitingForInput = 4,
 }
 
 impl BgTaskStatus {
     fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running | Self::Stalled)
+        !matches!(self, Self::Running | Self::WaitingForInput)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -48,7 +48,7 @@ impl BgTaskStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Killed => "killed",
-            Self::Stalled => "waiting_for_input",
+            Self::WaitingForInput => "waiting_for_input",
         }
     }
 
@@ -58,7 +58,7 @@ impl BgTaskStatus {
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "killed" => Some(Self::Killed),
-            "waiting_for_input" => Some(Self::Stalled),
+            "waiting_for_input" => Some(Self::WaitingForInput),
             _ => None,
         }
     }
@@ -104,7 +104,7 @@ pub(crate) enum BgTaskEvent {
         id: String,
         title: String,
     },
-    Stalled {
+    WaitingForInput {
         id: String,
         title: String,
         last_output_tail: String,
@@ -146,7 +146,7 @@ impl BackgroundTaskHandle {
             1 => BgTaskStatus::Completed,
             2 => BgTaskStatus::Failed,
             3 => BgTaskStatus::Killed,
-            4 => BgTaskStatus::Stalled,
+            4 => BgTaskStatus::WaitingForInput,
             _ => BgTaskStatus::Running,
         }
     }
@@ -175,7 +175,7 @@ impl BackgroundTaskHandle {
     }
 
     fn set_status_if_non_terminal(&self, s: BgTaskStatus) -> bool {
-        // `Stalled` is intentionally recoverable: output can stop before the
+        // `WaitingForInput` is intentionally recoverable: output can stop before the
         // child process exits, so the later real completion/failure/kill signal
         // must still be able to replace the placeholder stalled state.
         let mut current = self.status.load(Ordering::Acquire);
@@ -694,7 +694,7 @@ impl BackgroundTaskRegistry {
             if handle.status().is_terminal() {
                 continue;
             }
-            if handle.status() == BgTaskStatus::Stalled {
+            if handle.status() == BgTaskStatus::WaitingForInput {
                 continue; // already reported
             }
             let stdout_size = std::fs::metadata(&handle.stdout_path)
@@ -735,8 +735,8 @@ impl BackgroundTaskRegistry {
                     read_combined_tail_str(&handle.stdout_path, &handle.stderr_path, 1024)
                 {
                     if looks_like_prompt(&tail) {
-                        handle.set_status(BgTaskStatus::Stalled);
-                        let event = BgTaskEvent::Stalled {
+                        handle.set_status(BgTaskStatus::WaitingForInput);
+                        let event = BgTaskEvent::WaitingForInput {
                             id: handle.id.clone(),
                             title: handle.description.clone(),
                             last_output_tail: tail,
@@ -751,7 +751,7 @@ impl BackgroundTaskRegistry {
                 // at the tail. With reset removed, subsequent ticks
                 // keep checking on every poll; if the tail eventually
                 // grows into a recognizable prompt we still catch it.
-                // The handle.status == Stalled guard at the top of the
+                // The handle.status == WaitingForInput guard at the top of the
                 // loop already short-circuits once we DO fire.
             }
         }
@@ -760,16 +760,18 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    /// Number of currently running (non-terminal, non-stalled) tasks.
-    /// Stalled is excluded so the status-line "BG: N running"
-    /// represents only forward-progress tasks; stalled is reported
-    /// separately via [`stalled_count`].
+    /// Number of currently running (non-terminal, non-waiting) tasks.
+    /// WaitingForInput is excluded so the status-line "BG: N running"
+    /// represents only forward-progress tasks; waiting is reported
+    /// separately via [`waiting_count`].
     pub fn running_count(&self) -> usize {
         self.tasks
             .values()
             .filter(|h| {
                 let s = h.status();
-                h.live_control.is_available() && !s.is_terminal() && s != BgTaskStatus::Stalled
+                h.live_control.is_available()
+                    && !s.is_terminal()
+                    && s != BgTaskStatus::WaitingForInput
             })
             .count()
     }
@@ -778,12 +780,14 @@ impl BackgroundTaskRegistry {
         self.running_count() < MAX_CONCURRENT_TASKS
     }
 
-    /// Number of stalled tasks — surfaced separately on the status
+    /// Number of waiting tasks — surfaced separately on the status
     /// line so the user notices an interactive prompt blocking work.
-    pub fn stalled_count(&self) -> usize {
+    pub fn waiting_count(&self) -> usize {
         self.tasks
             .values()
-            .filter(|h| h.live_control.is_available() && h.status() == BgTaskStatus::Stalled)
+            .filter(|h| {
+                h.live_control.is_available() && h.status() == BgTaskStatus::WaitingForInput
+            })
             .count()
     }
 
@@ -1452,7 +1456,7 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
                 xml_escape(title),
             )
         }
-        BgTaskEvent::Stalled {
+        BgTaskEvent::WaitingForInput {
             id,
             title,
             last_output_tail,
@@ -1543,16 +1547,16 @@ mod tests {
     }
 
     #[test]
-    fn stalled_status_is_intentionally_recoverable() {
+    fn waiting_status_is_intentionally_recoverable() {
         assert!(
-            !BgTaskStatus::Stalled.is_terminal(),
-            "stalling only means output stopped; it must not freeze later completion/failure updates"
+            !BgTaskStatus::WaitingForInput.is_terminal(),
+            "waiting only means output stopped; it must not freeze later completion/failure updates"
         );
 
-        let (handle, _dir) = test_handle_with_status(BgTaskStatus::Stalled);
+        let (handle, _dir) = test_handle_with_status(BgTaskStatus::WaitingForInput);
         assert!(
             handle.set_status_if_non_terminal(BgTaskStatus::Completed),
-            "real process exit must still replace a stalled placeholder state"
+            "real process exit must still replace a waiting placeholder state"
         );
         assert_eq!(handle.status(), BgTaskStatus::Completed);
     }
@@ -2023,7 +2027,7 @@ mod tests {
         failed.description = "npm test".into();
         failed.started_at = Instant::now() - Duration::from_secs(10);
 
-        let (mut waiting, _waiting_dir) = test_handle_with_status(BgTaskStatus::Stalled);
+        let (mut waiting, _waiting_dir) = test_handle_with_status(BgTaskStatus::WaitingForInput);
         waiting.id = "bg-waiting".into();
         waiting.description = "deploy.sh".into();
         waiting.started_at = Instant::now() - Duration::from_secs(5);
@@ -2047,7 +2051,7 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for (id, status) in [
             ("running", BgTaskStatus::Running),
-            ("waiting", BgTaskStatus::Stalled),
+            ("waiting", BgTaskStatus::WaitingForInput),
             ("failed", BgTaskStatus::Failed),
             ("completed", BgTaskStatus::Completed),
             ("killed", BgTaskStatus::Killed),
@@ -2058,7 +2062,7 @@ mod tests {
         }
 
         assert_eq!(reg.running_count(), 1);
-        assert_eq!(reg.stalled_count(), 1);
+        assert_eq!(reg.waiting_count(), 1);
         assert_eq!(reg.failed_count(), 1);
     }
 
@@ -2153,7 +2157,7 @@ mod tests {
 
     #[test]
     fn notification_xml_uses_waiting_for_input_lifecycle_status() {
-        let event = BgTaskEvent::Stalled {
+        let event = BgTaskEvent::WaitingForInput {
             id: "bg-1".into(),
             title: "npm run dev".into(),
             last_output_tail: "Continue? (y/n)".into(),
@@ -2162,7 +2166,7 @@ mod tests {
         let xml = format_notification_xml(&event);
 
         assert!(xml.contains("<status>waiting_for_input</status>"), "{xml}");
-        assert!(!xml.contains("<status>stalled</status>"), "{xml}");
+        assert!(!xml.contains("<status>waiting</status>"), "{xml}");
     }
 
     #[tokio::test]
@@ -2243,7 +2247,7 @@ mod tests {
         reg.stall_check();
         assert!(reg.poll_completions().iter().any(|event| matches!(
             event,
-            BgTaskEvent::Stalled { id, last_output_tail, .. }
+            BgTaskEvent::WaitingForInput { id, last_output_tail, .. }
                 if id == "bg-throttle" && last_output_tail.contains("Continue? [y/N]")
         )));
     }

@@ -5468,7 +5468,7 @@ mod tests {
         );
         assert!(!completed.contains("Background command"));
 
-        let stalled = background_task_event_system_message(&BgTaskEvent::Stalled {
+        let stalled = background_task_event_system_message(&BgTaskEvent::WaitingForInput {
             id: "bg-shell-2".to_string(),
             title: "python script.py".to_string(),
             last_output_tail: "Continue? [y/N]".to_string(),
@@ -5636,7 +5636,7 @@ mod tests {
                 id: "bg-shell-4".to_string(),
                 title: "deploy.sh".to_string(),
             },
-            BgTaskEvent::Stalled {
+            BgTaskEvent::WaitingForInput {
                 id: "bg-shell-5".to_string(),
                 title: "python script.py".to_string(),
                 last_output_tail: "Continue? [y/N]".to_string(),

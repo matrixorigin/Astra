@@ -216,6 +216,7 @@ pub const TOOL_ERROR_KIND_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
 pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
+pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE: &str = "workspace_executor_unavailable";
 pub const RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE: &str =
     "workspace_executor_unavailable";
@@ -827,11 +828,11 @@ pub fn binding_event_fields(
     );
     fields.insert(
         "transport".to_string(),
-        serde_json::to_value(&executor.transport).unwrap_or(Value::Null),
+        serde_json::to_value(executor.transport).unwrap_or(Value::Null),
     );
     fields.insert(
         "fallback_policy".to_string(),
-        serde_json::to_value(&workspace.fallback_policy).unwrap_or(Value::Null),
+        serde_json::to_value(workspace.fallback_policy).unwrap_or(Value::Null),
     );
     fields
 }

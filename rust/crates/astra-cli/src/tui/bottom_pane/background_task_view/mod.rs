@@ -13,13 +13,13 @@ pub(crate) mod list_render;
 pub(crate) mod types;
 
 pub(crate) use types::{
-    parse_output_sentinel, parse_stop_sentinel, BackgroundTaskFanoutMembership,
+    BACKGROUND_TASK_OUTPUT_SENTINEL, BACKGROUND_TASK_STOP_SENTINEL, BackgroundTaskFanoutMembership,
     BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit, BackgroundTaskStatus,
-    LiveControlState, Mode, BACKGROUND_TASK_OUTPUT_SENTINEL, BACKGROUND_TASK_STOP_SENTINEL,
+    LiveControlState, Mode, parse_output_sentinel, parse_stop_sentinel,
 };
 
 use list_render::background_task_list_entries;
-use types::{sort_rows, PAGE_STEP};
+use types::{PAGE_STEP, sort_rows};
 
 use super::view::{BottomPaneView, CancellationEvent};
 
@@ -188,7 +188,12 @@ impl BottomPaneView for BackgroundTaskView {
                 area,
                 buf,
                 |fallback_area, fallback_buf| {
-                    list_render::render_list(&self.rows, self.selected, fallback_area, fallback_buf);
+                    list_render::render_list(
+                        &self.rows,
+                        self.selected,
+                        fallback_area,
+                        fallback_buf,
+                    );
                 },
             ),
         }
@@ -398,10 +403,30 @@ mod tests {
     #[test]
     fn list_renders_typed_task_kinds_beyond_shell() {
         let view = BackgroundTaskView::new(vec![
-            typed_row("agent-1", BackgroundTaskKind::LocalAgent, "waiting_for_input", "review auth flow"),
-            typed_row("cloud-1", BackgroundTaskKind::CloudSession, "running", "remote plan run"),
-            typed_row("main-1", BackgroundTaskKind::MainSession, "failed", "main turn"),
-            typed_row("mon-1", BackgroundTaskKind::Monitor, "running", "watch tests"),
+            typed_row(
+                "agent-1",
+                BackgroundTaskKind::LocalAgent,
+                "waiting_for_input",
+                "review auth flow",
+            ),
+            typed_row(
+                "cloud-1",
+                BackgroundTaskKind::CloudSession,
+                "running",
+                "remote plan run",
+            ),
+            typed_row(
+                "main-1",
+                BackgroundTaskKind::MainSession,
+                "failed",
+                "main turn",
+            ),
+            typed_row(
+                "mon-1",
+                BackgroundTaskKind::Monitor,
+                "running",
+                "watch tests",
+            ),
         ]);
 
         let text = render(&view, 120, 8);
@@ -409,21 +434,40 @@ mod tests {
         assert!(text.contains("cloud session"), "{text}");
         assert!(text.contains("main session"), "{text}");
         assert!(text.contains("monitor"), "{text}");
-        assert!(text.find("agent-1").unwrap() < text.find("cloud-1").unwrap(),
-            "attention rows must still sort above plain running rows: {text}");
-        assert!(text.find("main-1").unwrap() < text.find("cloud-1").unwrap(),
-            "failed rows must still sort above plain running rows: {text}");
+        assert!(
+            text.find("agent-1").unwrap() < text.find("cloud-1").unwrap(),
+            "attention rows must still sort above plain running rows: {text}"
+        );
+        assert!(
+            text.find("main-1").unwrap() < text.find("cloud-1").unwrap(),
+            "failed rows must still sort above plain running rows: {text}"
+        );
     }
 
     #[test]
     fn list_groups_fanout_local_agents_under_target_header() {
         let view = BackgroundTaskView::new(vec![
-            typed_row("agent-auth", BackgroundTaskKind::LocalAgent, "running", "auth review")
-                .with_fanout(fanout("review-1", 3, 0)),
-            typed_row("agent-storage", BackgroundTaskKind::LocalAgent, "killed", "storage review")
-                .with_fanout(fanout("review-1", 3, 1)),
-            typed_row("agent-api", BackgroundTaskKind::LocalAgent, "running", "API review")
-                .with_fanout(fanout("review-1", 3, 2)),
+            typed_row(
+                "agent-auth",
+                BackgroundTaskKind::LocalAgent,
+                "running",
+                "auth review",
+            )
+            .with_fanout(fanout("review-1", 3, 0)),
+            typed_row(
+                "agent-storage",
+                BackgroundTaskKind::LocalAgent,
+                "killed",
+                "storage review",
+            )
+            .with_fanout(fanout("review-1", 3, 1)),
+            typed_row(
+                "agent-api",
+                BackgroundTaskKind::LocalAgent,
+                "running",
+                "API review",
+            )
+            .with_fanout(fanout("review-1", 3, 2)),
         ]);
 
         let text = render(&view, 120, 6);
@@ -439,20 +483,44 @@ mod tests {
     #[test]
     fn list_navigation_follows_visible_fanout_grouping_order() {
         let mut view = BackgroundTaskView::new(vec![
-            typed_row("agent-failed", BackgroundTaskKind::LocalAgent, "failed", "failed review")
-                .with_fanout(fanout("review-1", 2, 0)),
-            typed_row("standalone", BackgroundTaskKind::Shell, "running", "cargo test"),
-            typed_row("agent-done", BackgroundTaskKind::LocalAgent, "completed", "completed review")
-                .with_fanout(fanout("review-1", 2, 1)),
+            typed_row(
+                "agent-failed",
+                BackgroundTaskKind::LocalAgent,
+                "failed",
+                "failed review",
+            )
+            .with_fanout(fanout("review-1", 2, 0)),
+            typed_row(
+                "standalone",
+                BackgroundTaskKind::Shell,
+                "running",
+                "cargo test",
+            ),
+            typed_row(
+                "agent-done",
+                BackgroundTaskKind::LocalAgent,
+                "completed",
+                "completed review",
+            )
+            .with_fanout(fanout("review-1", 2, 1)),
         ]);
 
-        assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("agent-failed"));
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("agent-failed")
+        );
 
         view.handle_key(key(KeyCode::Down));
-        assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("agent-done"));
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("agent-done")
+        );
 
         view.handle_key(key(KeyCode::Char('3')));
-        assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("standalone"));
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("standalone")
+        );
     }
 
     #[test]
@@ -467,8 +535,10 @@ mod tests {
         assert!(text.contains("shell"), "{text}");
         assert!(text.contains("running"), "{text}");
         assert!(text.contains("cargo"), "{text}");
-        assert!(!text.contains("bg-shell-1234567890abcdef"),
-            "long id should be compacted before it hides the command: {text}");
+        assert!(
+            !text.contains("bg-shell-1234567890abcdef"),
+            "long id should be compacted before it hides the command: {text}"
+        );
     }
 
     #[test]
@@ -504,7 +574,11 @@ mod tests {
     #[test]
     fn detail_renders_output_offsets_lines_and_terminal_reason() {
         let mut view = BackgroundTaskView::new(vec![
-            BackgroundTaskRow::shell("fail", "failed", 41_200, "npm test",
+            BackgroundTaskRow::shell(
+                "fail",
+                "failed",
+                41_200,
+                "npm test",
                 Some("/tmp/fail.stdout".to_string()),
                 Some("test failed".to_string()),
                 Some(13_244),
@@ -538,7 +612,8 @@ mod tests {
 
     #[test]
     fn waiting_for_input_renders_as_needs_input_not_internal_state() {
-        let mut view = BackgroundTaskView::new(vec![row("wait", "waiting_for_input", "prompting command")]);
+        let mut view =
+            BackgroundTaskView::new(vec![row("wait", "waiting_for_input", "prompting command")]);
 
         let list = render(&view, 100, 5);
         assert!(list.contains("1 needs input"), "{list}");
@@ -553,7 +628,8 @@ mod tests {
 
     #[test]
     fn pending_status_renders_explicitly() {
-        let mut view = BackgroundTaskView::new(vec![row_without_output("queued", "pending", "queued task")]);
+        let mut view =
+            BackgroundTaskView::new(vec![row_without_output("queued", "pending", "queued task")]);
 
         let list = render(&view, 100, 4);
         assert!(list.contains("pending"), "{list}");
@@ -580,14 +656,19 @@ mod tests {
         let detail = render(&view, 100, 12);
         assert!(detail.contains("stale · unavailable"), "{detail}");
         assert!(detail.contains("control stale handle"), "{detail}");
-        assert!(detail.contains("Unavailable · stale handle or unsupported runner"), "{detail}");
+        assert!(
+            detail.contains("Unavailable · stale handle or unsupported runner"),
+            "{detail}"
+        );
         assert!(!detail.contains("No output captured yet"), "{detail}");
         assert!(detail.contains("actions: output · return"), "{detail}");
         assert!(!detail.contains("stop"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('s')));
-        assert!(view.take_pending_action().is_none(),
-            "stale handles must not emit stop actions");
+        assert!(
+            view.take_pending_action().is_none(),
+            "stale handles must not emit stop actions"
+        );
     }
 
     #[test]
@@ -599,7 +680,10 @@ mod tests {
         view.handle_key(key(KeyCode::Down));
         view.handle_key(key(KeyCode::Char('s')));
 
-        assert_eq!(view.take_pending_action().as_deref(), Some("__background_task_stop__\nsecond"));
+        assert_eq!(
+            view.take_pending_action().as_deref(),
+            Some("__background_task_stop__\nsecond")
+        );
         assert!(view.take_pending_action().is_none());
         assert!(!view.is_complete());
     }
@@ -625,7 +709,10 @@ mod tests {
             row("first", "running", "first command"),
         ]);
 
-        assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("second"));
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("second")
+        );
     }
 
     #[test]
@@ -663,7 +750,10 @@ mod tests {
 
     #[test]
     fn parse_stop_sentinel_extracts_id() {
-        assert_eq!(parse_stop_sentinel("__background_task_stop__\nbg-shell-1"), Some("bg-shell-1"));
+        assert_eq!(
+            parse_stop_sentinel("__background_task_stop__\nbg-shell-1"),
+            Some("bg-shell-1")
+        );
         assert_eq!(parse_stop_sentinel("not it"), None);
         assert_eq!(parse_stop_sentinel(BACKGROUND_TASK_STOP_SENTINEL), None);
     }
@@ -678,36 +768,54 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
         view.handle_key(key(KeyCode::Char('o')));
 
-        assert_eq!(view.take_pending_action().as_deref(), Some("__background_task_output__\nsecond"));
+        assert_eq!(
+            view.take_pending_action().as_deref(),
+            Some("__background_task_output__\nsecond")
+        );
         assert!(view.take_pending_action().is_none());
         assert!(!view.is_complete());
     }
 
     #[test]
     fn parse_output_sentinel_extracts_id() {
-        assert_eq!(parse_output_sentinel("__background_task_output__\nbg-shell-1"), Some("bg-shell-1"));
+        assert_eq!(
+            parse_output_sentinel("__background_task_output__\nbg-shell-1"),
+            Some("bg-shell-1")
+        );
         assert_eq!(parse_output_sentinel("not it"), None);
         assert_eq!(parse_output_sentinel(BACKGROUND_TASK_OUTPUT_SENTINEL), None);
     }
 
     #[test]
     fn local_agent_detail_offers_typed_output_action() {
-        let mut view = BackgroundTaskView::new(vec![
-            typed_row("agent-1", BackgroundTaskKind::LocalAgent, "running", "review auth flow"),
-        ]);
+        let mut view = BackgroundTaskView::new(vec![typed_row(
+            "agent-1",
+            BackgroundTaskKind::LocalAgent,
+            "running",
+            "review auth flow",
+        )]);
         view.handle_key(key(KeyCode::Enter));
 
         let detail = render(&view, 80, 12);
-        assert!(detail.contains("actions: output · stop · return"), "{detail}");
+        assert!(
+            detail.contains("actions: output · stop · return"),
+            "{detail}"
+        );
         assert!(detail.contains("task review auth flow"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('o')));
-        assert!(matches!(view.take_pending_action().as_deref(),
-            Some("__background_task_output__\nagent-1")),
-            "local agent output should emit typed task_output sentinel");
+        assert!(
+            matches!(
+                view.take_pending_action().as_deref(),
+                Some("__background_task_output__\nagent-1")
+            ),
+            "local agent output should emit typed task_output sentinel"
+        );
 
         view.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(view.take_pending_action().as_deref(),
-            Some("__background_task_stop__\nagent-1"));
+        assert_eq!(
+            view.take_pending_action().as_deref(),
+            Some("__background_task_stop__\nagent-1")
+        );
     }
 }

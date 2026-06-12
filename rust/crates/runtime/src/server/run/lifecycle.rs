@@ -2750,7 +2750,10 @@ impl RunStatus {
                     | Self::Failed
                     | Self::Cancelled
             ),
-            Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Paused => matches!(
+                next,
+                Self::Running | Self::Waiting | Self::Cancelled | Self::Failed
+            ),
             Self::Waiting => matches!(
                 next,
                 Self::InputQueued | Self::Running | Self::Cancelled | Self::Failed
@@ -2927,7 +2930,7 @@ fn streaming_event_for_persistence(event: &Value) -> bool {
 }
 
 fn live_delta_event_for_persistence(event: &Value) -> bool {
-    if durable_event_type(event).is_some_and(|event_type| event_type.starts_with("run_blocked_")) {
+    if durable_event_type(event).is_some_and(|event_type| event_type == "run_blocked") {
         return true;
     }
     matches!(
@@ -9447,9 +9450,9 @@ mod tests {
             json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok"}),
             json!({"type": "agent_progress", "agent_id": "agent-1", "status": "started"}),
             json!({"type": "agent_live_event", "agent_id": "agent-1", "event_kind": "output_delta", "content": "child"}),
-            json!({"type": "run_blocked_transport_disconnected", "call_id": "call-1", "reason": "transport_disconnected"}),
-            json!({"type": "run_blocked_fallback_disabled", "call_id": "call-2", "reason": "fallback_disabled"}),
-            json!({"type": "run_blocked_workspace_executor_unavailable", "call_id": "call-3", "reason": "workspace_executor_unavailable"}),
+            json!({"type": "run_blocked", "call_id": "call-1", "reason": "transport_disconnected"}),
+            json!({"type": "run_blocked", "call_id": "call-2", "reason": "fallback_disabled"}),
+            json!({"type": "run_blocked", "call_id": "call-3", "reason": "workspace_executor_unavailable"}),
             json!({"event_type": "text_done", "data": {"full_text": "hi"}}),
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];

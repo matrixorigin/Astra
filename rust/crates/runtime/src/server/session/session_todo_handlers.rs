@@ -2361,12 +2361,11 @@ mod tests {
             }),
         )
         .await
-        .expect("old status update returns tool error output, not HTTP error");
+        .expect("status alias update should execute");
         assert!(
-            update_response.output.starts_with("Error:")
-                && update_response.output.contains("unknown field 'status'")
-                && !update_response.output.contains("new_status, status"),
-            "status must not remain a recognized cloud task.update argument: {}",
+            update_response.output.contains("\"success\":true")
+                && update_response.output.contains("\"completed\""),
+            "cloud task.update should normalize status as a recovery alias: {}",
             update_response.output
         );
 
@@ -2381,8 +2380,8 @@ mod tests {
         .await
         .expect("task status");
         assert_eq!(
-            status, "pending",
-            "old status argument must not mutate MatrixOne task state"
+            status, "completed",
+            "status alias should mutate MatrixOne task state"
         );
 
         cleanup_session_rows(&pool, &session_id).await;

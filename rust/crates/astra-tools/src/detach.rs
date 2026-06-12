@@ -225,6 +225,12 @@ pub struct DetachShellHandle {
 
 impl DetachShellHandle {
     pub fn mark_active(&self, active: bool) {
+        // Guard: a retired handle must never be reactivated. This prevents
+        // a race where a retired handle could be mistakenly restored to
+        // the reusable slot.
+        if active && self.retired.load(Ordering::Acquire) {
+            return;
+        }
         self.active.store(active, Ordering::Release);
     }
 

@@ -34,10 +34,7 @@ export type StreamEventType =
   | 'tool_transport_started'
   | 'tool_transport_completed'
   | 'tool_transport_failed'
-  | 'run_blocked_executor_offline'
-  | 'run_blocked_transport_disconnected'
-  | 'run_blocked_fallback_disabled'
-  | 'run_blocked_workspace_executor_unavailable'
+  | 'run_blocked'
   | 'agent_delegated'
   | 'agent_spawned'
   | 'agent_waiting'
@@ -451,27 +448,10 @@ type RunBlockedBaseEvent = {
   timestamp?: number;
 } & ExecutionBindingFields;
 
-export type RunBlockedExecutorOfflineEvent = RunBlockedBaseEvent & {
-  type: 'run_blocked_executor_offline';
+export type RunBlockedEvent = RunBlockedBaseEvent & {
+  type: 'run_blocked';
+  reason: 'executor_offline' | 'transport_disconnected' | 'fallback_disabled' | 'workspace_executor_unavailable';
 };
-
-export type RunBlockedTransportDisconnectedEvent = RunBlockedBaseEvent & {
-  type: 'run_blocked_transport_disconnected';
-};
-
-export type RunBlockedFallbackDisabledEvent = RunBlockedBaseEvent & {
-  type: 'run_blocked_fallback_disabled';
-};
-
-export type RunBlockedWorkspaceExecutorUnavailableEvent = RunBlockedBaseEvent & {
-  type: 'run_blocked_workspace_executor_unavailable';
-};
-
-export type RunBlockedEvent =
-  | RunBlockedExecutorOfflineEvent
-  | RunBlockedTransportDisconnectedEvent
-  | RunBlockedFallbackDisabledEvent
-  | RunBlockedWorkspaceExecutorUnavailableEvent;
 
 export type ToolApprovalRequestEvent = {
   type: 'tool_approval_request';

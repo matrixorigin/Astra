@@ -44,7 +44,7 @@ export function extractWaitingReason(event: {
 /**
  * Extract a blocked reason from a stream event, or null if not blocked.
  *
- * Handles `run_blocked_*` event types and explicit `blocked: true` flags.
+ * Handles `run_blocked` event type and explicit `blocked: true` flags.
  */
 export function extractBlockedReason(event: {
   type?: string;

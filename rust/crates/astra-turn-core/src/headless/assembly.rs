@@ -346,20 +346,37 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
             // ServerToolExecutor available, the error below is replaced
             // with the real result. Only tools that truly have NO
             // server-side executor will surface this message to the LLM.
-            format!(
-                "Error: headless edge protocol — tool `{name}` has no matching \
-                 edge execution in this turn.\n\n\
-                 This means `{name}` requires a server-side execution path that is \
-                 not available in the current session mode.\n\
-                 Workaround: use `bash` to accomplish the same task directly. For \
-                 example, use `gh issue create ...` instead of `github(action=create_issue)`, \
-                 or shell commands instead of `run_script`.\n\
-                 If you believe this tool should work here, ask the user to file a bug."
-            )
+            no_matching_edge_execution_message(name)
         }),
         duration_ms: 0,
         tool_result_fields: None,
     }
+}
+
+fn no_matching_edge_execution_message(name: &str) -> String {
+    if matches!(name, "enter_plan_mode" | "exit_plan_mode") {
+        return format!(
+            "Error: headless edge protocol — tool `{name}` has no matching \
+             edge execution in this turn.\n\n\
+             This plan lifecycle tool requires a trusted plan executor/review \
+             overlay, but the current session mode did not attach one. \
+             Do NOT retry `{name}` in this session mode and do NOT replace plan \
+             approval with bash. Continue normal execution if the user already \
+             asked to implement, or ask the user to switch to an interactive \
+             plan-capable surface."
+        );
+    }
+
+    format!(
+        "Error: headless edge protocol — tool `{name}` has no matching \
+         edge execution in this turn.\n\n\
+         This means `{name}` requires a server-side execution path that is \
+         not available in the current session mode.\n\
+         Workaround: use `bash` to accomplish the same task directly. For \
+         example, use `gh issue create ...` instead of `github(action=create_issue)`, \
+         or shell commands instead of `run_script`.\n\
+         If you believe this tool should work here, ask the user to file a bug."
+    )
 }
 
 /// Normalize server `tool_calls` or synthetic edge-round rows for stall / TurnGuard signature tracking.
@@ -1306,5 +1323,24 @@ mod tests {
         let args: Value =
             serde_json::from_str(tc[1]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["ref"], "HEAD");
+    }
+
+    #[test]
+    fn plan_lifecycle_no_matching_edge_error_does_not_suggest_bash() {
+        let message = no_matching_edge_execution_message("exit_plan_mode");
+
+        assert!(message.contains("trusted plan executor"));
+        assert!(message.contains("Do NOT retry"));
+        assert!(
+            !message.contains("Workaround: use `bash`"),
+            "plan approval must not be replaced with bash: {message}"
+        );
+    }
+
+    #[test]
+    fn non_plan_no_matching_edge_error_keeps_direct_workaround() {
+        let message = no_matching_edge_execution_message("github_create_issue");
+
+        assert!(message.contains("Workaround: use `bash`"), "{message}");
     }
 }

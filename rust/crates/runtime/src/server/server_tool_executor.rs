@@ -43,11 +43,13 @@ use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
 use crate::server::tool_transport::{
-    ExecutorBinding, ExecutorStatus, ServerLocalToolTransport, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
-    TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE,
-    ToolExecutionRequest, ToolExecutionRouteKind, ToolExecutionService, ToolPolicySnapshot,
-    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    binding_event_fields, route_binding_event_fields,
+    ExecutorBinding, ExecutorStatus, RUN_BLOCKED_REASON_EXECUTOR_OFFLINE,
+    RUN_BLOCKED_REASON_FALLBACK_DISABLED, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
+    RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE, ServerLocalToolTransport,
+    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
+    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE, ToolExecutionRequest, ToolExecutionRouteKind,
+    ToolExecutionService, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
+    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields, route_binding_event_fields,
 };
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
@@ -118,7 +120,7 @@ fn collect_shell_path_token(input: &str, start: usize) -> String {
         .chars()
         .take_while(|ch| !shell_path_token_delimiter(*ch))
         .collect::<String>()
-        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ':'))
+        .trim_end_matches(['.', ',', ':'])
         .to_string()
 }
 
@@ -136,7 +138,7 @@ fn collect_local_workspace_path_token(input: &str, start: usize) -> String {
             .chars()
             .take_while(|ch| !shell_path_token_delimiter(*ch))
             .collect::<String>()
-            .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ':'))
+            .trim_end_matches(['.', ',', ':'])
             .to_string();
         return format!("{BRACED_HOME}{suffix}");
     }
@@ -939,10 +941,18 @@ fn render_session_history_rows(
 /// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search)
 /// and session-scoped authoring tools (`task`, memory_retrieve, …) stay
 /// available so the agent can continue exploring while authoring a plan.
-fn is_plan_mode_blocked_tool(tool: &str, _args: &Value) -> bool {
+fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
+    // Legacy standalone tools are always blocked
     if tool == "task_stop" {
         return true;
     }
+
+    // Consolidated `task` tool: block only destructive actions (stop)
+    if tool == "task" {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        return action == "stop";
+    }
+
     matches!(
         tool,
         "bash"
@@ -1786,15 +1796,16 @@ impl ServerToolExecutor {
         let Some(error_kind) = result_metadata_str(result, "error_kind") else {
             return;
         };
-        let (executor_status, blocked_event_type) = match error_kind {
-            TOOL_ERROR_KIND_EXECUTOR_OFFLINE => ("offline", "run_blocked_executor_offline"),
+        let (executor_status, blocked_reason) = match error_kind {
+            TOOL_ERROR_KIND_EXECUTOR_OFFLINE => ("offline", RUN_BLOCKED_REASON_EXECUTOR_OFFLINE),
             TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED => {
-                ("degraded", "run_blocked_transport_disconnected")
+                ("degraded", RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED)
             }
-            TOOL_ERROR_KIND_FALLBACK_DISABLED => ("degraded", "run_blocked_fallback_disabled"),
-            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE => {
-                ("degraded", "run_blocked_workspace_executor_unavailable")
-            }
+            TOOL_ERROR_KIND_FALLBACK_DISABLED => ("degraded", RUN_BLOCKED_REASON_FALLBACK_DISABLED),
+            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE => (
+                "degraded",
+                RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE,
+            ),
             _ => return,
         };
         let Some(call_id) = Self::tool_call_id(args) else {
@@ -1830,9 +1841,10 @@ impl ServerToolExecutor {
         );
 
         let mut blocked_event = Map::new();
+        blocked_event.insert("type".to_string(), Value::String("run_blocked".to_string()));
         blocked_event.insert(
-            "type".to_string(),
-            Value::String(blocked_event_type.to_string()),
+            "reason".to_string(),
+            Value::String(blocked_reason.to_string()),
         );
         blocked_event.insert(
             "session_id".to_string(),
@@ -2635,11 +2647,15 @@ impl ServerToolExecutor {
                 }
             }
             "str_replace" => {
+                let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
+                    Ok(args) => args,
+                    Err(error) => return tool_result_from_output(error),
+                };
                 // edits array routes to multi_edit handler
                 if args.get("edits").and_then(|v| v.as_array()).is_some() {
-                    tool_result_from_output(self.server_multi_edit(args))
+                    tool_result_from_output(self.server_multi_edit(&args))
                 } else {
-                    tool_result_from_output(self.server_str_replace(args))
+                    tool_result_from_output(self.server_str_replace(&args))
                 }
             }
             "list_dir" => self.default_executor.execute("list_dir", args).await,
@@ -7038,8 +7054,11 @@ esac
 
         let blocked = events
             .iter()
-            .find(|event| event["type"] == "run_blocked_workspace_executor_unavailable")
-            .expect("run_blocked_workspace_executor_unavailable");
+            .find(|event| {
+                event["type"] == "run_blocked"
+                    && event["reason"] == "workspace_executor_unavailable"
+            })
+            .expect("run_blocked workspace_executor_unavailable");
         assert_eq!(blocked["run_id"], "run-unsupported-workspace");
         assert_eq!(blocked["call_id"], "call-unsupported-workspace");
         assert_eq!(
@@ -7231,8 +7250,8 @@ esac
 
         let blocked = events
             .iter()
-            .find(|event| event["type"] == "run_blocked_executor_offline")
-            .expect("run_blocked_executor_offline");
+            .find(|event| event["type"] == "run_blocked" && event["reason"] == "executor_offline")
+            .expect("run_blocked executor_offline");
         assert_eq!(blocked["call_id"], "call-offline");
         assert_eq!(blocked["run_id"], "run-offline");
         assert_eq!(blocked["tool"], "bash");
@@ -7300,8 +7319,10 @@ esac
 
         let blocked = events
             .iter()
-            .find(|event| event["type"] == "run_blocked_transport_disconnected")
-            .expect("run_blocked_transport_disconnected");
+            .find(|event| {
+                event["type"] == "run_blocked" && event["reason"] == "transport_disconnected"
+            })
+            .expect("run_blocked transport_disconnected");
         assert_eq!(blocked["call_id"], "call-transport-disconnected");
         assert_eq!(blocked["run_id"], "run-transport-disconnected");
         assert_eq!(blocked["tool"], "bash");
@@ -9475,6 +9496,24 @@ esac
             &json!({"task_id": "bg-shell-1"})
         ));
         assert!(!is_plan_mode_blocked_tool("task_list", &json!({})));
+
+        // Consolidated `task` tool: block only destructive actions
+        assert!(is_plan_mode_blocked_tool(
+            "task",
+            &json!({"action": "stop", "task_id": "bg-shell-1"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "task",
+            &json!({"action": "create", "title": "new task"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "task",
+            &json!({"action": "list"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "task",
+            &json!({"action": "update", "task_id": "bg-shell-1", "new_status": "in_progress"})
+        ));
     }
 
     #[tokio::test]

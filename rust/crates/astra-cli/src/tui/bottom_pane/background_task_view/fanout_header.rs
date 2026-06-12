@@ -5,8 +5,8 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::cli::effects::truncate_label;
 use super::types::{BackgroundTaskFanoutMembership, BackgroundTaskRow, BackgroundTaskStatus};
+use crate::cli::effects::truncate_label;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FanoutHeader {

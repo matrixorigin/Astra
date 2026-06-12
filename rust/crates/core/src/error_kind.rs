@@ -190,9 +190,9 @@ impl ErrorKind {
                  Fix the parameters and retry the same tool before switching tools."
             }
             Self::ToolTimeout => {
-                "Tool command timed out — the scope is too broad. \
-                 Do NOT retry with the same arguments. Narrow the search: \
-                 use a specific subdirectory, file filter, or more specific pattern."
+                "Tool command timed out. Do NOT retry with the same arguments. \
+                 Run a narrower target, increase timeout only for commands expected to be slow, \
+                 or split the work into focused commands."
             }
             Self::ToolUnavailable => {
                 "Tool is not available in this environment. \

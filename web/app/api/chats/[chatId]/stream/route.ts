@@ -583,7 +583,6 @@ export async function POST(
   const workspaceBindings = resolveWorkspaceBindings(
     effectiveWorkspaceSelection,
   );
-  let runtimeSessionId = chatId;
   const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
 
   const started = beginStreamingMessage(ownerUserId, chatId, {
@@ -596,17 +595,18 @@ export async function POST(
   const backendAbortController = new AbortController();
   const knownArtifactIds = new Set<string>();
 
+  // Resolve session ID synchronously before starting stream proxy
+  const runtime = await getStreamRuntime();
+  const [runtimeSessionId, model] = await Promise.all([
+    ensureChatBackendSession(ownerUserId, chatId, {
+      model: body.options?.model ?? chat.chat.model,
+      runtime,
+    }),
+    resolveBackendModelName(runtime, body.options?.model),
+  ]);
+
   return proxyRunStream({
     backendResponse: async (emit) => {
-      const runtime = await getStreamRuntime();
-      const [ensuredSessionId, model] = await Promise.all([
-        ensureChatBackendSession(ownerUserId, chatId, {
-          model: body.options?.model ?? chat.chat.model,
-          runtime,
-        }),
-        resolveBackendModelName(runtime, body.options?.model),
-      ]);
-      runtimeSessionId = ensuredSessionId;
       emit({
         type: "session_bound",
         chat_id: chatId,
@@ -656,13 +656,9 @@ export async function POST(
     ownerUserId,
     chatId,
     sessionId: () => runtimeSessionId,
-    runtime: getStreamRuntime,
+    runtime,
     assistantMessageId: started.assistantMessage.id,
     knownArtifactIds,
-    localMessages: {
-      userMessage: started.userMessage,
-      assistantMessage: started.assistantMessage,
-    },
   });
 }
 

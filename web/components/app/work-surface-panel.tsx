@@ -171,7 +171,8 @@ export function WorkSurfacePanel({
       return;
     }
     let cancelled = false;
-    let interval: number | undefined;
+    let timeout: number | undefined;
+    let intervalMs = 2_500;
     const runId = selectedAgent.runId;
     const load = async (quiet = false) => {
       if (!quiet) {
@@ -187,6 +188,7 @@ export function WorkSurfacePanel({
       try {
         const projection = await onLoadAgentRun(runId);
         if (cancelled) return;
+        intervalMs = 2_500;
         setAgentRunDetails((current) => ({
           ...current,
           [runId]: {
@@ -197,6 +199,7 @@ export function WorkSurfacePanel({
         }));
       } catch (error) {
         if (cancelled) return;
+        intervalMs = Math.min(intervalMs * 2, 30_000);
         setAgentRunDetails((current) => ({
           ...current,
           [runId]: {
@@ -211,17 +214,25 @@ export function WorkSurfacePanel({
       }
     };
 
+    const scheduleNext = () => {
+      if (cancelled) return;
+      if (document.hidden) {
+        timeout = window.setTimeout(scheduleNext, intervalMs);
+        return;
+      }
+      void load(true);
+      timeout = window.setTimeout(scheduleNext, intervalMs);
+    };
+
     void load();
     if (isAgentActive(selectedAgent.status)) {
-      interval = window.setInterval(() => {
-        void load(true);
-      }, 2_500);
+      timeout = window.setTimeout(scheduleNext, intervalMs);
     }
 
     return () => {
       cancelled = true;
-      if (interval) {
-        window.clearInterval(interval);
+      if (timeout) {
+        window.clearTimeout(timeout);
       }
     };
   }, [onLoadAgentRun, selectedAgent?.runId, selectedAgent?.status]);

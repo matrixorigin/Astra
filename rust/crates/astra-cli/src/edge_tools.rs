@@ -108,10 +108,18 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// Read-only tools (read_file, grep, glob, git_status/diff/log) and
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
-pub(crate) fn is_plan_mode_blocked_tool(tool: &str, _args: &Value) -> bool {
+pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
+    // Legacy standalone tools are always blocked
     if tool == "task_stop" {
         return true;
     }
+
+    // Consolidated `task` tool: block only destructive actions (stop)
+    if tool == "task" {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        return action == "stop";
+    }
+
     matches!(
         tool,
         "bash"
@@ -1491,6 +1499,8 @@ impl ToolExecutor {
                 "active_form",
                 "owner",
                 "metadata",
+                "add_blocks",
+                "add_blocked_by",
             ],
             "list" => &["action", "status_filter"],
             "get" => &["action", "task_id"],
@@ -1498,6 +1508,7 @@ impl ToolExecutor {
                 "action",
                 "task_id",
                 "new_status",
+                "status",
                 "title",
                 "description",
                 "subtask_id",
@@ -1508,12 +1519,13 @@ impl ToolExecutor {
                 "add_blocked_by",
                 "remove_blocks",
                 "remove_blocked_by",
+                "reason",
                 "error_message",
             ],
             "stop" => &["action", "task_id", "reason"],
             "list_user" => &["action", "user_status"],
             "adopt" => &["action", "source_session_id", "task_id"],
-            "archive" => &["action", "task_id", "older_than_days"],
+            "archive" => &["action", "task_id", "older_than_days", "reason"],
             _ => return Ok(()),
         };
         let Some(obj) = args.as_object() else {
@@ -1521,9 +1533,9 @@ impl ToolExecutor {
         };
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
-                if action == "create" && Self::is_task_dependency_edge_field(key) {
+                if action == "create" && Self::is_task_dependency_removal_field(key) {
                     return Err(format!(
-                        "unknown field '{key}' for task.create. Dependency edge fields (`add_blocks`, `add_blocked_by`, `remove_blocks`, `remove_blocked_by`) are update-only: first call task(action='create', title=...), then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
+                        "unknown field '{key}' for task.create. Dependency removal fields (`remove_blocks`, `remove_blocked_by`) are update-only: first create the task, then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
                         allowed.join(", ")
                     ));
                 }
@@ -1536,11 +1548,8 @@ impl ToolExecutor {
         Ok(())
     }
 
-    fn is_task_dependency_edge_field(key: &str) -> bool {
-        matches!(
-            key,
-            "add_blocks" | "add_blocked_by" | "remove_blocks" | "remove_blocked_by"
-        )
+    fn is_task_dependency_removal_field(key: &str) -> bool {
+        matches!(key, "remove_blocks" | "remove_blocked_by")
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -3708,11 +3717,15 @@ impl ToolExecutor {
                 "rollback_session_state" => self.rollback_session_state(args).await,
                 "rollback_turn_actions" => self.rollback_turn_actions(args).await,
                 "str_replace" => {
+                    let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
+                        Ok(args) => args,
+                        Err(error) => return error,
+                    };
                     // edits array routes to multi_edit handler
                     if args.get("edits").and_then(Value::as_array).is_some() {
-                        self.multi_edit(args)
+                        self.multi_edit(&args)
                     } else {
-                        self.str_replace(args)
+                        self.str_replace(&args)
                     }
                 }
                 "list_dir" => self.list_dir(args),

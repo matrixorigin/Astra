@@ -196,14 +196,25 @@ pub fn build_recovery_message(
              Do NOT retry — reduce system load or try a different approach.",
             tool_name
         ),
-        ErrorCategory::ToolTimeout => format!(
-            "⚠ {} timed out — the search scope is too broad. \
-             Do NOT retry with the same arguments. Instead: \
-             (1) search a specific subdirectory with 'path', \
-             (2) use 'include' to filter file types (e.g. '*.rs'), \
-             (3) use a more specific pattern.",
-            tool_name
-        ),
+        ErrorCategory::ToolTimeout => {
+            if matches!(tool_name, "grep" | "glob") {
+                format!(
+                    "⚠ {} timed out — the search scope is too broad. \
+                     Do NOT retry with the same arguments. Instead: \
+                     (1) search a specific subdirectory with 'path', \
+                     (2) use 'include' to filter file types (e.g. '*.rs'), \
+                     (3) use a more specific pattern.",
+                    tool_name
+                )
+            } else {
+                format!(
+                    "⚠ {} timed out. Do NOT retry the identical long-running command. \
+                     Instead run a narrower target, increase the timeout only when the command is expected to be slow, \
+                     or split build/test work into focused commands.",
+                    tool_name
+                )
+            }
+        }
         _ => {
             if ask_user_shape_error {
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()

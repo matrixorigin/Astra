@@ -656,6 +656,7 @@ pub trait TaskStore: Send + Sync {
         let parsed = parse_archive_args(args)?;
         let task_id = parsed.task_id;
         let days = parsed.older_than_days;
+        let reason = parsed.reason;
         let now = chrono::Utc::now();
         let now_rfc3339 = now.to_rfc3339();
         let cutoff = now - chrono::Duration::days(days);
@@ -728,6 +729,12 @@ pub trait TaskStore: Send + Sync {
                     tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
                     tasks[task_index].updated_at = now_rfc3339.clone();
                     tasks[task_index].archived_at = Some(now_rfc3339.clone());
+                    if let Some(reason) = reason.as_deref() {
+                        let meta = tasks[task_index]
+                            .metadata
+                            .get_or_insert_with(Default::default);
+                        meta.insert("archive_reason".to_string(), json!(reason));
+                    }
                     let archived_ids = HashSet::from([task_id.clone()]);
                     detach_task_dependency_edges(&mut tasks, &archived_ids);
                     return Ok(TaskMutationResult {
@@ -764,6 +771,10 @@ pub trait TaskStore: Send + Sync {
                         task.status = SessionTaskStatusKind::Archived;
                         task.updated_at = now_rfc3339.clone();
                         task.archived_at = Some(now_rfc3339.clone());
+                        if let Some(reason) = reason.as_deref() {
+                            let meta = task.metadata.get_or_insert_with(Default::default);
+                            meta.insert("archive_reason".to_string(), json!(reason));
+                        }
                         archived_ids.insert(task.id.clone());
                     }
                 }
@@ -1294,15 +1305,24 @@ pub fn normalize_title(title: &str) -> String {
 }
 
 fn normalize_update_status(args: &Value) -> Result<Option<SessionTaskStatusKind>, String> {
-    let Some(raw_status) = args.get("new_status") else {
+    let raw_new_status = args.get("new_status");
+    let raw_status_alias = args.get("status");
+    if let (Some(left), Some(right)) = (raw_new_status, raw_status_alias)
+        && left != right
+    {
+        return Err(
+            "fields 'new_status' and 'status' disagree; provide only new_status".to_string(),
+        );
+    }
+    let Some(raw_status) = raw_new_status.or(raw_status_alias) else {
         return Ok(None);
     };
     let Some(status) = raw_status.as_str() else {
-        return Err("field 'new_status' must be a string".to_string());
+        return Err("field 'new_status'/'status' must be a string".to_string());
     };
     if !VALID_UPDATE_STATUSES.contains(&status) {
         return Err(format!(
-            "invalid new_status '{}' (valid: {})",
+            "invalid new_status/status '{}' (valid: {})",
             status,
             VALID_UPDATE_STATUSES.join("|")
         ));
@@ -1330,19 +1350,6 @@ fn validate_parent_status_transition(
     ) {
         return Err(format!(
             "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to remove it"
-        ));
-    }
-    // Enforce state machine: Pending must go through InProgress before terminal states.
-    if previous_status == SessionTaskStatusKind::Pending
-        && matches!(
-            new_status,
-            SessionTaskStatusKind::Completed
-                | SessionTaskStatusKind::Failed
-                | SessionTaskStatusKind::Cancelled
-        )
-    {
-        return Err(format!(
-            "cannot transition directly from 'pending' to '{new_status}'; move to 'in_progress' first"
         ));
     }
     Ok(())
@@ -1754,11 +1761,20 @@ fn optional_string_array_field(args: &Value, field: &str) -> Result<Vec<String>,
 pub(crate) struct ArchiveArgs {
     pub task_id: Option<String>,
     pub older_than_days: i64,
+    pub reason: Option<String>,
 }
 
 pub(crate) fn parse_archive_args(args: &Value) -> Result<ArchiveArgs, String> {
-    validate_allowed_fields(args, "archive", &["action", "task_id", "older_than_days"])?;
+    validate_allowed_fields(
+        args,
+        "archive",
+        &["action", "task_id", "older_than_days", "reason"],
+    )?;
     let task_id = optional_non_empty_string_field(args, "task_id")?;
+    let reason = optional_non_empty_string_field(args, "reason")?;
+    if let Some(reason) = reason.as_deref() {
+        validate_string_chars(reason, "reason", MAX_TASK_STOP_REASON_CHARS)?;
+    }
     if task_id.is_some() && args.get("older_than_days").is_some() {
         return Err(
             "archive accepts either 'task_id' for a single task or 'older_than_days' for bulk archive, not both"
@@ -1776,6 +1792,7 @@ pub(crate) fn parse_archive_args(args: &Value) -> Result<ArchiveArgs, String> {
     Ok(ArchiveArgs {
         task_id,
         older_than_days,
+        reason,
     })
 }
 
@@ -2025,6 +2042,8 @@ impl TaskManager {
                 "active_form",
                 "owner",
                 "metadata",
+                "add_blocks",
+                "add_blocked_by",
             ],
         ) {
             return format!("Error: {error}");
@@ -2091,6 +2110,24 @@ impl TaskManager {
             },
             None => None,
         };
+        let proposed_blocks = match optional_string_array_field(args, "add_blocks") {
+            Ok(proposed_blocks) => proposed_blocks,
+            Err(error) => return format!("Error: {error}"),
+        };
+        let proposed_blocked_by = match optional_string_array_field(args, "add_blocked_by") {
+            Ok(proposed_blocked_by) => proposed_blocked_by,
+            Err(error) => return format!("Error: {error}"),
+        };
+        for (field, ids) in [
+            ("add_blocks", &proposed_blocks),
+            ("add_blocked_by", &proposed_blocked_by),
+        ] {
+            for id in ids {
+                if let Err(error) = validate_task_id_chars(id, field) {
+                    return format!("Error: {error}");
+                }
+            }
+        }
         let sid = self.sid();
         let mutation_title = title.clone();
         match self
@@ -2173,7 +2210,7 @@ impl TaskManager {
                         status: SessionTaskStatusKind::Pending,
                         subtasks,
                         created_at: now.clone(),
-                        updated_at: now,
+                        updated_at: now.clone(),
                         active_form,
                         owner,
                         metadata,
@@ -2182,11 +2219,19 @@ impl TaskManager {
                         archived_at: None,
                     };
                     tasks.push(task);
+                    for id in &proposed_blocks {
+                        add_dependency_edge(&mut tasks, &task_id, id, &now)?;
+                    }
+                    for id in &proposed_blocked_by {
+                        add_dependency_edge(&mut tasks, id, &task_id, &now)?;
+                    }
                     let response = prefix_summary(
                         format!("Task #{task_id} created: {mutation_title}"),
                         json!({
                             "success": true,
                             "task_id": task_id,
+                            "blocks": proposed_blocks,
+                            "blocked_by": proposed_blocked_by,
                             "message": format!("Task '{}' created successfully", mutation_title)
                         })
                         .to_string(),
@@ -2349,6 +2394,7 @@ impl TaskManager {
                 "action",
                 "task_id",
                 "new_status",
+                "status",
                 "title",
                 "description",
                 "subtask_id",
@@ -2359,6 +2405,7 @@ impl TaskManager {
                 "add_blocked_by",
                 "remove_blocks",
                 "remove_blocked_by",
+                "reason",
                 "error_message",
             ],
         ) {
@@ -2380,8 +2427,12 @@ impl TaskManager {
             Ok(subtask_id) => subtask_id,
             Err(error) => return format!("Error: {error}"),
         };
-        let error_message = match optional_non_empty_string_field(args, "error_message") {
+        let mut error_message = match optional_non_empty_string_field(args, "error_message") {
             Ok(error_message) => error_message,
+            Err(error) => return format!("Error: {error}"),
+        };
+        let reason = match optional_non_empty_string_field(args, "reason") {
+            Ok(reason) => reason,
             Err(error) => return format!("Error: {error}"),
         };
         if let Some(error_message) = error_message.as_deref()
@@ -2390,12 +2441,23 @@ impl TaskManager {
         {
             return format!("Error: {error}");
         }
+        if let Some(reason) = reason.as_deref()
+            && let Err(error) = validate_string_chars(reason, "reason", MAX_TASK_STOP_REASON_CHARS)
+        {
+            return format!("Error: {error}");
+        }
+        if error_message.is_none() && new_status == Some(SessionTaskStatusKind::Failed) {
+            error_message = reason.clone();
+        }
         if error_message.is_some() {
             if subtask_id.is_some() {
                 return "Error: field 'error_message' is only supported for parent task failure updates; subtask failures cannot store an error_message".to_string();
             }
-            if new_status != Some(SessionTaskStatusKind::Failed) {
-                return "Error: field 'error_message' requires new_status='failed'".to_string();
+            if !matches!(
+                new_status,
+                Some(SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled)
+            ) {
+                return "Error: field 'error_message' requires new_status='failed' or new_status='cancelled'".to_string();
             }
         }
         let now = chrono::Utc::now().to_rfc3339();
@@ -2474,6 +2536,7 @@ impl TaskManager {
                 ("add_blocked_by", !proposed_blocked_by.is_empty()),
                 ("remove_blocks", !remove_blocks.is_empty()),
                 ("remove_blocked_by", !remove_blocked_by.is_empty()),
+                ("reason", reason.is_some()),
             ]
             .into_iter()
             .filter_map(|(field, present)| present.then_some(field))
@@ -2500,9 +2563,10 @@ impl TaskManager {
                 || !proposed_blocked_by.is_empty()
                 || !remove_blocks.is_empty()
                 || !remove_blocked_by.is_empty()
-                || error_message.is_some();
+                || error_message.is_some()
+                || reason.is_some();
             if !has_parent_update {
-                return "Error: task.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, or error_message".to_string();
+                return "Error: task.update requires at least one update field: new_status, status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
             }
         }
         let sid = self.sid();
@@ -2828,17 +2892,29 @@ impl TaskManager {
                             }
                         }
                         if let Some(err) = error_message.as_deref() {
-                            // Stash structured error in metadata so `list`
-                            // can surface a preview without parsing
-                            // description prose. Keep a human-readable copy in
-                            // description as well, after any description update.
-                            task.description = Some(format!(
-                                "{}\n\nError: {}",
-                                task.description.as_deref().unwrap_or(""),
-                                err
-                            ));
                             let meta = task.metadata.get_or_insert_with(Default::default);
-                            meta.insert("error_message".to_string(), json!(err));
+                            if new_status == Some(SessionTaskStatusKind::Cancelled) {
+                                task.description = Some(format!(
+                                    "{}\n\nCancelled: {}",
+                                    task.description.as_deref().unwrap_or(""),
+                                    err
+                                ));
+                                meta.insert("reason".to_string(), json!(err));
+                            } else {
+                                // Stash structured error in metadata so `list`
+                                // can surface a preview without parsing
+                                // description prose. Keep a human-readable copy in
+                                // description as well, after any description update.
+                                task.description = Some(format!(
+                                    "{}\n\nError: {}",
+                                    task.description.as_deref().unwrap_or(""),
+                                    err
+                                ));
+                                meta.insert("error_message".to_string(), json!(err));
+                            }
+                        } else if let Some(note) = reason.as_deref() {
+                            let meta = task.metadata.get_or_insert_with(Default::default);
+                            meta.insert("reason".to_string(), json!(note));
                         }
 
                         task.updated_at = now.clone();
@@ -3767,7 +3843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rejects_error_message_without_parent_failed_status() {
+    async fn update_accepts_terminal_reasons_and_rejects_non_terminal_error_message() {
         let m = mgr();
         m.create(&json!({
             "title": "parent",
@@ -3779,12 +3855,12 @@ mod tests {
             (
                 "missing failed status",
                 json!({"task_id": "task-1", "error_message": "boom"}),
-                "requires new_status='failed'",
+                "requires new_status='failed' or new_status='cancelled'",
             ),
             (
                 "non-failed status",
                 json!({"task_id": "task-1", "new_status": "completed", "error_message": "boom"}),
-                "requires new_status='failed'",
+                "requires new_status='failed' or new_status='cancelled'",
             ),
             (
                 "subtask failure",
@@ -3820,6 +3896,25 @@ mod tests {
         assert!(
             task.metadata.is_none() && task.description.is_none(),
             "bad error_message shapes must not write hidden metadata/description: {task:?}"
+        );
+
+        let cancelled = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "cancelled",
+                "error_message": "superseded"
+            }))
+            .await;
+        assert!(!cancelled.starts_with("Error:"), "{cancelled}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.status, SessionTaskStatusKind::Cancelled);
+        assert_eq!(
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("reason"))
+                .and_then(Value::as_str),
+            Some("superseded")
         );
     }
 
@@ -4357,6 +4452,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_parent_can_move_directly_to_terminal_statuses() {
+        let m = mgr();
+        for (idx, status) in ["failed", "cancelled", "completed"].iter().enumerate() {
+            let create = m
+                .create(&json!({"title": format!("terminal from pending {status}")}))
+                .await;
+            assert!(!create.starts_with("Error:"), "{create}");
+            let task_id = format!("task-{}", idx + 1);
+            let out = m
+                .update(&json!({
+                    "task_id": task_id,
+                    "new_status": status,
+                    "reason": "settle stale task"
+                }))
+                .await;
+            assert!(!out.starts_with("Error:"), "{status}: {out}");
+        }
+
+        let tasks: Value = serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await)
+            .expect("task list json");
+        let statuses = tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["status"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec!["failed", "cancelled", "completed"]);
+    }
+
+    #[tokio::test]
     async fn update_rejects_second_in_progress_parent_task() {
         let m = mgr();
         m.create(&json!({"title": "first"})).await;
@@ -4490,9 +4615,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rejects_unknown_and_legacy_status_fields() {
+    async fn update_accepts_status_alias_but_keeps_schema_on_new_status() {
         let m = mgr();
-        m.create(&json!({"title": "strict status"})).await;
+        m.create(&json!({"title": "status alias"})).await;
         let invalid = m
             .update(&json!({"task_id": "task-1", "new_status": "active"}))
             .await;
@@ -4514,17 +4639,36 @@ mod tests {
             "wrong-type new_status should be actionable: {wrong_type}"
         );
 
-        let legacy = m
+        let alias = m
             .update(&json!({
                 "task_id": "task-1",
-                "status": "failed"
+                "status": "cancelled",
+                "reason": "not needed"
             }))
             .await;
-        assert!(legacy.starts_with("Error:"), "{legacy}");
+        assert!(!alias.starts_with("Error:"), "{alias}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.status, SessionTaskStatusKind::Cancelled);
         assert!(
-            legacy.contains("unknown field 'status'")
-                && !legacy.contains("valid: action, task_id, new_status, status"),
-            "status must not remain a recognized task.update argument: {legacy}"
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("reason"))
+                .and_then(Value::as_str)
+                == Some("not needed"),
+            "status alias update should preserve reason metadata: {task:?}"
+        );
+
+        let conflict = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "failed",
+                "status": "completed"
+            }))
+            .await;
+        assert!(
+            conflict.starts_with("Error:") && conflict.contains("disagree"),
+            "conflicting status fields should fail closed: {conflict}"
         );
     }
 
@@ -4701,6 +4845,31 @@ mod tests {
             serde_json::from_str(&m.get(&json!({"task_id": "task-3"})).await).unwrap();
         assert!(task_a.blocks.is_empty(), "{task_a:?}");
         assert!(task_c.blocked_by.is_empty(), "{task_c:?}");
+    }
+
+    #[tokio::test]
+    async fn create_accepts_dependency_edges_atomically() {
+        let m = mgr();
+        m.create(&json!({"title": "setup"})).await;
+        let created = m
+            .create(&json!({
+                "title": "verify",
+                "add_blocked_by": ["task-1"]
+            }))
+            .await;
+        assert!(!created.starts_with("Error:"), "{created}");
+
+        let setup: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        let verify: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(setup.blocks, vec!["task-2"]);
+        assert_eq!(verify.blocked_by, vec!["task-1"]);
+
+        let blocked_start = m
+            .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+            .await;
+        assert!(blocked_start.starts_with("Error:"), "{blocked_start}");
     }
 
     #[tokio::test]
@@ -6085,6 +6254,29 @@ mod tests {
             task.status,
             SessionTaskStatusKind::Completed,
             "ambiguous archive inputs must not mutate the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_accepts_reason_and_records_it() {
+        let m = mgr();
+        m.create(&json!({"title": "done"})).await;
+        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
+
+        let archived = m
+            .archive(&json!({"task_id": "task-1", "reason": "cleanup"}))
+            .await;
+        assert!(!archived.starts_with("Error:"), "{archived}");
+
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.status, SessionTaskStatusKind::Archived);
+        assert_eq!(
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("archive_reason"))
+                .and_then(Value::as_str),
+            Some("cleanup")
         );
     }
 

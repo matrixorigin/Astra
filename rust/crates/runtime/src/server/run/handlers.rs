@@ -147,7 +147,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "run_paused"
             | "run_resumed"
             | "run_finished"
-    ) || event_type.starts_with("run_blocked_")
+    ) || event_type == "run_blocked"
 }
 
 pub(crate) async fn get_run_status_handler(
@@ -778,7 +778,7 @@ mod tests {
             "run-123",
             vec![
                 json!({
-                    "event_type": "run_blocked_fallback_disabled",
+                    "event_type": "run_blocked", "reason": "fallback_disabled",
                     "data": {
                         "message": "Server fallback is disabled.",
                         "reason": "fallback_disabled"
@@ -786,12 +786,12 @@ mod tests {
                     "index": 4
                 }),
                 json!({
-                    "type": "run_blocked_transport_disconnected",
+                    "type": "run_blocked", "reason": "transport_disconnected",
                     "reason": "transport_disconnected",
                     "index": 5
                 }),
                 json!({
-                    "event_type": "run_blocked_workspace_executor_unavailable",
+                    "event_type": "run_blocked", "reason": "workspace_executor_unavailable",
                     "data": {
                         "reason": "workspace_executor_unavailable",
                         "workspace": {"kind": "git_checkout"},
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(
             transformed[0],
             json!({
-                "type": "run_blocked_fallback_disabled",
+                "type": "run_blocked", "reason": "fallback_disabled",
                 "run_id": "run-123",
                 "message": "Server fallback is disabled.",
                 "reason": "fallback_disabled",
@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(
             transformed[1],
             json!({
-                "type": "run_blocked_transport_disconnected",
+                "type": "run_blocked", "reason": "transport_disconnected",
                 "run_id": "run-123",
                 "reason": "transport_disconnected",
                 "index": 5
@@ -824,7 +824,7 @@ mod tests {
         assert_eq!(
             transformed[2],
             json!({
-                "type": "run_blocked_workspace_executor_unavailable",
+                "type": "run_blocked", "reason": "workspace_executor_unavailable",
                 "run_id": "run-123",
                 "reason": "workspace_executor_unavailable",
                 "workspace": {"kind": "git_checkout"},

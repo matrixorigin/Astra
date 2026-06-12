@@ -800,6 +800,8 @@ pub fn prepare_str_replace(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedStrReplace, ToolResult> {
+    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+    let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
@@ -950,7 +952,14 @@ pub fn prepare_str_replace(
 }
 
 pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
-    match prepare_str_replace(workspace_root, args) {
+    let args = match normalize_str_replace_args(args) {
+        Ok(args) => args,
+        Err(error) => return ToolResult::error(error),
+    };
+    if args.get("edits").and_then(Value::as_array).is_some() {
+        return multi_edit(workspace_root, &args);
+    }
+    match prepare_str_replace(workspace_root, &args) {
         Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
@@ -1007,6 +1016,8 @@ pub fn prepare_multi_edit(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedMultiEdit, ToolResult> {
+    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+    let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
@@ -1221,6 +1232,85 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
         Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
+}
+
+pub fn normalize_str_replace_args(args: &Value) -> Result<Value, String> {
+    let Some(input) = args.as_object() else {
+        return Err("Error: str_replace arguments must be an object".to_string());
+    };
+    let mut out = input.clone();
+
+    if !out.contains_key("old_str")
+        && let Some(value) = first_string_value(input, &["original_text", "old_text", "original"])
+    {
+        out.insert("old_str".to_string(), Value::String(value.to_string()));
+    }
+    if !out.contains_key("new_str")
+        && let Some(value) =
+            first_string_value(input, &["new_text", "replacement_text", "replacement"])
+    {
+        out.insert("new_str".to_string(), Value::String(value.to_string()));
+    }
+
+    if !out.contains_key("edits")
+        && let Some(replacements) = input.get("replacements")
+    {
+        out.insert("edits".to_string(), normalize_edit_array(replacements)?);
+    }
+    if let Some(edits) = out.get("edits").cloned() {
+        out.insert("edits".to_string(), normalize_edit_array(&edits)?);
+    }
+
+    Ok(Value::Object(out))
+}
+
+fn first_string_value<'a>(
+    input: &'a serde_json::Map<String, Value>,
+    fields: &[&str],
+) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| input.get(*field).and_then(Value::as_str))
+}
+
+fn normalize_edit_array(value: &Value) -> Result<Value, String> {
+    let parsed_value;
+    let value = if let Some(raw) = value.as_str() {
+        parsed_value = serde_json::from_str::<Value>(raw).map_err(|error| {
+            format!(
+                "Error: str_replace 'edits'/'replacements' string must contain a JSON array: {error}"
+            )
+        })?;
+        &parsed_value
+    } else {
+        value
+    };
+    let Some(items) = value.as_array() else {
+        return Err("Error: str_replace 'edits'/'replacements' must be an array".to_string());
+    };
+    let mut normalized = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(edit) = item.as_object() else {
+            return Err(format!(
+                "Error: str_replace edit[{index}] must be an object"
+            ));
+        };
+        let mut out = edit.clone();
+        if !out.contains_key("old_str")
+            && let Some(value) =
+                first_string_value(edit, &["original_text", "old_text", "original"])
+        {
+            out.insert("old_str".to_string(), Value::String(value.to_string()));
+        }
+        if !out.contains_key("new_str")
+            && let Some(value) =
+                first_string_value(edit, &["new_text", "replacement_text", "replacement"])
+        {
+            out.insert("new_str".to_string(), Value::String(value.to_string()));
+        }
+        normalized.push(Value::Object(out));
+    }
+    Ok(Value::Array(normalized))
 }
 
 const TEXT_TRAILING_NEWLINE_EXTS: &[&str] = &[
@@ -2307,6 +2397,60 @@ mod tests {
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "foo qux baz\n");
+    }
+
+    #[test]
+    fn str_replace_routes_schema_edits_array_to_atomic_multi_edit() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "alpha beta gamma").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [
+                {"old_str": "alpha", "new_str": "ALPHA"},
+                {"old_str": "gamma", "new_str": "GAMMA"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "ALPHA beta GAMMA\n");
+    }
+
+    #[test]
+    fn str_replace_normalizes_replacements_original_text_aliases() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one two three").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "replacements": [
+                {"original_text": "one", "new_text": "ONE"},
+                {"original_text": "three", "new_text": "THREE"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "ONE two THREE\n");
+    }
+
+    #[test]
+    fn str_replace_normalizes_json_string_replacements_aliases() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "replacements": r#"[{"original_text":"red","new_text":"RED"},{"original_text":"blue","new_text":"BLUE"}]"#
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "RED green BLUE\n");
     }
 
     #[test]

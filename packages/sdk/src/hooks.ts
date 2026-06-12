@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useReducer } from "react";
 import type {
   StreamEvent,
   ChatMessage,
@@ -130,27 +130,163 @@ function compactToolCall(call: ToolCall): ToolCall {
  * Manages messages, tool calls, plan state, usage tracking, and agent events.
  * Connects via SSE to the Astra server for real-time streaming.
  */
+type ChatState = {
+  sessionId: string | null;
+  runId: string | null;
+  messages: ChatMessage[];
+  toolCalls: ToolCall[];
+  isStreaming: boolean;
+  error: string | null;
+  plan: PlanState | null;
+  usage: TokenUsage;
+  agentEvents: StreamEvent[];
+  runStatus: string | null;
+  waitingFor: string | null;
+  workspace: WorkspaceBinding | undefined;
+  executor: ExecutorBinding | undefined;
+  transport: string | null;
+  fallbackPolicy: string | null;
+  connectionState: ConnectionState | "idle";
+};
+
+type ChatAction =
+  | { type: "SET_SESSION_ID"; sessionId: string | null }
+  | { type: "SET_RUN_ID"; runId: string | null }
+  | {
+      type: "SET_RUN_STATUS";
+      status: string | null;
+      waitingFor?: string | null;
+    }
+  | { type: "SET_ERROR"; error: string | null }
+  | { type: "SET_STREAMING"; isStreaming: boolean }
+  | { type: "SET_CONNECTION_STATE"; state: ConnectionState | "idle" }
+  | {
+      type: "SET_MESSAGES";
+      messages: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[]);
+    }
+  | { type: "SET_TOOL_CALLS"; toolCalls: ToolCall[] }
+  | {
+      type: "SET_PLAN";
+      plan: PlanState | null | ((prev: PlanState | null) => PlanState | null);
+    }
+  | {
+      type: "SET_USAGE";
+      usage: TokenUsage | ((prev: TokenUsage) => TokenUsage);
+    }
+  | { type: "ADD_AGENT_EVENT"; event: StreamEvent }
+  | {
+      type: "SET_WORKSPACE_BINDING";
+      workspace?: WorkspaceBinding;
+      executor?: ExecutorBinding;
+      transport?: string;
+      fallbackPolicy?: string;
+    }
+  | { type: "RESET" };
+
+const initialChatState: ChatState = {
+  sessionId: null,
+  runId: null,
+  messages: [],
+  toolCalls: [],
+  isStreaming: false,
+  error: null,
+  plan: null,
+  usage: emptyUsage,
+  agentEvents: [],
+  runStatus: null,
+  waitingFor: null,
+  workspace: undefined,
+  executor: undefined,
+  transport: null,
+  fallbackPolicy: null,
+  connectionState: "idle",
+};
+
+function chatReducer(state: ChatState, action: ChatAction): ChatState {
+  switch (action.type) {
+    case "SET_SESSION_ID":
+      return { ...state, sessionId: action.sessionId };
+    case "SET_RUN_ID":
+      return { ...state, runId: action.runId };
+    case "SET_RUN_STATUS":
+      return {
+        ...state,
+        runStatus: action.status,
+        waitingFor: action.waitingFor ?? null,
+      };
+    case "SET_ERROR":
+      return { ...state, error: action.error };
+    case "SET_STREAMING":
+      return { ...state, isStreaming: action.isStreaming };
+    case "SET_CONNECTION_STATE":
+      return { ...state, connectionState: action.state };
+    case "SET_MESSAGES":
+      return {
+        ...state,
+        messages:
+          typeof action.messages === "function"
+            ? action.messages(state.messages)
+            : action.messages,
+      };
+    case "SET_TOOL_CALLS":
+      return { ...state, toolCalls: action.toolCalls };
+    case "SET_PLAN":
+      return {
+        ...state,
+        plan:
+          typeof action.plan === "function"
+            ? action.plan(state.plan)
+            : action.plan,
+      };
+    case "SET_USAGE":
+      return {
+        ...state,
+        usage:
+          typeof action.usage === "function"
+            ? action.usage(state.usage)
+            : action.usage,
+      };
+    case "ADD_AGENT_EVENT":
+      return { ...state, agentEvents: [...state.agentEvents, action.event] };
+    case "SET_WORKSPACE_BINDING":
+      return {
+        ...state,
+        workspace: action.workspace ?? state.workspace,
+        executor: action.executor ?? state.executor,
+        transport: action.transport ?? state.transport,
+        fallbackPolicy: action.fallbackPolicy ?? state.fallbackPolicy,
+      };
+    case "RESET":
+      return initialChatState;
+    default:
+      return state;
+  }
+}
+
 export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
-  const [sessionId, setSessionId] = useState<string | null>(
-    config.sessionId ?? null,
-  );
-  const [runId, setRunId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [plan, setPlan] = useState<PlanState | null>(null);
-  const [usage, setUsage] = useState<TokenUsage>(emptyUsage);
-  const [agentEvents, setAgentEvents] = useState<StreamEvent[]>([]);
-  const [runStatus, setRunStatus] = useState<string | null>(null);
-  const [waitingFor, setWaitingFor] = useState<string | null>(null);
-  const [workspace, setWorkspace] = useState<WorkspaceBinding | undefined>();
-  const [executor, setExecutor] = useState<ExecutorBinding | undefined>();
-  const [transport, setTransport] = useState<string | null>(null);
-  const [fallbackPolicy, setFallbackPolicy] = useState<string | null>(null);
-  const [connectionState, setConnectionState] = useState<
-    ConnectionState | "idle"
-  >("idle");
+  const [state, dispatch] = useReducer(chatReducer, {
+    ...initialChatState,
+    sessionId: config.sessionId ?? null,
+  });
+
+  const {
+    sessionId,
+    runId,
+    messages,
+    toolCalls,
+    isStreaming,
+    error,
+    plan,
+    usage,
+    agentEvents,
+    runStatus,
+    waitingFor,
+    workspace,
+    executor,
+    transport,
+    fallbackPolicy,
+    connectionState,
+  } = state;
 
   const controllerRef = useRef<AbortController | null>(null);
   const accumulatedTextRef = useRef("");
@@ -163,7 +299,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   useEffect(() => {
     if (config.sessionId !== sessionId) {
       reset();
-      setSessionId(config.sessionId ?? null);
+      dispatch({ type: "SET_SESSION_ID", sessionId: config.sessionId ?? null });
     }
   }, [config.sessionId]);
 
@@ -179,49 +315,55 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     ) => {
       const existing = toolCallMapRef.current.get(callId);
       toolCallMapRef.current.set(callId, compactToolCall(build(existing)));
-      setToolCalls(Array.from(toolCallMapRef.current.values()));
+      dispatch({
+        type: "SET_TOOL_CALLS",
+        toolCalls: Array.from(toolCallMapRef.current.values()),
+      });
     };
 
     const applyRunExecutionBoundary = () => {
       const fields = runBoundaryFieldsFromEvent(event);
-      if (fields.workspace !== undefined) setWorkspace(fields.workspace);
-      if (fields.executor !== undefined) setExecutor(fields.executor);
-      if (fields.transport !== undefined) setTransport(fields.transport);
-      if (fields.fallbackPolicy !== undefined) {
-        setFallbackPolicy(fields.fallbackPolicy);
-      }
+      dispatch({
+        type: "SET_WORKSPACE_BINDING",
+        workspace: fields.workspace,
+        executor: fields.executor,
+        transport: fields.transport ?? undefined,
+        fallbackPolicy: fields.fallbackPolicy ?? undefined,
+      });
     };
 
     // Drop events from an earlier stream that completed after abort.
-    // Without this guard, a stale text_delta from the aborted stream can
-    // corrupt accumulatedTextRef of the new stream.
-    // Placed BEFORE the run_blocked_* handler so stale run-blocked events
-    // cannot leak execution bindings into the new stream's state.
     if (isStale()) {
       return;
     }
 
-    if (event.type.startsWith("run_blocked_")) {
+    if (event.type === "run_blocked") {
       applyRunExecutionBoundary();
       const reason = extractBlockedReason(event) ?? "blocked";
       const blockedRunId = runIdFromEvent(event);
-      setRunStatus("blocked");
-      setWaitingFor(reason);
-      if (blockedRunId) setRunId(blockedRunId);
+      dispatch({
+        type: "SET_RUN_STATUS",
+        status: "blocked",
+        waitingFor: reason,
+      });
+      if (blockedRunId) dispatch({ type: "SET_RUN_ID", runId: blockedRunId });
       return;
     }
 
     switch (event.type) {
       case "session_info":
-        setSessionId(event.session_id);
-        if (event.run_id) setRunId(event.run_id);
+        dispatch({ type: "SET_SESSION_ID", sessionId: event.session_id });
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         break;
 
       case "run_started":
         applyRunExecutionBoundary();
-        if (event.run_id) setRunId(event.run_id);
-        setRunStatus("running");
-        setWaitingFor(null);
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "running",
+          waitingFor: null,
+        });
         break;
 
       case "workspace_bound":
@@ -232,103 +374,133 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
       case "run_paused":
         applyRunExecutionBoundary();
-        if (event.run_id) setRunId(event.run_id);
-        setRunStatus("paused");
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({ type: "SET_RUN_STATUS", status: "paused" });
         break;
 
       case "run_resumed":
         applyRunExecutionBoundary();
-        if (event.run_id) setRunId(event.run_id);
-        setRunStatus("running");
-        setWaitingFor(null);
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "running",
+          waitingFor: null,
+        });
         break;
 
       case "run_waiting": {
         applyRunExecutionBoundary();
-        if (event.run_id) setRunId(event.run_id);
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         const reason = extractWaitingReason(event);
-        setRunStatus("waiting");
-        setWaitingFor(reason);
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "waiting",
+          waitingFor: reason,
+        });
         break;
       }
 
       case "run_error":
         applyRunExecutionBoundary();
-        if (event.run_id) setRunId(event.run_id);
-        setRunStatus("failed");
-        setWaitingFor(null);
-        setError(event.message ?? event.error ?? "Astra run failed.");
-        setIsStreaming(false);
-        setConnectionState("idle");
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return [...prev.slice(0, -1), { ...last, streaming: false }];
-          }
-          return prev;
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "failed",
+          waitingFor: null,
+        });
+        dispatch({
+          type: "SET_ERROR",
+          error: event.message ?? event.error ?? "Astra run failed.",
+        });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
         });
         break;
 
       case "run_interrupted":
         applyRunExecutionBoundary();
-        if (event.run_id) setRunId(event.run_id);
-        setRunStatus("paused");
-        setWaitingFor(event.waiting_for ?? "user_resume");
-        setIsStreaming(false);
-        setConnectionState("idle");
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return [...prev.slice(0, -1), { ...last, streaming: false }];
-          }
-          return prev;
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "paused",
+          waitingFor: event.waiting_for ?? "user_resume",
+        });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
         });
         break;
 
       case "text_delta":
         accumulatedTextRef.current += event.content;
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return [
-              ...prev.slice(0, -1),
-              { ...last, content: accumulatedTextRef.current },
-            ];
-          }
-          return prev;
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, content: accumulatedTextRef.current },
+              ];
+            }
+            return prev;
+          },
         });
         break;
 
       case "reasoning_delta":
         accumulatedThinkingRef.current += event.content;
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return [
-              ...prev.slice(0, -1),
-              {
-                ...last,
-                thinking: {
-                  content: accumulatedThinkingRef.current,
-                  done: false,
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.thinking) {
+              return [
+                ...prev.slice(0, -1),
+                {
+                  ...last,
+                  thinking: {
+                    content: accumulatedThinkingRef.current,
+                    done: false,
+                  },
                 },
-              },
-            ];
-          }
-          return prev;
+              ];
+            }
+            return prev;
+          },
         });
         break;
 
       case "reasoning_done":
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.thinking) {
-            return [
-              ...prev.slice(0, -1),
-              { ...last, thinking: { ...last.thinking, done: true } },
-            ];
-          }
-          return prev;
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.thinking) {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, thinking: { ...last.thinking, done: true } },
+              ];
+            }
+            return prev;
+          },
         });
         break;
 
@@ -423,108 +595,125 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       }
 
       case "usage":
-        setUsage((prev) => ({
-          promptTokens: prev.promptTokens + event.prompt_tokens,
-          completionTokens: prev.completionTokens + event.completion_tokens,
-          totalTokens:
-            prev.totalTokens + event.prompt_tokens + event.completion_tokens,
-          cacheCreationTokens:
-            prev.cacheCreationTokens + (event.cache_creation_tokens ?? 0),
-          cacheReadTokens:
-            prev.cacheReadTokens + (event.cache_read_tokens ?? 0),
-        }));
+        dispatch({
+          type: "SET_USAGE",
+          usage: (prev) => ({
+            promptTokens: prev.promptTokens + event.prompt_tokens,
+            completionTokens: prev.completionTokens + event.completion_tokens,
+            totalTokens:
+              prev.totalTokens + event.prompt_tokens + event.completion_tokens,
+            cacheCreationTokens:
+              prev.cacheCreationTokens + (event.cache_creation_tokens ?? 0),
+            cacheReadTokens:
+              prev.cacheReadTokens + (event.cache_read_tokens ?? 0),
+          }),
+        });
         break;
 
       case "plan_created":
       case "plan_revised":
-        setPlan({
-          planId: event.plan.plan_id,
-          title: event.plan.title,
-          subtasks: event.plan.subtasks.map(
-            (s: { id: string; title: string; status?: string }) => ({
-              id: s.id,
-              title: s.title,
-              status: (s.status ?? "pending") as
-                | "pending"
-                | "running"
-                | "done"
-                | "error",
-            }),
-          ),
+        dispatch({
+          type: "SET_PLAN",
+          plan: {
+            planId: event.plan.plan_id,
+            title: event.plan.title,
+            subtasks: event.plan.subtasks.map(
+              (s: { id: string; title: string; status?: string }) => ({
+                id: s.id,
+                title: s.title,
+                status: (s.status ?? "pending") as
+                  | "pending"
+                  | "running"
+                  | "done"
+                  | "error",
+              }),
+            ),
+          },
         });
         break;
 
       case "plan_step_start":
-        setPlan((prev) =>
-          prev
-            ? {
-                ...prev,
-                activeStepId: event.subtask_id ?? event.step,
-                subtasks: prev.subtasks.map((s) =>
-                  s.id === (event.subtask_id ?? event.step)
-                    ? { ...s, status: "running" as const }
-                    : s,
-                ),
-              }
-            : null,
-        );
+        dispatch({
+          type: "SET_PLAN",
+          plan: (prev) =>
+            prev
+              ? {
+                  ...prev,
+                  activeStepId: event.subtask_id ?? event.step,
+                  subtasks: prev.subtasks.map((s) =>
+                    s.id === (event.subtask_id ?? event.step)
+                      ? { ...s, status: "running" as const }
+                      : s,
+                  ),
+                }
+              : null,
+        });
         break;
 
       case "plan_step_done":
-        setPlan((prev) =>
-          prev
-            ? {
-                ...prev,
-                subtasks: prev.subtasks.map((s) =>
-                  s.id === (event.subtask_id ?? event.step)
-                    ? {
-                        ...s,
-                        status: (event.result === "error"
-                          ? "error"
-                          : "done") as "done" | "error",
-                      }
-                    : s,
-                ),
-              }
-            : null,
-        );
+        dispatch({
+          type: "SET_PLAN",
+          plan: (prev) =>
+            prev
+              ? {
+                  ...prev,
+                  subtasks: prev.subtasks.map((s) =>
+                    s.id === (event.subtask_id ?? event.step)
+                      ? {
+                          ...s,
+                          status: (event.result === "error"
+                            ? "error"
+                            : "done") as "done" | "error",
+                        }
+                      : s,
+                  ),
+                }
+              : null,
+        });
         break;
 
       case "error":
-        setError(event.message);
+        dispatch({ type: "SET_ERROR", error: event.message });
         break;
 
       case "turn_complete":
-        setIsStreaming(false);
-        setConnectionState("idle");
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return [...prev.slice(0, -1), { ...last, streaming: false }];
-          }
-          return prev;
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
         });
         break;
 
       case "run_finished":
       case "run_cancelled":
         applyRunExecutionBoundary();
-        setIsStreaming(false);
-        setConnectionState("idle");
-        if (event.run_id) setRunId(event.run_id);
-        setRunStatus(
-          event.type === "run_cancelled"
-            ? "cancelled"
-            : (event.status ?? "completed"),
-        );
-        setWaitingFor(null);
-        // Finalize the assistant message
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return [...prev.slice(0, -1), { ...last, streaming: false }];
-          }
-          return prev;
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status:
+            event.type === "run_cancelled"
+              ? "cancelled"
+              : (event.status ?? "completed"),
+          waitingFor: null,
+        });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
         });
         break;
 
@@ -536,7 +725,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       case "agent_failed":
       case "agent_cancelled":
       case "agent_interrupted":
-        setAgentEvents((prev) => [...prev, event]);
+        dispatch({ type: "ADD_AGENT_EVENT", event });
         break;
     }
   }, []);
@@ -566,12 +755,14 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         streaming: true,
       };
 
-      setMessages((prev) => [...prev, userMsg, assistantMsg]);
-      setToolCalls([]);
-      setError(null);
-      setRunStatus("running");
-      setWaitingFor(null);
-      setIsStreaming(true);
+      dispatch({
+        type: "SET_MESSAGES",
+        messages: (prev) => [...prev, userMsg, assistantMsg],
+      });
+      dispatch({ type: "SET_TOOL_CALLS", toolCalls: [] });
+      dispatch({ type: "SET_ERROR", error: null });
+      dispatch({ type: "SET_RUN_STATUS", status: "running", waitingFor: null });
+      dispatch({ type: "SET_STREAMING", isStreaming: true });
 
       // Abort previous stream
       controllerRef.current?.abort();
@@ -589,7 +780,8 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         },
         {
           onEvent: processEvent,
-          onStateChange: (state) => setConnectionState(state),
+          onStateChange: (state) =>
+            dispatch({ type: "SET_CONNECTION_STATE", state }),
           signal: controllerRef.current.signal,
         },
       );
@@ -614,38 +806,25 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
   const stop = useCallback(() => {
     controllerRef.current?.abort();
-    setIsStreaming(false);
-    setRunStatus("cancelled");
-    setWaitingFor(null);
-    setConnectionState("idle");
+    dispatch({ type: "SET_STREAMING", isStreaming: false });
+    dispatch({ type: "SET_RUN_STATUS", status: "cancelled", waitingFor: null });
+    dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
     // Finalize assistant message
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === "assistant" && last.streaming) {
-        return [...prev.slice(0, -1), { ...last, streaming: false }];
-      }
-      return prev;
+    dispatch({
+      type: "SET_MESSAGES",
+      messages: (prev: ChatMessage[]) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && last.streaming) {
+          return [...prev.slice(0, -1), { ...last, streaming: false }];
+        }
+        return prev;
+      },
     });
   }, []);
 
   const reset = useCallback(() => {
     controllerRef.current?.abort();
-    setSessionId(null);
-    setRunId(null);
-    setRunStatus(null);
-    setWaitingFor(null);
-    setWorkspace(undefined);
-    setExecutor(undefined);
-    setTransport(null);
-    setFallbackPolicy(null);
-    setMessages([]);
-    setToolCalls([]);
-    setIsStreaming(false);
-    setError(null);
-    setPlan(null);
-    setUsage(emptyUsage);
-    setAgentEvents([]);
-    setConnectionState("idle");
+    dispatch({ type: "RESET" });
     accumulatedTextRef.current = "";
     accumulatedThinkingRef.current = "";
     toolCallMapRef.current.clear();

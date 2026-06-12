@@ -424,12 +424,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       !isTerminalChatRunStatus(activeRunStatus)),
   );
 
+  const previousWorkspaceRef = useRef(workspaceSelectionState);
   const setWorkspaceSelection = useCallback(
     (selection: WorkspaceSelection) => {
-      const previous = workspaceSelectionState;
+      const previous = previousWorkspaceRef.current;
       const next = { selection, explicit: true };
       const requestId = workspaceSelectionRequestRef.current + 1;
       workspaceSelectionRequestRef.current = requestId;
+      previousWorkspaceRef.current = next;
       setWorkspaceSelectionState(next);
       storeWorkspaceSelectionState(detail.chat.id, next);
       void updateChatWorkspaceSelection(detail.chat.id, selection)
@@ -441,6 +443,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           setDetail(updated);
           setWorkspaceSelectionState(updatedState);
           storeWorkspaceSelectionState(updated.chat.id, updatedState);
+          previousWorkspaceRef.current = updatedState;
         })
         .catch((error) => {
           if (workspaceSelectionRequestRef.current !== requestId) {
@@ -448,6 +451,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           }
           setWorkspaceSelectionState(previous);
           storeWorkspaceSelectionState(detail.chat.id, previous);
+          previousWorkspaceRef.current = previous;
           addToast(
             `Workspace was not updated. ${
               error instanceof Error
@@ -458,7 +462,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           );
         });
     },
-    [addToast, detail.chat.id, workspaceSelectionState],
+    [addToast, detail.chat.id],
   );
 
   const refreshEdgeWorkspaces = useCallback(async () => {

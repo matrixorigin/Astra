@@ -270,23 +270,22 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "create typo must be actionable: {create_typo}"
     );
 
-    let create_dependency_field = exe
+    let create_dependency_removal_field = exe
         .execute(
             "task",
             &json!({
                 "action": "create",
                 "title": "Blocked task",
-                "add_blocked_by": ["task-1"]
+                "remove_blocked_by": ["task-1"]
             }),
         )
         .await;
     assert!(
-        create_dependency_field.starts_with("Error:")
-            && create_dependency_field.contains("update-only")
-            && create_dependency_field.contains("task(action='create'")
-            && create_dependency_field.contains("task(action='update'")
-            && create_dependency_field.contains("<created task_id>"),
-        "create dependency-field misuse should explain the two-step repair: {create_dependency_field}"
+        create_dependency_removal_field.starts_with("Error:")
+            && create_dependency_removal_field.contains("update-only")
+            && create_dependency_removal_field.contains("task(action='update'")
+            && create_dependency_removal_field.contains("<created task_id>"),
+        "create dependency-removal misuse should explain the two-step repair: {create_dependency_removal_field}"
     );
 
     let too_many_subtasks = (0..=astra_tools::task_mgmt::MAX_CREATE_SUBTASKS)
@@ -338,6 +337,30 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "blank owner should be rejected with an actionable error: {blank_owner}"
     );
 
+    let seed = exe
+        .execute("task", &json!({"action": "create", "title": "Seed task"}))
+        .await;
+    assert!(
+        !seed.starts_with("Error:") && seed.contains("\"task-1\""),
+        "seed task should be created for recovery-alias checks: {seed}"
+    );
+
+    let create_with_dependency = exe
+        .execute(
+            "task",
+            &json!({
+                "action": "create",
+                "title": "Blocked task",
+                "add_blocked_by": ["task-1"]
+            }),
+        )
+        .await;
+    assert!(
+        !create_with_dependency.starts_with("Error:")
+            && create_with_dependency.contains("\"task-2\""),
+        "task.create should accept dependency edges atomically: {create_with_dependency}"
+    );
+
     let update_typo = exe
         .execute(
             "task",
@@ -358,11 +381,8 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         )
         .await;
     assert!(
-        update_status_field.starts_with("Error:")
-            && update_status_field.contains("unknown field")
-            && update_status_field.contains("status")
-            && !update_status_field.contains("new_status, status"),
-        "status must not remain a recognized task.update argument: {update_status_field}"
+        !update_status_field.starts_with("Error:") && update_status_field.contains("\"paused\""),
+        "task.update should normalize status as a recovery alias: {update_status_field}"
     );
 
     let list_status_field = exe

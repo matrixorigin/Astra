@@ -7,11 +7,11 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::cli::effects::truncate_label;
-use super::fanout_header::{compute_fanout_header, fanout_header_line, fanout_slot_title, FanoutHeader};
-use super::types::{
-    format_elapsed, pluralize_with_count, BackgroundTaskRow, BackgroundTaskStatus,
+use super::fanout_header::{
+    FanoutHeader, compute_fanout_header, fanout_header_line, fanout_slot_title,
 };
+use super::types::{BackgroundTaskRow, BackgroundTaskStatus, format_elapsed, pluralize_with_count};
+use crate::cli::effects::truncate_label;
 
 pub(crate) enum BackgroundTaskListEntry<'a> {
     FanoutHeader(FanoutHeader),
@@ -62,11 +62,9 @@ pub(crate) fn background_task_list_entries(
                     .then_some(member_idx)
             })
             .collect::<Vec<_>>();
-        entries.push(BackgroundTaskListEntry::FanoutHeader(compute_fanout_header(
-            fanout,
-            &member_indices,
-            rows,
-        )));
+        entries.push(BackgroundTaskListEntry::FanoutHeader(
+            compute_fanout_header(fanout, &member_indices, rows),
+        ));
         for member_idx in member_indices {
             rendered[member_idx] = true;
             entries.push(BackgroundTaskListEntry::Row {

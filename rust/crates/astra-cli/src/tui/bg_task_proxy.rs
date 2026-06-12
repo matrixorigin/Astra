@@ -586,7 +586,7 @@ pub(crate) fn background_task_event_system_message(
             "Background shell {} failed: {error}",
             background_shell_notification_label(id, title)
         )),
-        super::background_tasks::BgTaskEvent::Stalled { id, title, .. } => Some(format!(
+        super::background_tasks::BgTaskEvent::WaitingForInput { id, title, .. } => Some(format!(
             "Background shell {} appears to be waiting for input",
             background_shell_notification_label(id, title)
         )),
