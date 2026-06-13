@@ -1469,6 +1469,20 @@ fn push_risk_tag(tags: &mut Vec<RiskTag>, tag: RiskTag) {
 mod tests {
     use super::*;
 
+    fn create_current_session_artifact() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        (temp, guard, artifact_path)
+    }
+
     /// **Pinning test** — Plan v3 §P2 requires a fixed evaluation
     /// order to make rule precedence auditable. Any reorder must
     /// be deliberate and update this test.
@@ -1857,12 +1871,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "child output").unwrap();
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         let artifact_path = artifact_path.to_string_lossy().to_string();
 
         let read_file = evaluate_permission(
@@ -1891,12 +1900,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "child output").unwrap();
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         let artifact_path = artifact_path.to_string_lossy().to_string();
 
         let bash_read = evaluate_permission(
@@ -1916,11 +1920,7 @@ mod tests {
 
     #[test]
     fn sensitive_path_match_ignores_internal_artifact_refs_inside_shell_pipelines() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
         let artifact_path = artifact_path.to_string_lossy().to_string();
 
@@ -1940,12 +1940,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "child output").unwrap();
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         let artifact_path = artifact_path.to_string_lossy().to_string();
 
         let bash_read = evaluate_permission(

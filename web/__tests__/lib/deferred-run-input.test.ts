@@ -581,6 +581,135 @@ describe('queueDeferredRunInput', () => {
     });
   });
 
+  it('persists the stopped assistant message while runtime cancellation is pending', async () => {
+    const cancelRun = jest.fn(
+      () =>
+        new Promise<void>(() => {
+          // Keep cancellation pending so stopActiveRun returns from its timeout path.
+        }),
+    );
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'working...',
+      model: 'sonnet-4.6-adaptive',
+      messages: [
+        {
+          id: 'assistant-active',
+          role: 'assistant',
+          content: 'working...',
+          createdAt: '2026-06-07T00:00:00.000Z',
+          status: 'streaming',
+          reasoningStatus: 'streaming',
+        },
+      ],
+      activeRun: {
+        runId: 'run-stop',
+        status: 'running',
+        waitingFor: null,
+        assistantMessageId: 'assistant-active',
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    const result = await stopActiveRun('user-a', 'chat-stop', {
+      skipSync: true,
+      cancelTimeoutMs: 1,
+    });
+
+    expect(result).toMatchObject({
+      activeRun: {
+        runId: 'run-stop',
+        status: 'cancelling',
+        waitingFor: 'cancel_requested',
+        assistantMessageId: 'assistant-active',
+      },
+      cancelPending: true,
+    });
+    expect(store.chats[0].messages[0]).toMatchObject({
+      id: 'assistant-active',
+      content: 'working...\n\nStopped.',
+      status: 'complete',
+      reasoningStatus: 'complete',
+    });
+    expect(store.chats[0].lastMessagePreview).toBe('working...\n\nStopped.');
+  });
+
+  it('restores the assistant message if a pending runtime cancellation later fails', async () => {
+    let rejectCancel!: (error: Error) => void;
+    const cancelRun = jest.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCancel = reject;
+        }),
+    );
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'working...',
+      model: 'sonnet-4.6-adaptive',
+      messages: [
+        {
+          id: 'assistant-active',
+          role: 'assistant',
+          content: 'working...',
+          createdAt: '2026-06-07T00:00:00.000Z',
+          status: 'streaming',
+          reasoningStatus: 'streaming',
+        },
+      ],
+      activeRun: {
+        runId: 'run-stop',
+        status: 'running',
+        waitingFor: null,
+        assistantMessageId: 'assistant-active',
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    await stopActiveRun('user-a', 'chat-stop', {
+      skipSync: true,
+      cancelTimeoutMs: 1,
+    });
+    expect(store.chats[0].messages[0].content).toBe('working...\n\nStopped.');
+
+    rejectCancel(new Error('cancel failed'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(store.chats[0].activeRun).toMatchObject({
+      runId: 'run-stop',
+      status: 'running',
+      waitingFor: null,
+      assistantMessageId: 'assistant-active',
+    });
+    expect(store.chats[0].messages[0]).toMatchObject({
+      id: 'assistant-active',
+      content: 'working...',
+      status: 'streaming',
+      reasoningStatus: 'streaming',
+    });
+    expect(store.chats[0].lastMessagePreview).toBe('working...');
+  });
+
   it('clears cancelling state when a late runtime cancellation reaches terminal status', async () => {
     let resolveCancel!: () => void;
     const cancelRun = jest.fn(

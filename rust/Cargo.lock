@@ -154,6 +154,7 @@ dependencies = [
  "astra-pipeline",
  "astra-prompts",
  "astra-runtime",
+ "astra-sandbox",
  "astra-services",
  "astra-skills",
  "astra-text-utils",

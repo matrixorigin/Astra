@@ -168,6 +168,43 @@ describe("useAstraChat", () => {
     expect(assistantMsg?.content).toBe("Hello World");
   });
 
+  test("ignores late events from superseded streams", () => {
+    const { client, streamChatMock } = createMockClient();
+    const closeSpy = jest.fn();
+    const callbacks: Array<(event: StreamEvent) => void> = [];
+    streamChatMock.mockImplementation(
+      (
+        _params: unknown,
+        opts: {
+          onEvent: (event: StreamEvent) => void;
+        },
+      ) => {
+        callbacks.push(opts.onEvent);
+        return { close: closeSpy } as unknown as SSEClient;
+      },
+    );
+
+    const { result } = renderHook(() => useAstraChat({ client }));
+
+    act(() => {
+      result.current.sendMessage("first");
+      result.current.sendMessage("second");
+    });
+    expect(callbacks).toHaveLength(2);
+
+    act(() => {
+      callbacks[0]({ type: "text_delta", content: "STALE" } as StreamEvent);
+      callbacks[1]({ type: "text_delta", content: "fresh" } as StreamEvent);
+    });
+
+    const assistantMessages = result.current.messages.filter(
+      (message) => message.role === "assistant",
+    );
+    expect(assistantMessages).toHaveLength(2);
+    expect(assistantMessages[0].content).toBe("");
+    expect(assistantMessages[1].content).toBe("fresh");
+  });
+
   /** Aligns with real-world-scenarios / streamChat ordering (session → text → usage → complete). */
   test("processes session_info → text_deltas → usage → turn_complete", () => {
     const { client, streamChatMock } = createMockClient();

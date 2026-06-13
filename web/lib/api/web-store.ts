@@ -79,6 +79,12 @@ type RuntimeCancelSettlement =
   | { status: 'completed' }
   | { status: 'failed'; error: unknown };
 
+type ChatMessageSnapshot = {
+  message: ChatMessage;
+  lastMessageAt: string;
+  lastMessagePreview?: string;
+};
+
 type ProjectRecord = ProjectDetail['project'];
 
 type Store = {
@@ -161,6 +167,104 @@ const DEFAULT_STORE_SCOPE = 'offline';
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isStoppableAssistantMessage(message: ChatMessage) {
+  return (
+    message.role === 'assistant' &&
+    message.status !== 'failed' &&
+    (message.status === 'streaming' ||
+      message.reasoningStatus === 'streaming' ||
+      message.status === undefined)
+  );
+}
+
+function findStoppableAssistantMessage(
+  chat: ChatRecord,
+  assistantMessageId?: string | null,
+) {
+  if (assistantMessageId) {
+    const matched = chat.messages.find(
+      (message) =>
+        message.id === assistantMessageId &&
+        isStoppableAssistantMessage(message),
+    );
+    if (matched) {
+      return matched;
+    }
+  }
+
+  for (let index = chat.messages.length - 1; index >= 0; index -= 1) {
+    const message = chat.messages[index];
+    if (message && isStoppableAssistantMessage(message)) {
+      return message;
+    }
+  }
+  return null;
+}
+
+function cloneChatMessage(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    attachments: message.attachments
+      ? message.attachments.map((attachment) => ({ ...attachment }))
+      : undefined,
+    artifacts: message.artifacts
+      ? message.artifacts.map((artifact) => ({ ...artifact }))
+      : undefined,
+  };
+}
+
+function snapshotStoppableAssistantMessage(
+  chat: ChatRecord,
+  assistantMessageId?: string | null,
+): ChatMessageSnapshot | null {
+  const message = findStoppableAssistantMessage(chat, assistantMessageId);
+  if (!message) {
+    return null;
+  }
+  return {
+    message: cloneChatMessage(message),
+    lastMessageAt: chat.lastMessageAt,
+    lastMessagePreview: chat.lastMessagePreview,
+  };
+}
+
+function restoreAssistantMessageSnapshot(
+  chat: ChatRecord,
+  snapshot: ChatMessageSnapshot | null,
+) {
+  if (!snapshot) {
+    return;
+  }
+  const messageIndex = chat.messages.findIndex(
+    (message) => message.id === snapshot.message.id,
+  );
+  if (messageIndex === -1) {
+    return;
+  }
+  chat.messages[messageIndex] = cloneChatMessage(snapshot.message);
+  chat.lastMessageAt = snapshot.lastMessageAt;
+  chat.lastMessagePreview = snapshot.lastMessagePreview;
+}
+
+function completeStoppedAssistantMessage(
+  chat: ChatRecord,
+  assistantMessageId?: string | null,
+) {
+  const message = findStoppableAssistantMessage(chat, assistantMessageId);
+  if (!message) {
+    return false;
+  }
+
+  message.content = message.content.trim()
+    ? `${message.content}${message.content.endsWith('\n') ? '' : '\n'}\nStopped.`
+    : 'Stopped.';
+  message.status = 'complete';
+  message.reasoningStatus = 'complete';
+  chat.lastMessageAt = nowIso();
+  chat.lastMessagePreview = message.content;
+  return true;
 }
 
 function titleFromMessage(message: string) {
@@ -1256,10 +1360,33 @@ export async function stopActiveRun(
 
   const previousActiveRun = chat.activeRun;
   const runId = previousActiveRun.runId;
+  const stoppedMessageSnapshot = snapshotStoppableAssistantMessage(
+    chat,
+    previousActiveRun.assistantMessageId ?? null,
+  );
   const client = await requireRuntimeClient({
     auth: 'required',
     operation: `cancel active run ${runId}`,
   });
+
+  let stoppedMessageCompleted = false;
+  const persistStoppedAssistantMessage = () => {
+    if (stoppedMessageCompleted) {
+      return;
+    }
+    const currentStore = getStore(ownerUserId);
+    const currentChat = currentStore.chats.find((item) => item.id === chatId);
+    if (!currentChat) {
+      return;
+    }
+    stoppedMessageCompleted = completeStoppedAssistantMessage(
+      currentChat,
+      previousActiveRun.assistantMessageId ?? null,
+    );
+    if (stoppedMessageCompleted && currentChat.projectId) {
+      touchProjectInStore(currentStore, currentChat.projectId);
+    }
+  };
 
   rememberLocallyStoppedRun(chat, runId);
   chat.activeRun = makeActiveRunRecord(
@@ -1281,6 +1408,9 @@ export async function stopActiveRun(
       return;
     }
     forgetLocallyStoppedRun(currentChat, runId);
+    if (stoppedMessageCompleted) {
+      restoreAssistantMessageSnapshot(currentChat, stoppedMessageSnapshot);
+    }
     currentChat.activeRun = makeActiveRunRecord(
       {
         runId,
@@ -1300,6 +1430,7 @@ export async function stopActiveRun(
       options?.cancelTimeoutMs,
       (settled) => {
         if (settled.status === 'completed') {
+          persistStoppedAssistantMessage();
           void reconcileStoppedRun(ownerUserId, chatId, runId);
           return;
         }
@@ -1327,7 +1458,9 @@ export async function stopActiveRun(
         'local_mutation',
       );
     }
+    persistStoppedAssistantMessage();
   } else {
+    persistStoppedAssistantMessage();
     await reconcileStoppedRun(ownerUserId, chatId, runId);
   }
 

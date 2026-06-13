@@ -6,10 +6,10 @@ use super::{
     ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
+use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
 };
-use astra_turn_core::permission::path_sensitivity::{PathSensitivity, classify_path_sensitivity};
 use serde_json::{Value, json};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
@@ -239,10 +239,7 @@ impl ToolExecutor {
         } else {
             ReadDedupKey::Full
         };
-        let is_internal_artifact_read = matches!(
-            classify_path_sensitivity(&path.to_string_lossy()),
-            PathSensitivity::InternalArtifactReadOnly(_)
-        );
+        let is_internal_artifact_read = is_internal_safe_path(&path.to_string_lossy()).is_some();
 
         // Consecutive identical outline/range request + unchanged file → stub before I/O.
         if !is_internal_artifact_read && self.can_dedup_identical_partial_read(&path, &dedup_key) {

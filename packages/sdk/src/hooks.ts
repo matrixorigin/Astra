@@ -301,11 +301,11 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     }
   }, [config.sessionId]);
 
-  const processEvent = useCallback((event: StreamEvent) => {
+  const processEvent = useCallback((event: StreamEvent, generation?: number) => {
     // Guard against stale events from an aborted stream leaking into the
     // new stream's state (accumulatedTextRef, toolCallMapRef, etc.).
-    const generation = streamGenerationRef.current;
-    const isStale = () => streamGenerationRef.current !== generation;
+    const expectedGeneration = generation ?? streamGenerationRef.current;
+    const isStale = () => streamGenerationRef.current !== expectedGeneration;
 
     const upsertToolCall = (
       callId: string,
@@ -777,7 +777,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           skillSearch: config.skillSearch,
         },
         {
-          onEvent: processEvent,
+          onEvent: (event) => processEvent(event, generation),
           onStateChange: (state) =>
             dispatch({ type: "SET_CONNECTION_STATE", state }),
           signal: controllerRef.current.signal,
@@ -803,6 +803,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   );
 
   const stop = useCallback(() => {
+    streamGenerationRef.current += 1;
     controllerRef.current?.abort();
     dispatch({ type: "SET_STREAMING", isStreaming: false });
     dispatch({ type: "SET_RUN_STATUS", status: "cancelled", waitingFor: null });
@@ -821,6 +822,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   }, []);
 
   const reset = useCallback(() => {
+    streamGenerationRef.current += 1;
     controllerRef.current?.abort();
     dispatch({ type: "RESET" });
     accumulatedTextRef.current = "";

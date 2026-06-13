@@ -5,7 +5,10 @@
 //! `permission::redact`; call sites should not manually combine redaction,
 //! sandbox, and internal-artifact rules.
 
-use astra_sandbox::{InternalPathKind, is_dangerous_file_path, is_internal_safe_path};
+use std::path::{Component, Path, PathBuf};
+
+use astra_sandbox::{InternalPathKind, is_dangerous_file_path};
+use astra_services::SessionArtifactStore;
 use serde_json::Value;
 
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
@@ -35,13 +38,85 @@ pub struct SensitivePathMatch {
 }
 
 pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
-    if let Some(kind) = is_internal_safe_path(path) {
+    if let Some(kind) = classify_current_session_artifact_path(path) {
         return PathSensitivity::InternalArtifactReadOnly(kind);
     }
     if is_dangerous_file_path(path) || matches_sensitive_path(path) {
         return PathSensitivity::Sensitive;
     }
     PathSensitivity::Normal
+}
+
+fn classify_current_session_artifact_path(path: &str) -> Option<InternalPathKind> {
+    let sessions_root = astra_services::local_session_artifact_store()
+        .sessions_root()
+        .canonicalize()
+        .ok()?;
+    let candidate = canonicalize_existing_or_nearest(&expand_home_path(path))?;
+    let relative = candidate.strip_prefix(&sessions_root).ok()?;
+    let mut components = relative.components();
+
+    match (components.next(), components.next(), components.next()) {
+        (
+            Some(Component::Normal(session_id)),
+            Some(Component::Normal(tool_results)),
+            Some(Component::Normal(_artifact_file)),
+        ) if !session_id.is_empty()
+            && tool_results == "tool-results"
+            && components.all(|component| matches!(component, Component::Normal(_))) =>
+        {
+            Some(InternalPathKind::SessionToolResult)
+        }
+        _ => None,
+    }
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    let Some(home) = dirs::home_dir() else {
+        return PathBuf::from(path);
+    };
+
+    if path == "~" {
+        return home;
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        return home.join(rest);
+    }
+    if let Some(rest) = path.strip_prefix("${HOME}/") {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+
+    let mut current = path;
+    let mut missing = Vec::new();
+
+    loop {
+        let file_name = current.file_name()?.to_os_string();
+        missing.push(file_name);
+
+        let parent = current.parent()?;
+        current = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+
+        if let Ok(mut canonical) = current.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+    }
 }
 
 pub fn path_requires_sensitive_gate(path: &str, access: PathAccess) -> Option<SensitivePathMatch> {
@@ -133,14 +208,23 @@ fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn classifies_internal_tool_results_as_read_only_artifacts() {
+    fn create_current_session_artifact() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
         let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "child output").unwrap();
+        (temp, guard, artifact_path)
+    }
+
+    #[test]
+    fn classifies_internal_tool_results_as_read_only_artifacts() {
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         let artifact_path = artifact_path.to_string_lossy();
 
         assert_eq!(
@@ -153,12 +237,27 @@ mod tests {
     }
 
     #[test]
-    fn shell_pipeline_over_internal_artifact_does_not_trip_sensitive_gate() {
+    fn arbitrary_astra_tool_results_are_not_permission_internal_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let artifact_path = temp
             .path()
             .join(".astra/sessions/session-1/tool-results/call_abc.txt");
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy();
+
+        assert_eq!(
+            classify_path_sensitivity(&artifact_path),
+            PathSensitivity::Sensitive
+        );
+        let hit =
+            path_requires_sensitive_gate(&artifact_path, PathAccess::DirectRead).expect("gate");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+    }
+
+    #[test]
+    fn shell_pipeline_over_internal_artifact_does_not_trip_sensitive_gate() {
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
         let artifact_path = artifact_path.to_string_lossy();
         let args = serde_json::json!({
@@ -170,12 +269,7 @@ mod tests {
 
     #[test]
     fn shell_command_with_mixed_internal_artifact_and_secret_path_is_sensitive() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "child output").unwrap();
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         let artifact_path = artifact_path.to_string_lossy();
         let args = serde_json::json!({
             "command": format!("cat {artifact_path} ~/.ssh/id_rsa")
@@ -189,12 +283,7 @@ mod tests {
 
     #[test]
     fn direct_write_to_internal_artifact_is_sensitive() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "child output").unwrap();
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
         let artifact_path = artifact_path.to_string_lossy();
         let args = serde_json::json!({"path": artifact_path, "content": "tamper"});
 

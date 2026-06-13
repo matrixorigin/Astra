@@ -28,6 +28,7 @@ astra-mcp.workspace = true
 astra-prompts.workspace = true
 astra-services.workspace = true
 astra-runtime.workspace = true
+astra-sandbox.workspace = true
 astra-pipeline.workspace = true
 astra-messaging.workspace = true
 astra-skills.workspace = true

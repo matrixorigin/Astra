@@ -94,6 +94,7 @@ use crate::server::tool_transport::{
 use crate::server::{server_skill_subrun, server_tool_executor};
 
 const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
+const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
@@ -4632,7 +4633,7 @@ impl AgenticRunLifecycleService {
     }
 
     fn durable_recent_events(run: &DurableRunRecord, limit: u32) -> Vec<Value> {
-        let capped = limit.clamp(1, 100) as usize;
+        let capped = limit.clamp(1, MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS) as usize;
         let offset = run.events.len().saturating_sub(capped);
         Self::format_run_events(&run.events[offset..], offset)
     }
@@ -9953,6 +9954,49 @@ mod tests {
         let formatted = AgenticRunLifecycleService::format_run_events(&events, 5);
         assert_eq!(formatted[0]["index"], 5);
         assert_eq!(formatted[1]["index"], 6);
+    }
+
+    #[test]
+    fn durable_recent_events_honors_work_surface_hydrate_limit() {
+        let events = (0..450)
+            .map(|i| json!({"event_type": "tool_call_end", "data": {"seq": i}}))
+            .collect();
+        let run = DurableRunRecord {
+            run_id: "run-long".to_string(),
+            user_id: "user-1".to_string(),
+            session_id: "session-1".to_string(),
+            parent_run_id: None,
+            root_run_id: None,
+            ancestor_path: None,
+            depth: 0,
+            delegation_id: None,
+            agent_id: None,
+            retry_of: None,
+            retry_scope: None,
+            status: STATUS_RUNNING.to_string(),
+            waiting_for: None,
+            owner_pod_id: None,
+            owner_lease_expires_at: None,
+            run_generation: 0,
+            last_event_idx: 449,
+            checkpoint_version: None,
+            checkpoint_json: None,
+            error_code: None,
+            error_message: None,
+            retry_count: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+            events,
+            created_at: "2026-06-13T00:00:00.000Z".to_string(),
+            updated_at: "2026-06-13T00:00:00.000Z".to_string(),
+        };
+
+        let recent_events = AgenticRunLifecycleService::durable_recent_events(&run, 400);
+
+        assert_eq!(recent_events.len(), 400);
+        assert_eq!(recent_events[0]["index"], 50);
+        assert_eq!(recent_events[399]["index"], 449);
     }
 
     #[test]

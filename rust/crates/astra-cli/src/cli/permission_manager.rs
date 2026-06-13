@@ -6844,9 +6844,9 @@ mod tests {
     #[test]
     fn sensitive_path_gate_ignores_internal_tool_result_pipeline() {
         let dir = tempfile::tempdir().unwrap();
-        let artifact_path = dir
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        let sessions_root = dir.path().join("sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
         let artifact_path = artifact_path.to_string_lossy().to_string();
@@ -6864,9 +6864,9 @@ mod tests {
     #[test]
     fn sensitive_path_gate_rejects_internal_artifact_mixed_with_secret_path() {
         let dir = tempfile::tempdir().unwrap();
-        let artifact_path = dir
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        let sessions_root = dir.path().join("sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "child output").unwrap();
         let artifact_path = artifact_path.to_string_lossy().to_string();
@@ -6877,6 +6877,25 @@ mod tests {
         assert!(
             super::sensitive_path_match_for_request("bash", &args).is_some(),
             "a safe internal artifact must not mask a separate sensitive path"
+        );
+    }
+
+    #[test]
+    fn sensitive_path_gate_rejects_arbitrary_astra_tool_result_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path}")
+        });
+
+        assert!(
+            super::sensitive_path_match_for_request("bash", &args).is_some(),
+            "only artifacts under the configured sessions root may bypass the sensitive-path gate"
         );
     }
 
