@@ -2,7 +2,7 @@
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
 expression: "draw(&tasks, 60, 24, true)"
 ---
-Tasks · 1 working · 1 queued · 1 done
+Tasks · 1 working · 1 queued · 1 done · Ctrl+T toggle
 • 重 构 认 证 模 块
 ◻ 编 写 单 元 测 试
 ✔ 更 新 文 档 并 提 交

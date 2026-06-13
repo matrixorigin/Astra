@@ -2,7 +2,7 @@
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
 expression: "draw(&tasks, 80, 24, true)"
 ---
-Tasks · 1 working · 1 queued · 1 done
+Tasks · 1 working · 1 queued · 1 done · Ctrl+T toggle
 • write unit tests
 ◻ update the docs
 ✔ refactor auth module

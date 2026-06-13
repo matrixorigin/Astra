@@ -39,6 +39,8 @@ use unicode_width::UnicodeWidthStr;
 
 use astra_tools::task_mgmt::SessionTaskStatusKind;
 
+const TASK_BOARD_TOGGLE_HINT: &str = " · Ctrl+T toggle";
+
 /// Colour triple the widget reads for all status rendering. Built from
 /// `tui::theme::current()` at render time so light and dark terminals
 /// get readable palettes instead of hardcoded ANSI Cyan/Green.
@@ -868,6 +870,13 @@ pub fn render_with_colors(
             suffix,
             Style::default().add_modifier(Modifier::DIM),
         ));
+        let header_width: usize = header_spans.iter().map(|s| s.content.width()).sum();
+        if header_width + TASK_BOARD_TOGGLE_HINT.width() <= columns as usize {
+            header_spans.push(Span::styled(
+                TASK_BOARD_TOGGLE_HINT,
+                Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
+            ));
+        }
 
         // Subtask roll-up: when any task fans out into subtasks, show
         // aggregate progress so a "1 task in progress" header doesn't
@@ -1017,6 +1026,19 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         spans.push(Span::styled(
             format!(" · {sub_done}/{sub_total} done"),
             Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+
+    let used_before_toggle: usize = spans.iter().map(|s| s.content.width()).sum();
+    let min_title_width = if current_task.is_some() {
+        " · ".width() + 8
+    } else {
+        0
+    };
+    if used_before_toggle + TASK_BOARD_TOGGLE_HINT.width() + min_title_width <= columns as usize {
+        spans.push(Span::styled(
+            TASK_BOARD_TOGGLE_HINT,
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
         ));
     }
 
@@ -1290,6 +1312,17 @@ mod tests {
         // the completed one.
         assert!(text.contains("beta-running"), "{text}");
         assert!(!text.contains("alpha-done"), "{text}");
+        assert!(text.contains("Ctrl+T toggle"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_summary_omits_ctrl_t_hint_when_narrow() {
+        let tasks = vec![
+            mk_task("task-1", "beta-running", "in_progress"),
+            mk_task("task-2", "gamma-pending", "pending"),
+        ];
+        let line = render_collapsed_summary(&tasks, 40).expect("non-empty");
+        let text = spans_text(&line);
         assert!(!text.contains("Ctrl+T"), "{text}");
     }
 
