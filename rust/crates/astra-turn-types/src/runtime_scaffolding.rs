@@ -73,16 +73,15 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
 /// narrowest-waist detector that works for all paths today.
 pub fn is_runtime_scaffolding_message(message: &Value) -> bool {
     let role = message.get("role").and_then(Value::as_str);
-
-    if role == Some("system") {
-        return true;
-    }
-
     let content = message
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let trimmed = content.trim_start();
+
+    if role == Some("system") && trimmed.is_empty() {
+        return true;
+    }
 
     for prefix in SCAFFOLDING_BODY_PREFIXES {
         if trimmed.starts_with(prefix) {
@@ -105,10 +104,10 @@ mod tests {
     // ── Positive cases: scaffolding is detected ─────────────────────────
 
     #[test]
-    fn system_role_is_scaffolding() {
-        assert!(is_runtime_scaffolding_message(&msg(
+    fn system_role_with_regular_content_is_not_scaffolding() {
+        assert!(!is_runtime_scaffolding_message(&msg(
             "system",
-            "anything at all"
+            "You are a helpful assistant for this workspace."
         )));
     }
 

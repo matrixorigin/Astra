@@ -20,6 +20,9 @@ use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
 /// When exceeded, the oldest entry (by dispatch time) is evicted before inserting.
 const MAX_PENDING_REQUESTS: usize = 1000;
+/// Maximum inflight dispatched tool requests one user may hold. This prevents a
+/// single edge account from exhausting the global pending-request pool.
+const MAX_PENDING_REQUESTS_PER_USER: usize = 100;
 
 /// Each dispatched request lives at most this long in the pending set before
 /// being purged by `cleanup_stale`. Set to 3× the edge tool timeout as a
@@ -87,6 +90,8 @@ pub struct EdgeConnectionPool {
     /// Maximum number of inflight dispatched tool requests. When exceeded,
     /// the oldest entry is evicted before insertion.
     max_pending: usize,
+    /// Maximum number of inflight dispatched tool requests per user.
+    max_pending_per_user: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +108,7 @@ impl EdgeConnectionPool {
             pending_request_ids_by_user: Arc::new(DashMap::new()),
             pending_request_order: Arc::new(Mutex::new(VecDeque::new())),
             max_pending: MAX_PENDING_REQUESTS,
+            max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
         }
     }
 
@@ -325,6 +331,12 @@ impl EdgeConnectionPool {
     /// Insert a dispatched request into the pending set, enforcing the capacity
     /// limit by evicting the oldest entry if necessary.
     fn insert_pending_request(&self, user_id: &str, request_id: &str, req: DispatchedToolRequest) {
+        while self.pending_count_for_user(user_id) >= self.max_pending_per_user.max(1) {
+            if !self.evict_oldest_pending_for_user(user_id) {
+                break;
+            }
+        }
+
         let mut eviction_attempts = 0usize;
         while self.pending_requests.len() >= self.max_pending
             && eviction_attempts < self.max_pending.max(1)
@@ -357,6 +369,37 @@ impl EdgeConnectionPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_back(request_id.to_string());
+    }
+
+    fn pending_count_for_user(&self, user_id: &str) -> usize {
+        self.pending_request_ids_by_user
+            .get(user_id)
+            .map(|entry| {
+                entry
+                    .iter()
+                    .filter(|request_id| self.pending_requests.contains_key(request_id.as_str()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn evict_oldest_pending_for_user(&self, user_id: &str) -> bool {
+        let request_id = self
+            .pending_request_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|request_id| {
+                self.pending_requests
+                    .get(request_id.as_str())
+                    .map(|entry| entry.user_id == user_id)
+                    .unwrap_or(false)
+            })
+            .cloned();
+        let Some(request_id) = request_id else {
+            return false;
+        };
+        self.remove_pending_request(&request_id).is_some()
     }
 
     fn remove_pending_request(&self, request_id: &str) -> Option<PendingRequestEntry> {
@@ -644,6 +687,39 @@ mod tests {
         let pending = pool.get_pending_requests_for_user("alice");
         let ids: Vec<&str> = pending.iter().map(|req| req.request_id.as_str()).collect();
         assert_eq!(ids, vec!["req-2", "req-3"]);
+    }
+
+    #[test]
+    fn per_user_pending_request_eviction_preserves_other_users() {
+        let mut pool = EdgeConnectionPool::new();
+        pool.max_pending = 10;
+        pool.max_pending_per_user = 2;
+
+        for request_id in ["alice-1", "alice-2", "bob-1", "alice-3"] {
+            let user_id = if request_id.starts_with("alice") {
+                "alice"
+            } else {
+                "bob"
+            };
+            pool.insert_pending_request(
+                user_id,
+                request_id,
+                DispatchedToolRequest {
+                    request_id: request_id.into(),
+                    tool_name: "bash".into(),
+                    args: json!({}),
+                    dispatched_at: Instant::now(),
+                },
+            );
+        }
+
+        let alice = pool.get_pending_requests_for_user("alice");
+        let alice_ids: Vec<&str> = alice.iter().map(|req| req.request_id.as_str()).collect();
+        assert_eq!(alice_ids, vec!["alice-2", "alice-3"]);
+
+        let bob = pool.get_pending_requests_for_user("bob");
+        let bob_ids: Vec<&str> = bob.iter().map(|req| req.request_id.as_str()).collect();
+        assert_eq!(bob_ids, vec!["bob-1"]);
     }
 
     #[test]

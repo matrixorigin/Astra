@@ -1090,6 +1090,107 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
+  it("restores the active run when stop and refresh both fail", async () => {
+    const user = userEvent.setup();
+    mockStopChatRun.mockRejectedValue(new Error("runtime cancellation failed"));
+    mockGetChat.mockRejectedValue(new Error("refresh failed"));
+
+    render(
+      <ToastProvider>
+        <ChatView
+          initial={{
+            ...makeDetail({
+              ...defaultActiveRun,
+              assistantMessageId: "assistant-active",
+            }),
+            messages: [
+              {
+                id: "assistant-active",
+                role: "assistant",
+                content: "working...",
+                createdAt: "2026-06-07T00:00:00.000Z",
+                status: "streaming",
+                reasoningStatus: "streaming",
+              },
+            ],
+          }}
+        />
+      </ToastProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Stop run" }));
+
+    await waitFor(() => {
+      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+    });
+    await waitFor(() => {
+      expect(mockGetChat).toHaveBeenCalledWith("chat-123");
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
+    });
+    expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+    expect(screen.getByText("working...")).toBeInTheDocument();
+    expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();
+    expect(screen.getByText("runtime cancellation failed")).toBeInTheDocument();
+  });
+
+  it("restores the active run when stop hangs and refresh fails", async () => {
+    jest.useFakeTimers();
+    try {
+      const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+      mockStopChatRun.mockReturnValue(new Promise(() => {}));
+      mockGetChat.mockRejectedValue(new Error("refresh failed"));
+
+      render(
+        <ToastProvider>
+          <ChatView
+            initial={{
+              ...makeDetail({
+                ...defaultActiveRun,
+                assistantMessageId: "assistant-active",
+              }),
+              messages: [
+                {
+                  id: "assistant-active",
+                  role: "assistant",
+                  content: "working...",
+                  createdAt: "2026-06-07T00:00:00.000Z",
+                  status: "streaming",
+                  reasoningStatus: "streaming",
+                },
+              ],
+            }}
+          />
+        </ToastProvider>,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Stop run" }));
+
+      await waitFor(() => {
+        expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+      });
+      await act(async () => {
+        jest.advanceTimersByTime(10_000);
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(mockGetChat).toHaveBeenCalledWith("chat-123");
+      });
+      await waitFor(() => {
+        expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
+      });
+      expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+      expect(screen.getByText("working...")).toBeInTheDocument();
+      expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();
+      expect(screen.getByText("Stop request timed out.")).toBeInTheDocument();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("retries active run stream reattach after a transient failure", async () => {
     jest.useFakeTimers();
     try {

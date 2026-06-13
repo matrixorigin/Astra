@@ -43,6 +43,8 @@ const STREAM_RECONCILE_INTERVAL_MS = 5_000;
 const STOP_RECONCILE_INITIAL_DELAY_MS = 500;
 const STOP_RECONCILE_INTERVAL_MS = 1_000;
 const STOP_RECONCILE_NOTICE_MS = 15_000;
+const STOP_REQUEST_TIMEOUT_MS = 10_000;
+const STOP_FAILURE_REFRESH_TIMEOUT_MS = 5_000;
 const RUN_ATTACH_MAX_RETRIES = 4;
 const ATTACHABLE_RUN_STATUSES = new Set([
   "running",
@@ -147,6 +149,22 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
   );
 }
 
+function withClientTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timeoutId: ReturnType<typeof window.setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId);
+    }
+  });
+}
+
 export interface UseStreamLifecycleParams {
   detail: ChatDetail;
   setDetail: Dispatch<SetStateAction<ChatDetail>>;
@@ -233,6 +251,7 @@ export function useStreamLifecycle(
     setStartingRun,
     setResumingRun,
     setStoppingRun,
+    setQueueingDeferredInput,
     setWorkSurface,
     runAttachRetrySignal: _runAttachRetrySignal,
     setRunAttachRetrySignal: _setRunAttachRetrySignal,
@@ -559,6 +578,8 @@ export function useStreamLifecycle(
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
+      detail.activeRun?.nextEventIndex,
+      detail.activeRun?.runId,
       detail.chat.id,
       nextStreamAbortSignal,
       resetWorkSurfaceRun,
@@ -914,7 +935,7 @@ export function useStreamLifecycle(
         return;
       }
       runControlMutationRef.current = true;
-      params.setQueueingDeferredInput(true);
+      setQueueingDeferredInput(true);
 
       try {
         const pendingMessageId = crypto.randomUUID();
@@ -1092,7 +1113,7 @@ export function useStreamLifecycle(
         );
       } finally {
         runControlMutationRef.current = false;
-        params.setQueueingDeferredInput(false);
+        setQueueingDeferredInput(false);
       }
     },
     [
@@ -1106,9 +1127,8 @@ export function useStreamLifecycle(
       nextStreamAbortSignal,
       resetWorkSurfaceRun,
       setDetail,
-      setStartingRun,
+      setQueueingDeferredInput,
       setStoppingRun,
-      params,
       router,
       startStream,
     ],
@@ -1120,6 +1140,8 @@ export function useStreamLifecycle(
       return;
     }
     const runId = detail.activeRun.runId;
+    const previousActiveRun = detail.activeRun;
+    const previousMessages = detail.messages;
     if (runControlMutationRef.current) {
       return;
     }
@@ -1140,7 +1162,11 @@ export function useStreamLifecycle(
       messages: completeLatestStreamingAssistantAsStopped(current.messages),
     }));
     void hydrateWorkSurfaceForChat({ silent: true });
-    void stopChatRun(detail.chat.id)
+    void withClientTimeout(
+      stopChatRun(detail.chat.id),
+      STOP_REQUEST_TIMEOUT_MS,
+      "Stop request timed out.",
+    )
       .then((result) => {
         setDetail((current) => ({
           ...current,
@@ -1195,11 +1221,30 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
-        void getChat(detail.chat.id)
-          .then(setDetail)
+        void withClientTimeout(
+          getChat(detail.chat.id),
+          STOP_FAILURE_REFRESH_TIMEOUT_MS,
+          "Timed out refreshing the active run after stop failed.",
+        )
+          .then((refreshed) => {
+            setDetail(refreshed);
+            void hydrateWorkSurfaceForChat({ silent: true });
+          })
           .catch(() => {
-            // The local stop still took effect; the toast below is the durable
-            // signal if both cancellation and refresh fail.
+            setDetail((current) => {
+              if (
+                current.activeRun?.runId !== runId ||
+                current.activeRun.status !== "cancelling"
+              ) {
+                return current;
+              }
+              return {
+                ...current,
+                activeRun: previousActiveRun,
+                messages: previousMessages,
+              };
+            });
+            void hydrateWorkSurfaceForChat({ silent: true });
           });
         addToast(
           error instanceof Error
@@ -1217,8 +1262,9 @@ export function useStreamLifecycle(
     canStopRun,
     chatListHref,
     clearAttachedRun,
-    detail.activeRun?.runId,
+    detail.activeRun,
     detail.chat.id,
+    detail.messages,
     hydrateWorkSurfaceForChat,
     reconcileIntervalRef,
     reconcileTimerRef,
@@ -1465,6 +1511,7 @@ export function useStreamLifecycle(
     chatListHref,
     claimAttachedRun,
     clearAttachedRun,
+    detail.activeRun?.nextEventIndex,
     detail.activeRun?.runId,
     detail.chat.id,
     detail.messages,

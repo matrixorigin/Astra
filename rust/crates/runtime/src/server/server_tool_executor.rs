@@ -527,10 +527,14 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
 }
 
 fn normalized_drift(old: f64, new: f64) -> Option<f64> {
-    let denom = old.abs();
-    if denom < f64::EPSILON {
+    if !old.is_finite() || !new.is_finite() {
         return None;
     }
+    let denom = old.abs().max(new.abs());
+    if denom < f64::EPSILON {
+        return Some(0.0);
+    }
+
     Some((new - old).abs() / denom)
 }
 
@@ -6046,6 +6050,14 @@ mod tests {
             !production.contains(".unwrap("),
             "server tool executor production path must handle unhappy paths instead of panicking"
         );
+    }
+
+    #[test]
+    fn normalized_drift_is_symmetric_and_handles_zero_baseline() {
+        assert_eq!(normalized_drift(0.0, 0.0), Some(0.0));
+        assert_eq!(normalized_drift(0.0, 10.0), Some(1.0));
+        assert_eq!(normalized_drift(10.0, 0.0), Some(1.0));
+        assert_eq!(normalized_drift(f64::NAN, 1.0), None);
     }
 
     #[test]

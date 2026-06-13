@@ -69,9 +69,6 @@ fn is_direct_correction(lower: &str) -> bool {
         "instead,",
         "forget that",
         "ignore that",
-        "wait,",
-        "hold on",
-        "stop,",
         "不对",
         "错了",
         "不是这样",
@@ -259,6 +256,21 @@ mod tests {
             classify_user_correction_signal("是不是可以让 web-agent 支持 taskboard?"),
             None
         );
+    }
+
+    #[test]
+    fn ambiguous_discourse_markers_are_not_corrections_by_themselves() {
+        for message in [
+            "wait, can you show the logs first?",
+            "hold on while I check the branch name",
+            "stop, collaborate and listen",
+        ] {
+            assert_eq!(
+                classify_user_correction_signal(message),
+                None,
+                "{message:?} should not become durable correction pressure"
+            );
+        }
     }
 
     #[test]

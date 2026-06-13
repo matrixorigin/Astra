@@ -756,22 +756,35 @@ mod tests {
 
     #[test]
     fn internal_safe_path_requires_artifact_file() {
+        let root = std::env::temp_dir().join(format!(
+            "astra-shell-hardening-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        let artifact_dir = root.join(".astra/sessions/s1/tool-results");
+        let artifact = artifact_dir.join("call_abc.txt");
+        std::fs::create_dir_all(&artifact_dir).expect("create test artifact directory");
+        std::fs::write(&artifact, "result").expect("write test artifact");
+
+        let artifact_path = artifact.to_string_lossy();
         assert_eq!(
-            is_internal_safe_path("/Users/test/.astra/sessions/s1/tool-results/call_abc.txt"),
+            is_internal_safe_path(&artifact_path),
             Some(InternalPathKind::SessionToolResult)
         );
         assert_eq!(
-            is_internal_safe_path("cat ~/.astra/sessions/s1/tool-results/call_abc.txt"),
+            is_internal_safe_path(&format!("cat {artifact_path}")),
             Some(InternalPathKind::SessionToolResult)
         );
+        assert_eq!(is_internal_safe_path(&artifact_dir.to_string_lossy()), None);
         assert_eq!(
-            is_internal_safe_path("/Users/test/.astra/sessions/s1/tool-results"),
+            is_internal_safe_path(&root.join(".astra/config.toml").to_string_lossy()),
             None
         );
-        assert_eq!(
-            is_internal_safe_path("/Users/test/.astra/config.toml"),
-            None
-        );
+
+        std::fs::remove_dir_all(&root).expect("remove test artifact directory");
     }
 
     #[test]
