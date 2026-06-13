@@ -162,12 +162,17 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("read_file", RO, C.union(EX).union(FI)),
     tool("file_read", RO, C.union(AL).union(FI)),
     tool("ReadFileTool", RO, C.union(AL).union(FI)),
+    tool("Read", RO, C.union(AL).union(FI)),
+    tool("View", RO, C.union(AL).union(FI)),
+    tool("view", RO, C.union(AL).union(FI)),
     tool("list_dir", RO, C.union(EX)),
     tool("ListDirTool", RO, C.union(AL)),
     tool("grep", RO, C.union(EX)),
     tool("GrepTool", RO, C.union(AL)),
+    tool("Grep", RO, C.union(AL)),
     tool("glob", RO, C.union(EX)),
     tool("GlobTool", RO, C.union(AL)),
+    tool("Glob", RO, C.union(AL)),
     tool("get_file_contents", RO, C.union(AL).union(FI)),
     tool("search_code", RO, C.union(AL)),
     tool("list_files", RO, C.union(AL)),
@@ -255,10 +260,17 @@ static TOOL_TABLE: &[ToolMeta] = &[
         A.union(AL).union(FI),
         ToolIdempotency::IdempotentWrite,
     ),
+    tool_idem(
+        "Write",
+        MU,
+        A.union(AL).union(FI),
+        ToolIdempotency::IdempotentWrite,
+    ),
     tool("str_replace", MU, A.union(FI)),
     tool("multi_edit", MU, A.union(FI)),
     tool("edit_file", MU, A.union(FI)),
     tool("EditFileTool", MU, A.union(AL).union(FI)),
+    tool("Edit", MU, A.union(AL).union(FI)),
     tool("apply_patch", MU, A.union(FI)),
     tool("ApplyPatchTool", MU, A.union(AL).union(FI)),
     tool("create_file", MU, A.union(FI)),
@@ -304,6 +316,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("BashTool", SH, AE.union(AL)),
+    tool("Bash", SH, AE.union(AL)),
     tool("exec", SH, AE.union(EX)),
     tool("run_command", SH, AE.union(EX)),
     tool("shell", SH, AE.union(EX)),
@@ -487,9 +500,11 @@ impl ToolRegistry {
                 "search"
                     | "grep"
                     | "GrepTool"
+                    | "Grep"
                     | "find"
                     | "glob"
                     | "GlobTool"
+                    | "Glob"
                     | "list_dir"
                     | "ListDirTool"
                     | "tool_search"
@@ -1420,12 +1435,20 @@ mod tests {
         let alias_pairs = [
             ("read_file", "file_read"),
             ("read_file", "ReadFileTool"),
+            ("read_file", "Read"),
+            ("read_file", "View"),
+            ("read_file", "view"),
             ("grep", "GrepTool"),
+            ("grep", "Grep"),
             ("glob", "GlobTool"),
+            ("glob", "Glob"),
             ("list_dir", "ListDirTool"),
             ("write_file", "WriteFileTool"),
+            ("write_file", "Write"),
             ("edit_file", "EditFileTool"),
+            ("edit_file", "Edit"),
             ("bash", "BashTool"),
+            ("bash", "Bash"),
             ("web_fetch", "WebFetchTool"),
             ("web_search", "WebSearchTool"),
             ("apply_patch", "ApplyPatchTool"),
@@ -2417,15 +2440,23 @@ mod tests {
         let alias_pairs = [
             ("read_file", "file_read"),
             ("read_file", "ReadFileTool"),
+            ("read_file", "Read"),
+            ("read_file", "View"),
+            ("read_file", "view"),
             ("grep", "GrepTool"),
+            ("grep", "Grep"),
             ("glob", "GlobTool"),
+            ("glob", "Glob"),
             ("list_dir", "ListDirTool"),
             ("write_file", "WriteFileTool"),
+            ("write_file", "Write"),
             ("edit_file", "EditFileTool"),
+            ("edit_file", "Edit"),
             ("apply_patch", "ApplyPatchTool"),
             ("web_fetch", "WebFetchTool"),
             ("web_search", "WebSearchTool"),
             ("bash", "BashTool"),
+            ("bash", "Bash"),
             ("powershell", "PowerShellTool"),
         ];
         for (canonical, alias) in alias_pairs {
