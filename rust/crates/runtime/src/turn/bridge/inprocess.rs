@@ -2174,8 +2174,9 @@ impl InProcessChatTurnBridge {
             );
             let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
             let bridge_restricted_snapshot = HashSet::new();
-            let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref() {
-                crate::turn::wire_assembly::session_memory_entry_for_pipeline(
+            let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref()
+            {
+                crate::turn::wire_assembly::session_memory_entry_for_user_turn(
                     crate::session_memory::runner::load_current_session_memory_preferring_local(
                         memoria,
                         &session_id,
@@ -2183,6 +2184,7 @@ impl InProcessChatTurnBridge {
                     .await
                     .as_deref(),
                     trace_turn,
+                    user_content_for_signal,
                 )
             } else {
                 None
@@ -2316,10 +2318,11 @@ impl InProcessChatTurnBridge {
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
 
                 if let Some(rerun) =
-                    crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry(
+                    crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
                         compact_result.session_memory_context.as_deref(),
                         initial_session_memory_entry.as_ref(),
                         trace_turn,
+                        user_content_for_signal,
                         |session_memory_entry| {
                             crate::turn::llm::context::assemble_bridge_context(
                                 crate::turn::llm::context::BridgeContextAssemblyInput {

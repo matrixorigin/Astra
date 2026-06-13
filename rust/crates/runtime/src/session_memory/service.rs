@@ -1219,6 +1219,7 @@ impl MemoryExtractionService {
         &self,
         session_id: &str,
         turn_number: u32,
+        user_content: &str,
     ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
         let content = if self.require_local_current_snapshot {
             super::runner::load_current_session_memory_preferring_local(
@@ -1230,7 +1231,11 @@ impl MemoryExtractionService {
             super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
                 .await?
         };
-        crate::turn::wire_assembly::session_memory_entry_for_pipeline(Some(&content), turn_number)
+        crate::turn::wire_assembly::session_memory_entry_for_user_turn(
+            Some(&content),
+            turn_number,
+            user_content,
+        )
     }
 
     fn record_selector_failure(&self, model_name: &str, detail: Option<&str>) {

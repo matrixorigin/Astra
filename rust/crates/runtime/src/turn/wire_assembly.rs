@@ -42,13 +42,54 @@ pub(crate) fn session_memory_entry_for_pipeline(
     )
 }
 
-pub(crate) fn rerun_with_distinct_session_memory_entry<T>(
+pub(crate) fn session_memory_entry_for_user_turn(
+    content: Option<&str>,
+    turn_number: u32,
+    user_content: &str,
+) -> Option<astra_turn_core::context_sources::MemoryEntry> {
+    let user_content = user_content.trim();
+    if astra_turn_core::input_classifier::is_correction_signal(user_content) {
+        return Some(session_memory_reanchor_entry(user_content, turn_number));
+    }
+    session_memory_entry_for_pipeline(content, turn_number)
+}
+
+fn session_memory_reanchor_entry(
+    user_content: &str,
+    turn_number: u32,
+) -> astra_turn_core::context_sources::MemoryEntry {
+    let clipped = truncate_reanchor_text(user_content, 500);
+    let content = format!(
+        "## Session Reanchor\n\
+         - The latest user correction supersedes previously injected session memory where they conflict.\n\
+         - Latest user correction: {clipped}\n\
+         - Treat older session state as stale unless it directly supports this correction."
+    );
+    astra_turn_core::context_sources::MemoryEntry::new(&content)
+        .with_source("session_memory.reanchor")
+        .with_freshness_turn(turn_number)
+}
+
+fn truncate_reanchor_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
+}
+
+pub(crate) fn rerun_with_distinct_session_memory_entry_for_user_turn<T>(
     content: Option<&str>,
     existing: Option<&astra_turn_core::context_sources::MemoryEntry>,
     turn_number: u32,
+    user_content: &str,
     rerun: impl FnOnce(astra_turn_core::context_sources::MemoryEntry) -> T,
 ) -> Option<T> {
-    let entry = session_memory_entry_for_pipeline(content, turn_number)?;
+    let entry = session_memory_entry_for_user_turn(content, turn_number, user_content)?;
     if existing.is_some_and(|current| {
         current.content_hash == entry.content_hash && current.content == entry.content
     }) {
@@ -696,26 +737,28 @@ mod tests {
     }
 
     #[test]
-    fn rerun_with_distinct_session_memory_entry_skips_identical_content() {
+    fn rerun_with_distinct_session_memory_entry_for_user_turn_skips_identical_content() {
         let current = session_memory_entry_for_pipeline(Some("same memory"), 7)
             .expect("current session memory entry");
-        let rerun = rerun_with_distinct_session_memory_entry(
+        let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
             Some("same memory"),
             Some(&current),
             7,
+            "continue",
             |_| panic!("identical content should not rerun"),
         );
         assert!(rerun.is_none());
     }
 
     #[test]
-    fn rerun_with_distinct_session_memory_entry_keeps_changed_content() {
+    fn rerun_with_distinct_session_memory_entry_for_user_turn_keeps_changed_content() {
         let current = session_memory_entry_for_pipeline(Some("old memory"), 7)
             .expect("current session memory entry");
-        let rerun = rerun_with_distinct_session_memory_entry(
+        let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
             Some("new memory"),
             Some(&current),
             7,
+            "continue",
             |entry| entry,
         )
         .expect("changed session memory should rerun");
@@ -723,6 +766,51 @@ mod tests {
             rerun,
             session_memory_entry_for_pipeline(Some("new memory"), 7).expect("rerun entry")
         );
+    }
+
+    #[test]
+    fn session_memory_entry_for_user_turn_keeps_memory_for_normal_turn() {
+        let entry =
+            session_memory_entry_for_user_turn(Some("## Session State\nKeep going"), 8, "continue")
+                .expect("session memory entry");
+
+        assert!(entry.content.contains("Keep going"));
+        assert_eq!(entry.source.as_deref(), Some("session_memory.compaction"));
+    }
+
+    #[test]
+    fn session_memory_entry_for_user_turn_reanchors_on_correction() {
+        let entry = session_memory_entry_for_user_turn(
+            Some("stale prior session memory"),
+            8,
+            "No, that's wrong; use the server-side executor.",
+        )
+        .expect("reanchor entry");
+
+        assert!(entry.content.contains("Latest user correction"));
+        assert!(entry.content.contains("server-side executor"));
+        assert!(!entry.content.contains("stale prior session memory"));
+        assert_eq!(entry.source.as_deref(), Some("session_memory.reanchor"));
+    }
+
+    #[test]
+    fn rerun_with_distinct_session_memory_entry_for_user_turn_keeps_reanchor_stable() {
+        let current = session_memory_entry_for_user_turn(
+            Some("old stale memory"),
+            9,
+            "No, that's wrong; keep the explicit invariant.",
+        )
+        .expect("current reanchor");
+
+        let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
+            Some("new compacted stale memory"),
+            Some(&current),
+            9,
+            "No, that's wrong; keep the explicit invariant.",
+            |_| panic!("same correction reanchor should not rerun"),
+        );
+
+        assert!(rerun.is_none());
     }
 
     #[test]

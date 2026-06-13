@@ -2877,8 +2877,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let initial_session_memory_entry =
             if let Some(svc) = state.memory_extraction_service.as_ref() {
-                svc.current_session_memory_entry_for_pipeline(&self.session_id, state.session_turn)
-                    .await
+                svc.current_session_memory_entry_for_pipeline(
+                    &self.session_id,
+                    state.session_turn,
+                    &user_content,
+                )
+                .await
             } else {
                 None
             };
@@ -2929,23 +2933,25 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg,
             )
             .await;
-        if let Some(rerun) = crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry(
-            compact_result.session_memory_context.as_deref(),
-            initial_session_memory_entry.as_ref(),
-            state.session_turn,
-            |session_memory_entry| {
-                self.run_turn_pipeline_with_cache_capability_and_session_memory(
-                    state,
-                    &visible_tools,
-                    &llm_cfg.provider,
-                    &llm_cfg.model_name,
-                    llm_cfg.cache_capability,
-                    Some(session_memory_entry),
-                    &user_content,
-                )
-            },
-        )
-        .transpose()?
+        if let Some(rerun) =
+            crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
+                compact_result.session_memory_context.as_deref(),
+                initial_session_memory_entry.as_ref(),
+                state.session_turn,
+                &user_content,
+                |session_memory_entry| {
+                    self.run_turn_pipeline_with_cache_capability_and_session_memory(
+                        state,
+                        &visible_tools,
+                        &llm_cfg.provider,
+                        &llm_cfg.model_name,
+                        llm_cfg.cache_capability,
+                        Some(session_memory_entry),
+                        &user_content,
+                    )
+                },
+            )
+            .transpose()?
         {
             debug_assert_eq!(rerun.tier, tier);
             final_system_messages = rerun.system_messages;
