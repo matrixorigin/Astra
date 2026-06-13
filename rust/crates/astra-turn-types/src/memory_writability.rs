@@ -46,6 +46,7 @@
 
 use serde_json::Value;
 
+use crate::correction_signal::{has_durable_correction_directive, is_user_correction_signal};
 use crate::runtime_scaffolding::is_runtime_scaffolding_message;
 
 /// User-message length threshold (in Unicode scalar values, not bytes)
@@ -113,7 +114,11 @@ pub fn should_store_in_memory(message: &Value) -> bool {
     match role {
         // Assistant text output is expensive to regenerate; always keep.
         "assistant" => true,
-        // User messages pass the length gate.
+        // Correction-like user messages are situational by default. Store
+        // only concrete directives; vague reanchors belong in per-session
+        // working memory, not ambient retrieval.
+        "user" if is_user_correction_signal(content) => has_durable_correction_directive(content),
+        // Other user messages pass the length gate.
         "user" => content.chars().count() >= USER_MSG_MIN_CHARS,
         // Tool role, system role, unknown role: don't write. Tools are
         // handled separately by compaction (which skips `role: "tool"`
@@ -252,6 +257,26 @@ mod tests {
     fn keeps_user_constraint() {
         assert!(should_store_in_memory(&user(
             "don't mock the database in these tests — we got burned last quarter"
+        )));
+    }
+
+    #[test]
+    fn rejects_vague_user_reanchor_from_memory() {
+        assert!(!should_store_in_memory(&user(
+            "我要的是长久健康运行，不是临时补丁"
+        )));
+        assert!(!should_store_in_memory(&user(
+            "You misunderstood the goal; keep the session healthy long-term"
+        )));
+    }
+
+    #[test]
+    fn keeps_correction_with_concrete_directive() {
+        assert!(should_store_in_memory(&user(
+            "wrong, don't use mocks in integration tests"
+        )));
+        assert!(should_store_in_memory(&user(
+            "我重新说一次，不要用case-by-case修补"
         )));
     }
 

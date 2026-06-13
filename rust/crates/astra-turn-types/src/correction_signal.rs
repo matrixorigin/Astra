@@ -33,6 +33,25 @@ pub fn is_user_correction_signal(message: &str) -> bool {
     classify_user_correction_signal(message).is_some()
 }
 
+/// Whether a correction-like user message contains a concrete directive that
+/// is safe to carry into durable memory.
+///
+/// Correction/reanchor messages often describe a local failure episode ("not a
+/// quick patch", "you misunderstood"). Those should reanchor the current turn
+/// but should not be indexed as reusable memory. Durable memory needs an
+/// actionable rule such as "don't use mocks", "always run tests", or
+/// "不要用 case-by-case 修补".
+#[must_use]
+pub fn has_durable_correction_directive(message: &str) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
+    }
+    let lower = message.to_lowercase();
+
+    directive_starts_at_boundary(message, &lower)
+}
+
 fn is_direct_correction(lower: &str) -> bool {
     [
         "no,",
@@ -162,6 +181,40 @@ fn is_chinese_reanchor_nudge(message: &str) -> bool {
     has_negation && has_redirect
 }
 
+fn directive_starts_at_boundary(original: &str, lower: &str) -> bool {
+    if starts_with_directive(lower) {
+        return true;
+    }
+
+    for sep in &[", ", ". ", "，", "。", "; ", "；", "—", ": ", "："] {
+        for (i, _) in lower.match_indices(sep) {
+            let after = i + sep.len();
+            if starts_with_directive(&lower[after..]) {
+                return true;
+            }
+            // Chinese text often omits spaces after punctuation; use the
+            // original byte offset too so CJK directives remain byte-aligned.
+            if original
+                .get(after..)
+                .is_some_and(|rest| starts_with_directive(&rest.to_lowercase()))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn starts_with_directive(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    [
+        "don't ", "do not ", "never ", "always ", "stop ", "use ", "prefer ", "avoid ", "不要",
+        "别", "禁止", "避免", "应该", "优先", "使用",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +259,24 @@ mod tests {
             classify_user_correction_signal("是不是可以让 web-agent 支持 taskboard?"),
             None
         );
+    }
+
+    #[test]
+    fn durable_directive_requires_actionable_rule() {
+        assert!(has_durable_correction_directive(
+            "wrong, don't use mocks in integration tests"
+        ));
+        assert!(has_durable_correction_directive(
+            "我重新说一次，不要用case-by-case修补"
+        ));
+        assert!(has_durable_correction_directive(
+            "always run focused tests before claiming completion"
+        ));
+        assert!(!has_durable_correction_directive(
+            "我要的是长久健康运行，不是临时补丁"
+        ));
+        assert!(!has_durable_correction_directive(
+            "You misunderstood the goal; keep the session healthy long-term"
+        ));
     }
 }

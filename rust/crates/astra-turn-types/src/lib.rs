@@ -14,7 +14,8 @@ pub mod session_facts;
 mod tool_idempotency;
 
 pub use correction_signal::{
-    UserCorrectionSignalKind, classify_user_correction_signal, is_user_correction_signal,
+    UserCorrectionSignalKind, classify_user_correction_signal, has_durable_correction_directive,
+    is_user_correction_signal,
 };
 pub use implicit_feedback::{
     ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,

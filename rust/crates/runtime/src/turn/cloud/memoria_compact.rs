@@ -2708,6 +2708,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn working_memory_rejects_vague_reanchor_but_keeps_directive() {
+        let msgs = vec![
+            user("我要的是长久健康运行，不是临时补丁"),
+            user("我重新说一次，不要用case-by-case修补"),
+            assistant("Understood; I will avoid one-off patches."),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            !r.contains("长久健康运行"),
+            "vague reanchor should not be indexed as reusable memory: {r}"
+        );
+        assert!(
+            r.contains("不要用case-by-case修补"),
+            "concrete directive should remain memory-eligible: {r}"
+        );
+        assert!(r.contains("avoid one-off patches"));
+    }
+
     // ──────────────────────────────────────────────────────────
     // collapse_whitespace
     // ──────────────────────────────────────────────────────────
