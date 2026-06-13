@@ -339,6 +339,8 @@ pub(crate) async fn run_extraction(
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
+    let filtered_messages = session_memory_extraction_messages(messages);
+    let messages = filtered_messages.as_slice();
     let base_memory = if current_memory.trim().is_empty() {
         SESSION_MEMORY_TEMPLATE.to_string()
     } else {
@@ -473,6 +475,19 @@ pub(crate) async fn run_extraction(
             failed_candidates,
         },
     }
+}
+
+fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|msg| !is_vague_reanchor_message(msg))
+        .cloned()
+        .collect()
+}
+
+fn is_vague_reanchor_message(msg: &Value) -> bool {
+    msg.get("role").and_then(Value::as_str) == Some("user")
+        && message_text(msg).is_some_and(is_vague_reanchor_for_session_memory)
 }
 
 pub fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
@@ -1979,6 +1994,72 @@ mod tests {
             } => {
                 assert_eq!(source, SessionMemoryExtractionSource::Llm);
                 assert!(content.contains("LLM Result"));
+            }
+            _ => panic!("expected llm persistence"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_selector_prompt_filters_vague_reanchor() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(
+                    !request.contains("durable fix, not a workaround"),
+                    "vague reanchor must not be sent to selector prompt: {request}"
+                );
+                assert!(
+                    request.contains("never use mocks in integration tests"),
+                    "concrete directive should remain visible to selector prompt: {request}"
+                );
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "# Session Memory\n\n## Session Title\nFiltered LLM Result"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let messages = vec![
+            json!({"role": "user", "content": "Improve long running session memory"}),
+            json!({"role": "assistant", "content": "I will patch the immediate case."}),
+            json!({"role": "user", "content": "What I asked for is a durable fix, not a workaround"}),
+            json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
+        ];
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-filtered-selector",
+            &messages,
+            4,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            std::slice::from_ref(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source, content, ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert!(content.contains("Filtered LLM Result"));
             }
             _ => panic!("expected llm persistence"),
         }
