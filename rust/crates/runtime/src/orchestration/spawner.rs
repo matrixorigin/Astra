@@ -838,6 +838,35 @@ impl DynamicAgentSpawner {
         }
     }
 
+    fn spawn_worktree_cleanup(&self, worktree_path: Option<PathBuf>, agent_id: &str) {
+        let Some(path) = worktree_path else {
+            return;
+        };
+        let agent_id = agent_id.to_string();
+        let agent_id_for_log = agent_id.clone();
+        let cleanup_future = async move {
+            let cleanup_agent_id = agent_id.clone();
+            let join_result = tokio::task::spawn_blocking(move || {
+                cleanup_agent_worktree(Some(&path), &cleanup_agent_id);
+            })
+            .await;
+            if let Err(error) = join_result {
+                astra_core::agent_warn!(
+                    "spawner",
+                    "worktree cleanup task for {agent_id} failed to join: {error}"
+                );
+            }
+        };
+        let Ok(mut tasks) = self.background_tasks.lock() else {
+            astra_core::agent_warn!(
+                "spawner",
+                "failed to track worktree cleanup task for {agent_id_for_log}"
+            );
+            return;
+        };
+        tasks.spawn(cleanup_future);
+    }
+
     async fn take_foreground_promotion_request(&self, agent_id: &str) -> bool {
         self.foreground_promotion_requests
             .write()
@@ -1823,7 +1852,9 @@ impl DynamicAgentSpawner {
                 agent_id, err
             );
         }
+        let worktree_path = state.worktree_path.take();
         self.archive_state(state.clone()).await;
+        self.spawn_worktree_cleanup(worktree_path, agent_id);
         self.notify_completion(agent_id).await;
         true
     }
@@ -1840,7 +1871,7 @@ impl DynamicAgentSpawner {
     ) -> bool {
         self.background_abort_handles.write().await.remove(agent_id);
         self.remove_background_agent_id(agent_id);
-        let (state, messaging_address) = {
+        let (mut state, messaging_address) = {
             let mut active_agents = self.active_agents.write().await;
             let Some(mut state) = active_agents.remove(agent_id) else {
                 return false;
@@ -1889,7 +1920,9 @@ impl DynamicAgentSpawner {
                 agent_id, err
             );
         }
+        let worktree_path = state.worktree_path.take();
         self.archive_state(state).await;
+        self.spawn_worktree_cleanup(worktree_path, agent_id);
         self.notify_completion(agent_id).await;
         true
     }

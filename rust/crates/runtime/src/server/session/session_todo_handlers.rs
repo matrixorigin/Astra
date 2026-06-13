@@ -967,8 +967,18 @@ async fn adopt_task_into_session(
         Err(error) => return format!("Error: {error}"),
     };
     if source_session == target_session {
-        return "Error: source_session_id matches the current session — nothing to adopt"
-            .to_string();
+        return format!(
+            "No-op: task '{source_task_id}' is already in the current session\n{}",
+            serde_json::json!({
+                "success": true,
+                "noop": true,
+                "reason": "source_session_is_current_session",
+                "source_session_id": source_session,
+                "target_session_id": target_session,
+                "task_id": source_task_id,
+                "message": "Task is already in the current session; continue with task.update/task.get."
+            })
+        );
     }
     let Some(pool) = state.shared_pool.as_ref() else {
         return "Error: session_todos store not configured on this server".to_string();
@@ -1254,6 +1264,31 @@ mod tests {
             body["message"].as_str().unwrap().contains("archive/rename"),
             "{output}"
         );
+    }
+
+    #[tokio::test]
+    async fn adopt_same_session_is_idempotent_noop_before_store_access() {
+        let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy));
+        let output = adopt_task_into_session(
+            &state,
+            "user-1",
+            "session-1",
+            &serde_json::json!({
+                "source_session_id": "session-1",
+                "task_id": "task-7",
+            }),
+        )
+        .await;
+
+        assert!(!output.starts_with("Error:"), "{output}");
+        let body = output
+            .find('{')
+            .and_then(|pos| serde_json::from_str::<serde_json::Value>(&output[pos..]).ok())
+            .expect("same-session adopt should return structured no-op JSON");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["noop"], true);
+        assert_eq!(body["reason"], "source_session_is_current_session");
+        assert_eq!(body["task_id"], "task-7");
     }
 
     #[test]

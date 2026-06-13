@@ -1352,20 +1352,6 @@ fn validate_parent_status_transition(
             "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to remove it"
         ));
     }
-    // Pending tasks cannot jump directly to terminal — must go through in_progress first.
-    if previous_status == SessionTaskStatusKind::Pending
-        && matches!(
-            new_status,
-            SessionTaskStatusKind::Completed
-                | SessionTaskStatusKind::Failed
-                | SessionTaskStatusKind::Cancelled
-        )
-    {
-        return Err(format!(
-            "task is '{previous_status}' — cannot transition directly to '{new_status}'. \
-             Set new_status='in_progress' first, then transition to terminal status when work is done"
-        ));
-    }
     Ok(())
 }
 

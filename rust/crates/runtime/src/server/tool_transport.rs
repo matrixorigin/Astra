@@ -454,23 +454,26 @@ impl ToolExecutionService {
         if !had_connected_edge {
             return EdgeTransportAttempt::Unavailable;
         }
-        let edge_result = if edge_executor_id(request).is_some() {
-            pool.execute_tool_with_cancel(
-                &request.user_id,
-                edge_executor_id(request).unwrap_or_default(),
-                &request.tool_name,
-                &request.args,
-                cancel_token,
-            )
-            .await
-        } else {
-            pool.execute_tool_any_edge_with_cancel(
-                &request.user_id,
-                &request.tool_name,
-                &request.args,
-                cancel_token,
-            )
-            .await
+        let edge_result = match edge_executor_id(request) {
+            Some(executor_id) => {
+                pool.execute_tool_with_cancel(
+                    &request.user_id,
+                    executor_id,
+                    &request.tool_name,
+                    &request.args,
+                    cancel_token,
+                )
+                .await
+            }
+            None => {
+                pool.execute_tool_any_edge_with_cancel(
+                    &request.user_id,
+                    &request.tool_name,
+                    &request.args,
+                    cancel_token,
+                )
+                .await
+            }
         };
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
@@ -743,10 +746,12 @@ fn edge_ledger_event_fields_from_metadata(
 }
 
 fn edge_executor_id(request: &ToolExecutionRequest) -> Option<&str> {
-    if matches!(request.executor.kind, ExecutorBindingKind::EdgeAgent)
-        && !request.executor.executor_id.trim().is_empty()
-    {
-        Some(request.executor.executor_id.as_str())
+    if matches!(request.executor.kind, ExecutorBindingKind::EdgeAgent) {
+        let executor_id = request.executor.executor_id.trim();
+        if !executor_id.is_empty() {
+            return Some(executor_id);
+        }
+        None
     } else {
         None
     }
@@ -1719,5 +1724,101 @@ mod tests {
         assert_eq!(metadata["executor"]["status"], "degraded");
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(local.calls(), 0);
+    }
+
+    /// Verify edge_executor_id never returns Some("") — the pattern
+    /// `is_some() + unwrap_or_default()` was previously exploitable.
+    #[test]
+    fn edge_executor_id_returns_none_for_empty_id() {
+        let request = ToolExecutionRequest {
+            executor: ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: String::new(),
+                display_name: "test-edge".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            workspace: WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "test-ws".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: FallbackPolicy::Disabled,
+            },
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({"cmd": "ls"}),
+            user_id: "test-user".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "tc-1".to_string(),
+            policy: ToolPolicySnapshot::default(),
+        };
+        assert_eq!(
+            edge_executor_id(&request),
+            None,
+            "empty executor_id on EdgeAgent must return None, not silently route with empty string"
+        );
+    }
+
+    /// When executor_id is whitespace-only, edge_executor_id returns None.
+    #[test]
+    fn edge_executor_id_rejects_whitespace_only_id() {
+        let request = ToolExecutionRequest {
+            executor: ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "   ".to_string(),
+                display_name: "test-edge".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            workspace: WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "test-ws".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: FallbackPolicy::Disabled,
+            },
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({"cmd": "ls"}),
+            user_id: "test-user".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "tc-1".to_string(),
+            policy: ToolPolicySnapshot::default(),
+        };
+        assert_eq!(
+            edge_executor_id(&request),
+            None,
+            "whitespace-only executor_id must be treated as unset"
+        );
+    }
+
+    /// verify match-based routing: None → execute_tool_any_edge_with_cancel
+    #[test]
+    fn edge_executor_id_returns_some_for_valid_id() {
+        let request = ToolExecutionRequest {
+            executor: ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "  valid-edge-123  ".to_string(),
+                display_name: "test-edge".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            workspace: WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "test-ws".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: FallbackPolicy::Disabled,
+            },
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({"cmd": "ls"}),
+            user_id: "test-user".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "tc-1".to_string(),
+            policy: ToolPolicySnapshot::default(),
+        };
+        assert_eq!(edge_executor_id(&request), Some("valid-edge-123"));
     }
 }

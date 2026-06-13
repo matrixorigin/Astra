@@ -95,6 +95,22 @@ pub enum OrphanReason {
     ChannelClosed,
 }
 
+/// Forked event detected during journal/DB reconciliation.
+#[derive(Debug, Clone)]
+pub struct ForkedEvent {
+    pub event: JournalEvent,
+    pub reason: ForkReason,
+}
+
+/// Why a journal event is missing from the DB projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkReason {
+    /// Event exists in journal but not in DB.
+    MissingFromDb,
+    /// Event hash mismatch between journal and DB.
+    ContentMismatch,
+}
+
 /// Error during DB ingestion.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum IngestionError {
@@ -461,6 +477,84 @@ impl EventCoordinator {
                     self.persist_timeout,
                 ))
             }
+        }
+    }
+
+    /// Detect journal events that are missing from DB projection.
+    ///
+    /// Called at session startup to identify persistent journal/DB forks.
+    /// Events in the journal but not in DB are returned so a recovery
+    /// process can re-ingest them.
+    pub fn detect_forked_events<'a>(
+        journal_events: impl Iterator<Item = &'a JournalEvent>,
+        db_event_count: u64,
+    ) -> Vec<ForkedEvent> {
+        let mut forked = Vec::new();
+        let mut seen: u64 = 0;
+
+        for event in journal_events {
+            seen += 1;
+            if seen > db_event_count {
+                forked.push(ForkedEvent {
+                    event: event.clone(),
+                    reason: ForkReason::MissingFromDb,
+                });
+            }
+        }
+
+        if seen < db_event_count {
+            warn!(
+                journal_count = seen,
+                db_count = db_event_count,
+                "DB has more events than journal — possible journal truncation"
+            );
+        }
+
+        forked
+    }
+
+    /// Re-ingest a forked event into the DB without re-writing to the journal.
+    ///
+    /// Used at session startup to heal journal/DB forks detected by
+    /// [`detect_forked_events`]. Skips journal write (event already durable)
+    /// and sends directly to the ingestion channel with confirmation timeout.
+    pub async fn reingest_forked_event(&self, event: &JournalEvent) -> Result<(), EventError> {
+        let (confirm_tx, confirm_rx) = oneshot::channel();
+        let request = IngestionRequest {
+            event: event.clone(),
+            confirm_tx,
+        };
+
+        // Send to ingestion channel (with timeout)
+        match tokio::time::timeout(self.ingestion_send_timeout, self.ingestion_tx.send(request))
+            .await
+        {
+            Ok(Ok(())) => { /* send succeeded */ }
+            Ok(Err(_)) => {
+                return Err(EventError::ChannelClosed);
+            }
+            Err(_) => {
+                return Err(EventError::IngestionSendTimeout(
+                    self.ingestion_send_timeout,
+                ));
+            }
+        }
+
+        // Await DB confirmation (with timeout)
+        match tokio::time::timeout(self.persist_timeout, confirm_rx).await {
+            Ok(Ok(Ok(()))) => {
+                debug!(event_type = ?event.event_type, "forked event re-ingested to DB");
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                warn!(event_type = ?event.event_type, error = %e, "forked event DB re-ingestion failed");
+                Err(EventError::Orphaned(format!("{:?}", event.event_type)))
+            }
+            Ok(Err(_)) => Err(EventError::ChannelClosed),
+            Err(_) => Err(EventError::Timeout(
+                format!("{:?}", event.event_type),
+                self.persist_timeout,
+            )),
         }
     }
 }
@@ -847,5 +941,130 @@ mod tests {
         let result = coord.emit_event(event).await;
 
         assert!(matches!(result, Err(EventError::ChannelClosed)));
+    }
+
+    #[test]
+    fn detect_forked_events_basic() {
+        let events: Vec<JournalEvent> = (0..5)
+            .map(|i| make_event(&format!("event-{}", i)))
+            .collect();
+
+        // DB has only 3 events (events 0,1,2) → events 3,4 are forked
+        let forked = EventCoordinator::detect_forked_events(events.iter(), 3);
+        assert_eq!(
+            forked.len(),
+            2,
+            "events 3 and 4 should be detected as missing from DB"
+        );
+        assert_eq!(forked[0].reason, ForkReason::MissingFromDb);
+        assert_eq!(forked[1].reason, ForkReason::MissingFromDb);
+    }
+
+    #[test]
+    fn detect_forked_events_exact_match() {
+        let events: Vec<JournalEvent> = (0..3)
+            .map(|i| make_event(&format!("event-{}", i)))
+            .collect();
+
+        // DB has exactly 3 events → no fork
+        let forked = EventCoordinator::detect_forked_events(events.iter(), 3);
+        assert!(
+            forked.is_empty(),
+            "exact match should produce no forked events, got {forked:?}"
+        );
+    }
+
+    #[test]
+    fn detect_forked_events_db_has_more() {
+        let events: Vec<JournalEvent> = (0..2)
+            .map(|i| make_event(&format!("event-{}", i)))
+            .collect();
+
+        // DB has 5 events (more than journal) → possible truncation, but no MissingFromDb
+        let forked = EventCoordinator::detect_forked_events(events.iter(), 5);
+        assert!(
+            forked.is_empty(),
+            "DB having more events is not a fork (possible truncation)"
+        );
+    }
+
+    #[test]
+    fn detect_forked_events_empty_journal() {
+        let events: Vec<JournalEvent> = vec![];
+        let forked = EventCoordinator::detect_forked_events(events.iter(), 0);
+        assert!(forked.is_empty());
+    }
+
+    /// End-to-end: when ingestion channel closes, the event is written to journal
+    /// but not DB. detect_forked_events must identify this discrepancy so
+    /// a recovery process can re-ingest.
+    #[tokio::test]
+    async fn channel_closed_event_journaled_detectable_as_fork() {
+        let (coord, journal, ingestion_rx, _broadcast_rx) = setup_coordinator();
+
+        // Drop receiver to simulate ingestion channel closed
+        drop(ingestion_rx);
+
+        let event = make_event("orphaned-by-channel-close");
+        let result = coord.emit_event(event).await;
+        assert!(
+            matches!(result, Err(EventError::ChannelClosed)),
+            "expected ChannelClosed error, got {result:?}"
+        );
+
+        // Verify event was written to journal despite channel failure
+        let journal_events: Vec<JournalEvent> = journal.events.lock().unwrap().clone();
+        assert_eq!(
+            journal_events.len(),
+            1,
+            "event should be in journal even after channel close"
+        );
+
+        // detect_forked_events should find the mismatch (1 journal, 0 DB)
+        let forked = EventCoordinator::detect_forked_events(journal_events.iter(), 0);
+        assert_eq!(
+            forked.len(),
+            1,
+            "journal/DB fork must be detectable after channel close"
+        );
+        assert_eq!(forked[0].reason, ForkReason::MissingFromDb);
+    }
+
+    /// Verify reingest_forked_event sends to DB without re-writing journal.
+    #[tokio::test]
+    async fn reingest_forked_event_skips_journal_write() {
+        let (coord, journal, mut ingestion_rx, _broadcast_rx) = setup_coordinator();
+
+        let forked_event = make_event("reingest-test");
+
+        // Start reingest
+        let handle = tokio::spawn({
+            let coord_clone = EventCoordinator::new(
+                Arc::clone(&coord.journal_writer),
+                coord.ingestion_tx.clone(),
+                coord.broadcast_tx.clone(),
+                Duration::from_secs(5),
+            );
+            let event = forked_event.clone();
+            async move { coord_clone.reingest_forked_event(&event).await }
+        });
+
+        // Confirm DB
+        let request = ingestion_rx
+            .recv()
+            .await
+            .expect("reingest should send to ingestion channel");
+        assert_eq!(request.event.event_type, JournalEventType::Turn);
+        request.confirm_tx.send(Ok(())).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "reingest should succeed: {result:?}");
+
+        // Journal must NOT be re-written
+        let journal_events: Vec<JournalEvent> = journal.events.lock().unwrap().clone();
+        assert!(
+            journal_events.is_empty(),
+            "reingest must NOT write to journal (event already durable)"
+        );
     }
 }

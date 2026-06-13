@@ -644,6 +644,122 @@ fn apply_open_ended_exploration_budget(state: &mut AgenticLoopState) -> bool {
     true
 }
 
+const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task(action='create'), then mark exactly one first task in_progress with task(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
+
+fn message_contains_any(message: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| message.contains(term))
+}
+
+fn message_contains_ascii_word(message: &str, word: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == word)
+}
+
+fn should_require_task_board_for_message(
+    message: &str,
+    profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+) -> bool {
+    let lower = message.to_lowercase();
+    let delegated_or_parallel = ["agent", "agents", "subagent", "spawn"]
+        .into_iter()
+        .any(|word| message_contains_ascii_word(&lower, word))
+        || message_contains_any(
+            &lower,
+            &[
+                "sub-agent",
+                "agent_fanout",
+                "fanout",
+                "multi-agent",
+                "多角度",
+                "并行",
+                "子任务",
+            ],
+        );
+    let codebase_scope = message_contains_any(
+        &lower,
+        &[
+            "branch",
+            "changes",
+            "diff",
+            "commit",
+            "repo",
+            "codebase",
+            "分支",
+            "改动",
+            "变更",
+            "代码库",
+            "当前分支",
+        ],
+    );
+    let broad_work = message_contains_any(
+        &lower,
+        &[
+            "systematic",
+            "first principles",
+            "end-to-end",
+            "all issues",
+            "everything",
+            "review again",
+            "cleanup",
+            "clean up",
+            "第一性原则",
+            "系统性",
+            "全部",
+            "所有",
+            "清理",
+            "优化",
+            "修复",
+            "重构",
+        ],
+    );
+    let review_or_repair = message_contains_any(
+        &lower,
+        &[
+            "review", "fix", "repair", "optimize", "refactor", "analyze", "审查", "评审", "分析",
+            "修复", "优化", "重构",
+        ],
+    );
+    let profile_requires_coordination = profile.mutates_workspace
+        || profile.exploratory_task
+        || profile.complexity == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex;
+
+    delegated_or_parallel
+        || (review_or_repair && codebase_scope && broad_work)
+        || (profile_requires_coordination && broad_work)
+}
+
+async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
+    host: &H,
+    state: &mut AgenticLoopState,
+) -> bool {
+    if !host.valid_tool_names().contains("task") {
+        return false;
+    }
+
+    state.refresh_task_board_snapshot().await;
+    if state.hooks.task_board_snapshot.has_unfinished_tasks() {
+        return false;
+    }
+
+    let inferred_profile =
+        astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+    let profile = if state.task_profile == Default::default() {
+        inferred_profile
+    } else {
+        state.task_profile
+    };
+    if !should_require_task_board_for_message(&state.message, profile) {
+        return false;
+    }
+
+    state.push_volatile(
+        super::host::VolatileKind::TaskBoardStartGate,
+        TASK_BOARD_START_GATE_MESSAGE,
+    );
+    true
+}
+
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     let budget = state.agentic_turn_budget;
     if budget.extension_turns == 0
@@ -881,6 +997,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
 ) {
     apply_open_ended_exploration_budget(state);
     apply_user_correction_reanchor(state);
+    maybe_inject_task_board_start_gate(host, state).await;
 
     if state
         .skills
@@ -1805,6 +1922,7 @@ mod tests {
     use crate::turn::agentic_loop::host::tests::{
         MockHost, make_hub, make_session, make_state, text_result,
     };
+    use crate::turn::agentic_loop::host::{TaskBoardSnapshot, VolatileKind};
 
     use super::*;
 
@@ -1960,6 +2078,64 @@ mod tests {
             "budget injection must be idempotent (singleton dedup); pending={:?}",
             state.volatile_pending,
         );
+    }
+
+    #[tokio::test]
+    async fn preamble_requires_task_board_before_broad_agent_review() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task", "agent_fanout"]);
+        let mut state = make_state();
+        state.message = "3 agents review这个分支的changes. 第一性原则，不考虑兼容".to_string();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        run_loop_preamble(&mut host, &mut state).await;
+
+        let gate = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::TaskBoardStartGate)
+            .expect("broad delegated review should receive task-board start gate");
+        assert!(
+            gate.content.contains("Before broad analysis")
+                && gate.content.contains("task(action='create')")
+                && gate.content.contains("in_progress"),
+            "{:?}",
+            state.volatile_pending
+        );
+    }
+
+    #[tokio::test]
+    async fn preamble_does_not_require_new_task_board_when_one_is_active() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task", "agent_fanout"]);
+        let mut state = make_state();
+        state.message = "multi-agent review current branch changes from first principles".into();
+        state.hooks.task_board_snapshot = TaskBoardSnapshot {
+            pending_count: 1,
+            in_progress_count: 0,
+            blocked_count: 0,
+            active_tasks: vec!["task-1 Review branch [pending]".into()],
+        };
+
+        run_loop_preamble(&mut host, &mut state).await;
+
+        assert!(
+            !state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.kind == VolatileKind::TaskBoardStartGate),
+            "existing board should be reconciled, not duplicated: {:?}",
+            state.volatile_pending
+        );
+    }
+
+    #[test]
+    fn task_board_start_gate_does_not_treat_agentic_as_agent_delegation() {
+        let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+            "explain the agentic loop at a high level",
+        );
+        assert!(!should_require_task_board_for_message(
+            "explain the agentic loop at a high level",
+            profile
+        ));
     }
 
     #[test]
