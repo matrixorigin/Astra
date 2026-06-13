@@ -441,6 +441,45 @@ pub(crate) fn background_task_live_control_state(
     }
 }
 
+pub(crate) const PENDING_BASH_HANDOFF_TASK_ID: &str = "bg-shell-handoff";
+
+pub(crate) fn pending_bash_handoff_row(
+    title: &str,
+    elapsed_ms: u64,
+) -> super::bottom_pane::background_task_view::BackgroundTaskRow {
+    let title = title.trim();
+    let title = if title.is_empty() {
+        "Bash handoff"
+    } else {
+        title
+    };
+    let tail = "Waiting for foreground Bash to hand off its process.".to_string();
+    super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
+        PENDING_BASH_HANDOFF_TASK_ID,
+        "pending",
+        elapsed_ms,
+        title,
+        None,
+        Some(tail.clone()),
+        Some(tail.len() as u64),
+    )
+    .with_output_stats(None, Some(1))
+}
+
+pub(crate) fn sync_background_task_footer_from_rows(
+    bottom_pane: &mut BottomPane,
+    rows: &[super::bottom_pane::background_task_view::BackgroundTaskRow],
+) {
+    let counts = super::status_line::BackgroundTaskCounts::from_rows(rows);
+    bottom_pane.footer.bg_task_counts = if counts.is_empty() {
+        None
+    } else {
+        Some(counts)
+    };
+    bottom_pane.footer.bg_fanout_summaries =
+        super::status_line::BackgroundTaskFanoutSummary::from_rows(rows);
+}
+
 pub(crate) async fn open_background_task_view(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
@@ -467,25 +506,99 @@ pub(crate) async fn reveal_background_task_view(
     frame_requester: &FrameRequester,
     selected_id: Option<&str>,
 ) -> bool {
-    let rows =
+    reveal_background_task_view_rows_inner(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        Vec::new(),
+        selected_id,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn reveal_background_task_view_with_extra_rows(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+    extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
+    selected_id: Option<&str>,
+) -> bool {
+    reveal_background_task_view_rows_inner(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        extra_rows,
+        selected_id,
+        false,
+    )
+    .await
+}
+
+/// Always open the background task panel, even if the registry is empty.
+/// Used by Ctrl+B so the user always lands in a panel they can navigate or
+/// dismiss. Empty-state rendering lives in `BackgroundTaskView`.
+pub(crate) async fn force_open_background_task_view(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    reveal_background_task_view_rows_inner(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+        Vec::new(),
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reveal_background_task_view_rows_inner(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+    extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
+    selected_id: Option<&str>,
+    force_open: bool,
+) -> bool {
+    let mut rows =
         background_task_rows_with_agents(background_registry, agent_spawner, restored_local_agents)
             .await;
-    if rows.is_empty() {
-        return false;
-    }
-    let counts = super::status_line::BackgroundTaskCounts::from_rows(&rows);
-    if counts.is_empty() {
-        return false;
-    }
-    use super::bottom_pane::background_task_view::BackgroundTaskView;
+    rows.extend(extra_rows);
+    sync_background_task_footer_from_rows(bottom_pane, &rows);
     if bottom_pane.accepts_background_task_rows() {
         bottom_pane.refresh_background_task_rows_selecting(rows, selected_id);
-    } else {
-        bottom_pane.push_view(Box::new(BackgroundTaskView::new_with_selected(
-            rows,
-            selected_id,
-        )));
+        bottom_pane.sync_popups();
+        frame_requester.schedule_frame();
+        return true;
     }
+    if !force_open {
+        let counts = super::status_line::BackgroundTaskCounts::from_rows(&rows);
+        if counts.is_empty() {
+            bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+            return false;
+        }
+    }
+    use super::bottom_pane::background_task_view::BackgroundTaskView;
+    bottom_pane.push_view(Box::new(BackgroundTaskView::new_with_selected(
+        rows,
+        selected_id,
+    )));
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
     true
@@ -550,6 +663,7 @@ pub(crate) async fn try_dispatch_background_task_stop_sentinel(
         restored_local_agents,
     )
     .await;
+    sync_background_task_footer_from_rows(bottom_pane, &rows);
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();

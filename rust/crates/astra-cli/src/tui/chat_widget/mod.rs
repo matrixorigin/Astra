@@ -493,6 +493,12 @@ impl ChatWidget {
 
     pub fn set_bash_background_hint_enabled(&mut self, enabled: bool) {
         self.bash_background_hint_enabled = enabled;
+        if let Some(cell) = self.active_cell.as_mut()
+            && let Some(tool) = cell.as_any_mut().downcast_mut::<ToolCell>()
+            && tool.name == "bash"
+        {
+            tool.set_ctrl_b_background_hint(enabled);
+        }
     }
 
     /// IDs of currently-live parallel TaskCells in spawn order.
@@ -2228,6 +2234,28 @@ mod tests {
             .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
             .unwrap();
         assert!(cell.ctrl_b_background_hint);
+    }
+
+    #[test]
+    fn bash_ctrl_b_hint_updates_existing_active_cell() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
+
+        w.set_bash_background_hint_enabled(true);
+        let cell = w
+            .active_cell
+            .as_deref()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .unwrap();
+        assert!(cell.ctrl_b_background_hint);
+
+        w.set_bash_background_hint_enabled(false);
+        let cell = w
+            .active_cell
+            .as_deref()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<ToolCell>())
+            .unwrap();
+        assert!(!cell.ctrl_b_background_hint);
     }
 
     #[test]

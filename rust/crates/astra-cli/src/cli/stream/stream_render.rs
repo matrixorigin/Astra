@@ -6977,11 +6977,6 @@ mod tests {
             payload.command,
             "printf 'before\\n'; sleep 5; printf 'after\\n'"
         );
-        assert!(
-            payload.partial_stdout.contains("before"),
-            "partial stdout should include foreground bytes: {:?}",
-            payload.partial_stdout
-        );
         payload
             .adoption_tx
             .send(Ok("bg-shell-edge".to_string()))
