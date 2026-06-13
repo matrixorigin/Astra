@@ -974,7 +974,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait for new output or terminal status before returning. Default true."
+                            "description": "Wait for new output or terminal status before returning. Default false; set true only when the user explicitly asks to wait."
                         },
                         "offset": {
                             "type": "integer",
@@ -988,7 +988,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Max ms to wait when block=true. Default 30000, max 300000."
+                            "description": "Max ms to wait when block=true, and max registry response wait when block=false. Default 30000, max 300000."
                         }
                     },
                     "required": ["task_id"]
@@ -1327,6 +1327,21 @@ mod tests {
         assert!(
             output_desc.contains("background task") && !output_desc.contains("job(action"),
             "task_output description must teach typed background task vocabulary"
+        );
+        let output_block_desc = find_schema(&schemas, "task_output")
+            .and_then(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|f| f.get("parameters"))
+                    .and_then(|p| p.get("properties"))
+                    .and_then(|p| p.get("block"))
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default();
+        assert!(
+            output_block_desc.contains("Default false"),
+            "task_output must default to snapshot reads unless the user asks to wait"
         );
         assert!(
             find_schema(&schemas, "agent_job").is_none(),

@@ -485,6 +485,36 @@ pub enum BgTaskCommand {
     },
 }
 
+#[cfg(not(test))]
+const BG_TASK_COMMAND_REPLY_TIMEOUT_MS: u64 = 1_000;
+#[cfg(test)]
+const BG_TASK_COMMAND_REPLY_TIMEOUT_MS: u64 = 25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BgTaskReplyError {
+    Closed,
+    TimedOut,
+}
+
+fn background_task_reply_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.clamp(1, BG_TASK_COMMAND_REPLY_TIMEOUT_MS))
+}
+
+async fn await_bg_task_command_reply<T>(
+    rx: tokio::sync::oneshot::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, BgTaskReplyError> {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_)) => Err(BgTaskReplyError::Closed),
+        Err(_) => Err(BgTaskReplyError::TimedOut),
+    }
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn format_background_task_error(task_id: &str, error: &str) -> String {
     if error.contains("no background shell with id") || error.contains("no background task with id")
     {
@@ -592,6 +622,27 @@ fn format_background_task_output(
 
 fn format_background_task_output_timeout(task_id: &str, timeout_ms: u64) -> String {
     format!("Read shell output {task_id}\nNo output yet · still running after {timeout_ms}ms")
+}
+
+fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
+    format!(
+        "Read shell output {task_id}\nBackground task registry did not respond within {}ms. Output polling is unavailable for this turn; the task may still be running.",
+        duration_ms_u64(timeout)
+    )
+}
+
+fn format_background_task_stop_registry_timeout(task_id: &str, timeout: Duration) -> String {
+    format!(
+        "Background task {task_id} stop status unknown\nBackground task registry did not respond within {}ms. The task may still be running; retry task_stop or task_list.",
+        duration_ms_u64(timeout)
+    )
+}
+
+fn format_background_task_list_registry_timeout(timeout: Duration) -> String {
+    format!(
+        "Background task registry unavailable\nTimed out after {}ms waiting for the interactive session to answer. Background tasks may still be running; retry task_list later.",
+        duration_ms_u64(timeout)
+    )
 }
 
 fn format_background_task_unavailable(cloud_session: bool) -> String {
@@ -2324,8 +2375,16 @@ impl ToolExecutor {
             let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::List { reply: tx });
         }
-        rx.await
-            .unwrap_or_else(|_| "Error: background task registry not available".to_string())
+        let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
+        match await_bg_task_command_reply(rx, reply_timeout).await {
+            Ok(output) => output,
+            Err(BgTaskReplyError::Closed) => {
+                "Error: background task registry not available".to_string()
+            }
+            Err(BgTaskReplyError::TimedOut) => {
+                format_background_task_list_registry_timeout(reply_timeout)
+            }
+        }
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -2337,7 +2396,7 @@ impl ToolExecutor {
             Err(error) => return error.to_string(),
             Ok(None) => return "Task id is required".to_string(),
         };
-        let block = args.get("block").and_then(Value::as_bool).unwrap_or(true);
+        let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let max_bytes = args
             .get("max_bytes")
@@ -2348,12 +2407,16 @@ impl ToolExecutor {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
-            .min(300_000);
+            .clamp(1, 300_000);
 
         if block {
-            let deadline =
-                tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
             loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                }
+                let reply_timeout = background_task_reply_timeout(timeout_ms).min(remaining);
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 {
                     let mut cmds = bg_commands.lock_recover();
@@ -2364,7 +2427,7 @@ impl ToolExecutor {
                         reply: tx,
                     });
                 }
-                match rx.await {
+                match await_bg_task_command_reply(rx, reply_timeout).await {
                     Ok(Ok(snapshot)) => {
                         if snapshot.kind != "shell"
                             || background_task_status_should_return_immediately(&snapshot.status)
@@ -2375,14 +2438,28 @@ impl ToolExecutor {
                         }
                     }
                     Ok(Err(e)) => return format_background_task_error(&task_id, &e),
-                    Err(_) => return "Error: background task registry not available".to_string(),
+                    Err(BgTaskReplyError::Closed) => {
+                        return "Error: background task registry not available".to_string();
+                    }
+                    Err(BgTaskReplyError::TimedOut) => {
+                        return format_background_task_output_registry_timeout(
+                            &task_id,
+                            reply_timeout,
+                        );
+                    }
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return format_background_task_output_timeout(&task_id, timeout_ms);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                let sleep_for = Duration::from_millis(500)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                if sleep_for.is_zero() {
+                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                }
+                tokio::time::sleep(sleep_for).await;
             }
         } else {
+            let reply_timeout = background_task_reply_timeout(timeout_ms);
             let (tx, rx) = tokio::sync::oneshot::channel();
             {
                 let mut cmds = bg_commands.lock_recover();
@@ -2393,10 +2470,15 @@ impl ToolExecutor {
                     reply: tx,
                 });
             }
-            match rx.await {
+            match await_bg_task_command_reply(rx, reply_timeout).await {
                 Ok(Ok(snapshot)) => format_background_task_output(&task_id, offset, &snapshot),
                 Ok(Err(e)) => format_background_task_error(&task_id, &e),
-                Err(_) => "Error: background task registry not available".to_string(),
+                Err(BgTaskReplyError::Closed) => {
+                    "Error: background task registry not available".to_string()
+                }
+                Err(BgTaskReplyError::TimedOut) => {
+                    format_background_task_output_registry_timeout(&task_id, reply_timeout)
+                }
             }
         }
     }
@@ -2418,10 +2500,16 @@ impl ToolExecutor {
                 reply: tx,
             });
         }
-        match rx.await {
+        let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
+        match await_bg_task_command_reply(rx, reply_timeout).await {
             Ok(Ok(())) => format!("Background task {task_id} stopped."),
             Ok(Err(e)) => format_background_task_stop_error(&task_id, &e),
-            Err(_) => "Error: background task registry not available".to_string(),
+            Err(BgTaskReplyError::Closed) => {
+                "Error: background task registry not available".to_string()
+            }
+            Err(BgTaskReplyError::TimedOut) => {
+                format_background_task_stop_registry_timeout(&task_id, reply_timeout)
+            }
         }
     }
 
@@ -4814,11 +4902,11 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BgTaskOutputSnapshot, ToolExecutor, all_tool_schemas, detect_git_remote_repos,
-        extract_github_owner_repo, file_checkpoint_dir_for, format_background_task_error,
-        format_background_task_output, format_background_task_output_timeout,
-        format_background_task_stop_error, memoria, parse_memory_search_contents,
-        utf16_col_to_char_idx,
+        BgTaskCommand, BgTaskOutputSnapshot, ToolExecutor, all_tool_schemas,
+        detect_git_remote_repos, extract_github_owner_repo, file_checkpoint_dir_for,
+        format_background_task_error, format_background_task_output,
+        format_background_task_output_timeout, format_background_task_stop_error, memoria,
+        parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::lock_recovery::LockRecovery;
     use std::path::PathBuf;
@@ -4935,6 +5023,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_output_nonblocking_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_output(&serde_json::json!({
+                "task_id": "bg-shell-1",
+                "block": false,
+                "timeout_ms": 5
+            })),
+        )
+        .await
+        .expect("registry reply timeout should bound task_output");
+
+        assert!(
+            result.contains("Background task registry did not respond within 5ms"),
+            "{result}"
+        );
+        assert!(result.contains("task may still be running"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn task_output_blocking_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_output(&serde_json::json!({
+                "task_id": "bg-shell-1",
+                "block": true,
+                "timeout_ms": 5
+            })),
+        )
+        .await
+        .expect("registry reply timeout should bound blocking task_output");
+
+        assert!(
+            result.contains("Background task registry did not respond within"),
+            "{result}"
+        );
+        assert!(result.contains("task may still be running"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn task_output_defaults_to_nonblocking_snapshot() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands.clone());
+        let args = serde_json::json!({
+            "task_id": "bg-shell-1",
+            "timeout_ms": 10_000
+        });
+        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let output_fut = executor.task_output(&args);
+            tokio::pin!(output_fut);
+
+            loop {
+                tokio::select! {
+                    output = &mut output_fut => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        let command = commands.lock_recover().pop();
+                        if let Some(BgTaskCommand::GetOutputSince {
+                            task_id,
+                            offset,
+                            reply,
+                            ..
+                        }) = command
+                        {
+                            assert_eq!(task_id, "bg-shell-1");
+                            assert_eq!(offset, 0);
+                            let _ = reply.send(Ok(bg_snapshot(0, 0, 0, "running", "")));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("default task_output should return the first snapshot without waiting");
+
+        assert!(output.contains("Read shell output bg-shell-1"), "{output}");
+        assert!(output.contains("No output yet"), "{output}");
+    }
+
+    #[tokio::test]
     async fn task_stop_cloud_without_edge_runner_names_missing_runner() {
         let executor = test_executor().with_cloud("https://cloud.example", "token");
         let result = tokio::time::timeout(
@@ -4950,6 +5121,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_stop_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_kill_bg(&serde_json::json!({"task_id": "bg-shell-1"})),
+        )
+        .await
+        .expect("registry reply timeout should bound task_stop");
+
+        assert!(
+            result.contains("Background task bg-shell-1 stop status unknown"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Background task registry did not respond within"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
     async fn task_list_cloud_without_edge_runner_names_missing_runner() {
         let executor = test_executor().with_cloud("https://cloud.example", "token");
         let result = tokio::time::timeout(
@@ -4961,6 +5153,27 @@ mod tests {
         assert_eq!(
             result,
             "Background task unavailable\nno edge runner is attached to this cloud session"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_list_bg(),
+        )
+        .await
+        .expect("registry reply timeout should bound task_list");
+
+        assert!(
+            result.contains("Background task registry unavailable"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Timed out after") && result.contains("retry task_list"),
+            "{result}"
         );
     }
 
