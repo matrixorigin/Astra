@@ -1,3 +1,4 @@
+import type { StreamEvent } from "@astra/sdk";
 import {
   setChatActiveRun,
   updateStreamingAssistantMessage,
@@ -35,7 +36,7 @@ function normalizeEventIndex(value: unknown): number | null {
   return Math.trunc(value);
 }
 
-export function blockedWaitingFor(event: Record<string, unknown>) {
+export function blockedWaitingFor(event: StreamEvent) {
   return (
     extractBlockedReason(
       event as {
@@ -48,12 +49,9 @@ export function blockedWaitingFor(event: Record<string, unknown>) {
   );
 }
 
-export function eventMessage(
-  event: Record<string, unknown>,
-  fallback: string,
-): string {
-  for (const key of ["message", "error", "user_message", "reason"]) {
-    const value = event[key];
+export function eventMessage(event: StreamEvent, fallback: string): string {
+  for (const key of ["message", "error", "user_message", "reason"] as const) {
+    const value = (event as Record<string, unknown>)[key];
     if (typeof value === "string" && value.trim()) {
       return value;
     }
@@ -61,9 +59,9 @@ export function eventMessage(
   return fallback;
 }
 
-export function explicitEventMessage(event: Record<string, unknown>): string {
-  for (const key of ["message", "error", "user_message"]) {
-    const value = event[key];
+export function explicitEventMessage(event: StreamEvent): string {
+  for (const key of ["message", "error", "user_message"] as const) {
+    const value = (event as Record<string, unknown>)[key];
     if (typeof value === "string" && value.trim()) {
       return value;
     }
@@ -76,7 +74,7 @@ export function isRunBlockedEvent(type: string): boolean {
 }
 
 export function applyStreamEvent(
-  event: Record<string, unknown>,
+  event: StreamEvent,
   ctx: StreamEventContext,
   state: StreamEventState,
 ): void {
