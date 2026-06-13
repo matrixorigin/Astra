@@ -1151,10 +1151,15 @@ fn restore_session_state_compact(
 }
 
 fn restore_step_checkpoint_runtime_state(
-    restored: &astra_pipeline::step_restore::RestoredSession,
+    restored: astra_pipeline::step_restore::RestoredSession,
     current_date: &str,
     loop_state: &mut AgenticLoopState,
 ) {
+    loop_state.restricted_tools.extend(restored.blocked_tools);
+    if !restored.recent_tools.is_empty() {
+        loop_state.recent_tools = restored.recent_tools;
+    }
+    loop_state.idempotency_cache = restored.idempotency_cache;
     loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
@@ -4897,7 +4902,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // state needed for long-running sessions.
         if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
             restore_step_checkpoint_runtime_state(
-                &restored,
+                restored,
                 &fresh_session_current_date,
                 &mut loop_state,
             );
@@ -5434,7 +5439,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if request.session_id.is_some() {
             if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
                 restore_step_checkpoint_runtime_state(
-                    &restored,
+                    restored,
                     &fresh_session_current_date,
                     &mut state,
                 );
@@ -7581,18 +7586,33 @@ mod tests {
     }
 
     #[test]
-    fn restore_step_checkpoint_runtime_state_restores_compaction_tracker_and_context_errors() {
+    fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_state() {
         let svc = test_service();
         let request = test_request("resume");
         let mut state =
             svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+            "read_file",
+            &json!({"path": "src/lib.rs"}),
+        );
+        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
+        idempotency_cache.record(
+            &idem_key,
+            astra_pipeline::step_protocol::CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "cached contents".into(),
+                is_error: false,
+                cached_at: 123,
+                context_signature: None,
+            },
+        );
         let restored = astra_pipeline::step_restore::RestoredSession {
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
-            blocked_tools: Vec::new(),
-            recent_tools: Vec::new(),
-            idempotency_cache: astra_pipeline::step_protocol::InMemoryIdempotencyCache::new(),
+            blocked_tools: vec!["flaky_tool".into()],
+            recent_tools: vec!["read_file".into(), "bash".into()],
+            idempotency_cache,
             resume_turn: 0,
             protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),
@@ -7609,8 +7629,15 @@ mod tests {
             pipeline_state: None,
         };
 
-        restore_step_checkpoint_runtime_state(&restored, "2026-06-13", &mut state);
+        restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state);
 
+        assert!(state.restricted_tools.contains("flaky_tool"));
+        assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
+        let cached = state
+            .idempotency_cache
+            .check(&idem_key)
+            .expect("idempotency cache should be restored");
+        assert_eq!(cached.output, "cached contents");
         assert_eq!(state.consecutive_context_window_errors, 5);
         assert_eq!(state.compaction_effectiveness.attempt_count, 6);
         assert_eq!(
