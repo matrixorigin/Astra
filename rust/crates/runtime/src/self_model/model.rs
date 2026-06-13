@@ -395,7 +395,9 @@ impl SelfModel {
                         rehabilitation_count: h.rehabilitation_count,
                     });
                 }
-                if h.deprioritized {
+                if h.deprioritized
+                    && !astra_turn_core::tool::categories::registry().is_never_restrict(name)
+                {
                     deprioritized.push(name.clone());
                 }
             }
@@ -1401,12 +1403,12 @@ mod tests {
         let mut health = ToolHealthTracker::new();
         health.record_success("bash");
         health.record_success("bash");
-        health.record_failure("web_search");
-        health.record_failure("web_search");
-        health.record_failure("web_search");
+        health.record_failure("write_file");
+        health.record_failure("write_file");
+        health.record_failure("write_file");
 
         let model = SelfModel::snapshot(
-            &["bash", "web_search"],
+            &["bash", "write_file"],
             &[],
             &[],
             &[],
@@ -1422,8 +1424,46 @@ mod tests {
             &[],
             &config,
         );
-        assert_eq!(model.capabilities.deprioritized_tools, vec!["web_search"]);
+        assert_eq!(model.capabilities.deprioritized_tools, vec!["write_file"]);
         assert_eq!(model.capabilities.tool_health.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_filters_read_only_health_from_deprioritized_capabilities() {
+        let config = RuntimeConfig::default();
+        let mut health = ToolHealthTracker::new();
+        health.record_resource_limit_failure("read_file");
+        health.record_failure("bash");
+        health.record_failure("bash");
+        health.record_failure("bash");
+
+        let model = SelfModel::snapshot(
+            &["bash", "read_file"],
+            &[],
+            &[],
+            &[],
+            Some(&health),
+            1,
+            None,
+            None,
+            None,
+            10,
+            0,
+            0,
+            None,
+            &[],
+            &config,
+        );
+
+        assert_eq!(model.capabilities.deprioritized_tools, vec!["bash"]);
+        assert!(
+            model
+                .capabilities
+                .tool_health
+                .iter()
+                .any(|entry| entry.name == "read_file" && entry.deprioritized),
+            "diagnostics should still show the read-only tool health record"
+        );
     }
 
     #[test]
