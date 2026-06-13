@@ -35,13 +35,19 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     // Task-focus manifests
     "[Active task attachment]",
     "[Self-check",
+    "[attention:v1]",
+    "[session-anchor]",
+    "[working-set:v1]",
     // Batching / parallel feedback
     "✓ Previous round:",
     "♻ Duplicate calls detected",
     // Runtime directives
     "⚠️ VERIFICATION REQUIRED",
     "🔄 ERROR BUDGET",
+    "<system-reminder>",
     // Runtime correction / warning headers
+    "## Already Fetched",
+    "## Cross-Session Project Context",
     "## ⤴",
     "## ⚠",
     "Runtime correction:",
@@ -172,6 +178,42 @@ mod tests {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "[Active task attachment] Resume the active task below"
+        )));
+    }
+
+    #[test]
+    fn context_manifests_are_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[attention:v1]\ngoal: ship auth"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[working-set:v1]\ngoal: ship auth"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[session-anchor]\nResume previous task state"
+        )));
+    }
+
+    #[test]
+    fn inventory_and_cross_session_context_are_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## Already Fetched (do NOT re-read)\nfoo.rs"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## Cross-Session Project Context\n- stale retrieved memory"
+        )));
+    }
+
+    #[test]
+    fn system_reminder_wrapper_is_scaffolding_across_roles() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "<system-reminder>\nBackground task updates"
         )));
     }
 
