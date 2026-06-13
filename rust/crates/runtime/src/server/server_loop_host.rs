@@ -13,7 +13,7 @@
 //!       → post_tool_policy(): stall/dedup/guard
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,7 +67,7 @@ const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 pub(crate) struct RunScopedAgentProgressFilter {
     pub(crate) run_ids: HashSet<String>,
     pub(crate) agent_ids: HashSet<String>,
-    pub(crate) pending_by_agent: HashMap<String, Vec<AgentProgressEvent>>,
+    pub(crate) pending_by_agent: HashMap<String, VecDeque<AgentProgressEvent>>,
 }
 
 impl RunScopedAgentProgressFilter {
@@ -99,8 +99,8 @@ impl RunScopedAgentProgressFilter {
                     .pending_by_agent
                     .remove(&event.agent_id)
                     .unwrap_or_default();
-                accepted.push(event);
-                return accepted;
+                accepted.push_back(event);
+                return accepted.into_iter().collect();
             }
 
             self.pending_by_agent.remove(&event.agent_id);
@@ -124,9 +124,9 @@ impl RunScopedAgentProgressFilter {
             .entry(event.agent_id.clone())
             .or_default();
         if pending.len() >= MAX_PENDING_PROGRESS_PER_AGENT {
-            pending.remove(0);
+            pending.pop_front();
         }
-        pending.push(event);
+        pending.push_back(event);
     }
 }
 

@@ -7689,6 +7689,37 @@ mod tests {
     }
 
     #[test]
+    fn run_scoped_agent_progress_filter_replays_bounded_latest_early_events_in_order() {
+        let mut filter =
+            server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
+
+        for timestamp in 1..=10 {
+            assert!(
+                filter
+                    .accept(test_agent_progress_event(
+                        "agent-a",
+                        timestamp,
+                        ProgressEventType::ToolExecuting {
+                            tool_name: format!("tool-{timestamp}"),
+                            turn: timestamp as u32,
+                        },
+                    ))
+                    .is_empty()
+            );
+        }
+
+        let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 11));
+
+        assert_eq!(
+            accepted
+                .iter()
+                .map(|event| event.timestamp_epoch_ms)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
+    }
+
+    #[test]
     fn run_scoped_agent_progress_filter_blocks_foreign_root_events() {
         let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-a".to_string());
 
