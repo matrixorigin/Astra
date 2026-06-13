@@ -26,7 +26,7 @@ use astra_skills::composition::{
 };
 use astra_tools::{ApprovalDecision, ToolApprovalGate};
 use astra_turn_core::ws_approval_gate::WebSocketApprovalGate;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 // ── Skill composition: schema validation ────────────────────────────────────
@@ -199,7 +199,7 @@ async fn concurrent_disjoint_approval_requests_do_not_cross_contaminate() {
 
     let ledger: Arc<TokioMutex<HashMap<String, serde_json::Value>>> =
         Arc::new(TokioMutex::new(HashMap::new()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel::<Value>(1);
     let gate = Arc::new(WebSocketApprovalGate::new(
         "user-concurrent".into(),
         ledger.clone(),

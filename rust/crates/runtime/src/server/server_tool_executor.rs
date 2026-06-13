@@ -1217,10 +1217,29 @@ impl ServerToolExecutor {
 
     /// Enable exactly-once execution for crash recovery deduplication.
     /// When enabled, tools are checked against an idempotency cache before execution.
+    /// The cache is warmed from the event store on creation to survive restarts.
     pub fn enable_exactly_once(&mut self) {
-        self.exactly_once_executor = Some(Mutex::new(
-            astra_pipeline::exactly_once::ExactlyOnceExecutor::new(),
-        ));
+        let mut executor = astra_pipeline::exactly_once::ExactlyOnceExecutor::new();
+
+        // Warm the cache from persisted step events so that after a crash,
+        // already-executed tools (especially side-effect tools like bash)
+        // are found in cache and not re-executed.
+        let (warmed_cache, _completed) =
+            astra_pipeline::step_restore::warm_cache_from_events(&self.session_id);
+        // Merge warmed entries into the new executor's cache.
+        // Since ExactlyOnceExecutor wraps InMemoryIdempotencyCache internally,
+        // we replace the fresh cache with the warmed one.
+        let warmed_len = warmed_cache.len();
+        if warmed_len > 0 {
+            *executor.cache_mut() = warmed_cache;
+            tracing::info!(
+                session_id = %self.session_id,
+                entries = warmed_len,
+                "Exactly-once cache warmed from event store"
+            );
+        }
+
+        self.exactly_once_executor = Some(Mutex::new(executor));
     }
 
     /// Check exactly-once cache and return cached result if available.

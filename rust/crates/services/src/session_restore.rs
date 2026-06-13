@@ -748,9 +748,7 @@ fn read_composite_snapshot_index_local(
     Ok(index)
 }
 
-fn composite_snapshots_json_path(
-    session_id: &str,
-) -> Result<PathBuf, String> {
+fn composite_snapshots_json_path(session_id: &str) -> Result<PathBuf, String> {
     crate::local_session_artifact_store()
         .session_path(session_id, "step_checkpoints/composite_snapshots.json")
         .map_err(|error| format!("invalid session_id: {error}"))

@@ -296,7 +296,7 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     let (previous_heavy, prev_state) = load_previous_recovery_state(state, &sid).await?;
     let session_state = super::super::session_projection::build_full_session_state_compact(
         state,
-        super::super::session_projection::CslCheckpointFields::default(),
+        super::super::session_projection::CslCheckpointFields,
         &prev_state,
     );
     let messages = super::super::session_projection::history_as_messages(&state.history);

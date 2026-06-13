@@ -533,11 +533,7 @@ impl ToolExecutionService {
         {
             return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
         }
-        let request_id = format!(
-            "xp-{}-{}",
-            request.session_id,
-            Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
-        );
+        let request_id = format!("xp-{}-{}", request.session_id, Uuid::new_v4().simple());
         let timeout_secs = 300u64;
         let msg = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
             request_id: request_id.clone(),
@@ -578,7 +574,13 @@ impl ToolExecutionService {
         let result_json = if let Some(token) = cancel_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {
-                    let _ = dispatch.fail_dispatch(&request_id, TOOL_ERROR_KIND_CANCELLED).await;
+                    if let Err(e) = dispatch.fail_dispatch(&request_id, TOOL_ERROR_KIND_CANCELLED).await {
+                        tracing::warn!(
+                            error = %e,
+                            request_id = %request_id,
+                            "failed to mark dispatch as cancelled"
+                        );
+                    }
                     return EdgeTransportAttempt::Delivered(cancelled_tool_result(&request.tool_name));
                 }
                 result = wait_result => result.ok().flatten(),
@@ -587,7 +589,13 @@ impl ToolExecutionService {
             wait_result.await.ok().flatten()
         };
         let Some(result_json) = result_json else {
-            let _ = dispatch.fail_dispatch(&request_id, "expired").await;
+            if let Err(e) = dispatch.fail_dispatch(&request_id, "expired").await {
+                tracing::warn!(
+                    error = %e,
+                    request_id = %request_id,
+                    "failed to mark dispatch as expired"
+                );
+            }
             return EdgeTransportAttempt::TransportDisconnected;
         };
         let (output, is_error) =

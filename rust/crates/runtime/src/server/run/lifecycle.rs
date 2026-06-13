@@ -3059,14 +3059,13 @@ pub struct AgenticRunLifecycleService {
     mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
-    approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
+    approval_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
     /// Per-run ask_user prompt channel receivers.
     /// Key: run_id → receiver that the WS handler drains.
-    user_prompt_channels:
-        Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
+    user_prompt_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
     /// Per-run progress event channel receivers (Phase F.3).
     /// Key: run_id → receiver that the WS handler drains.
-    progress_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<ProgressEvent>>>>,
+    progress_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<ProgressEvent>>>>,
     /// Hook DB writer for decision audit + skill selection persistence.
     hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     /// Memoria observer worker for cross-session knowledge extraction.
@@ -4543,7 +4542,13 @@ impl AgenticRunLifecycleService {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
         let workspace = base.join(&safe_id);
-        let _ = std::fs::create_dir_all(&workspace);
+        if let Err(error) = std::fs::create_dir_all(&workspace) {
+            tracing::warn!(
+                error = %error,
+                workspace = %workspace.display(),
+                "failed to create server workspace directory"
+            );
+        }
         Some(workspace)
     }
 
@@ -5002,7 +5007,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
 
             // ── Phase E: Wire WebSocket approval gate ───────────────
-            let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+            let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
             let approval_gate = astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new(
                 user_id.clone(),
                 self.edge_callback_ledger.clone(),
@@ -5015,7 +5020,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .insert(run_id.clone(), approval_rx);
 
             if request.interactive_client {
-                let (user_prompt_tx, user_prompt_rx) = mpsc::unbounded_channel();
+                let (user_prompt_tx, user_prompt_rx) = mpsc::channel::<Value>(64);
                 let user_prompt_gate =
                     astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
                         user_id.clone(),
@@ -5030,7 +5035,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // ── Phase F.3: Wire WebSocket progress callback ─────────
-            let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+            let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
             let progress_cb =
                 astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
                     progress_tx,
@@ -5478,19 +5483,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             runs.insert(run_id.clone(), run_state);
         }
-        if let Some((workspace_binding, executor_binding)) = execution_bindings.as_ref() {
-            for event in
-                binding_snapshot_events(&run_id, &session_id, workspace_binding, executor_binding)
-            {
-                if event_tx.send(event).await.is_err() {
-                    self.runs.write().await.remove(&run_id);
-                    return Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to start run event stream".to_string(),
-                    ));
-                }
-            }
-        }
+        // Persist run first, so the binding is durable before the client
+        // receives binding events and starts using the workspace.
         if let Err(error) = self
             .persist_run_start(
                 &run_id,
@@ -5503,6 +5497,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         {
             self.runs.write().await.remove(&run_id);
             return Err(error);
+        }
+        if let Some((workspace_binding, executor_binding)) = execution_bindings.as_ref() {
+            for event in
+                binding_snapshot_events(&run_id, &session_id, workspace_binding, executor_binding)
+            {
+                if event_tx.send(event).await.is_err() {
+                    self.runs.write().await.remove(&run_id);
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to start run event stream".to_string(),
+                    ));
+                }
+            }
         }
         if let Some(pool) = &self.shared_pool {
             let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
@@ -6954,7 +6961,13 @@ impl ServerSubRunExecutor {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
         let workspace = base.join(&safe_session).join(&safe_run);
-        let _ = std::fs::create_dir_all(&workspace);
+        if let Err(error) = std::fs::create_dir_all(&workspace) {
+            tracing::warn!(
+                error = %error,
+                workspace = %workspace.display(),
+                "failed to create run workspace directory"
+            );
+        }
         Ok(workspace)
     }
 }

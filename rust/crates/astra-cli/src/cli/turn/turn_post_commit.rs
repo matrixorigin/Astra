@@ -246,7 +246,7 @@ mod tests {
             &api,
             None,
             Vec::new(),
-            CslCheckpointFields::default(),
+            CslCheckpointFields,
             Instant::now(),
             &mut ui,
         )

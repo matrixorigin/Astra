@@ -41,7 +41,7 @@ pub struct ApprovalOutboundRequest {
 pub struct WebSocketApprovalGate {
     user_id: String,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    request_tx: mpsc::UnboundedSender<Value>,
+    request_tx: mpsc::Sender<Value>,
     timeout: Duration,
 }
 
@@ -49,7 +49,7 @@ impl WebSocketApprovalGate {
     pub fn new(
         user_id: String,
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-        request_tx: mpsc::UnboundedSender<Value>,
+        request_tx: mpsc::Sender<Value>,
     ) -> Self {
         Self {
             user_id,
@@ -75,7 +75,7 @@ impl ToolApprovalGate for WebSocketApprovalGate {
             "args": args,
         });
 
-        if self.request_tx.send(request).is_err() {
+        if self.request_tx.send(request).await.is_err() {
             // Channel closed — WS connection dropped.
             return ApprovalDecision::Denied {
                 reason: Some("WebSocket connection closed".into()),
@@ -137,7 +137,7 @@ mod tests {
     #[tokio::test]
     async fn approved_via_ledger() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketApprovalGate {
             user_id: "u1".into(),
@@ -168,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn denied_via_ledger() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketApprovalGate {
             user_id: "u1".into(),
@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_when_no_response() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketApprovalGate {
             user_id: "u1".into(),
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_evicts_late_response_from_ledger() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketApprovalGate {
             user_id: "u1".into(),
@@ -260,7 +260,7 @@ mod tests {
         // request_approval ran cleanup BEFORE the late insert landed, so we
         // need to invoke the same eviction path again to confirm the gate
         // doesn't leave the key behind on a subsequent timeout.
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::channel::<Value>(1);
         let gate2 = WebSocketApprovalGate {
             user_id: "u1".into(),
             edge_callback_ledger: ledger.clone(),
@@ -290,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn channel_closed_returns_denied() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel::<Value>(1);
         drop(rx); // Close the channel.
 
         let gate = WebSocketApprovalGate {
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn requires_approval_for_dangerous_tools() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<Value>(1);
         let gate = WebSocketApprovalGate::new("u1".into(), ledger, tx);
 
         assert!(gate.requires_approval("bash"));

@@ -53,10 +53,7 @@ impl RetentionPolicy {
     /// Returns statistics about what was removed.
     pub fn cleanup(&self, session_id: &str) -> io::Result<CleanupStats> {
         let mut stats = CleanupStats::default();
-        let dir = match session_dir_for(session_id) {
-            Ok(dir) => dir,
-            Err(error) => return Err(error),
-        };
+        let dir = session_dir_for(session_id)?;
 
         if !dir.exists() {
             return Ok(stats);
@@ -112,10 +109,7 @@ impl RetentionPolicy {
         let mut total_size = 0u64;
 
         // Current events file
-        let events_path = match events_path_for(session_id) {
-            Ok(path) => path,
-            Err(error) => return Err(error),
-        };
+        let events_path = events_path_for(session_id)?;
         if let Ok(meta) = std::fs::metadata(&events_path) {
             total_size += meta.len();
         }

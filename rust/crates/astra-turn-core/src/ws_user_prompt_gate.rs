@@ -31,7 +31,7 @@ pub struct UserPromptOutboundRequest {
 pub struct WebSocketUserPromptGate {
     user_id: String,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    request_tx: mpsc::UnboundedSender<Value>,
+    request_tx: mpsc::Sender<Value>,
     timeout: Duration,
 }
 
@@ -39,7 +39,7 @@ impl WebSocketUserPromptGate {
     pub fn new(
         user_id: String,
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-        request_tx: mpsc::UnboundedSender<Value>,
+        request_tx: mpsc::Sender<Value>,
     ) -> Self {
         Self {
             user_id,
@@ -62,7 +62,7 @@ impl AskUserGate for WebSocketUserPromptGate {
             "prompt": prompt,
         });
 
-        if self.request_tx.send(request).is_err() {
+        if self.request_tx.send(request).await.is_err() {
             return AskUserDecision::Error("WebSocket connection closed".into());
         }
 
@@ -105,7 +105,7 @@ mod tests {
     #[tokio::test]
     async fn answered_via_ledger() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketUserPromptGate {
             user_id: "u1".into(),
@@ -182,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_when_no_response() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketUserPromptGate {
             user_id: "u1".into(),
@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_timeout_overrides_gate_default() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketUserPromptGate {
             user_id: "u1".into(),
@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn channel_closed_returns_error() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel::<Value>(1);
         drop(rx);
 
         let gate = WebSocketUserPromptGate {
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_via_ledger() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Value>(1);
 
         let gate = WebSocketUserPromptGate {
             user_id: "u1".into(),

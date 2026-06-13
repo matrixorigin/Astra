@@ -17,7 +17,6 @@ use std::time::Instant;
 
 use astra_core::RuntimeLimits;
 use astra_runtime::{
-    pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
@@ -671,9 +670,7 @@ pub(crate) async fn stream_chat_sse(
         boosted_tools: HashSet::new(),
         widen_selection_pending: false,
         step_recorder,
-        idempotency_cache: p
-            .idempotency_cache
-            .unwrap_or_else(InMemoryIdempotencyCache::new),
+        idempotency_cache: p.idempotency_cache.unwrap_or_default(),
         semantic_dedup: SemanticDedup::new(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),

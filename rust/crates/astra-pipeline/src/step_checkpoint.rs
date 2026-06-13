@@ -67,7 +67,15 @@ fn write_atomic_encrypted_text(path: &Path, content: &str) -> std::io::Result<()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name")
         })?;
-    let tmp_path = dir.join(format!(".tmp-{file_name}"));
+    let tmp_path = dir.join(format!(
+        ".tmp-{}-{}-{}",
+        std::process::id(),
+        file_name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
     let encrypted = encrypt_checkpoint(content);
     {
         use std::io::Write;
