@@ -241,19 +241,17 @@ impl SessionMemorySnapshot {
                 .map(|f| format!("{} {} (t{})", f.last_action, f.path, f.turn))
                 .collect()
         };
-        let corrections = if self.facts.error_state.total_errors == 0 {
-            self.narrative.corrections.clone()
-        } else {
+        let corrections = if let Some(last_error) = &self.facts.error_state.last_error {
             let mut out = self.narrative.corrections.clone();
-            if let Some(last_error) = &self.facts.error_state.last_error {
-                if !out.iter().any(|line| line.contains(last_error)) {
-                    out.push(format!(
-                        "System observed {} errors; latest: {}",
-                        self.facts.error_state.total_errors, last_error
-                    ));
-                }
+            if !out.iter().any(|line| line.contains(last_error)) {
+                out.push(format!(
+                    "System observed {} errors; latest: {}",
+                    self.facts.error_state.total_errors, last_error
+                ));
             }
             out
+        } else {
+            self.narrative.corrections.clone()
         };
         format!(
             "# Session Memory\n\n## Session Title\n{title}\n\n## Active Goals\n{active_goals}\n\n## Pending Todos\n{pending_todos}\n\n## Completed\n{completed}\n\n## Current State\n{current_state}\n\n## Task Specification\n{task_spec}\n\n## Files and Functions\n{files_and_functions}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{corrections}\n\n## Learnings\n{learnings}\n\n## Worklog\n{worklog}",
@@ -2565,6 +2563,29 @@ mod tests {
         assert!(!canonical.contains("The user's request is complete"));
         assert!(!canonical.contains("session is idle"));
         assert!(!canonical.contains("No issues remain"));
+    }
+
+    #[test]
+    fn canonicalize_session_memory_does_not_promote_resolved_errors() {
+        let facts = SessionFacts {
+            error_state: astra_turn_types::session_facts::ErrorFact {
+                total_errors: 7,
+                last_error: None,
+                last_error_turn: None,
+            },
+            ..Default::default()
+        };
+
+        let canonical = canonicalize_session_memory_markdown(
+            "sess-42",
+            "# Session Memory\n\n## Current State\n- Continuing verified fix\n",
+            12,
+            &facts,
+        );
+
+        assert!(!canonical.contains("System observed"));
+        assert!(!canonical.contains("7 errors"));
+        assert!(canonical.contains("## Errors & Corrections\n- No corrections recorded."));
     }
 
     #[tokio::test]

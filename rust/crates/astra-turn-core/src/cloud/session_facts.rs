@@ -43,6 +43,9 @@ pub fn update_from_journal_event(facts: &mut SessionFacts, event: &JournalEvent)
         facts.error_state.total_errors += 1;
         facts.error_state.last_error = Some(truncate(err, 200));
         facts.error_state.last_error_turn = Some(facts.turn);
+    } else if event.turn.is_some() {
+        facts.error_state.last_error = None;
+        facts.error_state.last_error_turn = None;
     }
 }
 
@@ -285,6 +288,20 @@ mod tests {
     }
 
     #[test]
+    fn successful_turn_clears_active_error_without_resetting_lifetime_count() {
+        let mut facts = SessionFacts::default();
+        let mut failed = make_event(3, vec![]);
+        failed.error = Some("sqlx migration failed".to_string());
+        update_from_journal_event(&mut facts, &failed);
+
+        update_from_journal_event(&mut facts, &make_event(4, vec![]));
+
+        assert_eq!(facts.error_state.total_errors, 1);
+        assert_eq!(facts.error_state.last_error, None);
+        assert_eq!(facts.error_state.last_error_turn, None);
+    }
+
+    #[test]
     fn tracks_tool_outcomes() {
         let mut facts = SessionFacts::default();
         let event = make_event(
@@ -346,7 +363,7 @@ mod tests {
         let injection = facts.to_injection();
         assert!(injection.contains("Turn 5, ~25K tokens"));
         assert!(injection.contains("write src/main.rs (t5)"));
-        assert!(injection.contains("Errors: 1 total, last: compile error"));
+        assert!(injection.contains("Active error: compile error (1 total this session)"));
         assert!(injection.contains("Blocked tools: web_fetch"));
     }
 

@@ -78,11 +78,13 @@ impl SessionFacts {
             }
         }
 
-        if self.error_state.total_errors > 0 {
-            write!(out, "Errors: {} total", self.error_state.total_errors).ok();
-            if let Some(err) = &self.error_state.last_error {
-                write!(out, ", last: {err}").ok();
-            }
+        if let Some(err) = &self.error_state.last_error {
+            write!(
+                out,
+                "Active error: {err} ({} total this session)",
+                self.error_state.total_errors
+            )
+            .ok();
             out.push('\n');
         }
 
@@ -99,5 +101,45 @@ impl SessionFacts {
         self.active_files
             .iter()
             .any(|f| f.path == path && f.turn >= cutoff)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injection_omits_resolved_lifetime_error_count() {
+        let facts = SessionFacts {
+            error_state: ErrorFact {
+                total_errors: 4,
+                last_error: None,
+                last_error_turn: None,
+            },
+            ..Default::default()
+        };
+
+        let injection = facts.to_injection();
+
+        assert!(!injection.contains("Errors:"));
+        assert!(!injection.contains("Active error:"));
+        assert!(!injection.contains("4 total"));
+    }
+
+    #[test]
+    fn injection_keeps_active_error_with_lifetime_count_as_context() {
+        let facts = SessionFacts {
+            error_state: ErrorFact {
+                total_errors: 4,
+                last_error: Some("cargo test failed".to_string()),
+                last_error_turn: Some(7),
+            },
+            ..Default::default()
+        };
+
+        let injection = facts.to_injection();
+
+        assert!(injection.contains("Active error: cargo test failed"));
+        assert!(injection.contains("4 total this session"));
     }
 }
