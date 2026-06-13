@@ -1,5 +1,6 @@
 use crate::cli::session::session_input::detect_correction_signal;
 use crate::cli::session::session_state::SessionState;
+use astra_turn_types::{UserCorrectionSignalKind, classify_user_correction_signal};
 use crossterm::style::Stylize;
 
 /// Minimal async-capable chat completion abstraction so the skill-improvement
@@ -210,6 +211,22 @@ fn trim_feedback_sections(content: &str, keep: usize) -> String {
     out
 }
 
+fn durable_skill_feedback_from_correction(
+    correction: &str,
+) -> Option<astra_skills::improvement::SkillImprovement> {
+    let source_signal = match classify_user_correction_signal(correction)? {
+        UserCorrectionSignalKind::Correction => "correction",
+        UserCorrectionSignalKind::Reanchor => "rephrasing",
+    };
+    let feedback =
+        astra_pipeline::feedback_extraction::heuristic_extract(correction, source_signal, 0.7)?;
+    Some(astra_skills::improvement::SkillImprovement {
+        section: "Recent user feedback".into(),
+        change: format!("User directive: {}", feedback.rule),
+        reason: "Extracted concrete directive from user correction".into(),
+    })
+}
+
 fn check_skill_improvement_inner(state: &mut SessionState) {
     if !state.skill_improvement_tracker.should_analyze(state.turn) {
         return;
@@ -303,15 +320,17 @@ fn check_skill_improvement_inner(state: &mut SessionState) {
 
     let improvements: Vec<astra_skills::improvement::SkillImprovement> = corrections
         .iter()
-        .map(|correction| {
-            let snippet: String = correction.chars().take(240).collect();
-            astra_skills::improvement::SkillImprovement {
-                section: "Recent user feedback".into(),
-                change: format!("User correction: {}", snippet),
-                reason: "Detected correction pattern in user message".into(),
-            }
-        })
+        .filter_map(|correction| durable_skill_feedback_from_correction(correction))
         .collect();
+    if improvements.is_empty() {
+        astra_core::agent_debug!(
+            "skill",
+            "improvement check: {} correction-like message(s) found, no durable directive extracted",
+            corrections.len(),
+        );
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
 
     let proposal = astra_skills::improvement::ImprovementProposal {
         skill_name: target.name.clone(),
@@ -370,7 +389,7 @@ fn check_skill_improvement_inner(state: &mut SessionState) {
     eprintln!(
         "  {}",
         format!(
-            "✓ recorded {} user correction(s) into skill '{}' ({})",
+            "✓ recorded {} user directive(s) into skill '{}' ({})",
             improvements.len(),
             target.name,
             skill_md.display()
@@ -428,7 +447,7 @@ mod tests {
         let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![(
-                "no, that's wrong — please do it differently next time".to_string(),
+                "no, don't greet twice on follow-up turns".to_string(),
                 "(previous assistant response)".to_string(),
             )],
             turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
@@ -441,7 +460,8 @@ mod tests {
 
         let updated = std::fs::read_to_string(&skill_md).unwrap();
         assert!(updated.contains("Recent user feedback"));
-        assert!(updated.contains("User correction:"));
+        assert!(updated.contains("User directive: don't greet twice on follow-up turns"));
+        assert!(!updated.contains("User correction:"));
         assert!(updated.contains("Original instructions."));
 
         let pending = state
@@ -452,6 +472,78 @@ mod tests {
         assert_eq!(pending.skill_path, skill_md);
         assert!(!pending.improvements.is_empty());
         assert!(!state.skill_improvement_tracker.should_analyze(state.turn));
+    }
+
+    #[tokio::test]
+    async fn skill_improvement_ignores_vague_reanchor_without_durable_directive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        let original = "---\nname: my-skill\ndescription: test skill\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
+        std::fs::write(&skill_md, original).unwrap();
+
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        registry.load("my-skill").await.unwrap();
+
+        let mut state = SessionState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "我要的是长久健康运行，不是临时补丁".to_string(),
+                "I'll make a quick patch".to_string(),
+            )],
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
+            recent_tools: vec!["my-skill".to_string()],
+            ..Default::default()
+        };
+
+        check_skill_improvement_sync(&mut state);
+
+        let unchanged = std::fs::read_to_string(&skill_md).unwrap();
+        assert_eq!(unchanged, original);
+        assert!(state.skill_improvement_tracker.pending_proposal.is_none());
+        assert!(!state.skill_improvement_tracker.should_analyze(state.turn));
+    }
+
+    #[tokio::test]
+    async fn skill_improvement_records_reanchor_when_directive_is_concrete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_md,
+            "---\nname: my-skill\ndescription: test skill\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal instructions.\n",
+        )
+        .unwrap();
+
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        registry.load("my-skill").await.unwrap();
+
+        let mut state = SessionState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "我重新说一次，不要用case-by-case修补".to_string(),
+                "I'll patch that one case".to_string(),
+            )],
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
+            recent_tools: vec!["my-skill".to_string()],
+            ..Default::default()
+        };
+
+        check_skill_improvement_sync(&mut state);
+
+        let updated = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(updated.contains("User directive: 不要用case-by-case修补"));
+        assert!(!updated.contains("我重新说一次"));
     }
 
     #[tokio::test]
@@ -596,7 +688,7 @@ mod tests {
         let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![(
-                "no, that's wrong, do it differently".to_string(),
+                "no, that's wrong, don't greet twice".to_string(),
                 "sorry".to_string(),
             )],
             turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
@@ -615,7 +707,8 @@ mod tests {
 
         let updated = std::fs::read_to_string(&skill_md).unwrap();
         assert!(updated.contains("## Recent user feedback"));
-        assert!(updated.contains("no, that's wrong"));
+        assert!(updated.contains("User directive: don't greet twice"));
+        assert!(!updated.contains("no, that's wrong"));
     }
 
     #[test]
