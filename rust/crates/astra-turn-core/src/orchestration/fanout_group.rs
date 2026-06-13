@@ -338,8 +338,10 @@ impl AgentFanoutGroupProjection {
         let summary = self.summary_cache;
         self.status = if summary.terminal == self.target_count {
             AgentFanoutStatus::Finished
-        } else if summary.active > 0 || summary.terminal > 0 {
+        } else if summary.active > 0 {
             AgentFanoutStatus::Running
+        } else if summary.terminal > 0 {
+            AgentFanoutStatus::Incomplete
         } else {
             AgentFanoutStatus::Planned
         };
@@ -631,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_planned_slots_keep_group_non_terminal() {
+    fn pending_planned_slots_without_active_workers_make_group_incomplete() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
         group.record_spawn_accepted(0, "auth@aaa").unwrap();
         group
@@ -642,10 +644,10 @@ mod tests {
         assert_eq!(summary.terminal, 1);
         assert_eq!(summary.active, 0);
         assert_eq!(summary.planned, 2);
-        assert_eq!(group.status, AgentFanoutStatus::Running);
+        assert_eq!(group.status, AgentFanoutStatus::Incomplete);
         assert!(
-            !group.is_terminal(),
-            "a group with unstarted planned slots must not be evictable as terminal"
+            group.is_terminal(),
+            "a group with no active workers cannot make forward progress"
         );
     }
 

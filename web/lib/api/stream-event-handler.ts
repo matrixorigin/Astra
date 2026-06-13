@@ -25,6 +25,14 @@ export interface StreamEventState {
   lastStatus: "streaming" | "complete" | "failed";
   protocolError: boolean;
   runLifecycle: "running" | "paused" | "waiting" | "blocked" | "finished";
+  nextEventIndex?: number;
+}
+
+function normalizeEventIndex(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  return Math.trunc(value);
 }
 
 export function blockedWaitingFor(event: Record<string, unknown>) {
@@ -74,10 +82,26 @@ export function applyStreamEvent(
 ): void {
   const type = typeof event.type === "string" ? event.type : "";
   const expectedSessionId = ctx.getSessionId();
+  const eventIndex = normalizeEventIndex(event.index);
+  if (eventIndex !== null) {
+    state.nextEventIndex = Math.max(state.nextEventIndex ?? 0, eventIndex + 1);
+  }
 
   if (state.protocolError) {
     return;
   }
+
+  const setActiveRun = (run: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  }) => {
+    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+      ...run,
+      assistantMessageId: ctx.assistantMessageId,
+      nextEventIndex: state.nextEventIndex ?? null,
+    });
+  };
 
   const applyAssistantText = (
     rawText: string,
@@ -134,7 +158,7 @@ export function applyStreamEvent(
     }
     if (typeof event.run_id === "string") {
       state.runId = event.run_id;
-      setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+      setActiveRun({
         runId: event.run_id,
         status: "running",
         waitingFor: null,
@@ -146,7 +170,7 @@ export function applyStreamEvent(
   if (type === "run_started" && typeof event.run_id === "string") {
     state.runLifecycle = "running";
     state.runId = event.run_id;
-    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+    setActiveRun({
       runId: event.run_id,
       status: "running",
       waitingFor: null,
@@ -172,7 +196,7 @@ export function applyStreamEvent(
     }
     if (runId) {
       state.runId = runId;
-      setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+      setActiveRun({
         runId,
         status: "blocked",
         waitingFor,
@@ -202,7 +226,7 @@ export function applyStreamEvent(
     }
     if (runId) {
       state.runId = runId;
-      setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+      setActiveRun({
         runId,
         status: projection.status,
         waitingFor: projection.waitingFor,
@@ -214,7 +238,7 @@ export function applyStreamEvent(
   if (type === "run_paused" && typeof event.run_id === "string") {
     state.runLifecycle = "paused";
     state.runId = event.run_id;
-    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+    setActiveRun({
       runId: event.run_id,
       status: "paused",
       waitingFor: null,
@@ -225,7 +249,7 @@ export function applyStreamEvent(
   if (type === "run_input_queued" && typeof event.run_id === "string") {
     state.runLifecycle = "running";
     state.runId = event.run_id;
-    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+    setActiveRun({
       runId: event.run_id,
       status: "input-queued",
       waitingFor: "user_input",
@@ -236,7 +260,7 @@ export function applyStreamEvent(
   if (type === "run_resumed" && typeof event.run_id === "string") {
     state.runLifecycle = "running";
     state.runId = event.run_id;
-    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+    setActiveRun({
       runId: event.run_id,
       status: "running",
       waitingFor: null,
@@ -275,7 +299,7 @@ export function applyStreamEvent(
     ) {
       applyAssistantText(message, "streaming");
     }
-    setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+    setActiveRun({
       runId: event.run_id,
       status: "paused",
       waitingFor:
@@ -372,7 +396,7 @@ export function applyStreamEvent(
     if (status === "paused" || status === "interrupted") {
       state.runLifecycle = "paused";
       if (typeof event.run_id === "string") {
-        setChatActiveRun(ctx.ownerUserId, ctx.chatId, {
+        setActiveRun({
           runId: event.run_id,
           status: "paused",
           waitingFor:

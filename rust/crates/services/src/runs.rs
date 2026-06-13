@@ -2777,6 +2777,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "run_blocked",
     "run_paused",
     "run_resumed",
+    "run_input_queued",
     "context_meta",
     "session_info",
     "turn_complete",
@@ -3105,6 +3106,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         }
         "run_resumed" => {
             let mut out = serde_json::json!({ "type": "run_resumed" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "run_input_queued" => {
+            let mut out = serde_json::json!({ "type": "run_input_queued" });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
                     obj.insert(k.clone(), v.clone());

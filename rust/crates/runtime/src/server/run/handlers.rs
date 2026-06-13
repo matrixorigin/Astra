@@ -146,6 +146,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "run_waiting"
             | "run_paused"
             | "run_resumed"
+            | "run_input_queued"
             | "run_finished"
     ) || event_type == "run_blocked"
 }
@@ -769,6 +770,28 @@ mod tests {
         assert_eq!(
             transformed[2],
             json!({"type": "run_resumed", "run_id": "run-123", "index": 4})
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_emits_input_queued_with_run_id() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "event_type": "run_input_queued",
+                "data": {"waiting_for": "user_input"},
+                "index": 5
+            })],
+        );
+
+        assert_eq!(
+            transformed,
+            vec![json!({
+                "type": "run_input_queued",
+                "run_id": "run-123",
+                "waiting_for": "user_input",
+                "index": 5
+            })]
         );
     }
 

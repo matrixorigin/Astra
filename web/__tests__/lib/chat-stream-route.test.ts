@@ -378,11 +378,15 @@ describe("chat stream route proxy cancellation", () => {
       }
     }
 
-    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith("user-a", "chat-1", {
-      runId: "run-blocked",
-      status: "blocked",
-      waitingFor: "executor_offline",
-    });
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-blocked",
+        status: "blocked",
+        waitingFor: "executor_offline",
+      }),
+    );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
@@ -450,6 +454,89 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendStream();
     resolveFetch({ ok: true, body: backend.body });
     await reader?.cancel();
+  });
+
+  it("resumes an existing run from cursor into the requested assistant message", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"text_done","full_text":"resumed output","index":9}\n\n',
+    ]);
+    const runtime = {
+      sdk: {
+        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: jest.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      session: {
+        chatId: "chat-1",
+        backendSessionId: "runtime-session-1",
+        persisted: true,
+        messageCount: 3,
+      },
+      messages: [
+        {
+          id: "assistant-old",
+          role: "assistant",
+          content: "old",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "complete",
+        },
+        {
+          id: "assistant-queued",
+          role: "assistant",
+          content: "",
+          createdAt: "2026-06-07T00:00:01.000Z",
+          status: "streaming",
+        },
+      ],
+      activeRun: {
+        runId: "run-1",
+        status: "input-queued",
+        waitingFor: "user_input",
+        assistantMessageId: "assistant-queued",
+        nextEventIndex: 9,
+      },
+    } as never);
+
+    const url = new URL(
+      "http://web.test/api/chats/chat-1/stream?runId=run-1&last_index=9&assistantMessageId=assistant-queued",
+    );
+    const response = await GET({ nextUrl: url } as never, {
+      params: Promise.resolve({ chatId: "chat-1" }),
+    });
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(runtime.fetchResponse).toHaveBeenCalledWith(
+      expect.stringContaining("/runs/run-1/stream?last_index=9"),
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-queued",
+      expect.objectContaining({ content: "resumed output" }),
+    );
   });
 
   it("rejects local code prompts without workspace authority before creating stream messages", async () => {

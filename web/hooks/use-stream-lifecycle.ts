@@ -41,7 +41,7 @@ const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
 const STOP_RECONCILE_INITIAL_DELAY_MS = 500;
 const STOP_RECONCILE_INTERVAL_MS = 1_000;
-const STOP_RECONCILE_MAX_MS = 15_000;
+const STOP_RECONCILE_NOTICE_MS = 15_000;
 const RUN_ATTACH_MAX_RETRIES = 4;
 const ATTACHABLE_RUN_STATUSES = new Set([
   'running',
@@ -88,6 +88,24 @@ function hasCompletedAssistantAfterUser(
 
 export function canAttachRunStream(status: string | undefined | null) {
   return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
+}
+
+function streamRunUpdate(
+  run: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+    nextEventIndex?: number | null;
+  },
+  assistantMessageId: string,
+): NonNullable<ChatDetail['activeRun']> {
+  return {
+    runId: run.runId,
+    status: run.status,
+    waitingFor: run.waitingFor ?? null,
+    assistantMessageId,
+    nextEventIndex: run.nextEventIndex ?? null,
+  };
 }
 
 function createAssistantPatchController(params: {
@@ -214,7 +232,9 @@ export interface UseStreamLifecycleReturn {
     runId: string | null,
     sessionId?: string | null,
   ) => void;
-  ensureStreamingAssistantMessage: () => string;
+  ensureStreamingAssistantMessage: (
+    preferredMessageId?: string | null,
+  ) => string;
   scheduleAutoAttachRetry: (runId: string) => boolean;
   attachExistingRunStream: (
     runId: string,
@@ -349,35 +369,50 @@ export function useStreamLifecycle(
     [detail.session?.backendSessionId, setWorkSurface],
   );
 
-  const ensureStreamingAssistantMessage = useCallback(() => {
-    const existingAssistantMessageId = findStreamingAssistantMessageId(
-      detail.messages,
-    );
-    if (existingAssistantMessageId) {
-      return existingAssistantMessageId;
-    }
-    const assistantMessageId = crypto.randomUUID();
-    setDetail((current) =>
-      findStreamingAssistantMessageId(current.messages)
-        ? current
-        : {
-            ...current,
-            messages: [
-              ...current.messages,
-              {
-                id: assistantMessageId,
-                role: 'assistant' as const,
-                content: '',
-                createdAt: new Date().toISOString(),
-                status: 'streaming' as const,
-                reasoning: '',
-                reasoningStatus: 'streaming' as const,
-              },
-            ],
-          },
-    );
-    return assistantMessageId;
-  }, [detail.messages, setDetail]);
+  const ensureStreamingAssistantMessage = useCallback(
+    (preferredMessageId?: string | null) => {
+      if (
+        preferredMessageId &&
+        detail.messages.some(
+          (message) =>
+            message.id === preferredMessageId && message.role === 'assistant',
+        )
+      ) {
+        return preferredMessageId;
+      }
+      const existingAssistantMessageId = findStreamingAssistantMessageId(
+        detail.messages,
+      );
+      if (existingAssistantMessageId) {
+        return existingAssistantMessageId;
+      }
+      const assistantMessageId = preferredMessageId ?? crypto.randomUUID();
+      setDetail((current) =>
+        current.messages.some(
+          (message) =>
+            message.id === assistantMessageId && message.role === 'assistant',
+        ) || findStreamingAssistantMessageId(current.messages)
+          ? current
+          : {
+              ...current,
+              messages: [
+                ...current.messages,
+                {
+                  id: assistantMessageId,
+                  role: 'assistant' as const,
+                  content: '',
+                  createdAt: new Date().toISOString(),
+                  status: 'streaming' as const,
+                  reasoning: '',
+                  reasoningStatus: 'streaming' as const,
+                },
+              ],
+            },
+      );
+      return assistantMessageId;
+    },
+    [detail.messages, setDetail],
+  );
 
   const scheduleAutoAttachRetry = useCallback(
     (runId: string) => {
@@ -468,71 +503,78 @@ export function useStreamLifecycle(
         );
       };
 
-      void streamExistingChatRun(detail.chat.id, runId, {
-        signal: nextStreamAbortSignal(),
-        onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-        onRunUpdated: (run) => {
-          setDetail((current) => ({
-            ...current,
-            activeRun: {
-              runId: run.runId,
-              status: run.status,
-              waitingFor: run.waitingFor ?? null,
-            },
-          }));
+      void streamExistingChatRun(
+        detail.chat.id,
+        runId,
+        {
+          signal: nextStreamAbortSignal(),
+          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onRunUpdated: (run) => {
+            setDetail((current) => ({
+              ...current,
+              activeRun: streamRunUpdate(run, assistantMessageId),
+            }));
+          },
+          onRunFinished: () => {
+            setStoppingRun(false);
+            clearActiveRun();
+          },
+          onReasoning: (reasoning) => {
+            assistantPatcher.patchBatched({
+              reasoning,
+              reasoningStatus: 'streaming',
+              status: 'streaming',
+            });
+          },
+          onReasoningDone: (reasoning) => {
+            assistantPatcher.patchBatched({
+              reasoning,
+              reasoningStatus: 'complete',
+              status: 'streaming',
+            });
+          },
+          onText: (content) => {
+            assistantPatcher.patchBatched({ content, status: 'streaming' });
+          },
+          onArtifacts: (artifacts) => {
+            assistantPatcher.patchBatched({ artifacts });
+          },
+          onDone: (content) => {
+            assistantPatcher.flushNow();
+            clearActiveRun();
+            assistantPatcher.patchNow({
+              content:
+                content ||
+                'Astra completed the run without returning visible text.',
+              reasoningStatus: 'complete',
+              status: 'complete',
+            });
+          },
+          onCancelled: (content) => {
+            assistantPatcher.flushNow();
+            clearActiveRun();
+            assistantPatcher.patchNow({
+              content: content || 'Stopped.',
+              reasoningStatus: 'complete',
+              status: 'complete',
+            });
+          },
+          onPaused: (content) => {
+            assistantPatcher.flushNow();
+            assistantPatcher.patchNow({
+              content,
+              status: 'streaming',
+            });
+          },
         },
-        onRunFinished: () => {
-          setStoppingRun(false);
-          clearActiveRun();
+        {
+          assistantMessageId,
+          nextEventIndex:
+            detail.activeRun?.runId === runId
+              ? (detail.activeRun.nextEventIndex ?? null)
+              : null,
         },
-        onReasoning: (reasoning) => {
-          assistantPatcher.patchBatched({
-            reasoning,
-            reasoningStatus: 'streaming',
-            status: 'streaming',
-          });
-        },
-        onReasoningDone: (reasoning) => {
-          assistantPatcher.patchBatched({
-            reasoning,
-            reasoningStatus: 'complete',
-            status: 'streaming',
-          });
-        },
-        onText: (content) => {
-          assistantPatcher.patchBatched({ content, status: 'streaming' });
-        },
-        onArtifacts: (artifacts) => {
-          assistantPatcher.patchBatched({ artifacts });
-        },
-        onDone: (content) => {
-          assistantPatcher.flushNow();
-          clearActiveRun();
-          assistantPatcher.patchNow({
-            content:
-              content ||
-              'Astra completed the run without returning visible text.',
-            reasoningStatus: 'complete',
-            status: 'complete',
-          });
-        },
-        onCancelled: (content) => {
-          assistantPatcher.flushNow();
-          clearActiveRun();
-          assistantPatcher.patchNow({
-            content: content || 'Stopped.',
-            reasoningStatus: 'complete',
-            status: 'complete',
-          });
-        },
-        onPaused: (content) => {
-          assistantPatcher.flushNow();
-          assistantPatcher.patchNow({
-            content,
-            status: 'streaming',
-          });
-        },
-      })
+      )
         .catch((streamError: unknown) => {
           if (isAbortError(streamError)) {
             return;
@@ -743,6 +785,8 @@ export function useStreamLifecycle(
                 runId,
                 status: 'running',
                 waitingFor: null,
+                assistantMessageId: currentAssistantId,
+                nextEventIndex: null,
               },
             }));
           },
@@ -767,11 +811,7 @@ export function useStreamLifecycle(
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
-              activeRun: {
-                runId: run.runId,
-                status: run.status,
-                waitingFor: run.waitingFor ?? null,
-              },
+              activeRun: streamRunUpdate(run, currentAssistantId),
             }));
           },
           onRunFinished: () => {
@@ -933,11 +973,13 @@ export function useStreamLifecycle(
       params.setQueueingDeferredInput(true);
 
       try {
+        const pendingMessageId = crypto.randomUUID();
         const result = await queueChatRunInput(detail.chat.id, {
           content: text,
           options,
+          pendingMessageId,
         });
-        const assistantMessageId = crypto.randomUUID();
+        const assistantMessageId = result.assistantMessage.id;
         const runId = result.activeRun.runId;
         const attachLease = claimAttachedRun(runId);
         resetWorkSurfaceRun(runId);
@@ -945,17 +987,13 @@ export function useStreamLifecycle(
           ...current,
           activeRun: result.activeRun,
           messages: [
-            ...current.messages,
+            ...current.messages.filter(
+              (message) =>
+                message.id !== result.userMessage.id &&
+                message.id !== result.assistantMessage.id,
+            ),
             result.userMessage,
-            {
-              id: assistantMessageId,
-              role: 'assistant' as const,
-              content: '',
-              createdAt: new Date().toISOString(),
-              status: 'streaming' as const,
-              reasoning: '',
-              reasoningStatus: 'streaming' as const,
-            },
+            result.assistantMessage,
           ].sort(
             (a, b) =>
               new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
@@ -965,92 +1003,96 @@ export function useStreamLifecycle(
           setDetail,
           getAssistantId: () => assistantMessageId,
         });
-        void streamExistingChatRun(detail.chat.id, runId, {
-          signal: nextStreamAbortSignal(),
-          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-          onRunUpdated: (run) => {
-            setDetail((current) => ({
-              ...current,
-              activeRun: {
-                runId: run.runId,
-                status: run.status,
-                waitingFor: run.waitingFor ?? null,
-              },
-            }));
+        void streamExistingChatRun(
+          detail.chat.id,
+          runId,
+          {
+            signal: nextStreamAbortSignal(),
+            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onRunUpdated: (run) => {
+              setDetail((current) => ({
+                ...current,
+                activeRun: streamRunUpdate(run, assistantMessageId),
+              }));
+            },
+            onRunFinished: () => {
+              setStoppingRun(false);
+              setDetail((current) =>
+                current.activeRun?.runId === runId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
+            },
+            onReasoning: (reasoning) => {
+              assistantPatcher.patchBatched({
+                reasoning,
+                reasoningStatus: 'streaming',
+                status: 'streaming',
+              });
+            },
+            onReasoningDone: (reasoning) => {
+              assistantPatcher.patchBatched({
+                reasoning,
+                reasoningStatus: 'complete',
+                status: 'streaming',
+              });
+            },
+            onText: (content) => {
+              assistantPatcher.patchBatched({ content, status: 'streaming' });
+            },
+            onArtifacts: (artifacts) => {
+              assistantPatcher.patchBatched({ artifacts });
+            },
+            onDone: (content) => {
+              assistantPatcher.flushNow();
+              setDetail((current) =>
+                current.activeRun?.runId === runId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
+              assistantPatcher.patchNow({
+                content:
+                  content ||
+                  'Astra completed the run without returning visible text.',
+                reasoningStatus: 'complete',
+                status: 'complete',
+              });
+            },
+            onCancelled: (content) => {
+              assistantPatcher.flushNow();
+              setDetail((current) =>
+                current.activeRun?.runId === runId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
+              assistantPatcher.patchNow({
+                content: content || 'Stopped.',
+                reasoningStatus: 'complete',
+                status: 'complete',
+              });
+            },
+            onPaused: (content) => {
+              assistantPatcher.flushNow();
+              assistantPatcher.patchNow({
+                content,
+                status: 'streaming',
+              });
+            },
           },
-          onRunFinished: () => {
-            setStoppingRun(false);
-            setDetail((current) =>
-              current.activeRun?.runId === runId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
+          {
+            assistantMessageId,
+            nextEventIndex: result.activeRun.nextEventIndex ?? null,
           },
-          onReasoning: (reasoning) => {
-            assistantPatcher.patchBatched({
-              reasoning,
-              reasoningStatus: 'streaming',
-              status: 'streaming',
-            });
-          },
-          onReasoningDone: (reasoning) => {
-            assistantPatcher.patchBatched({
-              reasoning,
-              reasoningStatus: 'complete',
-              status: 'streaming',
-            });
-          },
-          onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: 'streaming' });
-          },
-          onArtifacts: (artifacts) => {
-            assistantPatcher.patchBatched({ artifacts });
-          },
-          onDone: (content) => {
-            assistantPatcher.flushNow();
-            setDetail((current) =>
-              current.activeRun?.runId === runId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
-            assistantPatcher.patchNow({
-              content:
-                content ||
-                'Astra completed the run without returning visible text.',
-              reasoningStatus: 'complete',
-              status: 'complete',
-            });
-          },
-          onCancelled: (content) => {
-            assistantPatcher.flushNow();
-            setDetail((current) =>
-              current.activeRun?.runId === runId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
-            assistantPatcher.patchNow({
-              content: content || 'Stopped.',
-              reasoningStatus: 'complete',
-              status: 'complete',
-            });
-          },
-          onPaused: (content) => {
-            assistantPatcher.flushNow();
-            assistantPatcher.patchNow({
-              content,
-              status: 'streaming',
-            });
-          },
-        })
+        )
           .catch((streamError: unknown) => {
             if (isAbortError(streamError)) {
               return;
@@ -1163,6 +1205,7 @@ export function useStreamLifecycle(
         void hydrateWorkSurfaceForChat({ silent: true });
         if (result.cancelPending) {
           const startedAt = Date.now();
+          let noticeShown = false;
           const reconcileStop = async () => {
             const refreshed = await getChat(detail.chat.id).catch(() => null);
             if (!refreshed) {
@@ -1173,17 +1216,19 @@ export function useStreamLifecycle(
             const activeRun = refreshed.activeRun;
             const stillCancelling =
               activeRun?.runId === runId && activeRun.status === 'cancelling';
-            if (
-              !stillCancelling ||
-              Date.now() - startedAt >= STOP_RECONCILE_MAX_MS
-            ) {
+            if (!stillCancelling) {
               stopReconcileRef.current();
-              if (stillCancelling) {
-                addToast(
-                  'Stop request is still being processed by the runtime.',
-                  'info',
-                );
-              }
+              return;
+            }
+            if (
+              !noticeShown &&
+              Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS
+            ) {
+              noticeShown = true;
+              addToast(
+                'Stop request is still being processed by the runtime.',
+                'info',
+              );
             }
           };
           stopReconcileRef.current();
@@ -1265,7 +1310,8 @@ export function useStreamLifecycle(
       if (!result.activeRun?.runId) {
         throw new Error('Resume response did not include an active run.');
       }
-      const runId = result.activeRun.runId;
+      const resumedActiveRun = result.activeRun;
+      const runId = resumedActiveRun.runId;
       const attachLease = claimAttachedRun(runId);
       resetWorkSurfaceRun(runId);
       const appendedOptimistic =
@@ -1276,7 +1322,10 @@ export function useStreamLifecycle(
       }
       setDetail((current) => ({
         ...current,
-        activeRun: result.activeRun,
+        activeRun: {
+          ...resumedActiveRun,
+          assistantMessageId,
+        },
         messages:
           existingAssistantMessageId ||
           current.messages.some((message) => message.id === assistantMessageId)
@@ -1299,92 +1348,99 @@ export function useStreamLifecycle(
         getAssistantId: () => assistantMessageId,
       });
       try {
-        await streamExistingChatRun(detail.chat.id, runId, {
-          signal: nextStreamAbortSignal(),
-          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-          onRunUpdated: (run) => {
-            setDetail((current) => ({
-              ...current,
-              activeRun: {
-                runId: run.runId,
-                status: run.status,
-                waitingFor: run.waitingFor ?? null,
-              },
-            }));
+        await streamExistingChatRun(
+          detail.chat.id,
+          runId,
+          {
+            signal: nextStreamAbortSignal(),
+            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onRunUpdated: (run) => {
+              setDetail((current) => ({
+                ...current,
+                activeRun: streamRunUpdate(run, assistantMessageId),
+              }));
+            },
+            onRunFinished: () => {
+              setStoppingRun(false);
+              setDetail((current) =>
+                current.activeRun?.runId === runId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
+            },
+            onReasoning: (reasoning) => {
+              assistantPatcher.patchBatched({
+                reasoning,
+                reasoningStatus: 'streaming',
+                status: 'streaming',
+              });
+            },
+            onReasoningDone: (reasoning) => {
+              assistantPatcher.patchBatched({
+                reasoning,
+                reasoningStatus: 'complete',
+                status: 'streaming',
+              });
+            },
+            onText: (content) => {
+              assistantPatcher.patchBatched({ content, status: 'streaming' });
+            },
+            onArtifacts: (artifacts) => {
+              assistantPatcher.patchBatched({ artifacts });
+            },
+            onDone: (content) => {
+              assistantPatcher.flushNow();
+              setDetail((current) =>
+                current.activeRun?.runId === runId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
+              assistantPatcher.patchNow({
+                content:
+                  content ||
+                  'Astra completed the run without returning visible text.',
+                reasoningStatus: 'complete',
+                status: 'complete',
+              });
+            },
+            onCancelled: (content) => {
+              assistantPatcher.flushNow();
+              setDetail((current) =>
+                current.activeRun?.runId === runId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
+              assistantPatcher.patchNow({
+                content: content || 'Stopped.',
+                reasoningStatus: 'complete',
+                status: 'complete',
+              });
+            },
+            onPaused: (content) => {
+              assistantPatcher.flushNow();
+              assistantPatcher.patchNow({
+                content,
+                status: 'streaming',
+              });
+            },
           },
-          onRunFinished: () => {
-            setStoppingRun(false);
-            setDetail((current) =>
-              current.activeRun?.runId === runId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
+          {
+            assistantMessageId,
+            nextEventIndex:
+              resumedActiveRun.nextEventIndex ??
+              detail.activeRun?.nextEventIndex ??
+              null,
           },
-          onReasoning: (reasoning) => {
-            assistantPatcher.patchBatched({
-              reasoning,
-              reasoningStatus: 'streaming',
-              status: 'streaming',
-            });
-          },
-          onReasoningDone: (reasoning) => {
-            assistantPatcher.patchBatched({
-              reasoning,
-              reasoningStatus: 'complete',
-              status: 'streaming',
-            });
-          },
-          onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: 'streaming' });
-          },
-          onArtifacts: (artifacts) => {
-            assistantPatcher.patchBatched({ artifacts });
-          },
-          onDone: (content) => {
-            assistantPatcher.flushNow();
-            setDetail((current) =>
-              current.activeRun?.runId === runId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
-            assistantPatcher.patchNow({
-              content:
-                content ||
-                'Astra completed the run without returning visible text.',
-              reasoningStatus: 'complete',
-              status: 'complete',
-            });
-          },
-          onCancelled: (content) => {
-            assistantPatcher.flushNow();
-            setDetail((current) =>
-              current.activeRun?.runId === runId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
-            assistantPatcher.patchNow({
-              content: content || 'Stopped.',
-              reasoningStatus: 'complete',
-              status: 'complete',
-            });
-          },
-          onPaused: (content) => {
-            assistantPatcher.flushNow();
-            assistantPatcher.patchNow({
-              content,
-              status: 'streaming',
-            });
-          },
-        });
+        );
       } catch (streamError) {
         if (isAbortError(streamError)) {
           return;

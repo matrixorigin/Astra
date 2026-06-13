@@ -134,6 +134,8 @@ export type ChatDetail = {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    assistantMessageId?: string | null;
+    nextEventIndex?: number | null;
   };
   pendingTurn?: {
     messageId: string;
@@ -203,10 +205,13 @@ export type SendMessageResponse = {
 
 export type QueueRunInputResponse = {
   userMessage: ChatMessage;
+  assistantMessage: ChatMessage;
   activeRun: {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    assistantMessageId?: string | null;
+    nextEventIndex?: number | null;
   };
 };
 
@@ -215,6 +220,8 @@ export type ActiveRunMutationResponse = {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    assistantMessageId?: string | null;
+    nextEventIndex?: number | null;
   };
   cancelPending?: boolean;
 };

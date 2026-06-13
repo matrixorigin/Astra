@@ -74,6 +74,7 @@ describe('queueDeferredRunInput', () => {
 
     const result = await queueDeferredRunInput('user-a', 'chat-1', {
       content: 'clear previous skill constraints',
+      pendingMessageId: 'user-input-1',
       options: {
         webSearch: false,
         thinking: true,
@@ -83,17 +84,78 @@ describe('queueDeferredRunInput', () => {
     });
 
     expect(submitRunInput).toHaveBeenCalledWith('run-1', {
-      idempotencyKey: expect.any(String),
+      idempotencyKey: 'web-deferred:run-1:user-input-1',
       input: {
         content: 'clear previous skill constraints',
         active_skills: [],
       },
     });
+    expect(result?.userMessage.id).toBe('user-input-1');
+    expect(result?.assistantMessage.role).toBe('assistant');
     expect(result?.activeRun).toEqual({
       runId: 'run-1',
       status: 'input-queued',
       waitingFor: 'user_input',
+      assistantMessageId: result?.assistantMessage.id,
+      nextEventIndex: 1,
     });
+  });
+
+  it('does not resubmit or duplicate messages for the same deferred input action', async () => {
+    const submitRunInput = jest.fn().mockResolvedValue({
+      runId: 'run-1',
+      accepted: true,
+      duplicate: false,
+    });
+    const getRunStatus = jest.fn().mockResolvedValue({
+      runId: 'run-1',
+      sessionId: 'chat-1',
+      status: 'running',
+      eventsCount: 4,
+      waitingFor: null,
+    });
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        getRunStatus,
+        submitRunInput,
+      },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-1',
+      title: 'Deferred test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-1',
+        status: 'running',
+        waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    const first = await queueDeferredRunInput('user-a', 'chat-1', {
+      content: 'continue from here',
+      pendingMessageId: 'user-input-1',
+    });
+    const second = await queueDeferredRunInput('user-a', 'chat-1', {
+      content: 'continue from here',
+      pendingMessageId: 'user-input-1',
+    });
+
+    expect(submitRunInput).toHaveBeenCalledTimes(1);
+    expect(second?.userMessage.id).toBe(first?.userMessage.id);
+    expect(second?.assistantMessage.id).toBe(first?.assistantMessage.id);
+    expect(store.chats[0].messages.map((message) => message.id)).toEqual([
+      'user-input-1',
+      first?.assistantMessage.id,
+    ]);
   });
 
   it('does not orphan a local queued message when submitRunInput fails', async () => {
@@ -151,6 +213,7 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-1',
       status: 'running',
       waitingFor: null,
+      nextEventIndex: 1,
       source: 'backend_poll',
       observedAt: expect.any(String),
     });
@@ -337,6 +400,8 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-recovered',
       status: 'input-queued',
       waitingFor: 'user_input',
+      assistantMessageId: result?.assistantMessage.id,
+      nextEventIndex: 1,
     });
   });
 

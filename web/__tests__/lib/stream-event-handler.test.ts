@@ -174,11 +174,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "blocked",
         waitingFor: "transport_disconnected",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
@@ -195,8 +195,26 @@ describe("applyStreamEvent", () => {
   it("projects run_input_queued events into active run state", () => {
     const state = makeState();
 
+    applyStreamEvent({ type: "run_input_queued", run_id: "run-1" }, ctx, state);
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "input-queued",
+        waitingFor: "user_input",
+        assistantMessageId: "assistant-1",
+      }),
+    );
+    expect(state.runLifecycle).toBe("running");
+  });
+
+  it("stores the next stream cursor when projecting active run state", () => {
+    const state = makeState();
+
     applyStreamEvent(
-      { type: "run_input_queued", run_id: "run-1" },
+      { type: "run_input_queued", run_id: "run-1", index: 12 },
       ctx,
       state,
     );
@@ -204,13 +222,13 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "input-queued",
-        waitingFor: "user_input",
-      },
+        assistantMessageId: "assistant-1",
+        nextEventIndex: 13,
+      }),
     );
-    expect(state.runLifecycle).toBe("running");
   });
 
   it("keeps execution-boundary run_waiting events blocked", () => {
@@ -230,11 +248,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "blocked",
         waitingFor: "executor_offline",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
@@ -266,11 +284,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "blocked",
         waitingFor: "workspace_executor_unavailable",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
@@ -302,11 +320,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "waiting",
         waitingFor: "tool_approval",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
@@ -337,11 +355,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "blocked",
         waitingFor: "fallback_disabled",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
@@ -373,11 +391,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "blocked",
         waitingFor: "fallback_disabled",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
@@ -422,11 +440,11 @@ describe("applyStreamEvent", () => {
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      {
+      expect.objectContaining({
         runId: "run-1",
         status: "paused",
         waitingFor: "user_resume",
-      },
+      }),
     );
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",

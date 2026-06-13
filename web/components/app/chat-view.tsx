@@ -429,16 +429,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
   const activeRunIsVisibleActivity = Boolean(
     detail.activeRun?.runId &&
-      activeRunStatus &&
-      !isTerminalChatRunStatus(activeRunStatus),
+    activeRunStatus &&
+    !isTerminalChatRunStatus(activeRunStatus),
   );
   const workSurfaceActiveRun = activeRunIsVisibleActivity
     ? detail.activeRun
     : undefined;
   const showRunActivityBar = Boolean(
-    !isArchived &&
-      !canResumeRun &&
-      (startingRun || activeRunIsVisibleActivity),
+    !isArchived && !canResumeRun && (startingRun || activeRunIsVisibleActivity),
   );
   const runActivityLabel =
     stoppingRun || activeRunStatus === "cancelling"
@@ -448,10 +446,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         : activeRunLabel;
   const workspaceSelectorDisabled = Boolean(
     startingRun ||
-      composerDisabled ||
-      (detail.activeRun?.runId &&
-        activeRunStatus &&
-        !isTerminalChatRunStatus(activeRunStatus)),
+    composerDisabled ||
+    (detail.activeRun?.runId &&
+      activeRunStatus &&
+      !isTerminalChatRunStatus(activeRunStatus)),
   );
 
   // ── effects ────────────────────────────────────────────────────────────────
@@ -498,14 +496,15 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     }
 
     stream.autoAttachAttemptedRunRef.current = activeRun.runId;
-    const assistantMessageId = stream.ensureStreamingAssistantMessage();
+    const assistantMessageId = stream.ensureStreamingAssistantMessage(
+      activeRun.assistantMessageId,
+    );
     stream.attachExistingRunStream(
       activeRun.runId,
       assistantMessageId,
       "The run is active, but the web UI could not reconnect to its stream.",
       {
-        scheduleRetry: () =>
-          stream.scheduleAutoAttachRetry(activeRun.runId),
+        scheduleRetry: () => stream.scheduleAutoAttachRetry(activeRun.runId),
       },
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps

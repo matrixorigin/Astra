@@ -438,7 +438,9 @@ impl FileBackedEventStore {
                 "failed to decrypt checkpoint",
             )
         })?;
-        Ok(serde_json::from_str::<StepEvent>(&json).ok())
+        serde_json::from_str::<StepEvent>(&json)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     fn load_events_matching(
@@ -480,13 +482,15 @@ impl FileBackedEventStore {
         Self::load_events_matching(session_id, |_| true)
     }
 
-    /// Stream only events written after a checkpoint timestamp. Recovery uses
-    /// this instead of materializing the entire long-session journal.
-    pub fn load_events_created_after(
+    /// Stream only events written at or after a checkpoint timestamp. Recovery
+    /// uses this instead of materializing the entire long-session journal.
+    pub fn load_events_created_at_or_after(
         session_id: &str,
         checkpoint_created_at: u64,
     ) -> std::io::Result<Vec<StepEvent>> {
-        Self::load_events_matching(session_id, |event| event.created_at > checkpoint_created_at)
+        Self::load_events_matching(session_id, |event| {
+            event.created_at >= checkpoint_created_at
+        })
     }
 
     /// Append a single event to the JSONL file.
@@ -1023,10 +1027,26 @@ mod tests {
             }
         }
 
-        let events = FileBackedEventStore::load_events_created_after(&session_id, 450)
+        let events = FileBackedEventStore::load_events_created_at_or_after(&session_id, 500)
             .expect("load recovery window");
         let ids: Vec<_> = events.iter().map(|event| event.event_id.as_str()).collect();
         assert_eq!(ids, vec!["e5", "e6", "e7", "e8", "e9"]);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+    }
+
+    #[test]
+    fn file_event_store_fails_on_corrupt_event_json() {
+        let session_id = format!("test-corrupt-event-json-{}", std::process::id());
+        let path = events_path_for(&session_id);
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(session_dir_for(&session_id)).expect("session dir");
+        append_encrypted_line(&path, r#"{"not":"a step event"}"#).expect("append corrupt event");
+
+        let error = FileBackedEventStore::load_events_created_at_or_after(&session_id, 0)
+            .expect_err("corrupt event json should fail recovery");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(session_dir_for(&session_id));

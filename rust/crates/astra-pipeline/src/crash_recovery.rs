@@ -77,14 +77,12 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
     // Extract turn number from checkpoint
     let checkpoint_turn = extract_turn_from_step_id(&heavy.light.step_id);
 
-    // Stream only the recovery window after the checkpoint. Long sessions may
-    // have very large journals; recovery should not materialize historical
-    // events that cannot affect the current replay.
+    // Stream only the recovery window from the checkpoint timestamp onward.
+    // Long sessions may have very large journals; recovery should not
+    // materialize historical events that cannot affect the current replay.
     let events =
-        FileBackedEventStore::load_events_created_after(session_id, heavy.light.created_at)
-            .map_err(|e| {
-                RecoveryError::JournalRead(format!("Failed to read event journal: {e}"))
-            })?;
+        FileBackedEventStore::load_events_created_at_or_after(session_id, heavy.light.created_at)
+            .map_err(|e| RecoveryError::JournalRead(format!("Failed to read event journal: {e}")))?;
 
     // Serialize checkpoint for scan_journal (must be StepCheckpoint enum JSON)
     let light_cp = StepCheckpoint::Light(heavy.light.clone());

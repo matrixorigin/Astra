@@ -6202,11 +6202,30 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .append_event(&run_id, input_queued_event.clone())
             .await
             .map_err(|error| Self::durable_persist_error("input queued event", error))?;
-        if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+        let mut stream_input_queued_event = input_queued_event.clone();
+        if let Some(obj) = stream_input_queued_event.as_object_mut() {
+            obj.insert(
+                "index".to_string(),
+                json!(durable_after_append.events.len()),
+            );
+        }
+        let live_events = run_handlers::transform_stream_run_events_for_client(
+            &run_id,
+            vec![stream_input_queued_event],
+        );
+        let live_tx = if let Some(run) = self.runs.write().await.get_mut(&run_id) {
             run.events.push(event);
             run.events.push(input_queued_event);
             run.status = RunStatus::InputQueued;
             run.waiting_for = Some("user_input".to_string());
+            run.live_tx.clone()
+        } else {
+            None
+        };
+        if let Some(live_tx) = live_tx {
+            for event in live_events {
+                let _ = live_tx.send(event);
+            }
         }
 
         Ok(RunInputRecord {

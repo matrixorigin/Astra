@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   PATH_CHAT_STREAM,
   PATH_EDGES_STATUS,
+  buildQueryString,
   chatRunStreamPath,
 } from "@astra/sdk";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
@@ -114,7 +115,8 @@ async function verifyLiveWorkspaceSelection(
 
   return {
     ...selection,
-    displayName: edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
+    displayName:
+      edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
     cwd: liveCwd,
   };
 }
@@ -160,6 +162,31 @@ function lastAssistantMessageId(messages: Array<{ id: string; role: string }>) {
     }
   }
   return null;
+}
+
+function assistantMessageBelongsToChat(
+  messages: Array<{ id: string; role: string }>,
+  messageId: string | null | undefined,
+) {
+  if (!messageId) {
+    return null;
+  }
+  return messages.some(
+    (message) => message.id === messageId && message.role === "assistant",
+  )
+    ? messageId
+    : null;
+}
+
+function normalizedLastIndex(value: string | null) {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return Math.trunc(parsed);
 }
 
 function proxyRunStream(params: {
@@ -508,7 +535,10 @@ export async function POST(
   }
   if (
     requestedWorkspaceSelection &&
-    !sameWorkspaceSelection(requestedWorkspaceSelection, storedWorkspaceSelection)
+    !sameWorkspaceSelection(
+      requestedWorkspaceSelection,
+      storedWorkspaceSelection,
+    )
   ) {
     try {
       const updated = await updateChatWorkspaceSelection(
@@ -650,7 +680,17 @@ export async function GET(
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
 
-  const assistantMessageId = lastAssistantMessageId(chat.messages);
+  const requestedAssistantMessageId = request.nextUrl.searchParams
+    .get("assistantMessageId")
+    ?.trim();
+  const activeRunAssistantMessageId =
+    chat.activeRun?.runId === runId
+      ? (chat.activeRun.assistantMessageId ?? null)
+      : null;
+  const assistantMessageId =
+    assistantMessageBelongsToChat(chat.messages, requestedAssistantMessageId) ??
+    assistantMessageBelongsToChat(chat.messages, activeRunAssistantMessageId) ??
+    lastAssistantMessageId(chat.messages);
   if (!assistantMessageId) {
     return NextResponse.json(
       { error: "no assistant message is available to resume" },
@@ -682,8 +722,13 @@ export async function GET(
   }
 
   const backendAbortController = new AbortController();
+  const lastIndex = normalizedLastIndex(
+    request.nextUrl.searchParams.get("last_index"),
+  );
   const backendResponse = await runtime.fetchResponse(
-    chatRunStreamPath(runId),
+    `${chatRunStreamPath(runId)}${buildQueryString(
+      lastIndex === null ? {} : { last_index: lastIndex },
+    )}`,
     {
       method: "GET",
       auth: "required",

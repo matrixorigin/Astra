@@ -273,10 +273,14 @@ describe("ChatView deferred-input unhappy paths", () => {
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
     await waitFor(() => {
-      expect(mockQueueChatRunInput).toHaveBeenCalledWith("chat-123", {
-        content: "queue this follow-up",
-        options: composerPayload.options,
-      });
+      expect(mockQueueChatRunInput).toHaveBeenCalledWith(
+        "chat-123",
+        expect.objectContaining({
+          content: "queue this follow-up",
+          options: composerPayload.options,
+          pendingMessageId: expect.any(String),
+        }),
+      );
     });
     expect(mockGetChat).not.toHaveBeenCalled();
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
@@ -929,10 +933,18 @@ describe("ChatView deferred-input unhappy paths", () => {
         createdAt: "2026-06-07T00:00:00.000Z",
         status: "complete",
       },
+      assistantMessage: {
+        id: "queued-assistant-1",
+        role: "assistant",
+        content: "",
+        createdAt: "2026-06-07T00:00:00.000Z",
+        status: "streaming",
+      },
       activeRun: {
         runId: "run-123",
         status: "input-queued",
         waitingFor: "user_input",
+        assistantMessageId: "queued-assistant-1",
       },
     });
 
@@ -951,10 +963,14 @@ describe("ChatView deferred-input unhappy paths", () => {
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
     await waitFor(() => {
-      expect(mockQueueChatRunInput).toHaveBeenCalledWith("chat-123", {
-        content: "queue this follow-up",
-        options: composerPayload.options,
-      });
+      expect(mockQueueChatRunInput).toHaveBeenCalledWith(
+        "chat-123",
+        expect.objectContaining({
+          content: "queue this follow-up",
+          options: composerPayload.options,
+          pendingMessageId: expect.any(String),
+        }),
+      );
     });
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
     expect(mockStreamExistingChatRun).toHaveBeenCalledWith(
@@ -963,6 +979,9 @@ describe("ChatView deferred-input unhappy paths", () => {
       expect.objectContaining({
         onText: expect.any(Function),
         onDone: expect.any(Function),
+      }),
+      expect.objectContaining({
+        assistantMessageId: "queued-assistant-1",
       }),
     );
   });
@@ -982,10 +1001,14 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
     await waitFor(() => {
-      expect(mockQueueChatRunInput).toHaveBeenCalledWith("chat-123", {
-        content: "queue this follow-up",
-        options: composerPayload.options,
-      });
+      expect(mockQueueChatRunInput).toHaveBeenCalledWith(
+        "chat-123",
+        expect.objectContaining({
+          content: "queue this follow-up",
+          options: composerPayload.options,
+          pendingMessageId: expect.any(String),
+        }),
+      );
     });
     expect(screen.getByRole("button", { name: "Stop run" })).toBeDisabled();
 
@@ -1001,10 +1024,18 @@ describe("ChatView deferred-input unhappy paths", () => {
         createdAt: "2026-06-07T00:00:00.000Z",
         status: "complete",
       },
+      assistantMessage: {
+        id: "queued-assistant-1",
+        role: "assistant",
+        content: "",
+        createdAt: "2026-06-07T00:00:00.000Z",
+        status: "streaming",
+      },
       activeRun: {
         runId: "run-123",
         status: "input-queued",
         waitingFor: "user_input",
+        assistantMessageId: "queued-assistant-1",
       },
     });
     await waitFor(() => {
@@ -1168,6 +1199,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         "chat-123",
         "run-blocked",
         expect.any(Object),
+        expect.any(Object),
       );
     });
   });
@@ -1183,10 +1215,18 @@ describe("ChatView deferred-input unhappy paths", () => {
         createdAt: "2026-06-07T00:00:00.000Z",
         status: "complete",
       },
+      assistantMessage: {
+        id: "queued-assistant-1",
+        role: "assistant",
+        content: "",
+        createdAt: "2026-06-07T00:00:00.000Z",
+        status: "streaming",
+      },
       activeRun: {
         runId: "run-123",
         status: "input-queued",
         waitingFor: "user_input",
+        assistantMessageId: "queued-assistant-1",
       },
     });
 
@@ -1236,10 +1276,18 @@ describe("ChatView deferred-input unhappy paths", () => {
         createdAt: "2026-06-07T00:00:00.000Z",
         status: "complete",
       },
+      assistantMessage: {
+        id: "queued-assistant-1",
+        role: "assistant",
+        content: "",
+        createdAt: "2026-06-07T00:00:00.000Z",
+        status: "streaming",
+      },
       activeRun: {
         runId: "run-123",
         status: "input-queued",
         waitingFor: "user_input",
+        assistantMessageId: "queued-assistant-1",
       },
     });
 
@@ -1330,6 +1378,9 @@ describe("ChatView deferred-input unhappy paths", () => {
           onRunUpdated: expect.any(Function),
           onDone: expect.any(Function),
           onPaused: expect.any(Function),
+        }),
+        expect.objectContaining({
+          assistantMessageId: expect.any(String),
         }),
       );
     });
@@ -1436,6 +1487,9 @@ describe("ChatView deferred-input unhappy paths", () => {
         expect.objectContaining({
           onText: expect.any(Function),
           onDone: expect.any(Function),
+        }),
+        expect.objectContaining({
+          assistantMessageId: expect.any(String),
         }),
       );
     });

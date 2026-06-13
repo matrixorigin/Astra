@@ -156,6 +156,7 @@ export type ChatStreamHandlers = {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    nextEventIndex?: number | null;
   }) => void;
   onRunFinished?: (run: {
     runId?: string;
@@ -177,7 +178,29 @@ type ChatStreamState = {
   cancelled?: boolean;
   paused?: boolean;
   error?: string;
+  nextEventIndex?: number;
 };
+
+function normalizeEventIndex(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  return Math.trunc(value);
+}
+
+function runUpdate(
+  state: ChatStreamState,
+  run: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  },
+) {
+  return {
+    ...run,
+    nextEventIndex: state.nextEventIndex ?? null,
+  };
+}
 
 export { splitThinkingTags };
 
@@ -256,6 +279,10 @@ function applyStreamEvent(
   handlers: ChatStreamHandlers,
 ) {
   const type = typeof event.type === "string" ? event.type : "";
+  const eventIndex = normalizeEventIndex(event.index);
+  if (eventIndex !== null) {
+    state.nextEventIndex = Math.max(state.nextEventIndex ?? 0, eventIndex + 1);
+  }
 
   if (
     type === "local_messages" &&
@@ -275,11 +302,13 @@ function applyStreamEvent(
       handlers.onSessionBound?.({ sessionId: event.session_id });
     }
     handlers.onRunStarted?.(event.run_id);
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "running",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "running",
+        waitingFor: null,
+      }),
+    );
     return;
   }
 
@@ -301,22 +330,26 @@ function applyStreamEvent(
     state.runId = event.run_id;
     handlers.onWorkSurfaceEvent?.(event);
     handlers.onRunStarted?.(event.run_id);
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "running",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "running",
+        waitingFor: null,
+      }),
+    );
     return;
   }
 
   if (type === "run_input_queued" && typeof event.run_id === "string") {
     state.runId = event.run_id;
     handlers.onWorkSurfaceEvent?.(event);
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "input-queued",
-      waitingFor: "user_input",
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "input-queued",
+        waitingFor: "user_input",
+      }),
+    );
     return;
   }
 
@@ -334,11 +367,13 @@ function applyStreamEvent(
     }
     if (runId) {
       state.runId = runId;
-      handlers.onRunUpdated?.({
-        runId,
-        status: "blocked",
-        waitingFor: blockedWaitingFor(event),
-      });
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId,
+          status: "blocked",
+          waitingFor: blockedWaitingFor(event),
+        }),
+      );
     }
     return;
   }
@@ -360,11 +395,13 @@ function applyStreamEvent(
     }
     if (runId) {
       state.runId = runId;
-      handlers.onRunUpdated?.({
-        runId,
-        status: projection.status,
-        waitingFor: projection.waitingFor,
-      });
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId,
+          status: projection.status,
+          waitingFor: projection.waitingFor,
+        }),
+      );
     }
     return;
   }
@@ -378,11 +415,13 @@ function applyStreamEvent(
     state.runId = event.run_id;
     handlers.onWorkSurfaceEvent?.(event);
     state.paused = true;
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "paused",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "paused",
+        waitingFor: null,
+      }),
+    );
     return;
   }
 
@@ -390,11 +429,13 @@ function applyStreamEvent(
     state.runId = event.run_id;
     handlers.onWorkSurfaceEvent?.(event);
     state.paused = false;
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "running",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "running",
+        waitingFor: null,
+      }),
+    );
     return;
   }
 
@@ -404,11 +445,13 @@ function applyStreamEvent(
     state.error = message;
     if (typeof event.run_id === "string") {
       state.runId = event.run_id;
-      handlers.onRunUpdated?.({
-        runId: event.run_id,
-        status: "failed",
-        waitingFor: null,
-      });
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId: event.run_id,
+          status: "failed",
+          waitingFor: null,
+        }),
+      );
     }
     return;
   }
@@ -423,14 +466,16 @@ function applyStreamEvent(
     }
     if (typeof event.run_id === "string") {
       state.runId = event.run_id;
-      handlers.onRunUpdated?.({
-        runId: event.run_id,
-        status: "paused",
-        waitingFor:
-          typeof event.waiting_for === "string"
-            ? event.waiting_for
-            : "user_resume",
-      });
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId: event.run_id,
+          status: "paused",
+          waitingFor:
+            typeof event.waiting_for === "string"
+              ? event.waiting_for
+              : "user_resume",
+        }),
+      );
     }
     return;
   }
@@ -488,14 +533,16 @@ function applyStreamEvent(
     if (status === "paused" || status === "interrupted") {
       state.paused = true;
       if (typeof event.run_id === "string") {
-        handlers.onRunUpdated?.({
-          runId: event.run_id,
-          status: "paused",
-          waitingFor:
-            typeof event.waiting_for === "string"
-              ? event.waiting_for
-              : "user_resume",
-        });
+        handlers.onRunUpdated?.(
+          runUpdate(state, {
+            runId: event.run_id,
+            status: "paused",
+            waitingFor:
+              typeof event.waiting_for === "string"
+                ? event.waiting_for
+                : "user_resume",
+          }),
+        );
       }
       return;
     }
@@ -632,9 +679,21 @@ export async function streamExistingChatRun(
   chatId: string,
   runId: string,
   handlers: ChatStreamHandlers,
+  options?: {
+    nextEventIndex?: number | null;
+    assistantMessageId?: string | null;
+  },
 ) {
+  const params = new URLSearchParams({ runId });
+  const nextEventIndex = normalizeEventIndex(options?.nextEventIndex);
+  if (nextEventIndex !== null) {
+    params.set("last_index", String(nextEventIndex));
+  }
+  if (options?.assistantMessageId?.trim()) {
+    params.set("assistantMessageId", options.assistantMessageId.trim());
+  }
   const response = await fetch(
-    `/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`,
+    `/api/chats/${encodeURIComponent(chatId)}/stream?${params.toString()}`,
     { method: "GET", signal: handlers.signal },
   );
   return consumeChatStream(response, handlers);

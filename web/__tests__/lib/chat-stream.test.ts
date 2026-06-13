@@ -129,11 +129,13 @@ describe('streamChatMessage cancellation semantics', () => {
       }),
     ).resolves.toBe('partial');
 
-    expect(onRunUpdated).toHaveBeenCalledWith({
-      runId: 'run-123',
-      status: 'paused',
-      waitingFor: null,
-    });
+    expect(onRunUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: null,
+      }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
       type: 'run_paused',
       run_id: 'run-123',
@@ -173,11 +175,13 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onText).toHaveBeenLastCalledWith(
       'Budget exhausted. You can continue.',
     );
-    expect(onRunUpdated).toHaveBeenLastCalledWith({
-      runId: 'run-123',
-      status: 'paused',
-      waitingFor: 'user_resume',
-    });
+    expect(onRunUpdated).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        runId: 'run-123',
+        status: 'paused',
+        waitingFor: 'user_resume',
+      }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_interrupted', run_id: 'run-123' }),
     );
@@ -224,11 +228,13 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onText).toHaveBeenLastCalledWith(
       'Edge executor MacBook Pro is offline.',
     );
-    expect(onRunUpdated).toHaveBeenLastCalledWith({
-      runId: 'run-123',
-      status: 'blocked',
-      waitingFor: 'executor_offline',
-    });
+    expect(onRunUpdated).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        runId: 'run-123',
+        status: 'blocked',
+        waitingFor: 'executor_offline',
+      }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_blocked' }),
     );
@@ -266,11 +272,13 @@ describe('streamChatMessage cancellation semantics', () => {
       }),
     ).resolves.toBe('');
 
-    expect(onRunUpdated).toHaveBeenLastCalledWith({
-      runId: 'run-123',
-      status: 'waiting',
-      waitingFor: 'tool_approval',
-    });
+    expect(onRunUpdated).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        runId: 'run-123',
+        status: 'waiting',
+        waitingFor: 'tool_approval',
+      }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_waiting' }),
     );
@@ -307,11 +315,13 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onText).toHaveBeenLastCalledWith(
       'Server fallback is disabled for this workspace.',
     );
-    expect(onRunUpdated).toHaveBeenLastCalledWith({
-      runId: 'run-123',
-      status: 'blocked',
-      waitingFor: 'fallback_disabled',
-    });
+    expect(onRunUpdated).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        runId: 'run-123',
+        status: 'blocked',
+        waitingFor: 'fallback_disabled',
+      }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_blocked' }),
     );
@@ -380,11 +390,13 @@ describe('streamChatMessage cancellation semantics', () => {
     ).resolves.toBe('visible');
 
     expect(onRunStarted).toHaveBeenCalledWith('run-session');
-    expect(onRunUpdated).toHaveBeenCalledWith({
-      runId: 'run-session',
-      status: 'running',
-      waitingFor: null,
-    });
+    expect(onRunUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'run-session',
+        status: 'running',
+        waitingFor: null,
+      }),
+    );
     expect(onLocalMessages).toHaveBeenCalledWith({
       userMessage: expect.objectContaining({
         id: 'u1',
@@ -479,11 +491,13 @@ describe('streamChatMessage cancellation semantics', () => {
       }),
     );
     expect(onRunStarted).toHaveBeenCalledWith('run-123');
-    expect(onRunUpdated).toHaveBeenCalledWith({
-      runId: 'run-123',
-      status: 'running',
-      waitingFor: null,
-    });
+    expect(onRunUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'run-123',
+        status: 'running',
+        waitingFor: null,
+      }),
+    );
   });
 
   it('uses turn_complete text as the final assistant text', async () => {
@@ -564,11 +578,13 @@ describe('streamChatMessage cancellation semantics', () => {
         onWorkSurfaceEvent,
       }),
     ).rejects.toThrow('loop crashed');
-    expect(onRunUpdated).toHaveBeenCalledWith({
-      runId: 'run-456',
-      status: 'failed',
-      waitingFor: null,
-    });
+    expect(onRunUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'run-456',
+        status: 'failed',
+        waitingFor: null,
+      }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_error', run_id: 'run-456' }),
     );
@@ -630,6 +646,30 @@ describe('streamChatMessage cancellation semantics', () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       '/api/chats/chat%20123/stream?runId=run%2F123',
+      { method: 'GET', signal: undefined },
+    );
+  });
+
+  it('streams an existing run from the stored cursor into the bound assistant message', async () => {
+    (globalThis.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
+    });
+
+    await expect(
+      streamExistingChatRun(
+        'chat 123',
+        'run/123',
+        {},
+        {
+          assistantMessageId: 'assistant-queued',
+          nextEventIndex: 9,
+        },
+      ),
+    ).resolves.toBe('resumed');
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      '/api/chats/chat%20123/stream?runId=run%2F123&last_index=9&assistantMessageId=assistant-queued',
       { method: 'GET', signal: undefined },
     );
   });
