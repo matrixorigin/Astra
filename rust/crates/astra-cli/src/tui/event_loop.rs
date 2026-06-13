@@ -52,6 +52,7 @@ use super::{
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
+const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
 
 fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
     let description = description.trim();
@@ -94,6 +95,23 @@ fn bash_detach_hint_enabled(listener: Option<&astra_tools::detach::DetachShellLi
 }
 
 type BashDetachHandoffResult = Result<astra_tools::detach::DetachedShellPayload, String>;
+
+async fn await_bash_detach_handoff_with_timeout(
+    listener: astra_tools::detach::DetachShellListener,
+    timeout: Duration,
+) -> BashDetachHandoffResult {
+    match tokio::time::timeout(timeout, listener.payload_rx).await {
+        Ok(Ok(payload)) => Ok(payload),
+        Ok(Err(_)) => Err("bash runner ended before handing off the process.".to_string()),
+        Err(_) => Err("bash runner did not hand off the process before timeout.".to_string()),
+    }
+}
+
+async fn await_bash_detach_handoff(
+    listener: astra_tools::detach::DetachShellListener,
+) -> BashDetachHandoffResult {
+    await_bash_detach_handoff_with_timeout(listener, BASH_DETACH_HANDOFF_WAIT).await
+}
 
 fn is_background_task_manage_key(key: &crossterm::event::KeyEvent) -> bool {
     key.code == crossterm::event::KeyCode::Down
@@ -1789,14 +1807,7 @@ pub(crate) async fn run_tui_session(
                                                                         let handoff_tx =
                                                                             bash_detach_handoff_tx.clone();
                                                                         tokio::spawn(async move {
-                                                                            let result =
-                                                                                match listener.payload_rx.await {
-                                                                                    Ok(payload) => Ok(payload),
-                                                                                    Err(_) => Err(
-                                                                                        "bash runner ended before handing off the process."
-                                                                                            .to_string(),
-                                                                                    ),
-                                                                                };
+                                                                            let result = await_bash_detach_handoff(listener).await;
                                                                             let _ = handoff_tx.send(result);
                                                                         });
                                                                         true
@@ -4507,6 +4518,22 @@ mod tests {
         assert!(is_ctrl_b_background_key(&ctrl_b));
         assert!(!is_ctrl_b_background_key(&plain_b));
         assert!(!is_ctrl_b_background_key(&ctrl_c));
+    }
+
+    #[tokio::test]
+    async fn bash_detach_handoff_timeout_returns_error() {
+        let (handle, listener) = astra_tools::detach::new_detach_pair();
+        handle.mark_active(true);
+
+        let result =
+            await_bash_detach_handoff_with_timeout(listener, Duration::from_millis(1)).await;
+
+        let error = match result {
+            Ok(_) => panic!("missing payload should time out"),
+            Err(error) => error,
+        };
+        assert!(error.contains("before timeout"));
+        assert!(!handle.is_retired());
     }
 
     #[tokio::test]

@@ -52,34 +52,25 @@ impl WebSocketProgressCallback {
 #[async_trait]
 impl ToolProgressCallback for WebSocketProgressCallback {
     async fn tool_started(&self, call_id: &str, tool_name: &str, args: &Value) {
-        let _ = self
-            .tx
-            .send(ProgressEvent::Started {
-                call_id: call_id.to_string(),
-                tool: tool_name.to_string(),
-                args: args.clone(),
-            })
-            .await;
+        let _ = self.tx.try_send(ProgressEvent::Started {
+            call_id: call_id.to_string(),
+            tool: tool_name.to_string(),
+            args: args.clone(),
+        });
     }
 
     async fn tool_output_delta(&self, call_id: &str, delta: &str) {
-        let _ = self
-            .tx
-            .send(ProgressEvent::Delta {
-                call_id: call_id.to_string(),
-                content: delta.to_string(),
-            })
-            .await;
+        let _ = self.tx.try_send(ProgressEvent::Delta {
+            call_id: call_id.to_string(),
+            content: delta.to_string(),
+        });
     }
 
     async fn tool_completed(&self, call_id: &str, _result: &str, success: bool) {
-        let _ = self
-            .tx
-            .send(ProgressEvent::Completed {
-                call_id: call_id.to_string(),
-                success,
-            })
-            .await;
+        let _ = self.tx.try_send(ProgressEvent::Completed {
+            call_id: call_id.to_string(),
+            success,
+        });
     }
 
     async fn ask_user_resolved(
@@ -90,16 +81,13 @@ impl ToolProgressCallback for WebSocketProgressCallback {
         was_custom: Option<bool>,
         error: Option<&str>,
     ) {
-        let _ = self
-            .tx
-            .send(ProgressEvent::UserPromptResolved {
-                request_id: request_id.to_string(),
-                outcome: outcome.to_string(),
-                answers: answers.to_vec(),
-                was_custom,
-                error: error.map(ToString::to_string),
-            })
-            .await;
+        let _ = self.tx.try_send(ProgressEvent::UserPromptResolved {
+            request_id: request_id.to_string(),
+            outcome: outcome.to_string(),
+            answers: answers.to_vec(),
+            was_custom,
+            error: error.map(ToString::to_string),
+        });
     }
 }
 
@@ -212,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_lifecycle_sequence() {
-        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(3);
         let cb = WebSocketProgressCallback::new(tx);
 
         cb.tool_started("c1", "write_file", &json!({"path": "a.txt"}))
@@ -233,5 +221,20 @@ mod tests {
             ProgressEvent::Completed { .. }
         ));
         assert!(rx.try_recv().is_err()); // No more events.
+    }
+
+    #[tokio::test]
+    async fn full_channel_drops_progress_instead_of_blocking() {
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
+        let cb = WebSocketProgressCallback::new(tx);
+
+        cb.tool_started("c1", "bash", &json!({})).await;
+        cb.tool_completed("c1", "done", true).await;
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            ProgressEvent::Started { .. }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

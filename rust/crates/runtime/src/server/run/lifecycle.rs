@@ -113,6 +113,28 @@ fn wire_executor_into_state(
     state.server_tool_executor = Some(executor);
 }
 
+struct NonInteractiveApprovalGate;
+
+#[async_trait]
+impl astra_tools::ToolApprovalGate for NonInteractiveApprovalGate {
+    async fn request_approval(
+        &self,
+        _request_id: &str,
+        tool_name: &str,
+        _args: &Value,
+    ) -> astra_tools::ApprovalDecision {
+        astra_tools::ApprovalDecision::Denied {
+            reason: Some(format!(
+                "{tool_name} requires interactive approval, but this run has no interactive client"
+            )),
+        }
+    }
+
+    fn requires_approval(&self, tool_name: &str) -> bool {
+        astra_tools::APPROVAL_REQUIRED_TOOLS.contains(&tool_name)
+    }
+}
+
 use crate::server::run::binding_resolution::{
     RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
     execution_bindings_from_edge_profile, execution_bindings_from_metadata,
@@ -5007,20 +5029,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await;
 
-            // ── Phase E: Wire WebSocket approval gate ───────────────
-            let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
-            let approval_gate = astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new(
-                user_id.clone(),
-                self.edge_callback_ledger.clone(),
-                approval_tx,
-            );
-            executor.set_approval_gate(std::sync::Arc::new(approval_gate));
-            self.approval_channels
-                .lock()
-                .await
-                .insert(run_id.clone(), approval_rx);
-
             if request.interactive_client {
+                // ── Phase E: Wire WebSocket approval and ask_user gates ───
+                let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
+                let approval_gate = astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new(
+                    user_id.clone(),
+                    self.edge_callback_ledger.clone(),
+                    approval_tx,
+                );
+                executor.set_approval_gate(std::sync::Arc::new(approval_gate));
+                self.approval_channels
+                    .lock()
+                    .await
+                    .insert(run_id.clone(), approval_rx);
+
                 let (user_prompt_tx, user_prompt_rx) = mpsc::channel::<Value>(64);
                 let user_prompt_gate =
                     astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
@@ -5033,19 +5055,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     .lock()
                     .await
                     .insert(run_id.clone(), user_prompt_rx);
-            }
 
-            // ── Phase F.3: Wire WebSocket progress callback ─────────
-            let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
-            let progress_cb =
-                astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
-                    progress_tx,
-                );
-            executor.set_progress_callback(std::sync::Arc::new(progress_cb));
-            self.progress_channels
-                .lock()
-                .await
-                .insert(run_id.clone(), progress_rx);
+                // ── Phase F.3: Wire WebSocket progress callback ──────
+                let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
+                let progress_cb =
+                    astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
+                        progress_tx,
+                    );
+                executor.set_progress_callback(std::sync::Arc::new(progress_cb));
+                self.progress_channels
+                    .lock()
+                    .await
+                    .insert(run_id.clone(), progress_rx);
+            } else {
+                executor.set_approval_gate(std::sync::Arc::new(NonInteractiveApprovalGate));
+            }
 
             wire_executor_into_state(executor, &mut loop_state);
         }
@@ -9618,6 +9642,43 @@ mod tests {
         assert_eq!(status.executor.as_ref().unwrap()["kind"], "server_local");
         assert_eq!(status.transport.as_deref(), Some("server_local"));
         assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
+    }
+
+    #[tokio::test]
+    async fn noninteractive_create_run_does_not_wire_ws_only_channels() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+
+        assert!(!svc.approval_channels.lock().await.contains_key(&run.run_id));
+        assert!(
+            !svc.user_prompt_channels
+                .lock()
+                .await
+                .contains_key(&run.run_id)
+        );
+        assert!(!svc.progress_channels.lock().await.contains_key(&run.run_id));
+    }
+
+    #[tokio::test]
+    async fn noninteractive_approval_gate_denies_required_tools_without_waiting_for_ws() {
+        let gate = NonInteractiveApprovalGate;
+
+        assert!(astra_tools::ToolApprovalGate::requires_approval(
+            &gate, "bash"
+        ));
+        let decision = astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "req-1",
+            "bash",
+            &serde_json::json!({"command": "rm -rf /tmp/example"}),
+        )
+        .await;
+
+        assert!(matches!(
+            decision,
+            astra_tools::ApprovalDecision::Denied { reason: Some(reason) }
+                if reason.contains("no interactive client")
+        ));
     }
 
     #[tokio::test]

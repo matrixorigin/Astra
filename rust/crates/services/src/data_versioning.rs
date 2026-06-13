@@ -118,9 +118,17 @@ fn read_composite_snapshot_index_local(
     if !path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(path).map_err(internal_error)?;
+    let content = std::fs::read_to_string(&path).map_err(internal_error)?;
+    let Some(decrypted) = crate::checkpoint_crypto::decrypt_text(&content) else {
+        tracing::warn!(
+            session_id,
+            path = %path.display(),
+            "composite snapshot index decryption failed; skipping local index for data versioning"
+        );
+        return Ok(None);
+    };
     let mut index: CompositeSnapshotIndex =
-        serde_json::from_str(&content).map_err(internal_error)?;
+        serde_json::from_str(&decrypted).map_err(internal_error)?;
     index.normalize_versions();
     Ok(Some(index))
 }
@@ -737,6 +745,7 @@ pub struct SandboxCheckpointRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_journal::JournalDirGuard;
 
     // ── validate_checkpoint_name (5→1 data-driven) ──
 
@@ -871,6 +880,31 @@ mod tests {
 
         let snapshot = snapshot_for_event(&index, "2026-04-12T10:04:30").expect("snapshot");
         assert_eq!(snapshot.version, 1);
+    }
+
+    #[test]
+    fn local_composite_snapshot_index_reads_encrypted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&sid, 7)
+            .session_state("000007-heavy.json")
+            .build();
+        snapshot.snapshot_id = "snap-data-versioning".into();
+        let index = CompositeSnapshotIndex {
+            snapshots: vec![snapshot],
+        };
+        let path = composite_snapshots_json_path(&sid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        std::fs::write(&path, crate::checkpoint_crypto::encrypt_text(&json)).unwrap();
+
+        let restored = read_composite_snapshot_index_local(&sid)
+            .unwrap()
+            .expect("encrypted local index should load");
+
+        assert_eq!(restored.snapshots.len(), 1);
+        assert_eq!(restored.snapshots[0].snapshot_id, "snap-data-versioning");
     }
 
     #[test]

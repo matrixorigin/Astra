@@ -5,6 +5,7 @@ pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
 pub mod branches;
+pub mod checkpoint_crypto;
 pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;

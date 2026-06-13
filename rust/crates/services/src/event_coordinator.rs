@@ -23,6 +23,7 @@
 //! MatrixOne. This is enforced by awaiting DB confirmation before broadcast.
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -102,6 +103,20 @@ pub struct ForkedEvent {
     pub reason: ForkReason,
 }
 
+/// Durable identity for an event as stored in the DB projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventFingerprint {
+    pub content_hash: String,
+}
+
+impl EventFingerprint {
+    pub fn from_journal_event(event: &JournalEvent) -> Self {
+        Self {
+            content_hash: journal_event_content_hash(event),
+        }
+    }
+}
+
 /// Why a journal event is missing from the DB projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkReason {
@@ -109,6 +124,12 @@ pub enum ForkReason {
     MissingFromDb,
     /// Event hash mismatch between journal and DB.
     ContentMismatch,
+}
+
+fn journal_event_content_hash(event: &JournalEvent) -> String {
+    let payload = serde_json::to_vec(event).unwrap_or_else(|_| format!("{event:?}").into_bytes());
+    let digest = Sha256::digest(&payload);
+    format!("sha256:{}", crate::checkpoint_crypto::hex_encode(&digest))
 }
 
 /// Error during DB ingestion.
@@ -480,33 +501,50 @@ impl EventCoordinator {
         }
     }
 
-    /// Detect journal events that are missing from DB projection.
+    /// Detect journal events that are missing from, or differ from, DB projection.
     ///
     /// Called at session startup to identify persistent journal/DB forks.
-    /// Events in the journal but not in DB are returned so a recovery
-    /// process can re-ingest them.
-    pub fn detect_forked_events<'a>(
+    /// Events in the journal but not in DB, or whose durable hash differs at
+    /// the same position, are returned so a recovery process can re-ingest
+    /// or repair them.
+    pub fn detect_forked_events<'a, 'b>(
         journal_events: impl Iterator<Item = &'a JournalEvent>,
-        db_event_count: u64,
+        db_events: impl Iterator<Item = &'b EventFingerprint>,
     ) -> Vec<ForkedEvent> {
         let mut forked = Vec::new();
-        let mut seen: u64 = 0;
+        let mut db_events = db_events.peekable();
+        let mut journal_count: u64 = 0;
+        let mut db_count: u64 = 0;
 
         for event in journal_events {
-            seen += 1;
-            if seen > db_event_count {
-                forked.push(ForkedEvent {
-                    event: event.clone(),
-                    reason: ForkReason::MissingFromDb,
-                });
+            journal_count += 1;
+            match db_events.next() {
+                Some(db_event) => {
+                    db_count += 1;
+                    if db_event.content_hash != journal_event_content_hash(event) {
+                        forked.push(ForkedEvent {
+                            event: event.clone(),
+                            reason: ForkReason::ContentMismatch,
+                        });
+                    }
+                }
+                None => {
+                    forked.push(ForkedEvent {
+                        event: event.clone(),
+                        reason: ForkReason::MissingFromDb,
+                    });
+                }
             }
         }
 
-        if seen < db_event_count {
+        for _ in db_events {
+            db_count += 1;
+        }
+
+        if journal_count < db_count {
             warn!(
-                journal_count = seen,
-                db_count = db_event_count,
-                "DB has more events than journal — possible journal truncation"
+                journal_count,
+                db_count, "DB has more events than journal — possible journal truncation"
             );
         }
 
@@ -664,6 +702,13 @@ mod tests {
             git_head: None,
             git_branch: None,
         }
+    }
+
+    fn fingerprints_for(events: &[JournalEvent]) -> Vec<EventFingerprint> {
+        events
+            .iter()
+            .map(EventFingerprint::from_journal_event)
+            .collect()
     }
 
     fn setup_coordinator() -> (
@@ -949,8 +994,9 @@ mod tests {
             .map(|i| make_event(&format!("event-{}", i)))
             .collect();
 
-        // DB has only 3 events (events 0,1,2) → events 3,4 are forked
-        let forked = EventCoordinator::detect_forked_events(events.iter(), 3);
+        // DB has only events 0,1,2 → events 3,4 are forked.
+        let db_events = fingerprints_for(&events[..3]);
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
         assert_eq!(
             forked.len(),
             2,
@@ -966,8 +1012,9 @@ mod tests {
             .map(|i| make_event(&format!("event-{}", i)))
             .collect();
 
-        // DB has exactly 3 events → no fork
-        let forked = EventCoordinator::detect_forked_events(events.iter(), 3);
+        // DB has exactly the same events → no fork.
+        let db_events = fingerprints_for(&events);
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
         assert!(
             forked.is_empty(),
             "exact match should produce no forked events, got {forked:?}"
@@ -980,8 +1027,12 @@ mod tests {
             .map(|i| make_event(&format!("event-{}", i)))
             .collect();
 
-        // DB has 5 events (more than journal) → possible truncation, but no MissingFromDb
-        let forked = EventCoordinator::detect_forked_events(events.iter(), 5);
+        let mut db_source = events.clone();
+        db_source.extend((2..5).map(|i| make_event(&format!("db-only-{i}"))));
+        let db_events = fingerprints_for(&db_source);
+
+        // DB has more events than journal → possible truncation, but no MissingFromDb.
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
         assert!(
             forked.is_empty(),
             "DB having more events is not a fork (possible truncation)"
@@ -991,8 +1042,31 @@ mod tests {
     #[test]
     fn detect_forked_events_empty_journal() {
         let events: Vec<JournalEvent> = vec![];
-        let forked = EventCoordinator::detect_forked_events(events.iter(), 0);
+        let db_events: Vec<EventFingerprint> = vec![];
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
         assert!(forked.is_empty());
+    }
+
+    #[test]
+    fn detect_forked_events_content_mismatch() {
+        let journal_events: Vec<JournalEvent> =
+            (0..3).map(|i| make_event(&format!("event-{i}"))).collect();
+        let mut db_source = journal_events.clone();
+        db_source[1].metadata = Some(serde_json::json!({
+            "key": "value",
+            "label": "event-1-mutated"
+        }));
+        let db_events = fingerprints_for(&db_source);
+
+        let forked =
+            EventCoordinator::detect_forked_events(journal_events.iter(), db_events.iter());
+
+        assert_eq!(forked.len(), 1);
+        assert_eq!(forked[0].reason, ForkReason::ContentMismatch);
+        assert_eq!(
+            forked[0].event.metadata.as_ref().unwrap()["label"],
+            "event-1"
+        );
     }
 
     /// End-to-end: when ingestion channel closes, the event is written to journal
@@ -1021,7 +1095,9 @@ mod tests {
         );
 
         // detect_forked_events should find the mismatch (1 journal, 0 DB)
-        let forked = EventCoordinator::detect_forked_events(journal_events.iter(), 0);
+        let db_events: Vec<EventFingerprint> = vec![];
+        let forked =
+            EventCoordinator::detect_forked_events(journal_events.iter(), db_events.iter());
         assert_eq!(
             forked.len(),
             1,
