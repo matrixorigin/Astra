@@ -952,8 +952,18 @@ impl CrashRecoveryManager {
                 }
             }
             ToolCallStatus::Failed => {
-                // Failed tool calls are safe to retry (they didn't produce side effects)
-                ToolReplayDecision::Replay
+                // A failed tool may still have partially produced side effects
+                // (e.g. bash "rm a/ b/ c/" deleted a/ before crashing).
+                // Classify by tool safety, same as StartedOnly.
+                let safety = classify_tool(&tool_call.tool_name);
+                match safety {
+                    ToolSafetyClass::PureRead | ToolSafetyClass::IdempotentWrite => {
+                        ToolReplayDecision::Replay
+                    }
+                    ToolSafetyClass::SideEffect => ToolReplayDecision::InFlightAtCrash {
+                        tool_name: tool_call.tool_name.clone(),
+                    },
+                }
             }
             ToolCallStatus::Skipped => {
                 if let Some(ref cached) = tool_call.cached_result {
@@ -1600,10 +1610,34 @@ mod tests {
     }
 
     #[test]
-    fn replay_decision_failed_tool_is_safe_to_replay() {
-        let record = tool_record("bash", ToolCallStatus::Failed, None);
+    fn replay_decision_failed_pure_read_is_safe_to_replay() {
+        // PureRead tools are safe to retry even when failed — they don't
+        // produce side effects, so replaying them is idempotent.
+        let record = tool_record("read_file", ToolCallStatus::Failed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(decision, ToolReplayDecision::Replay);
+    }
+
+    #[test]
+    fn replay_decision_failed_idempotent_write_is_safe_to_replay() {
+        // IdempotentWrite tools are safe to retry even when failed —
+        // write_file overwrites the same content, which is idempotent.
+        let record = tool_record("write_file", ToolCallStatus::Failed, None);
+        let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
+        assert_eq!(decision, ToolReplayDecision::Replay);
+    }
+
+    #[test]
+    fn replay_decision_failed_side_effect_is_not_safe_to_replay() {
+        // SideEffect tools (e.g. bash) may have partially executed before
+        // failing. Replaying them could double-apply mutations (e.g. delete
+        // files that were already deleted). Must return InFlightAtCrash.
+        let record = tool_record("bash", ToolCallStatus::Failed, None);
+        let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
+        assert!(matches!(
+            decision,
+            ToolReplayDecision::InFlightAtCrash { .. }
+        ));
     }
 
     #[test]

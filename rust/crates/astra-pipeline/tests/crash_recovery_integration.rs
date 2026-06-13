@@ -333,35 +333,47 @@ fn mixed_tools_partial_auto_recover_blocked() {
 // ── Failed tool → safe to replay ──────────────────────────────────────────
 
 #[test]
-fn failed_tool_is_safe_to_replay() {
+fn failed_side_effect_tool_requires_user_input() {
+    // Regression: Failed SideEffect tools (e.g. bash) may have partially executed
+    // before the failure (e.g. "rm a/ b/ c/" deleted a/ before crashing).
+    // Auto-replaying doubles the mutation. Must return RequiresUserInput.
     let temp = tempfile::tempdir().unwrap();
     let _guard = JournalDirGuard::new(temp.path());
-    let sid = "cr-int-failed-tool";
+    let sid = "test-failed-side-effect";
 
     write_test_heavy_checkpoint(sid, "session-turn-1-step-1", 1000);
 
-    let events = vec![
-        make_step_event(
-            "ev-1",
-            "session-turn-2-step-1",
-            StepEventType::ToolCallStarted,
-            2000,
-            Some(serde_json::json!({"tool_name": "bash"})),
-        ),
-        make_step_event(
-            "ev-2",
-            "session-turn-2-step-1",
-            StepEventType::ToolCallFailed,
-            2500,
-            Some(serde_json::json!({"tool_name": "bash", "error": "exit 1"})),
-        ),
-    ];
-    write_tool_events(sid, &events);
+    write_tool_events(
+        sid,
+        &[
+            StepEvent {
+                event_id: "ev-1".to_string(),
+                canonical_event_id: None,
+                step_id: "session-turn-2-step-1".to_string(),
+                event_type: StepEventType::ToolCallStarted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({"tool_name": "bash"})),
+                created_at: 2000,
+            },
+            StepEvent {
+                event_id: "ev-2".to_string(),
+                canonical_event_id: None,
+                step_id: "session-turn-2-step-1".to_string(),
+                event_type: StepEventType::ToolCallFailed,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({"tool_name": "bash", "error": "exit 1"})),
+                created_at: 2500,
+            },
+        ],
+    );
 
     let outcome = recover_from_crash(sid).unwrap();
+    // Failed SideEffect tool must NOT auto-recover — may have partial mutations.
     assert!(
-        matches!(outcome, Some(RecoveryOutcome::AutoRecovered { .. })),
-        "failed tools should be safe to auto-recover, got {:?}",
+        matches!(outcome, Some(RecoveryOutcome::RequiresUserInput { .. })),
+        "failed SideEffect tool should require user input, got {:?}",
         outcome.map(|o| format!("{:?}", o))
     );
 }

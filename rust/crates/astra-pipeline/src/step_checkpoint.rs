@@ -120,10 +120,15 @@ fn file_needs_trailing_newline(path: &Path) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-fn checkpoint_dir_for(session_id: &str) -> PathBuf {
+fn checkpoint_dir_for(session_id: &str) -> std::io::Result<PathBuf> {
     astra_services::local_session_artifact_store()
         .session_path(session_id, STEP_CHECKPOINT_DIR)
-        .expect("validated session_id must resolve step checkpoint dir")
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid session_id for checkpoint dir: {e}"),
+            )
+        })
 }
 
 /// Write a step checkpoint to local filesystem.
@@ -133,7 +138,7 @@ pub fn write_step_checkpoint(
     number: u32,
     checkpoint: &StepCheckpoint,
 ) -> std::io::Result<PathBuf> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     std::fs::create_dir_all(&dir)?;
 
     let tier = match checkpoint {
@@ -158,7 +163,7 @@ pub fn write_step_checkpoint(
 
 /// Delete a step checkpoint by number and tier.
 pub fn delete_step_checkpoint(session_id: &str, number: u32, tier: &str) -> std::io::Result<()> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     let filename = format!("{:06}-{}.json", number, tier);
     let path = dir.join(&filename);
     match std::fs::remove_file(&path) {
@@ -172,7 +177,7 @@ pub fn delete_step_checkpoint(session_id: &str, number: u32, tier: &str) -> std:
 /// Read the latest heavy checkpoint for session recovery.
 /// Returns None if no heavy checkpoint exists.
 pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<HeavyCheckpoint>> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
@@ -208,7 +213,17 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let decrypted = decrypt_checkpoint(&content).unwrap_or_else(|| content.to_string());
+        let decrypted = match decrypt_checkpoint(&content) {
+            Some(plain) => plain,
+            None => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping heavy checkpoint {:?}: decryption failed (key rotation or tampering?)",
+                    entry.file_name()
+                );
+                continue;
+            }
+        };
         let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
@@ -231,7 +246,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
 
 /// Read the latest light checkpoint (for quick cursor restore).
 pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<LightCheckpoint>> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
@@ -267,7 +282,17 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let decrypted = decrypt_checkpoint(&content).unwrap_or_else(|| content.to_string());
+        let decrypted = match decrypt_checkpoint(&content) {
+            Some(plain) => plain,
+            None => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping checkpoint {:?}: decryption failed (key rotation or tampering?)",
+                    entry.file_name()
+                );
+                continue;
+            }
+        };
         let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
@@ -290,7 +315,7 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
 
 /// List all checkpoint numbers and tiers for a session.
 pub fn list_checkpoints(session_id: &str) -> std::io::Result<Vec<(u32, CheckpointTier)>> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -365,7 +390,7 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
 pub fn read_breakpoint_index(
     session_id: &str,
 ) -> std::io::Result<crate::step_protocol::BreakpointIndex> {
-    let path = checkpoint_dir_for(session_id).join("breakpoints.json");
+    let path = checkpoint_dir_for(session_id)?.join("breakpoints.json");
     if !path.exists() {
         return Ok(crate::step_protocol::BreakpointIndex::default());
     }
@@ -381,7 +406,7 @@ pub fn write_composite_snapshot_index(
     session_id: &str,
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
 ) -> std::io::Result<()> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("composite_snapshots.json");
     let json = serde_json::to_string_pretty(index)
@@ -393,12 +418,21 @@ pub fn write_composite_snapshot_index(
 pub fn read_composite_snapshot_index(
     session_id: &str,
 ) -> std::io::Result<astra_core::composite_snapshot::CompositeSnapshotIndex> {
-    let path = checkpoint_dir_for(session_id).join("composite_snapshots.json");
+    let path = checkpoint_dir_for(session_id)?.join("composite_snapshots.json");
     if !path.exists() {
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    let decrypted = decrypt_checkpoint(&content).unwrap_or(content);
+    let decrypted = match decrypt_checkpoint(&content) {
+        Some(plain) => plain,
+        None => {
+            astra_core::agent_warn!(
+                "checkpoint",
+                "composite_snapshots.json decryption failed (key rotation or tampering?), returning empty index"
+            );
+            return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
+        }
+    };
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
         serde_json::from_str(&decrypted)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -861,7 +895,7 @@ mod tests {
     fn write_step_checkpoint_creates_dir_and_file() {
         // Use a unique session ID with tempdir-like suffix to avoid collision
         let session_id = format!("test-step-cp-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
 
         // Clean up from any previous run
         let _ = std::fs::remove_dir_all(&dir);
@@ -947,7 +981,9 @@ mod tests {
         write_composite_snapshot_index(session_id, &index).unwrap();
 
         let raw = std::fs::read_to_string(
-            checkpoint_dir_for(session_id).join("composite_snapshots.json"),
+            checkpoint_dir_for(session_id)
+                .unwrap()
+                .join("composite_snapshots.json"),
         )
         .unwrap();
         assert!(
@@ -1254,15 +1290,16 @@ mod tests {
     #[test]
     fn read_heavy_skips_corrupted_json_files() {
         let session_id = format!("test-corrupt-heavy-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid heavy checkpoint
+        // Write a valid heavy checkpoint (encrypted, as production writes)
         let heavy = make_heavy("step-ok", vec![json!({"role": "user", "content": "hello"})]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000002-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str);
+        std::fs::write(dir.join("000002-heavy.json"), &encrypted).unwrap();
 
         // Write a corrupted heavy checkpoint with a higher number
         std::fs::write(dir.join("000003-heavy.json"), "NOT VALID JSON{{{").unwrap();
@@ -1285,15 +1322,16 @@ mod tests {
     #[test]
     fn read_light_skips_corrupted_json_files() {
         let session_id = format!("test-corrupt-light-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid light checkpoint
+        // Write a valid light checkpoint (encrypted, as production writes)
         let light = make_light("step-ok", 0.5);
         let cp = StepCheckpoint::Light(light);
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-light.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str);
+        std::fs::write(dir.join("000001-light.json"), &encrypted).unwrap();
 
         // Write a corrupted light checkpoint with higher number
         std::fs::write(dir.join("000002-light.json"), "GARBAGE").unwrap();
@@ -1350,15 +1388,16 @@ mod tests {
         // Regression: filter_map(|e| e.ok()) was silent. Now logs warnings.
         // This test verifies the function still works when dir entries are fine.
         let session_id = format!("test-dir-ok-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid checkpoint
+        // Write a valid checkpoint (encrypted, as production writes)
         let heavy = make_heavy("step-1", vec![]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str);
+        std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         let result = read_latest_heavy_checkpoint(&session_id);
         assert!(result.is_ok());
@@ -1374,17 +1413,18 @@ mod tests {
     #[test]
     fn corrupted_latest_checkpoint_falls_back_to_previous() {
         let session_id = format!("test-corrupt-fallback-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid checkpoint as #1
+        // Write a valid checkpoint as #1 (encrypted, as production writes)
         let heavy = make_heavy(
             "step-valid",
             vec![json!({"role": "user", "content": "hello"})],
         );
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str);
+        std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         // Write a CORRUPTED checkpoint as #2 (latest)
         std::fs::write(dir.join("000002-heavy.json"), "{{{{CORRUPTED JSON!!!!").unwrap();
@@ -1415,15 +1455,16 @@ mod tests {
     #[test]
     fn orphaned_temp_file_ignored_by_reader() {
         let session_id = format!("test-fsync-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid checkpoint first
+        // Write a valid checkpoint first (encrypted, as production writes)
         let heavy = make_heavy("step-valid", vec![]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str);
+        std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         // Simulate power loss: a corrupted temp file left behind (never renamed)
         // This represents a crash after write but before rename.
@@ -1437,6 +1478,131 @@ mod tests {
         assert_eq!(
             cp.light.step_id, "step-valid",
             "must return valid checkpoint, not be confused by orphaned temp file"
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    // =======================================================================
+    // Regression: checkpoint_dir_for must NOT panic on invalid session_id (C2)
+    // =======================================================================
+
+    #[test]
+    fn checkpoint_dir_for_returns_err_on_traversal_session_id() {
+        // Regression: checkpoint_dir_for used .expect() which would panic
+        // on invalid session_id (e.g. path traversal). Must return Err.
+        let result = checkpoint_dir_for("../../etc/passwd");
+        assert!(
+            result.is_err(),
+            "checkpoint_dir_for must return Err for path-traversal session_id, \
+             got Ok({:?})",
+            result
+        );
+    }
+
+    #[test]
+    fn checkpoint_dir_for_returns_err_on_empty_session_id() {
+        let result = checkpoint_dir_for("");
+        assert!(
+            result.is_err(),
+            "checkpoint_dir_for must return Err for empty session_id, got Ok({:?})",
+            result
+        );
+    }
+
+    #[test]
+    fn write_step_checkpoint_returns_err_on_invalid_session_id() {
+        let light = make_light("step-invalid-id", 1.0);
+        let cp = StepCheckpoint::Light(light);
+        let result = write_step_checkpoint("../../etc/passwd", 1, &cp);
+        assert!(
+            result.is_err(),
+            "write_step_checkpoint must return Err for invalid session_id, got Ok"
+        );
+    }
+
+    #[test]
+    fn read_latest_heavy_checkpoint_returns_err_on_invalid_session_id() {
+        let result = read_latest_heavy_checkpoint("../../etc/passwd");
+        assert!(
+            result.is_err(),
+            "read_latest_heavy_checkpoint must return Err for invalid session_id, got Ok"
+        );
+    }
+
+    // =======================================================================
+    // Regression: decrypt_checkpoint must NOT fall back to plaintext (W1)
+    // =======================================================================
+
+    #[test]
+    fn decrypt_checkpoint_returns_none_for_plaintext_json() {
+        // Plain JSON is not valid hex → hex_decode fails → returns None.
+        let plaintext = r#"{"heavy":{"turn":1}}"#;
+        assert!(
+            decrypt_checkpoint(plaintext).is_none(),
+            "decrypt_checkpoint must return None for non-encrypted content"
+        );
+    }
+
+    #[test]
+    fn read_latest_heavy_checkpoint_skips_unencrypted_file() {
+        // Write a plaintext checkpoint file (simulating an attacker-written file
+        // or a corrupted encrypted file that fails decryption).
+        let session_id = format!("test-unencrypted-heavy-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a plaintext JSON file (not hex-encoded, not encrypted)
+        let bad_path = dir.join("000099-heavy.json");
+        std::fs::write(&bad_path, r#"{"Light":{"step_id":"malicious"}}"#).unwrap();
+
+        // read_latest_heavy_checkpoint must skip it and return Ok(None).
+        let result = read_latest_heavy_checkpoint(&session_id).unwrap();
+        assert!(
+            result.is_none(),
+            "unencrypted heavy checkpoint file must be rejected, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn read_latest_light_checkpoint_skips_unencrypted_file() {
+        let session_id = format!("test-unencrypted-light-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad_path = dir.join("000099-light.json");
+        std::fs::write(&bad_path, r#"{"Light":{"step_id":"malicious"}}"#).unwrap();
+
+        let result = read_latest_light_checkpoint(&session_id).unwrap();
+        assert!(
+            result.is_none(),
+            "unencrypted light checkpoint file must be rejected, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn read_composite_snapshot_index_returns_default_on_unencrypted_file() {
+        let session_id = format!("test-unencrypted-composite-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad_path = dir.join("composite_snapshots.json");
+        std::fs::write(&bad_path, r#"{"snapshots":[]}"#).unwrap();
+
+        // Must return empty index, not parse the plaintext.
+        let result = read_composite_snapshot_index(&session_id).unwrap();
+        assert!(
+            result.snapshots.is_empty(),
+            "unencrypted composite snapshot must return empty index, got {} snapshots",
+            result.snapshots.len()
         );
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());

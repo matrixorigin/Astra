@@ -445,9 +445,10 @@ fn apply_stdin_redirect(config: &ShellHardeningConfig, command: &str) -> String 
     if lower.contains("< ") || lower.contains("<<") || lower.contains("<<<") {
         return command.to_string();
     }
-    // Don't add redirect to pipe commands (would break the pipe).
+    // Wrap pipe commands in subshell to preserve pipe semantics
+    // while still redirecting the overall stdin to /dev/null.
     if command.contains('|') {
-        return command.to_string();
+        return format!("( {command} ) < /dev/null");
     }
     format!("{command} < /dev/null")
 }
@@ -498,7 +499,16 @@ mod tests {
     fn stdin_redirect_skipped_for_pipe() {
         let config = ShellHardeningConfig::default();
         let cmd = build_hardened_command(&config, "cat file.txt | grep pattern");
-        assert!(!cmd.contains("< /dev/null"));
+        // Pipe commands are now wrapped in subshell to preserve pipe semantics
+        // while still redirecting overall stdin to /dev/null.
+        assert!(
+            cmd.contains("< /dev/null"),
+            "pipe commands must have stdin redirect via subshell wrap"
+        );
+        assert!(
+            cmd.contains("(") && cmd.contains(")"),
+            "pipe commands must be wrapped in subshell"
+        );
     }
 
     // --- Secret scrubbing ---
@@ -736,14 +746,25 @@ mod tests {
     }
 
     #[test]
-    fn stdin_redirect_skipped_for_herestring() {
+    fn stdin_redirect_skipped_for_pipe_chain() {
+        // Pipe commands now get subshell wrapping with stdin redirect
+        // to prevent right-side commands from reading spawn stdin.
         let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cat <<< 'hello'");
-        assert!(!cmd.ends_with("< /dev/null"));
+        let cmd = build_hardened_command(&config, "echo hello | grep h | wc -l");
+        // Pipeline should be wrapped: ( ... ) < /dev/null
+        assert!(
+            cmd.contains("< /dev/null"),
+            "pipe commands must have stdin redirect via subshell wrap; \
+             got: '{cmd}'"
+        );
+        assert!(
+            cmd.contains("( echo hello | grep h | wc -l )"),
+            "expected subshell wrapper; got: '{cmd}'"
+        );
     }
 
     #[test]
-    fn stdin_redirect_skipped_for_pipe_chain() {
+    fn stdin_redirect_wraps_pipe_with_disabled_extras() {
         let config = ShellHardeningConfig {
             disable_extglob: false,
             reset_ifs: false,
@@ -751,7 +772,11 @@ mod tests {
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "echo hello | grep hello");
-        assert!(!cmd.contains("< /dev/null"));
+        // Even with only redirect_stdin enabled, pipe commands get subshell wrap.
+        assert!(
+            cmd.contains("< /dev/null"),
+            "pipe commands must have stdin redirect; got: '{cmd}'"
+        );
     }
 
     #[test]
