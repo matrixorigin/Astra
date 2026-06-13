@@ -2,6 +2,8 @@ use std::sync::OnceLock;
 
 use regex::{Regex, RegexBuilder};
 
+use crate::{UserCorrectionSignalKind, classify_user_correction_signal};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImplicitSignal {
     pub signal_type: String,
@@ -76,6 +78,18 @@ pub fn detect_implicit_feedback_signal(
                 };
             }
         }
+    }
+
+    if let Some(kind) = classify_user_correction_signal(user_input) {
+        let signal_type = match kind {
+            UserCorrectionSignalKind::Correction => "correction",
+            UserCorrectionSignalKind::Reanchor => "rephrasing",
+        };
+        return ImplicitSignal {
+            signal_type: signal_type.to_string(),
+            confidence: 0.7,
+            evidence: "shared_user_correction_signal".to_string(),
+        };
     }
 
     for (index, pattern) in negative_patterns().iter().enumerate() {
@@ -243,6 +257,28 @@ mod tests {
         let s = detect("不对");
         assert_eq!(s.signal_type, "correction");
         assert_eq!(s.confidence, 0.7);
+    }
+
+    #[test]
+    fn shared_correction_signal_reanchors_goal_nudges() {
+        for input in [
+            "我要的是长久健康运行，不是临时补丁",
+            "You misunderstood the goal; keep the session healthy long-term",
+        ] {
+            let s = detect(input);
+            assert_eq!(s.signal_type, "rephrasing", "input: {input:?}");
+            assert_eq!(s.confidence, 0.7, "input: {input:?}");
+            assert_eq!(
+                s.evidence, "shared_user_correction_signal",
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reanchor_question_is_not_feedback_signal() {
+        let s = detect("是不是可以让 web-agent 支持 taskboard?");
+        assert_eq!(s.signal_type, "neutral");
     }
 
     #[test]

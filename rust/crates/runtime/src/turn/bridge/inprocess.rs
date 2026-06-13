@@ -1904,10 +1904,13 @@ impl InProcessChatTurnBridge {
                     user_content_for_signal,
                     latest_assistant_message_text(&messages),
                 );
-                let is_correction = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-                // Store heuristic-extracted feedback only on correction/frustration signals
+                let is_correction_like = matches!(
+                    signal.signal_type.as_str(),
+                    "correction" | "frustration" | "rephrasing"
+                );
+                // Store heuristic-extracted feedback only on correction-like signals
                 // and only when we have a valid session_id (avoid cross-session leakage)
-                if !session_id.is_empty() && is_correction {
+                if !session_id.is_empty() && is_correction_like {
                     if let Some(fb) = astra_pipeline::feedback_extraction::heuristic_extract(
                         user_content_for_signal,
                         &signal.signal_type,
@@ -1948,7 +1951,7 @@ impl InProcessChatTurnBridge {
                 let hint = crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
                     .map(|s| format!("\n\n{s}"))
                     .unwrap_or_default();
-                (hint, is_correction)
+                (hint, is_correction_like)
             };
 
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──

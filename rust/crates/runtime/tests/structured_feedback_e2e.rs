@@ -326,6 +326,51 @@ async fn bridge_feedback_store_multi_turn_simulation() {
     assert!(store.is_empty("other-session").await);
 }
 
+#[tokio::test]
+async fn reanchor_nudge_injects_context_without_persisting_vague_goal() {
+    let store = FeedbackStore::new();
+    let sid = "reanchor-session";
+
+    let user_text = "我要的是长久健康运行，不是临时补丁";
+    let signal = detect_implicit_feedback_signal(user_text, Some("I will make a quick patch"));
+    assert_eq!(signal.signal_type, "rephrasing");
+    assert!(implicit_feedback_context_injection(&signal).is_some());
+
+    if matches!(
+        signal.signal_type.as_str(),
+        "correction" | "frustration" | "rephrasing"
+    ) && let Some(fb) = heuristic_extract(user_text, &signal.signal_type, signal.confidence)
+    {
+        store.add(sid, fb).await;
+    }
+
+    assert!(
+        store.is_empty(sid).await,
+        "vague reanchor goals should nudge the current turn but not become durable rules"
+    );
+}
+
+#[tokio::test]
+async fn rephrasing_with_directive_can_be_stored_for_later_turns() {
+    let store = FeedbackStore::new();
+    let sid = "rephrasing-directive-session";
+
+    let user_text = "我重新说一次，不要用case-by-case修补";
+    let signal = detect_implicit_feedback_signal(user_text, Some("I'll patch that one case"));
+    assert_eq!(signal.signal_type, "rephrasing");
+
+    if matches!(
+        signal.signal_type.as_str(),
+        "correction" | "frustration" | "rephrasing"
+    ) && let Some(fb) = heuristic_extract(user_text, &signal.signal_type, signal.confidence)
+    {
+        store.add(sid, fb).await;
+    }
+
+    let injection = store.build_injection(sid).await;
+    assert!(injection.contains("不要用case-by-case修补"));
+}
+
 // ─── Empty session_id guard (P0-2) ─────────────────────────────────────────
 
 #[tokio::test]
