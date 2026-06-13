@@ -103,8 +103,12 @@ pub fn is_low_information_followup(line: &str) -> bool {
 
 #[must_use]
 pub fn is_correction_signal(message: &str) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
+    }
     let lower = message.to_lowercase();
-    [
+    if [
         "no,",
         "no i",
         "that's wrong",
@@ -136,6 +140,98 @@ pub fn is_correction_signal(message: &str) -> bool {
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
+    {
+        return true;
+    }
+
+    is_reanchor_nudge(message, &lower)
+}
+
+fn is_reanchor_nudge(message: &str, lower: &str) -> bool {
+    is_english_reanchor_nudge(lower) || is_chinese_reanchor_nudge(message)
+}
+
+fn is_english_reanchor_nudge(lower: &str) -> bool {
+    if [
+        "you misunderstood",
+        "you misread",
+        "not what i asked",
+        "what i asked for is",
+        "what i need is",
+        "what i want is",
+        "i asked for",
+        "i need you to",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        return true;
+    }
+
+    let padded = format!(" {lower} ");
+    let has_negation = [
+        " not ",
+        " don't ",
+        " do not ",
+        " rather than ",
+        " instead of ",
+    ]
+    .iter()
+    .any(|pattern| padded.contains(pattern));
+    let has_redirect = [
+        "instead",
+        "rather",
+        "correct",
+        "durable",
+        "long-term",
+        "long term",
+        "systemic",
+        "first principles",
+        "workaround",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern));
+
+    has_negation && has_redirect
+}
+
+fn is_chinese_reanchor_nudge(message: &str) -> bool {
+    let normalized = message.replace("是不是", "是否");
+    if [
+        "我要的是",
+        "我想要的是",
+        "需要的是",
+        "说的是",
+        "目标是",
+        "正确的是",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        return true;
+    }
+
+    let has_negation = ["不是", "不要", "别"].iter().any(|pattern| {
+        normalized.contains(pattern) && !normalized.contains(&format!("是否{pattern}"))
+    });
+    let has_redirect = [
+        "而是",
+        "要",
+        "应该",
+        "正确",
+        "系统",
+        "第一性原则",
+        "长期",
+        "长久",
+        "临时",
+        "补丁",
+        "修修补补",
+        "case by case",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern));
+
+    has_negation && has_redirect
 }
 
 #[must_use]
@@ -352,6 +448,21 @@ mod tests {
         assert!(is_correction_signal("No, that's wrong."));
         assert!(is_correction_signal("不对，我的意思是改这里"));
         assert!(!is_correction_signal("please continue with the fix"));
+    }
+
+    #[test]
+    fn correction_signal_handles_reanchor_nudges_without_chinese_question_false_positive() {
+        assert!(is_correction_signal("不是修修补补，要系统性解决"));
+        assert!(is_correction_signal("我想要的是长久健康运行，不是临时补丁"));
+        assert!(is_correction_signal(
+            "What I asked for is a durable fix, not a workaround"
+        ));
+        assert!(is_correction_signal(
+            "You misunderstood the goal; keep the session healthy long-term"
+        ));
+        assert!(!is_correction_signal(
+            "是不是可以让 web-agent 支持 taskboard?"
+        ));
     }
 
     #[test]

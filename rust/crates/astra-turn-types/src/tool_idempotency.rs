@@ -70,12 +70,17 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         "read_file"
         | "file_read"
         | "ReadFileTool"
+        | "Read"
         | "get_file_contents"
         | "view_file"
+        | "View"
+        | "view"
         | "grep"
         | "GrepTool"
+        | "Grep"
         | "glob"
         | "GlobTool"
+        | "Glob"
         | "list_dir"
         | "ListDirTool"
         | "list_files"
@@ -135,7 +140,7 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         "ask_user" | "sleep" => ToolIdempotency::NonIdempotent,
 
         // Idempotent writes — overwrite semantics
-        "write_file" | "WriteFileTool" => ToolIdempotency::IdempotentWrite,
+        "write_file" | "WriteFileTool" | "Write" => ToolIdempotency::IdempotentWrite,
 
         // Everything else: non-idempotent (safe default)
         _ => ToolIdempotency::NonIdempotent,
@@ -155,9 +160,14 @@ mod tests {
     fn pure_read_tools() {
         for name in [
             "read_file",
+            "Read",
             "grep",
+            "Grep",
             "glob",
+            "Glob",
             "list_dir",
+            "View",
+            "view",
             "git_status",
             "git_log",
             "git_diff",
@@ -341,10 +351,16 @@ mod tests {
         let pairs = [
             ("read_file", "file_read"),
             ("read_file", "ReadFileTool"),
+            ("read_file", "Read"),
+            ("view_file", "View"),
+            ("view_file", "view"),
             ("grep", "GrepTool"),
+            ("grep", "Grep"),
             ("glob", "GlobTool"),
+            ("glob", "Glob"),
             ("list_dir", "ListDirTool"),
             ("write_file", "WriteFileTool"),
+            ("write_file", "Write"),
             ("web_fetch", "WebFetchTool"),
         ];
         for (canonical, alias) in pairs {
