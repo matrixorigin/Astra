@@ -25,12 +25,13 @@
 use crate::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache};
 use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const DEFAULT_RETRY_SUPPRESSION_SECS: u64 = 30;
+const DEFAULT_MAX_RETRY_TRACKING_ENTRIES: usize = 1024;
 
 fn unix_timestamp_secs() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -130,7 +131,11 @@ pub struct ExactlyOnceExecutor {
     /// Short-lived failure leases used to prevent crash-recovery retry storms
     /// without poisoning the exactly-once result cache.
     retry_suppressions: HashMap<IdempotencyKey, RetrySuppression>,
+    /// FIFO index for bounded transient retry state. Stale entries are skipped
+    /// during pruning, so clearing a key does not require scanning the queue.
+    retry_order: VecDeque<IdempotencyKey>,
     retry_suppression_secs: u64,
+    max_retry_tracking_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +178,9 @@ impl ExactlyOnceExecutor {
             max_retries: 5,
             retry_counts: HashMap::new(),
             retry_suppressions: HashMap::new(),
+            retry_order: VecDeque::new(),
             retry_suppression_secs: DEFAULT_RETRY_SUPPRESSION_SECS,
+            max_retry_tracking_entries: DEFAULT_MAX_RETRY_TRACKING_ENTRIES,
         }
     }
 
@@ -188,6 +195,17 @@ impl ExactlyOnceExecutor {
     /// Set the retry suppression lease duration.
     pub fn with_retry_suppression_secs(mut self, retry_suppression_secs: u64) -> Self {
         self.retry_suppression_secs = retry_suppression_secs;
+        self
+    }
+
+    /// Bound transient retry-state growth for long-running sessions.
+    ///
+    /// This does not evict successful exactly-once cache entries. A zero value
+    /// disables retry-state retention and therefore also disables retry
+    /// suppression.
+    pub fn with_max_retry_tracking_entries(mut self, max_entries: usize) -> Self {
+        self.max_retry_tracking_entries = max_entries;
+        self.enforce_retry_tracking_bound();
         self
     }
 
@@ -328,8 +346,7 @@ impl ExactlyOnceExecutor {
                     last_error: suppression.last_error.clone(),
                 });
             }
-            self.retry_suppressions.remove(&key);
-            self.retry_counts.remove(&key);
+            self.clear_retry_tracking(&key);
         }
 
         // Phase 2: Cache miss — execute tool
@@ -347,8 +364,7 @@ impl ExactlyOnceExecutor {
         match result {
             Ok(output) => {
                 // Success clears the retry counter for this key.
-                self.retry_counts.remove(&key);
-                self.retry_suppressions.remove(&key);
+                self.clear_retry_tracking(&key);
                 let cached_result = CachedToolResult {
                     tool_name: tool_name.to_string(),
                     output: output.clone(),
@@ -368,13 +384,14 @@ impl ExactlyOnceExecutor {
                 // failures for the same tool+args, install a short-lived
                 // suppression lease. Do not cache the error: a failed attempt
                 // is not proof that a side effect completed.
-                let count = self.retry_counts.entry(key.clone()).or_insert(0);
-                *count += 1;
-                if *count >= self.max_retries {
+                let Some(count) = self.record_retry_failure(&key) else {
+                    return Err(ExactlyOnceError::ToolExecutionError(error_msg));
+                };
+                if count >= self.max_retries {
                     tracing::warn!(
                         tool_name = %tool_name,
                         step_id = %step_id,
-                        retry_count = *count,
+                        retry_count = count,
                         max_retries = self.max_retries,
                         retry_suppression_secs = self.retry_suppression_secs,
                         "Exactly-once: retry-storm guard engaged with short-lived suppression lease"
@@ -384,14 +401,66 @@ impl ExactlyOnceExecutor {
                     self.retry_suppressions.insert(
                         key,
                         RetrySuppression {
-                            retry_count: *count,
+                            retry_count: count,
                             retry_after_epoch_secs,
                             last_error: error_msg.clone(),
                         },
                     );
+                    self.enforce_retry_tracking_bound();
                 }
                 Err(ExactlyOnceError::ToolExecutionError(error_msg))
             }
+        }
+    }
+
+    fn clear_retry_tracking(&mut self, key: &IdempotencyKey) {
+        self.retry_counts.remove(key);
+        self.retry_suppressions.remove(key);
+    }
+
+    fn record_retry_failure(&mut self, key: &IdempotencyKey) -> Option<u32> {
+        if self.max_retry_tracking_entries == 0 {
+            return None;
+        }
+
+        if !self.retry_counts.contains_key(key) && !self.retry_suppressions.contains_key(key) {
+            self.retry_order.push_back(key.clone());
+        }
+
+        let count = self.retry_counts.entry(key.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        let count = *count;
+        self.enforce_retry_tracking_bound();
+        Some(count)
+    }
+
+    fn retry_tracking_size(&self) -> usize {
+        self.retry_counts.len().max(self.retry_suppressions.len())
+    }
+
+    fn enforce_retry_tracking_bound(&mut self) {
+        if self.max_retry_tracking_entries == 0 {
+            self.retry_counts.clear();
+            self.retry_suppressions.clear();
+            self.retry_order.clear();
+            return;
+        }
+
+        while self.retry_tracking_size() > self.max_retry_tracking_entries {
+            let Some(key) = self.retry_order.pop_front() else {
+                self.retry_counts.clear();
+                self.retry_suppressions.clear();
+                return;
+            };
+            self.retry_counts.remove(&key);
+            self.retry_suppressions.remove(&key);
+        }
+
+        while let Some(key) = self.retry_order.front() {
+            if self.retry_counts.contains_key(key) || self.retry_suppressions.contains_key(key) {
+                break;
+            }
+            self.retry_order.pop_front();
         }
     }
 
@@ -660,6 +729,98 @@ mod tests {
         assert!(!recovered.from_cache);
         assert_eq!(recovered.output, "network recovered");
         assert_eq!(executor.cache_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_failure_tracking_is_bounded_for_long_sessions() {
+        let mut executor = ExactlyOnceExecutor::new();
+
+        for index in 0..1100 {
+            let args = json!({"command": format!("curl https://down-{index}.example")});
+            let result = executor
+                .execute_with_dedup("step-long-session", index, "bash", &args, |_, _| async {
+                    Err("temporary network timeout".to_string())
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(ExactlyOnceError::ToolExecutionError(_))
+            ));
+        }
+
+        assert_eq!(
+            executor.cache_size(),
+            0,
+            "transient failures must not enter the durable exactly-once cache"
+        );
+        assert!(
+            executor.retry_counts.len() <= DEFAULT_MAX_RETRY_TRACKING_ENTRIES,
+            "long sessions need a bounded transient retry-tracking table"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_suppression_tracking_respects_configured_bound() {
+        let mut executor = ExactlyOnceExecutor::new()
+            .with_max_retries(1)
+            .with_max_retry_tracking_entries(3)
+            .with_retry_suppression_secs(60);
+
+        for index in 0..10 {
+            let args = json!({"command": format!("curl https://down-{index}.example")});
+            let result = executor
+                .execute_with_dedup("step-suppressed", index, "bash", &args, |_, _| async {
+                    Err("temporary network timeout".to_string())
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(ExactlyOnceError::ToolExecutionError(_))
+            ));
+        }
+
+        assert!(
+            executor.retry_counts.len() <= 3,
+            "failure counters should obey the configured transient-state bound"
+        );
+        assert!(
+            executor.retry_suppressions.len() <= 3,
+            "retry suppression leases should obey the same transient-state bound"
+        );
+        assert_eq!(
+            executor.cache_size(),
+            0,
+            "suppression leases are runtime state, not durable exactly-once results"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_retry_clears_transient_failure_tracking() {
+        let mut executor = ExactlyOnceExecutor::new().with_max_retries(2);
+        let args = json!({"command": "curl https://flaky.example"});
+        let key = IdempotencyKey::new("step-flaky", 0, "bash", &args);
+
+        let failed = executor
+            .execute_with_dedup("step-flaky", 0, "bash", &args, |_, _| async {
+                Err("temporary network timeout".to_string())
+            })
+            .await;
+        assert!(matches!(
+            failed,
+            Err(ExactlyOnceError::ToolExecutionError(_))
+        ));
+        assert!(executor.retry_counts.contains_key(&key));
+
+        let recovered = executor
+            .execute_with_dedup("step-flaky", 0, "bash", &args, |_, _| async {
+                Ok("recovered".to_string())
+            })
+            .await
+            .expect("retry after transient failure should execute");
+
+        assert_eq!(recovered.output, "recovered");
+        assert!(!executor.retry_counts.contains_key(&key));
+        assert!(!executor.retry_suppressions.contains_key(&key));
     }
 
     #[tokio::test]
