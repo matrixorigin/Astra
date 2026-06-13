@@ -758,6 +758,13 @@ impl SessionState {
         self.resume_restricted_tools.clear();
     }
 
+    fn clear_runtime_recovery_state(&mut self) {
+        self.runtime_pipeline_state = None;
+        self.runtime_compaction_state = None;
+        self.runtime_consecutive_context_window_errors = 0;
+        self.runtime_idempotency_cache = None;
+    }
+
     /// Set the current session id and keep the Tier 1 task manager in sync
     /// (so `session_todos` reads/writes hit the correct session). Prefer
     /// this over `self.session_id = Some(...)` at any path that rebinds
@@ -776,6 +783,7 @@ impl SessionState {
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
         self.clear_resume_recovery_state();
+        self.clear_runtime_recovery_state();
         self.session_persistence_error = None;
     }
 
@@ -815,10 +823,7 @@ impl SessionState {
         self.last_turn_event = None;
         self.session_persistence_error = None;
         self.latest_context_assembly_trace = None;
-        self.runtime_pipeline_state = None;
-        self.runtime_compaction_state = None;
-        self.runtime_consecutive_context_window_errors = 0;
-        self.runtime_idempotency_cache = None;
+        self.clear_runtime_recovery_state();
         self.durable_task_state = None;
         self.last_delivery_report = None;
         self.plan_execution_last_error = None;
@@ -1050,12 +1055,31 @@ mod default_tests {
 
     #[test]
     fn clear_session_id_clears_resume_recovery_fields() {
+        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+        );
+        idempotency_cache.record(
+            &idem_key,
+            astra_pipeline::step_protocol::CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "old session contents".into(),
+                is_error: false,
+                cached_at: 1,
+                context_signature: None,
+            },
+        );
         let mut state = SessionState {
             session_id: Some("sess-1".into()),
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
             plan_mode_sync_error: Some("sync".into()),
             session_persistence_error: Some("journal append failed".into()),
+            runtime_pipeline_state: Some(serde_json::json!({"old_session": true})),
+            runtime_compaction_state: Some(serde_json::json!({"attempt_count": 3})),
+            runtime_consecutive_context_window_errors: 2,
+            runtime_idempotency_cache: Some(idempotency_cache),
             ..Default::default()
         };
 
@@ -1066,6 +1090,10 @@ mod default_tests {
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.session_persistence_error.is_none());
+        assert!(state.runtime_pipeline_state.is_none());
+        assert!(state.runtime_compaction_state.is_none());
+        assert_eq!(state.runtime_consecutive_context_window_errors, 0);
+        assert!(state.runtime_idempotency_cache.is_none());
     }
 
     #[test]
