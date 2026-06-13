@@ -88,18 +88,36 @@ fn append_encrypted_line(path: &Path, content: &str) -> std::io::Result<()> {
     };
     std::fs::create_dir_all(dir)?;
     let existed = path.exists();
+    let needs_leading_newline = existed && file_needs_trailing_newline(path)?;
     let encrypted = encrypt_checkpoint(content);
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    if needs_leading_newline {
+        file.write_all(b"\n")?;
+    }
     writeln!(file, "{encrypted}")?;
     file.sync_data()?;
     if !existed {
         sync_parent_dir(path)?;
     }
     Ok(())
+}
+
+fn file_needs_trailing_newline(path: &Path) -> std::io::Result<bool> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 fn checkpoint_dir_for(session_id: &str) -> PathBuf {
@@ -413,7 +431,7 @@ pub struct FileBackedEventStore {
 impl FileBackedEventStore {
     /// Create a new store for a session, loading existing events from disk.
     pub fn new(session_id: &str) -> Self {
-        let events = Self::load_events(session_id).unwrap_or_default();
+        let events = Self::load_events_lenient(session_id);
         Self {
             session_id: session_id.to_string(),
             events,
@@ -432,12 +450,10 @@ impl FileBackedEventStore {
         if line.trim().is_empty() {
             return Ok(None);
         }
-        let json = decrypt_checkpoint(line).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "failed to decrypt checkpoint",
-            )
-        })?;
+        let Some(json) = decrypt_checkpoint(line) else {
+            tracing::warn!("skipping undecryptable step event JSONL line");
+            return Ok(None);
+        };
         match serde_json::from_str::<StepEvent>(&json) {
             Ok(event) => Ok(Some(event)),
             Err(error)
@@ -451,6 +467,53 @@ impl FileBackedEventStore {
             }
             Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
         }
+    }
+
+    fn load_events_lenient(session_id: &str) -> Vec<StepEvent> {
+        let path = events_path_for(session_id);
+        let mut events = Vec::new();
+        if !path.exists() {
+            return events;
+        }
+
+        use std::io::BufRead;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "failed to open step events for lenient replay"
+                );
+                return events;
+            }
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "failed to read step event line during lenient replay"
+                    );
+                    break;
+                }
+            };
+            match Self::parse_event_line(&line) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "skipping invalid step event during lenient replay"
+                    );
+                }
+            }
+        }
+        events
     }
 
     fn load_events_matching(
@@ -485,11 +548,6 @@ impl FileBackedEventStore {
             }
         }
         Ok(())
-    }
-
-    /// Load events from JSONL file.
-    fn load_events(session_id: &str) -> std::io::Result<Vec<StepEvent>> {
-        Self::load_events_matching(session_id, |_| true)
     }
 
     /// Stream only events written at or after a checkpoint timestamp. Recovery
@@ -912,6 +970,14 @@ mod tests {
 
     use crate::step_protocol::StepEventType;
 
+    fn unique_session_id(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{}-{now}", std::process::id())
+    }
+
     fn make_event(id: &str, step_id: &str, event_type: StepEventType) -> StepEvent {
         StepEvent {
             event_id: id.to_string(),
@@ -1022,6 +1088,90 @@ mod tests {
     }
 
     #[test]
+    fn file_event_store_recovers_valid_events_after_torn_encrypted_tail() {
+        let session_id = unique_session_id("test-torn-encrypted-tail");
+        let path = events_path_for(&session_id);
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+        }
+
+        let torn_json =
+            serde_json::to_string(&make_event("torn", "s1", StepEventType::ToolCallCompleted))
+                .unwrap();
+        let torn_encrypted = encrypt_checkpoint(&torn_json);
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&torn_encrypted.as_bytes()[..17]).unwrap();
+        }
+
+        let store = FileBackedEventStore::new(&session_id);
+        let ids: Vec<_> = store
+            .all_events()
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let recovered = FileBackedEventStore::load_events_created_at_or_after(&session_id, 0)
+            .expect("torn encrypted tail must not fail recovery");
+        let ids: Vec<_> = recovered
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+    }
+
+    #[test]
+    fn append_after_torn_encrypted_tail_keeps_new_events_readable() {
+        let session_id = unique_session_id("test-append-after-torn-encrypted-tail");
+        let path = events_path_for(&session_id);
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            store.append(make_event("e1", "s1", StepEventType::StepCreated));
+        }
+
+        let torn_json =
+            serde_json::to_string(&make_event("torn", "s1", StepEventType::ToolCallCompleted))
+                .unwrap();
+        let torn_encrypted = encrypt_checkpoint(&torn_json);
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&torn_encrypted.as_bytes()[..17]).unwrap();
+        }
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+        }
+
+        let store = FileBackedEventStore::new(&session_id);
+        let ids: Vec<_> = store
+            .all_events()
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+    }
+
+    #[test]
     fn file_event_store_loads_recovery_window_without_full_store_materialization() {
         let session_id = format!("test-recovery-window-{}", std::process::id());
         let path = events_path_for(&session_id);
@@ -1060,6 +1210,36 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(session_dir_for(&session_id));
+    }
+
+    #[test]
+    fn file_event_store_new_skips_invalid_event_without_emptying_history() {
+        let session_id = unique_session_id("test-lenient-invalid-event");
+        let path = events_path_for(&session_id);
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+        std::fs::create_dir_all(session_dir_for(&session_id)).expect("session dir");
+
+        let e1 = serde_json::to_string(&make_event("e1", "s1", StepEventType::StepCreated))
+            .expect("serialize e1");
+        let e2 = serde_json::to_string(&make_event("e2", "s1", StepEventType::ToolCallCompleted))
+            .expect("serialize e2");
+        let content = format!(
+            "{}\n{}\n{}\n",
+            encrypt_checkpoint(&e1),
+            encrypt_checkpoint(r#"{"not":"a step event"}"#),
+            encrypt_checkpoint(&e2)
+        );
+        std::fs::write(&path, content).expect("write mixed event log");
+
+        let store = FileBackedEventStore::new(&session_id);
+        let ids: Vec<_> = store
+            .all_events()
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
     }
 
     #[test]
