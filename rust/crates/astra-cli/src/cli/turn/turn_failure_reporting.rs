@@ -45,6 +45,8 @@ pub(crate) fn report_turn_failure(
         state.set_session_id(sid.to_string());
     }
 
+    super::turn_runtime_state::update_from_turn_failure(state, failure);
+
     if let Some(journal) = state.journal.as_ref() {
         let mut err_event = session_journal::JournalEvent::turn_error(
             state.session_id.as_deref(),
@@ -101,6 +103,7 @@ pub(crate) fn report_turn_failure(
 mod tests {
     use super::report_turn_failure;
     use crate::cli::session::session_state::SessionState;
+    use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
     use astra_services::session_journal;
     use std::time::Instant;
 
@@ -123,6 +126,26 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    fn heavy_checkpoint_with_runtime_state(
+        pipeline_state: serde_json::Value,
+        compaction_state: serde_json::Value,
+        consecutive_context_window_errors: u32,
+    ) -> StepCheckpoint {
+        let mut heavy = match StepCheckpoint::heavy(
+            "session-turn-1".to_string(),
+            "task-1".to_string(),
+            "agent-1".to_string(),
+            ExecutionCursor::default(),
+        ) {
+            StepCheckpoint::Heavy(heavy) => *heavy,
+            StepCheckpoint::Light(_) => unreachable!("heavy checkpoint constructor returned light"),
+        };
+        heavy.pipeline_state = Some(pipeline_state);
+        heavy.compaction_state = Some(compaction_state);
+        heavy.consecutive_context_window_errors = consecutive_context_window_errors;
+        StepCheckpoint::Heavy(Box::new(heavy))
     }
 
     #[test]
@@ -183,6 +206,93 @@ mod tests {
             persisted.metadata.as_ref().unwrap()["run_id"],
             "run-failure-1"
         );
+    }
+
+    #[test]
+    fn report_turn_failure_updates_runtime_recovery_state_from_partial_checkpoint() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("test-turn-failure-runtime-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid),
+            runtime_pipeline_state: Some(serde_json::json!({"old": true})),
+            runtime_compaction_state: Some(serde_json::json!({"old": true})),
+            runtime_consecutive_context_window_errors: 9,
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "context window exceeded".into(),
+            partial: crate::PartialTurnData {
+                last_heavy_checkpoint: Some(heavy_checkpoint_with_runtime_state(
+                    serde_json::json!({"stats": {"ema": 0.91}}),
+                    serde_json::json!({
+                        "attempt_count": 5,
+                        "cumulative_tokens_freed": 21000,
+                        "last_tokens_freed": 1000,
+                        "last_was_insufficient": true,
+                    }),
+                    3,
+                )),
+                ..Default::default()
+            },
+        };
+
+        report_turn_failure(
+            &mut state,
+            None,
+            "continue",
+            &failure,
+            Instant::now(),
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
+
+        assert_eq!(
+            state.runtime_pipeline_state,
+            Some(serde_json::json!({"stats": {"ema": 0.91}}))
+        );
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 5,
+                "cumulative_tokens_freed": 21000,
+                "last_tokens_freed": 1000,
+                "last_was_insufficient": true,
+            }))
+        );
+        assert_eq!(state.runtime_consecutive_context_window_errors, 3);
+    }
+
+    #[test]
+    fn report_turn_failure_preserves_runtime_recovery_state_without_partial_checkpoint() {
+        let mut state = SessionState {
+            runtime_pipeline_state: Some(serde_json::json!({"previous": true})),
+            runtime_compaction_state: Some(serde_json::json!({"attempt_count": 2})),
+            runtime_consecutive_context_window_errors: 2,
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "network reset before checkpoint".into(),
+            partial: crate::PartialTurnData::default(),
+        };
+
+        report_turn_failure(
+            &mut state,
+            None,
+            "continue",
+            &failure,
+            Instant::now(),
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
+
+        assert_eq!(
+            state.runtime_pipeline_state,
+            Some(serde_json::json!({"previous": true}))
+        );
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({"attempt_count": 2}))
+        );
+        assert_eq!(state.runtime_consecutive_context_window_errors, 2);
     }
 
     #[test]

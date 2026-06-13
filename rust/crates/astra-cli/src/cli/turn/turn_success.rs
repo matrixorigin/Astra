@@ -195,21 +195,6 @@ fn initialize_post_commit_session_state(
     }
 }
 
-fn update_runtime_checkpoint_state_from_result(state: &mut SessionState, result: &StreamResult) {
-    let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) =
-        result.last_heavy_checkpoint.as_ref()
-    else {
-        state.runtime_pipeline_state = None;
-        state.runtime_compaction_state = None;
-        state.runtime_consecutive_context_window_errors = 0;
-        return;
-    };
-
-    state.runtime_pipeline_state = heavy.pipeline_state.clone();
-    state.runtime_compaction_state = heavy.compaction_state.clone();
-    state.runtime_consecutive_context_window_errors = heavy.consecutive_context_window_errors;
-}
-
 fn clear_rebound_observability_session(state: &mut SessionState) {
     if let Some(session_id) = state.observability_session.as_ref().map(|session| {
         session
@@ -273,7 +258,7 @@ fn apply_turn_success_sync(
         .as_ref()
         .map(astra_turn_core::interruption::resume_restricted_tools_from_interruption_json)
         .unwrap_or_default();
-    update_runtime_checkpoint_state_from_result(state, &result);
+    super::turn_runtime_state::update_from_stream_result(state, &result);
 
     if !result.tool_health_export.is_empty() {
         state.tool_health_entries = result.tool_health_export.clone();
