@@ -880,6 +880,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) {
     apply_open_ended_exploration_budget(state);
+    apply_user_correction_to_working_memory(state);
 
     if state
         .skills
@@ -928,6 +929,19 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // BEFORE the Session→None marker — now it participates in the cached
     // session prefix instead of being re-sent after the marker every turn.
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
+}
+
+fn apply_user_correction_to_working_memory(state: &mut AgenticLoopState) -> bool {
+    if !astra_turn_core::input_classifier::is_correction_signal(&state.message) {
+        return false;
+    }
+    let Some(session) = state.pipeline_session.as_mut() else {
+        return false;
+    };
+    session
+        .working_memory_mut()
+        .apply_user_correction(&state.message);
+    true
 }
 
 /// Estimate context pressure from raw message token count.
@@ -3035,6 +3049,70 @@ mod tests {
         assert!(p100 > p50, "100 msgs > 50 msgs pressure");
         assert!(p50 > p10, "50 msgs > 10 msgs pressure");
         assert!(p100 > p10, "100 msgs > 10 msgs pressure");
+    }
+
+    #[test]
+    fn user_correction_reanchors_working_memory_before_turn() {
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "No, that's wrong; use the server-side executor.".into();
+        {
+            let memory = state
+                .pipeline_session
+                .as_mut()
+                .expect("pipeline session")
+                .working_memory_mut();
+            memory.push_decision("keep durable project fact");
+            memory.push_blocker("stale tool outage");
+            memory.set_next_action("retry stale path");
+        }
+
+        assert!(apply_user_correction_to_working_memory(&mut state));
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(rendered.contains("keep durable project fact"));
+        assert!(!rendered.contains("stale tool outage"));
+        assert!(!rendered.contains("retry stale path"));
+        assert!(
+            rendered.contains("Latest user correction overrides conflicting prior working memory")
+        );
+        assert!(rendered.contains("server-side executor"));
+    }
+
+    #[test]
+    fn ordinary_followup_does_not_reanchor_working_memory() {
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "continue with the implementation".into();
+        {
+            let memory = state
+                .pipeline_session
+                .as_mut()
+                .expect("pipeline session")
+                .working_memory_mut();
+            memory.push_blocker("current blocker");
+            memory.set_next_action("continue current path");
+        }
+
+        assert!(!apply_user_correction_to_working_memory(&mut state));
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(rendered.contains("current blocker"));
+        assert!(rendered.contains("continue current path"));
     }
 
     // ── Full pipeline integration test ─────────────────────────────
