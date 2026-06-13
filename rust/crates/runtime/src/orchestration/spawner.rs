@@ -20,9 +20,9 @@ use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 use futures_util::FutureExt;
 
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
@@ -628,7 +628,7 @@ pub struct DynamicAgentSpawner {
     /// Agent type registry (builtins + user-defined).
     agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry,
     /// Completed agents archive for history queries.
-    completed_agents: Arc<RwLock<Vec<SpawnedAgentState>>>,
+    completed_agents: Arc<RwLock<VecDeque<SpawnedAgentState>>>,
     /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
     /// Shared across `clone_for_task` clones so every background handle lands here.
     background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
@@ -692,7 +692,7 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry:
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
-            completed_agents: Arc::new(RwLock::new(Vec::new())),
+            completed_agents: Arc::new(RwLock::new(VecDeque::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_abort_handles: Arc::new(RwLock::new(HashMap::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1469,6 +1469,7 @@ impl DynamicAgentSpawner {
                     if let Some(addr) = messaging_address.as_ref() {
                         let _ = self.mailbox_router.unregister(addr).await;
                     }
+                    cleanup_agent_worktree(worktree_path.as_ref(), &agent_id);
                     return Err(SpawnError::Race(format!(
                         "agent {agent_id} was cancelled before spawn completed"
                     )));
@@ -1494,6 +1495,7 @@ impl DynamicAgentSpawner {
             if let Some(addr) = messaging_address.as_ref() {
                 let _ = self.mailbox_router.unregister(addr).await;
             }
+            cleanup_agent_worktree(worktree_path.as_ref(), &agent_id);
             return Err(error);
         }
         self.emit_agent_spawned_trace(&spawned_state_for_trace)
@@ -1953,9 +1955,9 @@ impl DynamicAgentSpawner {
         let mut completed = self.completed_agents.write().await;
         const MAX_COMPLETED_AGENTS: usize = 256;
         if completed.len() >= MAX_COMPLETED_AGENTS {
-            completed.remove(0);
+            completed.pop_front();
         }
-        completed.push(state);
+        completed.push_back(state);
     }
 
     async fn notify_completion(&self, agent_id: &str) {
@@ -2258,7 +2260,8 @@ impl DynamicAgentSpawner {
         &self,
         root_run_id: &str,
     ) -> Vec<SpawnedAgentState> {
-        let mut states = self.completed_agents.read().await.clone();
+        let mut states: Vec<SpawnedAgentState> =
+            self.completed_agents.read().await.iter().cloned().collect();
         let active_states = self.active_agents.read().await;
         for state in active_states.values() {
             if !states
@@ -2549,6 +2552,48 @@ fn create_agent_worktree(parent_dir: &std::path::Path, run_id: &str) -> Result<P
     std::fs::create_dir_all(&worktree_path)
         .map_err(|e| format!("cannot create worktree dir: {e}"))?;
     Ok(worktree_path)
+}
+
+fn cleanup_agent_worktree(worktree_path: Option<&PathBuf>, agent_id: &str) {
+    let Some(path) = worktree_path else {
+        return;
+    };
+    match remove_git_agent_worktree(path) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            astra_core::agent_debug!(
+                "spawner",
+                "git worktree cleanup probe failed for {agent_id} at {}: {error}",
+                path.display()
+            );
+        }
+    }
+    if !path.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        astra_core::agent_warn!(
+            "spawner",
+            "failed to clean up worktree for {agent_id} at {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn remove_git_agent_worktree(path: &Path) -> Result<bool, std::io::Error> {
+    let Some(worktree_base) = path.parent() else {
+        return Ok(false);
+    };
+    let Some(parent_dir) = worktree_base.parent() else {
+        return Ok(false);
+    };
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .current_dir(parent_dir)
+        .output()?;
+    Ok(output.status.success())
 }
 
 #[cfg(test)]
@@ -3468,7 +3513,7 @@ mod tests {
         ));
         let completed = spawner.completed_agents.read().await;
         assert!(matches!(
-            completed.first().map(|state| &state.status),
+            completed.front().map(|state| &state.status),
             Some(AgentStatus::Waiting { reason }) if reason == "executor_offline"
         ));
         drop(completed);
@@ -3627,6 +3672,45 @@ mod tests {
             run_in_background: false,
             ..Default::default()
         }
+    }
+
+    fn completed_test_state(index: usize) -> SpawnedAgentState {
+        SpawnedAgentState {
+            agent_id: format!("agent-{index}"),
+            run_id: format!("run-{index}"),
+            parent_run_id: "root".to_string(),
+            agent_type: "explore".to_string(),
+            description: format!("archived {index}"),
+            status: AgentStatus::Completed {
+                result: "ok".to_string(),
+                finish_reason: Some("normal".to_string()),
+            },
+            messaging_address: None,
+            worktree_path: None,
+            started_at: SystemTime::now(),
+            metrics: Default::default(),
+            permission_summary: PermissionSummary::default(),
+            parent_agent_id: "parent".to_string(),
+            trace_context: None,
+            spawn_tool_call_id: None,
+            run_in_background: true,
+            fanout_slot: None,
+            execution_metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_agent_archive_evicts_oldest_at_capacity() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+
+        for index in 0..260 {
+            spawner.archive_state(completed_test_state(index)).await;
+        }
+
+        let completed = spawner.completed_agents.read().await;
+        assert_eq!(completed.len(), 256);
+        assert_eq!(completed.front().unwrap().agent_id, "agent-4");
+        assert_eq!(completed.back().unwrap().agent_id, "agent-259");
     }
 
     /// Concurrency cap: when `with_max_concurrent_agents(n)` is set,
@@ -3840,6 +3924,53 @@ mod tests {
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.active, 1);
         assert_eq!(groups[0].slots[1].requested_description, "bg test");
+
+        factory.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn rejected_fanout_spawn_cleans_created_worktree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
+        let mut context = make_bg_context();
+        context.working_dir = temp.path().to_path_buf();
+        let mut input = make_bg_input();
+        input.isolated = true;
+        input.fanout_group_id = Some("review-cleanup".to_string());
+        input.fanout_group_title = Some("review cleanup".to_string());
+        input.fanout_target_count = Some(2);
+        input.fanout_slot_index = Some(0);
+
+        let first = spawner
+            .spawn(input.clone(), &context)
+            .await
+            .expect("first isolated fanout spawn should be accepted");
+        assert!(matches!(first, SpawnAgentOutput::Launched { .. }));
+        let worktree_base = temp.path().join(".agent-worktrees");
+        let count_worktrees = || -> usize {
+            std::fs::read_dir(&worktree_base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count()
+        };
+        assert_eq!(count_worktrees(), 1);
+
+        let duplicate = spawner.spawn(input, &context).await;
+        assert!(
+            matches!(duplicate, Err(SpawnError::InvalidInput(ref message)) if message.contains("already accepted")),
+            "duplicate slot must reject after worktree creation: {duplicate:?}"
+        );
+        assert_eq!(
+            count_worktrees(),
+            1,
+            "duplicate fanout rejection must remove the worktree it created"
+        );
+        assert_eq!(spawner.active_agents.read().await.len(), 1);
 
         factory.unblock();
         spawner
@@ -4913,7 +5044,7 @@ mod tests {
                     .completed_agents
                     .read()
                     .await
-                    .last()
+                    .back()
                     .expect("foreground panic should archive failed state")
                     .agent_id
                     .clone()
